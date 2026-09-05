@@ -929,6 +929,7 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
             *,
             persist_stale: bool = True,
             allow_ahead: bool = False,
+            **kwargs: object,
         ) -> tuple[object, ...]:
             if threading.current_thread().name == "checkpoint-postlude":
                 inventory_entered.set()
@@ -941,6 +942,7 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
                 published_lsn,
                 persist_stale=persist_stale,
                 allow_ahead=allow_ahead,
+                **kwargs,
             )
 
         def run_checkpoint() -> None:
@@ -1031,6 +1033,7 @@ def test_maintenance_index_inventory_fences_a_foreign_commit(
             *,
             persist_stale: bool = True,
             allow_ahead: bool = False,
+            **kwargs: object,
         ) -> tuple[object, ...]:
             if (
                 manager is maintained_indexes
@@ -1046,6 +1049,7 @@ def test_maintenance_index_inventory_fences_a_foreign_commit(
                 published_lsn,
                 persist_stale=persist_stale,
                 allow_ahead=allow_ahead,
+                **kwargs,
             )
 
         def run_maintenance() -> None:

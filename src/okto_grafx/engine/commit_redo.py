@@ -74,6 +74,8 @@ class _PreparedPageEffect:
     page_index: int
     image: bytes
     page_lsn: Lsn
+    watermark_scope_known: bool
+    watermark_table_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +337,51 @@ class CommitRedo:
             return None
         return preflighted.contains_index_reset
 
+    def _verified_watermark_table_ids(
+        self, preflighted: object
+    ) -> frozenset[int] | None:
+        """Return exact heap owners only from this instance's verified full proof.
+
+        ``None`` deliberately means "take the canonical full photograph".  The shortcut is
+        available only when every page image was classified by the concrete IndexManager while
+        it was already being decoded by the mandatory preflight.  A custom manager, forged
+        proof, or image whose scope cannot be established therefore cannot suppress a table
+        watermark walk.
+        """
+        if (
+            not isinstance(preflighted, _PreflightedReplay)
+            or preflighted.seal is not _PREFLIGHT_SEAL
+            or preflighted.owner is not self
+            or not preflighted.signature_verified
+            or any(
+                not prepared.watermark_scope_known
+                for _position, prepared in preflighted.prepared_pages
+            )
+        ):
+            return None
+        return frozenset(
+            prepared.watermark_table_id
+            for _position, prepared in preflighted.prepared_pages
+            if prepared.watermark_table_id is not None
+        )
+
+    def _watermark_scope_for_page(
+        self, file: str, page: Page
+    ) -> tuple[bool, int | None]:
+        """Classify one decoded page without granting authority to manager lookalikes."""
+        manager = self._index_manager
+        if manager is None:
+            return False, None
+        # This is a freshness shortcut, not the replay dispatcher compatibility surface.  Only
+        # the concrete manager whose heap/page invariants are defined in this package can prove
+        # that an untouched table remained untouched.  All adapters and test doubles retain the
+        # complete scan.
+        from okto_grafx.engine.index_manager import IndexManager
+
+        if type(manager) is not IndexManager:
+            return False, None
+        return IndexManager.replay_watermark_scope(manager, file, page)
+
     def _ensure_preflight(
         self,
         replay: CommittedReplay,
@@ -566,6 +613,9 @@ class CommitRedo:
                     write.page_index,
                     write.image,
                 )
+                watermark_scope_known, watermark_table_id = (
+                    self._watermark_scope_for_page(write.file, decoded)
+                )
                 prepared_pages.append(
                     (
                         position,
@@ -575,6 +625,8 @@ class CommitRedo:
                             page_index=write.page_index,
                             image=write.image,
                             page_lsn=decoded.page_lsn,
+                            watermark_scope_known=watermark_scope_known,
+                            watermark_table_id=watermark_table_id,
                         ),
                     )
                 )

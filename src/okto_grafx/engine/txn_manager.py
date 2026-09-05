@@ -3484,7 +3484,18 @@ class TransactionManager:
         back on its own account; nothing here evicts it.
         """
         manager = self._index_manager
-        transition = None if manager is None else manager.open
+        transition = None
+        if manager is not None:
+            if type(manager) is IndexManager:
+
+                def open_from_replay_photo(published_lsn: Lsn) -> tuple[Any, ...]:
+                    """Reuse the complete photo established moments earlier in this section."""
+                    watermarks = manager.table_watermark_photo(refresh_table_ids=())
+                    return manager.open(published_lsn, watermarks=watermarks)
+
+                transition = open_from_replay_photo
+            else:
+                transition = manager.open
         return self._checkpoint(
             transition,
             concurrent_data_barrier=True,
@@ -4128,6 +4139,9 @@ class TransactionManager:
         contains_index_reset = self._commit_redo._verified_contains_index_reset(
             full_preflight
         )
+        watermark_table_ids = self._commit_redo._verified_watermark_table_ids(
+            full_preflight
+        )
         skip_reapply = self._can_skip_locally_applied_redo(
             checkpoint,
             through,
@@ -4165,7 +4179,13 @@ class TransactionManager:
             # verdict write a stale flag for every now-known persistent index. Heap pages are
             # already applied and index replay never moves them, so one photo serves this pass
             # and the completion mark below (ST-7).
-            watermarks = manager.table_watermark_photo()
+            watermarks = (
+                manager.table_watermark_photo()
+                if touched_catalog or watermark_table_ids is None
+                else manager.table_watermark_photo(
+                    refresh_table_ids=watermark_table_ids
+                )
+            )
             manager.check_replay_floor(checkpoint, watermarks=watermarks)
         index_result = None
         if not skip_reapply:

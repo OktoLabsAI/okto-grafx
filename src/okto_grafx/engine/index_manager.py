@@ -5772,15 +5772,56 @@ class IndexManager:
             high_waters[table_id] = self._heap.committed_high_water(table)
         return high_waters
 
-    def table_watermark_photo(self) -> dict[int, Lsn]:
+    def replay_watermark_scope(self, file: str, page: Page) -> tuple[bool, int | None]:
+        """Classify whether and whose committed watermark a replayed page can move.
+
+        The redo preflight calls this only on the concrete ``IndexManager`` and on a decoded,
+        checksum-verified image.  Non-heap files and heap overflow pages are proved irrelevant
+        to ``committed_high_water``.  A heap data page must expose its validated physical owner
+        even when the logical change had no secondary-index effect.  Any other heap-file image
+        returns an unknown scope: metadata/reclamation can change an extent or remove the prior
+        owner, which requires the canonical full photograph rather than a cached guess.
+        """
+        if file != self._heap.file or page.page_type == int(PageType.OVERFLOW):
+            return True, None
+        if page.page_type == int(PageType.HEAP):
+            return True, self._heap._page_table_id(page)
+        return False, None
+
+    def table_watermark_photo(
+        self, *, refresh_table_ids: Collection[int] | None = None
+    ) -> dict[int, Lsn]:
         """Photograph each covered table's committed watermark once, for one recovery holder.
 
         Valid only while the photographer holds the section and applies nothing: a caller that
         replays pages or adopts a catalog re-photographs before asking again, and the boot-time
         :meth:`open`, which runs after the section is released into the regime where foreign
         commits move the heap, always takes its own (ST-7).
+
+        An exact ``refresh_table_ids`` proof narrows the physical walk to tables whose heap data
+        pages occur in the verified replay plus newly-active tables absent from this manager's
+        last complete photograph.  The returned mapping remains complete for every active index;
+        callers therefore keep the same fail-closed freshness checks.  ``None`` is the canonical
+        full scan used by recovery, catalog changes, and every unproved/custom replay path.
         """
-        return self._table_high_waters(self.active_indexes())
+        indexes = self.active_indexes()
+        if refresh_table_ids is None:
+            return self._table_high_waters(indexes)
+        active_table_ids = {index.definition.table_id for index in indexes}
+        refresh = (set(refresh_table_ids) & active_table_ids) | (
+            active_table_ids - self._table_watermarks.keys()
+        )
+        refreshed = self._table_high_waters(
+            tuple(index for index in indexes if index.definition.table_id in refresh)
+        )
+        return {
+            table_id: (
+                refreshed[table_id]
+                if table_id in refreshed
+                else self._table_watermarks[table_id]
+            )
+            for table_id in active_table_ids
+        }
 
     def _replace_table_watermarks(self, high_waters: Mapping[int, Lsn]) -> None:
         """Bind every index to one open-time physical table-watermark picture."""
@@ -5830,16 +5871,30 @@ class IndexManager:
         persist_stale: bool = True,
         allow_ahead: bool = False,
         catalog: object | None = None,
+        watermarks: Mapping[int, Lsn] | None = None,
     ) -> tuple[IndexStore, ...]:
         """Check every registered index against the position the database has published.
 
         Returns the indexes that are stale, which is what a caller needs in order to decide
         between rebuilding them and running without them. Nothing is repaired here: a repair
         writes to the log and therefore belongs inside a transaction the caller owns.
+
+        ``watermarks`` may carry a complete photograph taken by the same holder without an
+        intervening mutation, as checkpoint does after redo.  A newly-active table absent from
+        that picture is still read fresh here; the optimization can remove duplicate walks but
+        cannot remove a freshness question.
         """
         published = _require_position("published_lsn", published_lsn)
         indexes = self.active_indexes(catalog=catalog)
-        high_waters = self._table_high_waters(indexes)
+        if watermarks is None:
+            high_waters = self._table_high_waters(indexes)
+        else:
+            high_waters = dict(watermarks)
+            for index in indexes:
+                table_id = index.definition.table_id
+                if table_id not in high_waters:
+                    table = self._heap.catalog.catalog.table_by_id(table_id)
+                    high_waters[table_id] = self._heap.committed_high_water(table)
         for index in indexes:
             required = high_waters[index.definition.table_id]
             if required > published:
