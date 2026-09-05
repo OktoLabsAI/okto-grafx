@@ -1917,3 +1917,37 @@ inventory fences. The pre-change populated T=40 profile attributed about 25.9--2
 time to full watermark walks; that is an opportunity ceiling, not a post-change timing claim.
 WAL continuity/preflight, both OCC passes, catalog adoption, index freshness, data barriers,
 durability and the original multiwriter/multireader premises remain unchanged.
+
+## Scale-removal batch 46 — device-fresh heap META root proof
+
+Status: **completed in `2b936f6`; grouped 112/112 and both Nexus handoffs PASS**.
+
+Batch 45 deliberately treated every heap META image as unknown, so ordinary allocation updates to
+page zero could still force a complete table-watermark photograph. The full redo preflight now
+captures the durable, device-fresh heap header once per physical `(file, page)` and compares only
+the authority that can select a high-water walk: `(table_id, first_page)`. Changes to
+`last_page`, `page_count`, or `next_record_id` do not choose a row header and therefore do not
+expand the scope. Added, removed, or moved roots name exactly the affected tables.
+
+This remains a fail-closed proof. The incoming WAL image is checksum-verified and stamped with its
+authoritative physical location before classification. An unreadable or malformed baseline,
+duplicate table authority, unexpected type/location, FREE page, custom manager, catalog effect, or
+incompatible proof takes the complete photograph or is refused by the canonical path. Multiple
+META images in one preflight compare against the same initial durable baseline; this may
+over-include a table but cannot omit one. Non-heap and OVERFLOW relevance is unchanged.
+
+In the same two-writer, 40-table populated harness used for the preceding checkpoint work, 15 of
+16 photographs became scoped and only one remained full. Physical
+`committed_high_water` walks fell from `440/480` to `168/172`; their observed writer share fell
+from `17.5/20.4%` to `3.6/4.4%` (`0.75/0.91 s`). Per-process write time moved directionally from
+`33.2/32.7 s` to `21.1/20.9 s`, with about `24.0 s` wall time. These timings are diagnostic, not a
+promotion gate. The structural spy counts are the promoted evidence; profiler and spy call counts
+use different attribution and are not mixed. The populated-graph penalty in this harness moved
+from roughly `+75%` to `+12%`, while the empty 40-table run retained 15 scoped/one full
+photographs and `170/171` walks at `0.7–1.2%` of writer time.
+
+The residual average of roughly 8.5 walks per scoped photograph costs under one second per writer
+in this workload and is not a new moving target. Thirteen dedicated root-proof tests and the
+grouped checkpoint/reclamation, open-freshness, recovery/redo and WAL-integration slice passed all
+112 cases; every measured database also passed `verify("all")`. No format, WAL ordering, OCC pass,
+durability barrier, lease duration, or multiwriter/multireader premise changed.
