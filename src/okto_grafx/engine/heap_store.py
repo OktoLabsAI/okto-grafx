@@ -508,11 +508,30 @@ class TableExtent:
 
 
 @dataclass(frozen=True, slots=True)
-class _ExtentProof:
-    """One extent read and the process-local page-view generation that proved it."""
+class _ExtentAuthority:
+    """Frozen reservation authority carried by one opaque commit-local proof."""
+
+    owner: object
+    seal: object
+    table_id: int
+    first_page: PageIndex
+    durable_floor: RecordId
+
+
+@dataclass(slots=True)
+class _ExtentCursor:
+    """Mutable physical hint whose authority remains in its frozen sibling."""
 
     extent: TableExtent
     derived_epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ExtentProof:
+    """One sealed reservation authority plus its revocable settled-tail cursor."""
+
+    authority: _ExtentAuthority
+    cursor: _ExtentCursor
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,6 +619,7 @@ class HeapStore:
         "_extent_slots",
         "_extent_slots_epoch",
         "_bootstrapped_epoch",
+        "_extent_proof_seal",
     )
 
     def __init__(
@@ -630,6 +650,7 @@ class HeapStore:
         # Internal operations may reuse a successful header proof only while the exact page
         # view it proved remains current. The public predicate never trusts this memo.
         self._bootstrapped_epoch: int | None = None
+        self._extent_proof_seal = object()
         # TransactionManager and recovery use the shared page-image door directly. Registering
         # the heap format classifier here lets those paths make the same structural distinction
         # as HeapStore.apply_page_image without teaching either component the heap layout.
@@ -1442,7 +1463,7 @@ class HeapStore:
         payload = encode_tuple(table, values)
         extent_epoch = self._derived_read_epoch()
         extent, _ = self._observe_record_id_extent(table, record_id)
-        extent_proof = _ExtentProof(extent, extent_epoch)
+        extent_proof = self._new_extent_proof(extent, derived_epoch=extent_epoch)
         header = RecordHeader(
             record_id=record_id,
             xmin=xmin,
@@ -1459,6 +1480,8 @@ class HeapStore:
         record_id: RecordId,
         values: tuple[Value, ...],
         xmin: Csn,
+        *,
+        extent_proof: object | None = None,
     ) -> RecordRef:
         """Store a row whose identity is already below this table's durable floor.
 
@@ -1471,6 +1494,131 @@ class HeapStore:
         still update the other fields of the extent; only the identity floor is bypassed.
         """
         _require_commit_number("xmin", xmin)
+        _require_record_id(record_id)
+        if record_id < FIRST_RECORD_ID:
+            raise GrafxConfigurationError(
+                f"A reserved record id starts at {FIRST_RECORD_ID}; got {record_id}.",
+                field="record_id",
+                value=record_id,
+            )
+        extent_epoch = self._derived_read_epoch()
+        cursor = self._current_extent_cursor(
+            extent_proof, table.table_id, derived_epoch=extent_epoch
+        )
+        if cursor is not None:
+            assert type(extent_proof) is _ExtentProof
+            proof = extent_proof
+            extent = cursor.extent
+            durable_floor = proof.authority.durable_floor
+        else:
+            extent = self._find_extent(table.table_id)
+            proof = (
+                None
+                if extent is None
+                else self._new_extent_proof(extent, derived_epoch=extent_epoch)
+            )
+            durable_floor = None if extent is None else extent.next_record_id
+        if extent is None:
+            raise GrafxTransactionStateError(
+                f"Table {table.name!r} has no heap extent, so record id {record_id} cannot "
+                "belong to a durable reservation.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="table_extent",
+                record_id=record_id,
+            )
+        assert durable_floor is not None
+        if record_id >= durable_floor:
+            raise GrafxTransactionStateError(
+                f"Record id {record_id} of table {table.name!r} is not below its durable "
+                f"identity floor {durable_floor}.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="record_id",
+                record_id=record_id,
+                durable_floor=durable_floor,
+            )
+        payload = encode_tuple(table, values)
+        header = RecordHeader(
+            record_id=record_id,
+            xmin=xmin,
+            xmax=0,
+            prev_version=NO_PREVIOUS_VERSION,
+            payload_len=len(payload),
+            schema_version=table.schema_version,
+        )
+        return self._store_version(table, header, payload, extent_proof=proof)
+
+    def insert_initial_reserved(
+        self,
+        table: TableDef,
+        record_id: RecordId,
+        values: tuple[Value, ...],
+        xmin: Csn,
+        *,
+        next_record_id: RecordId,
+    ) -> RecordRef:
+        """Create a table's first extent with one batch-wide identity floor.
+
+        A transaction that materialises the first rows of a table already planned every identity
+        while holding the global commit section.  Creating the extent at the exclusive upper
+        bound lets the remaining rows use :meth:`insert_reserved` instead of rewriting heap page
+        zero once per row.  The floor is part of the surrounding user transaction's ordinary page
+        image and WAL batch; this door never publishes a metadata subcommit.
+
+        The extent must still be absent.  An existing one means the caller's locked plan no longer
+        describes the materialisation point and is refused before any new page is allocated.
+        Encoding is also completed before allocation so malformed values cannot leave an empty
+        extent behind.
+        """
+        _require_commit_number("xmin", xmin)
+        _require_record_id(record_id)
+        floor = _require_record_id_floor(next_record_id)
+        if record_id < FIRST_RECORD_ID or record_id >= floor:
+            raise GrafxConfigurationError(
+                f"Initial record id {record_id} of table {table.name!r} must be at least "
+                f"{FIRST_RECORD_ID} and below its batch identity floor {floor}.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="record_id",
+                record_id=record_id,
+                next_record_id=floor,
+            )
+        if self._find_extent(table.table_id) is not None:
+            raise GrafxTransactionStateError(
+                f"Table {table.name!r} already has a heap extent, so its initial batch floor "
+                "cannot be installed.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="table_extent",
+                record_id=record_id,
+                next_record_id=floor,
+            )
+        payload = encode_tuple(table, values)
+        extent = self._create_extent(table, next_record_id=floor)
+        extent_proof = self._new_extent_proof(extent)
+        header = RecordHeader(
+            record_id=record_id,
+            xmin=xmin,
+            xmax=0,
+            prev_version=NO_PREVIOUS_VERSION,
+            payload_len=len(payload),
+            schema_version=table.schema_version,
+        )
+        return self._store_version(table, header, payload, extent_proof=extent_proof)
+
+    def reserved_extent_proof(self, table: TableDef, record_id: RecordId) -> object:
+        """Prove one durable reserved id and return a revocable, store-bound extent hint.
+
+        The caller may reuse the hint for later ids only through :meth:`insert_reserved`, which
+        rechecks the owner, table and current derived epoch and validates every id against the
+        captured exclusive floor.  A cache drop or foreign read view therefore falls back to the
+        ordinary extent lookup; the proof is never durable authority and never leaves this store.
+        """
         _require_record_id(record_id)
         if record_id < FIRST_RECORD_ID:
             raise GrafxConfigurationError(
@@ -1501,17 +1649,7 @@ class HeapStore:
                 record_id=record_id,
                 durable_floor=extent.next_record_id,
             )
-        extent_proof = _ExtentProof(extent, extent_epoch)
-        payload = encode_tuple(table, values)
-        header = RecordHeader(
-            record_id=record_id,
-            xmin=xmin,
-            xmax=0,
-            prev_version=NO_PREVIOUS_VERSION,
-            payload_len=len(payload),
-            schema_version=table.schema_version,
-        )
-        return self._store_version(table, header, payload, extent_proof=extent_proof)
+        return self._new_extent_proof(extent, derived_epoch=extent_epoch)
 
     def update(
         self,
@@ -1677,7 +1815,9 @@ class HeapStore:
             return False
 
         for _unused in self._walk(table, accept=observe, copy_content=False):
-            raise AssertionError("the high-water observer must not materialize heap versions")
+            raise AssertionError(
+                "the high-water observer must not materialize heap versions"
+            )
         return high_water
 
     def read(self, ref: RecordRef) -> HeapVersion:
@@ -2194,6 +2334,52 @@ class HeapStore:
 
     # --- internals ---------------------------------------------------------------------------
 
+    def _new_extent_proof(
+        self,
+        extent: TableExtent,
+        *,
+        derived_epoch: int | None = None,
+    ) -> _ExtentProof:
+        """Seal a frozen reservation boundary around one mutable physical cursor."""
+        epoch = self._derived_read_epoch() if derived_epoch is None else derived_epoch
+        return _ExtentProof(
+            authority=_ExtentAuthority(
+                owner=self,
+                seal=self._extent_proof_seal,
+                table_id=extent.table_id,
+                first_page=extent.first_page,
+                durable_floor=extent.next_record_id,
+            ),
+            cursor=_ExtentCursor(extent, epoch),
+        )
+
+    def _current_extent_cursor(
+        self,
+        proof: object | None,
+        table_id: int,
+        *,
+        derived_epoch: int | None = None,
+    ) -> _ExtentCursor | None:
+        """Return only an exact, sealed and still-current cursor for one table."""
+        if type(proof) is not _ExtentProof:
+            return None
+        authority = proof.authority
+        cursor = proof.cursor
+        epoch = self._derived_read_epoch() if derived_epoch is None else derived_epoch
+        if (
+            type(authority) is not _ExtentAuthority
+            or type(cursor) is not _ExtentCursor
+            or authority.owner is not self
+            or authority.seal is not self._extent_proof_seal
+            or authority.table_id != table_id
+            or cursor.derived_epoch != epoch
+            or cursor.extent.table_id != table_id
+            or cursor.extent.first_page != authority.first_page
+            or cursor.extent.next_record_id < authority.durable_floor
+        ):
+            return None
+        return cursor
+
     def _store_version(
         self,
         table: TableDef,
@@ -2215,13 +2401,20 @@ class HeapStore:
         instead is the property that actually matters to a caller: no version becomes reachable
         until every remaining step has succeeded, so a refusal leaves nothing to meet twice.
         """
-        extent = (
-            extent_proof.extent
-            if extent_proof is not None
-            and extent_proof.extent.table_id == table.table_id
-            and extent_proof.derived_epoch == self._derived_read_epoch()
-            else self._extent_for(table)
-        )
+        cursor = self._current_extent_cursor(extent_proof, table.table_id)
+        proof_is_current = cursor is not None
+        if cursor is None:
+            extent = self._extent_for(table)
+        else:
+            authority = extent_proof.authority
+            # Only last_page/page_count are cursor hints.  The table root and reservation floor
+            # remain frozen authority and are restored before any directory rewrite can occur.
+            extent = replace(
+                cursor.extent,
+                table_id=authority.table_id,
+                first_page=authority.first_page,
+                next_record_id=authority.durable_floor,
+            )
         tail, length = self._resolve_tail(table, extent)
         if RECORD_HEADER_SIZE + len(payload) <= self.inline_capacity:
             content = header.encode() + payload
@@ -2231,7 +2424,16 @@ class HeapStore:
             )
             overflowed = replace(header, flags=header.flags | RECORD_FLAG_HAS_OVERFLOW)
             content = overflowed.encode() + encode_overflow_pointer(chain[0])
-        return self._append(table, extent, tail, length, content)
+        reference, settled_extent = self._append(table, extent, tail, length, content)
+        if proof_is_current:
+            # Only this store mutates its private proof.  The exclusive identity floor never
+            # changes here; carrying the tail/count just settled by _append prevents a hot batch
+            # from mistaking its own older hint for directory drift on the next row.
+            assert extent_proof is not None
+            assert cursor is not None
+            cursor.extent = settled_extent
+            cursor.derived_epoch = self._derived_read_epoch()
+        return reference
 
     def _chain_limit(self) -> int:
         """Return the most hops any chain in this file can take before it must be a cycle.
@@ -2354,7 +2556,7 @@ class HeapStore:
         tail: PageIndex,
         length: int,
         content: bytes,
-    ) -> RecordRef:
+    ) -> tuple[RecordRef, TableExtent]:
         """Append one slot to the tail page of the table, growing the chain when it is full.
 
         The tail arrives resolved and checked, because the caller has to settle every refusal
@@ -2388,27 +2590,24 @@ class HeapStore:
         fits = False
         with self._pool.pinned(self._file, tail) as page:
             fits = page.can_fit(len(content))
-            if (
-                fits
-                and extent.last_page == tail
-                and extent.page_count == length
-            ):
+            if fits and extent.last_page == tail and extent.page_count == length:
                 # The capacity decision and insertion concern the same validated resident page.
                 # With no directory hint to repair, retaining this pin removes a second page
                 # acquisition and also removes its otherwise unnecessary refusal window.
-                return RecordRef(page=tail, slot=page.insert_slot(content))
+                return RecordRef(page=tail, slot=page.insert_slot(content)), extent
         if fits:
             if extent.last_page != tail or extent.page_count != length:
                 # The length the walk counted, never the stored count plus the distance
                 # travelled: adding to a count that describes wherever the hint happened to be
                 # is permanently wrong the moment the hint was not where the count said (A40.2).
-                self._write_extent(replace(extent, last_page=tail, page_count=length))
+                extent = replace(extent, last_page=tail, page_count=length)
+                extent = self._write_extent(extent)
             # Re-taken only after repairing a stale hint. This pin can still refuse -- it can
             # evict a dirty page, and the write-back is where the device speaks -- and it refuses
             # with nothing of this row on any page. Once held, insert_slot touches only the
             # pinned frame, so the row cannot half-arrive.
             with self._pool.pinned(self._file, tail) as page:
-                return RecordRef(page=tail, slot=page.insert_slot(content))
+                return RecordRef(page=tail, slot=page.insert_slot(content)), extent
         fresh = self._pool.allocate(self._file, int(PageType.HEAP))
         new_index = fresh.page_index
         try:
@@ -2420,7 +2619,8 @@ class HeapStore:
         # hint is settled while the row is still invisible. A refusal here leaves an unreferenced
         # page, which G6 forbids reclaiming and which every walk skips because every walk starts
         # at first_page -- a leak, and not a row a reader can meet twice.
-        self._write_extent(replace(extent, last_page=new_index, page_count=length + 1))
+        extent = replace(extent, last_page=new_index, page_count=length + 1)
+        extent = self._write_extent(extent)
         with self._pool.pinned(self._file, tail) as page:
             page.next_page = new_index
         self._tail_cache[table.table_id] = (
@@ -2428,7 +2628,7 @@ class HeapStore:
             length + 1,
             self._pool.derived_epoch(self._file),
         )
-        return RecordRef(page=new_index, slot=slot)
+        return RecordRef(page=new_index, slot=slot), extent
 
     def _initialize_data_page(self, page: Page, table_id: int) -> None:
         """Turn a fresh page into a data page of one table, with its descriptor in slot 0."""
@@ -2442,6 +2642,12 @@ class HeapStore:
         extent = self._find_extent(table.table_id)
         if extent is not None:
             return extent
+        return self._create_extent(table, next_record_id=FIRST_RECORD_ID)
+
+    def _create_extent(
+        self, table: TableDef, *, next_record_id: RecordId
+    ) -> TableExtent:
+        """Create one absent table extent with its already-validated exclusive id floor."""
         # The directory is settled before the device is asked to grow. The other order leaves a
         # page behind on every refusal at the table bound, and no sanctioned operation can take
         # it back (G6), which is the same reasoning BufferPool.allocate states for itself.
@@ -2453,7 +2659,11 @@ class HeapStore:
         finally:
             self._pool.unpin(self._file, index, dirty=True)
         extent = TableExtent(
-            table_id=table.table_id, first_page=index, last_page=index, page_count=1
+            table_id=table.table_id,
+            first_page=index,
+            last_page=index,
+            page_count=1,
+            next_record_id=next_record_id,
         )
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
             self._add_directory_entry(header_page, table, extent)
@@ -2591,27 +2801,37 @@ class HeapStore:
             )
         return extent
 
-    def _write_extent(self, extent: TableExtent) -> None:
-        """Replace the directory entry of a table on the header page."""
+    def _write_extent(self, extent: TableExtent) -> TableExtent:
+        """Replace one extent while preserving a newer durable identity floor."""
         with self._pinned_validated_header() as (header_page, _header):
             self._sync_extent_slots_epoch()
             cached = self._extent_slots.get(extent.table_id)
             if cached is not None:
                 payload = self._extent_payload_at(header_page, cached, extent.table_id)
                 if payload is not None:
-                    TableExtent.decode(payload)
+                    current = TableExtent.decode(payload)
+                    extent = replace(
+                        extent,
+                        next_record_id=max(
+                            extent.next_record_id, current.next_record_id
+                        ),
+                    )
                     header_page.update_slot(cached, extent.encode())
-                    return
+                    return extent
                 self._extent_slots.pop(extent.table_id, None)
             for slot, payload in header_page.iter_slot_views():
                 if slot < EXTENT_FIRST_SLOT:
                     continue
                 if self._extent_table_id(payload) != extent.table_id:
                     continue
-                TableExtent.decode(payload)
+                current = TableExtent.decode(payload)
+                extent = replace(
+                    extent,
+                    next_record_id=max(extent.next_record_id, current.next_record_id),
+                )
                 header_page.update_slot(slot, extent.encode())
                 self._extent_slots[extent.table_id] = slot
-                return
+                return extent
             raise GrafxCorruptionDetected(
                 f"Table {extent.table_id} has no directory entry on the header page of "
                 f"{self._file!r}, so its extent cannot be updated.",

@@ -61,6 +61,14 @@ including the on-disk format.
 
 ### Changed
 
+- First materialization of an empty table now installs the transaction's complete planned
+  identity floor with its first row, so the remainder uses the existing reserved-insert path
+  without rewriting heap page zero per row. Reserved inserts share a commit-local, sealed extent
+  authority whose mutable cursor contains only repairable tail hints; table/root/floor are frozen,
+  stale floors are merged monotonically at the directory write door, and epoch movement falls
+  back to canonical lookup. A 500-row structural probe reduced ordinary extent observations
+  `500→0` and directory lookups to `3`; the remaining `62` extent rewrites exactly matched the
+  `62` physical page growths.
 - Completed checkpoints now seed a revocable process-local witness for the exact WAL suffix whose
   ordinary DML was already applied, flushed and published by that process. Checkpoint still reads
   and validates the full WAL lineage and payload preflight, replay watermarks and all durability

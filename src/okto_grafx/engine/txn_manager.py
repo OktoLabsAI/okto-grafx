@@ -319,6 +319,7 @@ class _IdentityPlan:
     intents: tuple[RowIntent, ...]
     record_ids: dict[int, int]
     leased_positions: frozenset[int]
+    initial_floors: dict[int, int]
     reservation_lsn: Lsn | None = None
 
 
@@ -5870,6 +5871,8 @@ class TransactionManager:
     ) -> frozenset[tuple[int, str]]:
         """Write settled intents and return complete identities of materialized tables."""
         effective_row_tables: set[tuple[int, str]] = set()
+        initialized_tables: set[int] = set()
+        reserved_extent_proofs: dict[int, object] = {}
         for position, intent in enumerate(self._resolved_intents(txn, identities)):
             effective_row_tables.add((intent.table.table_id, intent.table.name))
             if intent.operation is RowOperation.DELETE:
@@ -5904,9 +5907,31 @@ class TransactionManager:
             # Planned above, never None here: the identity had to exist before the row was
             # written, because an edge staged in this same transaction may already carry it.
             record_id = intent.record_id
-            if position in identities.leased_positions:
+            table_id = intent.table.table_id
+            initial_floor = identities.initial_floors.get(table_id)
+            if initial_floor is not None and table_id not in initialized_tables:
+                # The extent did not exist at the locked planning point.  Install its final
+                # batch floor with the first row; every later row is then below that same floor
+                # and does not rewrite page zero.  This remains one ordinary user commit.
+                reference = heap.insert_initial_reserved(
+                    intent.table,
+                    record_id,
+                    intent.values,
+                    provisional,
+                    next_record_id=initial_floor,
+                )
+                initialized_tables.add(table_id)
+            elif initial_floor is not None or position in identities.leased_positions:
+                extent_proof = reserved_extent_proofs.get(table_id)
+                if extent_proof is None:
+                    extent_proof = heap.reserved_extent_proof(intent.table, record_id)
+                    reserved_extent_proofs[table_id] = extent_proof
                 reference = heap.insert_reserved(
-                    intent.table, record_id, intent.values, provisional
+                    intent.table,
+                    record_id,
+                    intent.values,
+                    provisional,
+                    extent_proof=extent_proof,
                 )
             else:
                 # The first row of a table has no extent to reserve yet.  Its ordinary insert
@@ -6063,6 +6088,7 @@ class TransactionManager:
                 intents=intents,
                 record_ids=planned,
                 leased_positions=frozenset(leased_positions),
+                initial_floors={},
             ),
             pending,
         )
@@ -6114,6 +6140,7 @@ class TransactionManager:
             for refresh_attempt in range(2):
                 planned = dict(base.record_ids)
                 leased_positions = set(base.leased_positions)
+                initial_floors: dict[int, int] = {}
                 floors: dict[object, int] = {}
                 expected_floors: dict[int, int] = {}
                 cache_ranges: dict[int, tuple[int, int]] = {}
@@ -6160,8 +6187,10 @@ class TransactionManager:
                             )
                             planned[position] = cursor
                             cursor += 1
-                        # Not leased: the user transaction must create the extent and floor
-                        # atomically through HeapStore.insert.
+                        # Not a CN-1 lease: the user transaction creates the extent and installs
+                        # this final floor atomically with its first row.  No identity becomes
+                        # reusable and no metadata subcommit precedes the user transaction.
+                        initial_floors[table_id] = cursor
                         continue
 
                     floor = int(extent.next_record_id)
@@ -6210,6 +6239,7 @@ class TransactionManager:
                             intents=base.intents,
                             record_ids=planned,
                             leased_positions=frozenset(leased_positions),
+                            initial_floors=initial_floors,
                         ),
                     )
 
@@ -6273,6 +6303,7 @@ class TransactionManager:
                     intents=base.intents,
                     record_ids=planned,
                     leased_positions=frozenset(leased_positions),
+                    initial_floors=initial_floors,
                     reservation_lsn=reservation_lsn,
                 ),
             )
@@ -6396,8 +6427,7 @@ class TransactionManager:
                 and not self._recovery_required
                 and not self._index_authority_sync_required
                 and not self._pool.has_dirty_pages()
-                and local_prefix_candidate.checkpoint_lsn
-                == previous.checkpoint_lsn
+                and local_prefix_candidate.checkpoint_lsn == previous.checkpoint_lsn
                 and local_prefix_candidate.applied_through_lsn
                 == previous.last_committed_lsn
             ):

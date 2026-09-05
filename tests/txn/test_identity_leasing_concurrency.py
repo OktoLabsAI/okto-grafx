@@ -63,7 +63,9 @@ def _insert(
 
 
 def _identities(stack: Any, table: Any) -> list[int]:
-    return sorted(version.record_id for _reference, version in stack.heap.scan_all(table))
+    return sorted(
+        version.record_id for _reference, version in stack.heap.scan_all(table)
+    )
 
 
 def _distinct_partition_keys(manager: Any, table_id: int) -> tuple[bytes, bytes]:
@@ -73,7 +75,9 @@ def _distinct_partition_keys(manager: Any, table_id: int) -> tuple[bytes, bytes]
         candidate = f"identity-b-{suffix}".encode()
         if manager.partition_of(table_id, candidate) != first_partition:
             return first, candidate
-    raise AssertionError("the configured partitioner produced no two distinct test buckets")
+    raise AssertionError(
+        "the configured partitioner produced no two distinct test buckets"
+    )
 
 
 def _wait_for(markers: tuple[str, ...], budget_seconds: float) -> None:
@@ -94,9 +98,19 @@ def _cached_reservation(stack: Any, table_id: int) -> tuple[int, int]:
     ids prove uniqueness, while the suffix also proves the two durable reservations themselves
     were disjoint.
     """
+    reservation = _cached_reservation_if_any(stack, table_id)
+    if reservation is None:
+        raise AssertionError(
+            "the one-row refill retained no observable local lease suffix"
+        )
+    return reservation
+
+
+def _cached_reservation_if_any(stack: Any, table_id: int) -> tuple[int, int] | None:
+    """Return the CN-1 interval, or None for an atomic first-extent commit."""
     lease = stack.manager._identity_leases.get(table_id)
     if lease is None:
-        raise AssertionError("the one-row refill retained no observable local lease suffix")
+        return None
     return lease.stop - IDENTITY_LEASE_SIZE, lease.stop
 
 
@@ -150,8 +164,10 @@ def _child_run(
         report = stack.manager.commit(committed)
 
     if reservation is None:
-        reservation = _cached_reservation(stack, table_id)
-    used_ids = [stack.heap.read(reference).record_id for reference in committed.row_refs]
+        reservation = _cached_reservation_if_any(stack, table_id)
+    used_ids = [
+        stack.heap.read(reference).record_id for reference in committed.row_refs
+    ]
     outcome = {
         "owner_id": owner_id,
         "committed": True,
@@ -207,7 +223,9 @@ def _crash_after_durable_reservation_entry(
         result = commit_floor(manager, *args, **kwargs)
         durable_reservation.set()
         if not release.wait(CHILD_BUDGET_SECONDS):
-            raise TimeoutError("the parent never terminated or released the crash participant")
+            raise TimeoutError(
+                "the parent never terminated or released the crash participant"
+            )
         return result
 
     TransactionManager._commit_identity_floor_plan = pause_after_publish
@@ -259,7 +277,9 @@ def _spawn(root: Path, plans: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         f"only {len(reports)} of {len(processes)} participants reported"
     )
     for process in processes:
-        assert process.exitcode == 0, f"a participant died with exit code {process.exitcode}"
+        assert process.exitcode == 0, (
+            f"a participant died with exit code {process.exitcode}"
+        )
     for report in reports:
         assert "error" not in report, (
             f"{report.get('owner_id')}: {report['error']}\n{report.get('traceback', '')}"
@@ -315,10 +335,67 @@ def test_two_processes_refill_one_table_with_disjoint_ranges_and_monotone_floor(
         start, stop = report["reservation"]
         assert all(start <= identity < stop for identity in report["used_ids"])
 
-    reopened = build_stack(root, owner_id="observer", identity_lease_size=IDENTITY_LEASE_SIZE)
+    reopened = build_stack(
+        root, owner_id="observer", identity_lease_size=IDENTITY_LEASE_SIZE
+    )
     assert reopened.heap.next_record_id(table) == 10
-    assert reopened.heap.next_record_id(table) >= max(report["floor_after"] for report in reports)
+    assert reopened.heap.next_record_id(table) >= max(
+        report["floor_after"] for report in reports
+    )
     assert _identities(reopened, table) == sorted([1, *used])
+    reopened.manager.close()
+
+
+@pytest.mark.multiprocess
+@pytest.mark.timeout(TEST_TIMEOUT_SECONDS, method="thread")
+def test_two_processes_materialize_one_truly_empty_table_without_reusing_an_id(
+    tmp_path: Path,
+) -> None:
+    from txn_support import build_stack
+
+    root = tmp_path / "empty-same-table"
+    root.mkdir()
+    setup = build_stack(root, owner_id="setup", identity_lease_size=IDENTITY_LEASE_SIZE)
+    table = _table()
+    _register(setup, table)
+    assert setup.heap.next_record_id(table) == 1
+    first_key, second_key = _distinct_partition_keys(setup.manager, table.table_id)
+    setup.manager.close()
+
+    reports = _spawn(
+        root,
+        [
+            {
+                "owner_id": "writer-a",
+                "table_id": table.table_id,
+                "table_name": table.name,
+                "value": "from-a",
+                "key": first_key,
+            },
+            {
+                "owner_id": "writer-b",
+                "table_id": table.table_id,
+                "table_name": table.name,
+                "value": "from-b",
+                "key": second_key,
+            },
+        ],
+    )
+
+    assert all(report["committed"] for report in reports)
+    assert all(report["floor_before"] == 1 for report in reports)
+    assert sorted(
+        report["reservation"] for report in reports if report["reservation"] is not None
+    ) == [(2, 6)]
+    assert sum(report["reservation"] is None for report in reports) == 1
+    used = sorted(identity for report in reports for identity in report["used_ids"])
+    assert used == [1, 2]
+
+    reopened = build_stack(
+        root, owner_id="observer", identity_lease_size=IDENTITY_LEASE_SIZE
+    )
+    assert reopened.heap.next_record_id(table) == 6
+    assert _identities(reopened, table) == used
     reopened.manager.close()
 
 
@@ -365,7 +442,9 @@ def test_two_processes_refilling_distinct_tables_do_not_false_conflict_on_page_z
     assert all(tuple(report["reservation"]) == (2, 6) for report in reports)
     assert all(report["used_ids"] == [2] for report in reports)
 
-    reopened = build_stack(root, owner_id="observer", identity_lease_size=IDENTITY_LEASE_SIZE)
+    reopened = build_stack(
+        root, owner_id="observer", identity_lease_size=IDENTITY_LEASE_SIZE
+    )
     assert reopened.heap.next_record_id(left) == 6
     assert reopened.heap.next_record_id(right) == 6
     assert _identities(reopened, left) == [1, 2]
@@ -404,7 +483,9 @@ def test_crash_after_durable_reservation_burns_range_across_recovery(
         assert durable_reservation.wait(CHILD_BUDGET_SECONDS), (
             "the child never reached the durable reservation boundary"
         )
-        assert process.is_alive(), "the child left the reservation boundary before the crash"
+        assert process.is_alive(), (
+            "the child left the reservation boundary before the crash"
+        )
         process.kill()
         process.join(timeout=CHILD_BUDGET_SECONDS)
         assert not process.is_alive(), "the crash participant did not terminate"
@@ -455,7 +536,9 @@ def test_an_invisible_id_below_a_burned_durable_floor_is_still_refused(
     assert _identities(first, table) == [1, 2]
     first.manager.close()
 
-    reopened = build_stack(root, owner_id="reopened", identity_lease_size=IDENTITY_LEASE_SIZE)
+    reopened = build_stack(
+        root, owner_id="reopened", identity_lease_size=IDENTITY_LEASE_SIZE
+    )
     assert 4 not in _identities(reopened, table)
     refused = reopened.manager.begin("write")
     refused.stage_row_insert(table, ("must-not-reuse-burned-id",), record_id=4)

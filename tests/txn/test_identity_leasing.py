@@ -11,7 +11,7 @@ from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.txn import page_partition
 from okto_grafx.domain.txn.records import WalRecordType, decode_page_write
-from okto_grafx.engine.heap_store import FIRST_RECORD_ID
+from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapStore
 from txn_support import Stack, build_stack
 
 
@@ -70,27 +70,132 @@ def test_first_extent_stays_atomic_then_one_refill_serves_the_local_range() -> N
     before = len(stack.wal.records())
     _insert(stack, table, "first")
     first_records = stack.wal.records()[before:]
-    assert sum(record.record_type == WalRecordType.COMMIT for record in first_records) == 1
+    assert (
+        sum(record.record_type == WalRecordType.COMMIT for record in first_records) == 1
+    )
     assert stack.heap.next_record_id(table) == 2
 
     before = len(stack.wal.records())
     _insert(stack, table, "second")
     refill_records = stack.wal.records()[before:]
-    assert sum(record.record_type == WalRecordType.COMMIT for record in refill_records) == 2
+    assert (
+        sum(record.record_type == WalRecordType.COMMIT for record in refill_records)
+        == 2
+    )
     assert _page_writes(refill_records).count(("heap.dat", 0)) == 1
     assert stack.heap.next_record_id(table) == 6
 
     before = len(stack.wal.records())
     _insert(stack, table, "third")
     cached_records = stack.wal.records()[before:]
-    assert sum(record.record_type == WalRecordType.COMMIT for record in cached_records) == 1
+    assert (
+        sum(record.record_type == WalRecordType.COMMIT for record in cached_records)
+        == 1
+    )
     assert ("heap.dat", 0) not in _page_writes(cached_records)
     assert stack.heap.next_record_id(table) == 6
     assert _identities(stack, table) == [1, 2, 3]
 
 
+def test_first_batch_installs_one_atomic_floor_without_a_metadata_subcommit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_stack(identity_lease_size=4)
+    table = _table()
+    _register(stack, table)
+    initial_calls = 0
+    reserved_calls = 0
+    ordinary_calls = 0
+    proof_calls = 0
+    supplied_proofs: list[object] = []
+    original_initial = HeapStore.insert_initial_reserved
+    original_reserved = HeapStore.insert_reserved
+    original_ordinary = HeapStore.insert
+    original_proof = HeapStore.reserved_extent_proof
+
+    def counted_initial(store: HeapStore, *args: object, **kwargs: object):
+        nonlocal initial_calls
+        initial_calls += 1
+        return original_initial(store, *args, **kwargs)
+
+    def counted_reserved(store: HeapStore, *args: object, **kwargs: object):
+        nonlocal reserved_calls
+        reserved_calls += 1
+        supplied_proofs.append(kwargs.get("extent_proof"))
+        return original_reserved(store, *args, **kwargs)
+
+    def counted_ordinary(store: HeapStore, *args: object, **kwargs: object):
+        nonlocal ordinary_calls
+        ordinary_calls += 1
+        return original_ordinary(store, *args, **kwargs)
+
+    def counted_proof(store: HeapStore, *args: object, **kwargs: object):
+        nonlocal proof_calls
+        proof_calls += 1
+        return original_proof(store, *args, **kwargs)
+
+    monkeypatch.setattr(HeapStore, "insert_initial_reserved", counted_initial)
+    monkeypatch.setattr(HeapStore, "insert_reserved", counted_reserved)
+    monkeypatch.setattr(HeapStore, "insert", counted_ordinary)
+    monkeypatch.setattr(HeapStore, "reserved_extent_proof", counted_proof)
+
+    txn = stack.manager.begin("write")
+    for identity in range(1, 17):
+        txn.stage_row_insert(table, (f"row-{identity}",))
+        txn.note_write(
+            stack.manager.partition_of(table.table_id, str(identity).encode())
+        )
+    before = len(stack.wal.records())
+
+    report = stack.manager.commit(txn)
+    records = stack.wal.records()[before:]
+
+    assert report.durable is True
+    assert initial_calls == 1
+    assert reserved_calls == 15
+    assert ordinary_calls == 0
+    assert proof_calls == 1
+    assert supplied_proofs[0] is not None
+    assert all(proof is supplied_proofs[0] for proof in supplied_proofs)
+    assert sum(record.record_type == WalRecordType.COMMIT for record in records) == 1
+    assert _page_writes(records).count(("heap.dat", 0)) == 1
+    assert stack.heap.next_record_id(table) == 17
+    assert _identities(stack, table) == list(range(1, 17))
+
+
+def test_one_batch_combines_an_atomic_first_extent_with_an_existing_cn1_range() -> None:
+    stack = build_stack(identity_lease_size=4)
+    existing = _table(1, "Existing")
+    initial = _table(2, "Initial")
+    _register(stack, existing, initial)
+    _insert(stack, existing, "seed", key=b"existing-seed")
+    txn = stack.manager.begin("write")
+    for table, value in (
+        (initial, "new-1"),
+        (existing, "old-2"),
+        (initial, "new-2"),
+        (existing, "old-3"),
+        (initial, "new-3"),
+    ):
+        txn.stage_row_insert(table, (value,))
+        txn.note_write(stack.manager.partition_of(table.table_id, value.encode()))
+    before = len(stack.wal.records())
+
+    report = stack.manager.commit(txn)
+    records = stack.wal.records()[before:]
+
+    assert report.durable is True
+    assert sum(record.record_type == WalRecordType.COMMIT for record in records) == 2
+    assert _identities(stack, initial) == [1, 2, 3]
+    assert stack.heap.next_record_id(initial) == 4
+    assert _identities(stack, existing) == [1, 2, 3]
+    assert stack.heap.next_record_id(existing) == 6
+
+
 @pytest.mark.parametrize("lease_size", [1, 64])
-def test_explicit_identity_below_the_floor_is_always_fail_closed(lease_size: int) -> None:
+def test_explicit_identity_below_the_floor_is_always_fail_closed(
+    lease_size: int,
+) -> None:
     stack = build_stack(identity_lease_size=lease_size)
     table = _table()
     _register(stack, table)
@@ -124,7 +229,9 @@ def test_explicit_identity_above_the_floor_is_reserved_before_mixed_use() -> Non
     assert stack.heap.next_record_id(table) == 106
 
 
-def test_a_conflict_visible_before_row_planning_reserves_no_identity(tmp_path: Path) -> None:
+def test_a_conflict_visible_before_row_planning_reserves_no_identity(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "burn-conflict"
     root.mkdir()
     winner = build_stack(root, owner_id="winner", identity_lease_size=4)
@@ -186,7 +293,9 @@ def test_a_pre_staged_page_zero_cannot_overwrite_its_own_later_refill() -> None:
 
     assert raised.value.details["partitions"] == [page_partition(stack.heap.file, 0)]
     reservation = stack.wal.records()[before:]
-    assert sum(record.record_type == WalRecordType.COMMIT for record in reservation) == 1
+    assert (
+        sum(record.record_type == WalRecordType.COMMIT for record in reservation) == 1
+    )
     assert _page_writes(reservation) == [(stack.heap.file, 0)]
     assert stack.heap.next_record_id(table) == 6
     assert _identities(stack, table) == [FIRST_RECORD_ID]

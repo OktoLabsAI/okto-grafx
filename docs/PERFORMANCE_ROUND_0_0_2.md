@@ -1755,3 +1755,33 @@ passed; the Nexus mutation review additionally exposed and the final suite fixed
 last-byte corruption discriminant. Checksum metrics now count work actually performed rather than
 using fresh reads as a proxy. OCC, WAL, durability and multiwriter/multireader semantics are
 unchanged.
+
+## Scale-removal batch 40 — atomic first-extent floor and sealed append cursor
+
+Status: **completed on `feature/v0.0.2`; independent adversarial review GO**.
+
+The locked identity planner already knew every explicit and implicit identity of an empty table,
+but the materializer still called the ordinary insert path for every row. Each call rewrote heap
+page zero merely to raise the same floor by one. The first row now creates the absent extent with
+the plan's final exclusive floor inside the ordinary user transaction; no CN-1 metadata subcommit
+or authority becomes visible first. The remaining rows are below that installed floor and use the
+reserved path.
+
+One proof per table carries a frozen, store-sealed authority over table id, first page and the
+exclusive reservation floor. Its cursor may retain only the last-page/page-count hints plus the
+derived epoch. `_store_version` reconstructs the extent from frozen authority before append, and
+the directory write door takes the maximum of the proposed and currently stored floor. Therefore
+a later legitimate floor advance cannot be regressed, an altered cursor cannot enlarge the
+reserved range or promote a false floor, and an altered first-page hint cannot detach the chain's
+prefix. Cache/epoch movement and wrong store/table/root fall back to the canonical lookup.
+
+The deterministic 500-row probe recorded `insert=0`, `insert_initial_reserved=1`,
+`insert_reserved=499`, `reserved_extent_proof=1`, `_find_extent=3`,
+`_observe_record_id_extent=0`, `_write_extent=62`, and `page_count=63`. Thus every remaining
+extent rewrite corresponds to one actual growth. The independent reviewer first found and
+reproduced floor regression, false floor promotion and root replacement in intermediate designs;
+all three were fixed and independently reproduced in the safe direction before GO. Tests also
+cover a truly empty two-process race, failure before the first user WAL append followed by retry,
+and one commit mixing an absent first extent with an existing CN-1 range. No wall-clock threshold
+was introduced. WAL ordering, both OCC passes, recovery, durability, writer ordering and the
+multiwriter/multireader premises remain unchanged.

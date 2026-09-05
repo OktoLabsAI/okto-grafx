@@ -6,7 +6,10 @@ from dataclasses import replace
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxCorruptionDetected
+from okto_grafx.domain.errors import (
+    GrafxCorruptionDetected,
+    GrafxTransactionStateError,
+)
 from okto_grafx.domain.ids import NO_PAGE
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
@@ -52,7 +55,9 @@ def test_a_warm_extent_slot_avoids_the_directory_walk(
 
     monkeypatch.setattr(Page, "iter_slot_views", unexpected_walk)
     assert heap_store._find_extent(table.table_id) == expected
-    heap_store._write_extent(replace(expected, next_record_id=expected.next_record_id + 1))
+    heap_store._write_extent(
+        replace(expected, next_record_id=expected.next_record_id + 1)
+    )
 
 
 def test_hot_extent_read_and_write_each_validate_and_use_one_header_pin(
@@ -130,6 +135,263 @@ def test_reserved_insert_reuses_its_just_validated_extent_once(
     assert heap_store.next_record_id(table) == 10
 
 
+def test_initial_reserved_insert_installs_one_floor_for_the_whole_first_batch(
+    heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _table(1)
+    original_write = HeapStore._write_extent
+    extent_rewrites = 0
+
+    def counted_write(store: HeapStore, extent: TableExtent) -> TableExtent:
+        nonlocal extent_rewrites
+        extent_rewrites += 1
+        return original_write(store, extent)
+
+    monkeypatch.setattr(HeapStore, "_write_extent", counted_write)
+
+    references = [
+        heap_store.insert_initial_reserved(table, 1, (1,), xmin=20, next_record_id=4),
+        heap_store.insert_reserved(table, 2, (2,), xmin=20),
+        heap_store.insert_reserved(table, 3, (3,), xmin=20),
+    ]
+
+    assert extent_rewrites == 0
+    assert heap_store.next_record_id(table) == 4
+    assert sorted(
+        version.record_id for _reference, version in heap_store.scan_all(table)
+    ) == [1, 2, 3]
+    assert len(set(references)) == 3
+
+
+def test_initial_reserved_insert_refuses_an_existing_extent_before_allocation(
+    pool: BufferPool, heap_store: HeapStore
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    page_count = pool.storage.page_count(heap_store.file)
+
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        heap_store.insert_initial_reserved(table, 2, (2,), xmin=20, next_record_id=3)
+
+    assert raised.value.details["field"] == "table_extent"
+    assert pool.storage.page_count(heap_store.file) == page_count
+    assert heap_store.next_record_id(table) == 2
+
+
+def test_reserved_extent_proof_avoids_repeated_directory_reads(
+    heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    heap_store.observe_record_id(table, 9)
+    proof = heap_store.reserved_extent_proof(table, 3)
+    original_find = HeapStore._find_extent
+    calls = 0
+
+    def counted_find(store: HeapStore, table_id: int) -> TableExtent | None:
+        nonlocal calls
+        calls += 1
+        return original_find(store, table_id)
+
+    monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
+
+    for record_id in (3, 4, 5):
+        heap_store.insert_reserved(
+            table,
+            record_id,
+            (record_id,),
+            xmin=20,
+            extent_proof=proof,
+        )
+
+    assert calls == 0
+    monkeypatch.setattr(HeapStore, "_find_extent", original_find)
+    assert heap_store.next_record_id(table) == 10
+    assert sorted(
+        version.record_id for _reference, version in heap_store.scan_all(table)
+    ) == [1, 3, 4, 5]
+
+
+def test_reserved_extent_proof_tracks_each_local_page_growth_once(
+    heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _table(1)
+    final_floor = 81
+    original_write = HeapStore._write_extent
+    extent_rewrites = 0
+
+    def counted_write(store: HeapStore, extent: TableExtent) -> TableExtent:
+        nonlocal extent_rewrites
+        extent_rewrites += 1
+        return original_write(store, extent)
+
+    monkeypatch.setattr(HeapStore, "_write_extent", counted_write)
+    heap_store.insert_initial_reserved(
+        table, 1, (1,), xmin=20, next_record_id=final_floor
+    )
+    proof = heap_store.reserved_extent_proof(table, 2)
+
+    for record_id in range(2, final_floor):
+        heap_store.insert_reserved(
+            table,
+            record_id,
+            (record_id,),
+            xmin=20,
+            extent_proof=proof,
+        )
+
+    extent = heap_store._find_extent(table.table_id)
+    assert extent is not None
+    assert extent.page_count > 1
+    assert extent_rewrites == extent.page_count - 1
+    assert extent.next_record_id == final_floor
+
+
+def test_stale_reserved_cursor_cannot_regress_a_newer_identity_floor(
+    heap_store: HeapStore,
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    heap_store.observe_record_id(table, 9)
+    proof = heap_store.reserved_extent_proof(table, 2)
+
+    heap_store.insert(table, 10, (10,), xmin=20)
+    assert heap_store.next_record_id(table) == 11
+
+    for record_id in range(2, 10):
+        heap_store.insert_reserved(
+            table,
+            record_id,
+            (record_id,),
+            xmin=21,
+            extent_proof=proof,
+        )
+
+    versions = tuple(version for _reference, version in heap_store.scan_all(table))
+    assert sorted(version.record_id for version in versions) == list(range(1, 11))
+    assert heap_store.next_record_id(table) == 11
+    assert heap_store.next_record_id(table) > max(
+        version.record_id for version in versions
+    )
+
+
+def test_reserved_cursor_mutation_cannot_enlarge_its_frozen_authority(
+    heap_store: HeapStore,
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    heap_store.observe_record_id(table, 9)
+    proof = heap_store.reserved_extent_proof(table, 2)
+    cursor = getattr(proof, "cursor")
+    cursor.extent = replace(cursor.extent, next_record_id=1_000)
+
+    with pytest.raises(GrafxTransactionStateError) as raised:
+        heap_store.insert_reserved(
+            table,
+            999,
+            (999,),
+            xmin=20,
+            extent_proof=proof,
+        )
+
+    assert raised.value.details["record_id"] == 999
+    assert raised.value.details["durable_floor"] == 10
+    assert heap_store.next_record_id(table) == 10
+    assert [
+        version.record_id for _reference, version in heap_store.scan_all(table)
+    ] == [1]
+
+
+def test_reserved_cursor_floor_cannot_be_promoted_by_valid_page_growth(
+    heap_store: HeapStore,
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    heap_store.observe_record_id(table, 9)
+    proof = heap_store.reserved_extent_proof(table, 2)
+    cursor = getattr(proof, "cursor")
+    cursor.extent = replace(cursor.extent, next_record_id=1_000)
+
+    for record_id in range(2, 10):
+        heap_store.insert_reserved(
+            table,
+            record_id,
+            (record_id,),
+            xmin=20,
+            extent_proof=proof,
+        )
+
+    extent = heap_store._find_extent(table.table_id)
+    assert extent is not None
+    assert extent.page_count > 1
+    assert extent.next_record_id == 10
+    assert sorted(
+        version.record_id for _reference, version in heap_store.scan_all(table)
+    ) == list(range(1, 10))
+
+
+def test_reserved_cursor_cannot_replace_the_frozen_extent_root(
+    heap_store: HeapStore,
+) -> None:
+    table = _table(1)
+    final_floor = 81
+    heap_store.insert_initial_reserved(
+        table, 1, (1,), xmin=20, next_record_id=final_floor
+    )
+    proof = heap_store.reserved_extent_proof(table, 2)
+    for record_id in range(2, 31):
+        heap_store.insert_reserved(
+            table,
+            record_id,
+            (record_id,),
+            xmin=20,
+            extent_proof=proof,
+        )
+    before = heap_store._find_extent(table.table_id)
+    assert before is not None
+    assert before.last_page != before.first_page
+    cursor = getattr(proof, "cursor")
+    cursor.extent = replace(cursor.extent, first_page=before.last_page)
+
+    for record_id in range(31, final_floor):
+        heap_store.insert_reserved(
+            table,
+            record_id,
+            (record_id,),
+            xmin=20,
+            extent_proof=proof,
+        )
+
+    after = heap_store._find_extent(table.table_id)
+    assert after is not None
+    assert after.first_page == before.first_page
+    assert after.next_record_id == final_floor
+    assert sorted(
+        version.record_id for _reference, version in heap_store.scan_all(table)
+    ) == list(range(1, final_floor))
+
+
+def test_reserved_extent_proof_falls_back_after_derived_epoch_change(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    heap_store.observe_record_id(table, 9)
+    proof = heap_store.reserved_extent_proof(table, 3)
+    pool.flush()
+    pool.invalidate(heap_store.file)
+    original_find = HeapStore._find_extent
+    calls = 0
+
+    def counted_find(store: HeapStore, table_id: int) -> TableExtent | None:
+        nonlocal calls
+        calls += 1
+        return original_find(store, table_id)
+
+    monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
+
+    heap_store.insert_reserved(table, 3, (3,), xmin=20, extent_proof=proof)
+
+    assert calls == 1
+    assert heap_store.next_record_id(table) == 10
+
+
 def test_ordinary_insert_reuses_the_extent_that_advanced_its_identity_floor(
     heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -202,7 +464,9 @@ def test_ordinary_insert_rechecks_extent_when_epoch_moves_during_observation(
         return result
 
     monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
-    monkeypatch.setattr(HeapStore, "_observe_record_id_extent", observe_before_cache_drop)
+    monkeypatch.setattr(
+        HeapStore, "_observe_record_id_extent", observe_before_cache_drop
+    )
 
     reference = heap_store.insert(table, 2, (2,), xmin=20)
 
@@ -259,7 +523,10 @@ def test_a_stale_slot_hint_falls_back_without_touching_the_wrong_table(
 
     heap_store._extent_slots[first.table_id] = heap_store._extent_slots[second.table_id]
     assert heap_store._find_extent(first.table_id) == first_extent
-    assert heap_store._extent_slots[first.table_id] != heap_store._extent_slots[second.table_id]
+    assert (
+        heap_store._extent_slots[first.table_id]
+        != heap_store._extent_slots[second.table_id]
+    )
 
     heap_store._extent_slots[first.table_id] = heap_store._extent_slots[second.table_id]
     updated = replace(first_extent, next_record_id=first_extent.next_record_id + 7)
@@ -278,7 +545,9 @@ def test_a_cached_slot_rewritten_for_another_table_is_never_overwritten(
     assert second_extent is not None
     second_slot = heap_store._extent_slots[second.table_id]
 
-    replacement = replace(first_extent, next_record_id=first_extent.next_record_id + 100)
+    replacement = replace(
+        first_extent, next_record_id=first_extent.next_record_id + 100
+    )
     with pool.pinned(heap_store.file, HEADER_PAGE_INDEX) as page:
         page.update_slot(second_slot, replacement.encode())
 

@@ -485,7 +485,9 @@ def test_committed_high_water_observes_stamps_without_materializing_headers(
     monkeypatch.setattr(RecordHeader, "__init__", counted)
 
     assert heap_store.committed_high_water(person_table) == 17
-    assert constructions == [], "the watermark needs only the three fields exposed by peek"
+    assert constructions == [], (
+        "the watermark needs only the three fields exposed by peek"
+    )
 
 
 def test_internal_heap_bootstrap_proof_expires_with_the_page_view(
@@ -2749,9 +2751,9 @@ def test_the_directory_entry_is_settled_before_the_row_can_be_read(
     original_extent = HeapStore._write_extent
     original_slot = Page.insert_slot
 
-    def note_extent(self: HeapStore, extent: TableExtent) -> None:
+    def note_extent(self: HeapStore, extent: TableExtent) -> TableExtent:
         order.append("directory")
-        original_extent(self, extent)
+        return original_extent(self, extent)
 
     def note_slot(self: Page, payload: bytes) -> int:
         order.append("row")

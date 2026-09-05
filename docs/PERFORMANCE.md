@@ -55,6 +55,23 @@ In an instrumented 2,000-CREATE workload, generic decodes changed `1,015→12` a
 decodes `1,007→4`. Short timing samples were noisy and establish no endpoint or wall-clock claim.
 OCC, WAL, durability and multiwriter/multireader behavior are unchanged.
 
+### 0.0.2 atomic first-extent floor and commit-local append cursor (batch 40)
+
+When one commit creates the first rows of an empty table, its first row now creates the extent
+with the final exclusive identity floor already planned under `COMMIT_SECTION`. Later rows use
+the reserved path and share one opaque, sealed extent proof. The frozen authority contains the
+table, first page and reservation floor; only tail/page-count hints and their revocable epoch move
+within the commit. Every directory rewrite preserves the greater floor already present.
+
+In a 500-row structural probe, ordinary `HeapStore.insert` and
+`_observe_record_id_extent` calls changed `500→0`; one `insert_initial_reserved`, 499
+`insert_reserved`, one proof and three `_find_extent` calls remained. The 62 directory rewrites
+equalled the 62 real page growths (`page_count=63`), rather than repeating per row. Short wall
+timings are not promoted as a gate. Adversarial regressions cover a newer floor, a modified cursor
+floor, a modified first-page hint, an empty-table two-writer race, pre-WAL failure/retry and a
+mixed empty/existing-table commit. WAL/OCC, durability and multiwriter/multireader behavior are
+unchanged.
+
 ---
 
 ## 1. Test machine and build
