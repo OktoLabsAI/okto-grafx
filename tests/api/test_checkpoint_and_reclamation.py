@@ -183,6 +183,50 @@ def test_reset_or_unverified_preflight_fact_uses_canonical_checkpoint_replay(
         database.close()
 
 
+def test_untrusted_staged_record_fact_does_not_extend_the_local_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact manager with a replaced validator still receives no private proof authority."""
+    database = connect(str(tmp_path / "untrusted-staging"), wal_segment_bytes=SEGMENT_BYTES)
+    nonempty_applies: list[int] = []
+    real_validate = IndexManager.validate_staged_records
+    real_apply = CommitRedo.apply
+    try:
+        _seed_local_checkpoint_prefix(database)
+        assert database._transactions._local_applied_prefix is not None
+
+        def wrapped_validate(
+            manager: IndexManager, txn: object, records: object
+        ) -> bool:
+            return real_validate(manager, txn, records)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(IndexManager, "validate_staged_records", wrapped_validate)
+        with database.begin("write") as txn:
+            txn.execute("MATCH (p:P {id: 1}) SET p.name = 'untrusted-proof'")
+
+        assert database._transactions._local_applied_prefix is None
+        local_redo = database._transactions._commit_redo
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+        database.checkpoint()
+
+        assert nonempty_applies, "an untrusted commit fact must retain canonical replay"
+        assert database.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("untrusted-proof",),
+        )
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+
 def test_identity_refill_extends_the_exact_local_checkpoint_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

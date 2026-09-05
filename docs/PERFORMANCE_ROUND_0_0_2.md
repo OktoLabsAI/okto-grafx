@@ -1707,8 +1707,8 @@ multiwriter/multireader behavior are unchanged.
 
 ## Scale-removal batch 38 — decoded RESET facts cross private validation boundaries
 
-Status: **completed in `6b142ba`; local adversarial review and focused/grouped quality slices
-PASS; Nexus review `hof_a85992ce987045a7ac73b2bb42ac822c` requested**.
+Status: **completed in `6b142ba`; local and Nexus
+`hof_a85992ce987045a7ac73b2bb42ac822c` adversarial reviews PASS**.
 
 Two mandatory validators decoded every logical index effect and then their callers decoded the
 same effects again only to ask whether one operation was `RESET`. The complete checkpoint
@@ -1729,6 +1729,8 @@ type: RESET itself is carried by `INDEX_WRITE`. Focused regressions cover ordina
 malformed payloads, wrong replay/passage/owner and the canonical checkpoint fallback. The grouped
 redo/checkpoint/index/WAL slice, compileall, Ruff and diff checks passed. A concurrent three-sample
 A/B run over 2,000 CREATEs, eight commits and eight checkpoints measured medians
-`11.396834 -> 11.165593 s` (`~1.02x`); it is directional evidence consistent with the profiled
-`~2.3–2.6%` ceiling, not a release gate. Format, corruption checks, WAL/OCC, durability,
-writer ordering and multiwriter/multireader semantics are unchanged.
+`11.396834 -> 11.165593 s`, but the ranges overlapped (`10.914–13.131` versus
+`10.898–13.296 s`), so the temporal delta is not distinguishable from noise. The promoted claim
+is the structural removal of the two rescans, consistent with their profiled `~2.3–2.6%` ceiling,
+not a release gate. Format, corruption checks, WAL/OCC, durability, writer ordering and
+multiwriter/multireader semantics are unchanged.

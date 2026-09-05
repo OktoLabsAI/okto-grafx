@@ -40,7 +40,8 @@ The follow-up batch 37 also removed the shortcut's duplicate logical-index prefl
 update changed from effect counts `[3, 2, 0]` to `[3, 0]`, retaining the one complete strict proof.
 Batch 38 then reused the decoded RESET fact from that proof and from live staged-record validation,
 removing two remaining logical-record rescans. An A/B 2,000-row/8-commit/8-checkpoint sample moved
-directionally from `11.397` to `11.166 s` median (`~1.02x`); timings remain informational.
+from `11.397` to `11.166 s` median, but overlapping ranges make that temporal delta indistinguishable
+from noise. The claim is the structural removal of the rescans; timings remain informational.
 
 ---
 
