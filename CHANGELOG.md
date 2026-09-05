@@ -68,6 +68,9 @@ including the on-disk format.
   changes, RESET, dirty pages, recovery/failure/close and custom collaborators retain canonical
   replay. Local CN-1 identity-floor subcommits extend the witness only after their own durable
   apply/flush/publication sequence, keeping the optimization reachable for large INSERT batches.
+- Certified checkpoint replay reuses that complete strict preflight instead of decoding the same
+  logical-index subplan a second time. Catalog-writing checkpoints remain on their canonical
+  permissive-then-strict path and cannot enter the shortcut.
 - Exact vector searches fed by a small, engine-sealed materialized candidate set now authenticate
   only the selected heap rows and their index buckets. Any incomplete proof, metadata drift, NULL,
   deletion, duplicate or wrong reference falls back to the canonical full scan before ranking; a

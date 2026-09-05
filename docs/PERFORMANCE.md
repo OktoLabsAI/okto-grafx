@@ -36,6 +36,8 @@ or custom-collaborator boundary. In the audited 4,000-row/16-transaction run it 
 and reduced `CommitRedo.apply` calls from 32 to 18. A seven-round, 250-insert checkpoint-only probe
 measured `0.15056 -> 0.10214 s` median (`1.47x`); an end-to-end 1,000-row sample was noisy and did
 not establish a throughput gain, so this is structural/directional evidence rather than a gate.
+The follow-up batch 37 also removed the shortcut's duplicate logical-index preflight: a focused
+update changed from effect counts `[3, 2, 0]` to `[3, 0]`, retaining the one complete strict proof.
 
 ---
 

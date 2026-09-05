@@ -1683,3 +1683,24 @@ separate alternating seven-round checkpoint-only probe over 250 inserts measured
 universal load-throughput claim or performance gate is made. The relevant grouped slice passed 101
 tests and the selected multiprocess/crash slice passed 11, with Ruff, compileall and diff checks
 green. WAL/OCC, durability, writer ordering and multiwriter/multireader semantics are unchanged.
+
+## Scale-removal batch 37 — one strict logical preflight per certified checkpoint
+
+Status: **completed in `75b0fdc`; Nexus review
+`hof_6a091147d30e460eb85518398c096ee0` verified PASS**.
+
+The batch-36 shortcut initially performed the complete replay preflight and then decoded every
+logical index effect again through a second index-only preflight. That second pass was redundant:
+the shortcut requires `touched_catalog=False`, so the complete preflight necessarily runs with
+`allow_unregistered_indexes=False` and already validates each index name/generation, versioned
+shape and key limit. No call, mutation, publication or suspension exists between that proof and
+the shortcut decision.
+
+One update checkpoint's effectful preflight sequence changed from `[3, 2, 0]` to `[3, 0]`: the
+three-effect complete proof remains and the two-effect logical duplicate is gone; the empty plan
+is a no-op retained by the canonical phase structure. On a separate 2,000-row/8-checkpoint audit,
+every shortcut had exactly one strict effectful preflight, while the sole permissive pass belonged
+to DDL and therefore could not use the shortcut. The focused checkpoint/redo slice passed 62
+tests, with Ruff and diff checks green. This is a simple removal of duplicated work, without a
+wall-clock claim or gate; corruption checks, format, WAL/OCC, durability and
+multiwriter/multireader behavior are unchanged.
