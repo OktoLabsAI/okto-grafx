@@ -107,6 +107,7 @@ from okto_grafx.domain.index.records import (
     IndexOperation,
     change_of,
     lsn_of,
+    record_for_change,
     wal_record_for,
 )
 from okto_grafx.domain.index.visibility import (
@@ -6190,7 +6191,7 @@ class IndexManager:
             records.append(
                 record
                 if change is original_change
-                else replace(record, payload=change.encode())
+                else record_for_change(record, change)
             )
 
         if Counter(actual) != Counter(expected):  # pragma: no cover - guarded above

@@ -2065,3 +2065,34 @@ are prioritization ceilings, not post-change timing claims. Each unopened result
 small door and result-local lock referencing the bounded shared recipe; it never shares a public
 plan tree. Persisted format, WAL, OCC, durability and multiwriter/multireader premises are
 unchanged.
+
+## Scale-removal batch 51 — validated runtime-authority reuse
+
+Status: **implemented and independently verified on `feature/v0.0.2`**.
+
+The Pulse-shaped transfer profile showed the same immutable catalog generation repeatedly rebuilt
+as an `IndexDefinition`, and the same in-process `WalRecord` repeatedly decoded after its payload
+had already been produced or validated. An exact `CatalogIndexDefinition` now retains the runtime
+definition for the identity of its last selected owned descriptor. Generation ownership is checked
+on every call; an equal but distinct descriptor rebuilds, a foreign descriptor is refused, and a
+new logical catalog state starts with no retained runtime object.
+
+Exact index WAL records have one non-value proof slot. Records read from WAL still perform the
+complete first decode and all checksum/framing validation before they can earn a proof. Records
+created or retargeted from an exact `IndexChange` seal only the bytes they encoded themselves.
+Every proof hit rechecks exact type, current immutable payload identity and canonical
+`change.encode() == payload`; corrupt or forged state therefore falls back to the bytes instead of
+changing their meaning. Stand-ins, subclasses, mutable payloads, decode failures, deepcopy and
+pickle keep the full path. A reflective test extracts the closure token and plants a false change;
+the false value is rejected and the WAL bytes remain authoritative.
+
+For 600 Pulse-shaped relationships, runtime-definition constructions fell from `14.04` to `0.02`
+per relationship and repeated decodes from `2.00` to `0.00`. For 300 vector nodes, constructions
+fell from `911` to `3` and repeated decodes from `2.00` to `0.00` per node. Checkpoint still decodes
+each record read from durable WAL exactly once, while runtime-definition constructions fell from
+`1.02` to `0.02` per record. A validated proof hit measured `1.97 us` versus `12.10 us` for decode
+in the component probe (`~6.1x`); this is not an end-to-end claim or gate. The independent focused
+and grouped slice passed 412 cases, the delegated adjacent slice passed 1,922, and Ruff/diff checks
+were clean. The former C6 retarget residual is closed as marginal after removing this duplicated
+work rather than becoming a new target. Format, WAL bytes, OCC, durability, writer ordering and the
+multiwriter/multireader premises are unchanged.

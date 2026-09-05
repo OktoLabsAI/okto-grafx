@@ -61,6 +61,17 @@ including the on-disk format.
 
 ### Changed
 
+- Exact built-in catalog index definitions now retain one runtime definition for the identity of
+  their selected generation descriptor, and exact in-process index WAL records retain a private
+  decoded proof for their immutable payload. Ownership and record-type checks still run on every
+  access; persisted, reconstructed/deep-copied, foreign, mutable or malformed data takes the full
+  refusing decode.
+  Even a reflectively planted proof is accepted only when its exact `IndexChange` canonically
+  encodes to the record's current bytes, so the optimization cannot override WAL authority.
+- A first or unproved transaction read view no longer discards an unsaved live catalog merely
+  because clean catalog frames were detached. The store rebases that local view only after a
+  non-destructive read proves the complete durable catalog image is byte-identical to its original
+  base; a real foreign catalog publication retains the existing fail-closed refusal.
 - Results produced by the exact built-in engine now defer their independent public plan clone
   until `QueryResult.plan` is first read. The prepared root is still eagerly rebuilt and
   validated once into a bounded recipe; results never share plan nodes, concurrent readers of

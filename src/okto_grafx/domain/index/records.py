@@ -27,7 +27,8 @@ Payload layout, little-endian::
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from enum import IntEnum
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
@@ -354,6 +355,13 @@ def wal_record_for(
             field="change",
             value=type(change).__name__,
         )
+    if type(change) is IndexChange:
+        # The record is born from this exact change and its payload is that change's own
+        # encoding, so the change is the record's proof: the readers that follow -- the
+        # mandatory staging validation, a retarget, the commit path -- reuse it instead of
+        # decoding bytes this process produced.  A subclass is not carried; its bytes are
+        # decoded and validated like any other record's.
+        return _sealed_record(change, descriptor=descriptor, epoch=epoch, txn_id=txn_id)
     return WalRecord(
         record_type=int(change.record_type),
         payload=change.encode(),
@@ -361,6 +369,99 @@ def wal_record_for(
         epoch=epoch,
         txn_id=txn_id,
     )
+
+
+def _proof_protocol() -> tuple[
+    Callable[[WalRecord], IndexChange],
+    Callable[..., WalRecord],
+]:
+    """Build the record proof protocol around one token that never leaves this closure.
+
+    A proof is ``(payload, change, token)`` in the record's private slot.  The token is created
+    here and is not a module attribute, so no import can name it; and the closure exposes only
+    two COMPLETE operations, neither of which accepts a proof from its caller:
+
+    * ``proved_change(record)`` reads the sealed proof or decodes the record's bytes itself and
+      seals what it decoded -- the value always derives from the bytes;
+    * ``sealed_record(change, ...)`` encodes the change itself, builds the record around those
+      bytes (a fresh record, or ``replace`` of a template for a retarget) and seals the pair it
+      just produced -- the bytes always derive from the value.
+
+    No visible callable seals a (payload, change) pair supplied from outside, so an ordinary
+    caller -- including one that imports every private name of this module -- cannot plant a
+    change in an intact record: the only way to reach a different change is to hold a different
+    record whose payload IS that change's encoding.  A slot entry without the token, or naming a
+    payload object other than the record's current ``bytes``, is not a proof and is ignored.
+    """
+    token = object()
+
+    def proved_change(record: WalRecord) -> IndexChange:
+        payload = record.payload
+        entry = record._decoded
+        if (
+            type(entry) is tuple
+            and len(entry) == 3
+            and entry[2] is token
+            and entry[0] is payload
+        ):
+            change = entry[1]
+            # The token keeps ordinary callers out; this equivalence keeps a reflective one
+            # out as well.  A change that encodes to exactly these bytes says nothing the
+            # bytes do not, so the proof is absolute -- and one encode plus one bytes
+            # comparison costs about a tenth of a decode.
+            if type(change) is IndexChange and change.encode() == payload:
+                return change
+        change = IndexChange.decode(payload)
+        if type(payload) is bytes:
+            object.__setattr__(record, "_decoded", (payload, change, token))
+        return change
+
+    def sealed_record(
+        change: IndexChange,
+        *,
+        template: WalRecord | None = None,
+        descriptor: str = "",
+        epoch: Epoch = 0,
+        txn_id: TxnId = 0,
+    ) -> WalRecord:
+        payload = change.encode()
+        if template is None:
+            record = WalRecord(
+                record_type=int(change.record_type),
+                payload=payload,
+                descriptor=descriptor,
+                epoch=epoch,
+                txn_id=txn_id,
+            )
+        else:
+            record = replace(template, payload=payload)
+        object.__setattr__(record, "_decoded", (record.payload, change, token))
+        return record
+
+    return proved_change, sealed_record
+
+
+_proved_change, _sealed_record = _proof_protocol()
+
+
+def record_for_change(record: WalRecord, change: IndexChange) -> WalRecord:
+    """Return a copy of ``record`` whose payload is ``change``, already proved for its readers.
+
+    The payload is exactly ``change.encode()`` and the codec is canonical -- decoding those
+    bytes rebuilds an equal change, which the log's own redo already relies on -- so the new
+    record carries ``change`` as its proof.  The mandatory staging validation and the commit
+    path that follow a retarget then reuse this process's own proof instead of decoding bytes it
+    produced a moment ago.  The proof cannot say anything the bytes do not: the record returned
+    is a new one whose payload IS the encoding of the carried change, and the record given is
+    left untouched.  A stand-in record or a change subclass is refused.
+    """
+    if type(record) is not WalRecord or type(change) is not IndexChange:
+        raise GrafxIndexError(
+            "Only an exact WalRecord can carry an exact IndexChange as its proved payload.",
+            field="record",
+            value=f"{type(record).__name__}/{type(change).__name__}",
+        )
+    return _sealed_record(change, template=record)
 
 
 def change_of(record: object) -> IndexChange:
@@ -387,7 +488,15 @@ def change_of(record: object) -> IndexChange:
             field="record_type",
             value=record_type,
         )
-    change = IndexChange.decode(payload if payload is not None else b"")
+    if type(record) is WalRecord and type(payload) is bytes:
+        # An exact, frozen log record over immutable bytes is decoded once: the first decode is
+        # the full refusing validation, and every later reader of the same record object --
+        # preflight, redo dispatch, the store's own apply, staging validation and retargeting --
+        # reuses that very result under the private proof protocol.  A stand-in record decodes
+        # every time, and a failed decode seals nothing, so a refusal repeats for every reader.
+        change = _proved_change(record)
+    else:
+        change = IndexChange.decode(payload if payload is not None else b"")
     if int(change.record_type) != record_type:
         raise GrafxCorruptionDetected(
             f"An index change of operation {change.operation.name} travels under record type "

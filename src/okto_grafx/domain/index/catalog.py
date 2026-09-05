@@ -13,7 +13,7 @@ layer's responsibility.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from okto_grafx.domain.errors import GrafxIndexError
@@ -177,6 +177,13 @@ class CatalogIndexDefinition:
     automatic: bool = False
     expected_cardinality: int | None = None
     generations: tuple[IndexGenerationDescriptor, ...] = ()
+    # One private slot per logical definition: the runtime definition last materialised, keyed
+    # by the identity of the generation descriptor it was built from.  It is not a field of the
+    # value (never compared, printed, replaced or persisted) and it never outlives this object:
+    # every generation change builds a new logical definition through ``replace``.
+    _runtime: tuple[IndexGenerationDescriptor, IndexDefinition] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         """Validate the complete, canonically ordered logical authority."""
@@ -525,6 +532,20 @@ class CatalogIndexDefinition:
                 value=repr(selected),
                 index=self.name,
             )
+        # The ownership refusal above runs on every call.  Only the construction -- and the
+        # full IndexDefinition validation it repeats -- is reused, and only for the very same
+        # descriptor object: an equal but distinct descriptor rebuilds, a foreign one refused.
+        cached = self._runtime
+        if cached is not None and cached[0] is selected:
+            return cached[1]
+        definition = self._build_runtime_definition(selected)
+        object.__setattr__(self, "_runtime", (selected, definition))
+        return definition
+
+    def _build_runtime_definition(
+        self, selected: IndexGenerationDescriptor
+    ) -> IndexDefinition:
+        """Construct -- and fully validate -- the runtime definition of one owned generation."""
         return IndexDefinition(
             name=self.name,
             table_id=self.table_id,

@@ -18,7 +18,7 @@ polynomial is a second thing that can drift.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 
 from okto_grafx.domain.errors import GrafxConfigurationError
@@ -213,6 +213,12 @@ class WalRecord:
     txn_id: TxnId = 0
     flags: int = 0
     format_version: int = WAL_LEGACY_FORMAT_VERSION
+    # One private slot per record, reserved for the codec that proves this record's payload
+    # (today: the index change codec in ``okto_grafx.domain.index.records``).  It is not a field
+    # of the value -- never compared, printed, replaced or written to the device -- and this
+    # class offers no door to it: the owning codec seals and reads it under its own private
+    # proof protocol, so an ordinary caller cannot plant a decoded value in a record.
+    _decoded: object = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Check every field against the width the format gives it, before any packing.
