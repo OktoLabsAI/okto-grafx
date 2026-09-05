@@ -3008,7 +3008,7 @@ class IndexStore:
                 else:
                     self._stamp(page, lsn)
                     bucket.pages.update(position, self._page_insert_capacity(page))
-                    return page_index, slot, entry.located_at(page_index, slot)
+                    return page_index, slot, entry
             position = bucket.pages.first_fit(len(payload))
 
         if not bucket.pages.pages:
@@ -3032,7 +3032,7 @@ class IndexStore:
             tail.next_page = page_index
             tail.dirty = True
         bucket.pages.append(page_index, capacity)
-        return page_index, slot, entry.located_at(page_index, slot)
+        return page_index, slot, entry
 
     def _apply_common_replay_hot_change(
         self,
@@ -3082,7 +3082,7 @@ class IndexStore:
                 bucket.entries[identity] = (
                     page_index,
                     slot,
-                    ended.located_at(page_index, slot),
+                    ended,
                 )
                 self._adjust_tombstone_backlog(1)
             return moved
@@ -3536,10 +3536,8 @@ class IndexStore:
             with self._pool.pinned(self.file, index) as page:
                 self._require_index_page(page, index)
                 if key is not None and not matching_complete:
-                    for slot in page.live_slots():
-                        entry = IndexEntry.decode_if_matches(
-                            page.slot_view(slot), key, ref
-                        )
+                    for slot, image in page.iter_slot_views():
+                        entry = IndexEntry.decode_if_matches(image, key, ref)
                         if entry is not None:
                             matches.append(entry.located_at(index, slot))
                     if first_matching_page and matches:

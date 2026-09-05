@@ -12,9 +12,11 @@ from contextvars import Context, copy_context
 import pytest
 
 from okto_grafx.domain.errors import GrafxIndexError
-from okto_grafx.domain.ids import RecordRef
+from okto_grafx.domain.ids import NO_CSN, NO_PAGE, RecordRef
 from okto_grafx.domain.index import IndexChange, IndexOperation
+from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.keys import bucket_of
+from okto_grafx.domain.page import Page
 import okto_grafx.engine.index_manager as index_manager_module
 from okto_grafx.engine.index_manager import HashIndex, IndexManager, IndexStore
 from okto_grafx.engine.txn_manager import TransactionManager
@@ -150,6 +152,74 @@ def test_internal_write_authority_enables_the_live_hot_directory(
 
     assert _commit_under_write_authority(database.manager, txn) == len(keys)
     assert calls == len(keys)
+
+
+def test_bucket_scan_consumes_the_page_slot_iterator_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(budget_pages=64)
+    txn = TransactionDouble(txn_id=103)
+    key = _colliding_keys(database.exact, 1, prefix="slot-view")[0]
+    reference = _stage_inserts(database.exact, txn, (key,))[0]
+    assert database.exact.commit(txn, COMMIT_LSN) == 1
+
+    def unexpected(_page: Page) -> tuple[int, ...]:
+        raise AssertionError("the fused scan rebuilt the live-slot tuple")
+
+    monkeypatch.setattr(Page, "live_slots", unexpected)
+
+    assert [entry.ref for entry in database.exact.candidates(key)] == [reference]
+
+
+def test_hot_directory_keeps_location_in_its_tuple_without_retagging_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(budget_pages=64)
+    key = _colliding_keys(database.exact, 1, prefix="tuple-location")[0]
+    reference = RecordRef(17, 1)
+    identity = (key, reference)
+    bucket = database.exact._prepare_common_replay_hot_bucket(  # noqa: SLF001
+        0,
+        {identity},
+        page_limit=64,
+    )
+    assert bucket is not None
+    assert bucket.entries[identity] is None
+    insert = IndexChange(
+        index=database.exact.name,
+        operation=IndexOperation.INSERT,
+        key=key,
+        ref=reference,
+        csn=NO_CSN,
+        versioned=False,
+    )
+    tombstone = IndexChange(
+        index=database.exact.name,
+        operation=IndexOperation.TOMBSTONE,
+        key=key,
+        ref=reference,
+        csn=COMMIT_LSN + 1,
+        versioned=False,
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> IndexEntry:
+        raise AssertionError("the hot directory redundantly copied its tuple location")
+
+    monkeypatch.setattr(IndexEntry, "located_at", unexpected)
+
+    assert database.exact._apply_common_replay_hot_change(  # noqa: SLF001
+        bucket, insert, COMMIT_LSN
+    )
+    inserted = bucket.entries[identity]
+    assert inserted is not None
+    assert inserted[2].page == NO_PAGE
+    assert database.exact._apply_common_replay_hot_change(  # noqa: SLF001
+        bucket, tombstone, COMMIT_LSN + 1
+    )
+    ended = bucket.entries[identity]
+    assert ended is not None
+    assert ended[2].dead_csn == COMMIT_LSN + 1
+    assert ended[2].page == NO_PAGE
 
 
 def test_instance_level_physical_hook_declines_live_acceleration() -> None:

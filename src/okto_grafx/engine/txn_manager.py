@@ -164,6 +164,7 @@ from okto_grafx.engine.commit_state_store import (
 )
 from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapVacuumPlan
+from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.engine.coordination import (
     COMMIT_SECTION,
@@ -5079,11 +5080,12 @@ class TransactionManager:
         # records, because they are part of that batch: they lengthen it, and the number they
         # carry is the number the lengthened batch gives the COMMIT record. Counting them first
         # is what breaks that circle; `_stage_index_changes` refuses if the count was wrong.
+        index_record_count = self._index_record_count(txn, rows)
         predicted = (
             base
             + len(staged)
             + len(txn.pending_records)
-            + self._index_record_count(txn, rows)
+            + index_record_count
             + 1
         )
         if predicted >= PROVISIONAL_CSN:
@@ -5093,7 +5095,28 @@ class TransactionManager:
                 field="last_lsn",
                 value=base,
             )
-        self._stage_index_changes(txn, rows, predicted)
+        manager = self._index_manager
+        uses_canonical_index_staging = (
+            type(manager) is IndexManager
+            and getattr(self._index_record_count, "__func__", self._index_record_count)
+            is TransactionManager._index_record_count
+            and getattr(self._stage_index_changes, "__func__", self._stage_index_changes)
+            is TransactionManager._stage_index_changes
+        )
+        if uses_canonical_index_staging:
+            # Count and staging run in this same COMMIT_SECTION against the same immutable
+            # catalog authority.  Carry that one-shot observation into the verifier instead of
+            # asking the catalog the identical question a second time.  Custom managers and
+            # overridden hooks retain the legacy double-call path because their calls may be
+            # observable or deliberately time-varying.
+            self._stage_index_changes(
+                txn,
+                rows,
+                predicted,
+                _expected_record_count=index_record_count,
+            )
+        else:
+            self._stage_index_changes(txn, rows, predicted)
         pending = list(txn.pending_records)
         self._validate_pending_index_records(txn, pending)
         images: list[tuple[str, PageIndex, bytes]] = []
@@ -5311,9 +5334,10 @@ class TransactionManager:
         how long the batch is -- which these very records lengthen. Counting first breaks the
         circle without a provisional stamp to correct afterwards.
 
-        Keeping the count and the staging in step is an invariant in two places (A66), so
-        :meth:`_stage_index_changes` re-counts what it actually staged and refuses when the two
-        disagree, rather than letting a silent drift put a wrong commit number on an entry.
+        Keeping the count and the staging in step is an invariant in two places (A66), so the
+        canonical path carries this count into :meth:`_stage_index_changes` and compares it with
+        what staging actually produced. Custom hooks retain the earlier second count because a
+        host may make the invocation itself observable.
         """
         manager = self._index_manager
         if manager is None:
@@ -5347,7 +5371,12 @@ class TransactionManager:
         return total
 
     def _stage_index_changes(
-        self, txn: TransactionContext, rows: Sequence[_RowWrite], csn: Csn
+        self,
+        txn: TransactionContext,
+        rows: Sequence[_RowWrite],
+        csn: Csn,
+        *,
+        _expected_record_count: int | None = None,
     ) -> None:
         """Stage, on every index covering each written row, the entries that row owes it.
 
@@ -5367,7 +5396,11 @@ class TransactionManager:
         if manager is None:
             return
         before = len(txn.pending_records)
-        expected = self._index_record_count(txn, rows)
+        expected = (
+            self._index_record_count(txn, rows)
+            if _expected_record_count is None
+            else _expected_record_count
+        )
         for row in rows:
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from okto_grafx.domain.index import (
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
@@ -159,6 +161,47 @@ def _insert(stack: Stack, table: TableDef, values: tuple[object, ...]) -> object
     txn.note_write(stack.manager.partition_of(table.table_id, b"identity-wiring"))
     stack.manager.commit(txn)
     return txn.row_refs[0]
+
+
+def test_canonical_manager_counts_index_records_once_per_row_version(
+    database_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One immutable commit-section view supplies quota prediction and verification."""
+    stack = build_stack(database_root)
+    table = _table()
+    stack.catalog.catalog.add_table(table)
+    stack.catalog.save()
+    stack.pool.flush(stack.catalog.file)
+    stack.pool.flush(stack.heap.file)
+    indexes = IndexManager(stack.pool, stack.heap, stack.metrics)
+    indexes.register(
+        HashIndex(
+            IndexDefinition(
+                name="rid_t_00000001",
+                table_id=table.table_id,
+                table_name=table.name,
+                positions=(),
+                visibility=IndexVisibility.EXACT,
+                key_derivation=RECORD_ID_KEY_DERIVATION,
+            ),
+            stack.pool,
+            stack.metrics,
+        )
+    )
+    stack.manager._index_manager = indexes
+    original = IndexManager.row_entry_count
+    calls = 0
+
+    def counted(manager: IndexManager, *args: object, **kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        return original(manager, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(IndexManager, "row_entry_count", counted)
+
+    _insert(stack, table, (7, "trusted"))
+
+    assert calls == 1, "the first quota count is carried into staging verification"
 
 
 def test_insert_passes_the_resolved_unsigned_identity_to_quota_and_staging(
