@@ -71,6 +71,9 @@ including the on-disk format.
 - Certified checkpoint replay reuses that complete strict preflight instead of decoding the same
   logical-index subplan a second time. Catalog-writing checkpoints remain on their canonical
   permissive-then-strict path and cannot enter the shortcut.
+- Mandatory checkpoint and staged-index validation now carry their already-decoded RESET fact
+  across sealed private boundaries. Exact built-in paths avoid a second logical-record scan;
+  missing/incompatible proofs, custom managers and overrides keep the canonical fail-closed path.
 - Exact vector searches fed by a small, engine-sealed materialized candidate set now authenticate
   only the selected heap rows and their index buckets. Any incomplete proof, metadata drift, NULL,
   deletion, duplicate or wrong reference falls back to the canonical full scan before ranking; a

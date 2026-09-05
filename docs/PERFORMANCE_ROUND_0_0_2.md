@@ -1704,3 +1704,31 @@ to DDL and therefore could not use the shortcut. The focused checkpoint/redo sli
 tests, with Ruff and diff checks green. This is a simple removal of duplicated work, without a
 wall-clock claim or gate; corruption checks, format, WAL/OCC, durability and
 multiwriter/multireader behavior are unchanged.
+
+## Scale-removal batch 38 — decoded RESET facts cross private validation boundaries
+
+Status: **completed in `6b142ba`; local adversarial review and focused/grouped quality slices
+PASS; Nexus review `hof_a85992ce987045a7ac73b2bb42ac822c` requested**.
+
+Two mandatory validators decoded every logical index effect and then their callers decoded the
+same effects again only to ask whether one operation was `RESET`. The complete checkpoint
+preflight now carries that boolean in its sealed, owner/replay/passage-bound proof. The shortcut
+may consume it only after the record identity/signature has been verified; a missing, forged,
+unverified or incompatible proof yields no fact and keeps canonical replay. Page-only projections
+always carry `False` because their exact effects contain no logical records.
+
+The live commit path applies the same rule to `IndexManager.validate_staged_records`: its existing
+decode now reports the RESET fact after the authorised multiset is proved. The fact crosses
+`_build_records` only for the exact built-in manager and original validator. Custom managers,
+overrides or an unrecognised result receive no authority. Segment retargeting keeps the already
+proved operation while still repeating the mandatory exact staged-record validation; no WAL
+record, order, CSN or durability step is removed.
+
+RESET is deliberately recognised from decoded `IndexChange.operation`, not from the WAL record
+type: RESET itself is carried by `INDEX_WRITE`. Focused regressions cover ordinary DML, RESET,
+malformed payloads, wrong replay/passage/owner and the canonical checkpoint fallback. The grouped
+redo/checkpoint/index/WAL slice, compileall, Ruff and diff checks passed. A concurrent three-sample
+A/B run over 2,000 CREATEs, eight commits and eight checkpoints measured medians
+`11.396834 -> 11.165593 s` (`~1.02x`); it is directional evidence consistent with the profiled
+`~2.3–2.6%` ceiling, not a release gate. Format, corruption checks, WAL/OCC, durability,
+writer ordering and multiwriter/multireader semantics are unchanged.
