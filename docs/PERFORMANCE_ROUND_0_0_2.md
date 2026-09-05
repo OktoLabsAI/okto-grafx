@@ -2099,7 +2099,7 @@ multiwriter/multireader premises are unchanged.
 
 ## Pulse stabilization — typed timestamp cursor pagination
 
-Status: **implemented and validated against the live Pulse 0.3.3 runtime; promotion pending**.
+Status: **published in Grafx `db89ade` and Pulse Core `4dca9b8`, and validated against the live Pulse 0.3.3 runtime**.
 
 Pulse decodes a graph-page cursor into an ISO timestamp string while Grafx stores the corresponding
 property as a typed `Timestamp`. The former query compared these unlike values, yielding Cypher
@@ -2116,7 +2116,7 @@ stored bytes nor transaction, recovery or concurrency semantics.
 
 ## Scale-removal batch 52 — index-driven Pulse filtered-vector search
 
-Status: **implemented on `feature/v0.0.2`; focused and adjacent correctness gates green; Nexus handoff `hof_978789c9dba543dfa2ebb3d1de295fca` independently verified PASS**.
+Status: **published in Grafx `db89ade`; paired Pulse Community activation published in `72a2df3`; focused/adjacent gates green; Nexus handoff `hof_978789c9dba543dfa2ebb3d1de295fca` independently verified PASS**.
 
 The Pulse search shape previously materialized the complete `FilterRows(NodeScan(SingleRow))`
 child before vector search, preserving O(N) row allocation even when HNSW could answer a bounded
@@ -2132,6 +2132,12 @@ membership lazily through the catalog-v2 identity index. Approximate admission a
 HNSW entry's exact `RecordRef` against that identity result before its score may enter the answer.
 A missing identity or a divergent physical ref fails closed rather than silently shrinking or
 misranking results.
+
+The logical-candidate sink in Pulse Community performs its existing empty-catalog activation
+before DDL and a second idempotent activation immediately after DDL. The latter materializes the
+new endpoint tables' `rid_t_*` generations before ingestion, which makes the lazy identity route
+available on a cold candidate without migrating an existing graph. Its order, persistence, cold
+reopen and post-DDL activation failure paths passed all 12 focused Pulse tests.
 
 Two work bounds are explicit. A proven empty filter returns before evaluating unused vector
 arguments or consulting the identity index. An approximate request whose `k` exceeds configured

@@ -9,8 +9,8 @@
 
 ## Estado de execução — 2026-09-03
 
-- **Paginação do Knowledge Graph e acesso vetorial filtrado Pulse corrigidos no worktree de
-  `0.0.2`.** A falha de `Load more` foi reproduzida no Pulse real: o cursor ISO era comparado com
+- **Paginação do Knowledge Graph e acesso vetorial filtrado Pulse publicados.** A falha de
+  `Load more` foi reproduzida no Pulse real: o cursor ISO era comparado com
   `Timestamp`, produzindo `UNKNOWN`. O Grafx agora ordena/compara timestamps por micros UTC e o
   Core converte explicitamente o cursor nas duas queries. A API retornou três páginas de 500 sem
   repetição e a UI avançou de 500 para 1.000 nós. Em seguida, o caminho Pulse de
@@ -24,7 +24,9 @@
   `k={1,11,100000}` e limites `T-1/T/T+1`, confirmou paridade integral e foi verificado PASS. Não
   houve mudança de formato, WAL/OCC, durabilidade
   ou premissas multiwriter/multireader. Detalhes e limitações honestas estão em
-  `docs/PERFORMANCE_ROUND_0_0_2.md`, lote 52.
+  `docs/PERFORMANCE_ROUND_0_0_2.md`, lote 52. SHAs: Grafx `db89ade`, Pulse Core `4dca9b8` e
+  Pulse Community `72a2df3` (a segunda ativação pós-DDL cria `rid_t_*` antes da ingestão; 12/12
+  testes focais verdes).
 
 - **Milestone de hot paths publicado em `9603115` (2026-09-04).** Foram concluídos os recortes
   limitados de heap/catalog bootstrap, projeção e sincronização de índices, segunda leitura de
