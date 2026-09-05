@@ -2098,6 +2098,31 @@ def _query_path_snapshot(
         active.remove(marker)
 
 
+def _require_int64(value: int, *, field: str) -> int:
+    """Refuse an integer outside the signed 64-bit range; the one bound every path shares."""
+    if not INT64_MIN <= value <= INT64_MAX:
+        raise GrafxConfigurationError(
+            "A query integer must fit in 64 signed bits.",
+            field=field,
+            value=value,
+            minimum=INT64_MIN,
+            maximum=INT64_MAX,
+        )
+    return value
+
+
+def _require_text_length(value: str, *, field: str, limit: int) -> str:
+    """Refuse a string longer than ``limit``; the one bound every path shares."""
+    if len(value) > limit:
+        raise GrafxConfigurationError(
+            f"A query string may carry at most {limit} characters.",
+            field=field,
+            value=len(value),
+            limit=limit,
+        )
+    return value
+
+
 def _query_value_snapshot(
     value: object,
     *,
@@ -2117,29 +2142,24 @@ def _query_value_snapshot(
     value_type = type(value)
     if value is None or value_type is bool:
         return value
+    # An exact built-in is already the object the canonical branches below would return
+    # (``int.__int__``, ``float.__float__`` and ``str.__str__`` hand back the same instance for
+    # an exact one), so only the shared bound remains. A subclass never matches ``is`` and keeps
+    # taking the canonical copy below, unchanged.
+    if value_type is int:
+        return _require_int64(value, field=field)
+    if value_type is float:
+        return value
+    if value_type is str:
+        return _require_text_length(value, field=field, limit=max_string_characters)
     if issubclass(value_type, int):
-        plain_integer = _builtin_int(value, field=field)
-        if not INT64_MIN <= plain_integer <= INT64_MAX:
-            raise GrafxConfigurationError(
-                "A query integer must fit in 64 signed bits.",
-                field=field,
-                value=plain_integer,
-                minimum=INT64_MIN,
-                maximum=INT64_MAX,
-            )
-        return plain_integer
+        return _require_int64(_builtin_int(value, field=field), field=field)
     if issubclass(value_type, float):
         return float.__float__(value)
     if issubclass(value_type, str):
-        plain_text = _builtin_text(value, field=field)
-        if len(plain_text) > max_string_characters:
-            raise GrafxConfigurationError(
-                f"A query string may carry at most {max_string_characters} characters.",
-                field=field,
-                value=len(plain_text),
-                limit=max_string_characters,
-            )
-        return plain_text
+        return _require_text_length(
+            _builtin_text(value, field=field), field=field, limit=max_string_characters
+        )
     if issubclass(value_type, (bytes, bytearray, memoryview)):
         return _builtin_bytes(value, field=field)
     if issubclass(value_type, Timestamp):
@@ -2972,12 +2992,17 @@ def _query_result_snapshot(
     )
     rows: list[tuple[Value, ...]] = []
     active: set[int] = set()
+    # The column suffixes are invariant across rows and the row prefix across columns; their
+    # concatenation is exactly ``f"query.result.rows[{row}][{column}]"``, built once per row
+    # instead of formatting two integers for every published value.
+    column_suffixes = tuple(f"[{position}]" for position in range(len(columns)))
     for row_position, raw_row in enumerate(raw_rows):
-        row_items = _tuple_items(raw_row, field=f"query.result.rows[{row_position}]")
+        row_field = f"query.result.rows[{row_position}]"
+        row_items = _tuple_items(raw_row, field=row_field)
         if len(row_items) != len(columns):
             raise GrafxConfigurationError(
                 "Every query result row must have exactly one value per column.",
-                field=f"query.result.rows[{row_position}]",
+                field=row_field,
                 value=len(row_items),
                 expected=len(columns),
             )
@@ -2985,7 +3010,7 @@ def _query_result_snapshot(
             tuple(
                 _query_value_snapshot(
                     item,
-                    field=f"query.result.rows[{row_position}][{column_position}]",
+                    field=row_field + column_suffixes[column_position],
                     depth=0,
                     active=active,
                     max_string_characters=max_string_characters,

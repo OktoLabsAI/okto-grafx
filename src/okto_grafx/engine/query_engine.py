@@ -7806,9 +7806,16 @@ def _project_rows(
     engine: QueryEngine, node: ProjectRows, context: _Context
 ) -> Iterator[_Row]:
     """Compute the projected columns of each row, keeping what it was projected from."""
+    names: tuple[str, ...] | None = None
     for row in engine._rows(node.child, context):
+        if names is None:
+            # A projected name is a property of the plan, not of the row: ``ReturnItem.name``
+            # renders ``describe()`` on every access, so it is rendered once, on the first row,
+            # and a child that yields no row renders none -- exactly as before.
+            names = tuple(item.name for item in node.items)
         columns = {
-            item.name: _evaluate(item.expression, row, context) for item in node.items
+            name: _evaluate(item.expression, row, context)
+            for name, item in zip(names, node.items)
         }
         yield _Row(bindings=row.bindings, computed=row.computed, columns=columns)
 
