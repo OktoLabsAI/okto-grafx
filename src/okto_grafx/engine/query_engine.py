@@ -103,6 +103,7 @@ from okto_grafx.engine.index_manager import (
     primary_key_index_name,
     relationship_endpoint_indexes,
 )
+from okto_grafx.engine.vector_engine import VectorEngine
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import (
     ENDPOINT_COLUMNS,
@@ -5889,18 +5890,23 @@ def _filter_rows(
     true -- which is also why this cannot be written as ``if value``.
     """
     for row in engine._rows(node.child, context):
-        value = _evaluate(node.predicate, row, context)
-        if value is None:
-            continue
-        if not isinstance(value, bool):
-            raise GrafxPlanError(
-                "A WHERE predicate is a condition, not a value; "
-                f"{node.predicate.describe()} produced {type(value).__name__}.",
-                field="predicate",
-                value=type(value).__name__,
-            )
-        if value:
+        if _predicate_admits(node.predicate, row, context):
             yield row
+
+
+def _predicate_admits(expression: Expression, row: _Row, context: _Context) -> bool:
+    """Apply the executor's exact three-valued WHERE rule to one already-bound row."""
+    value = _evaluate(expression, row, context)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise GrafxPlanError(
+            "A WHERE predicate is a condition, not a value; "
+            f"{expression.describe()} produced {type(value).__name__}.",
+            field="predicate",
+            value=type(value).__name__,
+        )
+    return value
 
 
 def _vector_search(
@@ -5931,6 +5937,10 @@ def _vector_search(
     direct = _direct_vector_search(engine, vectors, node, context)
     if direct is not None:
         yield from direct
+        return
+    filtered = _filtered_vector_search(engine, vectors, node, context)
+    if filtered is not None:
+        yield from filtered
         return
     yield from _materialised_vector_search(engine, vectors, node, context)
 
@@ -6082,6 +6092,335 @@ def _direct_vector_search(
     return tuple(rows)
 
 
+def _and_terms(expression: Expression) -> tuple[Expression, ...]:
+    """Flatten only conjunctions, preserving the predicate's left-to-right term order."""
+    if type(expression) is BinaryOperation and expression.operator.upper() == "AND":
+        return (*_and_terms(expression.left), *_and_terms(expression.right))
+    return (expression,)
+
+
+def _row_filter_property(
+    expression: Expression, variable: str, table: TableDef
+) -> ColumnDef | None:
+    """Return an exact scalar property of this one row binding, or ``None``."""
+    if (
+        type(expression) is not Property
+        or type(expression.subject) is not Variable
+        or expression.subject.name != variable
+    ):
+        return None
+    position = table.column_positions.get(expression.key)
+    if position is None:
+        return None
+    return table.columns[position]
+
+
+def _safe_filtered_vector_scalar(
+    expression: Expression, variable: str, table: TableDef
+) -> bool:
+    """Recognise the total scalar leaves used by Pulse eligibility predicates."""
+    if type(expression) in (Literal, Parameter):
+        return True
+    column = _row_filter_property(expression, variable, table)
+    if column is not None:
+        return not column.is_vector
+    if type(expression) is not FunctionCall:
+        return False
+    return (
+        expression.name.lower() == "coalesce"
+        and not expression.named_arguments
+        and not expression.distinct
+        and not expression.star
+        and bool(expression.arguments)
+        and all(
+            _safe_filtered_vector_scalar(argument, variable, table)
+            for argument in expression.arguments
+        )
+    )
+
+
+def _safe_filtered_vector_condition(
+    expression: Expression, variable: str, table: TableDef
+) -> bool:
+    """Recognise a deliberately small, total boolean grammar with no host callbacks."""
+    if type(expression) is NullCheck:
+        return _row_filter_property(expression.operand, variable, table) is not None
+    if type(expression) is not BinaryOperation:
+        return False
+    operator = expression.operator.upper()
+    if operator in ("AND", "OR"):
+        return _safe_filtered_vector_condition(
+            expression.left, variable, table
+        ) and _safe_filtered_vector_condition(expression.right, variable, table)
+    if operator not in ("=", "<>", "!="):
+        return False
+    return _safe_filtered_vector_scalar(
+        expression.left, variable, table
+    ) and _safe_filtered_vector_scalar(expression.right, variable, table)
+
+
+def _is_safe_filtered_vector_predicate(
+    expression: Expression,
+    *,
+    variable: str,
+    table: TableDef,
+    vector_property: str,
+) -> bool:
+    """Prove the narrow Pulse predicate and its unconditional non-null vector guard.
+
+    Merely finding ``embedding IS NOT NULL`` anywhere would be unsound when it sits below ``OR``.
+    It must be a top-level conjunct.  The remaining terms accept only equality/inequality, null
+    checks and ``coalesce`` over literals, parameters and scalar properties of this exact binding.
+    That excludes CASE, arithmetic, similarity, correlated variables and arbitrary functions.
+    """
+    terms = _and_terms(expression)
+    guarded = any(
+        type(term) is NullCheck
+        and term.negated
+        and type(term.operand) is Property
+        and type(term.operand.subject) is Variable
+        and term.operand.subject.name == variable
+        and term.operand.key == vector_property
+        for term in terms
+    )
+    return guarded and all(
+        _safe_filtered_vector_condition(term, variable, table) for term in terms
+    )
+
+
+def _filtered_vector_search(
+    engine: QueryEngine, vectors: object, node: VectorSearch, context: _Context
+) -> tuple[_Row, ...] | None:
+    """Accelerate the proven Pulse filter without first materialising its whole NodeScan.
+
+    The vector index scans at most until ``exact_threshold + 1`` admitted rows.  Exhaustion below
+    that bound produces the exact result from the already validated rows; crossing it runs the
+    ordinary filter-aware HNSW with lazy identity-index point reads.  Every unavailable proof
+    returns ``None`` before query arguments are evaluated, retaining the canonical child path.
+    """
+    if type(vectors) is not VectorEngine:
+        return None
+    filtered = node.child
+    if type(filtered) is not FilterRows:
+        return None
+    scan = filtered.child
+    if (
+        type(scan) is not NodeScan
+        or type(scan.child) is not SingleRow
+        or scan.variable != node.variable
+        or node.k is None
+        or type(context.snapshot) is not Snapshot
+        or engine._max_intermediate_rows is not None
+        or scan.table.kind != "node"
+    ):
+        return None
+    expressions = (node.space, node.query_vector, node.k)
+    if node.threshold is not None:
+        expressions += (node.threshold,)
+    if any(free_variables(expression) for expression in expressions):
+        return None
+    if type(node.k) not in (Literal, Parameter):
+        # A fallback after the bounded proof may need to defer evaluation to the canonical
+        # child-materialising path.  Restricting k to the side-effect-free Pulse forms keeps
+        # evaluation ordering identical when that happens.
+        return None
+    position = scan.table.column_positions.get(node.property_key)
+    if position is None:
+        return None
+    column = scan.table.columns[position]
+    if (
+        not column.is_vector
+        or column.vector_space != node.column_space
+        or not node.column_space
+        or not _is_safe_filtered_vector_predicate(
+            filtered.predicate,
+            variable=node.variable,
+            table=scan.table,
+            vector_property=node.property_key,
+        )
+    ):
+        return None
+
+    # The planned space must be fixed before discovery.  A dynamic expression historically runs
+    # only after child materialisation and therefore cannot safely select an index here.
+    if type(node.space) is not Literal or node.space.value != node.column_space:
+        return None
+    try:
+        frontier_count = vectors.snapshot_frontier_live_count(
+            node.column_space,
+            context.snapshot,
+            table_id=scan.table.table_id,
+            position=position,
+        )
+    except Exception:  # noqa: BLE001 - an unavailable optional proof keeps canonical semantics
+        return None
+    if type(frontier_count) is not int or frontier_count <= 0:
+        return None
+    def row_of(ref: RecordRef, version: HeapVersion) -> _Row:
+        """Bind one vector-index heap witness exactly as the omitted NodeScan would."""
+        return _Row(
+            bindings={
+                node.variable: RowBinding(
+                    variable=node.variable,
+                    table=scan.table,
+                    ref=ref,
+                    version=version,
+                )
+            }
+        )
+
+    def row_admits(ref: RecordRef, version: HeapVersion) -> bool:
+        """Evaluate only the structurally proved, row-local Pulse predicate."""
+        return _predicate_admits(filtered.predicate, row_of(ref, version), context)
+
+    proof = vectors._prepare_filtered_candidates(
+        space=node.column_space,
+        snapshot=context.snapshot,
+        table_id=scan.table.table_id,
+        position=position,
+        row_admits=row_admits,
+    )
+    if proof is None:
+        return None
+    candidate_count = vectors._prepared_filtered_candidate_count(proof)
+    if candidate_count == 0:
+        # Match ``_materialised_vector_search``: an empty filtered child does not evaluate the
+        # vector, k or threshold arguments and does not touch search metrics.
+        return ()
+
+    requested = _requested_neighbour_count(node, (), context)
+    if candidate_count is None and not vectors._supports_bounded_filtered_k(requested):
+        # Let the canonical child discover its exact filtered size and clamp k.  Widening HNSW
+        # to an unbounded caller value here would turn this optimization back into O(N) work.
+        return None
+    identity_index = _endpoint_identity_index(engine, context, scan.table)
+    if identity_index is None:
+        return None
+
+    space = _space_name(node, (), context)
+    query_vector = _query_vector(node, (), context)
+    wanted = (
+        requested
+        if candidate_count is None
+        else max(min(requested, candidate_count), 1)
+    )
+
+    def resolved_identity(
+        record_id: RecordId, expected_ref: RecordRef | None = None
+    ) -> tuple[RecordRef, HeapVersion]:
+        """Resolve and, when supplied, authenticate one exact HNSW physical witness."""
+        resolved = _visible_identity_with_ref(engine, context, scan.table, record_id)
+        if resolved is None:
+            raise GrafxIndexError(
+                f"Identity index {identity_index.name!r} cannot resolve vector candidate "
+                f"{record_id} in table {scan.table.name!r}.",
+                field="vector_filter_identity",
+                table=scan.table.name,
+                table_id=scan.table.table_id,
+                record_id=record_id,
+                index=identity_index.name,
+            )
+        if expected_ref is not None and resolved[0] != expected_ref:
+            raise GrafxCorruptionDetected(
+                f"Vector entry {record_id} at page {expected_ref.page} slot "
+                f"{expected_ref.slot} does not match identity index {identity_index.name!r}.",
+                field="vector_filter_identity",
+                table=scan.table.name,
+                table_id=scan.table.table_id,
+                record_id=record_id,
+                index=identity_index.name,
+                page=expected_ref.page,
+                slot=expected_ref.slot,
+                identity_page=resolved[0].page,
+                identity_slot=resolved[0].slot,
+            )
+        return resolved
+
+    def record_admits(record_id: RecordId) -> bool:
+        """Resolve an exact-path record through the certified identity index."""
+        return row_admits(*resolved_identity(record_id))
+
+    def entry_admits(record_id: RecordId, ref: RecordRef) -> bool:
+        """Authenticate the HNSW ref before its score can enter the result set."""
+        return row_admits(*resolved_identity(record_id, ref))
+
+    result = vectors._search_prepared_filtered_candidates(
+        proof,
+        query=query_vector,
+        k=wanted,
+        snapshot=context.snapshot,
+        record_admits=record_admits,
+        entry_admits=entry_admits,
+    )
+    _record_vector_search_statistics(context, result, candidate_count)
+    threshold_value = _threshold_value(node, (), context)
+
+    materialised: list[tuple[RecordRef, int, float, HeapVersion]] = []
+    for hit in result.hits:
+        ref = getattr(hit, "ref", None)
+        record_id = getattr(hit, "record_id", None)
+        score = getattr(hit, "score")
+        if type(ref) is not RecordRef or type(record_id) is not int or record_id < 1:
+            raise GrafxIndexError(
+                "A vector hit must name one positive record id and one exact heap reference.",
+                field="vector_hit_ref",
+                space=space,
+                value=repr(ref),
+                record_id=repr(record_id),
+            )
+        version = engine.heap._revalidate_visible_ref(
+            scan.table, ref, record_id, context.snapshot
+        )
+        if version is None:
+            raise GrafxIndexError(
+                f"Vector hit {record_id} at page {ref.page} slot {ref.slot} is not visible to "
+                "the snapshot its filtered index search certified.",
+                field="vector_hit_visibility",
+                space=space,
+                table=scan.table.name,
+                table_id=scan.table.table_id,
+                record_id=record_id,
+                page=ref.page,
+                slot=ref.slot,
+            )
+        identity = _visible_identity_with_ref(engine, context, scan.table, record_id)
+        if identity is None or identity[0] != ref:
+            raise GrafxCorruptionDetected(
+                f"Vector hit {record_id} does not match the certified identity index of "
+                f"table {scan.table.name!r}.",
+                field="vector_filter_identity",
+                space=space,
+                table=scan.table.name,
+                table_id=scan.table.table_id,
+                record_id=record_id,
+                page=ref.page,
+                slot=ref.slot,
+                index=identity_index.name,
+            )
+        if not row_admits(ref, version):
+            raise GrafxIndexError(
+                f"Vector hit {record_id} no longer satisfies its snapshot-stable row filter.",
+                field="vector_hit_filter",
+                space=space,
+                table=scan.table.name,
+                record_id=record_id,
+            )
+        materialised.append((ref, record_id, score, version))
+
+    context.count("vector_filtered_accesses")
+    context.count("vector_rows_materialized", len(materialised))
+    rows: list[_Row] = []
+    for ref, _record_id, score, version in materialised:
+        if threshold_value is not None and not _passes(
+            node.threshold_operator, score, threshold_value
+        ):
+            continue
+        bindings = dict(row_of(ref, version).bindings)
+        bindings[node.score_column] = score
+        rows.append(_Row(bindings=bindings))
+    return tuple(rows)
+
+
 def _materialised_vector_search(
     engine: QueryEngine, vectors: object, node: VectorSearch, context: _Context
 ) -> Iterator[_Row]:
@@ -6168,7 +6507,7 @@ def _materialised_vector_search(
 
 
 def _record_vector_search_statistics(
-    context: _Context, result: object, candidate_count: int
+    context: _Context, result: object, candidate_count: int | None
 ) -> None:
     """Record the common vector outcome for both physical candidate paths."""
     regime = getattr(result, "regime")
@@ -6177,7 +6516,7 @@ def _record_vector_search_statistics(
         "vector_regime_exact", 0
     ) + (1 if regime == "exact" else 0)
     context.count("vector_hits", len(hits))
-    if candidate_count and not hits:
+    if candidate_count is not None and candidate_count > 0 and not hits:
         # Silence here is the wrong answer to give a caller: the candidate source admitted rows
         # and the search came back with nothing.  Inventing rows would be worse, so keep the
         # empty answer observable whichever physical path supplied the cardinality.
@@ -10951,6 +11290,9 @@ def _ordered(operator: str, left: object, right: object) -> object:
     """Return an ordering comparison, which is unknown across kinds that have no order."""
     if left is None or right is None or not _comparable(left, right):
         return None
+    if isinstance(left, Timestamp) and isinstance(right, Timestamp):
+        left = left.micros
+        right = right.micros
     if operator == "<":
         return left < right  # type: ignore[operator]
     if operator == "<=":
@@ -12788,7 +13130,7 @@ def _sort_key(value: object) -> tuple[int, object]:
     direction is reversed.
     """
     if value is None:
-        return (5, 0)
+        return (6, 0)
     if isinstance(value, bool):
         return (0, int(value))
     if isinstance(value, (int, float)):
@@ -12799,9 +13141,11 @@ def _sort_key(value: object) -> tuple[int, object]:
         return (2, value)
     if isinstance(value, (bytes, bytearray)):
         return (3, bytes(value))
+    if isinstance(value, Timestamp):
+        return (4, value.micros)
     if isinstance(value, RowBinding):
-        return (4, _binding_identity(value))
-    return (6, repr(value))
+        return (5, _binding_identity(value))
+    return (7, repr(value))
 
 
 def _truth(value: object) -> bool | None:
@@ -12838,6 +13182,8 @@ def _comparable(left: object, right: object) -> bool:
     if isinstance(left, str) and isinstance(right, str):
         return True
     if isinstance(left, (bytes, bytearray)) and isinstance(right, (bytes, bytearray)):
+        return True
+    if isinstance(left, Timestamp) and isinstance(right, Timestamp):
         return True
     return isinstance(left, bool) and isinstance(right, bool)
 

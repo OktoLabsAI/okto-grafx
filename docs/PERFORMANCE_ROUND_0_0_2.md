@@ -2096,3 +2096,64 @@ and grouped slice passed 412 cases, the delegated adjacent slice passed 1,922, a
 were clean. The former C6 retarget residual is closed as marginal after removing this duplicated
 work rather than becoming a new target. Format, WAL bytes, OCC, durability, writer ordering and the
 multiwriter/multireader premises are unchanged.
+
+## Pulse stabilization — typed timestamp cursor pagination
+
+Status: **implemented and validated against the live Pulse 0.3.3 runtime; promotion pending**.
+
+Pulse decodes a graph-page cursor into an ISO timestamp string while Grafx stores the corresponding
+property as a typed `Timestamp`. The former query compared these unlike values, yielding Cypher
+UNKNOWN, and Grafx itself did not define ordering even after both sides were explicitly converted
+to `Timestamp`. Grafx now compares and sorts two timestamp values by their UTC microsecond count.
+The paired Pulse Core templates explicitly use `timestamp($cursor_ts)` in both the untyped and
+node-type-specific cursor variants.
+
+The focused contract covers chronological comparison, tied `(created_at, id)` keyset boundaries
+and the Core template/service forwarding. Against the real default Pulse data home, three
+consecutive pages returned 500 nodes each with zero repeated ids, and the Browser UI advanced
+from 500 to 1,000 visible nodes while preserving `Load more (1000+)`. The change affects neither
+stored bytes nor transaction, recovery or concurrency semantics.
+
+## Scale-removal batch 52 — index-driven Pulse filtered-vector search
+
+Status: **implemented on `feature/v0.0.2`; focused and adjacent correctness gates green; Nexus handoff `hof_978789c9dba543dfa2ebb3d1de295fca` independently verified PASS**.
+
+The Pulse search shape previously materialized the complete `FilterRows(NodeScan(SingleRow))`
+child before vector search, preserving O(N) row allocation even when HNSW could answer a bounded
+page. The optimized route accepts only that exact single-table shape, a top-level non-null vector
+guard, and a closed row-local predicate grammar made from null checks, equality/inequality,
+boolean composition and `coalesce` over scalar properties/literals/parameters. Every other plan
+keeps the canonical executor.
+
+Candidate discovery remains owned by the certified vector index. Exhaustion at or below the exact
+threshold retains at most that many validated vectors and physical witnesses, so scoring does not
+repeat the heap scan. Crossing `threshold + 1` retains no unbounded id set; HNSW resolves candidate
+membership lazily through the catalog-v2 identity index. Approximate admission authenticates the
+HNSW entry's exact `RecordRef` against that identity result before its score may enter the answer.
+A missing identity or a divergent physical ref fails closed rather than silently shrinking or
+misranking results.
+
+Two work bounds are explicit. A proven empty filter returns before evaluating unused vector
+arguments or consulting the identity index. An approximate request whose `k` exceeds configured
+`ef_search` declines this private route; canonical child materialization then discovers the exact
+filtered cardinality and clamps the HNSW request instead of widening the private traversal toward
+O(N). The exact proof still scans to exhaustion when selectivity is at or below the threshold;
+removing that worst-case O(N) proof requires a separate secondary predicate index and is not
+claimed here. Once `threshold + 1` rows establish the approximate regime, pages and rows not
+subsequently visited are outside this query's accessed-data validation boundary; full latent
+corruption discovery remains the verifier's responsibility, as in the other bounded access paths.
+
+Fourteen focused tests cover exact/approximate parity, absence of child materialization, empty
+short-circuit, physical-ref divergence, large-k fallback, unsupported predicates/snapshots/budgets,
+catalog-v1/stale fallback, legacy search-signature compatibility and a bounded ref visitor with
+more live entries than buckets. The directly affected
+vector, HNSW, index and query slice also passed, together with Ruff, compileall and diff checks.
+No persisted format, vector ranking rule, WAL/OCC, recovery, durability or multiwriter/multireader
+premise changed.
+
+The independent differential harness used 300 nodes with null vectors, historical updates and
+deletes; four predicate selectivities (218, 118, 57 and 0 admitted rows); and `k` values 1, 11 and
+100,000. Optimized, canonical and formula-derived oracle results agreed throughout. Boundary runs
+at `T-1`, `T` and `T+1` preserved both result and exact/approximate regime. In the small exact
+DIM384 case, the optimized median was 56.7 ms versus 63.7 ms canonical (about 11% lower), with no
+`rows_scanned`; this is a local small-N measurement, not a large-graph or end-to-end claim.

@@ -9,6 +9,23 @@
 
 ## Estado de execução — 2026-09-03
 
+- **Paginação do Knowledge Graph e acesso vetorial filtrado Pulse corrigidos no worktree de
+  `0.0.2`.** A falha de `Load more` foi reproduzida no Pulse real: o cursor ISO era comparado com
+  `Timestamp`, produzindo `UNKNOWN`. O Grafx agora ordena/compara timestamps por micros UTC e o
+  Core converte explicitamente o cursor nas duas queries. A API retornou três páginas de 500 sem
+  repetição e a UI avançou de 500 para 1.000 nós. Em seguida, o caminho Pulse de
+  `FilterRows(NodeScan)` deixou de materializar o child inteiro quando sua forma é estritamente
+  provada: filtros pequenos são preparados uma vez e filtros maiores usam HNSW com resolução lazy
+  pelo índice de identidade. A admissão autentica `(record_id, RecordRef)`, filtro vazio preserva
+  o short-circuit e `k > ef_search` volta ao caminho canônico para não alargar a travessia até
+  O(N). Predicados e ambientes fora da prova continuam integralmente no executor anterior. Treze
+  testes focais, regressão seletiva vetorial/query, Ruff, compileall e diff-check estão verdes. O
+  harness Nexus `hof_978789c9dba543dfa2ebb3d1de295fca`, com 300 nós, quatro seletividades,
+  `k={1,11,100000}` e limites `T-1/T/T+1`, confirmou paridade integral e foi verificado PASS. Não
+  houve mudança de formato, WAL/OCC, durabilidade
+  ou premissas multiwriter/multireader. Detalhes e limitações honestas estão em
+  `docs/PERFORMANCE_ROUND_0_0_2.md`, lote 52.
+
 - **Milestone de hot paths publicado em `9603115` (2026-09-04).** Foram concluídos os recortes
   limitados de heap/catalog bootstrap, projeção e sincronização de índices, segunda leitura de
   controle sob pin válido, caches de query por `Database`, packing/decode de slots, retenção de

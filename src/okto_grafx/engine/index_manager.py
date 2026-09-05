@@ -2734,6 +2734,37 @@ class IndexStore:
                         refs.append(RecordRef.decode(encoded_ref))
         return tuple(refs)
 
+    def _visit_entry_refs_until(self, visitor: Callable[[RecordRef], bool]) -> bool:
+        """Visit validated refs until the callback stops, without retaining an O(N) tuple.
+
+        One page is copied and unpinned before the callback runs.  A filtered vector proof may
+        therefore stop after ``threshold + 1`` qualifying rows without first walking every index
+        page, while no page pin crosses into heap I/O or query-predicate code.  ``True`` means the
+        index was exhausted; ``False`` means the callback established its bound and stopped.
+        """
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                refs: list[RecordRef] = []
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for _slot, image in page.iter_slot_views():
+                        _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
+                            _validated_image(image)
+                        )
+                        refs.append(RecordRef.decode(encoded_ref))
+                for ref in refs:
+                    keep_going = visitor(ref)
+                    if type(keep_going) is not bool:
+                        raise GrafxIndexError(
+                            "An internal bounded index visitor must return True or False.",
+                            field="index_visitor",
+                            index=self.name,
+                            value=type(keep_going).__name__,
+                        )
+                    if not keep_going:
+                        return False
+        return True
+
     def _matching_entries_on(
         self, page_index: PageIndex, key: bytes, ref: RecordRef | None = None
     ) -> tuple[IndexEntry, ...]:

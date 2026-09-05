@@ -277,6 +277,44 @@ class _MaterializedCandidateFilter:
         return record_id in self.record_ids
 
 
+@dataclass(frozen=True, slots=True)
+class _FilteredCandidateProof:
+    """A bounded proof produced while the vector index still owns candidate discovery.
+
+    ``candidates`` is present only when the certified index was exhausted at or below the exact
+    threshold.  The proof then carries the complete, already space-validated set and its physical
+    references, so scoring does not repeat either the heap scan or the predicate.  ``None`` means
+    that ``threshold + 1`` admitted rows were witnessed: it proves only the approximate regime and
+    deliberately retains neither an O(N) id set nor a false exact cardinality.
+    """
+
+    space: EmbeddingSpaceDef
+    index: VectorHnswIndex
+    table_id: int
+    position: int
+    read_lsn: Lsn
+    candidates: tuple[tuple[RecordId, tuple[float, ...]], ...] | None
+    locations: tuple[tuple[RecordId, RecordRef], ...] | None
+    owner: object
+
+
+@dataclass(frozen=True, slots=True)
+class _LazyFilteredCandidateFilter:
+    """The predicate used by HNSW after a bounded proof established an approximate regime."""
+
+    record_predicate: Callable[[RecordId], bool]
+    entry_predicate: Callable[[RecordId, RecordRef], bool]
+
+    @property
+    def cardinality(self) -> None:
+        """Keep the selective size honest: the proof established a lower bound, not a count."""
+        return None
+
+    def admits(self, record_id: RecordId) -> bool:
+        """Resolve membership lazily so rejected HNSW nodes remain traversal bridges."""
+        return self.record_predicate(record_id)
+
+
 def _require_positive_k(k: int) -> int:
     """Return the requested neighbour count, refusing one that could not describe a result."""
     if isinstance(k, bool) or not isinstance(k, int):
@@ -392,6 +430,31 @@ def _guarded_admits(
                 f"{type(failure).__name__}.",
                 field="candidate_filter",
                 value=record_id,
+            ) from failure
+
+    return admits
+
+
+def _guarded_entry_admits(
+    candidate_filter: _LazyFilteredCandidateFilter,
+) -> Callable[[RecordId, RecordRef], bool]:
+    """Contain a private ref-aware predicate without dropping a membership failure."""
+    inner = candidate_filter.entry_predicate
+
+    def admits(record_id: RecordId, ref: RecordRef) -> bool:
+        """Ask about the exact HNSW entry whose score may influence the traversal."""
+        try:
+            return bool(inner(record_id, ref))
+        except GrafxError:
+            raise
+        except Exception as failure:  # noqa: BLE001 - translated, never swallowed
+            raise GrafxIndexError(
+                f"The candidate filter of this search failed on record {record_id}: "
+                f"{type(failure).__name__}.",
+                field="candidate_filter",
+                value=record_id,
+                page=ref.page,
+                slot=ref.slot,
             ) from failure
 
     return admits
@@ -1347,6 +1410,7 @@ class VectorHnswIndex(ProximityIndex):
         admits: Callable[[RecordId], bool] | None = None,
         *,
         ef: int | None = None,
+        entry_admits: Callable[[RecordId, RecordRef], bool] | None = None,
     ) -> tuple[tuple[ScoredEntry, ...], TraversalStats]:
         """Return the best visible, admitted versions for a query, with traversal statistics.
 
@@ -1366,6 +1430,12 @@ class VectorHnswIndex(ProximityIndex):
         the build verified (commits landing during the build are caught up, in bounded passes),
         a commit past the last pass leaves the mark behind, and the NEXT search takes it.
         """
+        if admits is not None and entry_admits is not None:
+            raise GrafxConfigurationError(
+                "A vector traversal accepts either a record filter or a ref-aware entry "
+                "filter, never both.",
+                field="candidate_filter",
+            )
         predicate = _require_snapshot(snapshot)
         read_lsn = self._require_exact_read_lsn(predicate)
 
@@ -1389,10 +1459,12 @@ class VectorHnswIndex(ProximityIndex):
                 entry = entries.get(node)
                 if entry is None or not entry_visible(entry, predicate):
                     return False
-                if admits is None:
-                    return True
                 record = records.get(node)
-                return record is not None and bool(admits(record))
+                if record is None:
+                    return False
+                if entry_admits is not None:
+                    return bool(entry_admits(record, entry.ref))
+                return admits is None or bool(admits(record))
 
             ranked, stats = picture.graph.search(query, width, visible_and_admitted)
             scored = [
@@ -1522,6 +1594,16 @@ class VectorEngine:
     def exact_scan_threshold(self) -> int:
         """Return the filtered cardinality at or below which a search scans exactly."""
         return self._threshold
+
+    def _supports_bounded_filtered_k(self, k: int) -> bool:
+        """Say whether private filtered HNSW keeps its configured, non-linear work bound.
+
+        The public vector API may widen ``ef`` to honour a larger requested ``k``.  The query
+        optimizer has a canonical materialising fallback which can clamp ``k`` to the actual
+        filtered cardinality, so this private path declines requests that would widen its HNSW
+        beam beyond the configured search width.
+        """
+        return type(k) is int and 1 <= k <= self._ef_search
 
     def spaces(self) -> tuple[EmbeddingSpaceDef, ...]:
         """Return every embedding space of the catalog, ordered by numeric identity."""
@@ -2288,6 +2370,249 @@ class VectorEngine:
             return None
         return index.snapshot_frontier_live_count(snapshot)
 
+    def _prepare_filtered_candidates(
+        self,
+        *,
+        space: object,
+        snapshot: object,
+        table_id: object,
+        position: object,
+        row_admits: object,
+    ) -> _FilteredCandidateProof | None:
+        """Prove a row-filtered regime without materialising an unbounded record-id set.
+
+        This is a private query-engine seam, not a general candidate-filter API.  Its caller has
+        already proved a single-table, row-independent, total predicate and a current immutable
+        snapshot.  The vector index remains the candidate authority: it reads visible heap
+        versions once, asks the predicate about each row, and stops as soon as ``threshold + 1``
+        admissions prove that the ordinary planner must choose the approximate regime.
+
+        If the index is exhausted first, the retained set is complete and at most the configured
+        exact threshold.  Every admitted vector has been validated against the declared embedding
+        space before the proof leaves the stable index view, preserving BR-1's validate-before-
+        score rule.  ``None`` is an optional-gate refusal; corruption and adopted-index failures
+        remain typed failures and are never converted into a different access path.
+        """
+        if (
+            type(space) is not str
+            or not space
+            or type(snapshot) is not Snapshot
+            or type(table_id) is not int
+            or table_id < 1
+            or type(position) is not int
+            or position < 0
+            or not callable(row_admits)
+        ):
+            return None
+        definition = self._catalog.catalog.space(space)
+        index = self.index(space)
+        self._require_committed_search_index(index, definition)
+        if index.definition.table_id != table_id or index.definition.positions != (position,):
+            return None
+        frontier_count = index.snapshot_frontier_live_count(snapshot)
+        if type(frontier_count) is not int or frontier_count <= 0:
+            return None
+        read_lsn = index._require_exact_read_lsn(snapshot)
+
+        def scan(certificate: object) -> _FilteredCandidateProof:
+            """Read one certified generation until exact completion or a strict lower bound."""
+            self._refresh_heap_view(index.file, certificate)
+            candidates: list[tuple[RecordId, tuple[float, ...]]] = []
+            locations: dict[RecordId, RecordRef] = {}
+            scanned: set[int] = set()
+
+            def visible(_record_id: int, xmin: int, xmax: int) -> bool:
+                """Select snapshot-visible rows; membership remains the query predicate's job."""
+                return snapshot.visible(xmin, xmax)
+
+            def visit(ref: RecordRef) -> bool:
+                """Consume one unpinned index ref and stop at the strict regime witness."""
+                encoded = ref.encode()
+                if encoded in scanned:
+                    return True
+                scanned.add(encoded)
+                version = self._heap.read_if(ref, visible)
+                if version is None:
+                    return True
+                if version.table_id != table_id:
+                    raise GrafxCorruptionDetected(
+                        f"Vector index {index.name!r} points to table id {version.table_id}, not "
+                        f"its declared table id {table_id}.",
+                        file=index.file,
+                        field="table_id",
+                        index=index.name,
+                        space=space,
+                        table_id=table_id,
+                        actual_table_id=version.table_id,
+                        page=ref.page,
+                        slot=ref.slot,
+                    )
+                admitted = row_admits(ref, version)
+                if type(admitted) is not bool:
+                    raise GrafxIndexError(
+                        "The internal row filter must return exactly True or False.",
+                        field="candidate_filter",
+                        value=type(admitted).__name__,
+                        record_id=version.record_id,
+                    )
+                if not admitted:
+                    return True
+                stored = self._vector_of_version(definition, version, ref)
+                require_space_identity(definition, stored.space_ref, origin="stored vector")
+                previous = locations.get(version.record_id)
+                if previous is not None:
+                    raise _duplicate_version(definition, version.record_id, ref, previous)
+                locations[version.record_id] = ref
+                candidates.append((version.record_id, stored.values))
+                return len(candidates) <= self._threshold
+
+            exhausted = index._visit_entry_refs_until(visit)
+            if not exhausted:
+                return _FilteredCandidateProof(
+                    space=definition,
+                    index=index,
+                    table_id=table_id,
+                    position=position,
+                    read_lsn=read_lsn,
+                    candidates=None,
+                    locations=None,
+                    owner=self._candidate_filter_seal,
+                )
+
+            return _FilteredCandidateProof(
+                space=definition,
+                index=index,
+                table_id=table_id,
+                position=position,
+                read_lsn=read_lsn,
+                candidates=tuple(candidates),
+                locations=tuple(locations.items()),
+                owner=self._candidate_filter_seal,
+            )
+
+        return index._stable_view(read_lsn, scan)
+
+    def _prepared_filtered_candidate_count(self, proof: object) -> int | None:
+        """Return an exact prepared count, or ``None`` for the lower-bound-only regime."""
+        if type(proof) is not _FilteredCandidateProof or proof.owner is not self._candidate_filter_seal:
+            raise GrafxIndexError(
+                "A filtered candidate count needs a proof minted by this vector engine.",
+                field="candidate_filter_proof",
+            )
+        return None if proof.candidates is None else len(proof.candidates)
+
+    def _search_prepared_filtered_candidates(
+        self,
+        proof: object,
+        *,
+        query: Sequence[float],
+        k: int,
+        snapshot: object,
+        record_admits: object,
+        entry_admits: object,
+    ) -> VectorSearchResult:
+        """Score a proof minted by this engine, preserving the ordinary two-regime contract."""
+        if (
+            type(proof) is not _FilteredCandidateProof
+            or proof.owner is not self._candidate_filter_seal
+            or type(snapshot) is not Snapshot
+            or proof.read_lsn != snapshot.read_lsn
+            or not callable(record_admits)
+            or not callable(entry_admits)
+        ):
+            raise GrafxIndexError(
+                "A prepared filtered vector search must carry this engine's exact snapshot proof.",
+                field="candidate_filter_proof",
+            )
+        definition = self._catalog.catalog.space(proof.space.name)
+        _require_positive_k(k)
+        components = validate_query_components(definition, query)
+        index = self.index(definition.name)
+        self._require_committed_search_index(index, definition)
+        if (
+            definition != proof.space
+            or index is not proof.index
+            or index.definition.table_id != proof.table_id
+            or index.definition.positions != (proof.position,)
+        ):
+            raise GrafxIndexError(
+                "The vector authority changed after the filtered candidate proof was prepared.",
+                field="candidate_filter_proof",
+                space=proof.space.name,
+                retryable=True,
+            )
+
+        if proof.candidates is None:
+            # The preparation proved only ``actual cardinality > threshold``.  Keep the reported
+            # cardinality unknown rather than mislabelling threshold+1 as an exact count.  Since
+            # the certified space itself contains that many admitted rows, the ordinary planner's
+            # conservative space-size estimate selects the same approximate regime.  If a foreign
+            # commit changed the latest live count meanwhile, ``search`` still remains correct and
+            # may conservatively take its exact path over this lazy predicate.
+            return self.search(
+                space=definition.name,
+                query=components,
+                k=k,
+                snapshot=snapshot,
+                candidate_filter=_LazyFilteredCandidateFilter(
+                    record_predicate=record_admits,
+                    entry_predicate=entry_admits,
+                ),
+            )
+
+        locations = dict(proof.locations or ())
+        candidate_count = len(proof.candidates)
+        if len(locations) != candidate_count:
+            raise GrafxIndexError(
+                "A prepared exact vector proof lost its one-to-one physical witnesses.",
+                field="candidate_filter_proof",
+                space=definition.name,
+            )
+        space_size = index.live_count()
+        plan = plan_regime(
+            space_size=space_size,
+            filter_cardinality=candidate_count,
+            threshold=self._threshold,
+        )
+        if not plan.is_exact:
+            raise GrafxIndexError(
+                "A bounded filtered proof cannot be reclassified outside the exact threshold.",
+                field="candidate_filter_proof",
+                space=definition.name,
+                candidate_count=candidate_count,
+                threshold=self._threshold,
+            )
+        started = self._reading()
+        self._observe_phase(plan.regime, PHASE_PLAN, started)
+        started = self._reading()
+        ranked = (
+            self._math.top_k(components, proof.candidates, k, definition.metric)
+            if proof.candidates
+            else []
+        )
+        self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
+        started = self._reading()
+        retired = not definition.is_active
+        hits = tuple(
+            VectorHit(
+                record_id=record_id,
+                score=score,
+                ref=locations[record_id],
+                retired=retired,
+            )
+            for record_id, score in ranked
+        )
+        self._observe_phase(REGIME_EXACT, PHASE_VALIDATE, started)
+        self._publish_search_metrics(plan, len(hits))
+        return VectorSearchResult(
+            hits=hits,
+            regime=plan.regime,
+            achieved_k=len(hits),
+            requested_k=k,
+            space=definition.name,
+            filter_cardinality=candidate_count,
+        )
+
     def search(
         self,
         *,
@@ -2525,8 +2850,24 @@ class VectorEngine:
     ) -> tuple[VectorHit, ...]:
         """Traverse the versioned index, evaluating the filter during navigation."""
         started = self._reading()
-        admits = _guarded_admits(candidate_filter)
-        scored, _stats = index.search(query, k, snapshot, admits)
+        entry_admits = (
+            _guarded_entry_admits(candidate_filter)
+            if type(candidate_filter) is _LazyFilteredCandidateFilter
+            else None
+        )
+        admits = None if entry_admits is not None else _guarded_admits(candidate_filter)
+        if entry_admits is None:
+            # Preserve the established positional call for subclasses/adapters implementing the
+            # original VectorHnswIndex.search seam. Only the private filtered path opts into the
+            # new ref-aware keyword.
+            scored, _stats = index.search(query, k, snapshot, admits)
+        else:
+            scored, _stats = index.search(
+                query,
+                k,
+                snapshot,
+                entry_admits=entry_admits,
+            )
         self._observe_phase(REGIME_APPROXIMATE, PHASE_TRAVERSE, started)
         started = self._reading()
         retired = not space.is_active

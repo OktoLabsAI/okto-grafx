@@ -745,6 +745,62 @@ def test_timestamp_reads_iso_forms_into_utc_microseconds(
 
 
 @pytest.mark.parametrize(
+    ("operator", "expected"),
+    (("<", True), ("<=", True), (">", False), (">=", False)),
+)
+def test_timestamp_values_support_chronological_ordering(
+    stack: QueryStack, operator: str, expected: bool
+) -> None:
+    """TIMESTAMP is an ordered scalar, not an opaque value that yields UNKNOWN."""
+
+    found = run(
+        stack,
+        f"RETURN timestamp($earlier) {operator} timestamp($later)",
+        {
+            "earlier": "2024-01-02T03:04:05.123456Z",
+            "later": "2024-01-02T03:04:05.123457Z",
+        },
+    )
+
+    assert found.rows == ((expected,),)
+
+
+def test_timestamp_keyset_pagination_orders_by_instant_then_id() -> None:
+    """The Pulse cursor shape returns the rows strictly after a tied boundary."""
+
+    built = build_query_stack()
+    ddl = built.transaction()
+    built.engine.execute(
+        "CREATE NODE TABLE Event(id STRING, created_at TIMESTAMP, PRIMARY KEY(id))",
+        ddl,
+    )
+    built.apply_schema(ddl)
+    built.insert("Event", 1, ("newest", Timestamp(_INSTANT_MICROS + 2)))
+    built.insert("Event", 2, ("tie-c", Timestamp(_INSTANT_MICROS + 1)))
+    built.insert("Event", 3, ("tie-b", Timestamp(_INSTANT_MICROS + 1)))
+    built.insert("Event", 4, ("oldest", Timestamp(_INSTANT_MICROS)))
+
+    page = built.engine.execute(
+        "MATCH (n:Event) "
+        "WHERE n.created_at < timestamp($cursor_ts) "
+        "OR (n.created_at = timestamp($cursor_ts) AND n.id < $cursor_id) "
+        "RETURN n.id, n.created_at "
+        "ORDER BY n.created_at DESC, n.id DESC LIMIT $max_rows",
+        built.transaction(read_lsn=1000),
+        {
+            "cursor_ts": "2024-01-02T03:04:05.000001Z",
+            "cursor_id": "tie-c",
+            "max_rows": 2,
+        },
+    )
+
+    assert page.rows == (
+        ("tie-b", Timestamp(_INSTANT_MICROS + 1)),
+        ("oldest", Timestamp(_INSTANT_MICROS)),
+    )
+
+
+@pytest.mark.parametrize(
     ("written", "micros"),
     (
         ("1970-01-01T00:00:00Z", 0),
