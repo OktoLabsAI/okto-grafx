@@ -5606,20 +5606,22 @@ class IndexManager:
 
     def validate_staged_records(
         self, txn: StagingTransaction, records: Sequence[object]
-    ) -> None:
+    ) -> bool:
         """Prove that every staged WAL effect is owned by this registry's staging state.
 
         ``TransactionContext.pending_records`` is reachable to callers because indexes stage
         through that protocol. A caller must not be able to inject an ABORT/outcome record or an
         extra logical change that is replayed after restart but was never applied on the live
         commit path. The decoded multiset must exactly match the changes held by the registered
-        indexes for this transaction.
+        indexes for this transaction. The returned RESET fact comes from that same mandatory
+        decode and is trusted only by the exact built-in manager; existing callers may ignore it.
         """
         authorised = {
             index.definition.registry_key: index
             for index in self._transaction_indexes(txn)
         }
         actual: list[IndexChange] = []
+        contains_index_reset = False
         for position, record in enumerate(records):
             if not isinstance(record, WalRecord):
                 raise GrafxIndexError(
@@ -5654,6 +5656,9 @@ class IndexManager:
                     position=position,
                 )
             actual.append(change)
+            contains_index_reset = (
+                contains_index_reset or change.operation is IndexOperation.RESET
+            )
 
         expected = [
             change
@@ -5680,6 +5685,7 @@ class IndexManager:
                 actual=len(actual),
                 missing=missing.total(),
             )
+        return contains_index_reset
 
     def retarget_staged(
         self, txn: StagingTransaction, old_csn: Csn, new_csn: Csn

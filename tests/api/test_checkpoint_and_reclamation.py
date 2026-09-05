@@ -124,6 +124,65 @@ def test_checkpoint_validates_but_does_not_reapply_its_exact_local_dml_prefix(
         reopened.close()
 
 
+@pytest.mark.parametrize(
+    "proof_outcome",
+    ("contains-reset", "unverified"),
+)
+def test_reset_or_unverified_preflight_fact_uses_canonical_checkpoint_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    proof_outcome: str,
+) -> None:
+    """RESET and missing private authority decline only the shortcut, never the checkpoint."""
+    database = connect(str(tmp_path / proof_outcome), wal_segment_bytes=SEGMENT_BYTES)
+    nonempty_applies: list[int] = []
+    real_apply = CommitRedo.apply
+    real_reset_fact = CommitRedo._verified_contains_index_reset
+    try:
+        _seed_local_checkpoint_prefix(database)
+        local_redo = database._transactions._commit_redo
+
+        if proof_outcome == "contains-reset":
+
+            def report_reset(redo: CommitRedo, proof: object) -> bool | None:
+                observed = real_reset_fact(redo, proof)
+                assert observed is False
+                return True
+
+            monkeypatch.setattr(
+                CommitRedo,
+                "_verified_contains_index_reset",
+                report_reset,
+            )
+        else:
+            # Leave the genuine full proof in place for canonical page projection, but withhold
+            # the verified private proof consumed only by the shortcut.
+            monkeypatch.setattr(
+                CommitRedo,
+                "_verify_preflight_for",
+                lambda *_args, **_kwargs: None,
+            )
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+
+        database.checkpoint()
+
+        assert nonempty_applies, "declining the shortcut must retain canonical replay"
+        assert database.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("after",),
+        )
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+
 def test_identity_refill_extends_the_exact_local_checkpoint_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

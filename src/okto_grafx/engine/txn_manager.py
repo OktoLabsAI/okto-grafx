@@ -101,7 +101,7 @@ from okto_grafx.domain.ids import (
     RecordRef,
     TxnId,
 )
-from okto_grafx.domain.index.records import IndexOperation, change_of
+from okto_grafx.domain.index.records import change_of
 from okto_grafx.domain.index.catalog import (
     CatalogIndexDefinition,
     IndexGenerationDescriptor,
@@ -210,6 +210,9 @@ COMMIT_FLUSHES_TOTAL: str = "oktografx_commit_flushes_total"
 COMMIT_FOREIGN_COMMITS_TOTAL: str = "oktografx_commit_foreign_commits_total"
 COMMIT_RETARGETS_TOTAL: str = "oktografx_commit_retargets_total"
 
+_CANONICAL_VALIDATE_STAGED_RECORDS = IndexManager.validate_staged_records
+"""Exact validator whose decoded RESET fact may cross the private build-records boundary."""
+
 TRANSACTION_MANAGER_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
     for name in (
@@ -276,6 +279,7 @@ class _MaterializedAttempt:
     csn: Csn
     pages: dict[tuple[str, PageIndex], Page]
     page_stamps: dict[PageIndex, tuple[_HeapVersionStamp, ...]] | None = None
+    contains_index_reset: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3980,7 +3984,7 @@ class TransactionManager:
         through: Lsn,
         *,
         touched_catalog: bool,
-        index_records: Sequence[WalRecord],
+        contains_index_reset: bool | None,
     ) -> bool:
         """Say whether an exact checkpoint suffix was already applied by this process.
 
@@ -4001,9 +4005,8 @@ class TransactionManager:
             or self._own_published_lsn != through
             or self._index_authority_sync_required
             or type(self._index_manager) is not IndexManager
+            or contains_index_reset is not False
         ):
-            return False
-        if any(change_of(record).operation is IndexOperation.RESET for record in index_records):
             return False
         # Live commit flushes heap and index files before publishing. A dirty resident frame is
         # evidence that some later/local work escaped that completed prefix, so it revokes the
@@ -4093,11 +4096,22 @@ class TransactionManager:
             allow_unregistered_indexes=touched_catalog,
             _passage=redo_passage,
         )
+        verified_full_preflight = self._commit_redo._verify_preflight_for(
+            replay,
+            full_preflight,
+            allow_unregistered_indexes=touched_catalog,
+            passage=redo_passage,
+        )
+        if verified_full_preflight is not None:
+            full_preflight = verified_full_preflight
+        contains_index_reset = self._commit_redo._verified_contains_index_reset(
+            full_preflight
+        )
         skip_reapply = self._can_skip_locally_applied_redo(
             checkpoint,
             through,
             touched_catalog=touched_catalog,
-            index_records=index_records,
+            contains_index_reset=contains_index_reset,
         )
         page_result = None
         if not skip_reapply:
@@ -4571,6 +4585,14 @@ class TransactionManager:
                                 records, images, materialized_csn = self._build_records(
                                     txn, lease.epoch, rows
                                 )
+                            materialized_attempt = self._materialized
+                            contains_index_reset = (
+                                materialized_attempt.contains_index_reset
+                                if materialized_attempt is not None
+                                and materialized_attempt.txn_id == int(txn.txn_id)
+                                and materialized_attempt.csn == materialized_csn
+                                else None
+                            )
                             txn.validate_budgets()
                             with self._close_wait_hazard():
                                 planned_csn = self._wal.planned_terminal_lsn(records)
@@ -4607,16 +4629,7 @@ class TransactionManager:
                                 and activation_plan is None
                                 and identities is not None
                                 and type(self._index_manager) is IndexManager
-                                and not any(
-                                    record.record_type
-                                    in (
-                                        int(WalRecordType.INDEX_WRITE),
-                                        int(WalRecordType.INDEX_RECONCILE),
-                                    )
-                                    and change_of(record).operation
-                                    is IndexOperation.RESET
-                                    for record in records
-                                )
+                                and contains_index_reset is False
                             )
                             self._validate_lease(lease)
                             if commit_trace is not None:
@@ -5089,10 +5102,10 @@ class TransactionManager:
 
     def _validate_pending_index_records(
         self, txn: TransactionContext, records: Sequence[object]
-    ) -> None:
-        """Require staged logical records to match the index manager's private staging."""
+    ) -> bool | None:
+        """Require staged records to match private staging and return a trusted RESET fact."""
         if not records:
-            return
+            return False
         manager = self._index_manager
         validator = getattr(manager, "validate_staged_records", None)
         if manager is None or not callable(validator):
@@ -5104,7 +5117,15 @@ class TransactionManager:
                 txn_id=txn.txn_id,
             )
         with self._close_wait_hazard():
-            validator(txn, records)
+            contains_index_reset = validator(txn, records)
+        if (
+            type(manager) is IndexManager
+            and getattr(validator, "__func__", None)
+            is _CANONICAL_VALIDATE_STAGED_RECORDS
+            and isinstance(contains_index_reset, bool)
+        ):
+            return contains_index_reset
+        return None
 
     def _find_conflict(
         self,
@@ -5345,7 +5366,7 @@ class TransactionManager:
         else:
             self._stage_index_changes(txn, rows, predicted)
         pending = list(txn.pending_records)
-        self._validate_pending_index_records(txn, pending)
+        contains_index_reset = self._validate_pending_index_records(txn, pending)
         images: list[tuple[str, PageIndex, bytes]] = []
         records: list[WalRecordLike] = []
         self._materialized = _MaterializedAttempt(
@@ -5353,6 +5374,7 @@ class TransactionManager:
             csn=predicted,
             pages={},
             page_stamps=page_stamps,
+            contains_index_reset=contains_index_reset,
         )
         for file, page_index in staged:
             image = txn.page_images.get((file, page_index))

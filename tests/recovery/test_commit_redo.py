@@ -151,6 +151,19 @@ def _index_record(
     )
 
 
+def _reset_record(lsn: int = 1) -> WalRecord:
+    """Return one valid RESET carried by INDEX_WRITE, not a distinct WAL type."""
+    change = IndexChange(
+        index="by_name",
+        operation=IndexOperation.RESET,
+        ref=RecordRef(2, 0),
+        csn=11,
+    )
+    return wal_record_for(change, epoch=1, txn_id=7, descriptor=DESCRIPTOR).with_lsn(
+        lsn
+    )
+
+
 def _commit_record(lsn: int = 4) -> WalRecord:
     return WalRecord(
         record_type=int(WalRecordType.COMMIT),
@@ -575,6 +588,79 @@ def test_a_passage_bound_preflight_reuses_the_prepared_page_decode(
     assert pool.codec.decode_calls == 1
     assert calls == [0]
     assert result.page_images_applied == 1
+
+
+@pytest.mark.parametrize(
+    ("record", "contains_reset"),
+    (
+        (_index_record(IndexOperation.INSERT, 1), False),
+        (_reset_record(), True),
+    ),
+    ids=("ordinary-dml", "reset"),
+)
+def test_only_a_verified_full_preflight_exposes_its_reset_fact(
+    record: WalRecord,
+    contains_reset: bool,
+) -> None:
+    """The shortcut fact is decoded once and remains private until the proof is verified."""
+    redo = CommitRedo(_PoolDouble(), _IndexManagerDouble([]))  # type: ignore[arg-type]
+    replay = CommittedReplay(effects=(record,), last_committed_lsn=record.lsn)
+    passage = object()
+
+    proof = redo.preflight(replay, _passage=passage)
+
+    assert redo._verified_contains_index_reset(proof) is None
+    verified = redo._verify_preflight_for(
+        replay,
+        proof,
+        allow_unregistered_indexes=False,
+        passage=passage,
+    )
+    assert verified is not None
+    assert redo._verified_contains_index_reset(verified) is contains_reset
+
+
+def test_an_invalid_index_payload_cannot_produce_a_reset_fact() -> None:
+    """Malformed bytes still fail the mandatory preflight instead of becoming an unknown fact."""
+    redo = CommitRedo(_PoolDouble(), _IndexManagerDouble([]))  # type: ignore[arg-type]
+    damaged = WalRecord(
+        record_type=int(WalRecordType.INDEX_WRITE),
+        payload=b"",
+        descriptor=DESCRIPTOR,
+        epoch=1,
+        txn_id=7,
+        lsn=1,
+    )
+
+    with pytest.raises(GrafxCorruptionDetected):
+        redo.preflight(
+            CommittedReplay(effects=(damaged,), last_committed_lsn=1),
+            _passage=object(),
+        )
+
+
+@pytest.mark.parametrize("mismatch", ("replay", "passage", "owner"))
+def test_an_incompatible_preflight_exposes_no_reset_fact(mismatch: str) -> None:
+    """Wrong replay, passage or owner is an optimization miss, never borrowed authority."""
+    redo = CommitRedo(_PoolDouble(), _IndexManagerDouble([]))  # type: ignore[arg-type]
+    other = CommitRedo(_PoolDouble(), _IndexManagerDouble([]))  # type: ignore[arg-type]
+    replay = CommittedReplay(effects=(_reset_record(),), last_committed_lsn=1)
+    different = CommittedReplay(
+        effects=(_index_record(IndexOperation.INSERT, 2),),
+        last_committed_lsn=2,
+    )
+    passage = object()
+    proof = redo.preflight(replay, _passage=passage)
+
+    verified = (other if mismatch == "owner" else redo)._verify_preflight_for(
+        different if mismatch == "replay" else replay,
+        proof,
+        allow_unregistered_indexes=False,
+        passage=object() if mismatch == "passage" else passage,
+    )
+
+    assert verified is None
+    assert redo._verified_contains_index_reset(verified) is None
 
 
 @pytest.mark.parametrize(

@@ -188,7 +188,7 @@ def test_staged_record_multiset_accepts_order_and_preserves_duplicate_counts(
     first = database.exact.stage_insert(txn, b"ada", RecordRef(1, 1), 0)
     second = database.exact.stage_insert(txn, b"grace", RecordRef(1, 2), 0)
 
-    database.manager.validate_staged_records(txn, (second, first))
+    assert database.manager.validate_staged_records(txn, (second, first)) is False
 
     with pytest.raises(GrafxIndexError) as duplicated:
         database.manager.validate_staged_records(txn, (first, first))
@@ -200,6 +200,17 @@ def test_staged_record_multiset_accepts_order_and_preserves_duplicate_counts(
     assert missing.value.details["expected"] == 2
     assert missing.value.details["actual"] == 1
     assert missing.value.details["missing"] == 1
+
+
+def test_staged_record_validation_reports_reset_from_its_mandatory_decode(
+    database: Database,
+) -> None:
+    """RESET uses INDEX_WRITE, so only the decoded operation can certify its presence."""
+    txn = PendingTransaction(10)
+    token = database.exact._claim_rebuild("validate RESET fact")  # noqa: SLF001
+    reset = database.exact.stage_reset(txn, BORN, rebuild_token=token)
+
+    assert database.manager.validate_staged_records(txn, (reset,)) is True
 
 
 def test_persisted_index_entries_refuse_the_provisional_stamp_as_corruption() -> None:

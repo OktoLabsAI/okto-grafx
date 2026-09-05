@@ -18,7 +18,7 @@ from okto_grafx.domain.errors import (
     GrafxRecoveryRefused,
 )
 from okto_grafx.domain.ids import Lsn, NO_LSN
-from okto_grafx.domain.index.records import change_of
+from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.txn.records import decode_page_write, is_redoable_page_file
@@ -91,6 +91,7 @@ class _PreflightedReplay:
     allow_page_coalescing: bool
     record_signature: tuple[tuple[object, ...], ...]
     signature_verified: bool
+    contains_index_reset: bool
     prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...]
 
 
@@ -143,7 +144,7 @@ class CommitRedo:
         if proof is not None:
             prepared_pages = proof.prepared_pages
         else:
-            prepared_pages, _signature = self._preflight(
+            prepared_pages, _signature, _contains_index_reset = self._preflight(
                 replay.effects,
                 allow_unregistered_indexes=False,
             )
@@ -281,7 +282,7 @@ class CommitRedo:
                 field="allow_unregistered_indexes",
                 value=type(allow_unregistered_indexes).__name__,
             )
-        prepared_pages, signature = self._preflight(
+        prepared_pages, signature, contains_index_reset = self._preflight(
             replay.effects,
             allow_unregistered_indexes=allow_unregistered_indexes,
         )
@@ -297,8 +298,42 @@ class CommitRedo:
             allow_page_coalescing=len(prepared_pages) == len(replay.effects),
             record_signature=signature,
             signature_verified=False,
+            contains_index_reset=contains_index_reset,
             prepared_pages=prepared_pages,
         )
+
+    def _verify_preflight_for(
+        self,
+        replay: CommittedReplay,
+        preflighted: object,
+        *,
+        allow_unregistered_indexes: bool,
+        passage: object,
+    ) -> object | None:
+        """Consume one exact proof once so later private facts need no second decode.
+
+        A caller that cannot prove the object belongs to this redo instance, replay and passage
+        receives ``None``. That is a conservative optimization miss: canonical replay remains
+        responsible for the effects.
+        """
+        compatible = self._compatible_preflight(
+            replay,
+            preflighted,
+            allow_unregistered_indexes=allow_unregistered_indexes,
+            passage=passage,
+        )
+        return None if compatible is None else self._verified_preflight(compatible)
+
+    def _verified_contains_index_reset(self, preflighted: object) -> bool | None:
+        """Return the RESET fact only from this instance's already-verified private proof."""
+        if (
+            not isinstance(preflighted, _PreflightedReplay)
+            or preflighted.seal is not _PREFLIGHT_SEAL
+            or preflighted.owner is not self
+            or not preflighted.signature_verified
+        ):
+            return None
+        return preflighted.contains_index_reset
 
     def _ensure_preflight(
         self,
@@ -371,6 +406,7 @@ class CommitRedo:
                 for source_position, _prepared in source.prepared_pages
             ),
             signature_verified=True,
+            contains_index_reset=False,
             prepared_pages=prepared_pages,
         )
 
@@ -422,6 +458,7 @@ class CommitRedo:
             allow_page_coalescing=proof.allow_page_coalescing,
             record_signature=proof.record_signature,
             signature_verified=True,
+            contains_index_reset=proof.contains_index_reset,
             prepared_pages=proof.prepared_pages,
         )
 
@@ -470,9 +507,11 @@ class CommitRedo:
     ) -> tuple[
         tuple[tuple[int, _PreparedPageEffect], ...],
         tuple[tuple[object, ...], ...],
+        bool,
     ]:
         """Refuse an incomplete or malformed dispatch plan before the first mutation."""
         missing_manager_lsn: Lsn | None = None
+        contains_index_reset = False
         simulated_page_counts: dict[str, int] = {}
         prepared_pages: list[tuple[int, _PreparedPageEffect]] = []
         signature: list[tuple[object, ...]] = []
@@ -561,6 +600,9 @@ class CommitRedo:
                 simulated_page_counts[write.file] = max(present, write.page_index + 1)
             if record.record_type in _INDEX_EFFECTS:
                 change = change_of(record)
+                contains_index_reset = (
+                    contains_index_reset or change.operation is IndexOperation.RESET
+                )
                 manager = self._index_manager
                 if manager is None:
                     if missing_manager_lsn is None:
@@ -618,7 +660,7 @@ class CommitRedo:
                 field="index_manager",
                 lsn=missing_manager_lsn,
             )
-        return tuple(prepared_pages), tuple(signature)
+        return tuple(prepared_pages), tuple(signature), contains_index_reset
 
     @staticmethod
     def _coalesce_page_plan(
