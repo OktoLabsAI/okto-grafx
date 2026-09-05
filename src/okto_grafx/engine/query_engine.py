@@ -10212,11 +10212,22 @@ def _ended_by_this_transaction(context: _Context) -> set[object]:
     not exist yet -- so the scan will find it and would answer "this row already exists" about a
     row the caller has just said it wants gone.
     """
+    row_intents = getattr(context.txn, "row_intents", ())
+    if not any(held.operation == _HELD_DELETE for held in context.staged_rows) and not any(
+        getattr(intent, "operation", None) is RowOperation.DELETE for intent in row_intents
+    ):
+        # DELETE is the only input that can make _transaction_row_view report an ended row.
+        # Most relationship-ingestion transactions only append INSERT intents; avoid rebuilding
+        # every dirty table's complete row view for each endpoint seek in that overwhelmingly
+        # common case.  The seek's own table view still performs its canonical pending-reference
+        # validation immediately after this precheck.
+        return set()
+
     ended: set[object] = set()
     tables: dict[int, TableDef] = {}
     for held in context.staged_rows:
         tables[held.table.table_id] = held.table
-    for intent in getattr(context.txn, "row_intents", ()):
+    for intent in row_intents:
         intent_table = getattr(intent, "table", None)
         if getattr(intent_table, "table_id", None) is not None:
             tables[intent_table.table_id] = intent_table  # type: ignore[union-attr]

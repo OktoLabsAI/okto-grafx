@@ -1829,3 +1829,23 @@ and multiprocess rehash passed 6. The final grouped query/index/DDL/recovery/mul
 passed all 321 collected cases in about 94 seconds. The Pulse candidate/transfer consumer slice
 passed 57 cases. Ruff, compileall and diff checks were clean. No on-disk format, WAL order, OCC
 pass, durability barrier, writer ordering or multiwriter/multireader premise changed.
+
+## Scale-removal batch 42 — DELETE-aware ended-row precheck
+
+Status: **implemented on `feature/v0.0.2`; focused correctness gate green**.
+
+`_ended_by_this_transaction` used to rebuild the complete transaction row view once per dirty
+table at every relationship endpoint seek. Because `_transaction_row_view` filters the full intent
+list for each table, an insert-only batch paid `O(T * P)` merely to prove that the ended set was
+empty. `DELETE` and held-delete are the only inputs that can produce an ended row, so the helper
+now scans those two bounded transaction inputs once and returns the exact empty result when both
+are absent. Any DELETE delegates to the unchanged canonical table views.
+
+The independent discovery harness measured 1,500 Pulse-shaped relationships spread over 30
+relationship tables, in batches of 500: `_transaction_row_view` calls fell from `60.17` to `2.03`
+per relationship and median wall time from `21.147 s` to `11.687 s` (`-44.7%`), with disjoint
+three-run bands, identical 1,500-row output and clean `verify("all")`. This is a relationship-phase
+measurement, not a universal database throughput claim. Focused tests prove the insert-only
+short-circuit, mandatory delegation when DELETE exists, MERGE after DELETE, relationship
+read-your-writes and immediate same-table malformed-pending refusal. WAL, OCC, durability, format,
+writer ordering and multiwriter/multireader behavior are unchanged.

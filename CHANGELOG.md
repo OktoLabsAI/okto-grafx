@@ -61,6 +61,10 @@ including the on-disk format.
 
 ### Changed
 
+- Relationship seeks now reject the transaction-wide ended-row precheck immediately when neither
+  staged rows nor durable row intents contain a `DELETE`. Insert-only Pulse batches therefore no
+  longer rebuild every dirty table's row view for every endpoint seek; DELETE/read-your-writes
+  semantics and the seek table's pending-reference validation remain on the canonical path.
 - Exact built-in statements with a closed table footprint and their canonical commit path now
   derive index authority only from the tables actually touched. The commit-local projection is
   created after OCC/rebase and index synchronization, under the existing writer lease and
