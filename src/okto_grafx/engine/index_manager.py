@@ -142,6 +142,11 @@ from okto_grafx.engine.buffer_pool import (
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import metric
 
+# Bind the shortcut to the implementation audited with the raw-image witness protocol. A
+# dynamic class lookup could otherwise let a later monkeypatch claim ``unchanged`` without the
+# mandatory physical observation.
+_BUFFER_POOL_OBSERVE_FRESH_PAGE = BufferPool._observe_fresh_page
+
 __all__ = [
     "INDEX_DIRECTORY",
     "INDEX_FLAG_STALE",
@@ -316,6 +321,14 @@ class _IndexReadCertificate:
 
     seq: int
     header: IndexHeader
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshCertificateMemo:
+    """One atomically paired pool witness and semantic certificate for the same bytes."""
+
+    witness: object
+    certificate: _IndexReadCertificate
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +516,7 @@ class IndexStore:
         "_cache_certificate",
         "_local_certificate",
         "_carried_certificate",
+        "_fresh_certificate_memo",
         "_rebuild_authority",
         "_completed_rebuild_through",
         "_replaying",
@@ -558,6 +572,10 @@ class IndexStore:
         # it is consumed one-shot, dropped by every local page-0 write and by every refusal,
         # and it is never what certifies a traversal -- the fresh post-read still is.
         self._carried_certificate: _IndexReadCertificate | None = None
+        # Lazy and bounded to one raw page image plus its matching semantic certificate. The
+        # pool witness still performs a physical read on every use; it authorises only skipping
+        # decode when every byte is identical to this previously validated image.
+        self._fresh_certificate_memo: _FreshCertificateMemo | None = None
         # Set only after RESET has re-proved the durable stale generation while holding the
         # file's page-0 write section. It is the authority required to publish healthy again.
         self._rebuild_authority: _RebuildAuthority | None = None
@@ -975,10 +993,37 @@ class IndexStore:
 
     def _fresh_certificate(self) -> _IndexReadCertificate:
         """Collect one detached, checksum-verified certificate directly from the device."""
-        page = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
-        return _IndexReadCertificate(
+        memo = self._fresh_certificate_memo
+        if type(self._pool) is not BufferPool:
+            self._fresh_certificate_memo = None
+            page = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
+            return _IndexReadCertificate(
+                seq=page.seq, header=self._decode_header_page(page)
+            )
+        page, witness = _BUFFER_POOL_OBSERVE_FRESH_PAGE(
+            self._pool,
+            self.file,
+            HEADER_PAGE_INDEX,
+            None if memo is None else memo.witness,
+        )
+        if page is None:
+            if memo is not None and witness is memo.witness:
+                return memo.certificate
+            # A custom observer returned an unauthenticated unchanged verdict. Re-read through
+            # the established public door instead of pairing its value with unrelated semantics.
+            self._fresh_certificate_memo = None
+            fallback = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
+            return _IndexReadCertificate(
+                seq=fallback.seq, header=self._decode_header_page(fallback)
+            )
+        certificate = _IndexReadCertificate(
             seq=page.seq, header=self._decode_header_page(page)
         )
+        self._fresh_certificate_memo = _FreshCertificateMemo(
+            witness=witness,
+            certificate=certificate,
+        )
+        return certificate
 
     def _remember_local_certificate(self) -> _IndexReadCertificate:
         """Bind resident derived state to the page-0 image this handle just published.
@@ -1205,6 +1250,7 @@ class IndexStore:
         # ``_cache_certificate`` alone (position advance, reconciliation watermark); any of
         # them makes a carried certificate a stale impression of the device.
         self._carried_certificate = None
+        self._fresh_certificate_memo = None
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             self._require_file_header(page)
             page.update_slot(INDEX_HEADER_SLOT, header.encode())

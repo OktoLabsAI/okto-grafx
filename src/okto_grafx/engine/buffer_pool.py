@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, ContextDecorator, contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import wraps
 from itertools import islice
 from struct import calcsize
@@ -93,6 +94,19 @@ _READ_VIEW_BASELINE_UNSET: object = object()
 _READ_VIEW_MAX_TARGETS: int = 1024
 _CLEAN_CANDIDATE_LINGER_PER_FILE: int = 32
 """Clean hot pages retained in the D-10 candidate index to avoid read-path set churn."""
+
+_FRESH_PAGE_WITNESS_SEAL: object = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshPageWitness:
+    """Pool-owned proof that one immutable raw image passed the full read protocol."""
+
+    seal: object
+    owner: object
+    file: str
+    page_index: PageIndex
+    image: bytes
 
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
 BUFFER_RETAINED_ESTIMATE_BYTES: str = "oktografx_buffer_retained_estimate_bytes"
@@ -1305,6 +1319,34 @@ class BufferPool:
             self._invalidate_descriptor_identity(file)
             return self._read_page(file, page_index)
 
+    def _observe_fresh_page(
+        self,
+        file: str,
+        page_index: PageIndex,
+        previous: object | None = None,
+    ) -> tuple[Page | None, object]:
+        """Read the device and return a page only when its proved raw image changed.
+
+        ``None`` means byte-for-byte equality with the exact witness returned by this pool for
+        this location. The physical read and descriptor-identity invalidation still happen.
+        Unknown, foreign or wrong-location witnesses simply miss and take the complete torn-read,
+        checksum and structural decode path.
+        """
+        _require_page_index("page_index", page_index)
+        deferred = (
+            nullcontext() if self._metrics_defer is None else self._metrics_defer()
+        )
+        with deferred:
+            self._invalidate_descriptor_identity(file)
+            page, witness = self._read_page_observation(
+                file,
+                page_index,
+                previous=previous,
+                produce_witness=True,
+            )
+        assert witness is not None
+        return page, witness
+
     @_guarded
     def unpin(
         self,
@@ -2503,17 +2545,60 @@ class BufferPool:
 
     def _read_page(self, file: str, page_index: PageIndex) -> Page:
         """Read one page, applying the torn-read protocol of CONTRACT.md section 6.3."""
+        page, _witness = self._read_page_observation(
+            file,
+            page_index,
+            previous=None,
+            produce_witness=False,
+        )
+        assert page is not None
+        return page
+
+    def _read_page_observation(
+        self,
+        file: str,
+        page_index: PageIndex,
+        *,
+        previous: object | None,
+        produce_witness: bool,
+    ) -> tuple[Page | None, _FreshPageWitness | None]:
+        """Run the canonical read protocol, optionally reusing an exact raw-image proof."""
+        known = (
+            previous
+            if isinstance(previous, _FreshPageWitness)
+            and previous.seal is _FRESH_PAGE_WITNESS_SEAL
+            and previous.owner is self
+            and previous.file == file
+            and previous.page_index == page_index
+            else None
+        )
         failure: GrafxCorruptionDetected | None = None
         for attempt in range(TORN_READ_RETRY_BUDGET + 1):
             raw = self._storage.read_page(file, page_index)
+            if known is not None and raw == known.image:
+                return None, known
             if is_unwritten_image(raw, self._page_size):
                 # The device zero-fills what it allocates, so an image of nothing but zeros is a
                 # page nobody has written yet: free, not damaged. Spending the retry budget on it
                 # and then declaring corruption would turn the ordinary gap between a page
                 # allocation and the write that follows it into a false integrity incident.
-                return Page(
-                    int(PageType.FREE), page_size=self._page_size, page_index=page_index
+                page = Page(
+                    int(PageType.FREE),
+                    page_size=self._page_size,
+                    page_index=page_index,
                 )
+                witness = (
+                    _FreshPageWitness(
+                        seal=_FRESH_PAGE_WITNESS_SEAL,
+                        owner=self,
+                        file=file,
+                        page_index=page_index,
+                        image=bytes(raw),
+                    )
+                    if produce_witness
+                    else None
+                )
+                return page, witness
             if self._metrics_active():
                 self._metrics.increment(
                     CHECKSUM_VERIFICATIONS_TOTAL, 1.0, self._page_labels
@@ -2540,7 +2625,18 @@ class BufferPool:
                 )
                 continue
             page.page_index = page_index
-            return page
+            witness = (
+                _FreshPageWitness(
+                    seal=_FRESH_PAGE_WITNESS_SEAL,
+                    owner=self,
+                    file=file,
+                    page_index=page_index,
+                    image=bytes(raw),
+                )
+                if produce_witness
+                else None
+            )
+            return page, witness
         raise GrafxCorruptionDetected(
             f"Page {page_index} of {file!r} could not be read after "
             f"{TORN_READ_RETRY_BUDGET + 1} attempts.",

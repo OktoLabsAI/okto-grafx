@@ -2686,6 +2686,244 @@ def test_read_fresh_page_revalidates_its_name_before_the_device_read() -> None:
     assert device.trace == [f"identity:{FILE}", f"read:{FILE}:0"]
 
 
+def test_fresh_page_witness_skips_only_the_repeated_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact witness saves validation work, never the authoritative device observation."""
+    device = DescriptorIdentityRecordingDevice()
+    metrics = RecordingMetrics()
+    pool = make_pool(device, metrics)
+    seed_pages(pool, 1)
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        raw: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(raw))
+        return original_decode(codec, raw, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+    device.read_calls.clear()
+
+    first, witness = pool._observe_fresh_page(FILE, 0)
+
+    assert first is not None
+    assert first.read_slot(0) == b"page-0"
+    assert witness is not None
+    assert len(decode_calls) == 1
+    assert len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL)) == 1
+    assert device.read_calls == [(FILE, 0)]
+    assert device.identity_invalidations == [FILE]
+    assert device.trace == [f"identity:{FILE}", f"read:{FILE}:0"]
+
+    device.identity_invalidations.clear()
+    device.trace.clear()
+    device.read_calls.clear()
+    verification_count = len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+    decode_count = len(decode_calls)
+
+    repeated, repeated_witness = pool._observe_fresh_page(FILE, 0, witness)
+
+    assert repeated is None
+    assert repeated_witness is witness
+    assert len(decode_calls) == decode_count
+    assert len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL)) == verification_count
+    assert device.read_calls == [(FILE, 0)]
+    assert device.identity_invalidations == [FILE]
+    assert device.trace == [f"identity:{FILE}", f"read:{FILE}:0"]
+
+
+@pytest.mark.parametrize("wrong_authority", ["pool", "file", "page"])
+def test_fresh_page_witness_with_wrong_authority_takes_the_full_decode_path(
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_authority: str,
+) -> None:
+    """Byte equality cannot cross the process-local pool/location authority boundary."""
+    device = DescriptorIdentityRecordingDevice()
+    source_metrics = RecordingMetrics()
+    source = make_pool(device, source_metrics)
+    seed_pages(source, 2)
+    _page, witness = source._observe_fresh_page(FILE, 0)
+    target_pool = source
+    target_metrics = source_metrics
+    target_file = FILE
+    target_page = 0
+    raw = device.raw_page(FILE, 0)
+
+    if wrong_authority == "pool":
+        target_metrics = RecordingMetrics()
+        target_pool = make_pool(device, target_metrics)
+    elif wrong_authority == "file":
+        target_file = "catalog.dat"
+        device.create(target_file)
+        device.allocate(target_file)
+        device.poke_page(target_file, 0, raw)
+    else:
+        target_page = 1
+        device.poke_page(FILE, target_page, raw)
+
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        image: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(image))
+        return original_decode(codec, image, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    verifications_before = len(target_metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+    device.identity_invalidations.clear()
+    device.trace.clear()
+    device.read_calls.clear()
+
+    observed, replacement = target_pool._observe_fresh_page(
+        target_file,
+        target_page,
+        witness,
+    )
+
+    assert observed is not None
+    assert observed.read_slot(0) == b"page-0"
+    assert replacement is not witness
+    assert len(decode_calls) == 1
+    assert (
+        len(target_metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+        == verifications_before + 1
+    )
+    assert device.read_calls == [(target_file, target_page)]
+    assert device.identity_invalidations == [target_file]
+    assert device.trace == [
+        f"identity:{target_file}",
+        f"read:{target_file}:{target_page}",
+    ]
+
+
+def test_fresh_page_witness_decodes_changed_bytes_even_with_the_same_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shortcut proves the complete raw image, not merely its sequence counter."""
+    device = DescriptorIdentityRecordingDevice()
+    metrics = RecordingMetrics()
+    pool = make_pool(device, metrics)
+    seed_pages(pool, 1)
+    original, witness = pool._observe_fresh_page(FILE, 0)
+    assert original is not None
+    original_seq = original.seq
+    changed = pool.codec.decode_page(device.raw_page(FILE, 0), verify=True)
+    changed.update_slot(0, b"changed")
+    changed.seq = original_seq
+    changed_image = pool.codec.encode_page(changed)
+    assert changed_image != device.raw_page(FILE, 0)
+    device.poke_page(FILE, 0, changed_image)
+
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        image: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(image))
+        return original_decode(codec, image, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    verifications_before = len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+
+    observed, replacement = pool._observe_fresh_page(FILE, 0, witness)
+
+    assert observed is not None
+    assert observed.read_slot(0) == b"changed"
+    assert observed.seq == original_seq
+    assert replacement is not witness
+    assert len(decode_calls) == 1
+    assert (
+        len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+        == verifications_before + 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_checksum_failures"),
+    [
+        ("crc_near_header", TORN_READ_RETRY_BUDGET + 1),
+        ("crc_last_byte", TORN_READ_RETRY_BUDGET + 1),
+        ("odd_sequence", 0),
+    ],
+)
+def test_fresh_page_witness_never_certifies_crc_or_odd_sequence_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    expected_checksum_failures: int,
+) -> None:
+    """Changed invalid bytes retain bounded retries and fail without issuing a witness."""
+    device = MemoryDevice()
+    metrics = RecordingMetrics()
+    pool = make_pool(device, metrics)
+    seed_pages(pool, 1)
+    _page, witness = pool._observe_fresh_page(FILE, 0)
+
+    def damaged_read(_file: str, _page_index: PageIndex, raw: bytes) -> bytes:
+        if damage == "odd_sequence":
+            return torn_image(raw)
+        image = bytearray(raw)
+        offset = PAGE_HEADER_SIZE if damage == "crc_near_header" else len(image) - 1
+        image[offset] ^= 0xFF
+        return bytes(image)
+
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        image: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(image))
+        return original_decode(codec, image, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    device.page_reader = damaged_read
+    device.read_calls.clear()
+    verifications_before = len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+    failures_before = len(metrics.values_of(CHECKSUM_FAILURES_TOTAL))
+    sentinel = object()
+    outcome: object = sentinel
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        outcome = pool._observe_fresh_page(FILE, 0, witness)
+
+    attempts = TORN_READ_RETRY_BUDGET + 1
+    assert outcome is sentinel
+    assert raised.value.details["attempts"] == attempts
+    assert device.read_calls == [(FILE, 0)] * attempts
+    assert len(decode_calls) == attempts
+    assert (
+        len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+        == verifications_before + attempts
+    )
+    assert (
+        len(metrics.values_of(CHECKSUM_FAILURES_TOTAL))
+        == failures_before + expected_checksum_failures
+    )
+
+
 def test_fenced_page_zero_write_revalidates_its_name_before_the_cas_read() -> None:
     device = DescriptorIdentityRecordingDevice()
     pool = make_pool(
