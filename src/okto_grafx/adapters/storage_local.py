@@ -1710,8 +1710,15 @@ class LocalStorageDevice:
         directory = self._root
         identity = self._root_identity
         prefix = ""
-        for segment in name.split("/")[:-1]:
-            resolved = self._resolved_child(directory, identity, prefix, segment, name)
+        for position, segment in enumerate(name.split("/")[:-1]):
+            resolved = self._resolved_child(
+                directory,
+                identity,
+                prefix,
+                segment,
+                name,
+                parent_prevalidated=position == 0,
+            )
             if resolved is None:
                 return
             candidate, information = resolved
@@ -1740,16 +1747,27 @@ class LocalStorageDevice:
         prefix: str,
         segment: str,
         name: str,
+        *,
+        parent_prevalidated: bool = False,
     ) -> tuple[str, os.stat_result] | None:
         """Resolve one exact-case child while its parent keeps the proved identity.
 
-        The parent is checked before and after both the listing and the child's ``lstat``. Thus
-        a directory exchanged for a junction between either system call is refused without
-        resolving the real path of the child. A plain child inherits containment from that
-        proved parent exactly as entries of ``_walk`` do.
+        The parent is checked before and after both the listing and the child's ``lstat``. The
+        caller may carry the immediately preceding root check into the first step; the final
+        check still brackets the listing, while avoiding two consecutive observations of the
+        same root. Thus a directory exchanged for a junction between either system call is
+        refused without resolving the real path of the child. A plain child inherits containment
+        from that proved parent exactly as entries of ``_walk`` do.
         """
         label = prefix[:-1] if prefix else self._root
-        self._require_directory_identity(label, directory, identity)
+        parent_is_prevalidated_root = (
+            parent_prevalidated
+            and directory == self._root
+            and identity == self._root_identity
+            and prefix == ""
+        )
+        if not parent_is_prevalidated_root:
+            self._require_directory_identity(label, directory, identity)
         try:
             entries = tuple(os.listdir(directory))
         except (FileNotFoundError, NotADirectoryError):
@@ -1799,7 +1817,14 @@ class LocalStorageDevice:
         prefix = ""
         segments = name.split("/")
         for index, segment in enumerate(segments):
-            resolved = self._resolved_child(directory, identity, prefix, segment, name)
+            resolved = self._resolved_child(
+                directory,
+                identity,
+                prefix,
+                segment,
+                name,
+                parent_prevalidated=index == 0,
+            )
             if resolved is None:
                 return None
             candidate, information = resolved

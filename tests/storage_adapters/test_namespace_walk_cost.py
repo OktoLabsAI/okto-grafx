@@ -374,6 +374,10 @@ def test_identity_namespace_doors_do_not_rederive_real_paths(
     with _counting_syscalls() as exists_calls:
         assert device.exists(CONTROL)
     assert exists_calls["realpath"] == 0, dict(exists_calls)
+    # The initial root observation is also the pre-listing proof for the first component. The
+    # root is observed again after that listing, and each nested directory keeps its independent
+    # before/after bracket. A duplicate root check here used to make this seven lstat calls.
+    assert exists_calls["lstat"] == 6, dict(exists_calls)
 
     staging = "control/qw3.next"
     target = "control/qw3.state"
@@ -389,6 +393,36 @@ def test_identity_namespace_doors_do_not_rederive_real_paths(
     with _counting_syscalls() as remove_calls:
         device.remove(target)
     assert remove_calls["realpath"] == 0, dict(remove_calls)
+
+
+def test_parent_prevalidation_never_skips_an_intermediate_directory_proof(
+    board: tuple[LocalStorageDevice, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device, root = board
+    control = root / "control"
+    identity = os.lstat(control)
+    proofs = 0
+    require_identity = device._require_directory_identity
+
+    def counting_proof(
+        label: str, directory: str, expected: tuple[int, int]
+    ) -> None:
+        nonlocal proofs
+        proofs += 1
+        require_identity(label, directory, expected)
+
+    monkeypatch.setattr(device, "_require_directory_identity", counting_proof)
+    device._resolved_child(
+        str(control),
+        (identity.st_dev, identity.st_ino),
+        "control/",
+        "commit.state",
+        CONTROL,
+        parent_prevalidated=True,
+    )
+
+    # A future caller cannot turn this root-only fast path into a skipped intermediate proof.
+    assert proofs == 2
 
 
 def test_a_cold_descriptor_miss_does_not_rederive_real_paths(
