@@ -1328,3 +1328,32 @@ common replay, live hot batches, empty-build exclusion, table-local authority an
 staging. The independent review additionally exercised slotted-page iteration and repeated
 TOMBSTONE/REMOVE shapes; Ruff and diff checks were clean. No format, WAL, OCC, publication,
 durability, writer-lease or multiwriter/multireader rule changed.
+
+## Scale-removal batch 23 — class-based page-pin context
+
+Status: **completed in `b964155`; independent adversarial review PASS after two lifetime
+corrections**.
+
+`BufferPool.pinned()` now returns a private slotted context object instead of instantiating a
+generator context manager on every page acquisition. The optimization stops at this single hot
+door: `pin`, `unpin`, `page_write_fence` and every guard/section remain unchanged. Acquisition is
+still lazy; normal return, ordinary exceptions and `BaseException` unpin exactly once using the
+original page object and the value of `page.dirty` observed at exit. A pin failure performs no
+unpin, an unpin failure naturally replaces and chains the body error, distinct managers remain
+nestable, and each manager is single-use. `ContextDecorator` compatibility is also retained by
+creating an independent manager per decorated call.
+
+The first review found that a consumed object retained the pool and that `_recreate_cm` could
+revive a manager previously used by `with`. The promoted form clears pool/file/page authority on
+pin failure and before unpin (therefore also on unpin failure), and refuses recreation after any
+use. A retained consumed context can no longer keep the device, locks or callbacks alive. These
+are lifetime/authority requirements, not optional performance trade-offs.
+
+Claude's public profile placed generator-context machinery at `0.152 / 6.699 s` (`2.3%`) of the
+read workload and `0.195 / 14.433 s` (`1.4%`) of writing. The final full-contract class measured
+`0.563464 -> 0.428061 s` over 300,000 no-op pin bodies (`1.316x`) in a same-interpreter component
+micro. Consequently the honest endpoint ceilings are only about `1.006x` read and `1.003x` write;
+this batch is a broad fixed-cost reduction, not a material product-level multiplier, and no other
+context-manager churn is opened from it. All 154 buffer-pool cases and 367 adjacent heap/index/
+recovery cases passed, plus Ruff and diff checks. Format, WAL/OCC, durability, publication,
+writer-lease and multiwriter/multireader semantics are unchanged.
