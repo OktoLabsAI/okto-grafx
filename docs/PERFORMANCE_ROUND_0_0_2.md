@@ -1870,3 +1870,50 @@ proves one open/three revalidations, real lock acquisition on every entry, clean
 idle-thread admission, cross-thread cold fallback, close draining and retry/OCC lifecycle.
 No descriptor survives the lexical transaction boundary, and no format, WAL, OCC, durability or
 multiwriter/multireader contract changes.
+
+## Scale-removal batch 44 — exact publication without repeated copies
+
+Status: **completed in `19882b9`; Nexus and independent validation PASS**.
+
+Exact built-in `int`, `float`, and `str` results now cross the publication boundary without
+re-entering the generic canonicalizer after their shared range/length guards have succeeded.
+`bool`, subclasses, foreign values, invalid limits, and hostile objects retain the complete
+canonical route and its error taxonomy. Projection field labels and `ReturnItem.name` are derived
+once per result shape rather than once per row; an empty child remains lazy and does not invent a
+name evaluation.
+
+Structural instrumentation over 20,000 rows reduced `ReturnItem.name` calls from 40,040 to 30,
+`_builtin_int` calls from 60,054 to 46, and `_builtin_text` calls from 40,053 to 50. Timing noise
+was larger than the small endpoint delta, so no wall-clock claim or gate was introduced. The
+executor ran 479 focused cases and the independent validation reran the public query boundaries,
+operation outputs, path projection and exact-publication cases. No persisted format, public value
+semantics, WAL/OCC, durability, writer ordering or multiwriter/multireader premise changed.
+
+## Scale-removal batch 45 — physically proved checkpoint watermark scope
+
+Status: **completed in `5a85af8`; grouped 99/99 and Nexus handoff PASS**.
+
+The mandatory full redo preflight already decodes and checksum-verifies every page image. Its
+private, passage-bound proof now also records the owning table id of each validated HEAP data page.
+Only the concrete built-in `IndexManager` may supply that classification. Non-heap files and heap
+OVERFLOW pages are proved irrelevant to a high-water walk; HEAP META/FREE/other images are unknown
+because extent/reclamation changes can remove the previous owner, so they force the canonical full
+photograph. A catalog page in the replay, an incompatible/forged proof, or a custom manager also
+forces the full path.
+
+With an exact scope, `table_watermark_photo` walks only touched tables plus newly-active tables not
+present in the manager's prior complete picture. Its answer still contains every active table.
+`IndexManager.open` can consume the complete picture taken by the same checkpoint holder and reads
+any missing table fresh. The public checkpoint reuses it only before releasing the same
+`COMMIT_SECTION`, so a foreign writer cannot cross the proof-to-use interval. Boot recovery keeps
+calling the full no-argument photograph.
+
+Six focused tests count physical high-water walks rather than time. A foreign writer changing a
+non-indexed property of A while A/B/C remain active makes the entire checkpoint walk only A; the
+returned watermarks still cover A/B/C. DDL, deliberately unproved page scope and an IndexManager
+lookalike each walk every active table. The grouped regression additionally caught and closed a
+newly-active-table `KeyError` in the same phase-B foreign-DDL scenario and retained the stable
+inventory fences. The pre-change populated T=40 profile attributed about 25.9--26.5% of writer
+time to full watermark walks; that is an opportunity ceiling, not a post-change timing claim.
+WAL continuity/preflight, both OCC passes, catalog adoption, index freshness, data barriers,
+durability and the original multiwriter/multireader premises remain unchanged.
