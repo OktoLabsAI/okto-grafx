@@ -67,7 +67,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import wraps
+from functools import lru_cache, wraps
 from types import TracebackType
 from typing import TypeVar
 
@@ -142,6 +142,9 @@ MAX_LOGICAL_NAME_LENGTH: int = 255
 
 MAX_NAME_SEGMENT_LENGTH: int = 128
 """Longest single segment of a logical name, well inside the limit of every common file system."""
+
+_LOGICAL_NAME_VALIDATION_CACHE_SIZE: int = 512
+"""Maximum successful exact-string logical-name proofs retained process-locally."""
 
 MAX_OPEN_FILES: int = 256
 """Default per-device descriptor-cache budget before least-recently-used eviction.
@@ -479,6 +482,20 @@ def normalize_logical_name(file: object) -> str:
     Windows refuses, names that resolve to a Windows character device and the reserved pending
     delete infix are all refused with GrafxUnsupportedOperation.
     """
+    if type(file) is str:
+        _validate_exact_logical_name(file)
+        return file
+    return _normalize_logical_name_uncached(file)
+
+
+@lru_cache(maxsize=_LOGICAL_NAME_VALIDATION_CACHE_SIZE)
+def _validate_exact_logical_name(file: str) -> None:
+    """Remember a bounded successful proof for one immutable built-in string."""
+    _normalize_logical_name_uncached(file)
+
+
+def _normalize_logical_name_uncached(file: object) -> str:
+    """Apply the canonical portable logical-name grammar without derived state."""
     if not isinstance(file, str):
         raise refuse_operation(
             "not_a_string",

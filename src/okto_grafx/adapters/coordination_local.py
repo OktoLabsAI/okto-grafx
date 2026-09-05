@@ -43,6 +43,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from math import isfinite
 from typing import TypeVar
 
@@ -214,6 +215,9 @@ _MAX_WAIT_ITERATIONS: int = (1 << 63) - 1
 
 _MAX_IDENTIFIER_LENGTH: int = 96
 """Longest accepted identifier of any kind. It has to fit in a file name on every platform."""
+
+_IDENTIFIER_VALIDATION_CACHE_SIZE: int = 512
+"""Maximum successful exact-string identifier proofs retained process-locally."""
 
 _READER_SUFFIX_BUDGET: int = 8
 """Room a reader identifier needs on top of the stored owner identifier, as in ``-r0001``."""
@@ -427,6 +431,22 @@ def _validate_identifier(
     relative traversal is refused for the same family of reasons: a control directory of ``..``
     would put the lease outside the database it is supposed to protect.
     """
+    if type(label) is str and type(value) is str and type(limit) is int:
+        _validate_exact_identifier(label, value, limit)
+        return value
+    return _validate_identifier_uncached(label, value, limit=limit)
+
+
+@lru_cache(maxsize=_IDENTIFIER_VALIDATION_CACHE_SIZE)
+def _validate_exact_identifier(label: str, value: str, limit: int) -> None:
+    """Remember a bounded successful proof for immutable built-in strings only."""
+    _validate_identifier_uncached(label, value, limit=limit)
+
+
+def _validate_identifier_uncached(
+    label: str, value: str, *, limit: int = _MAX_IDENTIFIER_LENGTH
+) -> str:
+    """Apply the canonical identifier grammar without consulting derived state."""
     if not isinstance(value, str) or not value:
         raise _reject(
             f"The {label} must be a non-empty string.", field=label, value=repr(value)
