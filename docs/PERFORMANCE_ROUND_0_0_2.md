@@ -1604,3 +1604,25 @@ median paired improvement for 3,000 trivial public reads and only a small/noisy 
 (`0.284 -> 0.275 s` median for 400 CREATEs). These are directional measurements, not release gates.
 No storage format, checksum/corruption check, WAL/OCC rule, durability, locking, writer lease or
 multiwriter/multireader premise changed.
+
+## Scale-removal batch 34 — reuse of the immediate root identity proof
+
+Status: **completed in `bce884c`; Nexus adversarial review
+`hof_8995dc6efa8848f0be519389b1a35a84` verified PASS**.
+
+Exact-name resolution and parent validation used to observe the storage root twice consecutively
+before listing the first component. There was no syscall, I/O or suspension point between those
+two identical no-follow identity checks. The first component now carries the immediately preceding
+root proof into `_resolved_child`; the post-listing proof and every independent before/after bracket
+for nested directories remain unchanged.
+
+The skip is structurally restricted to the actual root, its captured identity and an empty prefix.
+Passing the hint for an intermediate directory therefore still performs both identity proofs; a
+focused regression locks that fail-closed property. One representative two-component `exists`
+operation now performs six rather than seven `lstat` calls. A short five-write instrumented probe
+reduced total `lstat` calls from 956 to 874 (`-8.6%`); this is directional evidence for a cumulative
+fixed-cost saving, not a wall-clock gate or a universal endpoint claim.
+
+The 55-case namespace/revalidation slice passed with seven declared platform skips; Ruff and diff
+checks passed. Exact-case matching, redirected-path refusal, descriptor revalidation, format,
+WAL/OCC, durability, locking and multiwriter/multireader premises remain unchanged.
