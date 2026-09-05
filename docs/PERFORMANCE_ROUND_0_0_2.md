@@ -1357,3 +1357,62 @@ this batch is a broad fixed-cost reduction, not a material product-level multipl
 context-manager churn is opened from it. All 154 buffer-pool cases and 367 adjacent heap/index/
 recovery cases passed, plus Ruff and diff checks. Format, WAL/OCC, durability, publication,
 writer-lease and multiwriter/multireader semantics are unchanged.
+
+## Scale-removal batch 24 — transient HNSW trim scores
+
+Status: **completed in `cdcf8c4`; Nexus reviews
+`hof_1fbc7385740a457cbed30c71ab3b6cd4` and
+`hof_7df9f6701ce04867aaeb773949f8c356` verified PASS**.
+
+The first approximate query and `rebuild_vector_index()` were proved to be different work: the
+maintenance door rebuilds durable vector-index entries, while the query derives the process-local
+HNSW adjacency graph. Persisting that graph or lowering `vector_exact_scan_threshold=4096` was not
+selected. Instead, a cold HNSW build now retains the scores aligned with each full adjacency and,
+on the next overflow, computes only the newly appended peer before applying the same total sort.
+Removal keeps the aligned prefix or invalidates it conservatively; no beam, visit, ranking, recall,
+seed or construction parameter changed.
+
+This capability is enabled only when the exact concrete adapter class opts in. The built-in
+stateless `PureVectorMath` and `NumpyVectorMath` do; subclasses and custom adapters do not inherit
+the authorization. The complete cache is bounded by the graph edges during construction and is
+discarded in `finally` before either publication or failure propagation. Published graphs and
+incremental maintenance therefore retain no duplicate score residency.
+
+On the public default path (`auto` selecting Pure) with the approximate regime forced for a short
+controlled N=512 run, alternating medians moved from `9.45 -> 6.09 s` (`1.55x`) with identical
+answers. A direct default-adapter N=256/d=96 run measured `3.589 -> 2.144 s` (`1.67x`); a NumPy
+public cold run measured about `1.43x`, and direct instrumentation observed about 53% fewer score
+callbacks. These are cold-HNSW-build results, not universal endpoint multipliers: tables below the
+default threshold use exact scan and do not enter this path.
+
+The 165-case grouped vector/query/rebuild suite passed. Independent differentials compared full
+topology, hex scores, traversal statistics and searches under insertion plus remove/reinsert churn
+at N=128/400/800; a mutant without `_unlink` cache invalidation was detected. Ruff and diff checks
+were clean. No durable format, WAL/OCC rule, publication order, writer lease, durability guarantee
+or multiwriter/multireader premise changed.
+
+## Scale-removal batch 25 — unlocked participant descriptor reuse in `executemany`
+
+Status: **completed in `429d192`; independent adversarial review PASS after one fail-closed
+correction**.
+
+A durable `executemany` now keeps one participant lock-file descriptor open, but unlocked, inside
+the already-bounded public batch operation. Every preflight, item and settlement access continues
+to acquire and release the operating-system advisory lock. Reuse is keyed by thread and normalized
+section name, never crosses a batch, never covers `COMMIT_SECTION`, a writer lease, WAL/OCC work or
+publication, and is unavailable to memory coordinators or alternate coordinators without the
+private capability. The permanent lock file is never removed or replaced.
+
+Any acquire timeout, storage error or uncertain unlock evicts and closes the descriptor. The first
+review found that an exception while constructing the Python handle after a successful OS acquire
+could escape the cleanup region and leak the locked descriptor; construction is now inside the
+`BaseException`-protected region, and a discriminating `KeyboardInterrupt` injection proves that a
+second coordinator immediately acquires afterwards. Nested scopes, two threads, multiprocess
+contention, callbacks, fallback and reentrant close are also covered.
+
+For a three-item batch the structural count changed to one `os.open` while retaining five real OS
+acquires and five releases; another thread was admitted between items. A noisy 500-CREATE micro
+showed about `1.06x` conservatively after an earlier `1.24x` sample, so this is recorded as a small
+cumulative fixed-cost saving rather than a performance gate. All 572 `executemany` and coordination
+cases passed, plus Ruff and diff checks. Format, WAL/OCC, durability, writer-lease and
+multiwriter/multireader semantics remain unchanged.
