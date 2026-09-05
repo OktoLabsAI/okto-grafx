@@ -42,6 +42,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     SingleRow,
+    TraverseRelationship,
     UnionRows,
     VectorSearch,
 )
@@ -226,6 +227,112 @@ def test_repeated_internal_plan_validation_is_memoized_but_public_trees_are_inde
     assert all(left is not right for left, right in zip(first.walk(), second.walk()))
     object.__setattr__(first, "columns", ("changed",))
     assert second.columns == ("value",)
+
+
+def test_owned_plan_clone_recipe_keeps_mutable_literals_private() -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    source = {"nested": [1]}
+    raw = ProduceResults(
+        child=ProjectRows(
+            child=SingleRow(),
+            items=(ReturnItem(expression=Literal(source), alias="payload"),),
+        ),
+        columns=("payload",),
+    )
+    memo = public_views.OrderedDict()
+    first = public_views._query_plan_view(
+        raw,
+        internally_owned=True,
+        memo=memo,
+    )
+    first_literal = first.child.items[0].expression
+    assert type(first_literal) is Literal
+    assert first_literal.value == {"nested": (1,)}
+    first_literal.value["nested"] = (9,)  # type: ignore[index]
+    object.__setattr__(first, "columns", ("changed",))
+
+    second = public_views._query_plan_view(
+        raw,
+        internally_owned=True,
+        memo=memo,
+    )
+    second_literal = second.child.items[0].expression
+    assert type(second_literal) is Literal
+    assert second.columns == ("payload",)
+    assert second_literal is not first_literal
+    assert second_literal.value == {"nested": (1,)}
+    assert second_literal.value is not first_literal.value
+
+
+def test_owned_relationship_plan_rebuilds_schema_values_and_their_caches() -> None:
+    query = "MATCH (a:A)-[e:E]->(b:A) RETURN a.id, b.id, e.w"
+    with connect(":memory:") as database:
+        schema = database.begin("write")
+        schema.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+        schema.execute("CREATE REL TABLE E(FROM A TO A, w INT64)")
+        schema.commit()
+
+        first = database.explain(query)
+        second = database.explain(query)
+
+        first_traverse = next(
+            node for node in first.walk() if type(node) is TraverseRelationship
+        )
+        second_traverse = next(
+            node for node in second.walk() if type(node) is TraverseRelationship
+        )
+        first_table = first_traverse.table
+        second_table = second_traverse.table
+        assert first_table is not second_table
+        assert first_table.columns is not second_table.columns
+        assert all(
+            left is not right
+            for left, right in zip(
+                first_table.columns,
+                second_table.columns,
+                strict=True,
+            )
+        )
+        assert dict(second_table.column_positions) == {"_from": 0, "_to": 1, "w": 2}
+        assert all(
+            decode[3] is column
+            for decode, column in zip(
+                second_table._decode_plan,
+                second_table.columns,
+                strict=True,
+            )
+        )
+
+        object.__setattr__(first_table, "name", "Corrupted")
+        object.__setattr__(first_table.columns[-1], "name", "corrupted")
+        third = database.explain(query)
+
+    third_traverse = next(
+        node for node in third.walk() if type(node) is TraverseRelationship
+    )
+    assert third_traverse.table.name == "E"
+    assert third_traverse.table.columns[-1].name == "w"
+    assert dict(third_traverse.table.column_positions) == {"_from": 0, "_to": 1, "w": 2}
+
+
+def test_non_owned_collaborator_plan_never_reaches_the_trusted_clone_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    raw = ProduceResults(child=SingleRow(), columns=("value",))
+    monkeypatch.setattr(QueryEngine, "explain", lambda *_args: raw)
+
+    def should_not_compile(_value: PlanNode) -> object:
+        raise AssertionError("a collaborator plan reached the internally owned clone path")
+
+    monkeypatch.setattr(public_views, "_query_owned_plan_clone_factory", should_not_compile)
+    with connect(":memory:") as database:
+        observed = database.explain("RETURN 1 AS value")
+
+    assert observed == raw
+    assert observed is not raw
 
 
 @pytest.mark.parametrize("character", ["\x00", "\U000e0001"])

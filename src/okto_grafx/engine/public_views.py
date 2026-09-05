@@ -15,7 +15,7 @@ change bytes or engine bookkeeping are absent rather than hidden behind an ``uns
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
@@ -2437,7 +2437,9 @@ _QUERY_PLAN_AUXILIARY_TYPES: frozenset[type[object]] = frozenset(
 
 
 _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES: int = 128
-_OwnedPlanViewMemo = OrderedDict[int, tuple[PlanNode, PlanNode]]
+_OwnedPlanClone = Callable[[], PlanNode]
+_OwnedPlanFieldClone = Callable[[], object]
+_OwnedPlanViewMemo = OrderedDict[int, tuple[PlanNode, _OwnedPlanClone]]
 
 
 def _query_plan_view(
@@ -2453,7 +2455,7 @@ def _query_plan_view(
             cached = memo.get(marker)
             if cached is not None and cached[0] is value:
                 memo.move_to_end(marker)
-                return _query_owned_plan_clone(cached[1])
+                return cached[1]()
         nodes = _query_plan_nodes(value)
         detached: dict[int, PlanNode] = {}
         for node in reversed(nodes):
@@ -2468,10 +2470,12 @@ def _query_plan_view(
         root = detached[id(value)]
         validated = validate_plan(root)
         if internally_owned and memo is not None:
-            # Keep a template distinct from the first caller's result. Subsequent callers clone
-            # only this already validated, capability-free graph and never trust the raw root.
-            template = _query_owned_plan_clone(validated)
-            memo[id(value)] = (value, template)
+            # Compile only this already validated, capability-free graph.  The resulting clone
+            # recipe captures immutable leaves and its own copy of a mutable literal, never the
+            # first caller's result.  Subsequent callers therefore avoid repeating dataclass
+            # reflection and validation while still receiving an entirely independent tree.
+            clone = _query_owned_plan_clone_factory(validated)
+            memo[id(value)] = (value, clone)
             memo.move_to_end(id(value))
             if len(memo) > _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES:
                 memo.popitem(last=False)
@@ -2488,20 +2492,25 @@ def _query_plan_view(
         ) from failure
 
 
-def _query_owned_plan_clone(value: PlanNode) -> PlanNode:
-    """Clone a previously validated closed-grammar plan without re-running hostile checks."""
-    cloned = _query_owned_plan_field_clone(value)
-    if type(cloned) not in _QUERY_PLAN_NODE_TYPES:  # pragma: no cover - closed helper grammar
-        raise GrafxPlanError(
-            "An internally owned plan template lost its operator root.",
-            field="plan",
-            value="internal_template",
-        )
-    return cloned  # type: ignore[return-value]
+def _query_owned_plan_clone_factory(value: PlanNode) -> _OwnedPlanClone:
+    """Compile an independent clone door for one validated, internally owned plan."""
+    clone_field = _query_owned_plan_field_clone_factory(value)
+
+    def clone_plan() -> PlanNode:
+        cloned = clone_field()
+        if type(cloned) not in _QUERY_PLAN_NODE_TYPES:  # pragma: no cover - closed helper grammar
+            raise GrafxPlanError(
+                "An internally owned plan template lost its operator root.",
+                field="plan",
+                value="internal_template",
+            )
+        return cast(PlanNode, cloned)
+
+    return clone_plan
 
 
-def _query_owned_plan_field_clone(value: object) -> object:
-    """Reconstruct exact frozen plan dataclasses and tuples from a validated private template."""
+def _query_owned_plan_field_clone_factory(value: object) -> _OwnedPlanFieldClone:
+    """Compile cloning of exact frozen dataclasses and tuples from a validated plan."""
     exact = type(value)
     if (
         exact in _QUERY_PLAN_NODE_TYPES
@@ -2509,30 +2518,77 @@ def _query_owned_plan_field_clone(value: object) -> object:
         or exact in _QUERY_PLAN_AUXILIARY_TYPES
     ):
         if exact is Literal:
-            return Literal(
-                value=_query_value_snapshot(
-                    _domain_field(value, Literal, "value"),
-                    field="plan.literal",
-                    depth=0,
-                    active=set(),
-                )
+            private_value = _query_value_snapshot(
+                _domain_field(value, Literal, "value"),
+                field="plan.literal",
+                depth=0,
+                active=set(),
             )
-        return exact(
-            **{
-                declared.name: _query_owned_plan_field_clone(
-                    _domain_field(value, exact, declared.name)
+
+            def clone_literal(private_value: Value = private_value) -> object:
+                cloned = object.__new__(Literal)
+                object.__setattr__(
+                    cloned,
+                    "value",
+                    _query_value_snapshot(
+                        private_value,
+                        field="plan.literal",
+                        depth=0,
+                        active=set(),
+                    ),
                 )
-                for declared in fields(exact)
-            }
+                return cloned
+
+            return clone_literal
+        field_names = tuple(declared.name for declared in fields(exact))
+        field_clones = tuple(
+            _query_owned_plan_field_clone_factory(
+                _domain_field(value, exact, field_name)
+            )
+            for field_name in field_names
         )
+
+        # TableDef and ColumnDef own canonicalising __post_init__ invariants. Resolve that
+        # property while compiling the recipe, including any future inherited hook, rather than
+        # rediscovering it for every public clone.
+        if hasattr(exact, "__post_init__"):
+
+            def clone_canonical_dataclass(
+                exact: type[object] = exact,
+                field_clones: tuple[_OwnedPlanFieldClone, ...] = field_clones,
+            ) -> object:
+                return exact(*(clone() for clone in field_clones))
+
+            return clone_canonical_dataclass
+
+        def clone_plain_dataclass(
+            exact: type[object] = exact,
+            field_names: tuple[str, ...] = field_names,
+            field_clones: tuple[_OwnedPlanFieldClone, ...] = field_clones,
+        ) -> object:
+            cloned = object.__new__(exact)
+            for field_name, clone in zip(field_names, field_clones, strict=True):
+                object.__setattr__(cloned, field_name, clone())
+            return cloned
+
+        return clone_plain_dataclass
     if exact is tuple:
-        return tuple(
-            _query_owned_plan_field_clone(item) for item in tuple.__iter__(value)  # type: ignore[arg-type]
+        item_clones = tuple(
+            _query_owned_plan_field_clone_factory(item)
+            for item in tuple.__iter__(value)  # type: ignore[arg-type]
         )
+
+        def clone_tuple(
+            item_clones: tuple[_OwnedPlanFieldClone, ...] = item_clones,
+        ) -> object:
+            return tuple(clone() for clone in item_clones)
+
+        return clone_tuple
     if exact in (str, bytes, int, float, bool, type(None)):
-        return value
+        return lambda value=value: value
     if isinstance(value, Enum):
-        return exact(value.value)
+        enum_value = value.value
+        return lambda exact=exact, enum_value=enum_value: exact(enum_value)
     raise GrafxPlanError(
         "An internally owned plan template contains a field outside the closed grammar.",
         field="plan",
