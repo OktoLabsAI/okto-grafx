@@ -74,6 +74,14 @@ including the on-disk format.
 - Mandatory checkpoint and staged-index validation now carry their already-decoded RESET fact
   across sealed private boundaries. Exact built-in paths avoid a second logical-record scan;
   missing/incompatible proofs, custom managers and overrides keep the canonical fail-closed path.
+- Fresh index page-zero observations continue to invalidate descriptor identity and physically
+  read the device on every call. When every byte equals a pool-owned witness already validated
+  for checksum, structure and index semantics, the exact built-in `IndexStore` reuses its
+  atomically paired certificate instead of decoding the same image again. Changed images,
+  semantic failures and custom pools retain the complete fail-closed path. Instrumented generic
+  decodes fell `1,015→12` and semantic header decodes `1,007→4`; noisy timings support no
+  wall-clock claim. The lazy memo retains one raw page per accessed store without changing OCC,
+  WAL, durability or multiwriter/multireader behavior.
 - Exact vector searches fed by a small, engine-sealed materialized candidate set now authenticate
   only the selected heap rows and their index buckets. Any incomplete proof, metadata drift, NULL,
   deletion, duplicate or wrong reference falls back to the canonical full scan before ranking; a

@@ -1734,3 +1734,24 @@ A/B run over 2,000 CREATEs, eight commits and eight checkpoints measured medians
 is the structural removal of the two rescans, consistent with their profiled `~2.3–2.6%` ceiling,
 not a release gate. Format, corruption checks, WAL/OCC, durability, writer ordering and
 multiwriter/multireader semantics are unchanged.
+
+## Scale-removal batch 39 — byte-identical fresh-certificate decode reuse
+
+Status: **completed in `f28c686`; local and Nexus
+`hof_0f5a8046fe2844d79b0c3bbd5a90ae72` adversarial reviews PASS**.
+
+Every `_fresh_certificate` continues to invalidate descriptor identity and read page zero
+physically. The exact built-in pool may skip generic and semantic decode only when the complete raw
+image equals its prior checksum-, structure- and semantics-validated witness. The witness and
+certificate form one immutable pair. Changed bytes, foreign generations, semantic refusals and
+custom pools use the canonical fail-closed path; the built-in observer is captured rather than
+dynamically dispatched so a later monkeypatch cannot forge an unchanged result.
+
+Instrumentation over 2,000 CREATEs changed generic decodes `1,015→12` and semantic header decodes
+`1,007→4`. Timings were noisy, so no temporal gain is claimed. The lazy cost is one raw page per
+accessed `IndexStore`—about 8 KiB by default and 1.1 MiB for 141 stores—outside the BufferPool
+retained-memory estimate. The 17 focused discriminants and grouped 298-test storage/index slice
+passed; the Nexus mutation review additionally exposed and the final suite fixed a missing
+last-byte corruption discriminant. Checksum metrics now count work actually performed rather than
+using fresh reads as a proxy. OCC, WAL, durability and multiwriter/multireader semantics are
+unchanged.

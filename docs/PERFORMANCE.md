@@ -43,6 +43,18 @@ removing two remaining logical-record rescans. An A/B 2,000-row/8-commit/8-check
 from `11.397` to `11.166 s` median, but overlapping ranges make that temporal delta indistinguishable
 from noise. The claim is the structural removal of the rescans; timings remain informational.
 
+### 0.0.2 fresh index-certificate decode reuse (batch 39)
+
+Every certificate observation still invalidates descriptor identity and performs a fresh physical
+page-zero read. Exact byte equality with the last checksum-, structure- and semantics-validated
+image reuses one immutable pool-witness/certificate pair; any changed byte performs the complete
+canonical decode and validation. Corruptions confined to the last byte and interleaved foreign
+header changes are explicit regressions.
+
+In an instrumented 2,000-CREATE workload, generic decodes changed `1,015→12` and semantic header
+decodes `1,007→4`. Short timing samples were noisy and establish no endpoint or wall-clock claim.
+OCC, WAL, durability and multiwriter/multireader behavior are unchanged.
+
 ---
 
 ## 1. Test machine and build
@@ -473,6 +485,11 @@ It intentionally excludes allocator arenas, interpreter-specific header variatio
 storage/codec/metrics collaborators, arbitrary read-view tokens and temporary raw/decode values
 owned only by an executing call stack. It is therefore an honest estimate of the pool-owned
 retained Python object graph, not process RSS, and it does not change nominal admission or eviction.
+
+Batch 39 additionally retains one raw page-zero image per accessed `IndexStore`: approximately
+8 KiB at the default page size, or about 1.1 MiB for 141 stores. This memory is owned outside
+`BufferPool` and is therefore intentionally absent from
+`oktografx_buffer_retained_estimate_bytes`.
 
 The same value is exposed as
 `oktografx_buffer_retained_estimate_bytes{db,estimator="python-v2"}` and in the immutable
