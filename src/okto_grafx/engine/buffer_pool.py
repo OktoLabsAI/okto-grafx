@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ContextDecorator, contextmanager, nullcontext
 from functools import wraps
 from itertools import islice
 from struct import calcsize
@@ -398,6 +398,75 @@ class _BufferWorkProbe:
         self.frames_examined += frames
         if flush:
             self.flushes += 1
+
+
+class _PinnedPage(AbstractContextManager[Page], ContextDecorator):
+    """One lazy, single-use page pin without generator context-manager machinery."""
+
+    __slots__ = ("_pool", "_file", "_page_index", "_page", "_used")
+
+    def __init__(self, pool: BufferPool, file: str, page_index: PageIndex) -> None:
+        self._pool: BufferPool | None = pool
+        self._file: str | None = file
+        self._page_index: PageIndex | None = page_index
+        self._page: Page | None = None
+        self._used = False
+
+    def __enter__(self) -> Page:
+        pool = self._pool
+        file = self._file
+        page_index = self._page_index
+        if self._used or pool is None or file is None or page_index is None:
+            raise RuntimeError("a pinned-page context manager is single-use")
+        # A generator context is consumed even when its pre-yield pin raises. Set the marker
+        # first so this class preserves that one-shot boundary as well.
+        self._used = True
+        try:
+            page = pool.pin(file, page_index)
+        except BaseException:
+            self._pool = None
+            self._file = None
+            self._page_index = None
+            raise
+        self._page = page
+        return page
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object,
+    ) -> bool:
+        del exc_type, exc, tb
+        pool = self._pool
+        file = self._file
+        page_index = self._page_index
+        page = self._page
+        if pool is None or file is None or page_index is None or page is None:
+            raise RuntimeError("the pinned-page context was not entered")
+        # Retire every retained authority before unpin so even a failing unpin cannot keep the
+        # pool alive or make this context reusable. Python preserves a body exception as
+        # __context__ if unpin now raises another one.
+        self._pool = None
+        self._file = None
+        self._page_index = None
+        self._page = None
+        pool.unpin(
+            file,
+            page_index,
+            dirty=page.dirty,
+            page=page,
+        )
+        return False
+
+    def _recreate_cm(self) -> _PinnedPage:
+        """Preserve ContextDecorator's fresh-manager-per-call behaviour."""
+        pool = self._pool
+        file = self._file
+        page_index = self._page_index
+        if self._used or pool is None or file is None or page_index is None:
+            raise RuntimeError("a pinned-page context manager is single-use")
+        return type(self)(pool, file, page_index)
 
 
 def _guarded(method: Callable[..., object]) -> Callable[..., object]:
@@ -1307,7 +1376,7 @@ class BufferPool:
 
     def pinned(self, file: str, page_index: PageIndex) -> AbstractContextManager[Page]:
         """Return a context manager that pins the page and always unpins it again."""
-        return self._pinned(file, page_index)
+        return _PinnedPage(self, file, page_index)
 
     @contextmanager
     def page_write_fence(self, file: str, page_index: PageIndex) -> Iterator[None]:
@@ -1337,18 +1406,6 @@ class BufferPool:
                 self._wait_for_loads()
                 with self._page_write_section(file, page_index):
                     yield
-
-    @contextmanager
-    def _pinned(self, file: str, page_index: PageIndex) -> Iterator[Page]:
-        page = self.pin(file, page_index)
-        try:
-            yield page
-        finally:
-            # The page carries its own dirty flag, so an exception in the body cannot lose a
-            # change that had already been applied to it. The OBJECT is named, because a read
-            # view taken while this page was pinned may have doomed the frame and a fresh one
-            # may now stand under the same key.
-            self.unpin(file, page_index, dirty=page.dirty, page=page)
 
     def _reusable_index(self, file: str) -> PageIndex | None:
         """Return an index this pool may hand out again, or None to ask the device for one.

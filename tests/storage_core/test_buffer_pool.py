@@ -1135,6 +1135,136 @@ def test_the_context_manager_unpins_even_when_the_body_raises() -> None:
     assert pool.flush(FILE) == 1
 
 
+def test_the_pinned_context_is_lazy_single_use_and_returns_the_pinned_page() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    assert pool.pin_count(FILE, 0) == 0
+
+    with context as page:
+        assert page is pool._frames[(FILE, 0)].page  # noqa: SLF001
+        assert pool.pin_count(FILE, 0) == 1
+
+    assert pool.pin_count(FILE, 0) == 0
+    assert context._pool is None  # type: ignore[attr-defined]  # noqa: SLF001
+    assert context._page is None  # type: ignore[attr-defined]  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="single-use"):
+        with context:
+            pass
+
+
+def test_a_pin_failure_does_not_unpin_and_consumes_the_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    failure = RuntimeError("pin")
+    unpins = 0
+
+    def refusing_pin(*_args: object, **_kwargs: object) -> Page:
+        raise failure
+
+    def counted_unpin(*_args: object, **_kwargs: object) -> None:
+        nonlocal unpins
+        unpins += 1
+
+    with monkeypatch.context() as refusal:
+        refusal.setattr(BufferPool, "pin", refusing_pin)
+        refusal.setattr(BufferPool, "unpin", counted_unpin)
+        with pytest.raises(RuntimeError) as raised:
+            with context:
+                pass
+        assert raised.value is failure
+        assert unpins == 0
+        assert context._pool is None  # type: ignore[attr-defined]  # noqa: SLF001
+        assert context._page is None  # type: ignore[attr-defined]  # noqa: SLF001
+        with pytest.raises(RuntimeError, match="single-use"):
+            with context:
+                pass
+        assert unpins == 0
+
+
+@pytest.mark.parametrize("failure", (KeyboardInterrupt(), SystemExit(19)))
+def test_the_pinned_context_releases_on_base_exception(failure: BaseException) -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+
+    with pytest.raises(type(failure)) as raised:
+        with pool.pinned(FILE, 0):
+            raise failure
+
+    assert raised.value is failure
+    assert pool.pin_count(FILE, 0) == 0
+
+
+def test_an_unpin_failure_replaces_but_chains_the_body_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    body_failure = ValueError("body")
+    unpin_failure = RuntimeError("unpin")
+    held: Page | None = None
+    context = pool.pinned(FILE, 0)
+
+    def refusing_unpin(*_args: object, **_kwargs: object) -> None:
+        raise unpin_failure
+
+    try:
+        with monkeypatch.context() as refusal:
+            refusal.setattr(BufferPool, "unpin", refusing_unpin)
+            with pytest.raises(RuntimeError) as raised:
+                with context as page:
+                    held = page
+                    raise body_failure
+        assert raised.value is unpin_failure
+        assert unpin_failure.__context__ is body_failure
+        assert context._pool is None  # type: ignore[attr-defined]  # noqa: SLF001
+        assert context._page is None  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        if held is not None and pool.pin_count(FILE, 0):
+            pool.unpin(FILE, 0, page=held)
+
+
+def test_pinned_context_decorator_recreates_its_authority_per_call() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    observations: list[int] = []
+
+    @context  # type: ignore[misc]
+    def observe() -> None:
+        observations.append(pool.pin_count(FILE, 0))
+
+    observe()
+    observe()
+
+    assert observations == [1, 1]
+    assert pool.pin_count(FILE, 0) == 0
+
+
+def test_a_consumed_pinned_context_cannot_later_recreate_as_a_decorator() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    with context:
+        pass
+
+    @context  # type: ignore[misc]
+    def unexpected() -> None:
+        raise AssertionError("a consumed context recreated its authority")
+
+    with pytest.raises(RuntimeError, match="single-use"):
+        unexpected()
+
+
 def test_an_allocated_page_comes_back_pinned_and_survives_pressure() -> None:
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics(), budget_pages=1)
