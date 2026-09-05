@@ -603,8 +603,13 @@ def _decode_expected_value_body(
         _require(buf, offset, length, "bytes")
         following = offset + length
         return bytes(buf[offset:following]), following
-    # LIST, MAP and both vector encodings keep the recursive decoder as their sole oracle. The
-    # caller proved the tag at offset - 1, so this is observationally the ordinary decode door.
+    if kind in VECTOR_VALUE_TYPES:
+        value, following = _decode_vector_mode(
+            buf, offset, kind, materialize=True
+        )
+        return cast(Value, value), following
+    # LIST and MAP keep the recursive decoder as their sole oracle. The caller proved the tag at
+    # offset - 1, so this is observationally the ordinary decode door.
     return decode_value(buf, offset - 1)
 
 

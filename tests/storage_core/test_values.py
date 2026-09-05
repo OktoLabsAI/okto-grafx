@@ -183,6 +183,82 @@ def test_values_encode_and_decode_positionally() -> None:
     assert offset == len(raw)
 
 
+@pytest.mark.parametrize(
+    ("kind", "dtype", "width"),
+    (
+        (ValueType.VECTOR_F32, "float32", 4),
+        (ValueType.VECTOR_F64, "float64", 8),
+    ),
+)
+def test_expected_vector_body_has_exact_generic_decoder_parity(
+    kind: ValueType, dtype: str, width: int
+) -> None:
+    """Known-tag vector decoding preserves every result and corruption detail."""
+    valid = encode_value(VectorValue((1.25, -2.5), space_ref=7, dtype=dtype))
+    zero_dimension = bytes([int(kind)]) + (0).to_bytes(4, "little") + (7).to_bytes(
+        4, "little"
+    )
+    oversized_dimension = (
+        bytes([int(kind)])
+        + (0xFFFFFFFF).to_bytes(4, "little")
+        + (7).to_bytes(4, "little")
+    )
+    zero_space = valid[:5] + (0).to_bytes(4, "little") + valid[9:]
+    largest_space = valid[:5] + (0xFFFFFFFF).to_bytes(4, "little") + valid[9:]
+    payloads = (
+        valid,
+        zero_dimension,
+        oversized_dimension,
+        zero_space,
+        largest_space,
+        *(valid[:length] for length in range(1, 9)),
+        *(valid[:length] for length in range(9, 9 + 2 * width)),
+    )
+
+    def outcome(call: object) -> tuple[object, ...]:
+        try:
+            value, following = call()  # type: ignore[operator]
+        except BaseException as failure:
+            cause = failure.__cause__
+            return (
+                "error",
+                type(failure),
+                getattr(failure, "message", str(failure)),
+                dict(getattr(failure, "details", {})),
+                None if cause is None else (type(cause), str(cause)),
+            )
+        return ("value", value, following)
+
+    for payload in payloads:
+        assert outcome(
+            lambda payload=payload: value_module._decode_expected_value_body(
+                payload, 1, kind
+            )
+        ) == outcome(lambda payload=payload: decode_value(payload))
+
+
+@pytest.mark.parametrize(
+    ("kind", "dtype"),
+    (
+        (ValueType.VECTOR_F32, "float32"),
+        (ValueType.VECTOR_F64, "float64"),
+    ),
+)
+def test_expected_vector_body_skips_redundant_generic_tag_dispatch(
+    kind: ValueType, dtype: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    encoded = encode_value(VectorValue((1.25, -2.5), space_ref=7, dtype=dtype))
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a proven vector tag must not be decoded again")
+
+    monkeypatch.setattr(value_module, "decode_value", forbidden)
+
+    restored, following = value_module._decode_expected_value_body(encoded, 1, kind)
+    assert restored == VectorValue((1.25, -2.5), space_ref=7, dtype=dtype)
+    assert following == len(encoded)
+
+
 def test_decoding_past_the_end_of_a_buffer_is_refused() -> None:
     raw = encode_value("abcdef")
     for cut in range(1, len(raw)):
