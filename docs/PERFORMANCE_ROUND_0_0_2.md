@@ -1440,3 +1440,24 @@ detected deliberately wrong peer/score association mutants. The grouped 167-test
 rebuild slice, focused 72-test slice, Ruff and diff checks passed. No durable format, query
 semantics, WAL/OCC rule, publication order, durability guarantee or multiwriter/multireader
 premise changed.
+
+## Scale-removal batch 27 — proven VECTOR tag direct decode
+
+Status: **completed in `bed6846`; independent adversarial review PASS**.
+
+Tuple decoding already proves that the stored tag byte equals the schema's expected tag. For
+`VECTOR_F32` and `VECTOR_F64`, the expected-value path now enters the same vector body decoder
+directly instead of returning to the generic decoder to re-read and dispatch that tag. LIST and
+MAP remain on the recursive generic door. All vector header/body bounds, dimension-derived width,
+materialization and final tuple trailing-payload checks are unchanged; no encode validation was
+weakened.
+
+The focused suite compares F32/F64 values, offsets and exact corruption class/message/details/
+cause for every header/body truncation plus boundary dimension and space values. An independent
+read-only differential added 40,000 random buffers with non-zero prefixes/offsets, and a
+discriminating monkeypatch proves the redundant generic dispatch is no longer called. Mixed-tuple
+micros measured `1.042x` at dimension 64 and `1.057x` at dimension 384 (roughly 4–6%); dimension 2
+reached `1.209x`. This is a small constant-cost improvement, not a new performance gate and not a
+reversal of batch 11's rejection of a broad vector-decoder redesign. The 485-test adjacent slice,
+Ruff and diff checks passed. Format, corruption policy, query semantics, WAL/OCC, durability and
+multiwriter/multireader premises remain unchanged.
