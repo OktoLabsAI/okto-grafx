@@ -146,6 +146,15 @@ transactions like any other.
   retained as STALE; older immutable files remain retained orphans until safe reclamation exists.
   A catalog-v1 automatic index activates v2 and grows in one build, so every process using the
   directory must satisfy the compatibility fence below.
+- **Unknown growth can be handled by explicit assisted maintenance.**
+  `db.maintenance.rehash_index_if_needed("by_email")` validates the selected physical generation,
+  samples only the bounded eager bucket heads and grows at most one `2x` step when average head
+  occupancy reaches the canonical 64-entry target or retained overflow reaches the configured
+  ratio. It never runs from commit or in a background worker and never walks all entries merely to
+  decide. `None` means only “no assisted growth was selected now” (or the 4,096-bucket ceiling),
+  not that the index is healthy. The eventual foreground shadow build has the same writer-pause,
+  OCC, WAL and durability contract as `rehash_index`; do not call it repeatedly without
+  reassessing a concurrent refusal or data skew.
 - **Catalog-v2 activation is a one-way compatibility fence.** `db.create_index(...)` and the
   explicit idempotent `db.ensure_identity_indexes()` may activate it. Every process that can open
   that database must therefore run a Grafx build that understands catalog v2; rollback uses a
@@ -429,7 +438,8 @@ streaming the terminal does not by itself make an unbounded sort, distinct or gr
 Properties such as `db.catalog`, `db.indexes`, `db.wal`, `db.storage` and `db.metrics` are frozen
 snapshots for schema, inventory and diagnostics. They never retain the storage device, page pool,
 WAL, transaction manager or adapter callbacks. Writes go through transactions or explicit gated
-database methods (`create_index`, `rehash_index`, `ensure_identity_indexes`, `checkpoint`,
+database methods (`create_index`, `rehash_index`, `rehash_index_if_needed`,
+`ensure_identity_indexes`, `checkpoint`,
 `recover`, `flush`, `publish_metrics`); there is no `unsafe=True` escape. `Transaction` exposes
 `snapshot`, `mode`, `txn_id`, `active` and `report`, but never its mutable engine context.
 

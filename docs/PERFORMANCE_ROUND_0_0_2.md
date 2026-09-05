@@ -1626,3 +1626,28 @@ fixed-cost saving, not a wall-clock gate or a universal endpoint claim.
 The 55-case namespace/revalidation slice passed with seven declared platform skips; Ruff and diff
 checks passed. Exact-case matching, redirected-path refusal, descriptor revalidation, format,
 WAL/OCC, durability, locking and multiwriter/multireader premises remain unchanged.
+
+## Scale-removal batch 35 — bounded assisted exact-index rehash
+
+Status: **completed in `8c13d0f`; local adversarial review GO and Nexus review
+`hof_0c6e83b53d60466397ea63cd6c453019` verified PASS**.
+
+Unknown growth no longer requires either premature maximum sizing or an O(N) census before an
+operator can request one safe growth step. `Database.rehash_index_if_needed()` and its maintenance
+facade first prove the catalog-selected physical header. Below the ceiling they inspect exactly
+the `B` eager head pages, without decoding entries or following overflow chains. Growth is
+suggested at the canonical `64 * B` occupied-head threshold or the configured retained-overflow
+ratio, and delegates one `B -> 2B` step to the existing immutable-shadow/OCC/WAL protocol. At
+4,096 buckets the method still proves identity but skips the useless directory pass.
+
+The signal is advisory and conservative, not a health certificate or exact load factor. Retained
+or unreachable append pages may recommend early growth; concentration in fewer than `B` overflow
+pages may hurt one bucket before the global fallback fires; a concurrent rehash may produce any
+of the existing typed OCC/generation/growth refusals. There is no automatic/background loop, and
+callers must reassess rather than retry blindly.
+
+The Nexus end-to-end check observed no growth at 4,000 rows and one 64-to-128 step at 5,000 rows,
+with all 5,000 rows and keyed seeks intact afterward. This is calibration evidence, not a wall-time
+gate. The local focused/adjacent slices passed 31 and 67 tests; the independent adversarial slice
+passed 107 tests, with Ruff and diff checks green. No format, WAL/OCC, durability, writer-lease or
+multiwriter/multireader premise changed.

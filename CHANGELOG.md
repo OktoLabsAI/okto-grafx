@@ -38,6 +38,11 @@ including the on-disk format.
   indexes. A complete immutable shadow becomes ACTIVE only after OCC and its durability barrier;
   the immediate predecessor becomes STALE, recovery converges to one complete authority, and
   long-lived/read-only handles adopt foreign generation changes at their next fresh read boundary.
+- Added explicit `Database.rehash_index_if_needed()` and maintenance delegation. Its advisory
+  probe proves physical generation identity, examines only the bounded eager head pages plus the
+  scalar physical page count, and requests at most one `2x` growth step through the existing
+  foreground rehash protocol. It is never automatic/background, never scans all index entries to
+  decide, and does not weaken WAL, OCC or multi-process reader/writer semantics.
 - Added explicit, idempotent `Database.ensure_identity_indexes()` activation for catalog-v2
   primary-key, relationship-endpoint and unsigned record-identity access paths. Catalog v2 is a
   one-way mixed-fleet fence; vector/proximity indexes remain schema-derived.

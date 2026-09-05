@@ -324,6 +324,41 @@ There is no automatic background rehash in this version. Inventory/metrics expos
 count and the configured/derived expected cardinality so operators can schedule foreground growth
 before chains become material.
 
+### 6.3 Explicit assisted rehash
+
+`Database.rehash_index_if_needed(name, *, overflow_pages_per_bucket=1)` and its maintenance facade
+choose whether to invoke the same section 6.2 protocol. The operation is explicit: no commit hook,
+startup path or background worker calls it. A single call can request only
+`B -> min(2B, MAX_BUCKET_COUNT)` and never loops through multiple growth generations.
+
+Before returning either an index view or `None`, the operation resolves fresh catalog authority
+and opens the selected physical generation. Header kind, format, definition digest, visibility,
+artifact nonce and bucket count must agree. Below the maximum directory it then reads exactly the
+`B` eager head pages, validates their page type and counts occupied slots without decoding entries
+or following `next_page`. The scalar physical page count yields retained extra pages. Growth is
+selected when either condition holds:
+
+```text
+occupied_head_slots >= B * TARGET_ENTRIES_PER_BUCKET
+retained_extra_pages >= B * overflow_pages_per_bucket
+```
+
+The assessment is O(B), bounded by the eager-directory format, rather than O(index entries). At
+`MAX_BUCKET_COUNT`, physical identity is still proved but the head-page pass is skipped because no
+legal growth exists. The first condition aligns unknown growth with the same 64-entry target used
+for initial sizing. The second remains a conservative fallback for large keys and physical
+pressure. Tombstones, empty/unlinked pages retained after interruption and unusual key
+distributions can recommend growth early; `None` does not certify health, balance or absence of
+corruption outside the pages visited.
+
+Use this door at an operator-selected maintenance point when creation-time cardinality was unknown
+and one bounded assessment is cheaper than an O(N) census. Do not run it after every commit, loop
+until the maximum, or treat it as remediation for one hot key: hashing cannot spread equal keys,
+and each selected rehash still performs the complete foreground scan/build and writer pause from
+section 6.2. A concurrent participant may change catalog/generation authority between assessment
+and preparation. The existing OCC/generation/growth checks refuse that attempt; callers must
+reassess current state and must not assume every such refusal has `retryable=True`.
+
 ## 7. Activation and migration protocol
 
 The activation point is the committed catalog v2 image. Before it, catalog v1 and the old access

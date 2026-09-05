@@ -180,6 +180,17 @@ and identity artifacts, and full index walks still cost
 `O(bucket_count + entries)`. The option affects only new generations; use explicit
 `rehash_index(...)` for an undersized existing index.
 
+When cardinality was not known at creation time,
+`maintenance.rehash_index_if_needed(name, overflow_pages_per_bucket=1)` is a bounded advisory
+door. It validates the catalog-selected physical header and reads only the `B` eager head pages
+(`B <= 4096`), not all entries or overflow chains. It requests one `B -> 2B` foreground rehash
+when occupied head slots reach `64 * B` or retained extra pages reach the configured integer
+ratio. The 4,096-bucket ceiling is identity-checked and returned immediately without the head-page
+pass. This avoids an O(N) assessment, but is not a free health check: a cold filesystem pays O(B),
+retained/unlinked pages can recommend early growth, hot-key skew may not improve after rehash, and
+the selected shadow build still pauses writers. Use it at an operator-selected maintenance point,
+not after every commit or in an unconditional loop.
+
 **Historical ceiling, now structurally addressed in 0.0.2:** the measurements above predate P2-ID,
 when a traversal whose target was *unbound* resolved landings by one scan of the landing table
 because edges store record identities. Activated catalog-v2 endpoint tables now receive an
