@@ -1922,9 +1922,7 @@ class IndexStore:
                     accelerated = (
                         None
                         if empty_build is None
-                        else self._apply_empty_build_change(
-                            empty_build, change, stamp
-                        )
+                        else self._apply_empty_build_change(empty_build, change, stamp)
                     )
                     if accelerated is None:
                         moved = self._apply_change(change, stamp)
@@ -3343,9 +3341,7 @@ class IndexStore:
             bucket, change.key, change.ref, first_matching_page=True
         )
         located = (
-            None
-            if not matches
-            else (matches[0].page, matches[0].slot, matches[0])
+            None if not matches else (matches[0].page, matches[0].slot, matches[0])
         )
         if change.operation is IndexOperation.INSERT:
             # The redo path never went through staging, so the key it carries is checked here as
@@ -3772,7 +3768,9 @@ class IndexStore:
 
     def _require_txn(self, txn: object) -> int:
         """Return the transaction number, refusing anything that cannot stage a record."""
-        if type(txn) is not TransactionContext and not isinstance(txn, StagingTransaction):
+        if type(txn) is not TransactionContext and not isinstance(
+            txn, StagingTransaction
+        ):
             raise GrafxIndexError(
                 "An index change is staged on a transaction that carries a txn_id and can stage "
                 f"a record; got {type(txn).__name__}.",
@@ -5772,21 +5770,50 @@ class IndexManager:
             high_waters[table_id] = self._heap.committed_high_water(table)
         return high_waters
 
-    def replay_watermark_scope(self, file: str, page: Page) -> tuple[bool, int | None]:
+    def replay_watermark_meta_baseline(self, file: str, page: Page) -> Page | None:
+        """Read the detached current heap META image needed by the redo scope proof."""
+        if (
+            file != self._heap.file
+            or page.page_type != int(PageType.META)
+            or page.page_index != HEADER_PAGE_INDEX
+        ):
+            return None
+        try:
+            return self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
+        except GrafxError:
+            # Scope inference must never turn an unreadable baseline into permission to omit a
+            # table. Canonical redo/freshness remains responsible for reporting the damage.
+            return None
+
+    def replay_watermark_scope(
+        self, file: str, page: Page, *, meta_baseline: Page | None = None
+    ) -> tuple[bool, frozenset[int]]:
         """Classify whether and whose committed watermark a replayed page can move.
 
         The redo preflight calls this only on the concrete ``IndexManager`` and on a decoded,
         checksum-verified image.  Non-heap files and heap overflow pages are proved irrelevant
         to ``committed_high_water``.  A heap data page must expose its validated physical owner
-        even when the logical change had no secondary-index effect.  Any other heap-file image
-        returns an unknown scope: metadata/reclamation can change an extent or remove the prior
-        owner, which requires the canonical full photograph rather than a cached guess.
+        even when the logical change had no secondary-index effect.  Heap META is accepted only
+        when a device-fresh baseline proves which extent roots changed. Any other heap-file image
+        returns an unknown scope, requiring the canonical full photograph rather than a guess.
         """
         if file != self._heap.file or page.page_type == int(PageType.OVERFLOW):
-            return True, None
+            return True, frozenset()
         if page.page_type == int(PageType.HEAP):
-            return True, self._heap._page_table_id(page)
-        return False, None
+            return True, frozenset((self._heap._page_table_id(page),))
+        if page.page_type == int(PageType.META) and meta_baseline is not None:
+            try:
+                before = self._heap._watermark_extent_roots(meta_baseline)
+                after = self._heap._watermark_extent_roots(page)
+            except GrafxError:
+                return False, frozenset()
+            table_ids = before.keys() | after.keys()
+            return True, frozenset(
+                table_id
+                for table_id in table_ids
+                if before.get(table_id) != after.get(table_id)
+            )
+        return False, frozenset()
 
     def table_watermark_photo(
         self, *, refresh_table_ids: Collection[int] | None = None
@@ -6332,9 +6359,7 @@ class IndexManager:
                 )
         return tuple(records)
 
-    def _commit_under_write_authority(
-        self, txn: StagingTransaction, csn: Csn
-    ) -> int:
+    def _commit_under_write_authority(self, txn: StagingTransaction, csn: Csn) -> int:
         """Commit through the private door owned by the fully fenced transaction path.
 
         The surrounding transaction manager already holds its participant section, writer lease
@@ -6381,13 +6406,17 @@ class IndexManager:
             index.definition.table_id for index in indexes if observations[index]
         }
         authority = _LIVE_COMMIT_AUTHORITY.get()
-        authorised_scope = authority if (
-            isinstance(authority, _LiveCommitAuthority)
-            and authority.active
-            and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
-            and authority.manager is self
-            and authority.txn is txn
-        ) else None
+        authorised_scope = (
+            authority
+            if (
+                isinstance(authority, _LiveCommitAuthority)
+                and authority.active
+                and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
+                and authority.manager is self
+                and authority.txn is txn
+            )
+            else None
+        )
         for index in indexes:
             observed = observations[index]
             if authorised_scope is not None:
@@ -6604,9 +6633,7 @@ class IndexManager:
             targets.add(target)
             retained_targets += 1
 
-        hot_buckets: dict[
-            tuple[IndexStore, int], _CommonReplayHotBucket
-        ] = {}
+        hot_buckets: dict[tuple[IndexStore, int], _CommonReplayHotBucket] = {}
         remaining_pages = _COMMON_REPLAY_HOT_PAGE_LIMIT
         for identity, targets in bucket_targets.items():
             store, bucket = identity

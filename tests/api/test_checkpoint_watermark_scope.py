@@ -199,7 +199,7 @@ def test_an_unproved_page_scope_takes_the_complete_photograph(
         monkeypatch.setattr(
             CommitRedo,
             "_watermark_scope_for_page",
-            lambda self, file, page: (False, None),
+            lambda self, file, page, **kwargs: (False, frozenset()),
         )
         spy = _Spy(monkeypatch)
         database.checkpoint()

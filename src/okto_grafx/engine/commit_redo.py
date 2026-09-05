@@ -19,6 +19,7 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.ids import Lsn, NO_LSN
 from okto_grafx.domain.index.records import IndexOperation, change_of
+from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.txn.records import decode_page_write, is_redoable_page_file
@@ -75,7 +76,7 @@ class _PreparedPageEffect:
     image: bytes
     page_lsn: Lsn
     watermark_scope_known: bool
-    watermark_table_id: int | None
+    watermark_table_ids: frozenset[int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,9 +186,7 @@ class CommitRedo:
                     )
 
         page_only = len(prepared_pages) == len(replay.effects)
-        may_coalesce = (
-            proof.allow_page_coalescing if proof is not None else page_only
-        )
+        may_coalesce = proof.allow_page_coalescing if proof is not None else page_only
         page_plan = (
             self._coalesce_page_plan(prepared_pages)
             if page_only and may_coalesce
@@ -210,7 +209,9 @@ class CommitRedo:
 
         for _position, record, prepared in effects:
             if record.record_type == _PAGE_EFFECT:
-                assert prepared is not None  # every page effect was prepared by preflight
+                assert (
+                    prepared is not None
+                )  # every page effect was prepared by preflight
                 # Offered files are flushed even when their image is already current.  A prior
                 # attempt may have installed the image into this same pool and failed before
                 # flushing; page_lsn then makes this attempt a no-op, but publication still owes
@@ -359,19 +360,22 @@ class CommitRedo:
             )
         ):
             return None
-        return frozenset(
-            prepared.watermark_table_id
-            for _position, prepared in preflighted.prepared_pages
-            if prepared.watermark_table_id is not None
-        )
+        table_ids: set[int] = set()
+        for _position, prepared in preflighted.prepared_pages:
+            table_ids.update(prepared.watermark_table_ids)
+        return frozenset(table_ids)
 
     def _watermark_scope_for_page(
-        self, file: str, page: Page
-    ) -> tuple[bool, int | None]:
+        self,
+        file: str,
+        page: Page,
+        *,
+        meta_baselines: dict[tuple[str, int], Page | None] | None = None,
+    ) -> tuple[bool, frozenset[int]]:
         """Classify one decoded page without granting authority to manager lookalikes."""
         manager = self._index_manager
         if manager is None:
-            return False, None
+            return False, frozenset()
         # This is a freshness shortcut, not the replay dispatcher compatibility surface.  Only
         # the concrete manager whose heap/page invariants are defined in this package can prove
         # that an untouched table remained untouched.  All adapters and test doubles retain the
@@ -379,8 +383,20 @@ class CommitRedo:
         from okto_grafx.engine.index_manager import IndexManager
 
         if type(manager) is not IndexManager:
-            return False, None
-        return IndexManager.replay_watermark_scope(manager, file, page)
+            return False, frozenset()
+        if meta_baselines is None:
+            meta_baselines = {}
+        baseline = None
+        if page.page_type == int(PageType.META):
+            key = (file, page.page_index)
+            if key not in meta_baselines:
+                meta_baselines[key] = IndexManager.replay_watermark_meta_baseline(
+                    manager, file, page
+                )
+            baseline = meta_baselines[key]
+        return IndexManager.replay_watermark_scope(
+            manager, file, page, meta_baseline=baseline
+        )
 
     def _ensure_preflight(
         self,
@@ -473,8 +489,7 @@ class CommitRedo:
             or preflighted.seal is not _PREFLIGHT_SEAL
             or preflighted.owner is not self
             or preflighted.passage is not passage
-            or preflighted.allow_unregistered_indexes
-            is not allow_unregistered_indexes
+            or preflighted.allow_unregistered_indexes is not allow_unregistered_indexes
             or preflighted.replay is not replay
             or preflighted.effects is not replay.effects
             or preflighted.incomplete_effects is not replay.incomplete_effects
@@ -561,6 +576,7 @@ class CommitRedo:
         contains_index_reset = False
         simulated_page_counts: dict[str, int] = {}
         prepared_pages: list[tuple[int, _PreparedPageEffect]] = []
+        watermark_meta_baselines: dict[tuple[str, int], Page | None] = {}
         signature: list[tuple[object, ...]] = []
         for position, record in enumerate(effects):
             if not isinstance(record, WalRecord):
@@ -613,8 +629,12 @@ class CommitRedo:
                     write.page_index,
                     write.image,
                 )
-                watermark_scope_known, watermark_table_id = (
-                    self._watermark_scope_for_page(write.file, decoded)
+                watermark_scope_known, watermark_table_ids = (
+                    self._watermark_scope_for_page(
+                        write.file,
+                        decoded,
+                        meta_baselines=watermark_meta_baselines,
+                    )
                 )
                 prepared_pages.append(
                     (
@@ -626,7 +646,7 @@ class CommitRedo:
                             image=write.image,
                             page_lsn=decoded.page_lsn,
                             watermark_scope_known=watermark_scope_known,
-                            watermark_table_id=watermark_table_id,
+                            watermark_table_ids=watermark_table_ids,
                         ),
                     )
                 )
@@ -728,7 +748,9 @@ class CommitRedo:
         by_location: dict[tuple[str, int], list[tuple[int, _PreparedPageEffect]]] = {}
         for item in prepared_pages:
             prepared = item[1]
-            by_location.setdefault((prepared.file, prepared.page_index), []).append(item)
+            by_location.setdefault((prepared.file, prepared.page_index), []).append(
+                item
+            )
 
         replacements: dict[int, _PreparedPageEffect] = {}
         skipped: set[int] = set()
@@ -757,9 +779,7 @@ class CommitRedo:
             if position not in skipped
         )
 
-    def _validate_page_image(
-        self, file: str, page_index: int, image: bytes
-    ) -> Page:
+    def _validate_page_image(self, file: str, page_index: int, image: bytes) -> Page:
         """Decode one WAL page image and attach its known location to any damage."""
         try:
             decoded = self._pool.codec.decode_page(image, verify=True)
@@ -782,4 +802,9 @@ class CommitRedo:
                 file=file,
                 page=page_index,
             )
+        # Page indices live in the storage port rather than the encoded page header. The codec
+        # therefore cannot recover this location unless its extended keyword is available; redo
+        # already owns the authoritative record location and attaches it before any heap-layout
+        # classifier can make a decision from the image.
+        decoded.page_index = page_index
         return decoded

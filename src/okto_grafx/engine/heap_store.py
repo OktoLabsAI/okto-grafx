@@ -869,6 +869,42 @@ class HeapStore:
             tuple(entries),
         )
 
+    def _watermark_extent_roots(self, page: Page) -> dict[int, PageIndex]:
+        """Return the complete table-to-chain-root authority of one heap header image.
+
+        ``committed_high_water`` reaches a table only through ``first_page`` and then through
+        data-page links.  The other extent fields are durable allocation/identity hints and do
+        not select a row header.  Comparing this exact projection therefore proves whether a
+        replayed META image can change any table watermark walk, while duplicate/malformed
+        directory authority remains an optimization miss rather than an omitted table.
+        """
+        if page.page_index != HEADER_PAGE_INDEX:
+            raise GrafxCorruptionDetected(
+                f"Heap metadata page {page.page_index} cannot describe the reserved header "
+                f"page {HEADER_PAGE_INDEX}.",
+                file=self._file,
+                page=page.page_index,
+                field="header_page_index",
+                value=page.page_index,
+            )
+        self._require_header_page(page)
+        roots: dict[int, PageIndex] = {}
+        for slot, payload in page.iter_slot_views():
+            if slot < EXTENT_FIRST_SLOT:
+                continue
+            extent = self._require_first_page(TableExtent.decode(payload))
+            if extent.table_id in roots:
+                raise GrafxCorruptionDetected(
+                    f"Table {extent.table_id} has more than one directory entry on the "
+                    f"header page of {self._file!r}.",
+                    file=self._file,
+                    page=HEADER_PAGE_INDEX,
+                    table_id=extent.table_id,
+                    field="directory_entry",
+                )
+            roots[extent.table_id] = extent.first_page
+        return roots
+
     @staticmethod
     def _slot_authority(page: Page, slot: SlotId) -> object:
         """Return a total signature for one authoritative slot, including absence/free state."""
