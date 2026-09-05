@@ -1384,6 +1384,30 @@ def test_a_retryable_refusal_between_the_relink_and_the_directory_leaves_no_row_
     assert repaired.page_count == len(grown), "the repaired count is the length walked"
 
 
+def test_tail_hint_repair_preserves_the_identity_floor_advanced_by_the_same_insert(
+    pool: BufferPool, heap_store: HeapStore, person_table: TableDef
+) -> None:
+    grow_to_pages(pool, heap_store, person_table, 3)
+    heap_store = stale_the_hint(pool, heap_store, person_table)
+    before = heap_store.extent_of(person_table)
+    chain = heap_store.pages_of(person_table)
+    assert before is not None
+    assert before.last_page != chain[-1]
+
+    reference = heap_store.insert(
+        person_table,
+        700,
+        (700, "settled after repair"),
+        xmin=6,
+    )
+
+    after = heap_store.extent_of(person_table)
+    assert after is not None
+    assert after.next_record_id == 701
+    assert after.last_page == heap_store.pages_of(person_table)[-1]
+    assert heap_store.read(reference).record_id == 700
+
+
 def test_one_page_of_drift_on_a_one_page_table_is_tolerated(
     pool: BufferPool, heap_store: HeapStore, person_table: TableDef
 ) -> None:

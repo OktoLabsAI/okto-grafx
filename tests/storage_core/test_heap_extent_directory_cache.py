@@ -130,6 +130,90 @@ def test_reserved_insert_reuses_its_just_validated_extent_once(
     assert heap_store.next_record_id(table) == 10
 
 
+def test_ordinary_insert_reuses_the_extent_that_advanced_its_identity_floor(
+    heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    original_find = HeapStore._find_extent
+    calls = 0
+
+    def counted_find(store: HeapStore, table_id: int) -> TableExtent | None:
+        nonlocal calls
+        calls += 1
+        return original_find(store, table_id)
+
+    monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
+
+    reference = heap_store.insert(table, 2, (2,), xmin=20)
+
+    assert calls == 1
+    assert any(
+        found == reference and version.record_id == 2
+        for found, version in heap_store.scan_all(table)
+    )
+    assert heap_store.next_record_id(table) == 3
+
+
+def test_first_ordinary_insert_reuses_the_extent_that_it_created(
+    heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _table(1)
+    original_find = HeapStore._find_extent
+    calls = 0
+
+    def counted_find(store: HeapStore, table_id: int) -> TableExtent | None:
+        nonlocal calls
+        calls += 1
+        return original_find(store, table_id)
+
+    monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
+
+    reference = heap_store.insert(table, 1, (1,), xmin=20)
+
+    assert calls == 1
+    assert any(
+        found == reference and version.record_id == 1
+        for found, version in heap_store.scan_all(table)
+    )
+    assert heap_store.next_record_id(table) == 2
+
+
+def test_ordinary_insert_rechecks_extent_when_epoch_moves_during_observation(
+    pool: BufferPool, heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table = _populate(heap_store, 1)[0]
+    pool.flush()
+    original_find = HeapStore._find_extent
+    original_observe = HeapStore._observe_record_id_extent
+    calls = 0
+
+    def counted_find(store: HeapStore, table_id: int) -> TableExtent | None:
+        nonlocal calls
+        calls += 1
+        return original_find(store, table_id)
+
+    def observe_before_cache_drop(
+        store: HeapStore,
+        stored_table: TableDef,
+        record_id: int,
+    ) -> tuple[TableExtent, bool]:
+        result = original_observe(store, stored_table, record_id)
+        pool.invalidate(heap_store.file)
+        return result
+
+    monkeypatch.setattr(HeapStore, "_find_extent", counted_find)
+    monkeypatch.setattr(HeapStore, "_observe_record_id_extent", observe_before_cache_drop)
+
+    reference = heap_store.insert(table, 2, (2,), xmin=20)
+
+    assert calls == 2
+    assert any(
+        found == reference and version.record_id == 2
+        for found, version in heap_store.scan_all(table)
+    )
+    assert heap_store.next_record_id(table) == 3
+
+
 def test_reserved_insert_rechecks_extent_after_derived_epoch_change(
     pool: BufferPool, heap_store: HeapStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

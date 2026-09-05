@@ -1384,10 +1384,24 @@ class HeapStore:
         Idempotent by construction: it only ever moves the counter up, so replaying the same
         record twice is the same as replaying it once, which is what A22 asks of every redo.
         """
+        _, changed = self._observe_record_id_extent(table, record_id)
+        return changed
+
+    def _observe_record_id_extent(
+        self, table: TableDef, record_id: RecordId
+    ) -> tuple[TableExtent, bool]:
+        """Raise the identity floor and retain the exact extent that was just settled.
+
+        ``insert`` needs both results: the public boolean and the extent whose identity floor
+        was proved before the row can become reachable.  Returning that already-read value
+        avoids a second page-zero directory lookup.  It is only a local hint: ``_store_version``
+        rejects its proof after any derived-view epoch change, while ``_resolve_tail`` still
+        validates and repairs stale physical tail hints before appending.
+        """
         _require_record_id(record_id)
         extent = self._extent_for(table)
         if record_id < extent.next_record_id:
-            return False
+            return extent, False
         if record_id >= MAX_U64:
             raise GrafxUnsupportedOperation(
                 f"Row identity {record_id} of table {table.name!r} leaves no room for the next "
@@ -1397,8 +1411,9 @@ class HeapStore:
                 field="next_record_id",
                 value=record_id,
             )
-        self._write_extent(replace(extent, next_record_id=record_id + 1))
-        return True
+        updated = replace(extent, next_record_id=record_id + 1)
+        self._write_extent(updated)
+        return updated, True
 
     def next_record_id(self, table: TableDef) -> RecordId:
         """Return the id the next row of this table would take, without spending it."""
@@ -1425,7 +1440,9 @@ class HeapStore:
         _require_commit_number("xmin", xmin)
         _require_record_id(record_id)
         payload = encode_tuple(table, values)
-        self.observe_record_id(table, record_id)
+        extent_epoch = self._derived_read_epoch()
+        extent, _ = self._observe_record_id_extent(table, record_id)
+        extent_proof = _ExtentProof(extent, extent_epoch)
         header = RecordHeader(
             record_id=record_id,
             xmin=xmin,
@@ -1434,7 +1451,7 @@ class HeapStore:
             payload_len=len(payload),
             schema_version=table.schema_version,
         )
-        return self._store_version(table, header, payload)
+        return self._store_version(table, header, payload, extent_proof=extent_proof)
 
     def insert_reserved(
         self,
