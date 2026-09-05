@@ -1494,3 +1494,31 @@ syscall reduction is the promoted claim. The composed relevant slice passed 203 
 declared platform skip; Ruff and diff checks passed. Two stale tests already failing at `48d4672`
 were corrected separately in `674e420` without changing engine code. Format, WAL/OCC, durability,
 writer-lease and multiwriter/multireader premises remain unchanged.
+
+## Scale-removal batch 29 — compiled defensive plan clones
+
+Status: **completed in `c06463f`; local and Nexus
+`hof_93cce5a9688049988570694a4588ecea` adversarial reviews PASS**.
+
+The public query boundary still snapshots and validates every plan that is not proven to be owned
+by the exact built-in query engine. For an internally owned root retained by the bounded prepared-
+plan cache, the first public result now compiles a private clone recipe from the already detached
+and validated tree. Later results use that recipe instead of repeating dataclass reflection,
+constructor dispatch and full plan validation. The recipe lives only in the existing 128-entry LRU
+and is evicted with its root; it introduces no independent or unbounded cache.
+
+Every call still receives a new operator/expression/schema tree. Mutable `Literal` values are
+snapshotted into private recipe state and snapshotted again per result. `TableDef` and `ColumnDef`
+continue through their canonical constructors so column positions, decode plans and automatic-
+index projections are rebuilt; plain closed-grammar dataclasses use direct frozen-slot allocation.
+The constructor choice is resolved once while compiling the recipe, including inherited future
+`__post_init__` hooks. External collaborators, subclasses and unproved roots never enter this
+path and retain the complete fail-closed `GrafxPlanError` boundary.
+
+An adversarial identity walk over two returned trees found zero shared grammar nodes and zero
+shared mutable objects; only immutable scalar and enum leaves were shared. The representative
+component micro measured a `1.983x` median speedup across seven rounds. A short full-query sample
+measured only `0.929 -> 0.910 s` for 750 executions (`~1.02x`) and was noisy, so this batch makes no
+larger endpoint claim and creates no performance gate. The focused file passed 62 tests; the two
+adjacent query/API slices passed 180 and 85 tests, with Ruff and diff checks clean. No storage
+format, WAL/OCC, durability, locking, writer-lease or multiwriter/multireader rule changed.
