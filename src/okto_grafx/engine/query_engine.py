@@ -597,6 +597,27 @@ class QueryResult:
         return f"{len(self.rows)} rows over columns {', '.join(self.columns) or 'none'}"
 
 
+def _owned_query_result(
+    *,
+    columns: tuple[str, ...] = (),
+    rows: tuple[tuple[Value, ...], ...] = (),
+    plan: PlanNode | None = None,
+    statistics: dict[str, int] | None = None,
+) -> QueryResult:
+    """Build a result whose exact fields were already validated and privately materialised.
+
+    This is not a second public constructor.  The query engine calls it only with the output of
+    its validated immutable plan, and the public boundary calls it only after rebuilding every
+    collaborator field.  All other callers keep :class:`QueryResult`'s hostile validation.
+    """
+    result = object.__new__(QueryResult)
+    object.__setattr__(result, "columns", columns)
+    object.__setattr__(result, "rows", rows)
+    object.__setattr__(result, "plan", plan)
+    object.__setattr__(result, "statistics", {} if statistics is None else statistics)
+    return result
+
+
 @dataclass(slots=True)
 class _Row:
     """One row travelling through the operator tree.
@@ -3039,7 +3060,7 @@ class QueryEngine:
             root, (CreateIndex, CreateNodeTable, CreateRelTable, CreateVectorSpace)
         ):
             self._schema(root, txn, statistics)
-            return QueryResult(plan=root, statistics=dict(statistics))
+            return _owned_query_result(plan=root, statistics=dict(statistics))
         if not isinstance(root, ProduceResults):
             raise GrafxPlanError(
                 f"A plan is rooted at the result it produces; got {root.label}.",
@@ -3079,7 +3100,7 @@ class QueryEngine:
         produced: tuple[tuple[Value, ...], ...] = ()
         if root.columns:
             produced = tuple(_projected(row, root.columns) for row in rows)
-        return QueryResult(
+        return _owned_query_result(
             columns=root.columns,
             rows=produced,
             plan=root,

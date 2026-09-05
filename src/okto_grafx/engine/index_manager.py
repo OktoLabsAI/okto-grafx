@@ -130,7 +130,8 @@ from okto_grafx.domain.page import (
     PageType,
 )
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
-from okto_grafx.domain.txn.context import RowIntent
+from okto_grafx.domain.txn.context import RowIntent, TransactionContext
+from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.buffer_pool import (
@@ -2473,7 +2474,7 @@ class IndexStore:
 
     def _require_exact_read_lsn(self, snapshot: object) -> Lsn:
         """Return the durable position an authoritative public lookup must prove."""
-        if not isinstance(snapshot, SnapshotLike):
+        if type(snapshot) is not Snapshot and not isinstance(snapshot, SnapshotLike):
             raise GrafxIndexError(
                 f"A lookup needs a snapshot; got {type(snapshot).__name__}.",
                 field="snapshot",
@@ -3650,7 +3651,7 @@ class IndexStore:
 
     def _require_txn(self, txn: object) -> int:
         """Return the transaction number, refusing anything that cannot stage a record."""
-        if not isinstance(txn, StagingTransaction):
+        if type(txn) is not TransactionContext and not isinstance(txn, StagingTransaction):
             raise GrafxIndexError(
                 "An index change is staged on a transaction that carries a txn_id and can stage "
                 f"a record; got {type(txn).__name__}.",

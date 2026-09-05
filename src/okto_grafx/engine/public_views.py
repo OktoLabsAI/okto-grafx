@@ -2930,7 +2930,7 @@ def _query_result_snapshot(
     """Rebuild one fully materialised query result outside the page-access section."""
     # Local import avoids making the query engine depend on the public-view module that rebuilds
     # its output.  Database calls this only after composition has finished importing both modules.
-    from okto_grafx.engine.query_engine import QueryResult
+    from okto_grafx.engine.query_engine import QueryResult, _owned_query_result
 
     source = _domain_value(value, QueryResult, field="query.result")
     raw_columns = _tuple_items(
@@ -3007,7 +3007,7 @@ def _query_result_snapshot(
     statistics = _query_statistics_snapshot(
         _domain_field(source, QueryResult, "statistics")
     )
-    return QueryResult(
+    return _owned_query_result(
         columns=tuple(columns),
         rows=tuple(rows),
         plan=plan,

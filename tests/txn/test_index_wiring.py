@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxWriteConflict
+import okto_grafx.domain.txn.context as txn_context_module
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxWriteConflict
 from okto_grafx.domain.ids import RecordRef
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.visibility import IndexVisibility
@@ -29,6 +30,15 @@ from okto_grafx.engine.txn_manager import TransactionManager
 from txn_support import Stack, build_stack, make_page_image
 
 HEAP = "heap.dat"
+
+
+class _ExplodingProtocolMeta(type):
+    def __instancecheck__(cls, instance: object) -> bool:
+        raise RuntimeError(f"protocol fallback reached for {type(instance).__name__}")
+
+
+class _ExplodingProtocol(metaclass=_ExplodingProtocolMeta):
+    pass
 
 
 class _RecordingIndexManager:
@@ -87,6 +97,61 @@ def _stage(stack: Stack, manager: TransactionManager, page: int = 3) -> object:
         WalRecord(record_type=int(WalRecordType.INDEX_WRITE), payload=b"entry", txn_id=txn.txn_id)
     )
     return txn
+
+
+def test_an_exact_wal_record_skips_protocol_reflection(
+    monkeypatch: pytest.MonkeyPatch,
+    stack: Stack,
+) -> None:
+    txn = stack.manager.begin("write")
+    record = WalRecord(
+        record_type=int(WalRecordType.INDEX_WRITE),
+        payload=b"entry",
+        txn_id=txn.txn_id,
+    )
+    monkeypatch.setattr(txn_context_module, "WalRecordLike", _ExplodingProtocol)
+
+    txn.stage_record(record)
+
+    assert txn.pending_records == [record]
+
+
+def test_a_wal_record_subclass_still_takes_the_structural_protocol_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    stack: Stack,
+) -> None:
+    class WalRecordSubclass(WalRecord):
+        pass
+
+    txn = stack.manager.begin("write")
+    record = WalRecordSubclass(
+        record_type=int(WalRecordType.INDEX_WRITE),
+        payload=b"entry",
+        txn_id=txn.txn_id,
+    )
+    monkeypatch.setattr(txn_context_module, "WalRecordLike", _ExplodingProtocol)
+
+    with pytest.raises(RuntimeError, match="WalRecordSubclass"):
+        txn.stage_record(record)
+    assert txn.pending_records == []
+
+
+def test_a_structural_wal_record_keeps_the_protocol_fallback_and_refusal_taxonomy(
+    stack: Stack,
+) -> None:
+    class StructuralRecord:
+        record_type = int(WalRecordType.INDEX_WRITE)
+        lsn = 0
+        payload = b"entry"
+
+    txn = stack.manager.begin("write")
+    structural = StructuralRecord()
+    txn.stage_record(structural)
+    assert txn.pending_records == [structural]
+
+    with pytest.raises(GrafxConfigurationError) as refused:
+        txn.stage_record(object())
+    assert refused.value.details["field"] == "record"
 
 
 # --- the calls, and when they happen --------------------------------------------------------

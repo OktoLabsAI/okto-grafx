@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import pytest
 
+import okto_grafx.engine.index_manager as index_manager_module
 from okto_grafx.domain.errors import (
     GrafxBufferBudgetExceeded,
     GrafxIndexError,
     GrafxStorageError,
     GrafxUnsupportedOperation,
 )
+from okto_grafx.domain.txn.context import TransactionContext, TransactionMode
+from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.index_manager import (
     INDEX_FLAG_STALE,
@@ -28,6 +31,60 @@ from .conftest import (
 
 BORN = 10
 LATER = 20
+
+
+class _ExplodingProtocolMeta(type):
+    def __instancecheck__(cls, instance: object) -> bool:
+        raise RuntimeError(f"protocol fallback reached for {type(instance).__name__}")
+
+
+class _ExplodingProtocol(metaclass=_ExplodingProtocolMeta):
+    pass
+
+
+def _transaction_context(context_type: type[TransactionContext]) -> TransactionContext:
+    return context_type(
+        txn_id=37,
+        mode=TransactionMode.WRITE,
+        snapshot=Snapshot(BORN),
+        epoch=1,
+        owner=object(),
+        page_staging_capability=object(),
+    )
+
+
+def test_exact_internal_snapshot_and_transaction_skip_protocol_reflection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = Snapshot(BORN)
+    transaction = _transaction_context(TransactionContext)
+    monkeypatch.setattr(index_manager_module, "SnapshotLike", _ExplodingProtocol)
+    monkeypatch.setattr(index_manager_module, "StagingTransaction", _ExplodingProtocol)
+
+    assert IndexStore._require_exact_read_lsn(object(), snapshot) == BORN  # type: ignore[arg-type]
+    assert IndexStore._require_txn(object(), transaction) == 37  # type: ignore[arg-type]
+
+
+def test_internal_type_subclasses_still_take_the_structural_protocol_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SnapshotSubclass(Snapshot):
+        pass
+
+    class TransactionSubclass(TransactionContext):
+        pass
+
+    monkeypatch.setattr(index_manager_module, "SnapshotLike", _ExplodingProtocol)
+    monkeypatch.setattr(index_manager_module, "StagingTransaction", _ExplodingProtocol)
+
+    with pytest.raises(RuntimeError, match="SnapshotSubclass"):
+        IndexStore._require_exact_read_lsn(  # type: ignore[arg-type]
+            object(), SnapshotSubclass(BORN)
+        )
+    with pytest.raises(RuntimeError, match="TransactionSubclass"):
+        IndexStore._require_txn(  # type: ignore[arg-type]
+            object(), _transaction_context(TransactionSubclass)
+        )
 
 
 def _insert_exact(database: object, record_id: int, name: str, csn: int, txn_id: int):

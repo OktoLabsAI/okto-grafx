@@ -335,6 +335,29 @@ def test_non_owned_collaborator_plan_never_reaches_the_trusted_clone_recipe(
     assert observed is not raw
 
 
+def test_owned_engine_results_do_not_repeat_the_public_constructor_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = QueryResult.__post_init__
+
+    def counted(result: QueryResult) -> None:
+        nonlocal calls
+        calls += 1
+        original(result)
+
+    monkeypatch.setattr(QueryResult, "__post_init__", counted)
+    with connect(":memory:") as database:
+        observed = database.execute("RETURN 1 AS value")
+
+    assert observed.columns == ("value",)
+    assert observed.rows == ((1,),)
+    assert calls == 0
+
+    QueryResult()
+    assert calls == 1
+
+
 @pytest.mark.parametrize("character", ["\x00", "\U000e0001"])
 def test_maximum_nonprintable_string_literal_fits_rendered_query_bound(
     character: str,

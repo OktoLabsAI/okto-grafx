@@ -28,6 +28,7 @@ from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, RecordRef, TxnI
 from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
 from okto_grafx.domain.txn.partitions import page_partition
 from okto_grafx.domain.txn.records import (
+    WalRecord,
     WalRecordLike,
     WalRecordType,
     is_redoable_page_file,
@@ -407,7 +408,7 @@ class TransactionContext:
         """
         self._require_active()
         self._require_write_mode("stage a log record")
-        if not isinstance(record, WalRecordLike):
+        if type(record) is not WalRecord and not isinstance(record, WalRecordLike):
             raise GrafxConfigurationError(
                 "A staged record must carry a record type, an LSN and a payload; got "
                 f"{type(record).__name__}.",
