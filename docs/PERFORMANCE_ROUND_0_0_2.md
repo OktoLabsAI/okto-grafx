@@ -42,7 +42,7 @@ assumption.
 
 ### Pulse candidate activation
 
-The Pulse 0.3.3 consumer integration activates catalog v2 with
+The Pulse 0.3.3 consumer integration in `e4ac346` activates catalog v2 with
 `database.ensure_identity_indexes()` only on the newly created, exclusive and still-empty Grafx
 candidate, before physical schema DDL. Existing graph paths are never adopted or migrated by this
 door. Activation failure is classified in the import phase, closes the handle and removes only the
@@ -1799,7 +1799,7 @@ multiwriter/multireader premises remain unchanged.
 
 ## Scale-removal batch 41 — statement- and commit-local index authority
 
-Status: **completed on `feature/v0.0.2`; independent structural and correctness reviews GO**.
+Status: **completed in `613bff6`; independent structural and correctness reviews GO**.
 
 The exact built-in query engine computes a closed statement footprint for typed node and
 relationship patterns, CREATE/MERGE/SET/DELETE and direction-aware endpoints. `DETACH DELETE`
