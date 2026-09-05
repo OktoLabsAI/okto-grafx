@@ -61,6 +61,11 @@ including the on-disk format.
 
 ### Changed
 
+- Exact built-in catalog snapshots now retain their own immutable, checksummed serialized image
+  until the next sanctioned schema, space, index-generation or required-capability mutation.
+  This removes repeated whole-catalog validation and encoding from DDL and prepared-plan keys;
+  every mutation invalidates the image, deserialization starts uncached, and catalog subclasses
+  preserve the former observable serialization protocol.
 - Built-in index verification now captures one catalog image per call, scans each covered heap
   table once and resolves each repeated physical row reference once across sibling indexes. The
   table-sized memo is released immediately after that table's final index and never survives the

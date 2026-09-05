@@ -2004,3 +2004,32 @@ state (`2/2/4` cumulative), and a custom-index regression retained `2/2`. All 78
 walks and counts every entry, derives its own expected key and emits the same located findings.
 No persisted format, WAL/OCC, durability, writer-ordering or multiwriter/multireader premise
 changed. The profile ceiling is prioritization evidence, not a post-change timing claim or gate.
+
+## Scale-removal batch 49 — exact catalog-state serialization image
+
+Status: **implemented on `feature/v0.0.2`; 83 focused tests and Ruff green**.
+
+DDL and prepared-plan consumers repeatedly requested the same complete catalog bytes. Each call
+previously revalidated the whole index authority, encoded every table, space and logical index,
+joined the complete body and recomputed its checksum. In the Pulse-shaped profile this produced
+13,284 table encodes for an approximately 82-table catalog.
+
+An exact built-in `Catalog` now retains one immutable serialized image after that state's first
+complete validation and encoding. Every sanctioned table, embedding-space, index-authority or
+required-capability mutation clears the image together with the existing derived index memo.
+Idempotently enabling an already-present capability keeps the same state and image. A catalog
+loaded from bytes starts uncached and earns a new canonical image only through its own serializer;
+subclasses retain the former per-call protocol because serialization may be observable there.
+
+The structural test over two tables observed two `_encode_table` calls on the first serialization
+and no additional calls on repetition. Adding and replacing index authority, then enabling each
+required capability, added exactly two calls per real state change and none on repeated reads or
+idempotent activations. Legacy schema/space/retirement tests separately prove that each mutation
+produces a new image and that a subclass returns equal but independently produced bytes.
+
+The pre-change Amdahl profile bounds this opportunity at about 8–9% of logical transfer. That is
+a prioritization ceiling, not a post-change wall-clock claim or a new gate. Retained memory is one
+immutable `bytes` image per live exact catalog snapshot. It is never shared as mutable authority
+or across snapshot ownership; the first serialization still performs every validation and emits
+byte-identical persisted format. WAL, OCC, durability, writer ordering and the original
+multiwriter/multireader premises are unchanged.

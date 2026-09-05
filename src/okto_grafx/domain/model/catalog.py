@@ -144,6 +144,7 @@ class Catalog:
         "_indexes_by_key",
         "_index_definitions_by_table",
         "_active_index_definitions_memo",
+        "_serialized_memo",
     )
 
     def __init__(self) -> None:
@@ -160,6 +161,7 @@ class Catalog:
             tuple[int, str], tuple[CatalogIndexDefinition, ...]
         ] = {}
         self._active_index_definitions_memo: tuple[IndexDefinition, ...] | None = None
+        self._serialized_memo: bytes | None = None
 
     # --- reading ---------------------------------------------------------------------------
 
@@ -428,20 +430,24 @@ class Catalog:
         """
 
         self._require_index_catalog()
-        self._required_capabilities = frozenset(
+        capabilities = frozenset(
             (*self._required_capabilities, HEAP_RECLAIM_V1_CAPABILITY)
         )
-        self._active_index_definitions_memo = None
+        if capabilities != self._required_capabilities:
+            self._required_capabilities = capabilities
+            self._invalidate_derived()
         return self
 
     def enable_wal_record_v2(self) -> Catalog:
         """Add the one-way capability required before emitting any WAL-v2 record."""
 
         self._require_index_catalog()
-        self._required_capabilities = frozenset(
+        capabilities = frozenset(
             (*self._required_capabilities, WAL_RECORD_V2_CAPABILITY)
         )
-        self._active_index_definitions_memo = None
+        if capabilities != self._required_capabilities:
+            self._required_capabilities = capabilities
+            self._invalidate_derived()
         return self
 
     def replace_index_definition(
@@ -583,6 +589,13 @@ class Catalog:
 
     def serialize(self) -> bytes:
         """Return the checksummed bytes of this catalog, in a stable order."""
+        # Catalog definitions are immutable values and every sanctioned authority change goes
+        # through one of the installers below.  Reusing this exact state's already-validated
+        # image therefore removes repeated O(tables + spaces + indexes) encoding from DDL and
+        # prepared-plan keys without sharing mutable authority between catalog snapshots.
+        # Subclasses retain the historical protocol because they may observe serialization.
+        if type(self) is Catalog and self._serialized_memo is not None:
+            return self._serialized_memo
         if self._format_version not in {
             CATALOG_LEGACY_FORMAT_VERSION,
             CATALOG_FORMAT_VERSION,
@@ -628,7 +641,10 @@ class Catalog:
         for definition in indexes:
             parts.append(_encode_catalog_index(definition))
         body = b"".join(parts)
-        return body + _CHECKSUM.pack(crc32c(body))
+        encoded = body + _CHECKSUM.pack(crc32c(body))
+        if type(self) is Catalog:
+            self._serialized_memo = encoded
+        return encoded
 
     @classmethod
     def deserialize(cls, raw: bytes) -> Catalog:
@@ -815,7 +831,7 @@ class Catalog:
         self._indexes_by_key = by_key
         self._indexes = by_name
         self._index_definitions_by_table = by_table
-        self._active_index_definitions_memo = None
+        self._invalidate_derived()
 
     def _validated_index_authority(
         self,
@@ -955,12 +971,18 @@ class Catalog:
     def _install_table(self, table: TableDef) -> None:
         self._tables[table.name] = table
         self._tables_by_id[table.table_id] = table
-        self._active_index_definitions_memo = None
+        self._invalidate_derived()
 
     def _install_space(self, space: EmbeddingSpaceDef) -> None:
         self._spaces[space.name] = space
         self._spaces_by_id[space.space_id] = space
+        self._invalidate_derived()
+
+    def _invalidate_derived(self) -> None:
+        """Drop values derived from the current catalog authority after one mutation."""
+
         self._active_index_definitions_memo = None
+        self._serialized_memo = None
 
     def _install_loaded(
         self, tables: list[TableDef], spaces: list[EmbeddingSpaceDef]

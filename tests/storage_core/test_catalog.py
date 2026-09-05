@@ -284,6 +284,42 @@ def test_serialisation_is_stable_for_the_same_catalog() -> None:
     assert populated().serialize() == populated().serialize()
 
 
+def test_exact_catalog_reuses_only_the_current_serialized_state() -> None:
+    catalog = Catalog()
+
+    empty = catalog.serialize()
+    assert catalog.serialize() is empty
+
+    catalog.add_space(space())
+    with_space = catalog.serialize()
+    assert with_space is not empty
+    assert catalog.serialize() is with_space
+
+    catalog.retire_space("minilm")
+    retired = catalog.serialize()
+    assert retired is not with_space
+    assert retired != with_space
+    assert catalog.serialize() is retired
+
+    catalog.add_table(table())
+    with_table = catalog.serialize()
+    assert with_table is not retired
+    assert with_table != retired
+    assert catalog.serialize() is with_table
+
+
+def test_catalog_subclasses_keep_the_observable_serialization_protocol() -> None:
+    class ObservedCatalog(Catalog):
+        pass
+
+    catalog = ObservedCatalog()
+    first = catalog.serialize()
+    second = catalog.serialize()
+
+    assert second == first
+    assert second is not first
+
+
 def test_the_serialised_form_opens_with_its_magic_and_version() -> None:
     raw = populated().serialize()
     assert raw.startswith(CATALOG_MAGIC)

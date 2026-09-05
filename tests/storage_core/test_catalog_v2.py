@@ -419,6 +419,55 @@ def test_wal_record_v2_capability_is_one_way_and_fences_an_older_v2_build(
     assert raised.value.details["unsupported"] == _CAPABILITY_WAL_RECORD_V2
 
 
+def test_v2_serialization_reencodes_tables_once_per_authority_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _schema_catalog()
+    catalog.upgrade_index_catalog((_identity(),))
+    encoded_tables = 0
+    original = catalog_module._encode_table
+
+    def count_table_encoding(table: TableDef) -> bytes:
+        nonlocal encoded_tables
+        encoded_tables += 1
+        return original(table)
+
+    monkeypatch.setattr(catalog_module, "_encode_table", count_table_encoding)
+
+    activated = catalog.serialize()
+    assert encoded_tables == 2
+    assert catalog.serialize() is activated
+    assert encoded_tables == 2
+
+    catalog.add_index_definition(_custom())
+    with_custom = catalog.serialize()
+    assert with_custom is not activated
+    assert encoded_tables == 4
+    assert catalog.serialize() is with_custom
+    assert encoded_tables == 4
+
+    catalog.replace_index_definition(_custom(nonce=12))
+    replacement = catalog.serialize()
+    assert replacement is not with_custom
+    assert encoded_tables == 6
+    assert catalog.serialize() is replacement
+    assert encoded_tables == 6
+
+    catalog.enable_heap_reclaim()
+    reclaim = catalog.serialize()
+    assert reclaim is not replacement
+    assert encoded_tables == 8
+    assert catalog.enable_heap_reclaim().serialize() is reclaim
+    assert encoded_tables == 8
+
+    catalog.enable_wal_record_v2()
+    wal_v2 = catalog.serialize()
+    assert wal_v2 is not reclaim
+    assert encoded_tables == 10
+    assert catalog.enable_wal_record_v2().serialize() is wal_v2
+    assert encoded_tables == 10
+
+
 def test_v2_layout_and_numeric_tags_are_pinned_independently() -> None:
     catalog = _schema_catalog(isolated=True)
     definition = _custom()
