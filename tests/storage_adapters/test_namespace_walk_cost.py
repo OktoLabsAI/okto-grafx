@@ -352,14 +352,14 @@ def test_a_warm_descriptor_hit_does_not_re_prove_the_path_chain(
     device.read_page(HEAP, 0)  # admit the descriptor: the chain is proved here, once
     with _counting_syscalls() as counts:
         assert device.read_page(HEAP, 0) == bytes([1]) * PAGE_SIZE
-    # Identity is one stat of the name and one fstat of the held descriptor (plus the fstat
-    # that sizes the file). Before, the same hit re-proved the root and every segment by real
-    # path as well. The guard that stays -- one lstat of the root and one of each existing
-    # component, followed nowhere -- is REQUIRED here: a hit that skipped it would not refuse
-    # a root or a directory exchanged for a redirect after admission.
+    # Identity reuses the final lstat of the required no-follow chain and compares it with one
+    # fstat of the held descriptor (plus the fstat that sizes the file). Before, the same hit
+    # followed the final path once more with stat. The guard that stays -- one lstat of the root
+    # and one of each existing component, followed nowhere -- is REQUIRED here: a hit that
+    # skipped it would not refuse a root or a directory exchanged for a redirect after admission.
     assert counts["realpath"] == 0, dict(counts)
     assert 2 <= counts["lstat"] <= 4, dict(counts)
-    assert counts["stat"] == 1, dict(counts)
+    assert counts["stat"] == 0, dict(counts)
     assert counts["fstat"] <= 2, dict(counts)
 
 

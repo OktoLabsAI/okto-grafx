@@ -1634,17 +1634,24 @@ class LocalStorageDevice:
             component=self._relative(path),
         )
 
-    def _require_safe_path(self, name: str, *, prove_containment: bool = True) -> None:
+    def _require_safe_path(
+        self, name: str, *, prove_containment: bool = True
+    ) -> os.stat_result | None:
         """Refuse every existing redirected component of one logical file path.
 
         Without ``prove_containment`` no real path is resolved: every existing component is
         still inspected without being followed and refused when redirected or foreign, but
         containment is taken from the proof made when the name was first resolved. That is the
         fast guard of a warm descriptor hit; a name being resolved anew always proves both.
+        The returned observation is the final component's no-follow identity, or ``None`` when
+        that component is absent. Callers that already need that identity can consume this
+        proof instead of following the same path with a redundant ``stat``.
         """
         self._require_root_identity(name, prove_real_path=prove_containment)
         current = self._root
-        for segment in name.split("/"):
+        segments = name.split("/")
+        final_information: os.stat_result | None = None
+        for position, segment in enumerate(segments):
             current = os.path.join(current, segment)
             try:
                 information = os.lstat(current)
@@ -1676,6 +1683,9 @@ class LocalStorageDevice:
                 )
             if prove_containment:
                 self._require_contained(name, current)
+            if position + 1 == len(segments):
+                final_information = information
+        return final_information
 
     def _require_directory_parents(self, name: str) -> None:
         """Refuse a name whose parent segment is itself a stored file, on both families alike."""
@@ -2178,15 +2188,15 @@ class LocalStorageDevice:
         file. Containment is not re-derived: it was proved at admission, and a plain component
         cannot have left a root whose identity still holds.
         """
-        path = self._paths.get(name)
-        if path is None:
-            path = self._physical_path(
+        if self._paths.get(name) is None:
+            current = self._require_safe_path(
                 name
             )  # admitted without a proved path: prove it now
         else:
-            self._require_safe_path(name, prove_containment=False)
+            current = self._require_safe_path(name, prove_containment=False)
+        if current is None:
+            return False
         try:
-            current = os.stat(path)
             held = os.fstat(descriptor)
         except OSError:
             return False

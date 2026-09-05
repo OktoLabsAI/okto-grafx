@@ -14,6 +14,7 @@ from okto_grafx.domain.control_record import (
 )
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxStorageError,
     GrafxUnsupportedOperation,
 )
@@ -102,6 +103,71 @@ def test_strict_revalidates_every_warm_descriptor_hit(
             assert reader.read_log(HEAP, 0, 4) == b"heap"
 
         assert calls == [HEAP, HEAP, HEAP]
+
+
+def test_safe_path_returns_only_the_final_component_observation(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"control"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        observed = device._require_safe_path(CONTROL, prove_containment=False)
+
+        assert observed is not None
+        expected = os.lstat(root / "control" / "commit.state")
+        parent = os.lstat(root / "control")
+        assert (observed.st_dev, observed.st_ino) == (
+            expected.st_dev,
+            expected.st_ino,
+        )
+        assert (observed.st_dev, observed.st_ino) != (parent.st_dev, parent.st_ino)
+
+
+@pytest.mark.parametrize("name", ["control/absent.state", "absent/commit.state"])
+def test_safe_path_returns_none_when_the_final_or_an_intermediate_component_is_absent(
+    tmp_path: Path, name: str
+) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"control"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        assert device._require_safe_path(name, prove_containment=False) is None
+
+
+def test_warm_descriptor_without_a_remembered_path_repeats_the_containment_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "database"
+    _seed(root, (HEAP, b"heap"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        assert device.read_log(HEAP, 0, 4) == b"heap"
+        device._paths.pop(HEAP)
+        proofs: list[bool] = []
+        original = LocalStorageDevice._require_safe_path
+
+        def counted(
+            self: LocalStorageDevice,
+            name: str,
+            *,
+            prove_containment: bool = True,
+        ) -> os.stat_result | None:
+            proofs.append(prove_containment)
+            return original(self, name, prove_containment=prove_containment)
+
+        monkeypatch.setattr(LocalStorageDevice, "_require_safe_path", counted)
+
+        assert device.read_log(HEAP, 0, 4) == b"heap"
+        assert proofs == [True]
+
+
+def test_warm_descriptor_is_not_used_after_its_name_disappears(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    _seed(root, (HEAP, b"heap"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        assert device.read_log(HEAP, 0, 4) == b"heap"
+        (root / HEAP).unlink()
+
+        with pytest.raises(GrafxCorruptionDetected):
+            device.read_log(HEAP, 0, 4)
+
+        assert HEAP not in device._handles
 
 
 def test_generation_classification_is_closed_and_canonical(tmp_path: Path) -> None:
