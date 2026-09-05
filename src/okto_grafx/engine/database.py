@@ -2104,17 +2104,29 @@ class Database:
         that has been released.
         """
         self._require_open()
-        txn = self.begin("read")
-        try:
-            result = txn.execute(text, parameters)
-        except BaseException as failure:
-            try:
-                txn.rollback()
-            except BaseException as cleanup_failure:
-                _note_cleanup_failure(failure, cleanup_failure)
-            raise
-        txn.commit()
-        return result
+        with self._public_transition():
+            # Close may win after the preliminary guard but before the transition becomes
+            # visible. Refuse before retaining the unlocked participant descriptor.
+            self._require_open()
+            with self._transactions._participant_descriptor_scope():
+                txn = self.begin("read")
+                try:
+                    result = txn.execute(text, parameters)
+                    txn.commit()
+                except BaseException as failure:
+                    if txn.active:
+                        try:
+                            txn.rollback()
+                        except BaseException as cleanup_failure:
+                            _note_cleanup_failure(failure, cleanup_failure)
+                            if txn.active:
+                                # No caller can recover this local wrapper. Seal the facade so
+                                # leaving the outer transition drains its reader pin and every
+                                # descriptor before lower dependencies are released.
+                                self._closed = True
+                                self._transactions.request_close()
+                    raise
+                return result
 
     def query(self, text: str, parameters: Mapping[str, object] | None = None) -> Query:
         """Return a reusable canonical read query whose cursors own their snapshots.

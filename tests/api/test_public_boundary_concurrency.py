@@ -786,7 +786,8 @@ def test_autocommit_execute_preserves_primary_when_rollback_cleanup_escapes(
             "SystemExit" in note and "autocommit rollback sentinel" in note
             for note in getattr(statement_failure, "__notes__", ())
         )
-        assert database._transactions.open_transactions == 1
+        assert database.closed is True
+        assert database._transactions.open_transactions == 0
     finally:
         database.close()
 

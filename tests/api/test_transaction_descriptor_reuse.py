@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from okto_grafx import connect
+from okto_grafx import Transaction, connect
 from okto_grafx.adapters import coordination_local
 from okto_grafx.domain.errors import GrafxWriteConflict
 
@@ -80,6 +80,147 @@ def test_repeated_execute_reuses_only_the_unlocked_participant_descriptor(
         assert released == 6
         assert database._transactions._transaction_descriptor_scopes == {}
         assert coordinator._descriptor_scopes == {}
+
+
+def test_autocommit_reuses_one_descriptor_but_takes_every_real_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "autocommit-descriptor"
+    with connect(root, checkpoint_interval_records=10_000) as database:
+        _seed(database)
+        coordinator = database._transactions._coordinator
+        participant = database._transactions._participant_section_name
+        participant_suffix = f"{participant}.lock"
+        real_open = os.open
+        real_acquire = coordination_local._acquire_os_lock
+        real_release = coordination_local._release_os_lock
+        participant_descriptors: set[int] = set()
+        opened = 0
+        acquired = 0
+        released = 0
+
+        def counted_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal opened
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if str(path).endswith(participant_suffix):
+                opened += 1
+                participant_descriptors.add(descriptor)
+            return descriptor
+
+        def counted_acquire(descriptor: int) -> None:
+            nonlocal acquired
+            if descriptor in participant_descriptors:
+                acquired += 1
+            real_acquire(descriptor)
+
+        def counted_release(descriptor: int) -> None:
+            nonlocal released
+            if descriptor in participant_descriptors:
+                released += 1
+            real_release(descriptor)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(coordination_local.os, "open", counted_open)
+            patch.setattr(coordination_local, "_acquire_os_lock", counted_acquire)
+            patch.setattr(coordination_local, "_release_os_lock", counted_release)
+            assert database.execute(_SEEK, {"id": 1}).rows == ((1,),)
+
+        assert opened == 1
+        assert acquired == 4
+        assert released == 4
+        assert database._transactions._transaction_descriptor_scopes == {}
+        assert coordinator._descriptor_scopes == {}
+
+
+def test_autocommit_scope_cannot_suppress_a_process_control_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = KeyboardInterrupt("query interrupted")
+
+    class SuppressingScope:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_outcome: object) -> bool:
+            return True
+
+    def scope(_coordinator: object, _name: str) -> SuppressingScope:
+        return SuppressingScope()
+
+    def fail_execute(
+        _transaction: Transaction, _text: str, _parameters: object = None
+    ) -> object:
+        raise failure
+
+    with connect(":memory:") as database, monkeypatch.context() as patch:
+        patch.setattr(
+            coordination_local.LocalProcessCoordinator,
+            "reuse_unlocked_section_descriptor",
+            scope,
+        )
+        patch.setattr(Transaction, "execute", fail_execute)
+        with pytest.raises(KeyboardInterrupt) as raised:
+            database.execute("RETURN 1")
+
+        assert raised.value is failure
+        assert database._transactions.open_transactions == 0
+
+
+def test_autocommit_scope_exit_failure_is_only_cleanup_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = KeyboardInterrupt("query interrupted")
+    cleanup = SystemExit("scope exit interrupted")
+
+    class FailingExitScope:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_outcome: object) -> None:
+            raise cleanup
+
+    def scope(_coordinator: object, _name: str) -> FailingExitScope:
+        return FailingExitScope()
+
+    def fail_execute(
+        _transaction: Transaction, _text: str, _parameters: object = None
+    ) -> object:
+        raise failure
+
+    with connect(":memory:") as database, monkeypatch.context() as patch:
+        patch.setattr(
+            coordination_local.LocalProcessCoordinator,
+            "reuse_unlocked_section_descriptor",
+            scope,
+        )
+        patch.setattr(Transaction, "execute", fail_execute)
+        with pytest.raises(KeyboardInterrupt) as raised:
+            database.execute("RETURN 1")
+
+        assert raised.value is failure
+        assert any(
+            "SystemExit" in note and "scope exit interrupted" in note
+            for note in getattr(failure, "__notes__", ())
+        )
+        assert database._transactions.open_transactions == 0
+
+
+def test_autocommit_rolls_back_a_commit_failure_that_left_the_context_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = KeyboardInterrupt("commit interrupted")
+
+    def fail_commit(_transaction: Transaction) -> object:
+        raise failure
+
+    with connect(":memory:") as database, monkeypatch.context() as patch:
+        patch.setattr(Transaction, "commit", fail_commit)
+        with pytest.raises(KeyboardInterrupt) as raised:
+            database.execute("RETURN 1")
+
+        assert raised.value is failure
+        assert database._transactions.open_transactions == 0
+        assert database.closed is False
 
 
 def test_idle_transaction_descriptor_never_excludes_another_thread(

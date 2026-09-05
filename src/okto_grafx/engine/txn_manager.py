@@ -7116,12 +7116,15 @@ class TransactionManager:
         try:
             yield entered
         except BaseException as failure:
-            with self._close_wait_hazard():
-                suppressed = bool(
+            try:
+                with self._close_wait_hazard():
                     scope.__exit__(type(failure), failure, failure.__traceback__)
-                )
-            if not suppressed:
-                raise
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
+            # This private optimization never owns an operation's outcome. A custom scope may
+            # release resources here, but its truthy return cannot suppress the failure whose
+            # unwind brought it here.
+            raise
         else:
             with self._close_wait_hazard():
                 scope.__exit__(None, None, None)
