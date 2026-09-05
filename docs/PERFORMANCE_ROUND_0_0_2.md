@@ -1259,6 +1259,32 @@ to about `1.034x` while requiring substantially broader cleanup/order/fence mach
 (`hof_2b85ac586d6042e78e0a973f86db45f4`). No format, WAL/OCC, durability, writer-lease or
 multiwriter/multireader premise changed.
 
+## Scale-removal batch 31 — bounded exact-string grammar witnesses
+
+Status: **completed in `c228b0a`; independent read-only audit GO, with no performance gate**.
+
+Repeated successful validation of exact built-in strings now uses two process-local LRU witnesses:
+one for control-plane identifiers keyed by `(label, value, limit)`, and one for complete logical
+storage names keyed by `file`. Each cache is limited to 512 entries, stores only successful proofs
+and is protected by the standard cache lock. Eviction changes only performance. The wrappers
+return the current argument, so two equal string objects do not acquire shared identity.
+
+Only exact `str` values enter either cache; the identifier path additionally requires exact
+`label` and `limit` types. Subclasses and hostile objects retain the original validation order,
+effects and refusal taxonomy. Invalid names are never cached and therefore repeat the canonical
+check and reproduce the same class, message and details. Different identifier limits cannot share
+a proof. The logical-name witness covers its segment checks, so no redundant segment cache was
+added. The grammar constants are module invariants, not mutable runtime configuration.
+
+The focused coordination and storage suites passed **26/26** and **147/147** independently (their
+flat `conftest` modules cannot be collected in one pytest process), with Ruff, import and diff
+checks green. Component hits measured roughly `4.6x` for identifiers and `13.7x` for logical names
+in the local sample. Profiling removed almost all of their repeated Python-loop cost, but the
+NTFS public PK endpoint remained too noisy and has a plausible product gain below 1%; this is a
+small cumulative optimization, not a gate or a transformative claim. No filesystem authority,
+path containment proof, descriptor validation, format, WAL/OCC, durability, locking, writer lease
+or multiwriter/multireader rule changed.
+
 ## Scale-removal batch 21 — reuse of the final no-follow identity
 
 Status: **completed in `b5cff4a`; independent and Nexus adversarial reviews PASS**.
