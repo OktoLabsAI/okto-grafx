@@ -1651,3 +1651,35 @@ with all 5,000 rows and keyed seeks intact afterward. This is calibration eviden
 gate. The local focused/adjacent slices passed 31 and 67 tests; the independent adversarial slice
 passed 107 tests, with Ruff and diff checks green. No format, WAL/OCC, durability, writer-lease or
 multiwriter/multireader premise changed.
+
+## Scale-removal batch 36 — revocable local checkpoint replay witness
+
+Status: **completed in `2792701`; Nexus adversarial review
+`hof_fbf973af72084c928938aa64dcb522d4` verified PASS after correcting one effectiveness
+blocker**.
+
+A completed public checkpoint may now seed one O(1), process-local witness for the exact empty
+suffix at its published LSN. Ordinary DML extends it only after the live commit has crossed its
+WAL barrier, applied and flushed its pages/index changes and published `commit.state`. Large INSERT
+batches also retain the witness across their private CN-1 identity-floor commit, but only after
+that heap-only subcommit has independently completed the same apply/flush/publication sequence.
+The witness is advisory, is never persisted and cannot authorize recovery.
+
+At checkpoint, Grafx still reads the complete WAL interval, validates checksums, contiguous LSNs,
+transaction outcomes and the terminal COMMIT, and runs the complete `CommitRedo.preflight` over
+every page payload. Index generation/name validation, replay-floor watermarks, data barriers,
+checkpoint publication and WAL recycling also remain. Only the redundant structural
+`CommitRedo.apply`/flush dispatch is skipped when the witness covers the exact
+`checkpoint_lsn -> last_committed_lsn` pair. Foreign views or commits, DDL/catalog or generation
+movement, RESET, dirty pages, recovery, close, failed apply/flush/barrier/publication/lease cleanup
+and custom index collaborators revoke or decline the shortcut and retain canonical replay.
+
+The first adversarial run found the original candidate delivered zero public activations because
+CN-1 reservation publication revoked the witness. After the fail-closed extension above, the same
+4,000-row/16-transaction workload activated it at 7 checkpoints and reduced `CommitRedo.apply`
+calls from 32 to 18 (`-43.8%`), with 4,000 rows and representative seeks intact after reopen. A
+separate alternating seven-round checkpoint-only probe over 250 inserts measured medians
+`0.15056 -> 0.10214 s` (`1.47x`). A 1,000-row end-to-end sample remained noisy (`0.96x`), so no
+universal load-throughput claim or performance gate is made. The relevant grouped slice passed 101
+tests and the selected multiprocess/crash slice passed 11, with Ruff, compileall and diff checks
+green. WAL/OCC, durability, writer ordering and multiwriter/multireader semantics are unchanged.

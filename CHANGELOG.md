@@ -61,6 +61,13 @@ including the on-disk format.
 
 ### Changed
 
+- Completed checkpoints now seed a revocable process-local witness for the exact WAL suffix whose
+  ordinary DML was already applied, flushed and published by that process. Checkpoint still reads
+  and validates the full WAL lineage and payload preflight, replay watermarks and all durability
+  barriers; only redundant structural redo dispatch is skipped. Foreign writers, DDL/generation
+  changes, RESET, dirty pages, recovery/failure/close and custom collaborators retain canonical
+  replay. Local CN-1 identity-floor subcommits extend the witness only after their own durable
+  apply/flush/publication sequence, keeping the optimization reachable for large INSERT batches.
 - Exact vector searches fed by a small, engine-sealed materialized candidate set now authenticate
   only the selected heap rows and their index buckets. Any incomplete proof, metadata drift, NULL,
   deletion, duplicate or wrong reference falls back to the canonical full scan before ranking; a

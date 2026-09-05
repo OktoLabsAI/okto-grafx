@@ -26,6 +26,17 @@ taken with the machine otherwise idle, and says so.
 Version 0.0.1, commit `eaad9c2`. Pre-alpha: these are the numbers of a young engine, recorded
 honestly, ceilings included.
 
+### 0.0.2 checkpoint replay dispatch (batch 36)
+
+The 0.0.2 branch retains complete WAL reading, continuity/checksum proof and payload preflight at
+checkpoint, but uses a revocable process-local witness to avoid dispatching page and logical-index
+effects that the same process already applied and flushed. The witness covers only one exact
+checkpoint suffix and is discarded on every foreign, catalog/generation, dirty, recovery, failure
+or custom-collaborator boundary. In the audited 4,000-row/16-transaction run it activated 7 times
+and reduced `CommitRedo.apply` calls from 32 to 18. A seven-round, 250-insert checkpoint-only probe
+measured `0.15056 -> 0.10214 s` median (`1.47x`); an end-to-end 1,000-row sample was noisy and did
+not establish a throughput gain, so this is structural/directional evidence rather than a gate.
+
 ---
 
 ## 1. Test machine and build
