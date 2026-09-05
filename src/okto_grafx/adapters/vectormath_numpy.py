@@ -122,6 +122,10 @@ class NumpyVectorMath:
 
     __slots__ = ()
 
+    # Private opt-in consumed only when declared directly on the concrete adapter class.  A
+    # subclass that adds callbacks or state does not inherit the authorization implicitly.
+    _stable_pair_scores_for_construction: bool = True
+
     @property
     def name(self) -> str:
         """Return the bounded label of this implementation, safe as a metric label value."""

@@ -187,6 +187,7 @@ class HnswGraph:
         "_norms",
         "_levels",
         "_links",
+        "_construction_link_scores",
         "_chain_next",
         "_chain_previous",
         "_chain_head",
@@ -204,6 +205,7 @@ class HnswGraph:
         neighbours: int = DEFAULT_NEIGHBOURS,
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         _component_typecode: str | None = None,
+        _cache_construction_link_scores: bool = False,
     ) -> None:
         """Build an empty graph whose shape is decided by the seed and the neighbour count.
 
@@ -241,6 +243,15 @@ class HnswGraph:
         self._norms: dict[int, tuple[tuple[float, ...] | bytes, float]] = {}
         self._levels: dict[int, int] = {}
         self._links: list[dict[int, list[int]]] = [{}]
+        # A cold engine build may opt into a transient score beside each full adjacency.  Once
+        # a node has overflowed, every later link used to rescore all of its unchanged peers just
+        # to rank one new peer.  The parallel lists retain those already-proved values only while
+        # the graph is being derived; ``_finish_construction`` drops the complete cache before the
+        # picture can be published.  Ordinary/public HnswGraph construction keeps the historical
+        # callback behaviour unless its caller explicitly selects this private capability.
+        self._construction_link_scores: list[dict[int, list[float]]] | None = (
+            [{}] if _cache_construction_link_scores else None
+        )
         self._chain_next: dict[int, int] = {}
         self._chain_previous: dict[int, int] = {}
         self._chain_head: int | None = None
@@ -354,6 +365,9 @@ class HnswGraph:
         self._append_to_chain(node)
         while len(self._links) <= level:
             self._links.append({})
+            scores = self._construction_link_scores
+            if scores is not None:
+                scores.append({})
         if self._entry_point is None:
             self._entry_point = node
             self._top_level = level
@@ -375,6 +389,16 @@ class HnswGraph:
             self._top_level = level
             self._entry_point = node
 
+    def _finish_construction(self) -> None:
+        """Release transient link scores before this derived graph is published.
+
+        Incremental maintenance intentionally retains the canonical scalar trimming path.  The
+        cache exists only to avoid repeated work while a complete cold picture is assembled in
+        locals, and keeping it afterwards would turn a build-time speedup into permanent O(E)
+        duplicate residency.
+        """
+        self._construction_link_scores = None
+
     def remove(self, node: int) -> None:
         """Take one node out of the graph, keeping the remaining nodes reachable.
 
@@ -392,10 +416,11 @@ class HnswGraph:
         for layer in range(len(self._links)):
             adjacency = self._links[layer]
             orphans = tuple(adjacency.pop(node, ()))
+            scores = self._construction_link_scores
+            if scores is not None:
+                scores[layer].pop(node, None)
             for neighbour in orphans:
-                peers = adjacency.get(neighbour)
-                if peers is not None and node in peers:
-                    peers.remove(node)
+                self._unlink(neighbour, node, layer)
             for position in range(len(orphans) - 1):
                 self._link(orphans[position], orphans[position + 1], layer)
         self._splice_from_chain(node)
@@ -560,20 +585,59 @@ class HnswGraph:
         if peers is None or len(peers) <= capacity:
             return
         scorer = self._scorer(self._components(node))
-        # Score in the established adjacency order, then let CPython's sort select the same
-        # total order in C. The previous repeated insort maintained this exact prefix after each
-        # peer; sorting once yields the same final prefix without O(M²) Python list shifts.
-        ranked = [(scorer(peer), peer) for peer in peers]
+        cached_by_node = (
+            None
+            if self._construction_link_scores is None
+            else self._construction_link_scores[layer]
+        )
+        cached = None if cached_by_node is None else cached_by_node.get(node)
+        if cached is not None and len(cached) == len(peers) - 1:
+            # A cached adjacency was full before _link appended exactly one new peer.  Its old
+            # scores remain aligned with the unchanged prefix; compute only the appended value.
+            ranked = list(zip(cached, peers[:-1], strict=True))
+            ranked.append((scorer(peers[-1]), peers[-1]))
+        else:
+            # The first overflow and every uncertain alignment retain the canonical complete
+            # scoring order.  A failed score publishes no cache and leaves the caller to discard
+            # or retire the containing graph exactly as before.
+            ranked = [(scorer(peer), peer) for peer in peers]
         ranked.sort(key=_rank_key)
-        kept = [peer for _score, peer in ranked[:capacity]]
+        retained_pairs = ranked[:capacity]
+        kept = [peer for _score, peer in retained_pairs]
         adjacency[node] = kept
+        if cached_by_node is not None:
+            cached_by_node[node] = [score for score, _peer in retained_pairs]
         retained = set(kept)
         for peer in peers:
             if peer in retained:
                 continue
-            other = adjacency.get(peer)
-            if other is not None and node in other:
-                other.remove(node)
+            self._unlink(peer, node, layer)
+
+    def _unlink(self, owner: int, peer: int, layer: int) -> None:
+        """Remove one directed adjacency and retire a transient cache if it is uncertain."""
+        adjacency = self._links[layer]
+        peers = adjacency.get(owner)
+        if peers is None:
+            return
+        try:
+            position = peers.index(peer)
+        except ValueError:
+            return
+        peers.pop(position)
+        scores = self._construction_link_scores
+        if scores is None:
+            return
+        cached_by_node = scores[layer]
+        cached = cached_by_node.get(owner)
+        if cached is None:
+            return
+        # A just-appended peer may not have been scored yet.  Removing that final item restores
+        # the aligned cached prefix.  Any other mismatch is conservative: forget and rescore at
+        # the next overflow rather than associate a value with the wrong neighbour.
+        if position < len(cached):
+            cached.pop(position)
+        if len(cached) != len(peers) or len(peers) < self._capacity(layer):
+            cached_by_node.pop(owner, None)
 
     def _append_to_chain(self, node: int) -> None:
         """Put a node at the end of the connectivity chain."""

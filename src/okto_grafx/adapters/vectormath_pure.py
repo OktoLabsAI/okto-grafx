@@ -185,6 +185,12 @@ class PureVectorMath:
     lock, so nothing here can be racing anything else.
     """
 
+    # Repeating a pair score is exact for this stateless oracle: every accumulation uses the
+    # same correctly-rounded ``fsum`` path.  The HNSW builder reads this capability directly
+    # from the concrete class (never through inheritance) before retaining transient trim
+    # scores, so an adapter subclass must opt in again after accounting for its own behaviour.
+    _stable_pair_scores_for_construction: bool = True
+
     __slots__ = ()
 
     @property

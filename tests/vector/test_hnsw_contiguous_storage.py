@@ -278,3 +278,114 @@ def test_the_real_numpy_adapter_keeps_compact_ranking_and_shape(
     database.insert_row(table, 1, 0, space, (1.0, 0.0, 0.0), csn=1)
     graph = database.engine.index(space.name).graph()
     assert all(type(stored) is bytes for stored in graph._values.values())
+
+
+@pytest.mark.parametrize("typecode", ["f", "d"])
+@pytest.mark.parametrize("metric", list(DistanceMetric))
+@pytest.mark.optional_dependency("numpy")
+def test_transient_construction_scores_preserve_the_complete_numpy_graph(
+    typecode: str, metric: DistanceMetric
+) -> None:
+    """Cold-build memoization changes neither topology nor any later graph answer."""
+    pytest.importorskip("numpy")
+    from okto_grafx.adapters.vectormath_numpy import NumpyVectorMath
+
+    corpus = _rounded(seeded_vectors(72, 16, seed=0xC01D), typecode)
+    canonical = HnswGraph(
+        NumpyVectorMath(),
+        metric,
+        seed=0xD13,
+        neighbours=4,
+        ef_construction=16,
+        _component_typecode=typecode,
+    )
+    accelerated = HnswGraph(
+        NumpyVectorMath(),
+        metric,
+        seed=0xD13,
+        neighbours=4,
+        ef_construction=16,
+        _component_typecode=typecode,
+        _cache_construction_link_scores=True,
+    )
+    for node, values in enumerate(corpus, 1):
+        canonical.insert(node, values)
+        accelerated.insert(node, values)
+
+    retained = accelerated._construction_link_scores
+    assert retained is not None
+    for layer, by_node in enumerate(retained):
+        capacity = accelerated._capacity(layer)
+        assert all(len(scores) <= capacity for scores in by_node.values())
+    accelerated._finish_construction()
+
+    assert accelerated._construction_link_scores is None
+    assert _shape(accelerated) == _shape(canonical)
+    for query in corpus[::13]:
+        assert accelerated.search(query, 24) == canonical.search(query, 24)
+
+    # Once published, incremental churn returns to the established scalar path.
+    for victim in (7, 29, 61):
+        canonical.remove(victim)
+        accelerated.remove(victim)
+    extra = _rounded(seeded_vectors(3, 16, seed=0xA66), typecode)
+    for node, values in enumerate(extra, 100):
+        canonical.insert(node, values)
+        accelerated.insert(node, values)
+    assert _shape(accelerated) == _shape(canonical)
+    assert accelerated.search(corpus[5], 24) == canonical.search(corpus[5], 24)
+
+
+@pytest.mark.parametrize("metric", list(DistanceMetric))
+def test_transient_construction_scores_preserve_the_default_pure_graph(
+    metric: DistanceMetric,
+) -> None:
+    """The optimisation used by ``vector_math='auto'`` preserves exact oracle answers."""
+    from okto_grafx.adapters.vectormath_pure import PureVectorMath
+
+    corpus = seeded_vectors(72, 16, seed=0xC01D)
+    canonical = HnswGraph(
+        PureVectorMath(), metric, seed=0xD13, neighbours=4, ef_construction=16
+    )
+    accelerated = HnswGraph(
+        PureVectorMath(),
+        metric,
+        seed=0xD13,
+        neighbours=4,
+        ef_construction=16,
+        _cache_construction_link_scores=True,
+    )
+    for node, values in enumerate(corpus, 1):
+        canonical.insert(node, values)
+        accelerated.insert(node, values)
+    accelerated._finish_construction()
+
+    assert _shape(accelerated) == _shape(canonical)
+    for query in corpus[::13]:
+        assert accelerated.search(query, 24) == canonical.search(query, 24)
+
+
+def test_pure_adapter_declares_stable_pairs_but_a_subclass_must_opt_in_again() -> None:
+    """The default oracle is eligible, while a customised subclass stays fail-closed."""
+    from okto_grafx.adapters.vectormath_pure import PureVectorMath
+
+    class CallbackCapablePureMath(PureVectorMath):
+        pass
+
+    capability = "_stable_pair_scores_for_construction"
+    assert type(PureVectorMath()).__dict__.get(capability) is True
+    assert type(CallbackCapablePureMath()).__dict__.get(capability) is None
+
+
+@pytest.mark.optional_dependency("numpy")
+def test_numpy_adapter_declares_stable_pairs_but_a_subclass_must_opt_in_again() -> None:
+    """The built-in accelerator is eligible, while a customised subclass stays fail-closed."""
+    pytest.importorskip("numpy")
+    from okto_grafx.adapters.vectormath_numpy import NumpyVectorMath
+
+    class CallbackCapableNumpyMath(NumpyVectorMath):
+        pass
+
+    capability = "_stable_pair_scores_for_construction"
+    assert type(NumpyVectorMath()).__dict__.get(capability) is True
+    assert type(CallbackCapableNumpyMath()).__dict__.get(capability) is None

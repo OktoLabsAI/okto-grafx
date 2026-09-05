@@ -1063,31 +1063,43 @@ class VectorHnswIndex(ProximityIndex):
                     if self._compact_vectors
                     else None
                 ),
+                _cache_construction_link_scores=(
+                    type(self._math).__dict__.get(
+                        "_stable_pair_scores_for_construction"
+                    )
+                    is True
+                ),
             ),
             node_of_entry={},
             entry_of_node={},
             record_of_node={},
             mark=mark,
         )
-        for header in sorted(
-            self._entry_headers(),
-            key=lambda item: (item.born_csn, item.encoded_ref),
-        ):
-            # The header walk has already validated every persisted image before this first
-            # fallible heap/vector operation.  Construct the final graph-owned DTO once, with
-            # its physical location, instead of decode + ``located_at`` constructing it twice.
-            self._install(
-                picture,
-                IndexEntry(
-                    key=header.key,
-                    ref=RecordRef.decode(header.encoded_ref),
-                    versioned=header.versioned,
-                    born_csn=header.born_csn,
-                    dead_csn=header.dead_csn,
-                    page=header.page,
-                    slot=header.slot,
-                ),
-            )
+        try:
+            for header in sorted(
+                self._entry_headers(),
+                key=lambda item: (item.born_csn, item.encoded_ref),
+            ):
+                # The header walk has already validated every persisted image before this first
+                # fallible heap/vector operation.  Construct the final graph-owned DTO once,
+                # with its physical location, instead of decode + ``located_at`` constructing it
+                # twice.
+                self._install(
+                    picture,
+                    IndexEntry(
+                        key=header.key,
+                        ref=RecordRef.decode(header.encoded_ref),
+                        versioned=header.versioned,
+                        born_csn=header.born_csn,
+                        dead_csn=header.dead_csn,
+                        page=header.page,
+                        slot=header.slot,
+                    ),
+                )
+        finally:
+            # Success publishes no duplicate score residency; failure discards the local graph
+            # and also drops the potentially large transient cache before propagating.
+            picture.graph._finish_construction()
         return picture
 
     def _retire(self, picture: _GraphSnapshot) -> None:
