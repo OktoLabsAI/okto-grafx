@@ -93,6 +93,7 @@ from okto_grafx.domain.index.keys import (
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.engine.index_manager import (
     HashIndex,
+    IndexManager,
     edge_from_index_name,
     edge_to_index_name,
     primary_key_index,
@@ -9545,16 +9546,33 @@ def _rows_carrying_key(
         return None
     template: list[Value] = [None] * len(table.columns)
     template[position] = key
+    encoded_key = index_key(template, (position,))
+    validated_versions = getattr(manager, "validated_versions", None)
+    validated = getattr(manager, "validated", None)
+    uses_canonical_validation = (
+        callable(validated)
+        and callable(validated_versions)
+        and getattr(validated, "__func__", validated) is IndexManager.validated
+        and getattr(validated_versions, "__func__", validated_versions)
+        is IndexManager.validated_versions
+    )
+    if uses_canonical_validation:
+        # Exact validation has already decoded each accepted heap version while the index's
+        # pre/post certificate is stable.  Keep that immutable proof instead of reading the
+        # identical slot a second time after the certified callback has ended.  This is one-call
+        # reuse, not a cache: no result survives this uniqueness check or becomes authority for
+        # another statement/process.
+        return tuple(validated_versions(index, encoded_key, context.snapshot))
     return tuple(
         (ref, engine.heap.read(ref))
         for ref in (
-            getattr(manager, "validated")(
+            validated(
                 index,
-                index_key(template, (position,)),
+                encoded_key,
                 context.snapshot,
             )
-            if callable(getattr(manager, "validated", None))
-            else lookup(name, index_key(template, (position,)), context.snapshot)
+            if callable(validated)
+            else lookup(name, encoded_key, context.snapshot)
         )
     )
 

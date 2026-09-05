@@ -415,17 +415,54 @@ def test_primary_key_uniqueness_crosses_the_central_exact_view_fence(
     with database.begin("write") as txn:
         txn.execute("CREATE (:Person {id: 1})")
     crossed: list[str] = []
-    original = IndexManager.validated
+    reads: list[object] = []
+    original = IndexManager.validated_versions
+    original_read = HeapStore.read
 
     def recording(self, index, key, snapshot):
         crossed.append(index.name)
         return original(self, index, key, snapshot)
 
-    monkeypatch.setattr(IndexManager, "validated", recording)
+    def recording_read(self, ref):
+        reads.append(ref)
+        return original_read(self, ref)
+
+    monkeypatch.setattr(IndexManager, "validated_versions", recording)
+    monkeypatch.setattr(HeapStore, "read", recording_read)
     with pytest.raises(GrafxQueryError):
         with database.begin("write") as txn:
             txn.execute("CREATE (:Person {id: 1})")
     assert primary_key_index_name("Person") in crossed
+    assert len(reads) == 1, "the uniqueness check decoded its exact hit twice"
+
+
+def test_primary_key_uniqueness_preserves_a_custom_validated_hook(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:Person {id: 1})")
+    original = database._indexes
+    calls: list[str] = []
+
+    class ValidatedOverride:
+        validated_versions = IndexManager.validated_versions
+
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        def validated(self, index, key, snapshot):
+            calls.append(index.name)
+            return original.validated(index, key, snapshot)
+
+    monkeypatch.setattr(database._queries, "_indexes", ValidatedOverride())
+
+    with pytest.raises(GrafxQueryError):
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:Person {id: 1})")
+
+    assert calls == [primary_key_index_name("Person")]
 
 
 # --- it survives the process --------------------------------------------------------------------
