@@ -61,6 +61,11 @@ including the on-disk format.
 
 ### Changed
 
+- Built-in index verification now captures one catalog image per call, scans each covered heap
+  table once and resolves each repeated physical row reference once across sibling indexes. The
+  table-sized memo is released immediately after that table's final index and never survives the
+  public verification call. Foreign indexes, heaps and catalogs keep the prior per-index
+  observation protocol, and every index still derives and checks its own complete coverage set.
 - Committed logical replay now partitions heterogeneous index batches by physical store. Exact
   built-in stores retain their single-seed/single-publication batch even when the same replay
   contains HNSW, RESET, rebuild, replaying or locally stale stores; each excluded store keeps its

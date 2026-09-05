@@ -18,6 +18,14 @@ from okto_grafx.domain.errors import (
     GrafxStorageError,
 )
 from okto_grafx.domain.ids import NO_CSN, NO_PAGE, PROVISIONAL_CSN, RecordRef
+from okto_grafx.domain.index import (
+    IndexChange,
+    IndexDefinition,
+    IndexOperation,
+    IndexVisibility,
+    index_key,
+    wal_record_for,
+)
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
@@ -49,7 +57,10 @@ from okto_grafx.engine.verifier import (
 from okto_grafx.adapters.codec_v1 import PageCodecV1
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import EXTENT_FIRST_SLOT, TableExtent
+from okto_grafx.engine.heap_store import HeapStore
+from okto_grafx.engine.index_manager import HashIndex, IndexManager
 
 from .conftest import HEAP_FILE, PAGE_SIZE, Stack
 
@@ -1157,6 +1168,144 @@ def test_the_indexes_scope_walks_every_index_it_was_given(stack: Stack) -> None:
     report = stack.verifier(indexes=[first, second]).verify(SCOPE_ALL)
     assert report.index_entries_checked == 3
     assert len(report.findings_of(FindingKind.INDEX_ENTRY_UNRESOLVED)) == 1
+
+
+def test_builtin_indexes_share_one_catalog_table_scan_and_heap_resolution(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clean built-in verifier pays for each physical table/ref once per call."""
+    table = _populate(stack, rows=2)
+    rows = tuple(stack.heap.scan_all(table))
+    manager = IndexManager(stack.pool, stack.heap, stack.metrics)
+    indexes: list[HashIndex] = []
+    for name, positions in (("person_by_id", (0,)), ("person_by_name", (1,))):
+        definition = IndexDefinition(
+            name=name,
+            table_id=table.table_id,
+            table_name=table.name,
+            positions=positions,
+            visibility=IndexVisibility.EXACT,
+        )
+        index = HashIndex(definition, stack.pool, stack.metrics)
+        manager.register(index)
+        indexes.append(index)
+        for ordinal, (ref, version) in enumerate(rows, start=1):
+            index.apply(
+                wal_record_for(
+                    IndexChange(
+                        index=index.name,
+                        operation=IndexOperation.INSERT,
+                        key=index_key(version.values, positions),
+                        ref=ref,
+                        csn=NO_CSN,
+                        versioned=False,
+                    )
+                ).with_lsn(ordinal)
+            )
+    stack.pool.flush()
+
+    catalog_reads = 0
+    table_scans = 0
+    heap_reads = 0
+    original_catalog_read = CatalogStore.read_from_pages
+    original_scan = HeapStore.scan_all
+    original_heap_read = HeapStore.read
+
+    def counted_catalog_read(store: CatalogStore):  # type: ignore[no-untyped-def]
+        nonlocal catalog_reads
+        if store is stack.catalog:
+            catalog_reads += 1
+        return original_catalog_read(store)
+
+    def counted_scan(store: HeapStore, selected: TableDef):  # type: ignore[no-untyped-def]
+        nonlocal table_scans
+        if store is stack.heap:
+            table_scans += 1
+        yield from original_scan(store, selected)
+
+    def counted_heap_read(store: HeapStore, ref: RecordRef):  # type: ignore[no-untyped-def]
+        nonlocal heap_reads
+        if store is stack.heap:
+            heap_reads += 1
+        return original_heap_read(store, ref)
+
+    monkeypatch.setattr(CatalogStore, "read_from_pages", counted_catalog_read)
+    monkeypatch.setattr(HeapStore, "scan_all", counted_scan)
+    monkeypatch.setattr(HeapStore, "read", counted_heap_read)
+
+    verifier = Verifier(
+        stack.pool,
+        stack.metrics,
+        heap=stack.heap,
+        catalog=stack.catalog,
+        indexes=indexes,
+    )
+    report = verifier.verify(SCOPE_INDEXES)
+
+    assert report.findings == ()
+    assert report.index_entries_checked == len(rows) * len(indexes)
+    assert catalog_reads == 1
+    assert table_scans == 1
+    assert heap_reads == len(rows)
+
+    repeated = verifier.verify(SCOPE_INDEXES)
+
+    assert repeated == report
+    assert catalog_reads == 2
+    assert table_scans == 2
+    assert heap_reads == len(rows) * 2
+
+
+def test_custom_indexes_keep_their_per_index_observation_protocol(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreign walk never opts into the built-in shared authority implicitly."""
+    table = _populate(stack, rows=1)
+    ref, version = next(iter(stack.heap.scan_all(table)))
+    definition = IndexDefinition(
+        name="custom_by_id",
+        table_id=table.table_id,
+        table_name=table.name,
+        positions=(0,),
+        visibility=IndexVisibility.EXACT,
+    )
+    indexes: list[_Index] = []
+    for name in ("custom_a", "custom_b"):
+        entry = _Entry(ref)
+        entry.key = index_key(version.values, definition.positions)
+        indexes.append(_Index(name, [entry], definition))
+
+    catalog_reads = 0
+    table_scans = 0
+    original_catalog_read = CatalogStore.read_from_pages
+    original_scan = HeapStore.scan_all
+
+    def counted_catalog_read(store: CatalogStore):  # type: ignore[no-untyped-def]
+        nonlocal catalog_reads
+        catalog_reads += 1
+        return original_catalog_read(store)
+
+    def counted_scan(store: HeapStore, selected: TableDef):  # type: ignore[no-untyped-def]
+        nonlocal table_scans
+        table_scans += 1
+        yield from original_scan(store, selected)
+
+    monkeypatch.setattr(CatalogStore, "read_from_pages", counted_catalog_read)
+    monkeypatch.setattr(HeapStore, "scan_all", counted_scan)
+
+    report = Verifier(
+        stack.pool,
+        stack.metrics,
+        heap=stack.heap,
+        catalog=stack.catalog,
+        indexes=indexes,
+    ).verify(SCOPE_INDEXES)
+
+    assert report.findings == ()
+    assert catalog_reads == len(indexes)
+    assert table_scans == len(indexes)
 
 
 # --- the verifier never changes what it describes -------------------------------------------------------

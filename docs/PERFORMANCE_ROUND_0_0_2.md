@@ -1978,3 +1978,29 @@ all 25 cases passed with Ruff clean. The pre-change profile bounds the expected 
 opportunity at about 7–10% (`~1.08–1.11x`). This is a prioritization ceiling, not a post-change
 performance claim or gate. On-disk format, WAL/OCC, recovery barriers, writer ordering and the
 multiwriter/multireader premises are unchanged.
+
+## Scale-removal batch 48 — bounded table-local built-in verification
+
+Status: **implemented on `feature/v0.0.2`; focused and adjacent correctness gates green**.
+
+Index verification formerly called `CatalogStore.read_from_pages()` and `HeapStore.scan_all()`
+once for every index, then resolved the same heap reference again for every sibling index entry.
+On the Pulse-shaped profile, catalog/heap work represented about 72% of `verify`; the transfer-level
+opportunity was bounded at 4.4–7%. The built-in path now captures one immutable catalog image per
+verification call, reuses one complete table scan across indexes for that table and memoizes
+successful physical-reference resolution across those siblings.
+
+The authority is deliberately narrow and bounded. It activates only when catalog, heap and every
+index are exact built-in implementations. A custom collaborator retains the former per-index call
+order and observations. Cached versions and references are keyed by exact `(table_id, table_name)`
+and are dropped immediately after that table's final index, so retained state is bounded by the
+largest current table rather than the whole graph. The catalog projection is call-local; no state
+survives `Verifier.verify()`.
+
+A structural regression with two built-in indexes and two rows reduced catalog reads `2→1`, full
+table scans `2→1` and heap resolutions `4→2`. Repeating verification rebuilt the complete local
+state (`2/2/4` cumulative), and a custom-index regression retained `2/2`. All 78 verifier tests,
+87 adjacent index/transaction tests, Ruff, compileall and diff-check passed. Each index still
+walks and counts every entry, derives its own expected key and emits the same located findings.
+No persisted format, WAL/OCC, durability, writer-ordering or multiwriter/multireader premise
+changed. The profile ceiling is prioritization evidence, not a post-change timing claim or gate.

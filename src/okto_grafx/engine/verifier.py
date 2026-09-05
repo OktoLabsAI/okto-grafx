@@ -67,7 +67,7 @@ from okto_grafx.domain.ids import (
 )
 from okto_grafx.domain.index.definition import index_definition_matches_table
 from okto_grafx.domain.index.keys import index_key
-from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
+from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, HeapVersion, RecordHeader
 from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
 from okto_grafx.domain.model.schema import TableDef
 from okto_grafx.domain.page.file_header import (
@@ -93,12 +93,16 @@ from okto_grafx.domain.verify.findings import (
 )
 from okto_grafx.domain.verify.routing import UNCLASSIFIED, route_page_refusal
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import (
     DESCRIPTOR_SIZE,
     EXTENT_FIRST_SLOT,
+    HeapStore,
     TableExtent,
 )
+from okto_grafx.engine.index_manager import HashIndex, ProximityIndex
 from okto_grafx.engine.metrics_catalog import metric
+from okto_grafx.engine.vector_engine import VectorHnswIndex
 
 __all__ = [
     "CHECKSUM_FAILURES_TOTAL",
@@ -131,6 +135,65 @@ DEFAULT_VERIFIED_FILES: tuple[str, ...] = ("heap.dat", "catalog.dat")
 
 _HEAP_DESCRIPTOR_SLOT: int = 0
 _FIRST_RECORD_SLOT: int = 1
+
+_CANONICAL_INDEX_TYPES: tuple[type[object], ...] = (
+    HashIndex,
+    ProximityIndex,
+    VectorHnswIndex,
+)
+
+
+class _CanonicalIndexVerification:
+    """One-call immutable authorities and bounded memo for built-in index verification."""
+
+    __slots__ = (
+        "catalog_failure",
+        "remaining_indexes",
+        "resolved_refs",
+        "scan_failures",
+        "tables",
+        "versions",
+    )
+
+    def __init__(self) -> None:
+        self.catalog_failure: GrafxError | None = None
+        self.tables: dict[tuple[int, str], TableDef] = {}
+        self.versions: dict[
+            tuple[int, str], tuple[tuple[RecordRef, HeapVersion], ...]
+        ] = {}
+        self.scan_failures: dict[tuple[int, str], GrafxError] = {}
+        self.resolved_refs: dict[tuple[int, str], set[int]] = {}
+        self.remaining_indexes: dict[tuple[int, str], int] = {}
+
+    def register(self, index: object) -> None:
+        """Count one canonical consumer so table-sized state can be released promptly."""
+        identity = _index_table_identity(index)
+        if identity is not None:
+            self.remaining_indexes[identity] = self.remaining_indexes.get(identity, 0) + 1
+
+    def release(self, index: object) -> None:
+        """Discard table-sized state immediately after its final index was verified."""
+        identity = _index_table_identity(index)
+        if identity is None:
+            return
+        remaining = self.remaining_indexes.get(identity, 0) - 1
+        if remaining > 0:
+            self.remaining_indexes[identity] = remaining
+            return
+        self.remaining_indexes.pop(identity, None)
+        self.versions.pop(identity, None)
+        self.scan_failures.pop(identity, None)
+        self.resolved_refs.pop(identity, None)
+
+
+def _index_table_identity(index: object) -> tuple[int, str] | None:
+    """Return the exact catalog identity published by one built-in index."""
+    definition = getattr(index, "definition", None)
+    table_id = getattr(definition, "table_id", None)
+    table_name = getattr(definition, "table_name", None)
+    if not isinstance(table_id, int) or not isinstance(table_name, str):
+        return None
+    return table_id, table_name
 
 
 class Verifier:
@@ -1031,13 +1094,50 @@ class Verifier:
         """Verify every secondary index against the heap it points at (AC-12)."""
         findings: list[VerificationFinding] = []
         checked = 0
+        shared = self._canonical_index_verification()
         for index in self._indexes:
-            counted, found = self._verify_index(index)
+            try:
+                counted, found = self._verify_index(index, shared=shared)
+            finally:
+                if shared is not None:
+                    shared.release(index)
             checked += counted
             findings.extend(found)
         return checked, findings
 
-    def _verify_index(self, index: object) -> tuple[int, list[VerificationFinding]]:
+    def _canonical_index_verification(
+        self,
+    ) -> _CanonicalIndexVerification | None:
+        """Capture one-call catalog authority only for the exact built-in collaboration.
+
+        A custom catalog, heap or index may attach observable behaviour to each call.  It keeps
+        the former per-index protocol.  The built-in database runs verification inside one fresh
+        page-access section, so one physical catalog image and one table scan can serve every
+        built-in index without broadening their authority or surviving the public call.
+        """
+        if (
+            type(self._catalog) is not CatalogStore
+            or type(self._heap) is not HeapStore
+            or any(type(index) not in _CANONICAL_INDEX_TYPES for index in self._indexes)
+        ):
+            return None
+        shared = _CanonicalIndexVerification()
+        try:
+            catalog = self._catalog.read_from_pages()
+            for table in catalog.tables():
+                shared.tables.setdefault((table.table_id, table.name), table)
+        except GrafxError as failure:
+            shared.catalog_failure = failure
+        for index in self._indexes:
+            shared.register(index)
+        return shared
+
+    def _verify_index(
+        self,
+        index: object,
+        *,
+        shared: _CanonicalIndexVerification | None = None,
+    ) -> tuple[int, list[VerificationFinding]]:
         """Verify one index: every entry must resolve to a heap version that exists.
 
         An EXACT index returns a superset by contract (SD-3), so an entry pointing at a version
@@ -1068,6 +1168,12 @@ class Verifier:
                 )
             ]
         covered: set[tuple[bytes, int]] = set()
+        table_identity = _index_table_identity(index)
+        resolved_refs = (
+            shared.resolved_refs.setdefault(table_identity, set())
+            if shared is not None and table_identity is not None
+            else None
+        )
         for entry in entries:
             checked += 1
             location = FindingLocation(
@@ -1095,8 +1201,12 @@ class Verifier:
                 covered.add((bytes(getattr(entry, "key", b"")), ref.encode()))
             if self._heap is None:
                 continue
+            ref_identity = ref.encode() if type(ref) is RecordRef else None
             try:
-                self._heap.read(ref)
+                if resolved_refs is None or ref_identity not in resolved_refs:
+                    self._heap.read(ref)
+                    if ref_identity is not None and resolved_refs is not None:
+                        resolved_refs.add(ref_identity)
             except GrafxError as failure:
                 findings.append(
                     VerificationFinding(
@@ -1108,11 +1218,23 @@ class Verifier:
                         ),
                     )
                 )
-        findings.extend(self._verify_index_covers_the_heap(index, name, covered))
+        findings.extend(
+            self._verify_index_covers_the_heap(
+                index,
+                name,
+                covered,
+                shared=shared,
+            )
+        )
         return checked, findings
 
     def _verify_index_covers_the_heap(
-        self, index: object, name: str, covered: set[tuple[bytes, int]]
+        self,
+        index: object,
+        name: str,
+        covered: set[tuple[bytes, int]],
+        *,
+        shared: _CanonicalIndexVerification | None = None,
     ) -> list[VerificationFinding]:
         """Report a live heap row this index has no entry for (AC-12, BR-11).
 
@@ -1143,21 +1265,42 @@ class Verifier:
             or not isinstance(table_name, str)
         ):
             return []
+        identity = (table_id, table_name)
         try:
-            catalog = self._catalog.read_from_pages()
-            table = next(
-                (
-                    found
-                    for found in catalog.tables()
-                    if found.table_id == table_id and found.name == table_name
-                ),
-                None,
-            )
+            if shared is None:
+                catalog = self._catalog.read_from_pages()
+                table = next(
+                    (
+                        found
+                        for found in catalog.tables()
+                        if found.table_id == table_id and found.name == table_name
+                    ),
+                    None,
+                )
+            else:
+                if shared.catalog_failure is not None:
+                    raise shared.catalog_failure
+                table = shared.tables.get(identity)
             if table is None:
                 return []
             if not index_definition_matches_table(definition, table):
                 return []
-            versions = list(self._heap.scan_all(table))
+            if shared is None:
+                versions: Sequence[tuple[RecordRef, HeapVersion]] = tuple(
+                    self._heap.scan_all(table)
+                )
+            else:
+                scan_failure = shared.scan_failures.get(identity)
+                if scan_failure is not None:
+                    raise scan_failure
+                versions = shared.versions.get(identity, ())
+                if identity not in shared.versions:
+                    try:
+                        versions = tuple(self._heap.scan_all(table))
+                    except GrafxError as failure:
+                        shared.scan_failures[identity] = failure
+                        raise
+                    shared.versions[identity] = versions
         except GrafxError as failure:
             return [
                 VerificationFinding(
