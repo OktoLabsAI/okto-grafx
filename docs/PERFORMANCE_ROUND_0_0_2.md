@@ -1522,3 +1522,32 @@ measured only `0.929 -> 0.910 s` for 750 executions (`~1.02x`) and was noisy, so
 larger endpoint claim and creates no performance gate. The focused file passed 62 tests; the two
 adjacent query/API slices passed 180 and 85 tests, with Ruff and diff checks clean. No storage
 format, WAL/OCC, durability, locking, writer-lease or multiwriter/multireader rule changed.
+
+## Scale-removal batch 30 — trusted result publication and exact concrete protocol checks
+
+Status: **completed in `e572227`; local and Nexus
+`hof_9016dfc426f5439c9d204f9792dea69d` adversarial reviews PASS**.
+
+The exact built-in query engine now constructs its private intermediate `QueryResult` without
+repeating the hostile public constructor over values and plans it has already normalised and
+validated. The public boundary uses the same private door only after it has rebuilt and validated
+all columns, rows, values, plan nodes and statistics. The public `QueryResult` constructor,
+collaborator results, cursor wrappers, subclasses and forged values retain the complete validation
+path. There are exactly three trusted call sites; any future caller must first establish the same
+ownership and normalisation preconditions.
+
+Three frequent runtime-checkable Protocol checks now accept only the exact built-in concrete type
+without structural reflection: `Snapshot` for exact reads, `TransactionContext` for index staging
+and `WalRecord` for transaction staging. Subclasses, structural doubles and incomplete objects
+continue through the original Protocol check and preserve the existing typed refusal. A proposed
+fourth shortcut in index visibility was rejected because it created an import cycle for a merely
+punctual saving.
+
+The adversarial review rebuilt eight representative published results with the hostile public
+constructor, confirmed all three concrete types satisfy their Protocols, exercised imports in
+fresh processes and found no blocker. The focused and adjacent slice passed **422 tests**; import,
+compileall, Ruff and diff checks passed. Alternating in-process samples measured about `1.08x`
+median paired improvement for 3,000 trivial public reads and only a small/noisy write improvement
+(`0.284 -> 0.275 s` median for 400 CREATEs). These are directional measurements, not release gates.
+No storage format, checksum/corruption check, WAL/OCC rule, durability, locking, writer lease or
+multiwriter/multireader premise changed.
