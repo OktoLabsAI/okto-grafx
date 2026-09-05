@@ -1224,3 +1224,37 @@ An independent 720-append differential selected the settled shortcut 713 times, 
 reported zero invariant violations and read back 720 distinct rows. The grouped heap/transaction/
 vacuum regression passed 369 cases, plus Ruff and diff checks. No page/WAL/catalog format, OCC,
 writer lease, publication, durability or multiwriter/multireader rule changed.
+
+## Scale-removal batch 20 — observed extents and exact-hit reuse
+
+Status: **completed in `51543a7` and `b9cfa10`; independent adversarial reviews PASS**.
+
+- An ordinary heap insert now retains the exact extent that just proved/advanced its durable
+  identity floor and carries it into `_store_version` with the same process-local derived-epoch
+  proof already used by reserved inserts. The epoch is captured before the extent observation;
+  any view change during or after it forces the canonical lookup. First-extent creation, stale
+  tail repair and growth retain the post-floor extent, so a repair cannot restore an older
+  `next_record_id`. Encoding still precedes every directory mutation.
+- Primary-key uniqueness now consumes the immutable `HeapVersion` already decoded inside the
+  exact index's stable pre/post certificate instead of reading the same accepted heap slot again.
+  This one-call reuse is enabled only when both `IndexManager.validated` and
+  `validated_versions` are the canonical hooks. A subclass, instance override or duck-typed
+  collaborator keeps the former `validated`/`lookup` path, including its observable hook order.
+  Nothing is cached across keys, statements, transactions or processes.
+
+Against the batch-19 public 100-row first-use commit, the ordinary-insert change reduced total
+`BufferPool.pin` calls from `876 -> 776` (`-11.4%`), heap-page-0 pins from `306 -> 206`
+(`-32.7%`), `_find_extent` calls from `201 -> 101` (`-49.8%`) and `_extent_for` calls from
+`200 -> 100` (`-50%`). The primary-key change is deliberately not credited to bulk unique-key
+loads: misses decode no heap candidate. In 50 repeated duplicate refusals it reduced heap reads
+from `100 -> 50` and the same-interpreter median from `7.204 -> 6.636 ms` (`~1.09x`), a hit/error
+path result rather than a throughput claim.
+
+Focused and grouped heap tests covered first extent, epoch movement during observation, tail-hint
+repair plus floor advancement, reserved inserts and the complete heap store. Primary-key/index
+tests covered exact hit reuse, custom-hook fallback, stale and incremental statement/transaction
+state; 83 grouped query cases passed. Ruff and diff checks were clean. A proposed physical heap
+batch was not selected after file:line:function profiling limited its optimistic aggregate ceiling
+to about `1.034x` while requiring substantially broader cleanup/order/fence machinery
+(`hof_2b85ac586d6042e78e0a973f86db45f4`). No format, WAL/OCC, durability, writer-lease or
+multiwriter/multireader premise changed.
