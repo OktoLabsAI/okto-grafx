@@ -1298,3 +1298,33 @@ count by at most `1.65x`; because path proof was about `7.6%` of the measured wr
 optimistic aggregate gain is about `1.02x`. Entry/exit proof on every section would make the count
 worse (`2,036` versus `1,786`). This is marginal and cannot justify a new authority interval;
 multiwriter freshness stays unchanged (`hof_1c88b59f2a4d4cba99e26b40a4c3eb81`).
+
+## Scale-removal batch 22 — one-shot index quota and allocation-free hot scans
+
+Status: **completed in `7b5ce1f`; independent adversarial review PASS**.
+
+The canonical `IndexManager` commit path now carries the index-record count that computed the
+candidate COMMIT LSN into staging's existing `produced != expected` verification. Count, staging
+and comparison remain in the same writer lease, `COMMIT_SECTION` and WAL-tail hold; only the
+second identical catalog/index projection is removed. An `IndexManager` subclass, a component
+double, or an override of either transaction hook retains the legacy signature and double-call
+behaviour. The focused integration test observes one `row_entry_count` call on the canonical path,
+while the existing recording subclass still observes two. In the 500-row generation profile the
+removed projection had an optimistic aggregate ceiling of about `1.015x`; it is recorded as a
+small cumulative saving, not a universal endpoint claim.
+
+Bucket matching now consumes `Page.iter_slot_views()` directly rather than first allocating a
+tuple of live slot ids and then reconstructing each view. The page remains pinned, slot order and
+free-slot filtering are identical, and every selected image still passes the same fail-closed
+entry decoder. The bounded live replay directory also keeps the already-authoritative
+`(page, slot)` in its tuple without cloning each new/tombstoned `IndexEntry` merely to repeat that
+location. The unlocated DTO is private to the ephemeral directory; rewrite, erase and capacity
+maintenance continue to use the tuple's scalars, and mixed/repeated effects remain byte-equivalent
+to scalar replay. These allocation removals had a combined profile ceiling near `1.01x` for the
+measured workload.
+
+Eighty selected transaction/index tests passed locally, including custom-manager fallback,
+common replay, live hot batches, empty-build exclusion, table-local authority and record-aware
+staging. The independent review additionally exercised slotted-page iteration and repeated
+TOMBSTONE/REMOVE shapes; Ruff and diff checks were clean. No format, WAL, OCC, publication,
+durability, writer-lease or multiwriter/multireader rule changed.
