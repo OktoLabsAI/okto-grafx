@@ -38,7 +38,7 @@ honestly, ceilings included.
 | OS / filesystem | Windows 11 Home (10.0.26200) / NTFS |
 | Python | 3.13.1 |
 | Build | `[accel]` installed — native CRC-32C (`google-crc32c`), numpy 2.5.1 present |
-| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `max_open_files=256`, `partitions_per_table=64`, `identity_lease_size=64`, `descriptor_revalidation="strict"`, `metrics="noop"`, `checksum="auto"` (→ native) |
+| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `max_open_files=256`, `partitions_per_table=64`, `identity_lease_size=64`, `automatic_index_expected_cardinality=None`, `descriptor_revalidation="strict"`, `metrics="noop"`, `checksum="auto"` (→ native) |
 
 Cross-platform rows in §5 additionally used Ubuntu (WSL2, ext4) on the same hardware.
 
@@ -170,6 +170,15 @@ The distinction avoids speculative probes on a scan-shaped plan, which previousl
 1,830 ms for 1,800 lookups where the grouped scan paid ~220 ms. `QueryResult.statistics` exposes
 `edge_lookups` and `edge_scans`, and the instrument proves **index-vs-scan equality** by staling the
 indexes and comparing answers.
+
+For a known bulk load, set `automatic_index_expected_cardinality` on the connection that activates
+catalog v2 or creates later tables. The value is the expected row count of the largest automatic
+exact index, not the sum across the graph. Grafx derives the next power-of-two directory at 64
+expected entries per bucket. Leave it unset when the scale is unknown: every bucket owns an eager
+head page, relationship tables own both `ef_` and `et_`, referenced keyed node tables own both PK
+and identity artifacts, and full index walks still cost
+`O(bucket_count + entries)`. The option affects only new generations; use explicit
+`rehash_index(...)` for an undersized existing index.
 
 **Historical ceiling, now structurally addressed in 0.0.2:** the measurements above predate P2-ID,
 when a traversal whose target was *unbound* resolved landings by one scan of the landing table

@@ -420,6 +420,9 @@ class DatabaseConfig:
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
     max_index_build_entries: int | None = dataclass_field(default=None, kw_only=True)
+    automatic_index_expected_cardinality: int | None = dataclass_field(
+        default=None, kw_only=True
+    )
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
@@ -500,6 +503,20 @@ catalog-v2 DDL batch; a newly declared empty table contributes zero. Preflight s
 observed and raises `GrafxTransactionBudgetExceeded(field="max_index_build_entries")` before
 catalog staging and before the first exclusive generation-file create. The option is an admission
 guard, not an index-sizing hint and not a persisted format field.
+
+`automatic_index_expected_cardinality` is a separate keyword-only sizing hint for newly
+materialized automatic exact generations. `None` preserves 64 buckets. A value in
+`1..262144` is interpreted per index at 64 expected entries per bucket and rounded up to the next
+power-of-two directory. It applies to automatic PK and relationship endpoint indexes; for the
+automatic `record_id` index it is only a floor beneath the fenced `max(4096, 2 * visible_rows)`
+estimate. The chosen expected cardinality and bucket count are persisted in catalog v2, so a
+later open with another setting adopts the existing generation unchanged. It never sizes custom
+or vector indexes and never triggers an implicit rehash. Because creation, reset, verification
+and full walks remain `O(bucket_count + entries)`, callers should not oversize it speculatively.
+On writable open, the explicit hint promotes an empty v1 catalog through the ordinary
+`ensure_identity_indexes` transaction before returning. A non-empty v1 catalog is not migrated
+implicitly because its complete shadow build can be substantial; table DDL refuses with
+`remedy="maintenance.ensure_identity_indexes"` until the caller performs that explicit migration.
 
 The four query admission limits are positive integers when set and disabled by `None`. The row
 limits are:
@@ -877,7 +894,8 @@ class TransactionManager:
                  max_transaction_rows: int | None = None,
                  max_transaction_bytes: int | None = None,
                  max_wal_batch_bytes: int | None = None,
-                 max_index_build_entries: int | None = None)
+                 max_index_build_entries: int | None = None,
+                 automatic_index_expected_cardinality: int | None = None)
     def begin(self, mode: str) -> "TransactionContext"      # "read" | "write"
     def commit(self, txn: "TransactionContext") -> "CommitReport"
     def rollback(self, txn: "TransactionContext") -> None
@@ -1118,7 +1136,8 @@ class QueryEngine:
                  query_spill: QuerySpillFactory | None = None,
                  max_traversal_expansions: int | None = None,
                  max_traversal_paths: int | None = None,
-                 max_index_build_entries: int | None = None)
+                 max_index_build_entries: int | None = None,
+                 automatic_index_expected_cardinality: int | None = None)
     def parse(self, text: str) -> "Statement"
     def plan(self, statement: "Statement", snapshot: Snapshot) -> "PlanNode"
     def execute(self, text: str, txn, parameters: Mapping[str, object] | None = None) -> "QueryResult"

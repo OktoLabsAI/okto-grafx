@@ -2219,6 +2219,14 @@ Sequência recomendada:
 
 ### P1.12 — Hash indexes têm escala fixa
 
+**Parcial estrutural concluída em 0.0.2:** índices automáticos exatos recém-materializados podem
+ser dimensionados por `connect(..., automatic_index_expected_cardinality=N)`. A dica vale por
+índice, é persistida na nova geração v2 e não redimensiona artefatos existentes. PK e `ef_`/`et_`
+usam o mesmo número porque cada um contém uma entrada por linha; o índice `record_id` usa a dica
+somente como piso sobre `max(4096, 2 * visible_rows)`. Um catálogo vazio e gravável é ativado em
+v2 no open; catálogo v1 não vazio mantém migração explícita e recusa novo DDL em vez de ignorar a
+dica. `None` preserva 64 buckets.
+
 Índices automáticos recebem 64 buckets por padrão em [`keys.py`](src/okto_grafx/domain/index/keys.py#L49). O lookup percorre toda a cadeia daquele bucket em [`index_manager.py`](src/okto_grafx/engine/index_manager.py#L942).
 
 São necessários:
@@ -2238,10 +2246,11 @@ da reconstrução, então dimensionar por cardinalidade esperada precisa vir jun
 não pague pelos buckets vazios. O `CREATE INDEX` já aceita as duas opções de dimensionamento
 ([`parser.py`](src/okto_grafx/domain/query/parser.py#L384)) e o valor é persistido. Os índices de
 identidade v2 também são uma exceção já entregue: `identity_index_sizing(visible_rows)` escolhe o
-diretório a partir da cardinalidade cercada. O gap remanescente está nos índices automáticos
-legados de PK/endpoint criados por `automatic_index_definitions`
-([`definition.py`](src/okto_grafx/domain/index/definition.py#L410)), que ainda omitem o
-dimensionamento e herdam `DEFAULT_BUCKET_COUNT`.
+diretório a partir da cardinalidade cercada. O gap de configuração dos índices automáticos foi
+fechado sem alterar `TableDef` ou a projeção lógica de `automatic_index_definitions`: o sizing é
+aplicado somente quando QueryEngine/TransactionManager planejam uma nova geração física. Continuam
+como evoluções separadas o crescimento automático/rehash sob carga e um diretório extensível ou
+esparso; não são pré-condição para usar a dica entregue.
 
 ### P1.13 — Traversal ainda paga landing scan
 
@@ -3534,6 +3543,7 @@ começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidên
 | 0.0.2 / lote de escala 30 — publicação confiável de resultados e Protocols concretos exatos | concluído e auditado na branch | `e572227`; revisão Nexus `hof_9016dfc426f5439c9d204f9792dea69d` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O engine exato e a fronteira pública pós-snapshot não repetem a guarda hostil de `QueryResult`; o construtor público e toda entrada colaboradora mantêm a validação integral. `Snapshot`, `TransactionContext` e `WalRecord` exatos evitam reflexão estrutural, mas subclasses, doubles e incompletos continuam pelo Protocol e pelas mesmas recusas. Um quarto atalho foi descartado por ciclo real de importação e ganho pontual. O auditor reconstruiu oito resultados publicados pela porta pública e confirmou tipos/imports em processos novos. Foram aprovados 422 testes focais/adjacentes e checks estáticos; a leitura trivial indicou `~1,08x`, enquanto a escrita mostrou apenas ganho pequeno e ruidoso, sem gate. Formato, checks de corrupção, WAL/OCC, locks, durabilidade e multiwriter/multireader intactos |
 | 0.0.2 / lote de escala 31 — witnesses bounded da gramática de nomes exatos | concluído e auditado na branch | `c228b0a`; auditoria independente GO sem gate; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Validações bem-sucedidas de strings built-in exatas usam LRU process-local de 512 entradas, com chave `(label,value,limit)` no controle e `file` integral no storage. Falhas nunca entram no cache; limites distintos, subclasses e objetos hostis preservam o caminho e a taxonomia, e o retorno mantém a identidade do argumento corrente. Nenhum cache extra por segmento foi criado. Ganhos de componente foram `~4,6x`/`~13,7x`, mas o teto plausível em PK seek NTFS é `<1%`: melhoria cumulativa, sem gate. Suítes 26/26 e 147/147 e checks estáticos verdes. Autoridade de path/descriptor, formato, WAL/OCC, locks, durabilidade e multiwriter/multireader intactos |
 | 0.0.2 / lote de escala 32 — um descritor desbloqueado por autocommit read | concluído e auditado na branch | `1038ddb`; revisão Nexus `hof_6b1f9e6b31b54c5a97ebed76a2214a32` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O ciclo público `begin→execute→commit/rollback` fica numa transição externa e na capability de descritor já auditada. `os.open` do participant cai `4→1`, mantendo exatamente quatro acquires/releases reais. Falha de commit reverte somente contexto ACTIVE; rollback que deixa contexto inalcançável sela e drena o facade. Scope custom não suprime falha primária nem deixa exit substituí-la. API 80/80, coordination 29 + 1 skip de plataforma e multiprocesso 5/5; checks estáticos verdes. Amostra indicou `~1,11x`, sem gate; a contagem estrutural é a evidência promovida. Lock duration, formato, WAL/OCC, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 33 — dimensionamento de novas gerações automáticas | concluído e auditado na branch | `2dbc367`; revisão Nexus `hof_37ec8f454ada4a668678ebd943b5df6d` verificada PASS | `automatic_index_expected_cardinality` dimensiona somente novas gerações v2; banco v1 vazio e gravável é ativado antes do primeiro DDL, enquanto v1 não vazio não sofre migração implícita e recusa novo DDL com remediação explícita. O índice `record_id` usa a estimativa apenas como piso; reabertura preserva gerações existentes. A sonda física confirmou `64→4096` buckets no máximo configurável sem alterar artefatos legados; o custo máximo é `4097` páginas por artefato automático e multiplica pelo número de PKs/identidades/endpoints. O padrão permanece 64 para evitar custo de buckets vazios em grafos pequenos. Formato existente, WAL/OCC, durabilidade e multiwriter/multireader permanecem intactos |
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um

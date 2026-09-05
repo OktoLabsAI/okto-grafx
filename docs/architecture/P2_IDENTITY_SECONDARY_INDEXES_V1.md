@@ -251,11 +251,22 @@ largest representable expected cardinality. The operator can choose an explicit 
 the engine makes no claim that a capped chained hash remains constant-cost under unbounded growth.
 An extensible/sparse directory is deliberately outside this ADR.
 
-With neither hint, custom indexes retain the current `DEFAULT_BUCKET_COUNT = 64`, which is
-equivalent to a default expected cardinality of `4096` under the formula. An automatic identity
-index uses `max(4096, 2 * current_visible_row_count)` as its expected cardinality at build time,
-giving existing endpoint data one growth interval of headroom. The count and scan are taken from
-the same fenced durable view used to build the shadow.
+With neither hint, custom and automatic exact indexes retain the current
+`DEFAULT_BUCKET_COUNT = 64`, which is equivalent to a default expected cardinality of `4096`
+under the formula. `connect(..., automatic_index_expected_cardinality=N)` may provide a per-index
+floor for automatic PK and endpoint generations created by catalog-v2 activation or later DDL.
+It does not affect vector/custom indexes and a reopened generation always keeps its persisted
+sizing. Supplying it on an empty writable v1 database selects catalog v2 before the first table;
+supplying it on a non-empty v1 database leaves migration explicit and table DDL refuses rather
+than silently creating a 64-bucket legacy index. An automatic identity index uses
+`max(4096, configured_floor, 2 * current_visible_row_count)` as its expected cardinality at build
+time, giving existing endpoint data one growth interval of headroom without discarding a known
+future load. The count and scan are taken from the same fenced durable view used to build the
+shadow. At the 4096-bucket ceiling and default 8192-byte pages, one index eagerly occupies 4097
+pages (about 32.008 MiB) before entries need overflow pages. Cost is per artifact: a keyed node
+owns a PK index and also an identity index when referenced by a relationship, while a relationship
+owns the `ef_`/`et_` pair. Thus two keyed endpoint tables plus one relationship materialize six
+automatic exact indexes, about 192.05 MiB at that ceiling before overflow pages.
 
 ### 6.2 Rehash
 

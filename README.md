@@ -116,6 +116,15 @@ transactions like any other.
 - **A relationship table gets an index per endpoint** (`ef_`/`et_`), so traversal expands a
   bounded frontier by lookup instead of reading every edge, switching to one grouped scan when
   the frontier grows past the point where the scan is cheaper.
+- **Known bulk loads can size new automatic exact indexes up front.** Pass
+  `automatic_index_expected_cardinality=` to `connect()` before catalog-v2 activation or new DDL.
+  The hint applies per new PK, endpoint and identity index; it never resizes an existing
+  generation. An empty writable catalog is activated to v2 immediately; a non-empty v1 catalog
+  requires the explicit `db.ensure_identity_indexes()` migration before further table DDL, so
+  the hint is never silently ignored. Count artifacts, not tables: a keyed node owns its PK and,
+  when referenced by a relationship, a separate identity index; a relationship owns `ef_` and
+  `et_`. Leave the hint unset when the scale is unknown, because full walks cost
+  `O(bucket_count + entries)` and an oversized eager directory wastes space and scan time.
 - **Dual visibility (CONTRACT §8.7).** An EXACT index returns candidates that are validated against
   the heap under the caller's own snapshot — so the index may be a superset and can never be a wrong
   answer. A PROXIMITY index is versioned with tombstones and a horizon, and its entries are the
@@ -705,6 +714,7 @@ refused with the field name the caller actually wrote.
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
 | `max_index_build_entries` | `None` | Optional hard limit on final exact entries across one detached shadow-build batch; counted to at most N+1 and refused before catalog staging or the first generation file is created |
+| `automatic_index_expected_cardinality` | `None` | Keyword-only expected rows per newly materialized automatic exact index; derives 1..4096 eager buckets at 64 expected entries each, activates an empty writable catalog to v2, is persisted with that generation, and never rehashes an existing index |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
