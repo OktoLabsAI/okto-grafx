@@ -1258,3 +1258,31 @@ batch was not selected after file:line:function profiling limited its optimistic
 to about `1.034x` while requiring substantially broader cleanup/order/fence machinery
 (`hof_2b85ac586d6042e78e0a973f86db45f4`). No format, WAL/OCC, durability, writer-lease or
 multiwriter/multireader premise changed.
+
+## Scale-removal batch 21 — reuse of the final no-follow identity
+
+Status: **completed in `b5cff4a`; independent adversarial review PASS**.
+
+`LocalStorageDevice._require_safe_path` now returns the fresh `lstat` observation of the final
+component, or `None` when the final component or an earlier suffix is absent. A warm cached
+descriptor consumes that observation directly when comparing `(st_dev, st_ino)` with
+`fstat(descriptor)`, instead of immediately following the same proved regular path once more with
+`stat(path)`. The full root/component no-follow walk is retained on every strict revalidation;
+generation mode retains exactly the same invalidation boundaries. A descriptor admitted without
+a remembered physical path still requests the complete containment proof.
+
+The structural saving is exact: one `os.stat(path)` call is removed per descriptor identity
+revalidation. The focused warm-page test changed from one to zero `stat` calls while retaining
+the platform-dependent root/component `lstat` calls and the descriptor `fstat` calls. This is not
+described as an `lstat` reduction or as a broad wall-clock multiplier: the earlier profile placed
+path identity inside a material hot chain, but only the redundant followed observation was
+removed. Strict benefits on every warm hit; generation benefits on the first hit after a directed
+or global invalidation.
+
+Focused regressions cover final-component identity, nested names, missing final and intermediate
+components, the containment fallback when `_paths` is absent, removal between warm hits and
+atomic replacement between participants. Descriptor-policy, namespace-cost, pinning, cache-
+capacity, recycle and durability/platform groups passed, with Ruff and diff checks clean. For a
+regular nonredirected file `lstat` and `stat` name the same physical identity; redirects, junctions,
+reparse points and unsupported entries are still refused before comparison. The observation is
+not cached across calls, so WAL/OCC, durability and multiwriter/multireader premises are unchanged.
