@@ -7399,20 +7399,36 @@ class TransactionManager:
             yield
 
     @contextmanager
-    def _participant_descriptor_scope(self) -> Iterator[None]:
+    def _participant_descriptor_scope(
+        self, *, revalidate_identity: bool = False
+    ) -> Iterator[None]:
         """Reuse only an unlocked participant-section descriptor for one bounded batch.
 
         The concrete local coordinator offers this optional optimization. Narrow collaborator
         doubles and alternate coordinators keep their existing behavior. As with section entry,
         only foreign context-protocol callbacks are close hazards; the yielded body deliberately
         is not, so lazy input and mapping callbacks may close without deadlocking.
+
+        A caller whose lexical scope may span arbitrary user work asks for identity revalidation.
+        That longer form is available only when the concrete coordinator explicitly declares the
+        same private capability already used by live multi-statement transactions. Every section
+        entry still takes and releases the operating-system lock; only its unlocked descriptor is
+        retained.
         """
         with self._close_wait_hazard():
-            capability = getattr(
-                self._coordinator, "reuse_unlocked_section_descriptor", None
+            capability = (
+                type(self._coordinator).__dict__.get(
+                    "_reuse_revalidated_unlocked_section_descriptor"
+                )
+                if revalidate_identity
+                else getattr(
+                    self._coordinator, "reuse_unlocked_section_descriptor", None
+                )
             )
             scope = (
-                capability(self._participant_section_name)
+                capability(self._coordinator, self._participant_section_name)
+                if revalidate_identity and callable(capability)
+                else capability(self._participant_section_name)
                 if callable(capability)
                 else None
             )

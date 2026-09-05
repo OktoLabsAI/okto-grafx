@@ -1849,3 +1849,24 @@ measurement, not a universal database throughput claim. Focused tests prove the 
 short-circuit, mandatory delegation when DELETE exists, MERGE after DELETE, relationship
 read-your-writes and immediate same-table malformed-pending refusal. WAL, OCC, durability, format,
 writer ordering and multiwriter/multireader behavior are unchanged.
+
+## Scale-removal batch 43 — bounded read-transaction descriptor lifetime
+
+Status: **implemented on `feature/v0.0.2`; focused lifecycle gate green**.
+
+`Database.transaction()` now places its complete lexical begin/statement/commit/schema-settlement
+lifetime inside the concrete coordinator's existing identity-revalidated unlocked-descriptor
+scope. The scope never retains the advisory lock: every participant-section entry still acquires
+and releases the OS lock, and every reuse proves that the parked descriptor still names the
+current path. The concrete private capability remains exact-type opt-in; alternate/custom
+coordinators keep the canonical cold-open path. Manually managed `begin()` transactions retain
+their current semantics and existing post-first-statement optimization.
+
+An independent four-round A/B over 200 one-statement point-read transactions recorded the
+deterministic structural change `4.0 -> 1.0` lock-file opens per transaction and `0 -> 3.0`
+successful physical-identity revalidations. Timing was directionally lower in every paired round,
+but the bands overlapped, so no exact wall-clock claim is promoted. The focused descriptor suite
+proves one open/three revalidations, real lock acquisition on every entry, cleanup on exceptions,
+idle-thread admission, cross-thread cold fallback, close draining and retry/OCC lifecycle.
+No descriptor survives the lexical transaction boundary, and no format, WAL, OCC, durability or
+multiwriter/multireader contract changes.

@@ -132,6 +132,48 @@ def test_autocommit_reuses_one_descriptor_but_takes_every_real_lock(
         assert coordinator._descriptor_scopes == {}
 
 
+def test_bounded_transaction_scope_revalidates_one_descriptor_for_its_whole_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bounded-transaction-descriptor"
+    with connect(root, checkpoint_interval_records=10_000) as database:
+        _seed(database)
+        coordinator = database._transactions._coordinator
+        participant = database._transactions._participant_section_name
+        participant_suffix = f"{participant}.lock"
+        real_open = os.open
+        real_names = type(coordinator)._descriptor_names
+        opened = 0
+        revalidated = 0
+
+        def counted_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal opened
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if str(path).endswith(participant_suffix):
+                opened += 1
+            return descriptor
+
+        def counted_names(descriptor: int, path: str) -> bool:
+            nonlocal revalidated
+            revalidated += 1
+            return real_names(descriptor, path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(coordination_local.os, "open", counted_open)
+            patch.setattr(
+                type(coordinator), "_descriptor_names", staticmethod(counted_names)
+            )
+            with database.transaction("read") as transaction:
+                assert transaction.execute(_SEEK, {"id": 1}).rows == ((1,),)
+
+        # begin opens and parks the descriptor; statement, manager commit and public schema
+        # settlement each revalidate it before taking the real operating-system lock.
+        assert opened == 1
+        assert revalidated == 3
+        assert database._transactions._transaction_descriptor_scopes == {}
+        assert coordinator._descriptor_scopes == {}
+
+
 def test_autocommit_scope_cannot_suppress_a_process_control_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

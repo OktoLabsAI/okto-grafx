@@ -61,6 +61,10 @@ including the on-disk format.
 
 ### Changed
 
+- `Database.transaction()` now retains only the participant section's unlocked file descriptor
+  for its lexical lifetime and revalidates physical identity before every reuse. One-statement
+  scoped transactions therefore replace four Windows lock-file opens with one open plus three
+  identity checks, while manually managed `begin()` transactions keep their existing lifecycle.
 - Relationship seeks now reject the transaction-wide ended-row precheck immediately when neither
   staged rows nor durable row intents contain a `DELETE`. Insert-only Pulse batches therefore no
   longer rebuild every dirty table's row view for every endpoint seek; DELETE/read-your-writes

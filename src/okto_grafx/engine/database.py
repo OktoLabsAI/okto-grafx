@@ -2106,10 +2106,17 @@ class Database:
 
     @contextmanager
     def transaction(self, mode: str = "write") -> Iterator[Transaction]:
-        """Open a transaction as a block, committing on a clean exit and rolling back otherwise."""
-        txn = self.begin(mode)
-        with txn:
-            yield txn
+        """Open a transaction as a block, committing on a clean exit and rolling back otherwise.
+
+        The lexical boundary also retains this participant section's unlocked descriptor. Its
+        physical identity is revalidated before every later lock acquisition, so a bounded
+        one-statement transaction avoids repeated open/close calls without retaining the lock or
+        weakening another process's admission.
+        """
+        with self._transactions._participant_descriptor_scope(revalidate_identity=True):
+            txn = self.begin(mode)
+            with txn:
+                yield txn
 
     def execute(
         self, text: str, parameters: Mapping[str, object] | None = None
