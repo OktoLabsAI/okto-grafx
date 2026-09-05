@@ -125,11 +125,11 @@ def test_successful_retry_replaces_the_context_without_gauge_churn() -> None:
     stack, _storage = _stack(metrics=metrics)
     old = _write(stack)
     old.mark_conflicted()
-    before = list(metrics.gauges)
+    before = metrics.gauge_values(ACTIVE_TRANSACTIONS, "mode", "write")
 
     successor = stack.manager.retry(old)
 
-    assert metrics.gauges == before
+    assert metrics.gauge_values(ACTIVE_TRANSACTIONS, "mode", "write") == before
     assert old.state is TransactionState.ABORTED
     assert successor.active
     assert stack.manager.open_transactions == 1

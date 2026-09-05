@@ -352,12 +352,13 @@ def test_three_participants_writing_one_catalog_page_cannot_all_commit(make_stac
     participants = [make_stack() for _ in range(3)]
     catalog_page = 1
     staged = []
-    for index, participant in enumerate(participants):
+    for participant in participants:
         txn = participant.manager.begin("write")
-        txn.owner._stage_page_image(txn,
+        txn.owner._stage_page_image(
+            txn,
             "catalog.dat",
             catalog_page,
-            make_page_image(participant.codec, [bytes([index])], page_index=catalog_page),
+            participant.storage.read_page("catalog.dat", catalog_page),
         )
         staged.append((participant, txn))
         assert page_partition("catalog.dat", catalog_page) in txn.write_partitions
