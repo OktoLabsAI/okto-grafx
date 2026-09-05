@@ -1191,3 +1191,36 @@ checks, but a safe reduction requires a new per-fenced-interval identity proof a
 TOCTOU/security risk for only an estimated `~1.12x` aggregate gain. No authority cache or bundle is
 being added in this round; a future design must retain complete pre-validation, the real operation
 window and fail-closed post-validation before it can be reconsidered.
+
+## Scale-removal batch 19 — single-pin heap decisions
+
+Status: **completed in `08c0197` and `526e882`; reviews
+`hof_627aebc2a59a4e7981052ef87eb8c1ae` and `hof_942f47dd6b06455fa4614b892587c777`
+verified PASS/GO**.
+
+- A settled inline heap append now inserts through the same pin that proved the tail had room.
+  The shortcut is selected only when both durable extent hints already equal the resolved tail and
+  length. Hint drift still writes page 0 before repinning/inserting, while a full tail retains the
+  allocation, directory-first and relink order. This removes one acquisition and closes the old
+  unpinned interval between `can_fit` and `insert_slot`.
+- Hot extent reads/writes and reclaim-floor reads now validate and use resident heap page 0 under
+  one continuous pin. A moved derived epoch still runs the canonical bootstrap probe and cache
+  invalidation, then validates the operational pin again. Detached identity/reclaim planners keep
+  the separate `read_fresh_page` device-authority protocol; no resident proof crosses a context or
+  becomes durable/cross-process authority.
+
+The settled reserved-insert path fell from six to five total pins and from four to three tail-page
+pins. Fusing header use reduced a public first-use 100-row commit from 1,176 to 876 total
+`BufferPool.pin` calls (`-25.5%`) and heap-page-0 pins from 606 to 306 (`-49.5%`). The already
+adversarial update and growing-update sweeps independently confirmed their complete paths moved
+from ten to eight pins; every one of the eight remaining injected retryable-refusal points leaves
+one live version.
+
+Wall-clock evidence remains intentionally secondary: with one interpreter/dependency set, the
+2,000-row reserved-insert component moved directionally `0.540385 -> 0.380088 s` (`~1.42x`) for
+the header fusion over the already-fused append, while the 1,000-row public in-memory endpoint did
+not separate from run-to-run noise.
+An independent 720-append differential selected the settled shortcut 713 times, grew seven times,
+reported zero invariant violations and read back 720 distinct rows. The grouped heap/transaction/
+vacuum regression passed 369 cases, plus Ruff and diff checks. No page/WAL/catalog format, OCC,
+writer lease, publication, durability or multiwriter/multireader rule changed.
