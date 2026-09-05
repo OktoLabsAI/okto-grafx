@@ -48,6 +48,11 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.entry import IndexEntry
+from okto_grafx.domain.index.keys import (
+    MAX_BUCKET_COUNT,
+    TARGET_ENTRIES_PER_BUCKET,
+)
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     HEAP_RECLAIM_V1_CAPABILITY,
@@ -1430,6 +1435,18 @@ class Maintenance:
             name,
             bucket_count=bucket_count,
             expected_cardinality=expected_cardinality,
+        )
+
+    def rehash_index_if_needed(
+        self,
+        name: str,
+        *,
+        overflow_pages_per_bucket: int = 1,
+    ) -> IndexView | None:
+        """Grow one physically pressured exact index by at most one directory step."""
+        return self._database.rehash_index_if_needed(
+            name,
+            overflow_pages_per_bucket=overflow_pages_per_bucket,
         )
 
     def publish_metrics(self) -> None:
@@ -2886,6 +2903,82 @@ class Database:
 
             self._refresh_index_inventory()
             return self._committed_index_receipt(wanted_name)
+
+    def rehash_index_if_needed(
+        self,
+        name: str,
+        *,
+        overflow_pages_per_bucket: int = 1,
+    ) -> IndexView | None:
+        """Grow one exact index after a bounded directory-pressure assessment.
+
+        The probe validates the physical identity and only the eager head page of each bucket;
+        it never follows overflow chains or decodes entries.  Its cost is therefore
+        O(bucket_count), capped by the format at 4,096 pages, rather than O(index entries).  One
+        growth step is suggested when average occupied head slots reach the canonical sizing
+        target, or when retained overflow reaches the configured integer ratio to bucket heads.
+        Tombstones and pages retained after an interrupted append can make either signal
+        conservative and cause an early rebuild.  Neither signal certifies index health or
+        authorizes reads: the existing foreground rehash rebuilds and verifies a complete
+        immutable shadow.
+
+        This is an explicit maintenance operation, never a commit hook or background loop.  One
+        call grows by at most one power-of-two step and returns ``None`` below the threshold or at
+        the eager-directory ceiling.  A concurrent participant may supersede the observed ACTIVE
+        generation before preparation; ordinary rehash OCC/generation/growth checks may then
+        refuse the attempt.  The caller should reassess current state rather than retry blindly;
+        no particular refusal is promised to be retryable.
+        """
+
+        with self._public_operation("rehash_index_if_needed"):
+            self._require_open()
+            self._require_writable("rehash an exact index when physically pressured")
+            indexes = self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            wanted_name = _require_text("name", name)
+            wanted_ratio = _require_positive_integer(
+                "overflow_pages_per_bucket", overflow_pages_per_bucket
+            )
+
+            with self._transactions.page_access_section(fresh_read_view=True):
+                self._require_open()
+                active_index = getattr(indexes, "active_index", None)
+                selected = (
+                    active_index(wanted_name, catalog=self._catalog._catalog)
+                    if callable(active_index)
+                    else indexes.index(wanted_name)
+                )
+                definition = selected.definition
+                if definition.visibility is not IndexVisibility.EXACT:
+                    raise GrafxUnsupportedOperation(
+                        "Assisted rehash applies only to exact indexes.",
+                        operation="rehash_index_if_needed",
+                        field="visibility",
+                        value=definition.visibility.value,
+                        index=definition.name,
+                    )
+                bucket_count = definition.bucket_count
+                # Even a no-op proves the selected physical identity.  At the directory ceiling
+                # there is no useful reason to sample thousands of heads after that proof.
+                if bucket_count >= MAX_BUCKET_COUNT:
+                    selected.open()
+                    return None
+                head_entries, overflow_pages = selected.assisted_rehash_pressure()
+                if (
+                    head_entries
+                    < bucket_count * TARGET_ENTRIES_PER_BUCKET
+                    and overflow_pages < bucket_count * wanted_ratio
+                ):
+                    return None
+                target_bucket_count = min(MAX_BUCKET_COUNT, bucket_count * 2)
+
+            # Re-enter the existing public protocol after releasing the read observation.  Its
+            # fresh catalog/OCC checks are the authority; the advisory page-count sample is not.
+            return self.rehash_index(
+                wanted_name,
+                bucket_count=target_bucket_count,
+            )
 
     def verify(self, scope: str = "all") -> VerificationReport:
         """Walk the database and report every finding, precisely located (SPEC-M1 FR-11).

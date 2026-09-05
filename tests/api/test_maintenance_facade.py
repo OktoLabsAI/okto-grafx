@@ -43,6 +43,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
             "enable_wal_page_compression",
             "create_index",
             "rehash_index",
+            "rehash_index_if_needed",
         }
     )
 
@@ -63,6 +64,9 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     )
     assert get_type_hints(Maintenance.create_index)["return"] is IndexView
     assert get_type_hints(Maintenance.rehash_index)["return"] is IndexView
+    assert get_type_hints(Maintenance.rehash_index_if_needed)["return"] == (
+        IndexView | None
+    )
 
 
 def test_status_reports_only_last_observed_available_values() -> None:
@@ -162,6 +166,20 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         )
         return index_result
 
+    def rehash_index_if_needed(
+        _database: Database,
+        name: str,
+        *,
+        overflow_pages_per_bucket: int = 1,
+    ) -> object:
+        calls.append(
+            (
+                "rehash_index_if_needed",
+                (name, overflow_pages_per_bucket),
+            )
+        )
+        return index_result
+
     try:
         with monkeypatch.context() as boundary:
             boundary.setattr(Database, "checkpoint", checkpoint)
@@ -178,6 +196,11 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             )
             boundary.setattr(Database, "create_index", create_index)
             boundary.setattr(Database, "rehash_index", rehash_index)
+            boundary.setattr(
+                Database,
+                "rehash_index_if_needed",
+                rehash_index_if_needed,
+            )
             boundary.setattr(Database, "_bloat", bloat)
 
             assert maintenance.checkpoint() is checkpoint_result
@@ -203,6 +226,13 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
                 )
                 is index_result
             )
+            assert (
+                maintenance.rehash_index_if_needed(
+                    "by_name",
+                    overflow_pages_per_bucket=2,
+                )
+                is index_result
+            )
     finally:
         database.close()
 
@@ -219,6 +249,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             ("by_name", "Person", ("name",), None, 1_000),
         ),
         ("rehash_index", ("by_name", 128, None)),
+        ("rehash_index_if_needed", ("by_name", 2)),
     ]
 
 
@@ -250,6 +281,9 @@ def test_a_retained_maintenance_facade_obeys_database_lifecycle() -> None:
         maintenance.rehash_index("by_name", bucket_count=128)
 
     with pytest.raises(GrafxUnsupportedOperation):
+        maintenance.rehash_index_if_needed("by_name")
+
+    with pytest.raises(GrafxUnsupportedOperation):
         _ = database.maintenance
 
 
@@ -276,3 +310,7 @@ def test_read_only_maintenance_refuses_only_its_writing_operations(
             with pytest.raises(GrafxUnsupportedOperation) as raised:
                 call()
             assert raised.value.details["field"] == "read_only"
+
+        with pytest.raises(GrafxUnsupportedOperation) as assisted:
+            maintenance.rehash_index_if_needed("missing")
+        assert assisted.value.details["field"] == "read_only"

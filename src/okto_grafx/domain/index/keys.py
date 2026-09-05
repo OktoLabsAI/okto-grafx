@@ -32,6 +32,7 @@ __all__ = [
     "MAX_EXPECTED_CARDINALITY",
     "MIN_BUCKET_COUNT",
     "RECORD_ID_KEY_FORMAT_VERSION",
+    "TARGET_ENTRIES_PER_BUCKET",
     "bucket_of",
     "custom_index_sizing",
     "identity_index_sizing",
@@ -57,12 +58,14 @@ DEFAULT_BUCKET_COUNT: int = 64
 """Buckets an index gets when its definition does not say. Small enough to stay cheap on a tiny
 database, large enough that the reference index really does spread keys across chains."""
 
-_TARGET_ENTRIES_PER_BUCKET: int = 64
+TARGET_ENTRIES_PER_BUCKET: int = 64
+"""Canonical average occupancy target used by automatic sizing and assisted growth."""
+
 _AUTOMATIC_IDENTITY_MIN_EXPECTED: int = (
-    DEFAULT_BUCKET_COUNT * _TARGET_ENTRIES_PER_BUCKET
+    DEFAULT_BUCKET_COUNT * TARGET_ENTRIES_PER_BUCKET
 )
 
-MAX_EXPECTED_CARDINALITY: int = MAX_BUCKET_COUNT * _TARGET_ENTRIES_PER_BUCKET
+MAX_EXPECTED_CARDINALITY: int = MAX_BUCKET_COUNT * TARGET_ENTRIES_PER_BUCKET
 """Largest sizing hint representable by the eager hash directory."""
 
 RECORD_ID_KEY_FORMAT_VERSION: int = 1
@@ -76,8 +79,8 @@ _EXHAUSTED_RECORD_ID: int = 0xFFFFFFFFFFFFFFFF
 def _bucket_count_for_expected(expected_cardinality: int) -> int:
     """Resolve one already-validated expected count by the single P2-ID formula."""
     required = (
-        expected_cardinality + _TARGET_ENTRIES_PER_BUCKET - 1
-    ) // _TARGET_ENTRIES_PER_BUCKET
+        expected_cardinality + TARGET_ENTRIES_PER_BUCKET - 1
+    ) // TARGET_ENTRIES_PER_BUCKET
     return validate_bucket_count(1 << (required - 1).bit_length())
 
 

@@ -3463,6 +3463,53 @@ class IndexStore:
         """Return the head page of a bucket: buckets follow the header page, in order."""
         return bucket + 1
 
+    def assisted_rehash_pressure(self) -> tuple[int, int]:
+        """Return ``(head_entries, overflow_pages)`` without walking bucket chains.
+
+        ``open`` first proves that the catalog-selected definition still names the physical
+        header, including its digest, visibility and artifact nonce.  The bounded pass then
+        validates and counts slots only on the eager directory's head pages.  It deliberately
+        does not decode entries, follow ``next_page`` or treat this advisory sample as read or
+        commit authority.  Cost is O(bucket_count), capped by the format at 4,096 pages, rather
+        than O(number of index entries).
+
+        Extra append-only pages are a conservative upper bound on retained overflow: an
+        interrupted allocation may leave one unreachable, but counting it can only suggest an
+        early rehash.  It cannot hide pressure or authorize a query result.
+        """
+
+        header = self.open()
+        definition = self._definition
+        if header.bucket_count != definition.bucket_count:
+            raise GrafxIndexError(
+                f"Index {definition.name!r} declares {definition.bucket_count} buckets in "
+                f"the catalog-selected definition but {header.bucket_count} in its header.",
+                field="bucket_count",
+                index=definition.name,
+                file=self.file,
+                expected=definition.bucket_count,
+                observed=header.bucket_count,
+            )
+        page_count = self._pool.storage.page_count(self.file)
+        required_pages = 1 + header.bucket_count
+        if page_count < required_pages:
+            raise GrafxCorruptionDetected(
+                f"Index {definition.name!r} has {page_count} pages but its directory requires "
+                f"at least {required_pages}.",
+                field="page_count",
+                file=self.file,
+                index=definition.name,
+                value=page_count,
+                required=required_pages,
+            )
+        head_entries = 0
+        for bucket in range(header.bucket_count):
+            page_index = self._bucket_head(bucket)
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                head_entries += len(page.live_slots())
+        return head_entries, page_count - required_pages
+
     def _bucket_pages(self, bucket: int) -> tuple[PageIndex, ...]:
         """Return the pages of a bucket, in chain order, refusing a chain that does not end.
 

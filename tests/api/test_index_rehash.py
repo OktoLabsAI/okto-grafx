@@ -14,6 +14,7 @@ import pytest
 
 from okto_grafx import connect
 from okto_grafx.domain.errors import (
+    GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
     GrafxUnsupportedOperation,
@@ -22,10 +23,17 @@ from okto_grafx.domain.index import (
     MAX_BUCKET_COUNT,
     MAX_EXPECTED_CARDINALITY,
     RECORD_ID_KEY_DERIVATION,
+    TARGET_ENTRIES_PER_BUCKET,
     IndexGenerationState,
     IndexOperation,
     change_of,
     identity_index_name,
+)
+from okto_grafx.domain.page.file_header import (
+    HEADER_PAGE_INDEX,
+    FileHeader,
+    FileHeaderPage,
+    FileKind,
 )
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
@@ -92,7 +100,7 @@ def _durable_fingerprint(database: object) -> tuple[object, ...]:
     )
 
 
-def test_v1_automatic_rehash_coactivates_v2_and_builds_target_once(
+def test_v1_automatic_assisted_rehash_coactivates_v2_and_builds_target_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -131,7 +139,21 @@ def test_v1_automatic_rehash_coactivates_v2_and_builds_target_once(
             record_build,
         )
 
-        grown = database.rehash_index("pk_Person", bucket_count=128)
+        source = database._indexes.active_index(
+            "pk_Person", catalog=database._catalog.catalog
+        )
+        store_type = type(source)
+        real_pressure = store_type.assisted_rehash_pressure
+
+        def pressured(selected: object) -> tuple[int, int]:
+            if selected is source:
+                return source.definition.bucket_count * TARGET_ENTRIES_PER_BUCKET, 0
+            return real_pressure(selected)
+
+        monkeypatch.setattr(store_type, "assisted_rehash_pressure", pressured)
+
+        grown = database.rehash_index_if_needed("pk_Person")
+        assert grown is not None
 
         target_builds = [build for build in builds if build[0].lower() == "pk_person"]
         assert len(target_builds) == 1, (
@@ -245,6 +267,136 @@ def test_v2_custom_rehash_rotates_immutable_generations_and_sizing_hints(
             "MATCH (p:Person) WHERE p.email = 'ada@example.test' RETURN p.id"
         ).rows == ((1,),)
         assert reopened.verify("all").findings == ()
+
+
+def test_assisted_rehash_uses_bounded_directory_pressure_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with connect(tmp_path / "database", page_size=PAGE_SIZE) as database:
+        _seed_people(database)
+        first = database.create_index("by_email", "Person", ("email",), bucket_count=8)
+        store = database._indexes.active_index(
+            "by_email", catalog=database._catalog.catalog
+        )
+        storage_type = type(database._storage)
+        real_page_count = storage_type.page_count
+        page_count = real_page_count(database._storage, first.file)
+        assert page_count == 1 + first.bucket_count
+
+        def forbid_bucket_scan(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("the pressure probe scanned an index bucket")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(type(store), "_bucket_pages", forbid_bucket_scan)
+            assert database.rehash_index_if_needed("by_email") is None
+
+        store_type = type(store)
+        real_pressure = store_type.assisted_rehash_pressure
+
+        def one_pressured_observation(selected: object) -> tuple[int, int]:
+            if selected is store:
+                return first.bucket_count * TARGET_ENTRIES_PER_BUCKET, 0
+            return real_pressure(selected)
+
+        monkeypatch.setattr(
+            store_type,
+            "assisted_rehash_pressure",
+            one_pressured_observation,
+        )
+        grown = database.maintenance.rehash_index_if_needed("by_email")
+
+        assert grown is not None
+        assert grown.bucket_count == 16
+        assert grown.file != first.file
+        assert database._storage.exists(first.file)
+        assert database.execute(
+            "MATCH (p:Person) WHERE p.email = 'grace@example.test' RETURN p.id"
+        ).rows == ((2,),)
+        assert database.verify("all").findings == ()
+
+
+def test_assisted_rehash_threshold_and_short_directory_are_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with connect(tmp_path / "database", page_size=PAGE_SIZE) as database:
+        _seed_people(database)
+        index = database.create_index("by_email", "Person", ("email",), bucket_count=8)
+        storage_type = type(database._storage)
+        real_page_count = storage_type.page_count
+
+        def below_two_pages_per_bucket(storage: object, file: str) -> int:
+            observed = real_page_count(storage, file)
+            return (
+                observed + index.bucket_count
+                if file == index.file
+                else observed
+            )
+
+        monkeypatch.setattr(storage_type, "page_count", below_two_pages_per_bucket)
+        assert (
+            database.rehash_index_if_needed(
+                "by_email", overflow_pages_per_bucket=2
+            )
+            is None
+        )
+
+        def short_directory(storage: object, file: str) -> int:
+            observed = real_page_count(storage, file)
+            return index.bucket_count if file == index.file else observed
+
+        monkeypatch.setattr(storage_type, "page_count", short_directory)
+        with pytest.raises(GrafxCorruptionDetected) as refused:
+            database.rehash_index_if_needed("by_email")
+        assert refused.value.details["field"] == "bucket_count"
+        assert refused.value.details["file"] == index.file
+        assert refused.value.details["value"] == index.bucket_count
+        assert database.indexes.index("by_email") == index
+
+
+def test_assisted_rehash_proves_physical_header_before_returning_none(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "database", page_size=PAGE_SIZE) as database:
+        _seed_people(database)
+        index = database.create_index(
+            "by_email", "Person", ("email",), bucket_count=8
+        )
+        with database._pool.pinned(index.file, HEADER_PAGE_INDEX) as page:
+            FileHeaderPage.write(
+                page,
+                FileHeader(kind=FileKind.HEAP, page_size=PAGE_SIZE),
+            )
+        database._pool.flush(index.file)
+        database._pool.invalidate(index.file)
+
+        with pytest.raises(GrafxCorruptionDetected) as refused:
+            database.rehash_index_if_needed("by_email")
+        assert refused.value.details["kind"] == "HEAP"
+
+
+def test_assisted_rehash_at_directory_ceiling_proves_identity_without_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with connect(tmp_path / "database", page_size=PAGE_SIZE) as database:
+        _seed_people(database)
+        index = database.create_index(
+            "by_email", "Person", ("email",), bucket_count=8
+        )
+        store = database._indexes.active_index(
+            "by_email", catalog=database._catalog.catalog
+        )
+
+        def forbid_pressure_scan(*_args: object, **_kwargs: object) -> tuple[int, int]:
+            raise AssertionError("a directory at the format ceiling cannot grow")
+
+        monkeypatch.setattr(
+            "okto_grafx.engine.database.MAX_BUCKET_COUNT", index.bucket_count
+        )
+        monkeypatch.setattr(
+            type(store), "assisted_rehash_pressure", forbid_pressure_scan
+        )
+
+        assert database.rehash_index_if_needed("by_email") is None
 
 
 def test_record_id_index_rehash_preserves_endpoint_identity_semantics(
@@ -451,6 +603,11 @@ def test_unknown_specialized_and_read_only_rehashes_are_typed_non_mutations(
             with pytest.raises(GrafxError):
                 database.rehash_index(name, bucket_count=128)
             assert _durable_fingerprint(database) == before
+        with pytest.raises(GrafxUnsupportedOperation) as assisted_proximity:
+            database.rehash_index_if_needed("vector_Item_s")
+        assert assisted_proximity.value.details["field"] == "visibility"
+        assert assisted_proximity.value.details["value"] == "proximity"
+        assert _durable_fingerprint(database) == before
         database.checkpoint()
 
     with connect(root, page_size=PAGE_SIZE, read_only=True) as reader:
@@ -458,4 +615,70 @@ def test_unknown_specialized_and_read_only_rehashes_are_typed_non_mutations(
         with pytest.raises(GrafxUnsupportedOperation) as refused:
             reader.rehash_index("pk_Item", bucket_count=128)
         assert refused.value.details["field"] == "read_only"
+        with pytest.raises(GrafxUnsupportedOperation) as assisted:
+            reader.rehash_index_if_needed("pk_Item")
+        assert assisted.value.details["field"] == "read_only"
         assert _durable_fingerprint(reader) == before
+
+
+def test_assisted_rehash_reassesses_after_concurrent_growth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "database"
+    publisher = connect(root, page_size=PAGE_SIZE)
+    observer = None
+    try:
+        _seed_people(publisher)
+        first = publisher.create_index(
+            "by_email", "Person", ("email",), bucket_count=8
+        )
+        publisher.checkpoint()
+        observer = connect(root, page_size=PAGE_SIZE)
+        observed_store = observer._indexes.active_index(
+            "by_email", catalog=observer._catalog.catalog
+        )
+        store_type = type(observed_store)
+        real_pressure = store_type.assisted_rehash_pressure
+
+        def pressured(selected: object) -> tuple[int, int]:
+            if selected is observed_store:
+                return first.bucket_count * TARGET_ENTRIES_PER_BUCKET, 0
+            return real_pressure(selected)
+
+        monkeypatch.setattr(store_type, "assisted_rehash_pressure", pressured)
+        database_type = type(observer)
+        real_rehash = database_type.rehash_index
+        interposed = False
+
+        def publish_before_observer(
+            selected: object,
+            name: str,
+            *,
+            bucket_count: int | None = None,
+            expected_cardinality: int | None = None,
+        ) -> object:
+            nonlocal interposed
+            if selected is observer and not interposed:
+                interposed = True
+                publisher.rehash_index("by_email", bucket_count=16)
+            return real_rehash(
+                selected,
+                name,
+                bucket_count=bucket_count,
+                expected_cardinality=expected_cardinality,
+            )
+
+        monkeypatch.setattr(database_type, "rehash_index", publish_before_observer)
+
+        with pytest.raises(GrafxIndexError):
+            observer.rehash_index_if_needed("by_email")
+        assert interposed is True
+        assert publisher.indexes.index("by_email").bucket_count == 16
+        assert publisher.execute(
+            "MATCH (p:Person) WHERE p.email = 'grace@example.test' RETURN p.id"
+        ).rows == ((2,),)
+        assert publisher.verify("all").findings == ()
+    finally:
+        if observer is not None:
+            observer.close()
+        publisher.close()
