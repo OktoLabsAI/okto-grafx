@@ -61,6 +61,9 @@ including the on-disk format.
 
 ### Changed
 
+- Bumped the development version to `0.0.3` and started a focused performance round for the
+  user-visible Okto Pulse Knowledge Graph load path. The round may change internals aggressively,
+  but retains multi-reader/multi-writer operation, durability and data consistency as invariants.
 - Exact built-in catalog index definitions now retain one runtime definition for the identity of
   their selected generation descriptor, and exact in-process index WAL records retain a private
   decoded proof for their immutable payload. Ownership and record-type checks still run on every
