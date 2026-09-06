@@ -3664,8 +3664,9 @@ Na página exata, o híbrido manteve 500 nós/777 relações e zero falhas, redu
 `7.844 -> 2.082`. Em duas execuções pareadas, o primeiro passe mediu `1,827–2,056 s` contra
 `2,377–2,736 s` do scan forçado; os passes quentes mediram `0,763–0,967 s` contra
 `2,273–2,724 s`. É medição direta de provider/engine, não alegação HTTP, mas o consumidor
-`523e759` passa a **GO nas branches candidatas**. Os 1.582 probes de PK ainda repetidos alimentam
-o próximo ganho bounded (memo B lexical), sem transformar esse residual em gate móvel.
+`523e759` passa a **GO nas branches candidatas**. Os 1.582 probes de PK ainda repetidos foram
+mensurados, mas não constituem automaticamente o próximo ganho: o `memo B` foi posteriormente
+deferido pela decisão adversarial registrada abaixo, sem transformar o residual em gate móvel.
 
 Esse caminho não altera formato, WAL, recovery, nenhuma das duas OCCs, leases, admissão de writers
 ou snapshots de readers. Tabela/índice ausente, stale ou owner-dirty escolhe o plano canônico antes
@@ -3676,7 +3677,7 @@ O refresh foi concluído sobre `a726744` e substitui o baseline antigo: o transf
 `86,81 s` para mediana de `58,49 s` (`1,48x`). No caminho exato da tela, o perfil isolou custos de
 landing/certificação por linha, re-encode de endpoint apenas para tarifar memo, `IN $lista` linear
 e decode das linhas largas. O consenso finito da segunda leva está detalhado em
-`docs/PERFORMANCE_ROUND_0_0_3.md`: KG-3 → KG-1/KG-4 → KG-2 bounded, com R-11 no decode. KG-3 foi
+`docs/PERFORMANCE_ROUND_0_0_3.md`: KG-3 → KG-1/KG-4 → decisão KG-2, com R-11 no decode. KG-3 foi
 publicado em `8d806b0` usando somente o `payload_len` já autenticado pelo heap; versão sintética ou
 alterada perde a testemunha e mantém o encode canônico. R-11 foi publicado em `a610b55`, inlinando
 o corpo de `STRING` já tipado sem alterar bytes, validação UTF-8 ou taxonomia de corrupção. Os
@@ -3684,9 +3685,7 @@ testes focais passaram (50 para KG-3; 197 no codec/schema para R-11). Na página
 permaneceu 500 nós/777 relações/zero falhas; uma amostra mediu nós em `0,858 s`, híbrido quente em
 `1,036–1,103 s` e scan forçado em `2,334–2,547 s`, sem atribuir a variação inteira aos dois patches.
 Hashing de `IN` só poderá reter parâmetros profundamente destacados, tipos exatos
-`str`/`bytes`/`None` e teto por statement; listas numéricas/mistas continuam lineares. O batch de
-landings não poderá materializar o statement inteiro: será limitado por chunks e preservará os
-caminhos v1, RYOW, snapshot e certificado pós-leitura fail-closed.
+`str`/`bytes`/`None` e teto por statement; listas numéricas/mistas continuam lineares.
 
 KG-1/KG-4 foram então integrados em `216319e`/`d12602f` após o rework adversarial. O memo só
 consulta o hash para LHS exato `str`/`bytes` e RHS `Parameter` destacado contendo apenas tipos
@@ -3697,6 +3696,26 @@ A saída antecipada universal preserva `NULL` quando não há match, e listas nu
 cherry-pick. No board real, 500 nós/777 relações/zero falhas permaneceram; o run seguinte mediu
 nós em `0,866 s`, híbrido quente em `0,762–0,848 s` e scan forçado em `0,811–0,818 s`. A queda
 frente ao scan imediatamente anterior é evidência direcional e não promessa estatística isolada.
+
+A revisão adversarial subsequente fechou KG-2 e `memo B` como **deferidos nesta onda**. Mesmo um
+chunk geométrico resolve linhas futuras antes do primeiro `yield` e, portanto, pode antecipar ou
+reordenar corrupção que um cursor encerrado por `LIMIT` não observaria; 256 linhas também não
+limitam bytes de payload, e o mecanismo alcançaria todo `RelationshipScan`. Com a página real já
+em `0,762–0,848 s` no híbrido e `0,811–0,818 s` no scan, o residual plausível é somente
+`0,08–0,16 s`. Claude concordou que a medida real prevalece sobre o modelo sintético. Uma futura
+reabertura exige API estreita/materializada, limites simultâneos de linhas e bytes, consumo exato
+do mapa local após saturação e nenhuma mudança na semântica de cursor, v1, stale, RYOW ou recusa
+fail-closed. Não há gate adicional criado por essa decisão.
+
+A execução avançou então para custos medidos do transfer. `9d17ed8` implementa a primitiva E-1c
+`BufferPool.allocate_run`: uma estrutura eager cresce fisicamente em uma única chamada e observa
+o tamanho inicial uma vez, mas instala frames sujos não pinados individualmente sob o mesmo
+budget, `_grown`, revogação de loads e write-back existentes; recusa de budget continua anterior
+ao crescimento. Passaram 174 testes do buffer pool. O wiring do diretório de buckets será feito
+somente após integrar LB-3 para evitar conflito no mesmo arquivo. LB-3 foi delegado formalmente ao
+Claude: agrupar efeitos de replay por balde e varrer cada balde uma vez, com ordem por chave/LSN e
+SHA/imagens finais byte a byte como critérios de integração. Nenhuma das duas frentes altera
+formato, WAL, as duas OCCs, durabilidade ou multi-reader/multi-writer.
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um

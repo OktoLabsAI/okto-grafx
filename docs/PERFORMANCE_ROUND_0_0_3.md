@@ -296,7 +296,7 @@ the same endpoint visibility and canonical-reference validation as ordinary trav
 
 ## KG-LOAD-2 — refreshed hot path and second implementation wave
 
-Status: **finite joint selection; first two removals integrated, evaluator work under review**.
+Status: **finite joint selection; KG hot-path batch closed and transfer/storage batch in progress**.
 
 Claude repeated the Amdahl transfer on `a726744` after the earlier optimizations, rather than
 reusing the obsolete baseline. The clean median fell from 86.81 s to 58.49 s (`1.48x`). A
@@ -308,15 +308,15 @@ of its profiled time decoding all 44 columns, including the vector, before retur
 properties. These fractions come from the profiled synthetic board; the live board remains the
 end-user validation target and the percentages are not release gates.
 
-The joint order is deliberately closed: (1) remove re-encoding from landing accounting using an
+The joint order was deliberately closed: (1) remove re-encoding from landing accounting using an
 authenticated payload-length witness; (2) add bounded statement-local hashing only for detached
 `str`/`bytes`/`None` parameter lists, while every mixed/numeric case retains the canonical walk
 and its `1 = 1.0` semantics; (3) add exact same-type scalar equality and universal membership
-early exit; (4) batch physical endpoint landings only in bounded chunks, using the existing
-`validated_versions_many` certificate and retaining v1/RYOW scalar paths; and (5) reduce wide-row
-decode overhead without changing the stored format or corruption oracle. Row-independent
-expression folding and unbounded relationship materialization are not part of this wave because
-their error-order and memory semantics are not yet proved.
+early exit; and (4) reduce wide-row decode overhead without changing the stored format or
+corruption oracle. Physical endpoint batching was investigated and then explicitly deferred by
+the joint adversarial decision below. Row-independent expression folding and unbounded
+relationship materialization are not part of this wave because their error-order and memory
+semantics are not proved.
 
 `8d806b0` completed the first item. `HeapVersion` now carries the `RecordHeader.payload_len` that
 the heap already authenticated while decoding. Optional landing accounting consumes that exact
@@ -354,6 +354,38 @@ the node query at 0.866 s, the warm hybrid at 0.762–0.848 s and forced scan at
 large scan change relative to the immediately preceding 2.334–2.547 s observation is useful
 directional evidence but is not presented as a statistically isolated promise.
 
+### KG-2 decision — deferred after live remeasurement
+
+Claude's bounded endpoint-landing design was reviewed against the public pull-driven cursor, not
+only against a fully consumed statement. A generic chunk inside `RelationshipScan` would resolve
+later rows before yielding the first row of that chunk. That can surface relationship or endpoint
+corruption which the current `LIMIT`/early-close consumer would never reach and can reorder the
+first `from`/`to` refusal across rows. A row count of 256 is also not a memory bound for wide
+relationship payloads, and a saturated landing cache would have to consume the exact per-chunk
+map rather than accidentally resolving the same key again through the scalar path. Finally, the
+change would affect every `RelationshipScan`, not only the closed Pulse projection.
+
+The live measurement after KG-1/KG-4 put warm hybrid fan-out at 0.762–0.848 s and forced scan at
+0.811–0.818 s. The plausible remaining KG-2 benefit is therefore about 0.08–0.16 s on this page,
+not the 0.3–0.4 s derived from the earlier synthetic board. Claude accepted that the live
+denominator supersedes the model, and the joint decision is **NO-GO in this wave** for both generic
+KG-2 batching and the cross-statement `memo B`. This is a finite decision, not a new performance
+gate. A future attempt must use a narrow/materialized API, bound both rows and bytes, leave cursor
+error order unchanged, consume its returned local map exactly after cache saturation, and retain
+the canonical v1, stale, RYOW and pending-row routes.
+
+### Transfer/storage continuation
+
+With the KG screen batch closed, the next two measured transfer costs are being implemented in
+parallel without overlapping source files. `9d17ed8` adds `BufferPool.allocate_run`: an eager
+structural directory can grow its physical file with one `StorageDevice.allocate(file, count)`
+and one initial `page_count`, while admitting ordinary unpinned dirty frames one at a time under
+the same buffer budget. Budget refusal still occurs before growth; every page remains in the
+existing `_grown`, load-revocation, dirty-candidate and write-back accounting. The index-directory
+wiring is intentionally held until LB-3 is integrated. Claude owns LB-3: group checkpoint replay
+effects by bucket and scan each bucket once while proving per-key/LSN order and byte-identical
+final page images. Neither item changes format, WAL, OCC, durability or multi-process admission.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -370,6 +402,8 @@ directional evidence but is not presented as a statistically isolated promise.
 | Landing accounting without row re-encode | complete | `8d806b0`; authenticated durable payload length on disk rows, canonical fallback for synthetic/modified rows; 50 focused tests and Ruff pass |
 | Planned STRING body decode | complete | `a610b55`; same byte validation/error taxonomy, 197 schema/value codec tests and Ruff pass; live ordered page preserved 500/777 |
 | Bounded `IN` memo and scalar equality | complete | Claude `1c1a57e` + `2672fce`, integrated as `216319e` + `d12602f`; 2,107 complete query tests, 240 post-integration focused tests, 11 killed mutations; live 500/777 preserved |
-| Bounded batch endpoint landing | selected, not started | must use finite chunks and the existing exact multi-key certificate; v1 and RYOW retain canonical semantics |
+| Bounded batch endpoint landing / memo B | deferred after adversarial review and live remeasurement | generic batching changes pull-cursor error order and has no byte cap; residual is about 0.08–0.16 s on the live page; only a future narrow/materialized API may reopen it |
+| Structural allocation run (E-1c) | pool primitive complete; index wiring pending LB-3 integration | `9d17ed8`; one physical grow and one initial page count, ordinary per-page pool accounting, pre-growth budget refusal; 174 buffer-pool tests pass |
+| Checkpoint bucket replay (LB-3) | in progress with Claude | separate worktree; differential final-page/SHA and per-key/LSN-order proof required before integration |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |
