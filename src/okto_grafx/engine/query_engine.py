@@ -278,6 +278,9 @@ _ERRORS_TOTAL = metric("oktografx_query_errors_total").name
 # text become an unbounded retention surface. Bump the version after a planner/key semantic
 # change so an older shape can never survive inside a long-lived engine.
 _PARSE_CACHE_MAX_ENTRIES: int = 256
+# One statement-authority memo per retained parsed statement; the parse cache bounds the
+# statements, and this bound keeps the memo from outliving that cache by more than its size.
+_STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES: int = _PARSE_CACHE_MAX_ENTRIES
 _PLAN_CACHE_MAX_ENTRIES: int = 128
 _PREPARED_PLAN_VERSION: int = 1
 
@@ -2422,6 +2425,23 @@ def _catalog_active_indexes(manager: object, catalog: Catalog) -> tuple[object, 
     return tuple(listing()) if callable(listing) else ()
 
 
+@dataclass(slots=True)
+class _StatementAuthorityMemo:
+    """One proved statement projection and the identities it was proved under.
+
+    Every field but the projection is a fence: the entry answers only for the same statement
+    object, the same catalog picture object and the same index manager, at the same registry
+    revision.  The entry holds the statement, so the identity it is keyed by cannot be reused
+    by another object while the entry lives.
+    """
+
+    statement: Statement
+    catalog: Catalog
+    manager: IndexManager
+    registry_revision: int
+    projection: _IndexAuthorityProjection
+
+
 def _closed_statement_tables(
     statement: Statement, catalog: Catalog
 ) -> tuple[TableDef, ...] | None:
@@ -2776,6 +2796,7 @@ class QueryEngine:
         "_parse_cache",
         "_plan_cache",
         "_owned_prepared_plans",
+        "_statement_authority_memo",
     )
 
     def __init__(
@@ -2901,6 +2922,12 @@ class QueryEngine:
         # Public result detachment may take its fast path only for a root retained here by this
         # exact engine. Counts handle one immutable plan admitted under more than one key.
         self._owned_prepared_plans: dict[int, tuple[PlanNode, int]] = {}
+        # Statement-authority memo: keyed by the identity of a retained parsed statement and
+        # fenced by the identities of the catalog picture and index manager plus the registry
+        # revision.  An acceleration only -- every hit re-proves those fences.
+        self._statement_authority_memo: OrderedDict[int, _StatementAuthorityMemo] = (
+            OrderedDict()
+        )
         self._metrics = MetricEmitter(metrics)
         self._clock = clock
         if metrics.enabled:
@@ -2929,7 +2956,10 @@ class QueryEngine:
             if existing is None:
                 self._parse_cache[text] = statement
                 if len(self._parse_cache) > _PARSE_CACHE_MAX_ENTRIES:
-                    self._parse_cache.popitem(last=False)
+                    _text, evicted = self._parse_cache.popitem(last=False)
+                    # The memo is keyed by the identity of a retained statement; a statement
+                    # the parse cache no longer retains leaves the memo with it.
+                    self._statement_authority_memo.pop(id(evicted), None)
             else:
                 statement = existing
                 self._parse_cache.move_to_end(text)
@@ -3294,6 +3324,17 @@ class QueryEngine:
             if isinstance(txn_id, int) and not isinstance(txn_id, bool) and txn_id >= 0
             else None
         )
+        fence = (
+            self._statement_authority_fence(manager, scoped_txn)
+            if statement is not None and type(manager) is IndexManager
+            else None
+        )
+        if fence is not None:
+            memoized = self._memoized_statement_authority(
+                statement, catalog, manager, fence
+            )
+            if memoized is not None:
+                return memoized
         closed_tables = (
             None if statement is None else _closed_statement_tables(statement, catalog)
         )
@@ -3306,9 +3347,14 @@ class QueryEngine:
             planning, runtime = scoped_indexes(
                 closed_tables, txn=scoped_txn, catalog=catalog
             )
-            return _IndexAuthorityProjection.build(
+            projection = _IndexAuthorityProjection.build(
                 tuple(runtime), planning_indexes=tuple(planning)
             )
+            if fence is not None:
+                self._remember_statement_authority(
+                    statement, catalog, manager, fence, projection
+                )
+            return projection
         statement_indexes = getattr(manager, "_statement_indexes", None)
         if callable(statement_indexes):
             planning, runtime = statement_indexes(txn=scoped_txn, catalog=catalog)
@@ -3324,6 +3370,80 @@ class QueryEngine:
         else:
             indexes = _catalog_active_indexes(manager, catalog)
         return _IndexAuthorityProjection.build(indexes)
+
+    @staticmethod
+    def _statement_authority_fence(
+        manager: IndexManager, scoped_txn: object | None
+    ) -> int | None:
+        """Return the registry revision a memoized projection may be keyed under, or None.
+
+        The scoped projection of a statement depends on the parsed statement, the catalog
+        picture, the registered index inventory and -- only when this transaction staged
+        speculative DDL -- on what that transaction observed.  The first three are fenced by
+        identity and by the registry revision; the last makes the answer transaction-specific,
+        so such a statement is never memoized.  A manager whose revision is not the exact
+        integer this door was written against declines as well.
+        """
+        revision = getattr(manager, "_registry_revision", None)
+        if type(revision) is not int:
+            return None
+        if scoped_txn is not None:
+            observed = getattr(manager, "_schema_observed", None)
+            if type(observed) is not dict:
+                return None
+            if observed.get(getattr(scoped_txn, "txn_id", None)):
+                return None
+        return revision
+
+    def _memoized_statement_authority(
+        self,
+        statement: Statement,
+        catalog: Catalog,
+        manager: IndexManager,
+        fence: int,
+    ) -> _IndexAuthorityProjection | None:
+        """Return the projection memoized for exactly this statement under exactly these fences."""
+        key = id(statement)
+        with self._prepared_guard:
+            entry = self._statement_authority_memo.get(key)
+            if entry is None:
+                return None
+            if (
+                entry.statement is not statement
+                or entry.catalog is not catalog
+                or entry.manager is not manager
+                or entry.registry_revision != fence
+            ):
+                # Never an authority: a drifted fence drops the entry so the next proof
+                # replaces it instead of shadowing it.
+                del self._statement_authority_memo[key]
+                return None
+            self._statement_authority_memo.move_to_end(key)
+            return entry.projection
+
+    def _remember_statement_authority(
+        self,
+        statement: Statement,
+        catalog: Catalog,
+        manager: IndexManager,
+        fence: int,
+        projection: _IndexAuthorityProjection,
+    ) -> None:
+        """Retain one freshly proved projection for exactly this statement, bounded."""
+        key = id(statement)
+        with self._prepared_guard:
+            self._statement_authority_memo[key] = _StatementAuthorityMemo(
+                statement=statement,
+                catalog=catalog,
+                manager=manager,
+                registry_revision=fence,
+                projection=projection,
+            )
+            self._statement_authority_memo.move_to_end(key)
+            while len(self._statement_authority_memo) > (
+                _STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES
+            ):
+                self._statement_authority_memo.popitem(last=False)
 
     def _prepared_plan_key(
         self,
