@@ -451,9 +451,13 @@ def test_reset_active_rebuild_and_vector_store_fall_back_for_the_whole_replay(
         storage_dtype="f32",
         normalized=False,
         math=PureVectorMath(),
-        resolve=lambda _ref: (1.0, 0.0),
+        resolve=lambda _ref: (1, (1.0, 0.0)),
     )
     database.manager._indexes[vector.definition.registry_key] = vector  # noqa: SLF001
+    # A published picture is what keeps an HNSW store on the scalar protocol: its per-record
+    # note/certify discipline needs the header to move per record.  Without a picture the store
+    # declares itself batch-compatible (see test_vector_replay_batch.py).
+    vector.snapshot()
     vector_record = _effect(database.proximity, IndexOperation.INSERT, 12, ordinal=2)
     assert database.manager.apply_common_replay_batch((vector_record,)) is None
     vector_calls = 0
@@ -487,6 +491,9 @@ def test_vector_store_stays_scalar_without_poisoning_canonical_store_batch(
         resolve=lambda _ref: (1, (1.0, 0.0)),
     )
     database.manager._indexes[vector.definition.registry_key] = vector  # noqa: SLF001
+    # Publish a picture so the HNSW store keeps its scalar protocol while the canonical store
+    # next to it is still batched (the non-poisoning property under test).
+    vector.snapshot()
     records = (
         _effect(database.exact, IndexOperation.INSERT, 10, ordinal=1),
         _effect(vector, IndexOperation.INSERT, 11, ordinal=2),

@@ -1376,6 +1376,34 @@ class VectorHnswIndex(ProximityIndex):
         if self._note(picture, change):
             self._certify(picture, self.built_through_lsn)
 
+    def _batch_replay_admits(self) -> bool:
+        """Join a composed replay batch only while no published picture could observe it.
+
+        With no picture, :meth:`apply` degenerates to the canonical protocol plus forgetting the
+        derived live count, and both are what :meth:`_batch_replay_settled` reproduces once at
+        the end.  With a picture the per-record ``_note``/``_certify`` discipline needs the
+        header to move per record, which a composed header does not, so the scalar protocol
+        stays.  Only this exact type answers: a subclass may have changed what ``apply`` means.
+        """
+        if type(self) is not VectorHnswIndex:
+            return False
+        with self._guard:
+            return self._snapshot is None
+
+    def _batch_replay_settled(self, *, moved: bool) -> None:
+        """Forget derived state once, after the composed header decision of a batch.
+
+        The buckets moved under a header that did not advance until now.  A picture that was
+        built meanwhile may therefore describe entries beyond its mark, so it is REPLACED (never
+        certified), exactly as :meth:`invalidate_graph` does; with no picture the live count is
+        the only derived value and it is forgotten as the scalar path would have done per record.
+        """
+        with self._guard:
+            if self._snapshot is not None:
+                self._snapshot = None
+                self._graph_generation = object()
+            self._discard_live_count_locked()
+
     def mark_stale(self, reason: str, *, persist: bool = True) -> None:
         """Record staleness as requested, and drop the graph derived from doubtful entries."""
         super().mark_stale(reason, persist=persist)

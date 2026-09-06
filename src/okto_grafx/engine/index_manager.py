@@ -2452,6 +2452,51 @@ class IndexStore:
                 self._discard_replay_frames(failure)
             raise
 
+    def _batch_replay_admits(self) -> bool:
+        """Declare whether a store that overrides :meth:`apply` may join a composed replay batch.
+
+        A canonical store is never asked: its ``apply`` IS the batch's own per-record protocol.
+        A specialised store answers only for its exact type, and only while the part of its
+        ``apply`` that goes beyond the canonical protocol is provably a no-op for the whole
+        batch; :meth:`_batch_replay_settled` then runs exactly once, after the composed header
+        decision, so derived state is never certified against a position the header has not
+        reached.  The default is a refusal, which keeps every unknown subclass on the scalar
+        protocol it was written against.
+        """
+        return False
+
+    def _batch_replay_settled(self, *, moved: bool) -> None:
+        """Hear, once per batch and after the header decision, that this store was batched."""
+        return None
+
+    def _require_same_replay_identity(self, initial: IndexHeader) -> None:
+        """Refuse to publish a composed header over a page 0 that no longer names this generation.
+
+        The composed image was read before the first bucket mutation of the batch.  Writing it
+        back through :meth:`_write_header` only re-checks the file kind and page size, so a
+        participant that replaced the artifact or flagged it stale between two effects would
+        otherwise receive a healthy header describing another generation's buckets.  Identity
+        fields are compared; the built/reconciled positions are exactly what the batch advances.
+        """
+        with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
+            current = self._decode_header_page(page)
+        if (
+            current.digest != initial.digest
+            or current.artifact_nonce != initial.artifact_nonce
+            or current.table_id != initial.table_id
+            or current.bucket_count != initial.bucket_count
+            or current.visibility != initial.visibility
+            or (current.flags & INDEX_FLAG_STALE) != (initial.flags & INDEX_FLAG_STALE)
+        ):
+            raise GrafxCorruptionDetected(
+                f"Index {self.name!r} changed identity while a batched replay was in flight, "
+                "so the composed header was not published.",
+                field="replay_identity",
+                index=self.name,
+                file=self.file,
+                page=HEADER_PAGE_INDEX,
+            )
+
     def _apply_replay_change(self, change: IndexChange, position: Lsn) -> None:
         """Apply one already-validated logical record without choosing its outer fence."""
         self._replaying = True
@@ -6537,7 +6582,9 @@ class IndexManager:
         The returned value is deliberately opaque outside this module and belongs to exactly
         this call.  It is never cached on the manager or a store.  A caller gets ``None`` for any
         shape whose existing per-record protocol carries extra semantics: RESET, an active
-        rebuild, or a subclass such as ``VectorHnswIndex`` that overrides :meth:`IndexStore.apply`.
+        rebuild, or a store overriding :meth:`IndexStore.apply` that does not declare, through
+        :meth:`IndexStore._batch_replay_admits`, that its extra semantics are a no-op for this
+        batch (``VectorHnswIndex`` does so only while it publishes no picture).
 
         Every record is decoded and resolved before page 0 of the first store is seeded.  Header
         transitions are then composed in WAL order with the same monotonic value objects used by
@@ -6561,7 +6608,7 @@ class IndexManager:
                 # invokes the capability directly.
                 return None
             if (
-                type(store).apply is not IndexStore.apply
+                not self._batch_replay_compatible(store)
                 or store._rebuild_authority is not None
                 or store._replaying
             ):
@@ -6679,6 +6726,43 @@ class IndexManager:
         )
         return _CommonReplayBatch(self, tuple(items), stores, hot_buckets)
 
+    @staticmethod
+    def _batch_replay_compatible(store: IndexStore) -> bool:
+        """Return whether ``store`` may take part in a composed replay batch.
+
+        A store whose ``apply`` is exactly the canonical one always may.  Any override must
+        declare, for its exact type and for this moment, that the batch protocol is complete for
+        it; an undeclared override keeps the scalar protocol it was written against.
+        """
+        if type(store).apply is IndexStore.apply:
+            return True
+        return bool(store._batch_replay_admits())
+
+    def _publish_common_replay_headers(
+        self,
+        prepared: _CommonReplayBatch,
+        moved_by_store: Mapping[IndexStore, bool],
+    ) -> None:
+        """Publish each composed header once, then let a specialised store settle derived state.
+
+        One composed header image is both the monotonic built/reconciled advance and, when a
+        bucket moved, the final page-0 clock the caller's existing flush boundary publishes
+        after those buckets.  Before it is written the resident page 0 must still name the
+        generation the batch prepared against.  A store that joined through
+        :meth:`IndexStore._batch_replay_admits` hears about the batch exactly once, here, after
+        the header decision for that store.
+        """
+        for state in prepared.stores:
+            store = state.store
+            store_moved = moved_by_store[store]
+            if state.final != state.initial or store_moved:
+                store._require_same_replay_identity(state.initial)
+                store._write_header(state.final)
+                if store_moved:
+                    store._cache_certificate = None
+            if type(store).apply is not IndexStore.apply:
+                store._batch_replay_settled(moved=store_moved)
+
     def apply_common_replay_batch(
         self, records: Sequence[WalRecord]
     ) -> tuple[str, ...] | None:
@@ -6722,15 +6806,7 @@ class IndexManager:
                     store._replaying = False
                 moved_by_store[store] = moved_by_store[store] or item_moved
 
-            for state in prepared.stores:
-                store_moved = moved_by_store[state.store]
-                if state.final != state.initial or store_moved:
-                    # One composed header image is both the monotonic built/reconciled advance
-                    # and, when a bucket moved, the final page-0 clock the caller's existing
-                    # flush boundary publishes after those buckets.
-                    state.store._write_header(state.final)
-                    if store_moved:
-                        state.store._cache_certificate = None
+            self._publish_common_replay_headers(prepared, moved_by_store)
             return tuple(store.file for store in touched)
         except Exception as failure:
             for store in touched:
@@ -6806,7 +6882,7 @@ class IndexManager:
             resolved.append((record, store, change))
             if (
                 change.operation is IndexOperation.RESET
-                or type(store).apply is not IndexStore.apply
+                or not self._batch_replay_compatible(store)
                 or store._rebuild_authority is not None
                 or store._replaying
                 or store._stale_reason is not None
@@ -6864,12 +6940,7 @@ class IndexManager:
                     store._replaying = False
                 moved_by_store[store] = moved_by_store[store] or moved
 
-            for state in prepared.stores:
-                store_moved = moved_by_store[state.store]
-                if state.final != state.initial or store_moved:
-                    state.store._write_header(state.final)
-                    if store_moved:
-                        state.store._cache_certificate = None
+            self._publish_common_replay_headers(prepared, moved_by_store)
             return tuple(store.file for store in touched)
         except Exception as failure:
             for store in touched:
