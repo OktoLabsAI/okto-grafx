@@ -117,15 +117,19 @@ def _page_count_if_present(
 
     ``page_count`` already performs the exact-name and descriptor proof needed to size a file.
     Calling ``exists`` immediately before it repeats that namespace walk on the established-file
-    hot path.  Only its typed ``missing_file`` refusal is translated, and only when the caller
-    has not supplied a preceding directory proof.  Every other storage/corruption failure, and a
-    missing file after ``proved_present=True``, remains fail-closed and byte-for-byte observable
-    to the caller.
+    hot path. Its typed ``missing_file`` refusal and Python's exact ``FileNotFoundError`` adapter
+    signal are translated only when the caller has not supplied a preceding directory proof.
+    Every other storage/corruption failure, and a missing file after ``proved_present=True``,
+    remains fail-closed and byte-for-byte observable to the caller.
     """
     try:
         return storage.page_count(file)
     except GrafxCorruptionDetected as failure:
         if proved_present or failure.details.get("reason") != "missing_file":
+            raise
+        return None
+    except FileNotFoundError:
+        if proved_present:
             raise
         return None
 

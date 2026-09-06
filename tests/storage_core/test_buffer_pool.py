@@ -137,6 +137,24 @@ class PresenceRecordingDevice(MemoryDevice):
         return super().exists(file)
 
 
+def test_page_count_if_present_accepts_only_unproved_python_missing_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Filesystem-style adapters may expose absence as FileNotFoundError."""
+    device = MemoryDevice()
+
+    def missing(_file: str) -> int:
+        raise FileNotFoundError("missing")
+
+    monkeypatch.setattr(device, "page_count", missing)
+
+    assert pool_module._page_count_if_present(device, "index/missing.idx") is None
+    with pytest.raises(FileNotFoundError):
+        pool_module._page_count_if_present(
+            device, "index/missing.idx", proved_present=True
+        )
+
+
 class AllocationRecordingDevice(MemoryDevice):
     """Expose physical sizing calls made by scalar and run allocation."""
 
