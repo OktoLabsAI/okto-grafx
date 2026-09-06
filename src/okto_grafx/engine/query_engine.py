@@ -104,6 +104,7 @@ from okto_grafx.engine.index_manager import (
     primary_key_index_name,
     relationship_endpoint_indexes,
 )
+from okto_grafx.engine.heap_store import FIRST_RECORD_ID
 from okto_grafx.engine.vector_engine import VectorEngine
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import (
@@ -6089,8 +6090,9 @@ def _relationship_incident_seek(
 
     Capability selection happens before the first lookup. A missing/stale store or an engine
     without the multi-key door executes the retained canonical plan. Once all four exact stores
-    are adopted, every refusal propagates: falling back after a partial certified read could hide
-    a generation replacement or corrupt heap candidate.
+    are adopted, the durable allocation frontier selects an edge-first scan for small tables
+    before any index certificate is opened.  Every later refusal propagates: falling back after
+    a partial certified read could hide a generation replacement or corrupt heap candidate.
     """
 
     manager = engine._indexes
@@ -6178,6 +6180,23 @@ def _relationship_incident_seek(
     from_keys = encoded_keys(node.from_keys, node.from_table, node.from_key_position)
     to_keys = encoded_keys(node.to_keys, node.to_table, node.to_key_position)
     if from_keys is None or to_keys is None:
+        yield from engine._rows(node.fallback, context)
+        return
+
+    # next_record_id is the durable O(1) upper bound that is strictly beyond every identity ever
+    # allocated for this relationship table.  Deletions and reservation gaps can only
+    # overestimate its live cardinality, which conservatively favours the seek.  page_count is
+    # deliberately excluded: it is a repairable chain hint and may lag an interrupted append.
+    #
+    # Measured crossover: scan when allocated_upper <= 0.5 * distinct endpoint probes.  Use
+    # integer arithmetic so the boundary is exact and deterministic on every platform.  This
+    # decision happens before validated_versions_many opens the first durable index certificate.
+    extent = engine.heap.extent_of(node.table)
+    allocated_upper = (
+        0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
+    )
+    probe_frontier = len(from_keys) + len(to_keys)
+    if allocated_upper * 2 <= probe_frontier:
         yield from engine._rows(node.fallback, context)
         return
 

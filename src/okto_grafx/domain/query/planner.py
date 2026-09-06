@@ -3039,24 +3039,6 @@ class _Planner:
         self.tables[first_variable] = first_table
         self.tables[target_variable] = target_table
         self.tables[relationship.variable] = table
-        canonical = TraverseRelationship(
-            child=NodeScan(
-                child=pipeline,
-                variable=first_variable,
-                table=first_table,
-            ),
-            source=first_variable,
-            target=target_variable,
-            relationship=relationship.variable,
-            table=table,
-            direction=relationship.direction,
-            min_hops=1,
-            max_hops=1,
-            target_table=target_table,
-            target_bound=False,
-        )
-        fallback: PlanNode = FilterRows(child=canonical, predicate=predicate)
-
         if relationship.direction is Direction.OUTGOING:
             from_variable, to_variable = first_variable, target_variable
             from_table_def, to_table_def = first_table, target_table
@@ -3067,6 +3049,23 @@ class _Planner:
             from_table_def, to_table_def = target_table, first_table
             from_keys, to_keys = keys[target_variable], keys[first_variable]
             from_definition, to_definition = target_definition, first_definition
+
+        # Keep the cheap branch edge-first.  The incident predicate needs both endpoint
+        # bindings, so RelationshipScan cannot consume it internally, but it can still avoid
+        # walking the whole source-node table merely to discover a small relationship table.
+        # This is also the fallback for a missing/stale acceleration capability: only the
+        # physical access path changes, never the statement predicate or its snapshot.
+        canonical = RelationshipScan(
+            child=pipeline,
+            from_variable=from_variable,
+            to_variable=to_variable,
+            relationship=relationship.variable,
+            table=table,
+            from_table=from_table_def,
+            to_table=to_table_def,
+            predicate=None,
+        )
+        fallback: PlanNode = FilterRows(child=canonical, predicate=predicate)
 
         return (
             RelationshipIncidentSeek(

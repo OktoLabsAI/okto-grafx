@@ -423,7 +423,7 @@ class RelationshipIncidentSeek(PlanNode):
 
     The operator is admitted only for the closed predicate
     ``from.pk IN keys OR to.pk IN keys`` over one directed typed hop. ``fallback`` is the full
-    canonical traversal and predicate tree for the same statement: a missing/stale capability
+    canonical edge-first scan and predicate tree for the same statement: a missing/stale capability
     therefore changes only the access path, never the answer. The runtime still validates every
     exact-index candidate against the heap under the transaction snapshot and resolves both
     endpoint rows before yielding an edge.

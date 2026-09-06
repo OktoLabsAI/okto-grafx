@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,10 @@ from okto_grafx.domain.errors import GrafxPlanError
 from okto_grafx.domain.query.plan import (
     FilterRows,
     RelationshipIncidentSeek,
+    RelationshipScan,
     TraverseRelationship,
 )
+from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapStore
 from okto_grafx.engine.index_manager import IndexManager
 
 
@@ -31,7 +34,24 @@ INCOMING_QUERY = (
 
 @pytest.fixture
 def database(tmp_path: Path) -> Iterator[object]:
-    handle = okto_grafx.connect(tmp_path / "db", page_size=512)
+    handle = _seed_database(tmp_path / "db", identity_indexes=True)
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+@pytest.fixture
+def database_without_identity_indexes(tmp_path: Path) -> Iterator[object]:
+    handle = _seed_database(tmp_path / "db-v1", identity_indexes=False)
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def _seed_database(path: Path, *, identity_indexes: bool) -> object:
+    handle = okto_grafx.connect(path, page_size=512)
     with handle.begin("write") as transaction:
         transaction.execute("CREATE NODE TABLE A(id STRING, PRIMARY KEY(id))")
         transaction.execute("CREATE NODE TABLE B(id STRING, PRIMARY KEY(id))")
@@ -56,11 +76,9 @@ def database(tmp_path: Path) -> Iterator[object]:
                     "confidence": confidence,
                 },
             )
-    handle.ensure_identity_indexes()
-    try:
-        yield handle
-    finally:
-        handle.close()
+    if identity_indexes:
+        handle.ensure_identity_indexes()
+    return handle
 
 
 def test_closed_endpoint_union_retains_a_canonical_fallback(database: object) -> None:
@@ -70,7 +88,8 @@ def test_closed_endpoint_union_retains_a_canonical_fallback(database: object) ->
     )
 
     assert type(incident.fallback) is FilterRows
-    assert any(type(node) is TraverseRelationship for node in incident.fallback.walk())
+    assert any(type(node) is RelationshipScan for node in incident.fallback.walk())
+    assert not any(type(node) is TraverseRelationship for node in incident.fallback.walk())
     assert incident.from_table.name == "A"
     assert incident.to_table.name == "B"
 
@@ -117,6 +136,42 @@ def test_non_exact_probe_values_return_to_canonical_membership(database: object)
     )
 
 
+def test_wrong_probe_types_cannot_partially_encode_an_int64_frontier(
+    tmp_path: Path,
+) -> None:
+    handle = okto_grafx.connect(tmp_path / "int64-db", page_size=512)
+    try:
+        with handle.begin("write") as transaction:
+            transaction.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+            transaction.execute("CREATE NODE TABLE B(id INT64, PRIMARY KEY(id))")
+            transaction.execute("CREATE REL TABLE R(FROM A TO B, confidence DOUBLE)")
+        with handle.begin("write") as transaction:
+            transaction.execute("CREATE (:A {id: 1})")
+            transaction.execute("CREATE (:B {id: 3})")
+            transaction.execute(
+                "MATCH (a:A {id: 1}), (b:B {id: 3}) "
+                "CREATE (a)-[:R {confidence: 0.9}]->(b)"
+            )
+        handle.ensure_identity_indexes()
+
+        assert handle.execute(QUERY, {"node_ids": ["1", 1.5, 3]}).rows == (
+            (1, 3, 0.9),
+        )
+    finally:
+        handle.close()
+
+
+def test_v1_without_identity_indexes_resolves_landings_outside_the_probe_frontier(
+    database_without_identity_indexes: object,
+) -> None:
+    assert database_without_identity_indexes.execute(
+        QUERY, {"node_ids": ["a1"]}
+    ).rows == (
+        ("a1", "b1", 0.4),
+        ("a1", "b1", 0.5),
+    )
+
+
 def test_non_list_parameter_preserves_the_public_in_refusal(database: object) -> None:
     with pytest.raises(GrafxPlanError) as raised:
         database.execute(QUERY, {"node_ids": "a1"})
@@ -143,6 +198,58 @@ def test_opposite_landings_share_one_identity_certificate(
     )
     assert calls.count(()) == 1
     assert len(calls) == 5
+
+
+def test_tiny_relationship_frontier_uses_edge_first_scan_before_any_certificate(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = IndexManager.validated_versions_many
+    calls = 0
+
+    def observed(manager, index, keys, snapshot):
+        nonlocal calls
+        calls += 1
+        return original(manager, index, keys, snapshot)
+
+    monkeypatch.setattr(IndexManager, "validated_versions_many", observed)
+    missing = [f"missing-{number}" for number in range(10)]
+
+    assert database.execute(QUERY, {"node_ids": missing}).rows == ()
+    assert calls == 0
+
+
+@pytest.mark.parametrize(("allocated_upper", "expects_seek"), ((12, False), (60, True)))
+def test_cost_selector_crosses_between_twelve_and_sixty_edges_for_eighty_four_keys(
+    database: object,
+    monkeypatch: pytest.MonkeyPatch,
+    allocated_upper: int,
+    expects_seek: bool,
+) -> None:
+    extent_of = HeapStore.extent_of
+    calls = 0
+    original_many = IndexManager.validated_versions_many
+
+    def drifted_page_hint(heap, table):
+        extent = extent_of(heap, table)
+        if extent is not None and table.name == "R":
+            return replace(
+                extent,
+                page_count=0,
+                next_record_id=FIRST_RECORD_ID + allocated_upper,
+            )
+        return extent
+
+    def observed(manager, index, keys, snapshot):
+        nonlocal calls
+        calls += 1
+        return original_many(manager, index, keys, snapshot)
+
+    monkeypatch.setattr(HeapStore, "extent_of", drifted_page_hint)
+    monkeypatch.setattr(IndexManager, "validated_versions_many", observed)
+    missing = [f"missing-{number}" for number in range(42)]
+
+    assert database.execute(QUERY, {"node_ids": missing}).rows == ()
+    assert (calls > 0) is expects_seek
 
 
 @pytest.mark.parametrize(
