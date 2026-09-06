@@ -201,6 +201,58 @@ The accepted Claude batch adds two further internal improvements:
   alternating harness. This is an 8.9–18× local gain but only about 0.5% of the measured Pulse
   transfer, so it is recorded as a safe small removal rather than a headline end-to-end gain.
 
+## KG-LOAD-1 — typed multi-key incident seek
+
+Status: **implemented on the Grafx and Pulse working branches; independent adversarial review in
+progress**.
+
+The scale defect left by the first batch was precise: `RelationshipScan` made the current graph
+page tolerable, but it still read every relationship row of every applicable physical layout.
+Adding `IN` as a filter above that scan would remain `O(E)`. Issuing one scalar equality statement
+per page node was also rejected after a direct reproduction: 5,276 statements took 8.459 s. A
+private exact-index reproduction found the same 810 incident candidates with 5,556 scalar probes
+in 1.407 s, identifying durable per-probe certification rather than edge materialization as the
+next removable cost.
+
+Claude implemented `IndexManager.validated_versions_many` in `1926fcd`. It canonicalizes and
+validates every requested key before opening the view, probes repeated keys once, validates every
+candidate against the heap and transaction snapshot, and returns only after one page-0
+post-certificate for the whole index batch. A generation transition repeats the entire batch or
+refuses; it never publishes a prefix. On disk, 300 primary-key lookups fell from 87.9 ms and 300
+certificates to 27.3 ms and one certificate, a 3.2× component gain.
+
+Grafx `bcfa395` adds the closed `RelationshipIncidentSeek` only for a directed typed one-hop whose
+predicate is exactly `from.pk IN keys OR to.pk IN keys`, with a named relationship and a large/full
+frontier. It resolves page keys through the node PK indexes, unions and deduplicates relationship
+rows from the two automatic endpoint indexes, then resolves the opposite landings in one identity
+index batch per endpoint table when that catalog-v2 capability is active. Missing/stale
+capabilities and owner-dirty tables use the retained canonical plan before any accelerated read;
+after all four endpoint stores are adopted, generation, read or corruption failures propagate
+fail-closed. Parallel edges are preserved because deduplication is by physical `RecordRef`, not by
+endpoint pair.
+
+Pulse `523e759` supplies separate endpoint-type ID batches from the node page it has already read
+and does not issue a physical-layout statement when neither endpoint type occurs on that page.
+Untyped provider rows are conservatively included in both arms, preserving the old result. The
+Python membership check remains a final provider boundary defence.
+
+The naive first integration, which probed all 500 page IDs against every endpoint table, regressed
+the helper to 5.783 s cold and 4.188–4.744 s warm and was not retained. The typed form on the active
+board reduced queried layouts from 70 to 29 and multi-key calls from 261 to 110. It performed 9,723
+key probes, returned the same 810 incident edges with zero failed layouts, and measured 2.184 s on
+the first one-snapshot run and 1.181 s warm. The prior bounded scan helper measured 1.74–2.08 s.
+The promoted claim is therefore both honest and structural: warm latency improved in this sample,
+while the new path's relationship work is bounded by the typed page keys and incident candidates
+instead of growing with every unrelated edge in the graph; the single cold observation is not
+claimed as a gain.
+
+Focused validation is 68 Grafx tests plus 10 Pulse consumer tests and Ruff/diff checks. The Grafx
+set includes batch/scalar snapshot parity, page-0 transition retry/refusal, hostile keys, stale and
+proximity refusal, primary/endpoint index near misses, incoming syntax, parallel relationships,
+identity landing batching, owner read-your-writes and differential comparison with the canonical
+fallback. No format, WAL, commit, OCC, lease, recovery, writer admission or reader-snapshot code
+changed.
+
 Two apparent follow-ups are deliberately not being smuggled into this wave. R-3 cannot skip the
 commit-time tuple encoding solely because `intent.values` retained object identity: the direct
 `TransactionContext.stage_row_insert/update` port does not schema-encode unless byte quota
@@ -222,5 +274,7 @@ the same endpoint visibility and canonical-reference validation as ordinary trav
 | First Grafx implementation batch | complete | `4638204`, 3.6–4.1× relationship-fanout reduction |
 | HNSW replay and structural catalog batch | complete | `477fd45`, `36cea9b`; 230 focused tests and Ruff pass |
 | Statement authority memo | complete | `4786496`; identity/catalog/revision/DDL fences, 39 integrated focused tests and Ruff pass |
+| Exact multi-key index validation | complete | `1926fcd`; one durable certificate per index batch, 3.2× for 300 on-disk PK keys |
+| Typed incident-edge operator | implemented; adversarial review in progress | Grafx `bcfa395`, Pulse `523e759`; 68 + 10 focused tests, same 810 edges, 70→29 queried layouts |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |

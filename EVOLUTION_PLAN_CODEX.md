@@ -3629,6 +3629,32 @@ começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidên
 | 0.0.2 / estabilização do catálogo após read-view sem mudança durável | concluído em `01114bd`; 12 testes focais verdes | `CatalogStore` preserva um catálogo local sujo quando a queda conservadora de frames mudou apenas o epoch e uma leitura não destrutiva prova que a imagem durável completa continua idêntica à base. Catálogo estrangeiro diferente continua no refusal fail-closed e o caso idêntico não chama sincronização redundante de índice. Nenhum trabalho local é descartado; formato, WAL/OCC, durabilidade e multiwriter/multireader intactos. |
 | 0.0.2 / lote de escala 51 — autoridade runtime validada reaproveitada | implementado e auditado; Nexus `hof_97c7f64cc8e141ee8ccba381d15c0d6b` PASS após dois reworks; 412 testes independentes, 1.922 adjacentes e sonda reflexiva verdes | `CatalogIndexDefinition` retém uma única definição runtime pela identidade do descriptor owned. `WalRecord` exato retém prova ligada ao payload somente depois de produzir ou decodificar os próprios bytes; cada hit compara o encode canônico ao payload, impedindo poisoning até com token extraído da closure. Persistido, stand-in, subclass, mutável, corrupto, deepcopy e pickle mantêm validação integral. Relações: construções `14,04→0,02`/relação e decodes repetidos `2→0`; vetor: `911→3` construções e `2→0` decodes/nó; checkpoint continua um decode por registro durável e reduz construções `1,02→0,02`. Hit `~6,1x` mais barato que decode no componente, sem claim end-to-end. O residual de retarget C6 fica encerrado como marginal, evitando alvo móvel. Formato, WAL/OCC, durabilidade e multiwriter/multireader intactos. |
 
+### Rodada 0.0.3 — carregamento visível do Knowledge Graph no Pulse
+
+O ponto de dor reportado pelo usuário está registrado como alvo prioritário e finito em
+`docs/PERFORMANCE_ROUND_0_0_3.md`. O baseline real mostrou `/graph` em `5,894–6,947 s`, `/stats`
+em `12,010 s` e o frontend bloqueando a publicação do grafo por diagnósticos independentes. O
+primeiro lote (`4638204`, Pulse `e2b6053`/`880db68`) reduziu o fanout de relações no engine em
+`3,6–4,1x`, fixou os 70 reads num snapshot, removeu `/stats` da rota crítica visual e eliminou a
+duplicação de requests.
+
+O sublote seguinte fecha a degradação `O(E)` da projeção paginada sem trocar as premissas do banco.
+O primitive multi-chave `1926fcd` usa um único certificado durável por índice; o operador fechado
+`bcfa395` faz seek da união incidente pelos PK/endpoint indexes e valida heap, snapshot, geração e
+landings; o consumidor Pulse `523e759` envia IDs por tipo de endpoint e evita layouts impossíveis.
+Na geração ativa, a mesma página de 500 nós retornou as mesmas 810 relações, zero falhas, reduziu
+layouts consultados `70→29`, chamadas multi-chave `261→110` e mediu `2,184 s` no primeiro run e
+`1,181 s` warm. O claim promovido é redução estrutural para trabalho proporcional às chaves da
+página e arestas incidentes, não promessa baseada em um único cold run. Foram aprovados 68 testes
+Grafx e 10 testes Pulse focais; a revisão adversarial Nexus `hof_aecbb8257cb443c198a50634d2d1af2d`
+permanece em andamento antes do fechamento do sublote.
+
+Esse caminho não altera formato, WAL, recovery, nenhuma das duas OCCs, leases, admissão de writers
+ou snapshots de readers. Tabela/índice ausente, stale ou owner-dirty escolhe o plano canônico antes
+da primeira leitura acelerada; depois da adoção, troca de geração, erro de leitura e corrupção
+continuam fail-closed. A próxima leva somente será ordenada após o novo levantamento do Claude e o
+consenso explícito no Nexus, evitando criar alvos móveis.
+
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
 `DELETE p, p` que recusava o segundo nome do mesmo insert. O primeiro agora falha tipado antes do
