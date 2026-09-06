@@ -14,6 +14,16 @@
 
 ## Estado de execução — 2026-09-03
 
+- **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
+  estão publicados até `ed3ce95`; o memo transacional de resolução de PK entrou em `04aa244` com
+  cercas de transação/snapshot/store/revisão/época/geração, LRU de 4.096 entradas dentro da quota
+  compartilhada e settlement integral. No fan-out sintético de dez layouts ele eliminou 90% das
+  decodificações de PK e mediu `1,19x`, com digest idêntico e 124 testes proporcionais verdes.
+  LADYBUG-M4 foi encerrado como NO-GO: o protótipo indexado mediu `19,7x`, mas necessariamente
+  ocultava corrupção em linha não incidente que o contrato atual exige detectar antes de qualquer
+  `end`; nenhum código semântico nem teste afrouxado foi integrado. A justificativa completa e o
+  handoff Nexus estão em `docs/PERFORMANCE_ROUND_0_0_4.md`.
+
 - **Linha 0.0.3 em execução com foco no carregamento visível do Knowledge Graph do Pulse.** A base
   0.0.2 está congelada em `feature/v0.0.2@acf63c8`; a branch `feature/v0.0.3` e o bump foram
   publicados em `1f2172d`. O baseline real isolou fan-out fixo de 70 consultas de arestas por

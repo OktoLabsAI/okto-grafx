@@ -247,9 +247,31 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    signal was a noisy `1.07x`, so the structural reduction is accepted without a larger timing
    claim. Eight initial query shapes, the two-mode adversarial cache sequence, four killed
    mutants and the accumulated full `tests/query` regression pass.
-6. LADYBUG-M4: indexed `DETACH DELETE` in both directions, including pending transaction rows.
-7. STO-M1: transaction-scoped primary-key resolution memo. First re-profile the Wave 0 overlay;
-   implement only the residual and keep ownership/generation inside the transaction.
+6. LADYBUG-M4: **closed as NO-GO under the current fail-closed contract**. The retained DETACH
+   guarantee requires a corrupt *non-incident* relationship row to refuse the statement before
+   any row is ended. Such corruption can be a property tag inside a checksum-valid page, so it
+   is observable only by decoding every visible relationship row; an endpoint index cannot
+   validate what it does not read. Claude built the indexed variant outside the branch and
+   proved the trade-off: on 14,044 visible relationship rows it reduced three scans to four
+   probes and improved the operation from median 226 ms to 12 ms (`19.7x`), with the same
+   successful-state digest, but failed exactly the two pinned non-incident-corruption cases.
+   No semantic code or weakened test was integrated. Handoff
+   `hof_87ab57fb01084030bea3fae7be43c239` records the evidence. Reopening requires an explicit
+   policy change; cheaper full-payload structural validation may be considered only as a codec
+   optimization that retains the same refusal.
+7. STO-M1: **implemented and integrated** in `04aa244`. Node primary-key groups repeatedly
+   resolved by the relationship layouts of one transaction are retained only for the exact
+   transaction object, intent list, snapshot object, native manager/store identity, registry
+   revision, heap derived epoch and private durable index generation. Every cache hit still
+   opens the normal pre/post page-0 certificate and companion heap view; a generation change
+   revalidates every requested key, and a heap/registry transition during a cached read forces
+   one uncached read. Dirty tables, custom/overridden managers and any incomplete authority keep
+   the canonical path. The LRU is capped at 4,096 entries per transaction inside the existing
+   32 MiB decoded-landing budget; admission precedes mutation, capacity changes cost only, and
+   commit/rollback/transaction-id replacement returns every charge. In an alternating
+   ten-layout workload, PK decodes fell from 1,200 to 120 (`-90%`) and median fan-out time from
+   229 ms to 192 ms (`1.19x`), with identical result digests. The focused/proportional 124-test
+   slice, Ruff, compileall and diff-check pass.
 
 ### Wave 3 — small residuals and one re-profile
 
@@ -307,3 +329,9 @@ exercises both arrival orders and mixed repetitions. The first accumulated query
 second interaction with bounded spill; `d1b775f` added a private spill tag for the projection
 sentinel and updated scan-consumption instrumentation. The failing block then passed, followed by
 the complete query regression at 100%.
+
+The LADYBUG-M4 handoff is `hof_87ab57fb01084030bea3fae7be43c239`. Its adversarial result was
+accepted as a NO-GO, not as an implementation: the measured `19.7x` indexed path necessarily
+removed a currently pinned non-incident corruption refusal, so its patch and test relaxation
+were excluded. STO-M1 then proceeded on the canonical branch and removed the independently
+measured repeated-PK residual without changing the fail-closed contract.
