@@ -203,10 +203,15 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    3,142-byte Pulse-shaped row improved about `1.17x`; the end-to-end post-WRITE-1 write signal
    was neutral within noise, so no larger claim is made. The full `tests/storage_core` slice plus
    WRITE-1 tests passes.
-2. NATVER-3 only after a discriminating CRC microbenchmark. **Discriminant completed:** against
-   the active `google_crc32c` provider, one collapsed wrapper preserved the full acceptance-corpus
-   answers and measured 2.05x–2.54x faster per call for 32 B, 256 B, 4 KiB and 16,380 B inputs
-   across eight alternating rounds. Implementation remains ordered after the Wave 1 checkpoint.
+2. NATVER-3 only after a discriminating CRC microbenchmark. **Implemented and integrated** in
+   `38d2785` after the discriminant: only the already corpus-proved `google_crc32c.extend` and
+   `crc32c.crc32c` identities receive a collapsed adapter/call/result-check frame. Injected,
+   stale and runtime-verified providers retain the original path; late bool, oversized-int and
+   provider-exception mutants retain their typed refusals. The implemented path reproduced the
+   same answers and measured `1.35x`, `1.71x`, `1.73x` and `1.85x` per call at 32 B, 256 B,
+   4 KiB and 16,380 B. The corrected transfer estimate remains about 0.2%, so this is explicitly
+   not reported as a material endpoint gain. The checksum, page-codec, WAL-format, ledger and
+   bootstrap slice passes.
 3. CKPTCERT-1 with heap and index corruption injected independently.
 4. One generated decode plan for KGRUN-1/LADYBUG-M1/NATVER-1; it must pass a 10,000-case hostile
    corpus with the same exception class, field and offset as the canonical decoder.
