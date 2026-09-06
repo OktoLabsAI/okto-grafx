@@ -2715,6 +2715,31 @@ class _PreparedPlanKey:
     version: int = _PREPARED_PLAN_VERSION
 
 
+def _dirty_primary_key_seek_definition(definition: object, catalog: Catalog) -> bool:
+    """Say whether one dirty-table index has the exact overlay implemented by IndexSeek.
+
+    This intentionally recognizes only Grafx's automatic exact primary-key artifact.  A custom
+    exact index over the same column may share its bytes, but it does not share the frozen name
+    and ownership contract used by the transaction-local primary-key fold.  Keeping the proof
+    this narrow makes an unfamiliar or speculative artifact take the established scan fallback.
+    """
+    if not isinstance(definition, IndexDefinition):
+        return False
+    if definition.visibility is not IndexVisibility.EXACT:
+        return False
+    if not catalog.has_table(definition.table_name):
+        return False
+    table = catalog.table(definition.table_name)
+    if (
+        table.kind != "node"
+        or table.table_id != definition.table_id
+        or table.primary_key is None
+        or definition.name != primary_key_index_name(table.name)
+    ):
+        return False
+    return definition.positions == (table.column_index(table.primary_key),)
+
+
 def _catalog_active_index(
     manager: object,
     name: str,
@@ -3288,7 +3313,15 @@ class QueryEngine:
         without_indexes_for: frozenset[int] = frozenset(),
         authority: _IndexAuthorityProjection | None = None,
     ) -> tuple[object, ...]:
-        """Return usable index definitions, withholding tables that need an owner overlay."""
+        """Return usable index definitions, retaining safe owner-overlay primary seeks.
+
+        A dirty table used to lose every index for the rest of its transaction.  That is safe,
+        but turns the common ``create nodes, then connect them`` ingestion shape into one full
+        node scan per endpoint.  The automatic primary-key index is different from a general
+        secondary index: :func:`_index_seek` can overlay the transaction's incrementally folded
+        primary-key ownership map on its durable candidates.  Keep only that exact access path
+        for a dirty table; every other index still falls back to the canonical scan.
+        """
         if self._indexes is None:
             return ()
         # A STALE index is withheld from the planner, and that is a correctness rule rather than
@@ -3308,9 +3341,9 @@ class QueryEngine:
             usable: list[object] = []
             for index in indexes:
                 definition = index.definition
-                if (
-                    getattr(index, "stale", False)
-                    or definition.table_id in without_indexes_for
+                if getattr(index, "stale", False) or (
+                    definition.table_id in without_indexes_for
+                    and not _dirty_primary_key_seek_definition(definition, catalog)
                 ):
                     continue
                 if not catalog.has_table(definition.table_name):
@@ -3331,7 +3364,10 @@ class QueryEngine:
             index.definition
             for index in indexes
             if not getattr(index, "stale", False)
-            and index.definition.table_id not in without_indexes_for
+            and (
+                index.definition.table_id not in without_indexes_for
+                or _dirty_primary_key_seek_definition(index.definition, catalog)
+            )
             and (
                 (
                     table := tables.get(
@@ -5348,7 +5384,30 @@ def _index_seek(
         and node.index == primary_key_index_name(node.table.name)
     )
     ended = _ended_by_this_transaction(context)
-    changed, inserted = _transaction_row_view(context, node.table, include_held=False)
+    logical_overlay: (
+        tuple[
+            dict[object, tuple[Value, ...] | None],
+            list[tuple[object, tuple[Value, ...]]],
+        ]
+        | None
+    ) = None
+
+    def scan_overlay() -> tuple[
+        dict[object, tuple[Value, ...] | None],
+        list[tuple[object, tuple[Value, ...]]],
+    ]:
+        nonlocal logical_overlay
+        if logical_overlay is None:
+            logical_overlay = _transaction_row_view(
+                context, node.table, include_held=False
+            )
+        return logical_overlay
+
+    primary_state = (
+        _transaction_primary_key_state(engine, context, node.table, primary_position)
+        if reuse_validated_version and primary_position is not None
+        else None
+    )
     single_source = isinstance(node.child, SingleRow)
     selected_index: object | None = None
     index_resolved = False
@@ -5367,6 +5426,7 @@ def _index_seek(
             # (INT64/DOUBLE, signed zero and nested numeric values), so a single hash probe could
             # otherwise omit true rows.  Filter here because the planner correctly consumed the
             # equality terms when it chose IndexSeek.
+            changed, inserted = scan_overlay()
             for candidate in _logical_node_rows_for_input(
                 engine,
                 table=node.table,
@@ -5398,6 +5458,39 @@ def _index_seek(
         for position, value in zip(positions, values):
             template[position] = value
         key = index_key(template, positions)
+        statement_primary: _PrimaryKeyStatementMemo | None = None
+        overlay_candidates: tuple[tuple[object, _PrimaryKeyOutcome], ...] = ()
+        if primary_state is not None and primary_position is not None:
+            # Refresh the held-row suffix per driving row.  An UNWIND/SET statement can change
+            # this same table while the seek pipeline is still producing input rows.
+            statement_primary = _statement_primary_key_state(
+                context, node.table, primary_position, primary_state
+            )
+            selected = _primary_key_seek_candidates(
+                primary_state, statement_primary, values[0]
+            )
+            if selected is None:
+                # A legacy insert without a pending identity cannot be reconstructed from the
+                # incremental ownership fold.  Preserve its established duck-typed semantics by
+                # using the complete logical scan for this one probe.
+                changed, inserted = scan_overlay()
+                for candidate in _logical_node_rows_for_input(
+                    engine,
+                    table=node.table,
+                    variable=node.variable,
+                    input_row=row,
+                    context=context,
+                    snapshot=snapshot,
+                    changed=changed,
+                    inserted=inserted,
+                    single_source=single_source,
+                ):
+                    binding = candidate.bindings[node.variable]
+                    if _equal(binding.version.values[primary_position], values[0]):
+                        yield candidate
+                continue
+            overlay_candidates = selected
+        yielded: set[object] = set()
         for ref, version in _index_lookup_versions(
             engine,
             manager,
@@ -5410,6 +5503,14 @@ def _index_seek(
         ):
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
+            if primary_state is not None and statement_primary is not None:
+                replaced, outcome = _primary_key_current_outcome(
+                    primary_state, statement_primary, ref
+                )
+                if replaced:
+                    if outcome is None or outcome.operation is RowOperation.DELETE:
+                        continue
+                    version = replace(version, values=outcome.values)
             if not all(
                 _equal(version.values[position], value)
                 for position, value in zip(positions, values)
@@ -5422,6 +5523,29 @@ def _index_seek(
             bindings[node.variable] = RowBinding(
                 variable=node.variable, table=node.table, ref=ref, version=version
             )
+            context.count("rows_seeked")
+            yielded.add(ref)
+            yield _Row(bindings=bindings)
+        for reference, outcome in overlay_candidates:
+            if reference in yielded or outcome.operation is RowOperation.DELETE:
+                continue
+            if isinstance(reference, PendingRowRef):
+                binding = _pending_binding(
+                    node.variable,
+                    node.table,
+                    outcome.values,
+                    reference=reference,
+                )
+            else:
+                version = replace(engine.heap.read(reference), values=outcome.values)
+                binding = RowBinding(
+                    variable=node.variable,
+                    table=node.table,
+                    ref=reference,
+                    version=version,
+                )
+            bindings = {} if single_source else dict(row.bindings)
+            bindings[node.variable] = binding
             context.count("rows_seeked")
             yield _Row(bindings=bindings)
 
@@ -6225,9 +6349,7 @@ def _relationship_incident_seek(
     # integer arithmetic so the boundary is exact and deterministic on every platform.  This
     # decision happens before validated_versions_many opens the first durable index certificate.
     extent = engine.heap.extent_of(node.table)
-    allocated_upper = (
-        0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
-    )
+    allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
     probe_frontier = len(from_keys) + len(to_keys)
     if allocated_upper * 2 <= probe_frontier:
         yield from engine._rows(node.fallback, context)
@@ -6321,7 +6443,9 @@ def _relationship_incident_seek(
                         field="index_candidate",
                     )
 
-    ordered = sorted(candidates.items(), key=lambda item: cast(RecordRef, item[0]).encode())
+    ordered = sorted(
+        candidates.items(), key=lambda item: cast(RecordRef, item[0]).encode()
+    )
     endpoint_rows: list[tuple[object, HeapVersion, RecordId, RecordId]] = []
     source_ids: set[RecordId] = set()
     target_ids: set[RecordId] = set()
@@ -6348,7 +6472,9 @@ def _relationship_incident_seek(
         """Resolve the opposite landings through one identity-index certificate when present."""
 
         resolved = dict(cached)
-        missing = tuple(record_id for record_id in record_ids if record_id not in resolved)
+        missing = tuple(
+            record_id for record_id in record_ids if record_id not in resolved
+        )
         if not missing:
             return resolved, True
         identity_index = _endpoint_identity_index(engine, context, table)
@@ -10702,6 +10828,71 @@ def _statement_primary_key_state(
         )
     memo.state.cursor = len(held)
     return memo
+
+
+def _primary_key_current_outcome(
+    base: _PrimaryKeyFoldState,
+    statement: _PrimaryKeyStatementMemo,
+    reference: object,
+) -> tuple[bool, _PrimaryKeyOutcome | None]:
+    """Return the owner-visible replacement for one durable index hit, when any."""
+    if reference in statement.changed_refs:
+        return True, statement.state.outcomes.get(reference)
+    if reference in base.outcomes:
+        return True, base.outcomes.get(reference)
+    return False, None
+
+
+def _primary_key_state_owners(
+    state: _PrimaryKeyFoldState, key: Value
+) -> Iterator[tuple[object, Value]]:
+    """Yield owners filed under one equality key without walking unrelated transaction rows."""
+    identity = _primary_key_identity(key)
+    if identity is None:
+        for owner, observed in state.mutable_key_owners.items():
+            if _equal(observed, key):
+                yield owner, observed
+        return
+    for owner, observed in state.key_owners.get(identity, {}).items():
+        if _equal(observed, key):
+            yield owner, observed
+
+
+def _primary_key_seek_candidates(
+    base: _PrimaryKeyFoldState,
+    statement: _PrimaryKeyStatementMemo,
+    key: Value,
+) -> tuple[tuple[object, _PrimaryKeyOutcome], ...] | None:
+    """Return transaction-local rows under ``key``, or decline an unidentifiable legacy row.
+
+    The base fold is incremental across statements and the statement fold is incremental across
+    held rows.  Looking up their key buckets is therefore proportional to the number of matching
+    transaction-local owners (one for a valid primary key), rather than to all nodes created so
+    far.  A current-statement replacement shadows the corresponding base owner exactly as the
+    canonical row reducer does.
+    """
+    selected: list[tuple[object, _PrimaryKeyOutcome]] = []
+
+    def add(state: _PrimaryKeyFoldState, *, exclude: set[object]) -> bool:
+        for owner, _observed in _primary_key_state_owners(state, key):
+            if owner in exclude:
+                continue
+            if isinstance(owner, _PrimaryKeyLegacyOwner):
+                return False
+            outcome = state.outcomes.get(owner)
+            if outcome is None:
+                # Only legacy reference-less inserts lack an outcome.  Keep the fallback closed
+                # for foreign transaction collaborators that reproduce that shape differently.
+                return False
+            if outcome.operation is not RowOperation.DELETE:
+                selected.append((owner, outcome))
+        return True
+
+    if not add(base, exclude=statement.changed_refs):
+        return None
+    if not add(statement.state, exclude=set()):
+        return None
+    return tuple(selected)
 
 
 def _primary_key_conflicts(
