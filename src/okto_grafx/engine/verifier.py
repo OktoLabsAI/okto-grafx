@@ -1285,7 +1285,6 @@ class Verifier:
         """
         if identity in shared.seeded:
             return
-        shared.seeded.add(identity)
         if shared.catalog_failure is not None:
             return
         definition = getattr(index, "definition", None)
@@ -1304,6 +1303,11 @@ class Verifier:
             versions = self._canonical_versions(identity, table, shared)
         except GrafxError:
             return
+        # Publish the seeded marker only after this particular index proved that it exposes a
+        # valid built-in definition and the heap/catalog pair agreed.  An earlier malformed or
+        # non-covering index for the same table must not suppress the optimization for a later
+        # valid one; all failure paths above remain canonical fallbacks.
+        shared.seeded.add(identity)
         resolved_refs.update(
             ref.encode() for ref, _version in versions if type(ref) is RecordRef
         )

@@ -212,7 +212,17 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    4 KiB and 16,380 B. The corrected transfer estimate remains about 0.2%, so this is explicitly
    not reported as a material endpoint gain. The checksum, page-codec, WAL-format, ledger and
    bootstrap slice passes.
-3. CKPTCERT-1 with heap and index corruption injected independently.
+3. CKPTCERT-1 with heap and index corruption injected independently. **Implemented and
+   integrated** in `577bdb0`: the one canonical, call-local table scan now seeds exact resolved
+   `RecordRef` identities for the index-entry pass only when the built-in heap's catalog agrees
+   structurally with the same table definition. A scan failure seeds nothing and remains reported
+   once per affected index while entry failures are still resolved and reported independently;
+   custom collaborators keep their former protocol. The adversarial integration review also
+   delays publication of the seeded marker until a valid covering index and successful scan are
+   proved, so an earlier malformed/non-covering index cannot suppress the optimization. On 4,600
+   rows and 28 indexes, six paired rounds improved `verify(all)` from about 0.98 s to 0.575 s
+   (`1.71x`, all rounds `1.70x`--`1.87x`) with identical reports. Heap-only, index-only and combined
+   corruption retained their classifications/digests; 80 focal and 547 proportional tests pass.
 4. One generated decode plan for KGRUN-1/LADYBUG-M1/NATVER-1; it must pass a 10,000-case hostile
    corpus with the same exception class, field and offset as the canonical decoder.
 5. KGRUN-3: project only retained rows after the bounded top-k/order stage.
