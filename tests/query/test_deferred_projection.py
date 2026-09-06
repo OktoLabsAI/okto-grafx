@@ -5,13 +5,27 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import okto_grafx
 import okto_grafx.engine.query_engine as query_engine_module
 from okto_grafx.domain.errors import GrafxError
-from okto_grafx.engine.query_engine import RowBinding, _top_rows_from
+from okto_grafx.domain.query.ast import (
+    Literal,
+    Property,
+    ReturnItem,
+    SortItem,
+    Variable,
+)
+from okto_grafx.domain.query.plan import ProjectRows, SingleRow, SortRows
+from okto_grafx.engine.query_engine import (
+    RowBinding,
+    _DeferredProjection,
+    _Row,
+    _top_rows_from,
+)
 
 PAGE = (
     "MATCH (n) "
@@ -32,7 +46,10 @@ STATEMENTS: tuple[tuple[str, dict[str, object]], ...] = (
         "MATCH (n) RETURN n.id, n.created_at AS t ORDER BY t + 1 ASC, n.id LIMIT 4",
         {},
     ),
-    ("MATCH (n:Doc) RETURN n.id, n.score, $tag AS tag ORDER BY n.score DESC LIMIT 3", {"tag": 7}),
+    (
+        "MATCH (n:Doc) RETURN n.id, n.score, $tag AS tag ORDER BY n.score DESC LIMIT 3",
+        {"tag": 7},
+    ),
     ("MATCH (n) RETURN DISTINCT n.layer ORDER BY n.layer LIMIT 2", {}),
     ("MATCH (n) RETURN n.id, n.title ORDER BY n.created_at", {}),
     ("MATCH (n:Doc) RETURN n.id, n.title ORDER BY n.created_at DESC LIMIT 3", {}),
@@ -41,7 +58,10 @@ STATEMENTS: tuple[tuple[str, dict[str, object]], ...] = (
         "ORDER BY total DESC LIMIT 1",
         {},
     ),
-    ("MATCH (n:Doc) RETURN n.id, 10.0 / n.score AS inverse ORDER BY n.created_at DESC LIMIT 3", {}),
+    (
+        "MATCH (n:Doc) RETURN n.id, 10.0 / n.score AS inverse ORDER BY n.created_at DESC LIMIT 3",
+        {},
+    ),
     ("MATCH (n:Doc) RETURN n.id, n.nope ORDER BY n.created_at LIMIT 2", {}),
     ("MATCH (n) RETURN n.id, n.nope ORDER BY n.created_at LIMIT 2", {}),
     (
@@ -91,7 +111,11 @@ def database(tmp_path: Path) -> Iterator[object]:
         for index in range(12):
             transaction.execute(
                 "CREATE (:Note {id: $id, title: $title, created_at: $at})",
-                {"id": f"n-{index:02d}", "title": f"note {index}", "at": 2 + index // 2},
+                {
+                    "id": f"n-{index:02d}",
+                    "title": f"note {index}",
+                    "at": 2 + index // 2,
+                },
             )
     try:
         yield handle
@@ -133,7 +157,9 @@ def test_every_shape_answers_exactly_as_the_canonical_projection(
     deferred = [_outcome(database, text, parameters) for text, parameters in STATEMENTS]
     with monkeypatch.context() as scoped:
         _canonical(scoped)
-        canonical = [_outcome(database, text, parameters) for text, parameters in STATEMENTS]
+        canonical = [
+            _outcome(database, text, parameters) for text, parameters in STATEMENTS
+        ]
     for (text, parameters), left, right in zip(STATEMENTS, deferred, canonical):
         assert left == right, (text, parameters)
     # The corpus is not trivially green: it carries real rows and real refusals.
@@ -210,6 +236,62 @@ def test_a_map_subject_and_a_missing_column_keep_their_refusals_on_discarded_row
     assert _outcome(database, polymorphic, {})[0] == "linhas"
 
 
+def test_the_proof_of_a_table_is_never_borrowed_across_the_polymorphic_flag(
+    database: object,
+) -> None:
+    """The same variable and table may arrive polymorphic and then typed."""
+    engine = database._queries  # type: ignore[attr-defined]
+    table = engine.catalog.catalog.table("Doc")
+    ref, version = next(iter(engine.heap.scan_all(table)))
+    reads_nope = ProjectRows(
+        child=SingleRow(),
+        items=(
+            ReturnItem(expression=Property(subject=Variable(name="n"), key="nope")),
+        ),
+    )
+    sort = SortRows(
+        child=reads_nope,
+        keys=(
+            SortItem(expression=Property(subject=Variable(name="n"), key="created_at")),
+        ),
+        retained_limit=Literal(value=1),
+    )
+    context = SimpleNamespace(coalesce_types={})
+
+    def row(polymorphic: bool) -> _Row:
+        binding = RowBinding(
+            variable="n",
+            table=table,
+            ref=ref,
+            version=version,
+            polymorphic=polymorphic,
+        )
+        return _Row(bindings={"n": binding})
+
+    plan = _DeferredProjection(reads_nope, sort, context)  # type: ignore[arg-type]
+    assert plan.eager == ()
+    for polymorphic in (True, False, True):
+        assert plan.proven(row(polymorphic)) is polymorphic
+
+    fresh = _DeferredProjection(reads_nope, sort, context)  # type: ignore[arg-type]
+    for polymorphic in (False, True, False):
+        assert fresh.proven(row(polymorphic)) is polymorphic
+
+    reads_title = ProjectRows(
+        child=reads_nope.child,
+        items=(
+            ReturnItem(expression=Property(subject=Variable(name="n"), key="title")),
+        ),
+    )
+    declared = _DeferredProjection(reads_title, sort, context)  # type: ignore[arg-type]
+    for polymorphic in (True, False, True):
+        assert declared.proven(row(polymorphic))
+
+    mixed = _DeferredProjection(reads_nope, sort, context)  # type: ignore[arg-type]
+    for polymorphic in (True, False, True, True, False, False, True):
+        assert mixed.proven(row(polymorphic)) is polymorphic
+
+
 def test_the_projection_is_admitted_to_the_row_budget_once_per_scanned_row(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -242,7 +324,9 @@ def test_a_refusal_on_the_first_row_still_precedes_the_row_budget(
     Had the undeclared column of a labelled match been deferred, the scan would have delivered
     its sixth row -- and exceeded max_intermediate_rows -- before any projection refused.
     """
-    handle = okto_grafx.connect(tmp_path / "budget", page_size=4096, max_intermediate_rows=5)
+    handle = okto_grafx.connect(
+        tmp_path / "budget", page_size=4096, max_intermediate_rows=5
+    )
     try:
         with handle.begin("write") as transaction:
             transaction.execute(

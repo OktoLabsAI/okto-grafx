@@ -114,6 +114,7 @@ from okto_grafx.domain.model.schema import (
     ColumnDef,
     EmbeddingSpaceDef,
     TableDef,
+    _UNMATERIALIZED_COLUMN,
     _encode_tuple_with_proof,
     _is_unmaterialized_column,
     encode_tuple,
@@ -5392,8 +5393,10 @@ def _node_scan(
     snapshot = context.snapshot
     changed, inserted = _transaction_row_view(context, node.table, include_held=False)
     single_source = isinstance(node.child, SingleRow)
-    projection = getattr(context, "node_scan_projections", {}).get(id(node), {}).get(
-        node.table.table_id
+    projection = (
+        getattr(context, "node_scan_projections", {})
+        .get(id(node), {})
+        .get(node.table.table_id)
     )
     for row in engine._rows(node.child, context):
         yield from _logical_node_rows_for_input(
@@ -5807,11 +5810,13 @@ def _closed_node_scan_projections(
             expressions.append(planned.predicate)  # type: ignore[attr-defined]
         elif kind is ProjectRows:
             expressions.extend(
-                item.expression for item in planned.items  # type: ignore[attr-defined]
+                item.expression
+                for item in planned.items  # type: ignore[attr-defined]
             )
         elif kind is SortRows:
             expressions.extend(
-                item.expression for item in planned.keys  # type: ignore[attr-defined]
+                item.expression
+                for item in planned.keys  # type: ignore[attr-defined]
             )
             if planned.retained_limit is not None:  # type: ignore[attr-defined]
                 expressions.append(planned.retained_limit)  # type: ignore[attr-defined]
@@ -7075,7 +7080,9 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
     fallbacks = 0
     instrumented: dict[int, bool] = {}
 
-    def shared(node: Expression, function: Callable[..., object]) -> Callable[..., object]:
+    def shared(
+        node: Expression, function: Callable[..., object]
+    ) -> Callable[..., object]:
         kind = type(node)
         if kind is Literal or kind is Parameter or kind is Variable:
             return function
@@ -7203,7 +7210,10 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                     def exclusive(row: _Row, ctx: _Context, memo: object) -> object:
                         left_value = left(row, ctx, memo)
                         right_value = right(row, ctx, memo)
-                        left_truth, right_truth = _truth(left_value), _truth(right_value)
+                        left_truth, right_truth = (
+                            _truth(left_value),
+                            _truth(right_value),
+                        )
                         if left_truth is None or right_truth is None:
                             return None
                         return left_truth != right_truth
@@ -7231,7 +7241,9 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                     return inequality
 
                 def ordering(row: _Row, ctx: _Context, memo: object) -> object:
-                    return _ordered(operator, left(row, ctx, memo), right(row, ctx, memo))
+                    return _ordered(
+                        operator, left(row, ctx, memo), right(row, ctx, memo)
+                    )
 
                 return ordering
         if (
@@ -8055,6 +8067,7 @@ _SPILL_VALUE_MAP = b"OGQM\x01"
 _SPILL_VALUE_PATH = b"OGQH\x01"
 _SPILL_VALUE_BINDING = b"OGQB\x01"
 _SPILL_VALUE_PENDING = b"OGQR\x01"
+_SPILL_VALUE_UNMATERIALIZED = b"OGQU\x01"
 _AGGREGATE_GROUP_OVERHEAD = 64
 _AGGREGATE_SLOT_OVERHEAD = 64
 _AGGREGATE_VALUE_OVERHEAD = 16
@@ -8607,6 +8620,11 @@ class _SpillRowCodec:
         return token
 
     def _detach(self, value: object) -> Value:
+        if _is_unmaterialized_column(value):
+            # A projected binding can cross a blocking operator's temporary spill. Preserve its
+            # closed-plan proof as an engine-private tag; never coerce the sentinel into a public
+            # stored value and never materialise a column the scan deliberately omitted.
+            return (_SPILL_VALUE_UNMATERIALIZED,)
         if isinstance(value, RowBinding):
             reference: Value
             if isinstance(value.ref, PendingRowRef):
@@ -8665,6 +8683,8 @@ class _SpillRowCodec:
             return self._restore_binding(value)
         if tag == _SPILL_VALUE_PENDING:
             return self._restore_pending(value)
+        if tag == _SPILL_VALUE_UNMATERIALIZED and len(value) == 1:
+            return _UNMATERIALIZED_COLUMN
         if tag == _SPILL_VALUE_SCALAR and len(value) == 2:
             kind = value_type_of(value[1])
             if kind not in (ValueType.LIST, ValueType.MAP):
@@ -10128,7 +10148,10 @@ class _DeferredProjection:
         self.requirements = tuple(
             (variable, tuple(keys)) for variable, keys in requirements.items()
         )
-        self.proven_tables: dict[str, TableDef] = {}
+        # Missing properties are total only for a polymorphic binding.  The same table can
+        # legitimately reach an internal producer in both modes, so the proof cache must retain
+        # the mode as well as the immutable table identity.
+        self.proven_tables: dict[str, tuple[TableDef, bool]] = {}
         self.deferred_any = len(eager) < len(items)
 
     def proven(self, row: _Row) -> bool:
@@ -10144,14 +10167,19 @@ class _DeferredProjection:
             if type(binding) is not RowBinding:
                 return False
             table = binding.table
-            if table is proven_tables.get(variable):
+            cached = proven_tables.get(variable)
+            if (
+                cached is not None
+                and cached[0] is table
+                and cached[1] is binding.polymorphic
+            ):
                 continue
             if not binding.polymorphic:
                 positions = table.column_positions
                 for key in keys:
                     if key not in positions:
                         return False
-            proven_tables[variable] = table
+            proven_tables[variable] = (table, binding.polymorphic)
         return True
 
 
@@ -10705,9 +10733,7 @@ def _write_pattern(
     """Materialise and stage the nodes and edges one written pattern names."""
     merging = isinstance(node, MergePattern)
     bindings = dict(row.bindings)
-    staged: list[
-        tuple[TableDef, tuple[Value, ...], int | None, int, object]
-    ] = []
+    staged: list[tuple[TableDef, tuple[Value, ...], int | None, int, object]] = []
     fresh: set[str] = set()
     for written in node.nodes:
         if written.variable is None:
@@ -12678,9 +12704,7 @@ def _materialise_row_with_proof(
     # and every column the caller actually wrote is checked here exactly as before.
     validatable = _validatable_row(table, materialised)
     if validatable is materialised:
-        _payload, encoding_proof = _encode_tuple_with_proof(
-            table, materialised
-        )
+        _payload, encoding_proof = _encode_tuple_with_proof(table, materialised)
         return materialised, encoding_proof
     encode_tuple(table, validatable)
     return materialised, None
