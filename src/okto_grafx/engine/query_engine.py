@@ -284,6 +284,10 @@ _PARSE_CACHE_MAX_ENTRIES: int = 256
 # One statement-authority memo per retained parsed statement; the parse cache bounds the
 # statements, and this bound keeps the memo from outliving that cache by more than its size.
 _STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES: int = _PARSE_CACHE_MAX_ENTRIES
+# Elements every IN parameter list of one statement may contribute, in total, to hashed
+# membership memos.  Beyond the ceiling the linear comparison stays the answer: the memo is an
+# accelerator over the same _freeze keys, never a second semantics.
+_IN_LIST_MEMO_MAX_TOTAL_ELEMENTS: int = 65_536
 _PLAN_CACHE_MAX_ENTRIES: int = 128
 _PREPARED_PLAN_VERSION: int = 1
 
@@ -1100,6 +1104,23 @@ class _PrimaryKeyStatementMemo:
     changed_refs: set[object] = field(default_factory=set)
 
 
+@dataclass(slots=True, frozen=True)
+class _InListMemo:
+    """Hashed picture of one detached IN parameter list, built at most once per statement.
+
+    Only an exact tuple whose elements are exact ``str``, exact ``bytes`` or ``None`` is
+    memoised: for those kinds ``_equal`` is nothing but ``_freeze`` key equality, so a set of
+    the same keys answers exactly what the linear walk answers.  Numbers stay on the walk
+    because ``1 = 1.0`` crosses Python types, and every other kind stays there too.  ``values``
+    is the detached parameter object itself: an evaluation that meets a different object proves
+    the memo stale instead of trusting the name.
+    """
+
+    values: tuple[Value, ...]
+    keys: frozenset[object]
+    has_null: bool
+
+
 @dataclass(slots=True)
 class _Context:
     """What every operator of one running statement needs."""
@@ -1152,6 +1173,10 @@ class _Context:
     # their source is a NodeScan. The set is derived once from the immutable physical plan; every
     # blocking or semantically wider shape is absent and keeps the canonical grouped scan.
     short_circuit_traversals: frozenset[int] = frozenset()
+    # Hashed IN parameter lists keyed by parameter name.  ``None`` records a declined build, so
+    # the linear walk is chosen once for that parameter rather than re-examined on every row.
+    in_list_memos: dict[str, _InListMemo | None] = field(default_factory=dict)
+    in_list_memo_elements: int = 0
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -11838,6 +11863,10 @@ def _binary(expression: BinaryOperation, row: _Row, context: _Context) -> object
     if operator in ("<", "<=", ">", ">="):
         return _ordered(operator, left, right)
     if operator == "IN":
+        if isinstance(expression.right, Parameter):
+            memo = _in_list_memo(expression.right.name, right, context)
+            if memo is not None:
+                return _memo_membership(left, memo)
         return _membership(left, right)
     if operator in ("STARTS WITH", "ENDS WITH", "CONTAINS"):
         return _text(operator, left, right)
@@ -11891,17 +11920,69 @@ def _membership(left: object, right: object) -> object:
         )
     if left is None:
         return None
-    found = False
     unknown = False
     for element in right:
         if element is None:
             unknown = True
             continue
         if _equal(left, element):
-            found = True
+            # A match decides the answer whatever follows: a later null only matters when
+            # nothing matched, so the walk ends here rather than comparing the rest.
+            return True
+    return None if unknown else False
+
+
+def _in_list_memo(name: str, value: object, context: _Context) -> _InListMemo | None:
+    """Return the statement's hashed picture of one IN parameter, building it at most once."""
+    memos = context.in_list_memos
+    if name in memos:
+        memo = memos[name]
+        if memo is None or memo.values is not value:
+            return None
+        return memo
+    memo = _build_in_list_memo(value, context)
+    memos[name] = memo
+    return memo
+
+
+def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
+    """Hash one detached list of strings, bytes and nulls, or decline to the linear walk.
+
+    Declining is silent and final for the statement: an exact list (not the detached tuple the
+    facade hands over), any element of another kind, or a list that would carry the statement
+    past its memo ceiling all keep the linear comparison, which is the same answer.
+    """
+    if type(value) is not tuple:
+        return None
+    if len(value) > _IN_LIST_MEMO_MAX_TOTAL_ELEMENTS - context.in_list_memo_elements:
+        return None
+    keys: set[object] = set()
+    has_null = False
+    for element in value:
+        kind = type(element)
+        if element is None:
+            has_null = True
+        elif kind is str or kind is bytes:
+            keys.add(_freeze(element))
+        else:
+            return None
+    context.in_list_memo_elements += len(value)
+    return _InListMemo(values=value, keys=frozenset(keys), has_null=has_null)
+
+
+def _memo_membership(left: object, memo: _InListMemo) -> object:
+    """Answer IN over a hashed list exactly as the linear walk over the same list would."""
+    if left is None:
+        return None
+    try:
+        found = _freeze(left) in memo.keys
+    except TypeError:
+        # A left value whose frozen form cannot be hashed is compared the long way; the memo
+        # never changes an answer, it only skips comparisons it can prove unnecessary.
+        return _membership(left, memo.values)
     if found:
         return True
-    return None if unknown else False
+    return None if memo.has_null else False
 
 
 def _text(operator: str, left: object, right: object) -> object:
@@ -13789,6 +13870,11 @@ def _equal(left: object, right: object) -> bool:
     # refused by that exclusion; a boolean against anything else carries a different kind tag in
     # _freeze. Proved over every pair of a spread of values: removing this line changed no
     # answer in 576 comparisons.
+    kind = type(left)
+    if kind is type(right) and (kind is str or kind is bytes):
+        # One exact built-in kind on both sides: _freeze would tag both identically and compare
+        # the payloads, so the payload comparison is the same answer without two tuples.
+        return left == right
     if _numbers(left, right):
         return float(left) == float(right)
     if isinstance(left, RowBinding) or isinstance(right, RowBinding):
