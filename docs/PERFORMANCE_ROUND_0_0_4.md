@@ -134,7 +134,10 @@ Engine/query lane:
    norm only after a successful score and binds it to the immutable backing object of that node
    generation. A paired 384-dimensional/300-candidate scorer microbenchmark measured 2.00x
    (`0.1544 s` to `0.0771 s`, 50.1% less scorer time); the workload-level estimate remains ~8%.
-6. VECTOR-6: test the identity-index gate before the O(N) proof.
+6. VECTOR-6: test the identity-index gate before the O(N) proof. **Already present in the 0.0.3
+   base** (`c77d414`): `_seal_materialized_candidates` validates the space/index/cost gate before
+   it even obtains the witness iterator, and the query layer supplies a lazy generator. No new
+   implementation is due in this round.
 7. LV-3: resolve active indexes once per row in commit accounting/staging. **Implemented
    locally:** the canonical manager now carries one immutable table-local projection from WAL
    quota prediction into delete/insert staging, while custom managers and overridden hooks keep
