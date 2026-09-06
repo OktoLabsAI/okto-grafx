@@ -336,6 +336,24 @@ measured the hybrid relationship phase at 1.036–1.103 s warm, versus 2.334–2
 edge-first scan. This is a compatibility/non-regression observation, not an isolated attribution
 of the wall-time delta to the two new commits.
 
+Claude's evaluator batch was accepted after adversarial rework and integrated as `216319e` plus
+`d12602f`. The universal walk stops on its first match. Hashing is narrower: it runs only when the
+RHS is a named parameter whose detached value is an exact tuple containing exact `str`, exact
+`bytes` or `None`, and the LHS is exact `str` or `bytes`. Bindings, lists, maps, numbers, booleans,
+`bytearray` and every mixed RHS retain the canonical walk. This preserves cross-type numeric
+equality, including `1 = 1.0`, and three-valued null results. The statement-local total is capped
+at 4,096 elements, records a declined build once per parameter name, and proves object identity
+before reuse. It cannot outlive the query context or become shared authority.
+
+The focused file contains 114 cases and killed 11 non-equivalent mutations. The complete query
+suite passed 2,107 tests on the source branch; a post-cherry-pick composition of evaluator,
+incident seek/scan, landing memo and schema codec passed 240 tests. Claude's alternating synthetic
+A/B measured `1.083x` for hybrid fan-out, `1.144x` for forced scan and `1.045x` for the node page.
+On the live board, the next exact-page observation preserved 500/777 with zero failures, measured
+the node query at 0.866 s, the warm hybrid at 0.762–0.848 s and forced scan at 0.811–0.818 s. The
+large scan change relative to the immediately preceding 2.334–2.547 s observation is useful
+directional evidence but is not presented as a statistically isolated promise.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -351,7 +369,7 @@ of the wall-time delta to the two new commits.
 | Typed incident-edge operator and cost selection | complete and GO on candidate branches | Grafx `bcfa395` + `a726744`, Pulse `523e759`; adversarial review `hof_aecbb8257cb443c198a50634d2d1af2d` PASS; ordered page preserved 500/777, calls/probes `248/17,116 -> 54/4,355`, paired warm hybrid `0.763–0.967 s` versus forced scan `2.273–2.724 s` |
 | Landing accounting without row re-encode | complete | `8d806b0`; authenticated durable payload length on disk rows, canonical fallback for synthetic/modified rows; 50 focused tests and Ruff pass |
 | Planned STRING body decode | complete | `a610b55`; same byte validation/error taxonomy, 197 schema/value codec tests and Ruff pass; live ordered page preserved 500/777 |
-| Bounded `IN` memo and scalar equality | in adversarial review | Claude worktree `perf/claude-kg1`; exact scalar/null/mixed-numeric/cap tests required before integration |
+| Bounded `IN` memo and scalar equality | complete | Claude `1c1a57e` + `2672fce`, integrated as `216319e` + `d12602f`; 2,107 complete query tests, 240 post-integration focused tests, 11 killed mutations; live 500/777 preserved |
 | Bounded batch endpoint landing | selected, not started | must use finite chunks and the existing exact multi-key certificate; v1 and RYOW retain canonical semantics |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |

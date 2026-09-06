@@ -3688,6 +3688,16 @@ Hashing de `IN` só poderá reter parâmetros profundamente destacados, tipos ex
 landings não poderá materializar o statement inteiro: será limitado por chunks e preservará os
 caminhos v1, RYOW, snapshot e certificado pós-leitura fail-closed.
 
+KG-1/KG-4 foram então integrados em `216319e`/`d12602f` após o rework adversarial. O memo só
+consulta o hash para LHS exato `str`/`bytes` e RHS `Parameter` destacado contendo apenas tipos
+exatos `str`/`bytes`/`None`; todo binding, coleção, número, booleano, `bytearray` e RHS misto mantém
+o walk. O teto é 4.096 elementos por statement e a identidade do objeto é reprovada em cada hit.
+A saída antecipada universal preserva `NULL` quando não há match, e listas numéricas mantêm
+`1 = 1.0`. Foram verdes 2.107 testes de query no branch autoral e 240 testes combinados depois do
+cherry-pick. No board real, 500 nós/777 relações/zero falhas permaneceram; o run seguinte mediu
+nós em `0,866 s`, híbrido quente em `0,762–0,848 s` e scan forçado em `0,811–0,818 s`. A queda
+frente ao scan imediatamente anterior é evidência direcional e não promessa estatística isolada.
+
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
 `DELETE p, p` que recusava o segundo nome do mesmo insert. O primeiro agora falha tipado antes do
