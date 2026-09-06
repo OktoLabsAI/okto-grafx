@@ -53,6 +53,7 @@ from okto_grafx.domain.query.plan import (
     NodeScan,
     ProduceResults,
     ProjectRows,
+    RelationshipScan,
     SingleRow,
     TraverseRelationship,
 )
@@ -1024,10 +1025,11 @@ def test_decorative_path_remains_accepted_without_materialising_a_path() -> None
     statement = parse(text)
     assert exact_path_projection(statement) is None
     planned = build_plan(statement, catalog=_catalog())
-    traversal = next(
-        node for node in planned.root.walk() if type(node) is TraverseRelationship
+    assert any(type(node) is RelationshipScan for node in planned.root.walk())
+    assert not any(
+        type(node) is TraverseRelationship and node.path_variable is not None
+        for node in planned.root.walk()
     )
-    assert traversal.path_variable is None
 
 
 # --- hostile trees no parser could have built ---------------------------------------------------
