@@ -119,6 +119,7 @@ from okto_grafx.domain.model.schema import (
 from okto_grafx.domain.model.value import (
     INT64_MAX,
     INT64_MIN,
+    VECTOR_VALUE_TYPES,
     Timestamp,
     Value,
     ValueType,
@@ -323,6 +324,24 @@ _OWNER_LANDING_FINGERPRINT_ENTRY_BYTES: int = 256
 _OWNER_LANDING_RESULT_BASE_BYTES: int = 512
 _OWNER_LANDING_MISS_BYTES: int = 192
 _OWNER_LANDING_PAYLOAD_MULTIPLIER: int = 16
+_OWNER_LANDING_TUPLE_SLOT_BYTES: int = 8
+_OWNER_LANDING_SCALAR_BYTES: int = 40
+_OWNER_LANDING_STRING_BASE_BYTES: int = 80
+_OWNER_LANDING_STRING_CHAR_BYTES: int = 4
+_OWNER_LANDING_BYTES_BASE_BYTES: int = 40
+_OWNER_LANDING_OBJECT_BYTES: int = 96
+_OWNER_LANDING_VECTOR_BASE_BYTES: int = 128
+_OWNER_LANDING_VECTOR_COMPONENT_BYTES: int = 32
+"""Shape tariff of one retained landing (KGRUN-M4).
+
+Each constant dominates the CPython footprint of the object it meters: a scalar cell is one
+reference plus a 24-28 byte int/float; a str is 49 + 1 x len (ASCII) up to 76 + 4 x len (UCS-4);
+a vector is a tuple of floats (40 + 32 x n) inside a small slotted object.  The charge is a pure
+function of the decoded values (their types, string lengths and vector dimension), so it is the
+same on every platform and run, and it stays above the measured footprint (15.8 KiB real against
+18.5 KiB charged for a 45-column row with a 384-float vector) without the 16 x payload rule, which
+overcharged that row 2.7 x and starved the cache at 777 landings.
+"""
 
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -2013,9 +2032,48 @@ class _OwnerLandingBudget:
 def _owner_landing_result_bytes(
     table: TableDef, found: tuple[object, HeapVersion] | None
 ) -> int | None:
-    """Return a conservative charge, or decline optional retention without changing the row."""
+    """Return a conservative charge, or decline optional retention without changing the row.
+
+    The charge is the shape tariff of the decoded values: deterministic, computed from types,
+    string lengths and vector dimensions only, and above the real footprint of every shape it
+    knows.  A row holding a compound value (LIST or MAP) has no bounded shape and keeps the
+    former rule, 16 x its stored payload length, re-encoding a synthetic version once when the
+    heap did not authenticate a length.
+    """
     if found is None:
         return _OWNER_LANDING_MISS_BYTES
+    values = found[1].values
+    charge = _OWNER_LANDING_RESULT_BASE_BYTES + (
+        _OWNER_LANDING_SCALAR_BYTES + _OWNER_LANDING_TUPLE_SLOT_BYTES * len(values)
+    )
+    compound = False
+    for column, value in zip(table.columns, values):
+        if value is None:
+            charge += _OWNER_LANDING_TUPLE_SLOT_BYTES
+            continue
+        kind = column.type
+        if kind is ValueType.STRING:
+            charge += (
+                _OWNER_LANDING_STRING_BASE_BYTES
+                + _OWNER_LANDING_STRING_CHAR_BYTES * len(cast(str, value))
+            )
+        elif kind in VECTOR_VALUE_TYPES:
+            charge += (
+                _OWNER_LANDING_VECTOR_BASE_BYTES
+                + _OWNER_LANDING_VECTOR_COMPONENT_BYTES
+                * len(cast(VectorValue, value).values)
+            )
+        elif kind is ValueType.BYTES:
+            charge += _OWNER_LANDING_BYTES_BASE_BYTES + len(cast(bytes, value))
+        elif kind is ValueType.LIST or kind is ValueType.MAP:
+            compound = True
+            break
+        elif kind is ValueType.TIMESTAMP or kind is ValueType.UUID:
+            charge += _OWNER_LANDING_OBJECT_BYTES
+        else:
+            charge += _OWNER_LANDING_SCALAR_BYTES
+    if not compound:
+        return charge
     authenticated = found[1].stored_payload_bytes
     if authenticated is not None:
         return (
@@ -2023,7 +2081,7 @@ def _owner_landing_result_bytes(
             + authenticated * _OWNER_LANDING_PAYLOAD_MULTIPLIER
         )
     try:
-        stored_bytes = len(encode_tuple(table, found[1].values))
+        stored_bytes = len(encode_tuple(table, values))
     except (GrafxError, MemoryError):
         # Accounting is optional acceleration.  The version was already decoded and validated by
         # the heap (or built by the owner's validated intent reducer), so a failure to size a
@@ -2079,10 +2137,12 @@ class _OwnerLandingView:
     ``changed`` and ``ended`` are then applied in the same order as the former full-table map.
 
     Results are memoized across statements only while the transaction, snapshot, schema,
-    fingerprint and heap epoch still vouch for them.  Admission precedes every cache mutation.  If
-    any result would exceed the shared bytes or entries ceiling, all decoded results of this table
-    are discarded and this view becomes lookup-only.  The query is never refused for acceleration
-    capacity.  When both this result cache and the D-02 prefix locator exceed their independent
+    fingerprint and heap epoch still vouch for them.  Admission precedes every cache mutation.
+    The retained results of one view form a least-recently-used set under the shared bytes and
+    entries ceiling: a result that would exceed the ceiling first evicts this view's own least
+    recently used results, and when nothing of this view is left to evict it is simply not
+    retained -- the cache never grows past the ceiling, never disables itself for the rest of
+    the transaction, and the query is never refused for acceleration capacity (KGRUN-M4).  When both this result cache and the D-02 prefix locator exceed their independent
     ceilings, the honest residual worst case is one canonical O(N) lookup per distinct landing;
     eliminating that case requires the separately governed persistent identity access path.
     """
@@ -2203,6 +2263,9 @@ class _OwnerLandingView:
                 )
             cached = self._cache.get(identity)
             if cached is not None:
+                # A hit becomes the most recently used entry (dict order is the LRU order).
+                del self._cache[identity]
+                self._cache[identity] = cached
                 return cached[0]
             self._active += 1
         lease_open = True
@@ -2220,20 +2283,16 @@ class _OwnerLandingView:
                         and identity not in self._cache
                     ):
                         budget = self._budget
-                        if budget is not None:
+                        if budget is not None and self._reserve_evicting_locked(
+                            budget, charge
+                        ):
                             try:
-                                budget.reserve(bytes_=charge, entries=1)
-                            except _OwnerLandingCapacity:
-                                self._discard_results_locked()
-                                self._cache_enabled = False
-                            else:
-                                try:
-                                    self._cache[identity] = (found, charge)
-                                except BaseException:
-                                    budget.release(bytes_=charge, entries=1)
-                                    raise
-                                self._cache_bytes += charge
-                                self._cache_entries += 1
+                                self._cache[identity] = (found, charge)
+                            except BaseException:
+                                budget.release(bytes_=charge, entries=1)
+                                raise
+                            self._cache_bytes += charge
+                            self._cache_entries += 1
                 finally:
                     self._leave_locked()
                     lease_open = False
@@ -2301,6 +2360,30 @@ class _OwnerLandingView:
                 return None
             version = replace(version, values=values)
         return ref, version
+
+    def _reserve_evicting_locked(
+        self, budget: _OwnerLandingBudget, charge: int
+    ) -> bool:
+        """Reserve one result charge, evicting this view's LRU results while that helps.
+
+        Only results of this view are evicted, oldest first, so a saturated shared budget makes a
+        view trade its own stale results for fresh ones and never touches another view's.  When
+        this view holds nothing more to release and the reservation still fails, the result is
+        not retained and the cache stays enabled for the next one.  Caller holds the guard.
+        """
+        while True:
+            try:
+                budget.reserve(bytes_=charge, entries=1)
+            except _OwnerLandingCapacity:
+                if not self._cache:
+                    return False
+                oldest = next(iter(self._cache))
+                _found, released = self._cache.pop(oldest)
+                budget.release(bytes_=released, entries=1)
+                self._cache_bytes -= released
+                self._cache_entries -= 1
+            else:
+                return True
 
     def _leave_locked(self) -> None:
         """Finish one heap-I/O lease; caller holds the injected re-entrant guard."""
