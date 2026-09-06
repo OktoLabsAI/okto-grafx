@@ -1310,20 +1310,20 @@ def test_an_allocated_page_comes_back_pinned_and_survives_pressure() -> None:
         assert reread.read_slot(0) == b"written into a fresh page"
 
 
-def test_allocation_uses_page_count_instead_of_a_redundant_presence_walk() -> None:
-    device = PresenceRecordingDevice()
+def test_successful_allocation_leaves_size_and_identity_to_the_atomic_device_door() -> None:
+    device = AllocationRecordingDevice()
     device.create(FILE)
-    device.exists_calls.clear()
     pool = make_pool(device, RecordingMetrics())
 
     page = pool.allocate(FILE, int(PageType.HEAP))
     pool.unpin(FILE, page.page_index, page=page)
 
-    assert device.exists_calls == []
-    assert device.page_count(FILE) == 1
+    assert device.page_count_calls == []
+    assert device.allocate_calls == [(FILE, 1)]
+    assert len(device._pages[FILE]) == 1
 
 
-def test_allocation_does_not_read_a_non_missing_page_count_refusal_as_empty() -> None:
+def test_allocation_resolves_the_exact_target_before_reporting_an_admission_refusal() -> None:
     class RefusingPageCountDevice(PresenceRecordingDevice):
         def page_count(self, file: str) -> int:
             raise GrafxCorruptionDetected(
@@ -1333,7 +1333,11 @@ def test_allocation_does_not_read_a_non_missing_page_count_refusal_as_empty() ->
             )
 
     device = RefusingPageCountDevice()
-    pool = make_pool(device, RecordingMetrics())
+    device.create(FILE)
+    device.allocate(FILE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    pool.pin(FILE, 0)
+    device.exists_calls.clear()
 
     with pytest.raises(GrafxCorruptionDetected) as refused:
         pool.allocate(FILE, int(PageType.HEAP))

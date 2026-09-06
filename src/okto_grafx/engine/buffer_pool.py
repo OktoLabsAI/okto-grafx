@@ -1568,19 +1568,31 @@ class BufferPool:
         point.
         """
         self._wait_for_evictions(file)
-        try:
-            prospective = self._storage.page_count(file)
-        except GrafxError as failure:
-            # page_count is the cheaper presence question and, unlike exists(), does not walk
-            # every sibling name merely to calculate the budget position of the append.  Only
-            # absence has the old zero answer.  A case collision, an unaligned paged file and
-            # every other typed refusal remain corruption/incompatibility rather than being
-            # mistaken for an empty file.  storage.allocate below still re-proves the exact
-            # descriptor identity before it grows anything.
-            if failure.details.get("reason") != "missing_file":
-                raise
-            prospective = 0
-        self._make_room(file, prospective)
+
+        # Admission depends only on whether one frame can be made available, not on the number
+        # the device will atomically assign to that frame.  The old eager page_count therefore
+        # duplicated StorageDevice.allocate's descriptor-size proof on every heap growth.  Keep
+        # the exact prospective index lazy: it is resolved only if admission must report a
+        # refusal (including a re-entrant wait), where preserving the established diagnostic is
+        # useful.  On the successful hot path allocate remains the single authority for both
+        # descriptor identity and the physical index, so a foreign writer can grow the same file
+        # between calls without making a local hint stale -- there is no hint.
+        prospective: PageIndex | None = None
+
+        def prospective_index() -> PageIndex:
+            nonlocal prospective
+            if prospective is None:
+                try:
+                    prospective = self._storage.page_count(file)
+                except GrafxError as failure:
+                    # Only absence has the old zero answer. A case collision, an unaligned paged
+                    # file and every other typed refusal remain corruption/incompatibility.
+                    if failure.details.get("reason") != "missing_file":
+                        raise
+                    prospective = 0
+            return prospective
+
+        self._make_room(file, prospective_index)
         page_index = self._reusable_index(file) if reuse else None
         if page_index is None:
             page_index = self._storage.allocate(file, 1)
@@ -2581,15 +2593,38 @@ class BufferPool:
                     load.epoch = target_epoch
                 self._signal_flight_state()
 
-    def _make_room(self, file: str, page_index: PageIndex) -> None:
-        """Evict until one more frame fits in the budget, or refuse the request."""
+    def _make_room(
+        self,
+        file: str,
+        page_index: PageIndex | Callable[[], PageIndex],
+    ) -> None:
+        """Evict until one more frame fits in the budget, or refuse the request.
+
+        Allocation may pass a lazy prospective index because a successful admission does not
+        depend on it.  Existing-page reads pass their concrete index.  Resolve the callable only
+        on a refusal path so allocation does not repeat the storage adapter's authoritative size
+        proof merely to admit a frame.
+        """
+        resolved_page_index: PageIndex | None = (
+            page_index if not callable(page_index) else None
+        )
+
+        def target_index() -> PageIndex:
+            nonlocal resolved_page_index
+            if resolved_page_index is None:
+                assert callable(page_index)
+                resolved_page_index = page_index()
+            return resolved_page_index
+
         while (self._occupied_slots() + 1) * self._page_size > self._budget_bytes:
             victim = self._find_victim()
             if victim is None:
                 condition = self._condition
                 if condition is not None and (self._loads or self._evictions):
                     owner = condition.thread_token()
-                    self._refuse_capacity_wait_on_self(owner, file, page_index)
+                    self._refuse_capacity_wait_on_self(
+                        owner, file, target_index()
+                    )
                     observed = self._flight_state_epoch
                     condition.wait_for(lambda: self._flight_state_epoch != observed)
                     continue
@@ -2597,7 +2632,7 @@ class BufferPool:
                     self._metrics.increment(
                         BUFFER_BUDGET_EXCEEDED_TOTAL, 1.0, self._labels
                     )
-                raise self._budget_failure(file, page_index)
+                raise self._budget_failure(file, target_index())
             name, victim_index = victim
             frame = self._frames[victim]
             if frame.page.dirty:
