@@ -128,7 +128,12 @@ Engine/query lane:
    project the vector; all validation and refusal paths remain.
 4. EXEC-CSE, including KGRUN-M1: closures, exact `coalesce` leaf, lazy per-row CSE and the
    `row.computed` guard. No `exec` code generation in this wave.
-5. KGRUN-M2(a): stateless pure cosine scorer preparation; no authority-bearing memo.
+5. KGRUN-M2(a): stateless pure cosine scorer preparation; no authority-bearing memo outside the
+   HNSW generation fence. **Implemented locally:** `PureVectorMath` now exposes the existing
+   exact prepared-norm capability while retaining no adapter state; HNSW publishes a candidate
+   norm only after a successful score and binds it to the immutable backing object of that node
+   generation. A paired 384-dimensional/300-candidate scorer microbenchmark measured 2.00x
+   (`0.1544 s` to `0.0771 s`, 50.1% less scorer time); the workload-level estimate remains ~8%.
 6. VECTOR-6: test the identity-index gate before the O(N) proof.
 7. LV-3: resolve active indexes once per row in commit accounting/staging. **Implemented
    locally:** the canonical manager now carries one immutable table-local projection from WAL

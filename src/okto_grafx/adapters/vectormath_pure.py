@@ -228,6 +228,16 @@ class PureVectorMath:
         surfaces for the same candidate with the same reason whichever door measured ``a``.
         """
         length_b = _require_finite(self.norm(b), "norm")
+        return self._cosine_from_lengths(a, length_a, b, length_b)
+
+    def _cosine_from_lengths(
+        self,
+        a: Sequence[float],
+        length_a: float,
+        b: Sequence[float],
+        length_b: float,
+    ) -> float:
+        """Return exact cosine with both successfully measured lengths supplied."""
         if length_a == 0.0 or length_b == 0.0:
             require_same_length(a, b)
             return 0.0
@@ -320,6 +330,42 @@ class PureVectorMath:
             return self._cosine_from_length(query, length_query, values)
 
         return cosine
+
+    def prepare_cosine_with_norm(
+        self, query: Sequence[float]
+    ) -> tuple[
+        Callable[[Sequence[float]], tuple[float, float]],
+        Callable[[Sequence[float], float], float],
+    ]:
+        """Prepare exact cosine scoring while reusing a proved candidate norm.
+
+        The adapter stays stateless: the two closures retain only the query's lazily measured
+        length. Candidate norms live in the HNSW graph, fenced by the immutable backing object
+        of one node generation, and are published only after this measuring scorer succeeds.
+        Merely preparing an unused scorer still examines neither the query nor a candidate.
+        """
+        length_query: float | None = None
+
+        def query_length() -> float:
+            nonlocal length_query
+            if length_query is None:
+                length_query = _require_finite(self.norm(query), "norm")
+            return length_query
+
+        def measured(values: Sequence[float]) -> tuple[float, float]:
+            left_norm = query_length()
+            right_norm = _require_finite(self.norm(values), "norm")
+            return (
+                self._cosine_from_lengths(query, left_norm, values, right_norm),
+                right_norm,
+            )
+
+        def cosine(values: Sequence[float], right_norm: float) -> float:
+            return self._cosine_from_lengths(
+                query, query_length(), values, right_norm
+            )
+
+        return measured, cosine
 
     def __repr__(self) -> str:
         return f"PureVectorMath(name={PURE_ADAPTER_NAME!r})"

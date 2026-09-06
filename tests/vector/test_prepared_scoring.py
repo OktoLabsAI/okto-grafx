@@ -23,6 +23,7 @@ from okto_grafx.adapters.vectormath_pure import PureVectorMath
 from okto_grafx.domain.errors import GrafxVectorValidationError
 from okto_grafx.domain.ports.vectormath import (
     DistanceMetric,
+    PreparedCosineVectorMath,
     PreparedVectorMath,
     VectorMath,
 )
@@ -168,6 +169,7 @@ def _outcome(call) -> tuple[str, object]:
 
 def test_the_oracle_declares_the_capability() -> None:
     assert isinstance(PureVectorMath(), PreparedVectorMath)
+    assert isinstance(PureVectorMath(), PreparedCosineVectorMath)
     assert not isinstance(ScoreOnlyMath(PureVectorMath()), PreparedVectorMath)
 
 
@@ -185,6 +187,45 @@ def test_a_prepared_scorer_refuses_each_vector_as_the_pairwise_door_does() -> No
     check_a_prepared_scorer_refuses_each_vector_as_the_pairwise_door_does(
         PureVectorMath()
     )
+
+
+def test_pure_prepared_cosine_reuses_only_successfully_measured_norms() -> None:
+    class CountingPureMath(PureVectorMath):
+        def __init__(self) -> None:
+            self.norm_calls = 0
+
+        def norm(self, values: Sequence[float]) -> float:
+            self.norm_calls += 1
+            return super().norm(values)
+
+    math_ = CountingPureMath()
+    unused, _unused_cached = math_.prepare_cosine_with_norm((float("nan"), 0.0))
+    measured, cached = math_.prepare_cosine_with_norm((1.0, 2.0, 3.0))
+    candidate = (4.0, 5.0, 6.0)
+
+    assert callable(unused)
+    first, candidate_norm = measured(candidate)
+    assert first == math_.score((1.0, 2.0, 3.0), candidate, DistanceMetric.COSINE)
+    calls_after_oracle = math_.norm_calls
+    assert cached(candidate, candidate_norm) == first
+    assert math_.norm_calls == calls_after_oracle
+
+
+def test_pure_hnsw_norm_cache_is_bound_to_the_node_generation() -> None:
+    graph = HnswGraph(PureVectorMath(), DistanceMetric.COSINE, seed=17)
+    graph.insert(7, (1.0, 0.0))
+
+    assert graph.search((1.0, 0.0), ef=1)[0] == ((1.0, 7),)
+    retained, first_norm = graph._norms[7]  # noqa: SLF001 - generation fence
+    assert retained is graph._values[7]  # noqa: SLF001 - generation fence
+    assert first_norm == 1.0
+
+    graph.remove(7)
+    graph.insert(7, (0.0, 2.0))
+    assert graph.search((0.0, 1.0), ef=1)[0] == ((1.0, 7),)
+    retained, second_norm = graph._norms[7]  # noqa: SLF001 - generation fence
+    assert retained is graph._values[7]  # noqa: SLF001 - generation fence
+    assert second_norm == 2.0
 
 
 @pytest.mark.parametrize("metric", list(DistanceMetric))
