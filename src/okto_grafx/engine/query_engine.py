@@ -10138,14 +10138,25 @@ def _visible_identity_with_ref(
         manager = engine.require_indexes()
         # Selection already proved this capability.  Do not catch AttributeError or any other
         # read failure here: after adoption, fallback would hide a generation change or damage.
-        found = tuple(
-            manager.validated_versions(
-                identity_index,
-                record_id_key(record_id),
-                context.snapshot,
-                landing=landing,
+        # The landing form is opted into explicitly; the ordinary call keeps its exact shape so
+        # every collaborator implementing validated_versions(index, key, snapshot) still fits.
+        if landing:
+            found = tuple(
+                manager.validated_versions(
+                    identity_index,
+                    record_id_key(record_id),
+                    context.snapshot,
+                    landing=True,
+                )
             )
-        )
+        else:
+            found = tuple(
+                manager.validated_versions(
+                    identity_index,
+                    record_id_key(record_id),
+                    context.snapshot,
+                )
+            )
         if not found:
             return None
         if len(found) > 1:
