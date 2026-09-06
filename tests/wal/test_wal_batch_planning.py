@@ -128,9 +128,10 @@ def _outcome(function: Callable[[], object]) -> tuple:
 
 def _hostile_records() -> list[WalRecord]:
     """Exact and not-quite-exact records, plus records mutated behind the frozen door."""
-    exact = make_record(1)
+    exact = replace(make_record(1), record_type=int(WalRecordType.WRITE_PAGE))
     corpus: list[WalRecord] = [
         exact,
+        make_record(1),  # the IntEnum record type of the fixture: copied, not returned
         make_record(2, record_type=WalRecordType.COMMIT),
         replace(exact, descriptor=""),
         replace(exact, descriptor=DESCRIPTOR),
@@ -263,6 +264,40 @@ def test_a_tail_change_between_preview_and_append_still_refuses_the_epoch(
     with pytest.raises(GrafxStaleEpoch):
         wal.append_many(records, expected_terminal_lsn=planned)
     assert wal._planned_canonical == {}
+
+
+def test_the_memo_serves_only_the_very_object_it_retained(
+    wal: WalManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An id alone is never enough: the retained object must be the one that arrives."""
+    calls = _count_canonicalisations(monkeypatch)
+    first = _exact(make_record(1))
+    commit = _exact(make_record(2, record_type=WalRecordType.COMMIT))
+    planned = wal.planned_terminal_lsn((first, commit))
+    assert calls[0] == 2
+    twin = replace(first)  # equal in every field, a different object
+    wal._planned_canonical = {id(twin): wal._planned_canonical[id(first)]}
+    wal.append_many((twin, commit), expected_terminal_lsn=planned)
+    assert calls[0] == 4  # neither the twin (wrong object) nor the commit (forgotten) is served
+
+
+def test_the_memo_is_empty_after_any_outcome(wal: WalManager) -> None:
+    """Success, refusal at the append, refusal at the preview: nothing is kept."""
+    good = (_exact(make_record(1)), _exact(make_record(2, record_type=WalRecordType.COMMIT)))
+    planned = wal.planned_terminal_lsn(good)
+    assert wal._planned_canonical and wal._planned_records
+    wal.append_many(good, expected_terminal_lsn=planned)
+    assert wal._planned_canonical == {} and wal._planned_records == ()
+
+    wal.planned_terminal_lsn(good)
+    with pytest.raises(GrafxConfigurationError):
+        wal.append_many((replace(good[0], lsn=7), good[1]))
+    assert wal._planned_canonical == {} and wal._planned_records == ()
+
+    wal.planned_terminal_lsn(good)
+    with pytest.raises(GrafxConfigurationError):
+        wal.planned_terminal_lsn((replace(good[0], lsn=7), good[1]))
+    assert wal._planned_canonical == {} and wal._planned_records == ()
 
 
 def test_a_second_preview_replaces_the_first(wal: WalManager, monkeypatch: pytest.MonkeyPatch) -> None:

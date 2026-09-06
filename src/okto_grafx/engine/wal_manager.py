@@ -888,6 +888,8 @@ class WalManager:
         instead of a batch whose payload names a different commit number.
         """
         self._require_open()
+        self._planned_records = ()
+        self._planned_canonical = {}
         self._refresh_tail_if_needed()
         self._require_healthy()
         _batch, _body_length, _rolling, terminal = self._plan_batch(
@@ -918,9 +920,12 @@ class WalManager:
         # hold_tail(); no foreign append can move it until that context is released.
         self._refresh_tail_if_needed()
         self._require_healthy()
-        batch, _body_length, rolling, terminal = self._plan_batch(records)
+        planned = self._planned_canonical
         self._planned_records = ()
         self._planned_canonical = {}
+        batch, _body_length, rolling, terminal = self._plan_batch(
+            records, planned=planned
+        )
         if expected_terminal_lsn is not None:
             expected = _require_lsn("expected_terminal_lsn", expected_terminal_lsn)
             if terminal != expected:
@@ -1021,7 +1026,11 @@ class WalManager:
         return lsn
 
     def _plan_batch(
-        self, records: Sequence[WalRecord], *, remember: bool = False
+        self,
+        records: Sequence[WalRecord],
+        *,
+        remember: bool = False,
+        planned: Mapping[int, tuple[WalRecord, WalRecord]] | None = None,
     ) -> tuple[tuple[WalRecord, ...], int, bool, Lsn]:
         """Validate a batch and return its encoded length, roll decision and terminal LSN.
 
@@ -1033,7 +1042,7 @@ class WalManager:
         roll, the terminal number, the segment ceiling) is re-derived on every plan.  The memo
         lives from one preview to the next append and holds nothing but the caller's own records.
         """
-        batch = self._validate_batch(records, remember=remember)
+        batch = self._validate_batch(records, remember=remember, planned=planned)
         body_length = sum(record.encoded_length() for record in batch)
         rolling = self._needs_roll(body_length)
         header_length = (
@@ -1067,7 +1076,11 @@ class WalManager:
         return batch, body_length, rolling, terminal
 
     def _validate_batch(
-        self, records: Sequence[WalRecord], *, remember: bool = False
+        self,
+        records: Sequence[WalRecord],
+        *,
+        remember: bool = False,
+        planned: Mapping[int, tuple[WalRecord, WalRecord]] | None = None,
     ) -> tuple[WalRecord, ...]:
         """Return the batch, stamped with this log's descriptor, or refuse it whole.
 
@@ -1089,7 +1102,8 @@ class WalManager:
                 value=0,
             )
         batch: list[WalRecord] = []
-        planned = self._planned_canonical
+        if planned is None:
+            planned = {}
         remembered: dict[int, tuple[WalRecord, WalRecord]] = {}
         for position, record in enumerate(records):
             if type(record) is not WalRecord:
