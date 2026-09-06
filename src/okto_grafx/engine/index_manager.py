@@ -7036,6 +7036,82 @@ class IndexManager:
             project=lambda ref, version: (ref, version),
         )
 
+    def validated_versions_many(
+        self,
+        index: IndexStore,
+        keys: Sequence[bytes],
+        snapshot: SnapshotLike,
+    ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+        """Validate many exact keys of one index inside ONE durable page-0 certificate.
+
+        One :meth:`validated_versions` call costs one stable view: a page-0 pre-certificate
+        (fresh or carried), the bucket traversal, the heap validation and a fresh page-0
+        post-read.  A consumer resolving hundreds of keys of the same index -- the endpoint
+        landing of an edge scan, an incident-edge seek for a page of node ids -- paid that
+        certificate per key.  Here every key is validated and canonicalised BEFORE the view
+        opens, the companion heap view is prepared once per attempt, every distinct key is
+        probed once and every candidate validated exactly as :meth:`_validated_items` validates
+        it, and the whole batch lives inside one stable view: a page-0 transition during the
+        batch repeats the ENTIRE batch within the existing retry budget and refuses when that
+        budget is exhausted.  A prefix is never returned, because nothing leaves the callback
+        before the post-read.
+
+        The answer is aligned one-to-one with ``keys``: a repeated key (or one given as a
+        ``bytearray``/``memoryview``) is probed once and answered at every position, and a key
+        without a visible row answers an empty tuple.  Only an EXACT index answers; a PROXIMITY
+        index does not validate heap versions and is refused before any view opens.
+        """
+        if index.visibility is IndexVisibility.PROXIMITY:
+            raise GrafxIndexError(
+                f"Index {index.name!r} has proximity visibility and does not validate heap "
+                "versions during lookup.",
+                field="visibility",
+                value=index.visibility.value,
+                index=index.name,
+                file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        definition = index.definition
+        wanted_by_position = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted_by_position))
+        if not distinct:
+            return ()
+
+        def confirm(
+            certificate: _IndexReadCertificate,
+        ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+            """Probe every distinct key and validate every candidate inside this certificate."""
+            self._prepare_heap_view(index.file, certificate)
+            answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
+            for wanted in distinct:
+                accepted: list[tuple[RecordRef, HeapVersion]] = []
+                for entry in index._candidates_unchecked(wanted):
+                    version = self._heap.read(entry.ref)
+                    if version.table_id != definition.table_id:
+                        raise GrafxCorruptionDetected(
+                            f"Index {definition.name!r} points at a row of table "
+                            f"{version.table_id} and covers table {definition.table_id}.",
+                            file=index.file,
+                            page=entry.page,
+                            slot=entry.slot,
+                            index=definition.name,
+                            field="table_id",
+                        )
+                    if not snapshot.visible(version.xmin, version.xmax):
+                        continue
+                    if (
+                        definition.entry_key_for_record(
+                            version.record_id, version.values
+                        )
+                        != entry.key
+                    ):
+                        continue
+                    accepted.append((entry.ref, version))
+                answers[wanted] = tuple(accepted)
+            return tuple(answers[wanted] for wanted in wanted_by_position)
+
+        return index._stable_view(read_lsn, confirm)
+
     def _validated_items(
         self,
         index: IndexStore,
