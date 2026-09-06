@@ -27,7 +27,9 @@ from okto_grafx.domain.model.value import (
     VECTOR_VALUE_TYPES,
     Value,
     ValueType,
+    _U32,
     _decode_expected_value_body,
+    _require,
     _validate_value,
     decode_value,
     encode_value,
@@ -705,9 +707,32 @@ def _decode_tuple(
             else:
                 stored_tag = buf[offset]
                 if stored_tag == expected_tag:
-                    value, offset = _decode_expected_value_body(
-                        buf, offset + 1, expected_type
-                    )
+                    if expected_type is ValueType.STRING:
+                        # STRING dominates wide graph rows.  Keep the generic decoder as the
+                        # single oracle for mismatched tags and compound values, but execute this
+                        # already-planned scalar body in the table loop so every ordinary string
+                        # does not pay another Python dispatch.  The checks and error taxonomy are
+                        # byte-for-byte the same operations as _decode_expected_value_body.
+                        offset += 1
+                        _require(buf, offset, _U32.size, "length")
+                        length = _U32.unpack_from(buf, offset)[0]
+                        offset += _U32.size
+                        _require(buf, offset, length, "string")
+                        following = offset + length
+                        try:
+                            value = bytes(buf[offset:following]).decode("utf-8")
+                        except UnicodeDecodeError as failure:
+                            raise GrafxCorruptionDetected(
+                                "A stored STRING is not valid UTF-8.",
+                                field="string",
+                                offset=offset,
+                                length=length,
+                            ) from failure
+                        offset = following
+                    else:
+                        value, offset = _decode_expected_value_body(
+                            buf, offset + 1, expected_type
+                        )
                 elif stored_tag == int(ValueType.NULL):
                     value = None
                     offset += 1

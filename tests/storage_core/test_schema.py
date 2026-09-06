@@ -149,6 +149,28 @@ def test_decode_tuple_compares_the_stored_tag_without_reclassifying_valid_values
     assert decode_tuple(table, payload) == (7, "Ada", 3.5)
 
 
+def test_planned_string_body_is_inlined_without_changing_other_scalar_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = person_table()
+    payload = encode_tuple(table, (7, "Ada", 3.5))
+    original = schema_module._decode_expected_value_body
+    observed: list[ValueType] = []
+
+    def observe_dispatch(
+        buf: memoryview,
+        offset: int,
+        expected: ValueType,
+    ) -> tuple[object, int]:
+        observed.append(expected)
+        return original(buf, offset, expected)
+
+    monkeypatch.setattr(schema_module, "_decode_expected_value_body", observe_dispatch)
+
+    assert decode_tuple(table, payload) == (7, "Ada", 3.5)
+    assert observed == [ValueType.INT64, ValueType.DOUBLE]
+
+
 def test_a_relationship_table_needs_both_endpoints() -> None:
     columns = (ColumnDef(name="since", type=ValueType.INT64),)
     table = TableDef(
