@@ -439,6 +439,12 @@ _ClosedProviderSlot = tuple[str, str]
 _MAX_CLOSED_PROVIDER_PROOFS: int = 2
 """Maximum closed-provider slots the shipped adapter can offer (google-crc32c, crc32c)."""
 
+_CLOSED_PROVIDER_CRC_FIRST: dict[_ClosedProviderSlot, bool] = {
+    ("google_crc32c", "extend"): True,
+    ("crc32c", "crc32c"): False,
+}
+"""The complete closed provider list and its fixed argument convention."""
+
 _validated_closed_identities: tuple[
     tuple[_ClosedProviderIdentity, Callable[[bytes, int], int]], ...
 ] = ()
@@ -482,6 +488,12 @@ def _require_closed_identity(value: object) -> _ClosedProviderIdentity:
             "A CRC-32C memo identity has invalid closed-provider fields.",
             field="memo_identity",
             value="invalid_fields",
+        )
+    if (module_name, attribute) not in _CLOSED_PROVIDER_CRC_FIRST:
+        raise GrafxConfigurationError(
+            "A CRC-32C memo identity does not name a closed provider slot.",
+            field="memo_identity",
+            value="unknown_slot",
         )
     return (module_name, attribute, origin, version, raw_function)
 
@@ -586,11 +598,57 @@ def _install_validated_crc32c(
         if accepted_identity is not None:
             _remember_closed_proof(accepted_identity, function)
 
-    def checked(data: bytes, crc: int) -> int:
-        """Contain one fast-path answer without adding the Python oracle."""
-        return _candidate_answer(function, data, crc, plain_name)
+    checked = (
+        _closed_provider_checked(accepted_identity, plain_name)
+        if accepted_identity is not None
+        else lambda data, crc: _candidate_answer(function, data, crc, plain_name)
+    )
 
     return _publish_implementation(checked, plain_name)
+
+
+def _closed_provider_checked(
+    identity: _ClosedProviderIdentity, name: str
+) -> Callable[[bytes, int], int]:
+    """Collapse adaptation, provider call and exact-answer validation into one hot frame.
+
+    The raw callable and its argument convention come from the same closed identity that passed
+    both adapter and domain corpora. The success path returns only an exact unsigned 32-bit int;
+    exceptional and unusual-result paths retain the established typed diagnostics.
+    """
+    raw_function = identity[4]
+    crc_first = _CLOSED_PROVIDER_CRC_FIRST[_closed_slot(identity)]
+
+    def checked(data: bytes, crc: int) -> int:
+        try:
+            observed = (
+                raw_function(crc, data)  # type: ignore[operator]
+                if crc_first
+                else raw_function(data, crc)  # type: ignore[operator]
+            )
+        except GrafxError:
+            raise
+        except Exception as failure:
+            cause = _builtin_type_name(failure)
+            raise GrafxConfigurationError(
+                f"The CRC-32C implementation {name!r} raised {cause} during validation.",
+                field="crc32c",
+                value=name,
+                cause=cause,
+                length=len(data),
+                seed=crc,
+            ) from failure
+        if type(observed) is int and 0 <= observed <= _MASK_32:
+            return observed
+        return _require_crc32c_answer(
+            observed,
+            field="implementation",
+            name=name,
+            length=len(data),
+            seed=crc,
+        )
+
+    return checked
 
 
 def _publish_implementation(function: Callable[[bytes, int], int], name: str) -> str:
