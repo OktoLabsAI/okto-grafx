@@ -223,9 +223,30 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    rows and 28 indexes, six paired rounds improved `verify(all)` from about 0.98 s to 0.575 s
    (`1.71x`, all rounds `1.70x`--`1.87x`) with identical reports. Heap-only, index-only and combined
    corruption retained their classifications/digests; 80 focal and 547 proportional tests pass.
-4. One generated decode plan for KGRUN-1/LADYBUG-M1/NATVER-1; it must pass a 10,000-case hostile
-   corpus with the same exception class, field and offset as the canonical decoder.
-5. KGRUN-3: project only retained rows after the bounded top-k/order stage.
+4. One planned decode path for KGRUN-1/LADYBUG-M1/NATVER-1. **Closed with split outcomes** in
+   `055d8ee`: the exact built-in heap can retain only the positional columns proved by a closed
+   node-scan pipeline while still parsing and validating the complete durable tuple. Omitted
+   positions carry a private sentinel and any unproved access refuses fail-closed; dirty
+   transaction rows replace the physical projection with their complete pending values. A
+   hostile 10,000-payload differential matched the canonical decoder's acceptance/refusal and
+   exact exception class, `field` and `offset`. On a same-process alternating KG-shaped A/B
+   (800 wide rows, 32 extra strings, 384-dimensional vector, seven queries per round), median
+   wall time fell from 0.921 s to 0.772 s (`1.19x`, `-16.2%`) with an identical digest. The
+   proposed full scalar inlining was rejected after measuring about 9% regression, and the
+   projected vector-prefilter wiring was removed after an 11--13% end-to-end regression: its
+   scorer still required the vector and skipped strings still had to validate UTF-8. Those two
+   negative variants are not carried forward as moving targets.
+5. KGRUN-3: **implemented and integrated** in `9e2d692` and `86f72f0`, with the adversarial
+   correction `d1b775f`. A bounded `ORDER BY`/`LIMIT` now evaluates only potentially refusing
+   projections and sort aliases on every source row; literals, already-bound parameters,
+   declared/polymorphic properties, `label()` and non-DOUBLE `coalesce` are evaluated only for
+   retained rows. The proof distinguishes typed from polymorphic bindings, so a cached nullability
+   proof cannot hide a missing-column refusal. Temporary sort/distinct spill preserves the
+   private unmaterialized-column marker rather than publishing or coercing it. The KG-page
+   structural count fell from about 56,000 to 20,000 property reads (`-64%`); its isolated wall
+   signal was a noisy `1.07x`, so the structural reduction is accepted without a larger timing
+   claim. Eight initial query shapes, the two-mode adversarial cache sequence, four killed
+   mutants and the accumulated full `tests/query` regression pass.
 6. LADYBUG-M4: indexed `DETACH DELETE` in both directions, including pending transaction rows.
 7. STO-M1: transaction-scoped primary-key resolution memo. First re-profile the Wave 0 overlay;
    implement only the residual and keep ownership/generation inside the transaction.
@@ -277,3 +298,12 @@ index collaborators. The focused combined-head gate passed 127 tests; the single
 query/vector/storage-core regression passed 3,835 tests in 358.35 seconds. Codex owns Wave 0,
 the first storage/identity lane and final integration. Pulse-specific work remains in Community
 adapters and composition roots.
+
+The Wave 2 KGRUN-3 handoff is `hof_57a62b5a23d34d2c8644894b1ef002d1`. Claude supplied
+`13bac09`/`f65bc51`; Codex's adversarial review found that the totality cache omitted the
+`RowBinding.polymorphic` mode. Both agents agreed on the defect and on an exact two-mode proof.
+The integrated tuple-keyed variant also caches the dominant polymorphic KG path; the shared test
+exercises both arrival orders and mixed repetitions. The first accumulated query run exposed a
+second interaction with bounded spill; `d1b775f` added a private spill tag for the projection
+sentinel and updated scan-consumption instrumentation. The failing block then passed, followed by
+the complete query regression at 100%.
