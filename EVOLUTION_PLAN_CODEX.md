@@ -3753,12 +3753,21 @@ dispersão e sem causalidade específica; ele não virou um novo gate marginal. 
 de 381 testes e os checks Ruff/diff ficaram verdes.
 
 As otimizações complementares do consumidor estão publicadas em Community
-`perf/v0.3.3-kg-load-grafx@52dbd22` e Core
-`perf/v0.3.3-kg-active-filter@56b4764`. A primeira usa `generation` como padrão apenas nos
+`perf/v0.3.3-kg-load-grafx@6ae14ed` e Core
+`perf/v0.3.3-kg-active-filter@7ebc849`. A primeira usa `generation` como padrão apenas nos
 diretórios geracionais gerenciados pelo Pulse, mantendo `strict` disponível e documentado; a
 segunda substitui sete desigualdades de tombstone por um `NOT IN` semanticamente equivalente,
 confirmado nos dois backends. Formato, WAL, ambas as OCCs, recovery, durabilidade e as premissas
 multi-reader/multi-writer continuam inalterados.
+
+O test run instalado encontrou e fechou a paginação vazia do Knowledge Graph. O cursor mantinha
+`created_at` como texto: Ladybug fazia cast implícito, mas Grafx preservava corretamente os
+domínios `STRING`/`TIMESTAMP`, fazendo a segunda página voltar vazia. Core `7ebc849` passa um
+`datetime` UTC ao executor sem tirar a string estável da chave de cache; Community `6ae14ed`
+converte os parâmetros tipados para o domínio público imutável do Grafx. Cinco testes Core, 34
+Community, um probe Ladybug e a instância real passaram. As páginas reais retornaram 500/777 e
+500/775 nós/arestas, sem IDs sobrepostos; no navegador, o grafo avançou de 500 para 1000 nós e o
+controle de `Load more (500+)` para `Load more (1000+)`.
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um

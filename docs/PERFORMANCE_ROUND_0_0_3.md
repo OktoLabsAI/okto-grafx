@@ -485,6 +485,16 @@ Core commit `56b4764` collapses seven equivalent active-tombstone inequalities i
 predicate with identical null semantics on Grafx and Ladybug. Those changes preserve storage
 format, WAL, both OCC validations, recovery, durability and multi-reader/multi-writer operation.
 
+The installed-browser validation exposed one functional cursor defect outside Grafx: Pulse kept
+the opaque cursor timestamp as `STRING`. Ladybug implicitly cast it against a `TIMESTAMP` column,
+while Grafx kept the two value domains distinct and correctly returned no ordered matches.
+Core `7ebc849` now converts the decoded ISO boundary to a UTC `datetime` only for execution while
+retaining the original string in the cache identity; Community `6ae14ed` normalizes typed read
+parameters to Grafx's public immutable value domain. The focused result was 5 Core and 34
+Community tests plus a Ladybug typed-parameter probe. On the installed real board, page one was
+500 nodes/777 edges and page two was a disjoint 500 nodes/775 edges; the browser advanced from
+`Knowledge graph with 500 nodes` / `Load more (500+)` to 1000 nodes / `Load more (1000+)`.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -510,5 +520,6 @@ format, WAL, both OCC validations, recovery, durability and multi-reader/multi-w
 | Exact expression/value dispatch (KG-6a/R-15) | complete and integrated | `6165bce`, `4de7be9`, `1940466`, `6e29c7e`, `b3e70e5`; sealed exact-type tables with original fallback; KG node page `713 -> 667 ms`, fan-out `2.783 -> 2.543 s`; 381 combined focused tests |
 | Pulse generation revalidation default (D-4) | complete on companion Community branch | `perf/v0.3.3-kg-load-grafx@52dbd22`; 60 focused tests with paired Core; strict mode remains available and documented |
 | Active tombstone filter collapse (KG-5) | complete on companion Core branch | `perf/v0.3.3-kg-active-filter@56b4764`; seven focused tests plus Grafx/Ladybug semantic probes |
+| Pulse cursor pagination parity | complete, installed and browser-validated | Core `7ebc849` + Community `6ae14ed`; typed UTC cursor boundary and Grafx public-value normalization; disjoint real pages `500/777 + 500/775`, UI advanced to 1000 nodes |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |
