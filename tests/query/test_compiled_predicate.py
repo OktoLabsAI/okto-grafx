@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -228,7 +229,7 @@ def _compiled(engine, expression, context):
     compiled = engine._compiled_predicate(expression, context)
 
     def run(row: _Row, ctx: object) -> object:
-        memo = [_COMPILED_MISS] * compiled.slots if compiled.slots else None
+        memo = [_COMPILED_MISS] * compiled.slots + [0] if compiled.slots else None
         return compiled.function(row, ctx, memo)
 
     return run
@@ -302,6 +303,155 @@ def test_shared_subtrees_are_evaluated_once_per_row_and_only_when_reached(
     boom = B(">=", BOOM, Literal(value=1))
     skipped = B("OR", B("AND", LIT[False], boom), B("AND", LIT[True], LIT[True]))
     assert _compiled(engine, skipped, context)(rows[0], context) is True
+
+
+class _CountingMap(dict):
+    """A hostile mapping parameter: every read is observable, and it can change its answer."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.reads = 0
+        self.answers: list[object] = []
+
+    def items(self):
+        self.reads += 1
+        if self.answers:
+            return [("k", self.answers.pop(0))]
+        return super().items()
+
+
+def test_a_mapping_subject_is_read_exactly_as_often_as_the_walk_reads_it(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review: no double evaluation of the subject, no CSE over an observable read."""
+    rows, context = _capture(database, monkeypatch)
+    engine = database._queries  # type: ignore[attr-defined]
+    hostile = _CountingMap(k=1)
+    context.parameters["mapa"] = hostile  # type: ignore[attr-defined]
+    single = Property(subject=Parameter(name="mapa"), key="k")
+    read_twice = B("AND", B("=", single, Literal(value=1)), B("=", single, Literal(value=1)))
+    coalesced_twice = B(
+        "AND",
+        B("=", CO(single, Literal(value=0)), Literal(value=1)),
+        B("=", CO(single, Literal(value=0)), Literal(value=1)),
+    )
+    # A repeated subtree that falls back to the canonical walk (arithmetic is not compiled)
+    # around the mapping read: the walk does not count its reads, so it is never memoized.
+    fallback_twice = B(
+        "AND",
+        B(">", B("+", single, Literal(value=1)), Literal(value=0)),
+        B(">", B("+", single, Literal(value=1)), Literal(value=0)),
+    )
+    cases = (
+        ("single", single),
+        ("twice", read_twice),
+        ("coalesce", coalesced_twice),
+        ("fallback", fallback_twice),
+    )
+    for name, expression in cases:
+        hostile.reads = 0
+        expected = _snapshot(lambda r, c: _evaluate(expression, r, c), rows[0], context)
+        walk_reads = hostile.reads
+        hostile.reads = 0
+        observed = _snapshot(_compiled(engine, expression, context), rows[0], context)
+        assert observed == expected, name
+        assert hostile.reads == walk_reads, (name, walk_reads, hostile.reads)
+    # A mapping that changes its answer between reads: the walk sees 1 then 2 and answers False;
+    # a compiled form that memoized the first read would answer True.
+    hostile.answers = [1, 2]
+    expected = _snapshot(lambda r, c: _evaluate(read_twice, r, c), rows[0], context)
+    hostile.answers = [1, 2]
+    observed = _snapshot(_compiled(engine, read_twice, context), rows[0], context)
+    assert observed == expected == ("valor", "bool", "False")
+    # The same mutation through the canonical fallback: 1 + 1 > 0 then -5 + 1 > 0 is False.
+    hostile.answers = [1, -5]
+    expected = _snapshot(lambda r, c: _evaluate(fallback_twice, r, c), rows[0], context)
+    hostile.answers = [1, -5]
+    observed = _snapshot(_compiled(engine, fallback_twice, context), rows[0], context)
+    assert observed == expected == ("valor", "bool", "False")
+    # And the row-bound property beside it still shares its slot: only the mapping read is
+    # excluded from memoization, not the whole predicate.
+    mixed = B(
+        "AND",
+        B("=", CO(P("revocation_reason"), Literal(value="")), Literal(value="")),
+        B("AND", B("=", single, Literal(value=1)), B("=", CO(P("revocation_reason"), Literal(value="")), Literal(value=""))),
+    )
+    reads = 0
+    original_value = query_engine_module.RowBinding.value
+
+    def counted_value(self, key):
+        nonlocal reads
+        reads += 1
+        return original_value(self, key)
+
+    monkeypatch.setattr(query_engine_module.RowBinding, "value", counted_value)
+    hostile.answers = []
+    hostile.reads = 0
+    assert _compiled(engine, mixed, context)(rows[0], context) is True
+    assert reads == 1 and hostile.reads == 1
+
+
+def test_concurrent_readers_keep_the_bound_and_share_one_compiled_form(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review: the cache is published under a guard, so the hard bound holds and no
+    concurrent eviction can surface a KeyError; the guard never wraps compilation."""
+    _rows, context = _capture(database, monkeypatch)
+    engine = database._queries  # type: ignore[attr-defined]
+    original_compile = query_engine_module._compile_predicate
+    compiles = 0
+    compile_lock = threading.Lock()
+
+    def slow_compile(expression, ctx):
+        nonlocal compiles
+        with compile_lock:
+            compiles += 1
+        for _ in range(200):  # widen the window in which two threads compile the same plan
+            pass
+        return original_compile(expression, ctx)
+
+    monkeypatch.setattr(query_engine_module, "_compile_predicate", slow_compile)
+    limit = query_engine_module._COMPILED_PREDICATE_MAX_ENTRIES
+    workers = 8
+    expressions = [
+        B("=", P("revocation_reason"), Literal(value=f"v{index}")) for index in range(limit * 3)
+    ]
+    shared = B("=", P("revocation_reason"), Literal(value="shared"))
+    barrier = threading.Barrier(workers)
+    flood = threading.Barrier(workers)  # every thread holds its shared form before any eviction
+    failures: list[BaseException] = []
+    shared_forms: list[object] = []
+    peak = 0
+    peak_lock = threading.Lock()
+
+    def reader(offset: int) -> None:
+        nonlocal peak
+        try:
+            barrier.wait()
+            shared_forms.append(engine._compiled_predicate(shared, context))
+            flood.wait()
+            for index in range(offset, len(expressions), workers):
+                engine._compiled_predicate(expressions[index], context)
+                size = len(engine._compiled_predicates)
+                with peak_lock:
+                    peak = max(peak, size)
+                if index % 7 == 0:
+                    engine._compiled_predicate(shared, context)
+        except BaseException as failure:  # noqa: BLE001 - every failure must reach the assert
+            failures.append(failure)
+
+    threads = [threading.Thread(target=reader, args=(offset,)) for offset in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert failures == []
+    assert peak <= limit
+    assert len(engine._compiled_predicates) <= limit
+    assert len(shared_forms) == workers
+    assert all(form is shared_forms[0] for form in shared_forms)
+    assert compiles >= len(expressions) + 1
+    assert not engine._compiled_predicates_lock.locked()
 
 
 def test_the_compiled_cache_is_bounded_and_keyed_by_expression_identity(

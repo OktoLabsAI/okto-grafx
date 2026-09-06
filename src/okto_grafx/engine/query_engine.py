@@ -2950,6 +2950,7 @@ class QueryEngine:
         "_owned_prepared_plans",
         "_statement_authority_memo",
         "_compiled_predicates",
+        "_compiled_predicates_lock",
     )
 
     def __init__(
@@ -3008,6 +3009,9 @@ class QueryEngine:
             guard=self._endpoint_guard,
         )
         self._compiled_predicates: dict[int, _CompiledPredicate] = {}
+        # Guards only the lookup, publication and eviction of compiled predicates: never held
+        # while compiling, evaluating a row or doing I/O.
+        self._compiled_predicates_lock = Lock()
         self._endpoint_memo: dict[int, _EndpointTxnMemo] = {}
         self._endpoint_budget = _EndpointLocatorBudget(
             max_bytes=_ENDPOINT_LOCATOR_MAX_BYTES,
@@ -3155,16 +3159,28 @@ class QueryEngine:
         it was compiled with still hold.  Bounded by ``_COMPILED_PREDICATE_MAX_ENTRIES``; the
         oldest entry leaves first.  It holds no row, value or snapshot: nothing here is
         authority beyond the life of the statement that runs it.
+
+        Readers of one engine may run on several threads: the dictionary is only read, published
+        or trimmed under ``_compiled_predicates_lock``, which is never held while compiling (so
+        the concurrent compile of one predicate is at most repeated, never serialized with row
+        evaluation) and the first published entry wins so every thread runs the same closures.
         """
         cache = self._compiled_predicates
-        entry = cache.get(id(expression))
-        if entry is not None and entry.serves(expression, context):
-            return entry
-        entry = _compile_predicate(expression, context)
-        if len(cache) >= _COMPILED_PREDICATE_MAX_ENTRIES:
-            cache.pop(next(iter(cache)))
-        cache[id(expression)] = entry
-        return entry
+        key = id(expression)
+        with self._compiled_predicates_lock:
+            entry = cache.get(key)
+            if entry is not None and entry.serves(expression, context):
+                return entry
+        compiled = _compile_predicate(expression, context)
+        with self._compiled_predicates_lock:
+            entry = cache.get(key)
+            if entry is not None and entry.serves(expression, context):
+                return entry
+            cache.pop(key, None)
+            while len(cache) >= _COMPILED_PREDICATE_MAX_ENTRIES:
+                cache.pop(next(iter(cache)))
+            cache[key] = compiled
+        return compiled
 
     def _planned_for(
         self,
@@ -6879,13 +6895,29 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
 
     key_of(expression)
     slot_of: dict[tuple, int] = {}
+    fallback: set[int] = set()
+    instrumented: dict[int, bool] = {}
+
+    def fully_compiled(node: Expression) -> bool:
+        """Whether every read below ``node`` runs through instrumented closures.
+
+        A subtree that reaches the canonical walk anywhere is never memoized: the walk does
+        not count the mapping reads it performs, so a repeated fallback could turn two
+        observable reads into one.
+        """
+        known = instrumented.get(id(node))
+        if known is None:
+            known = instrumented[id(node)] = id(node) not in fallback and all(
+                fully_compiled(child) for child in node.children()
+            )
+        return known
 
     def shared(node: Expression, function: Callable[..., object]) -> Callable[..., object]:
         kind = type(node)
         if kind is Literal or kind is Parameter or kind is Variable:
             return function
         key = keys[id(node)]
-        if counts.get(key, 0) < 2:
+        if counts.get(key, 0) < 2 or not fully_compiled(node):
             return function
         slot = slot_of.get(key)
         if slot is None:
@@ -6894,7 +6926,13 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         def memoized(row: _Row, ctx: _Context, memo: list[object]) -> object:
             value = memo[slot]
             if value is _COMPILED_MISS:
-                value = memo[slot] = function(row, ctx, memo)
+                reads_before = memo[-1]
+                value = function(row, ctx, memo)
+                # A subtree that read a property of anything but a matched row (a mapping
+                # parameter, a mapping variable) is never memoized: such a read may be observable
+                # or mutable, and the canonical walk performs it once per occurrence.
+                if memo[-1] == reads_before:
+                    memo[slot] = value
             return value
 
         return memoized
@@ -6930,8 +6968,11 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                     return None
                 if type(value) is RowBinding:
                     return value.value(key)
-                # A mapping subject or a refusal: the canonical walk answers exactly as before.
-                return _evaluate_property(node, row, ctx, None)
+                # A mapping subject or a refusal, decided from the value already obtained (the
+                # subject is never evaluated twice); the read is counted so no memo slot keeps it.
+                if memo is not None:
+                    memo[-1] += 1  # type: ignore[index]
+                return _property_of(value, node)
 
             return prop
         if kind is NullCheck:
@@ -7037,6 +7078,8 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
 
             return coalesce
 
+        fallback.add(id(node))
+
         def canonical(row: _Row, ctx: _Context, memo: object) -> object:
             return _evaluate(node, row, ctx)
 
@@ -7050,7 +7093,11 @@ def _predicate_admits(expression: Expression, row: _Row, context: _Context) -> b
     """Apply the executor's exact three-valued WHERE rule to one already-bound row."""
     if row.computed is None:
         compiled = context.engine._compiled_predicate(expression, context)
-        memo = [_COMPILED_MISS] * compiled.slots if compiled.slots else None
+        if compiled.slots:
+            memo: list[object] | None = [_COMPILED_MISS] * compiled.slots
+            memo.append(0)  # the count of non-row property reads on this row
+        else:
+            memo = None
         value = compiled.function(row, context, memo)
     else:
         value = _evaluate(expression, row, context)
@@ -12383,6 +12430,11 @@ def _evaluate_property(
         # KGRUN-M1: the matched row is the common case; the abstract Mapping test below walks
         # the ABC registry and is only reached by a map subject or a refusal.
         return subject.value(expression.key)
+    return _property_of(subject, expression)
+
+
+def _property_of(subject: object, expression: Property) -> object:
+    """Read one property of an already evaluated, non-null subject."""
     if isinstance(subject, Mapping):
         return _map_property_value(subject, expression)
     if not isinstance(subject, RowBinding):
