@@ -293,6 +293,13 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    acerto, ausência e colisão sem permitir `listdir`; a matriz proporcional cobre também troca
    por junction/symlink, descritores e durabilidade. Nesse diretório, 300 resoluções do último
    filho caíram de mediana 0,411 s para 0,185 s (`2,22x`).
+   O checkpoint também executou os dois testes de recovery que já falhavam na base. Um fixture
+   chamava de válida uma página HEAP sem o descritor estrutural hoje verificado pela pré-validação
+   e foi corrigido para exercitar a imagem inválida posterior pretendida. O segundo caso expôs
+   um defeito real: o diretório de replay quente podia ignorar hooks físicos especializados ou
+   injetados. `a082ff8` agora recusa apenas esse diretório quando qualquer hook substituído não é
+   o canônico, preservando o replay escalar e a falha fail-closed. Os 27 testes do batch comum e
+   a regressão combinada de replay/recovery ficaram verdes.
 4. Re-run the direct KG page, relationship fan-out, vector, transfer, open, recovery and
    concurrent-reader workloads once for the accumulated implementation.
 5. Decide whether CURSOR-1 and BATCH-REL-1 remain material; do not add smaller residuals.

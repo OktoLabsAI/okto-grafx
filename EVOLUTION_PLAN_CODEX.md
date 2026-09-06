@@ -19,6 +19,10 @@
   O(1), com ganhos isolados de `2,80x` e `3,01x`. `fd111cd` removeu a enumeração O(N) de irmãos
   da resolução exata no Windows por uma prova nativa cercada pela mesma validação de identidade,
   mantendo fallback portátil e as recusas de caixa/reparse; com 688 irmãos mediu `2,22x`.
+  No mesmo checkpoint, `a082ff8` corrigiu o replay quente para nunca ignorar um hook físico
+  especializado/injetado; a alternativa escalar continua obrigatória nesses casos. Um fixture
+  antigo de recovery também passou a construir uma página HEAP estruturalmente válida, mantendo
+  a recusa tardia que ele pretendia provar.
   A otimização de planejamento WAL está isolada no handoff
   `hof_ab1156bc405346f3b767bbef80a0eeb3` e só será integrada após paridade byte a byte e matriz de
   crash/recuperação. Rastreabilidade e testes estão em `docs/PERFORMANCE_ROUND_0_0_4.md`.
