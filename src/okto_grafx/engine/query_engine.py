@@ -10033,6 +10033,8 @@ def _visible_identity_with_ref(
     context: _Context,
     table: TableDef,
     record_id: RecordId,
+    *,
+    landing: bool = False,
 ) -> tuple[RecordRef, HeapVersion] | None:
     """Resolve one identity through the statement's fixed index or canonical heap access path.
 
@@ -10040,6 +10042,13 @@ def _visible_identity_with_ref(
     visible versions are corruption.  No heap scan follows either result.  Tables without that
     access path retain the bounded reusable prefix locator below, including all of its existing
     capacity, lifecycle and fail-closed stored-data behaviour.
+
+    ``landing=True`` (RELSEEK-M4) is for a caller that consumes only the header fields of the
+    version it proves -- the physical endpoint witness of an edge -- and never a column: on the
+    identity-index path the heap then validates vector bodies without building the vector
+    objects.  The version it returns carries the decoder's sentinel in vector positions, which
+    ``value_type_of`` refuses, so it can never be encoded or published as a row.  The two other
+    access paths below have no such door and decode completely, which is only slower.
     """
     identity_index = _endpoint_identity_index(engine, context, table)
     if identity_index is not None:
@@ -10051,6 +10060,7 @@ def _visible_identity_with_ref(
                 identity_index,
                 record_id_key(record_id),
                 context.snapshot,
+                landing=landing,
             )
         )
         if not found:
@@ -10176,8 +10186,15 @@ def _require_physical_endpoint(
     expected_ref: RecordRef,
     end: str,
 ) -> HeapVersion:
-    """Validate a binding's physical witness against the canonical snapshot-visible identity."""
-    canonical = _visible_identity_with_ref(engine, context, endpoint_table, identity)
+    """Validate a binding's physical witness against the canonical snapshot-visible identity.
+
+    Only the header fields of the canonical version are consumed here and by the caller (its
+    physical reference and its record id), so the landing form of the identity door is used:
+    vector bodies are validated without building the vector objects (RELSEEK-M4).
+    """
+    canonical = _visible_identity_with_ref(
+        engine, context, endpoint_table, identity, landing=True
+    )
     if canonical is None:
         # A visible row outside the table's canonical page chain is corruption, not absence.
         disconnected = engine.heap._revalidate_visible_ref(

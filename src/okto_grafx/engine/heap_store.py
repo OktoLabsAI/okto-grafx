@@ -62,6 +62,7 @@ from okto_grafx.domain.model.schema import (
     TableDef,
     decode_relationship_endpoints,
     decode_tuple,
+    decode_tuple_landing,
     encode_tuple,
 )
 from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
@@ -3204,8 +3205,29 @@ class HeapStore:
             table, RecordHeader.decode(content), content
         )
 
+    def read_landing(self, ref: RecordRef) -> HeapVersion:
+        """Return the version at that location for an identity landing (RELSEEK-M4).
+
+        Everything :meth:`read` checks is checked here, in the same order, with the same
+        refusals; the only difference is that vector bodies are validated without building the
+        vector object, because a landing consumes the header fields of the version it proves and
+        never a component.  The vector positions of ``values`` carry the decoder's private
+        sentinel, which ``value_type_of`` refuses, so such a version cannot be encoded or
+        published as a row: it is a proof, not a row.
+        """
+        table_id, content = self._read_slot(ref)
+        table = self._catalog.catalog.table_by_id(table_id)
+        return self._decode_version_with_header(
+            table, RecordHeader.decode(content), content, landing=True
+        )
+
     def _decode_version_with_header(
-        self, table: TableDef, header: RecordHeader, content: bytes
+        self,
+        table: TableDef,
+        header: RecordHeader,
+        content: bytes,
+        *,
+        landing: bool = False,
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
         payload = self._validated_payload(table, header, content)
@@ -3213,7 +3235,11 @@ class HeapStore:
             record_id=header.record_id,
             xmin=header.xmin,
             xmax=header.xmax,
-            values=decode_tuple(table, payload),
+            values=(
+                decode_tuple_landing(table, payload)
+                if landing
+                else decode_tuple(table, payload)
+            ),
             prev=header.previous,
             schema_version=header.schema_version,
             deleted=bool(header.flags & RECORD_FLAG_DELETED),

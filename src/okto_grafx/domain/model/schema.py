@@ -29,6 +29,7 @@ from okto_grafx.domain.model.value import (
     ValueType,
     _U32,
     _decode_expected_value_body,
+    _decode_vector_mode,
     _require,
     _validate_value,
     decode_value,
@@ -659,6 +660,22 @@ def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:
     return _decode_tuple(table, buf, materialized_positions=None)
 
 
+def decode_tuple_landing(table: TableDef, buf: bytes) -> tuple[Value, ...]:
+    """Return the row for an identity landing: every check of ``decode_tuple``, no vector object.
+
+    An identity landing consumes the header of the version it validates (its record id and its
+    physical reference) and never a vector component, so the vector body is validated exactly as
+    ``decode_tuple`` validates it (tag, header, dimension, space reference, body length, trailing
+    bytes) and the 384-float object is simply not built.  The vector positions carry the shared
+    decoder's ``_ValidatedValue`` sentinel, which is deliberately NOT a stored value: any attempt
+    to type, encode or publish it is refused by ``value_type_of`` (RELSEEK-M4).  Every scalar
+    column is decoded and judged exactly as ``decode_tuple`` does.
+    """
+    return _decode_tuple(
+        table, buf, materialized_positions=None, materialize_vectors=False
+    )
+
+
 def decode_relationship_endpoints(
     table: TableDef, buf: bytes
 ) -> tuple[RecordId, RecordId]:
@@ -692,8 +709,16 @@ def _decode_tuple(
     buf: bytes,
     *,
     materialized_positions: frozenset[int] | None,
+    materialize_vectors: bool = True,
 ) -> tuple[Value, ...]:
-    """Validate one tuple and retain either every value or selected positions."""
+    """Validate one tuple and retain either every value or selected positions.
+
+    ``materialize_vectors=False`` is the identity-landing form (RELSEEK-M4): a vector column
+    whose stored tag matches the plan is validated by ``_decode_vector_mode`` exactly as the
+    materialising branch validates it, and its position carries the decoder's private sentinel
+    instead of a ``VectorValue``.  A mismatched tag still takes the generic decoder, so the
+    corruption-before-mismatch rule below is untouched.
+    """
     values: list[Value] = []
     offset = 0
     if materialized_positions is None:
@@ -707,7 +732,11 @@ def _decode_tuple(
             else:
                 stored_tag = buf[offset]
                 if stored_tag == expected_tag:
-                    if expected_type is ValueType.STRING:
+                    if not materialize_vectors and expected_type in VECTOR_VALUE_TYPES:
+                        value, offset = _decode_vector_mode(
+                            buf, offset + 1, expected_type, materialize=False
+                        )
+                    elif expected_type is ValueType.STRING:
                         # STRING dominates wide graph rows.  Keep the generic decoder as the
                         # single oracle for mismatched tags and compound values, but execute this
                         # already-planned scalar body in the table loop so every ordinary string

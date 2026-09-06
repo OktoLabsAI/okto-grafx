@@ -84,6 +84,7 @@ from okto_grafx.domain.ids import (
 from okto_grafx.domain.index.contract import SecondaryIndex, StagingTransaction
 from okto_grafx.domain.index.definition import (
     INDEX_DIRECTORY,
+    RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
     index_definition_matches_table,
@@ -7143,19 +7144,32 @@ class IndexManager:
         )
 
     def validated_versions(
-        self, index: IndexStore, key: bytes, snapshot: SnapshotLike
+        self,
+        index: IndexStore,
+        key: bytes,
+        snapshot: SnapshotLike,
+        *,
+        landing: bool = False,
     ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
         """Return the exact candidates and the versions read while validating them.
 
         Keeping the pair inside one stable-view callback is the important part: the page-0
         certificate still brackets both index traversal and heap validation, and callers cannot
         accidentally turn one exact hit into two heap decodes.
+
+        ``landing=True`` is the identity-landing form (RELSEEK-M4): the heap validates every
+        version through :meth:`HeapStore.read_landing`, which performs every check of ``read``
+        but does not build vector objects.  It is accepted only for a record-id derived index,
+        whose key never touches a column, so the sentinel a landing carries in vector positions
+        can neither be compared nor published: the versions it returns are proofs consumed by
+        their header fields, never rows.
         """
         return self._validated_items(
             index,
             key,
             snapshot,
             project=lambda ref, version: (ref, version),
+            landing=landing,
         )
 
     def validated_versions_many(
@@ -7241,10 +7255,24 @@ class IndexManager:
         snapshot: SnapshotLike,
         *,
         project: Callable[[RecordRef, HeapVersion], _ReadResult],
+        landing: bool = False,
     ) -> tuple[_ReadResult, ...]:
         """Validate exact candidates once and project each accepted heap proof."""
         read_lsn = index._require_exact_read_lsn(snapshot)
         definition = index.definition
+        if landing and definition.key_derivation != RECORD_ID_KEY_DERIVATION:
+            # A landing version carries an unmaterialised vector sentinel; re-deriving a
+            # column key from it would compare a proof shape with stored bytes.  Refuse before
+            # any view opens rather than let a sentinel reach a key comparison.
+            raise GrafxIndexError(
+                f"Index {definition.name!r} derives its key from columns and cannot validate "
+                "identity landings.",
+                field="key_derivation",
+                value=definition.key_derivation,
+                index=definition.name,
+                file=index.file,
+            )
+        read = self._heap.read_landing if landing else self._heap.read
         wanted = index._require_key(key)
 
         def confirm(
@@ -7254,7 +7282,7 @@ class IndexManager:
             self._prepare_heap_view(index.file, certificate)
             confirmed: list[_ReadResult] = []
             for entry in index._candidates_unchecked(wanted):
-                version = self._heap.read(entry.ref)
+                version = read(entry.ref)
                 if version.table_id != definition.table_id:
                     raise GrafxCorruptionDetected(
                         f"Index {definition.name!r} points at a row of table "
