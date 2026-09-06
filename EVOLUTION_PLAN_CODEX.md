@@ -9,6 +9,15 @@
 
 ## Estado de execução — 2026-09-03
 
+- **Linha 0.0.3 iniciada com foco no carregamento visível do Knowledge Graph do Pulse.** A base
+  0.0.2 está congelada em `feature/v0.0.2@acf63c8`; a branch `feature/v0.0.3` e o bump foram
+  publicados em `1f2172d`. O baseline real isolou fan-out fixo de 70 consultas de arestas por
+  request, estatísticas separadas de aproximadamente 12 s e uma duplicação da rodada inicial no
+  frontend. Limites de 100 e 500 nós custaram praticamente o mesmo (~6,1 s), indicando que o
+  gargalo medido antecede a renderização. Escopo, números, invariantes e candidatos limitados estão
+  registrados em `docs/PERFORMANCE_ROUND_0_0_3.md`; a seleção será fechada com a análise do Claude,
+  sem abrir mão de multiwriter/multireader, WAL, OCC, durabilidade ou consistência.
+
 - **Lote de escala 53 — histórico de intents indexado por tabela.** `a0b0508`, endurecido em
   `eb1c162`, reutiliza a lista
   revisionada já pertencente à transação para indexar uma vez o sufixo append-only por `table_id`
