@@ -234,6 +234,39 @@ def test_the_projection_is_admitted_to_the_row_budget_once_per_scanned_row(
     assert deferred["ProjectRows"] == 36
 
 
+def test_a_refusal_on_the_first_row_still_precedes_the_row_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An item that refuses on row one refuses there, before the scan can exhaust a budget.
+
+    Had the undeclared column of a labelled match been deferred, the scan would have delivered
+    its sixth row -- and exceeded max_intermediate_rows -- before any projection refused.
+    """
+    handle = okto_grafx.connect(tmp_path / "budget", page_size=4096, max_intermediate_rows=5)
+    try:
+        with handle.begin("write") as transaction:
+            transaction.execute(
+                "CREATE NODE TABLE Doc(id STRING, created_at INT64, PRIMARY KEY(id))"
+            )
+        with handle.begin("write") as transaction:
+            for index in range(21):
+                transaction.execute(
+                    "CREATE (:Doc {id: $id, created_at: $at})",
+                    {"id": f"d-{index:02d}", "at": index},
+                )
+        text = "MATCH (n:Doc) RETURN n.id, n.nope ORDER BY n.created_at DESC LIMIT 2"
+        deferred = _outcome(handle, text, {})
+        with monkeypatch.context() as scoped:
+            _canonical(scoped)
+            canonical = _outcome(handle, text, {})
+        assert deferred == canonical
+        assert deferred[0] == "erro"
+        assert "no column named" in deferred[1]
+        assert "max_intermediate_rows" not in deferred[1]
+    finally:
+        handle.close()
+
+
 def test_an_alias_a_sort_key_reads_is_projected_on_every_row(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

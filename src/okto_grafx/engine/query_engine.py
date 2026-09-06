@@ -10091,12 +10091,13 @@ class _DeferredProjection:
     KGRUN-3.  Between a projection and the bounded sort above it, most rows are discarded, yet
     every one of them was projected.  An item is deferred only when its evaluation is TOTAL on
     the row -- it can neither raise nor observe anything -- so evaluating it after the retention
-    instead of before is not observable: a literal; a property of a variable bound to a matched
-    row that declares the column (or to a polymorphic match, where an undeclared column is
-    null) or to null; ``label`` of such a variable; a positional ``coalesce`` of those whose
-    result type the planner resolved to something other than DOUBLE (so no coercion can fail).
-    Everything else -- a parameter, an operator, a function, a variable the row does not bind, a
-    map subject, an aggregation memo -- is evaluated for every row exactly where the canonical
+    instead of before is not observable: a literal; a parameter (bound and refused before the
+    first row); a property of a variable bound to a matched row that declares the column (or
+    to a polymorphic match, where an undeclared column is null) or to null; ``label`` of such a
+    variable; a positional ``coalesce`` of those whose result type the planner resolved to
+    something other than DOUBLE (so no coercion can fail).  Everything else -- an operator, a
+    function, a variable the row does not bind, a map subject, an aggregation memo -- is
+    evaluated for every row exactly where the canonical
     projection evaluated it, in the same order, so every refusal happens at the same row with
     the same message.  An item a sort key names as an alias is evaluated for every row as well,
     because the key reads it from the projected columns.
@@ -10171,7 +10172,7 @@ def _deferrable(
 ) -> bool:
     """Say whether an item is total on every row its proof admits, recording the proof."""
     kind = type(expression)
-    if kind is Literal:
+    if kind is Literal or kind is Parameter:
         return True
     if kind is Property:
         subject = expression.subject
@@ -10197,6 +10198,7 @@ def _deferrable(
                 return False
             return bool(expression.arguments) and all(
                 type(argument) is Literal
+                or type(argument) is Parameter
                 or (
                     type(argument) is Property
                     and type(argument.subject) is Variable
