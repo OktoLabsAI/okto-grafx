@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from struct import Struct
 
 import pytest
 
+from okto_grafx.domain.page import MAX_PAGE_SIZE, PAGE_HEADER_SIZE, SLOT_ENTRY_SIZE, Page
+from okto_grafx.domain.page import slotted as slotted_page
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
@@ -42,14 +45,18 @@ OWNED_MODULES: tuple[Path, ...] = (
 
 MUTABLE_CONTAINERS: tuple[type, ...] = (list, set, bytearray, dict)
 
-DECLARED_BINDINGS: frozenset[str] = frozenset({"__all__", "VECTOR_DTYPES"})
-"""The two module-level containers of the storage core, both declarations rather than state.
+DECLARED_BINDINGS: frozenset[str] = frozenset(
+    {"__all__", "VECTOR_DTYPES", "_DIRECTORY_STRUCTS"}
+)
+"""The explicit module containers which cannot carry database-owned state.
 
 ``__all__`` is the export list every module declares (amendment A6). ``VECTOR_DTYPES`` is the
 fixed mapping from the storage dtype of an embedding space to the value type its vectors encode
-to; it is written once at import and only ever read. Neither of them accumulates anything, which
-is what this gate is looking for: a container that grows as databases are used would be shared
-between them.
+to; it is written once at import and only ever read. ``_DIRECTORY_STRUCTS`` is the bounded page-v1
+codec memo added by the packing optimization: its integer key is only a valid slot count and its
+immutable `Struct` value is completely determined by that key. The separate test below proves
+that it cannot carry a database, file, page or caller value. Every other accumulating container
+remains forbidden by the structural scan.
 """
 
 
@@ -72,6 +79,24 @@ def test_no_module_of_the_storage_core_binds_a_mutable_container(path: Path) -> 
             assert node.value.func.id not in {"list", "dict", "set", "bytearray"}, (
                 f"{path.name} builds the mutable container {names} at module level"
             )
+
+
+def test_the_only_format_memo_is_bounded_and_contains_no_database_identity() -> None:
+    page = Page(page_size=512)
+    page.insert_slot(b"format only")
+    page.to_bytes()
+
+    layouts = slotted_page._DIRECTORY_STRUCTS
+    maximum_slots = (MAX_PAGE_SIZE - PAGE_HEADER_SIZE) // SLOT_ENTRY_SIZE
+    assert layouts
+    assert all(type(slot_count) is int for slot_count in layouts)
+    assert all(0 < slot_count <= maximum_slots for slot_count in layouts)
+    assert all(isinstance(layout, Struct) for layout in layouts.values())
+    assert all(
+        layout.format == f"<{slot_count * 2}H"
+        and layout.size == slot_count * SLOT_ENTRY_SIZE
+        for slot_count, layout in layouts.items()
+    )
 
 
 @pytest.mark.parametrize(
