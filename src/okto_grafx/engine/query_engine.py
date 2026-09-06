@@ -6789,8 +6789,9 @@ def _filter_rows(
     error: it is the unknown of the three-valued logic, and the row goes because unknown is not
     true -- which is also why this cannot be written as ``if value``.
     """
+    admits = _predicate_admitter(node.predicate, context)
     for row in engine._rows(node.child, context):
-        if _predicate_admits(node.predicate, row, context):
+        if admits(row):
             yield row
 
 
@@ -6854,8 +6855,23 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             return known
         kind = type(node)
         if kind is Literal:
+            # A closed key, built without calling into the value: exact safe types by value
+            # (a float by its bits, so 0.0 and -0.0 stay apart), anything else by identity, so
+            # two distinct objects never share a slot.
             value = node.value
-            key: tuple = ("L", type(value).__name__, repr(value))
+            value_kind = type(value)
+            if (
+                value is None
+                or value_kind is bool
+                or value_kind is int
+                or value_kind is str
+                or value_kind is bytes
+            ):
+                key: tuple = ("L", value_kind.__name__, value)
+            elif value_kind is float:
+                key = ("L", "float", value.hex())
+            else:
+                key = ("L", "id", id(value))
         elif kind is Parameter:
             key = ("P", node.name)
         elif kind is Variable:
@@ -6886,38 +6902,27 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 resolved,
             )
         else:
+            # Anything else runs through the canonical walk as a whole and is never shared, so
+            # nothing below it is keyed or even visited here.
             key = ("X", id(node))
-            for child in node.children():
-                key_of(child)
         keys[id(node)] = key
         counts[key] = counts.get(key, 0) + 1
         return key
 
     key_of(expression)
     slot_of: dict[tuple, int] = {}
-    fallback: set[int] = set()
+    fallbacks = 0
     instrumented: dict[int, bool] = {}
-
-    def fully_compiled(node: Expression) -> bool:
-        """Whether every read below ``node`` runs through instrumented closures.
-
-        A subtree that reaches the canonical walk anywhere is never memoized: the walk does
-        not count the mapping reads it performs, so a repeated fallback could turn two
-        observable reads into one.
-        """
-        known = instrumented.get(id(node))
-        if known is None:
-            known = instrumented[id(node)] = id(node) not in fallback and all(
-                fully_compiled(child) for child in node.children()
-            )
-        return known
 
     def shared(node: Expression, function: Callable[..., object]) -> Callable[..., object]:
         kind = type(node)
         if kind is Literal or kind is Parameter or kind is Variable:
             return function
         key = keys[id(node)]
-        if counts.get(key, 0) < 2 or not fully_compiled(node):
+        # A subtree that reaches the canonical walk anywhere is never memoized: the walk does
+        # not count the mapping reads it performs, so a repeated fallback could turn two
+        # observable reads into one.
+        if counts.get(key, 0) < 2 or not instrumented[id(node)]:
             return function
         slot = slot_of.get(key)
         if slot is None:
@@ -6938,6 +6943,13 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         return memoized
 
     def compile_node(node: Expression) -> Callable[..., object]:
+        fallbacks_before = fallbacks
+        function = compile_kind(node)
+        # Instrumented only when neither this node nor anything compiled below it fell back.
+        instrumented[id(node)] = fallbacks == fallbacks_before
+        return function
+
+    def compile_kind(node: Expression) -> Callable[..., object]:
         kind = type(node)
         if kind is Literal:
             constant = node.value
@@ -7078,7 +7090,8 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
 
             return coalesce
 
-        fallback.add(id(node))
+        nonlocal fallbacks
+        fallbacks += 1
 
         def canonical(row: _Row, ctx: _Context, memo: object) -> object:
             return _evaluate(node, row, ctx)
@@ -7089,28 +7102,52 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
     return _CompiledPredicate(expression, function, len(slot_of), tuple(calls))
 
 
+def _predicate_admitter(
+    expression: Expression, context: _Context
+) -> Callable[[_Row], bool]:
+    """Return the exact three-valued WHERE door of one node execution.
+
+    The compiled closures are resolved once per execution (the planner bound every coalesce
+    type before the first row, so nothing they were compiled against changes mid-stream) and
+    applied to each already-bound row; a row carrying an aggregation memo is judged by the
+    canonical walk, which consults that memo at every node.
+    """
+    engine = context.engine
+    compiled: _CompiledPredicate | None = None
+
+    def admits(row: _Row) -> bool:
+        nonlocal compiled
+        if row.computed is None:
+            if compiled is None:
+                # Nothing is compiled, cached or even keyed before the first row that needs it:
+                # a child that yields no row leaves the predicate untouched, as the walk did.
+                compiled = engine._compiled_predicate(expression, context)
+            slots = compiled.slots
+            if slots:
+                memo: list[object] | None = [_COMPILED_MISS] * slots
+                memo.append(0)  # the count of non-row property reads on this row
+            else:
+                memo = None
+            value = compiled.function(row, context, memo)
+        else:
+            value = _evaluate(expression, row, context)
+        if value is None:
+            return False
+        if not isinstance(value, bool):
+            raise GrafxPlanError(
+                "A WHERE predicate is a condition, not a value; "
+                f"{expression.describe()} produced {type(value).__name__}.",
+                field="predicate",
+                value=type(value).__name__,
+            )
+        return value
+
+    return admits
+
+
 def _predicate_admits(expression: Expression, row: _Row, context: _Context) -> bool:
     """Apply the executor's exact three-valued WHERE rule to one already-bound row."""
-    if row.computed is None:
-        compiled = context.engine._compiled_predicate(expression, context)
-        if compiled.slots:
-            memo: list[object] | None = [_COMPILED_MISS] * compiled.slots
-            memo.append(0)  # the count of non-row property reads on this row
-        else:
-            memo = None
-        value = compiled.function(row, context, memo)
-    else:
-        value = _evaluate(expression, row, context)
-    if value is None:
-        return False
-    if not isinstance(value, bool):
-        raise GrafxPlanError(
-            "A WHERE predicate is a condition, not a value; "
-            f"{expression.describe()} produced {type(value).__name__}.",
-            field="predicate",
-            value=type(value).__name__,
-        )
-    return value
+    return _predicate_admitter(expression, context)(row)
 
 
 def _vector_search(
@@ -7474,9 +7511,11 @@ def _filtered_vector_search(
             }
         )
 
+    admits = _predicate_admitter(filtered.predicate, context)
+
     def row_admits(ref: RecordRef, version: HeapVersion) -> bool:
         """Evaluate only the structurally proved, row-local Pulse predicate."""
-        return _predicate_admits(filtered.predicate, row_of(ref, version), context)
+        return admits(row_of(ref, version))
 
     proof = vectors._prepare_filtered_candidates(
         space=node.column_space,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import replace
@@ -15,6 +16,7 @@ import okto_grafx.engine.query_engine as query_engine_module
 from okto_grafx.domain.errors import GrafxError
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
+    Expression,
     FunctionCall,
     ListExpression,
     Literal,
@@ -316,8 +318,10 @@ class _CountingMap(dict):
     def items(self):
         self.reads += 1
         if self.answers:
-            return [("k", self.answers.pop(0))]
+            return [(self.key, self.answers.pop(0))]
         return super().items()
+
+    key = "k"
 
 
 def test_a_mapping_subject_is_read_exactly_as_often_as_the_walk_reads_it(
@@ -326,9 +330,11 @@ def test_a_mapping_subject_is_read_exactly_as_often_as_the_walk_reads_it(
     """Codex review: no double evaluation of the subject, no CSE over an observable read."""
     rows, context = _capture(database, monkeypatch)
     engine = database._queries  # type: ignore[attr-defined]
-    hostile = _CountingMap(k=1)
+    hostile = _CountingMap(k=1, inner={"k": 1})
     context.parameters["mapa"] = hostile  # type: ignore[attr-defined]
     single = Property(subject=Parameter(name="mapa"), key="k")
+    # The subject itself is an observable read: evaluating it twice would double the count.
+    nested = Property(subject=Property(subject=Parameter(name="mapa"), key="inner"), key="k")
     read_twice = B("AND", B("=", single, Literal(value=1)), B("=", single, Literal(value=1)))
     coalesced_twice = B(
         "AND",
@@ -344,6 +350,7 @@ def test_a_mapping_subject_is_read_exactly_as_often_as_the_walk_reads_it(
     )
     cases = (
         ("single", single),
+        ("nested", nested),
         ("twice", read_twice),
         ("coalesce", coalesced_twice),
         ("fallback", fallback_twice),
@@ -363,6 +370,14 @@ def test_a_mapping_subject_is_read_exactly_as_often_as_the_walk_reads_it(
     hostile.answers = [1, 2]
     observed = _snapshot(_compiled(engine, read_twice, context), rows[0], context)
     assert observed == expected == ("valor", "bool", "False")
+    # A subject that changes between reads: the walk reads it once and sees k = 1.
+    hostile.key = "inner"
+    hostile.answers = [{"k": 1}, {"k": 2}]
+    expected = _snapshot(lambda r, c: _evaluate(nested, r, c), rows[0], context)
+    hostile.answers = [{"k": 1}, {"k": 2}]
+    observed = _snapshot(_compiled(engine, nested, context), rows[0], context)
+    assert observed == expected == ("valor", "int", "1")
+    hostile.key = "k"
     # The same mutation through the canonical fallback: 1 + 1 > 0 then -5 + 1 > 0 is False.
     hostile.answers = [1, -5]
     expected = _snapshot(lambda r, c: _evaluate(fallback_twice, r, c), rows[0], context)
@@ -417,6 +432,8 @@ def test_concurrent_readers_keep_the_bound_and_share_one_compiled_form(
         B("=", P("revocation_reason"), Literal(value=f"v{index}")) for index in range(limit * 3)
     ]
     shared = B("=", P("revocation_reason"), Literal(value="shared"))
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # interleave the readers between every few bytecodes
     barrier = threading.Barrier(workers)
     flood = threading.Barrier(workers)  # every thread holds its shared form before any eviction
     failures: list[BaseException] = []
@@ -441,10 +458,13 @@ def test_concurrent_readers_keep_the_bound_and_share_one_compiled_form(
             failures.append(failure)
 
     threads = [threading.Thread(target=reader, args=(offset,)) for offset in range(workers)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
     assert failures == []
     assert peak <= limit
     assert len(engine._compiled_predicates) <= limit
@@ -487,6 +507,89 @@ def test_filter_and_vector_style_admission_agree_with_the_walk_end_to_end(databa
     with pytest.raises(GrafxError) as missing:
         database.execute("MATCH (n:Node) WHERE n.nope = 1 RETURN n.id")
     assert missing.value.details["field"] == "column"
+
+
+class _HostileRepr:
+    """A literal value whose repr must never be asked for while keying."""
+
+    def __repr__(self) -> str:
+        raise AssertionError("repr() was called on a literal while compiling")
+
+
+class _HostileNode(Expression):
+    """An expression the compiler does not know; its children must never be walked."""
+
+    def children(self) -> tuple[Expression, ...]:
+        raise AssertionError("children() was walked on a fallback node while compiling")
+
+
+def test_keying_never_calls_into_a_literal_nor_walks_a_fallback_node(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review: the structural key is closed (no repr, no hashing of arbitrary values) and
+    a node that will run through the canonical walk is not visited below."""
+    rows, context = _capture(database, monkeypatch)
+    engine = database._queries  # type: ignore[attr-defined]
+    hostile_value = _HostileRepr()
+    hostile_literal = Literal(value=hostile_value)
+    expression = B(
+        "AND",
+        B("=", P("p16"), Literal(value=1)),
+        B("OR", B("=", P("p16"), hostile_literal), _HostileNode()),
+    )
+    compiled = query_engine_module._compile_predicate(expression, context)  # must not raise
+    plain = B(
+        "AND",
+        B("=", P("p16"), Literal(value=1)),
+        B("OR", B("=", P("p16"), Literal(value=2)), _HostileNode()),
+    )
+    slots_of = lambda candidate: query_engine_module._compile_predicate(candidate, context).slots  # noqa: E731
+    assert compiled.slots == slots_of(plain) == 1  # only the repeated property shares
+    # The same object twice is keyed by identity and may share; two distinct objects never do.
+    twice_same = B("AND", B("=", P("p16"), hostile_literal), B("=", P("p16"), hostile_literal))
+    twice_distinct = B(
+        "AND",
+        B("=", P("p16"), Literal(value=_HostileRepr())),
+        B("=", P("p16"), Literal(value=_HostileRepr())),
+    )
+    assert slots_of(twice_same) == slots_of(twice_distinct) + 1
+    # Floats are keyed by their bits, exact safe scalars by value and type.
+    same_zero = B("AND", B("=", P("p16"), Literal(value=0.0)), B("=", P("p16"), Literal(value=0.0)))
+    signed_zero = B(
+        "AND", B("=", P("p16"), Literal(value=0.0)), B("=", P("p16"), Literal(value=-0.0))
+    )
+    assert slots_of(same_zero) == slots_of(signed_zero) + 1
+    for name, candidate in (("hostile", expression), ("same", twice_same)):
+        for row in rows:
+            expected = _snapshot(lambda r, c: _evaluate(candidate, r, c), row, context)
+            observed = _snapshot(_compiled(engine, candidate, context), row, context)
+            assert observed == expected, (name, row)
+
+
+def test_a_child_without_rows_never_compiles_its_predicate(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review: zero rows means zero compilation, zero keying and zero cache entries."""
+    compiles = 0
+    original = query_engine_module._compile_predicate
+
+    def counted(expression, context):
+        nonlocal compiles
+        compiles += 1
+        return original(expression, context)
+
+    monkeypatch.setattr(query_engine_module, "_compile_predicate", counted)
+    with database.begin("write") as transaction:  # type: ignore[attr-defined]
+        transaction.execute("CREATE NODE TABLE Empty(id STRING, k INT64, PRIMARY KEY(id))")
+    engine = database._queries  # type: ignore[attr-defined]
+    before = len(engine._compiled_predicates)
+    rows = database.execute("MATCH (e:Empty) WHERE e.k = 1 RETURN e.id").rows  # type: ignore[attr-defined]
+    assert not rows
+    assert compiles == 0
+    assert len(engine._compiled_predicates) == before
+    rows = database.execute("MATCH (n:Node) WHERE n.p16 = 1 RETURN n.id").rows  # type: ignore[attr-defined]
+    assert [row[0] for row in rows] == ["n-0"]
+    assert compiles == 1
 
 
 def test_plan_filter_nodes_are_compiled_once_per_cached_plan(database: object) -> None:
