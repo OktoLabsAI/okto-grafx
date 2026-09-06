@@ -273,6 +273,45 @@ def test_probe_frontier_counts_exact_strings_and_declines_everything_else() -> N
     assert _string_probe_frontier(table, 0, ("x", Tagged("y"))) is None
     assert _string_probe_frontier(table, 0, ("x", 1)) is None
     assert _string_probe_frontier(table, 1, (1, 2)) is None
+    # Only ASCII is provably UTF-8 without encoding: accented text and a lone surrogate both
+    # return to the encoder, which accepts the former and refuses the latter exactly as before.
+    assert _string_probe_frontier(table, 0, ("x", "ação")) is None
+    assert _string_probe_frontier(table, 0, ("x", "\ud800")) is None
+
+
+@pytest.mark.parametrize(
+    "probes",
+    (
+        ["\ud800"],
+        [f"missing-{number}" for number in range(10)] + ["\ud800"],
+        ["a1", "\ud800"],
+    ),
+    ids=("alone", "inside-a-scan-sized-frontier", "beside-a-hit"),
+)
+def test_a_lone_surrogate_probe_is_refused_before_any_branch_exactly_as_before(
+    database: object, monkeypatch: pytest.MonkeyPatch, probes: list[str]
+) -> None:
+    """A probe UTF-8 cannot encode must keep the encoder's refusal, class, details and timing."""
+    from okto_grafx.domain.model.errors import SchemaMismatchError
+
+    certificates = 0
+    original = IndexManager.validated_versions_many
+
+    def observed(manager, index, keys, snapshot):
+        nonlocal certificates
+        certificates += 1
+        return original(manager, index, keys, snapshot)
+
+    monkeypatch.setattr(IndexManager, "validated_versions_many", observed)
+
+    with pytest.raises(SchemaMismatchError) as refused:
+        database.execute(QUERY, {"node_ids": probes})
+    details = refused.value.to_dict()
+    assert details["code"] == "schema_mismatch"
+    assert "surrogates not allowed" in details["message"]
+    assert certificates == 0, "the refusal must come before any index certificate"
+    # Accented text is not ASCII either, but it encodes: it takes the encoder route and answers.
+    assert database.execute(QUERY, {"node_ids": ["ação"]}).rows == ()
 
 
 @pytest.mark.parametrize(("allocated_upper", "expects_seek"), ((12, False), (60, True)))

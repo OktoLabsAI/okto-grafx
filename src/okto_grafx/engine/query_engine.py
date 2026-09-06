@@ -5353,14 +5353,18 @@ _ENCODING_COMPLETE_EXACT_TYPES: frozenset[ValueType] = frozenset(
 def _string_probe_frontier(
     table: TableDef, position: int, values: tuple[object, ...]
 ) -> int | None:
-    """Return the distinct encoded-key count of exact ``str`` probes of a STRING key column.
+    """Return the distinct encoded-key count of exact ASCII ``str`` probes of a STRING column.
 
     ``index_key`` encodes a STRING value as its tag, length and UTF-8 bytes, an injective map:
     two ``str`` probes are the same key exactly when they are equal, so the distinct count of
-    the encoding route is known without encoding.  ``None`` is not a count: it means some probe
-    is not an exact ``str`` (a subclass, a number, a compound value), and the caller must take
-    the encoding route, which stays the single oracle for cross-representation probes and for
-    the canonical fallback refusal.  A ``None`` probe is skipped exactly as the encoder skips it.
+    the encoding route is known without encoding -- provided the encoding route would have
+    accepted every probe.  Only ASCII text is provably encodable without encoding it (a lone
+    surrogate is an exact ``str`` that UTF-8 refuses), so any non-ASCII probe returns ``None``.
+    ``None`` is not a count: it means some probe is not an exact ASCII ``str`` (a subclass, a
+    number, a compound value, non-ASCII text), and the caller must take the encoding route,
+    which stays the single oracle for refusals and cross-representation probes, raising exactly
+    what it raised before and at the same point.  A ``None`` probe is skipped exactly as the
+    encoder skips it.
     """
     if table.columns[position].type is not ValueType.STRING:
         return None
@@ -5368,7 +5372,7 @@ def _string_probe_frontier(
     for value in values:
         if value is None:
             continue
-        if type(value) is not str:
+        if type(value) is not str or not value.isascii():
             return None
         distinct.add(value)
     return len(distinct)
