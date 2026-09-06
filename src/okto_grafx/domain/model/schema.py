@@ -757,6 +757,41 @@ def decode_tuple_landing(table: TableDef, buf: bytes) -> tuple[Value, ...]:
     )
 
 
+class _UnmaterializedColumn:
+    """Private proof that a projected column was validated but not retained."""
+
+    __slots__ = ()
+
+
+_UNMATERIALIZED_COLUMN = _UnmaterializedColumn()
+
+
+def _is_unmaterialized_column(value: object) -> bool:
+    """Return whether ``value`` is the private projected-row sentinel."""
+    return value is _UNMATERIALIZED_COLUMN
+
+
+def _decode_tuple_projection(
+    table: TableDef,
+    buf: bytes,
+    materialized_positions: frozenset[int],
+) -> tuple[Value, ...]:
+    """Validate a complete row while retaining only the selected positional values.
+
+    This is an internal execution proof, not a public row decoder. The returned tuple preserves
+    the table's full positional shape so trusted query consumers can use their ordinary column
+    offsets; positions outside the closed plan carry an unforgeable sentinel. Every omitted
+    value still passes the canonical non-materialising parser, including UTF-8, recursive MAP
+    key, vector-boundary and trailing-payload validation.
+    """
+    return _decode_tuple(
+        table,
+        buf,
+        materialized_positions=materialized_positions,
+        preserve_positions=True,
+    )
+
+
 def decode_relationship_endpoints(
     table: TableDef, buf: bytes
 ) -> tuple[RecordId, RecordId]:
@@ -791,6 +826,7 @@ def _decode_tuple(
     *,
     materialized_positions: frozenset[int] | None,
     materialize_vectors: bool = True,
+    preserve_positions: bool = False,
 ) -> tuple[Value, ...]:
     """Validate one tuple and retain either every value or selected positions.
 
@@ -800,109 +836,102 @@ def _decode_tuple(
     instead of a ``VectorValue``.  A mismatched tag still takes the generic decoder, so the
     corruption-before-mismatch rule below is untouched.
     """
-    values: list[Value] = []
+    values: list[Value] = (
+        [_UNMATERIALIZED_COLUMN] * len(table.columns)  # type: ignore[list-item]
+        if preserve_positions
+        else []
+    )
     offset = 0
-    if materialized_positions is None:
-        for position, (expected_tag, expected_type, nullable, column) in enumerate(
-            table._decode_plan
-        ):
-            tag_offset = offset
-            if offset >= len(buf):
-                # Keep the generic oracle's classified short-tag refusal verbatim.
-                value, offset = decode_value(buf, offset)
-            else:
-                stored_tag = buf[offset]
-                if stored_tag == expected_tag:
-                    if not materialize_vectors and expected_type in VECTOR_VALUE_TYPES:
-                        value, offset = _decode_vector_mode(
-                            buf, offset + 1, expected_type, materialize=False
-                        )
-                    elif expected_type is ValueType.STRING:
-                        # STRING dominates wide graph rows.  Keep the generic decoder as the
-                        # single oracle for mismatched tags and compound values, but execute this
-                        # already-planned scalar body in the table loop so every ordinary string
-                        # does not pay another Python dispatch.  The checks and error taxonomy are
-                        # byte-for-byte the same operations as _decode_expected_value_body.
-                        offset += 1
-                        _require(buf, offset, _U32.size, "length")
-                        length = _U32.unpack_from(buf, offset)[0]
-                        offset += _U32.size
-                        _require(buf, offset, length, "string")
-                        following = offset + length
-                        try:
-                            value = bytes(buf[offset:following]).decode("utf-8")
-                        except UnicodeDecodeError as failure:
-                            raise GrafxCorruptionDetected(
-                                "A stored STRING is not valid UTF-8.",
-                                field="string",
-                                offset=offset,
-                                length=length,
-                            ) from failure
-                        offset = following
-                    else:
-                        value, offset = _decode_expected_value_body(
-                            buf, offset + 1, expected_type
-                        )
-                elif stored_tag == int(ValueType.NULL):
-                    value = None
-                    offset += 1
-                else:
-                    # A mismatched value is still decoded completely before schema rejection.
-                    # This preserves the rule that malformed stored bytes are corruption rather
-                    # than being hidden by the schema mismatch they would otherwise reach first.
-                    value, offset = decode_value(buf, offset)
-            if value is None:
-                if not nullable:
-                    raise _reject(
-                        table,
-                        column,
-                        position,
-                        "a null is not allowed in this column.",
+    for position, (expected_tag, expected_type, nullable, column) in enumerate(
+        table._decode_plan
+    ):
+        tag_offset = offset
+        materialize = (
+            materialized_positions is None or position in materialized_positions
+        )
+        if offset >= len(buf):
+            # Keep the generic oracle's classified short-tag refusal verbatim.
+            value, offset = decode_value(buf, offset)
+        else:
+            stored_tag = buf[offset]
+            if stored_tag == expected_tag:
+                if (
+                    expected_type in VECTOR_VALUE_TYPES
+                    and (not materialize or not materialize_vectors)
+                ):
+                    value, offset = _decode_vector_mode(
+                        buf, offset + 1, expected_type, materialize=False
                     )
-                values.append(value)
-                continue
-            if buf[tag_offset] != expected_tag:
-                observed = value_type_of(value)
-                raise _reject(
-                    table,
-                    column,
-                    position,
-                    f"a stored {observed.name} value does not belong to "
-                    f"a {column.type.name} column.",
-                )
-            values.append(value)
-    else:
-        for position, column in enumerate(table.columns):
-            tag_offset = offset
-            materialize = position in materialized_positions
-            if materialize:
+                elif expected_type is ValueType.STRING:
+                    # STRING dominates wide graph rows.  Keep the generic decoder as the single
+                    # oracle for mismatched tags and compound values, but execute this planned
+                    # body in the table loop. A skipped string is decoded and discarded: UTF-8
+                    # validation is part of the durable format and projection cannot remove it.
+                    offset += 1
+                    _require(buf, offset, _U32.size, "length")
+                    length = _U32.unpack_from(buf, offset)[0]
+                    offset += _U32.size
+                    _require(buf, offset, length, "string")
+                    following = offset + length
+                    try:
+                        value = bytes(buf[offset:following]).decode("utf-8")
+                    except UnicodeDecodeError as failure:
+                        raise GrafxCorruptionDetected(
+                            "A stored STRING is not valid UTF-8.",
+                            field="string",
+                            offset=offset,
+                            length=length,
+                        ) from failure
+                    offset = following
+                elif materialize:
+                    value, offset = _decode_expected_value_body(
+                        buf, offset + 1, expected_type
+                    )
+                else:
+                    offset = _validate_value(buf, offset)
+                    value = None
+            elif stored_tag == int(ValueType.NULL):
+                value = None
+                offset += 1
+            elif materialize:
+                # A mismatched value is still decoded completely before schema rejection. This
+                # preserves the rule that malformed stored bytes are corruption rather than
+                # being hidden by the schema mismatch they would otherwise reach first.
                 value, offset = decode_value(buf, offset)
             else:
                 offset = _validate_value(buf, offset)
                 value = None
-            stored = ValueType(buf[tag_offset])
-            is_null = stored is ValueType.NULL
-            if is_null:
-                if not column.nullable:
-                    raise _reject(
-                        table,
-                        column,
-                        position,
-                        "a null is not allowed in this column.",
-                    )
-                if materialize:
-                    values.append(None)
-                continue
-            if stored is not column.type:
-                observed = value_type_of(value) if materialize else stored
+        if buf[tag_offset] == int(ValueType.NULL):
+            if not nullable:
                 raise _reject(
                     table,
                     column,
                     position,
-                    f"a stored {observed.name} value does not belong to "
-                    f"a {column.type.name} column.",
+                    "a null is not allowed in this column.",
                 )
             if materialize:
+                if preserve_positions:
+                    values[position] = None
+                else:
+                    values.append(None)
+            continue
+        if buf[tag_offset] != expected_tag:
+            observed = (
+                value_type_of(value)
+                if materialize
+                else ValueType(buf[tag_offset])
+            )
+            raise _reject(
+                table,
+                column,
+                position,
+                f"a stored {observed.name} value does not belong to "
+                f"a {column.type.name} column.",
+            )
+        if materialize:
+            if preserve_positions:
+                values[position] = value  # type: ignore[assignment]
+            else:
                 values.append(value)  # type: ignore[arg-type]
     if offset != len(buf):
         raise GrafxCorruptionDetected(

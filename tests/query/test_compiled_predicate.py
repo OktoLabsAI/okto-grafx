@@ -211,7 +211,15 @@ def _capture(database: object, monkeypatch: pytest.MonkeyPatch) -> tuple[list[_R
     for kind, handler in list(query_engine_module._HANDLERS.items()):
         if handler is original:
             monkeypatch.setitem(query_engine_module._HANDLERS, kind, grab)
-    database.execute("MATCH (n:Node) WHERE n.created_at >= $x RETURN n.id", dict(PARAMS))
+    # The captured binding is intentionally reused below against every column, outside the
+    # statement that produced it. Ask that statement for the complete stored shape so this
+    # white-box harness does not retain an internal projected-row proof past its closed plan.
+    database.execute(
+        "MATCH (n:Node) WHERE n.created_at >= $x "
+        "RETURN n.id, n.title, n.created_at, n.revocation_reason, n.graph_layer, "
+        "n.p14, n.p16, n.source_confidence",
+        dict(PARAMS),
+    )
     context = captured["context"]
     context.parameters.update(PARAMS)  # type: ignore[attr-defined]
     return captured["rows"], context  # type: ignore[return-value]

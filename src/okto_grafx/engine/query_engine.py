@@ -115,6 +115,7 @@ from okto_grafx.domain.model.schema import (
     EmbeddingSpaceDef,
     TableDef,
     _encode_tuple_with_proof,
+    _is_unmaterialized_column,
     encode_tuple,
 )
 from okto_grafx.domain.model.value import (
@@ -426,7 +427,17 @@ class RowBinding:
         if position is not None:
             if position >= len(self.version.values):
                 return None
-            return self.version.values[position]
+            value = self.version.values[position]
+            if _is_unmaterialized_column(value):
+                raise GrafxPlanError(
+                    "An internal projected row was read outside its closed column plan.",
+                    field="projection",
+                    value=key,
+                    table=self.table.name,
+                    variable=self.variable,
+                    position=position,
+                )
+            return value
         if self.polymorphic:
             return None
         raise GrafxPlanError(
@@ -1204,6 +1215,12 @@ class _Context:
     # their source is a NodeScan. The set is derived once from the immutable physical plan; every
     # blocking or semantically wider shape is absent and keeps the canonical grouped scan.
     short_circuit_traversals: frozenset[int] = frozenset()
+    # Exact, statement-local column sets for a closed single-source node scan. The outer key is
+    # the physical scan node identity and the inner key is table_id (one table for NodeScan,
+    # potentially many for AllNodesScan). Absence means the canonical full-row decoder.
+    node_scan_projections: dict[int, dict[int, frozenset[int]]] = field(
+        default_factory=dict
+    )
     # Hashed IN parameter lists keyed by parameter name.  ``None`` records a declined build, so
     # the linear walk is chosen once for that parameter rather than re-examined on every row.
     in_list_memos: dict[str, _InListMemo | None] = field(default_factory=dict)
@@ -3428,6 +3445,7 @@ class QueryEngine:
                 result_node=root.child,
                 union_coercions=_bound_union_columns(plan, bound),
                 index_authority=authority,
+                node_scan_projections=_closed_node_scan_projections(root.child),
             )
             _bind_timestamp_values(plan, context)
             _validate_bound_subscript_types(plan, bound)
@@ -3827,6 +3845,7 @@ class QueryEngine:
             union_coercions=_bound_union_columns(plan, parameters),
             index_authority=index_authority,
             short_circuit_traversals=_short_circuit_traversals(root.child),
+            node_scan_projections=_closed_node_scan_projections(root.child),
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
@@ -5293,6 +5312,22 @@ def _with_rows(
         yield _Row(bindings=projected)
 
 
+def _scanned_node_versions(
+    engine: QueryEngine,
+    table: TableDef,
+    snapshot: object,
+    materialized_positions: frozenset[int] | None,
+) -> Iterator[tuple[RecordRef, HeapVersion]]:
+    """Choose the closed projected scan only for the exact built-in heap."""
+    if materialized_positions is not None and type(engine.heap) is HeapStore:
+        return engine.heap.scan_projected(
+            table,
+            snapshot,  # type: ignore[arg-type]
+            materialized_positions,
+        )
+    return engine.heap.scan(table, snapshot)  # type: ignore[arg-type]
+
+
 def _all_nodes_scan(
     engine: QueryEngine, node: AllNodesScan, context: _Context
 ) -> Iterator[_Row]:
@@ -5310,9 +5345,15 @@ def _all_nodes_scan(
         for table in node.tables
     ]
     single_source = isinstance(node.child, SingleRow)
+    projections = getattr(context, "node_scan_projections", {}).get(id(node), {})
     for row in engine._rows(node.child, context):
         for table, changed, inserted in views:
-            for ref, version in engine.heap.scan(table, snapshot):
+            for ref, version in _scanned_node_versions(
+                engine,
+                table,
+                snapshot,
+                projections.get(table.table_id),
+            ):
                 if ref in changed:
                     latest = changed[ref]
                     if latest is None:
@@ -5351,6 +5392,9 @@ def _node_scan(
     snapshot = context.snapshot
     changed, inserted = _transaction_row_view(context, node.table, include_held=False)
     single_source = isinstance(node.child, SingleRow)
+    projection = getattr(context, "node_scan_projections", {}).get(id(node), {}).get(
+        node.table.table_id
+    )
     for row in engine._rows(node.child, context):
         yield from _logical_node_rows_for_input(
             engine,
@@ -5362,6 +5406,7 @@ def _node_scan(
             changed=changed,
             inserted=inserted,
             single_source=single_source,
+            materialized_positions=projection,
         )
 
 
@@ -5376,10 +5421,13 @@ def _logical_node_rows_for_input(
     changed: Mapping[object, tuple[Value, ...] | None],
     inserted: Sequence[tuple[object, tuple[Value, ...]]],
     single_source: bool,
+    materialized_positions: frozenset[int] | None = None,
 ) -> Iterator[_Row]:
     """Yield one table's scan-equivalent rows for an already-produced input row."""
 
-    for ref, version in engine.heap.scan(table, snapshot):
+    for ref, version in _scanned_node_versions(
+        engine, table, snapshot, materialized_positions
+    ):
         if ref in changed:
             latest = changed[ref]
             if latest is None:
@@ -5737,6 +5785,97 @@ Chosen from the shape of the two costs, not tuned to a machine: a lookup costs a
 reads however large the edge table is, and the grouped scan costs the whole edge table once.
 NodeScan and AllNodesScan frontiers bypass this limit and scan immediately because their plan
 already promises a whole-table walk. Unknown producers retain the conservative hybrid fallback."""
+
+
+def _closed_node_scan_projections(
+    root: PlanNode,
+) -> dict[int, dict[int, frozenset[int]]]:
+    """Plan projections for one closed, read-only, single-source node pipeline.
+
+    Projection is declined unless the entire physical path is a linear combination of filters,
+    result projection, ordering, DISTINCT and a window over exactly one NodeScan/AllNodesScan
+    driven by SingleRow. Every expression is walked: direct properties of the scan variable are
+    retained, while a bare occurrence of that variable declines the optimization because it may
+    expose or inspect the complete entity. Expressions over other computed aliases do not need
+    stored columns. This makes the proof intentionally narrower than the query language.
+    """
+    expressions: list[Expression] = []
+    planned = root
+    while True:
+        kind = type(planned)
+        if kind is FilterRows:
+            expressions.append(planned.predicate)  # type: ignore[attr-defined]
+        elif kind is ProjectRows:
+            expressions.extend(
+                item.expression for item in planned.items  # type: ignore[attr-defined]
+            )
+        elif kind is SortRows:
+            expressions.extend(
+                item.expression for item in planned.keys  # type: ignore[attr-defined]
+            )
+            if planned.retained_limit is not None:  # type: ignore[attr-defined]
+                expressions.append(planned.retained_limit)  # type: ignore[attr-defined]
+            if planned.retained_skip is not None:  # type: ignore[attr-defined]
+                expressions.append(planned.retained_skip)  # type: ignore[attr-defined]
+        elif kind in (LimitRows, SkipRows):
+            expressions.append(planned.count)  # type: ignore[attr-defined]
+        elif kind is not DistinctRows:
+            break
+        planned = planned.child  # type: ignore[attr-defined]
+
+    if type(planned) is NodeScan:
+        if type(planned.child) is not SingleRow:
+            return {}
+        variable = planned.variable
+        tables = (planned.table,)
+    elif type(planned) is AllNodesScan:
+        if type(planned.child) is not SingleRow:
+            return {}
+        variable = planned.variable
+        tables = planned.tables
+    else:
+        return {}
+
+    property_names: set[str] = set()
+    pending = list(expressions)
+    while pending:
+        expression = pending.pop()
+        if (
+            type(expression) is FunctionCall
+            and expression.name.upper() == LABEL_FUNCTION
+            and len(expression.arguments) == 1
+            and type(expression.arguments[0]) is Variable
+            and expression.arguments[0].name == variable
+            and not expression.named_arguments
+            and not expression.distinct
+            and not expression.star
+        ):
+            # label(n) reads the binding's table identity, not its stored values.
+            continue
+        if type(expression) is Property:
+            subject = expression.subject
+            if type(subject) is Variable:
+                if subject.name == variable:
+                    property_names.add(expression.key)
+                continue
+            pending.append(subject)
+            continue
+        if type(expression) is Variable:
+            if expression.name == variable:
+                return {}
+            continue
+        pending.extend(expression.children())
+
+    by_table: dict[int, frozenset[int]] = {}
+    for table in tables:
+        positions = frozenset(
+            position
+            for name in property_names
+            if (position := table.column_positions.get(name)) is not None
+        )
+        if len(positions) < len(table.columns):
+            by_table[table.table_id] = positions
+    return {id(planned): by_table} if by_table else {}
 
 
 def _short_circuit_traversals(root: PlanNode) -> frozenset[int]:
@@ -7503,7 +7642,6 @@ def _filtered_vector_search(
         )
     ):
         return None
-
     # The planned space must be fixed before discovery.  A dynamic expression historically runs
     # only after child materialisation and therefore cannot safely select an index here.
     if type(node.space) is not Literal or node.space.value != node.column_space:

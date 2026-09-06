@@ -64,6 +64,7 @@ from okto_grafx.domain.model.schema import (
     decode_relationship_endpoints,
     decode_tuple,
     decode_tuple_landing,
+    _decode_tuple_projection,
     encode_tuple,
 )
 from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
@@ -1981,6 +1982,31 @@ class HeapStore:
         for ref, header, content in self._walk(table, accept=visible):
             yield ref, self._decode_version_with_header(table, header, content)
 
+    def scan_projected(
+        self,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        materialized_positions: frozenset[int],
+    ) -> Iterator[tuple[RecordRef, HeapVersion]]:
+        """Yield visible rows while retaining only a closed positional projection.
+
+        Visibility and the physical walk are exactly :meth:`scan`. The complete payload remains
+        schema-validated before a row leaves this door; only allocations for unrequested values
+        are omitted. This method is an internal capability selected only for the exact built-in
+        heap and a query plan that proves every later property read.
+        """
+
+        def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            return snapshot.visible(xmin, xmax)
+
+        for ref, header, content in self._walk(table, accept=visible):
+            yield ref, self._decode_version_with_header(
+                table,
+                header,
+                content,
+                materialized_positions=materialized_positions,
+            )
+
     def scan_relationship_endpoints(
         self, table: TableDef, snapshot: SnapshotLike
     ) -> Iterator[tuple[RecordRef, tuple[RecordId, RecordId]]]:
@@ -3249,6 +3275,7 @@ class HeapStore:
         content: bytes,
         *,
         landing: bool = False,
+        materialized_positions: frozenset[int] | None = None,
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
         payload = self._validated_payload(table, header, content)
@@ -3259,7 +3286,11 @@ class HeapStore:
             values=(
                 decode_tuple_landing(table, payload)
                 if landing
-                else decode_tuple(table, payload)
+                else (
+                    _decode_tuple_projection(table, payload, materialized_positions)
+                    if materialized_positions is not None
+                    else decode_tuple(table, payload)
+                )
             ),
             prev=header.previous,
             schema_version=header.schema_version,
