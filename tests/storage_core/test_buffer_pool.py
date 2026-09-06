@@ -1531,6 +1531,29 @@ def test_a_payload_larger_than_a_page_survives_a_chain() -> None:
     assert read_chain(pool, FILE, pages[0], page_type=int(PageType.OVERFLOW)) == payload
 
 
+def test_populated_chain_file_uses_one_exists_probe_after_page_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(), budget_pages=2)
+    reserve_header(pool)
+    calls = 0
+    original = device.exists
+
+    def counted(file: str) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(file)
+
+    monkeypatch.setattr(device, "exists", counted)
+
+    write_chain(pool, FILE, b"payload")
+
+    # _require_chain_file still proves that the name exists.  The preceding reserved-header
+    # guard now reuses page_count and no longer performs a duplicate exists walk.
+    assert calls == 1
+
+
 def test_a_chain_reuses_the_pages_it_is_given_before_it_grows_the_file() -> None:
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics())

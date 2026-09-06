@@ -109,6 +109,27 @@ class _FreshPageWitness:
     page_index: PageIndex
     image: bytes
 
+
+def _page_count_if_present(
+    storage: StorageDevice, file: str, *, proved_present: bool = False
+) -> int | None:
+    """Return a file's page count, or ``None`` for one initially absent name.
+
+    ``page_count`` already performs the exact-name and descriptor proof needed to size a file.
+    Calling ``exists`` immediately before it repeats that namespace walk on the established-file
+    hot path.  Only its typed ``missing_file`` refusal is translated, and only when the caller
+    has not supplied a preceding directory proof.  Every other storage/corruption failure, and a
+    missing file after ``proved_present=True``, remains fail-closed and byte-for-byte observable
+    to the caller.
+    """
+    try:
+        return storage.page_count(file)
+    except GrafxCorruptionDetected as failure:
+        if proved_present or failure.details.get("reason") != "missing_file":
+            raise
+        return None
+
+
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
 BUFFER_RETAINED_ESTIMATE_BYTES: str = "oktografx_buffer_retained_estimate_bytes"
 BUFFER_RETAINED_ESTIMATOR_VERSION: str = "python-v2"
@@ -3009,7 +3030,12 @@ def _require_reserved_header_page(pool: BufferPool, file: str) -> None:
     takes the file header with it. A file that exists and holds nothing at all is the one case
     where an allocation reaches it, so it is closed before anything is touched.
     """
-    if pool.storage.exists(file) and pool.storage.page_count(file) == 0:
+    present = _page_count_if_present(pool.storage, file)
+    # Some deliberately narrow test/storage collaborators represent an absent file as a zero
+    # page count instead of the production adapter's typed missing_file refusal.  Pay exists only
+    # on that cold ambiguous boundary; populated files take the single page_count proof.
+    zero_length_file = present == 0 and pool.storage.exists(file)
+    if zero_length_file:
         raise GrafxCorruptionDetected(
             f"The file {file!r} has no reserved header page, so the first page a chain "
             f"allocated would be page {HEADER_PAGE_INDEX}.",

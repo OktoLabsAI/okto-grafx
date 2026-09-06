@@ -8,7 +8,7 @@ processes and several threads read and write it at the same time**. There is no 
 no daemon to keep alive. The core is pure Python and the standard library is its only runtime
 requirement.
 
-**Version 0.0.3 — pre-alpha.** The on-disk format, the public API and the query surface may all
+**Version 0.0.4 — pre-alpha.** The on-disk format, the public API and the query surface may all
 change. Read [Status and limitations](#status-and-limitations) before you rely on it.
 
 ---
@@ -864,7 +864,7 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 
 ## Status and limitations
 
-**0.0.3 is pre-alpha.** It is tested hard — multi-process smoke tests, crash-and-recover
+**0.0.4 is pre-alpha.** It is tested hard — multi-process smoke tests, crash-and-recover
 tests, a mutation battery with per-mutant verdicts — and it is still young. What that means in
 practice:
 

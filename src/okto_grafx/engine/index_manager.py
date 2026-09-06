@@ -137,6 +137,7 @@ from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.buffer_pool import (
     BufferPool,
+    _page_count_if_present,
     refuse_endless_chain,
     visited_pages,
 )
@@ -746,9 +747,10 @@ class IndexStore:
         header identity, definition digest and every corruption refusal remain mandatory.
         """
         storage = self._pool.storage
-        if (not proved_present and not storage.exists(self.file)) or storage.page_count(
-            self.file
-        ) == 0:
+        present = _page_count_if_present(
+            storage, self.file, proved_present=proved_present
+        )
+        if present is None or present == 0:
             return False
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
@@ -786,7 +788,18 @@ class IndexStore:
         """
         storage = self._pool.storage
         created = False
-        if not proved_present and not storage.exists(self.file):
+        present = (
+            storage.page_count(self.file)
+            if proved_present
+            else _page_count_if_present(storage, self.file)
+        )
+        # Production devices refuse an absent name from page_count.  The zero-page exists probe
+        # retains compatibility with narrow collaborators that encode both "missing" and
+        # "empty existing file" as zero, without taxing an established index.
+        missing = present is None or (
+            present == 0 and not proved_present and not storage.exists(self.file)
+        )
+        if missing:
             try:
                 storage.create(self.file)
                 created = True
@@ -960,9 +973,10 @@ class IndexStore:
     def _read_header(self, *, proved_present: bool = False) -> IndexHeader:
         """Return the index header stored in slot 1 of the reserved header page."""
         storage = self._pool.storage
-        if (not proved_present and not storage.exists(self.file)) or storage.page_count(
-            self.file
-        ) == 0:
+        present = _page_count_if_present(
+            storage, self.file, proved_present=proved_present
+        )
+        if present is None or present == 0:
             raise GrafxIndexError(
                 f"Index {self.name!r} has no file yet; create it before using it.",
                 field="file",
@@ -5026,11 +5040,20 @@ class IndexManager:
         validating door.  Zero is never an occupied generation identity.
         """
 
+        indexes = self.indexes()
+        needs_header = any(index.definition.artifact_nonce == 0 for index in indexes)
+        persisted = (
+            frozenset(self._pool.storage.list_files(f"{INDEX_DIRECTORY}/"))
+            if needs_header
+            else frozenset()
+        )
         occupied: set[int] = set()
-        for index in self.indexes():
+        for index in indexes:
             nonce = index.definition.artifact_nonce
             if nonce == 0:
-                nonce = index.open().artifact_nonce
+                nonce = index.open(
+                    proved_present=index.file in persisted
+                ).artifact_nonce
             if nonce != 0:
                 occupied.add(nonce)
         return frozenset(occupied)

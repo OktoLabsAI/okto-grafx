@@ -7,6 +7,11 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
+> **Rodada ativa:** a linha `0.0.4` foi iniciada em `feature/v0.0.4`. A seleção finita,
+> as medições, as invariantes e a rastreabilidade de execução estão em
+> `docs/PERFORMANCE_ROUND_0_0_4.md`. Itens específicos do Pulse permanecem na camada Community;
+> o Core continua agnóstico ao backend de grafo.
+
 ## Estado de execução — 2026-09-03
 
 - **Linha 0.0.3 em execução com foco no carregamento visível do Knowledge Graph do Pulse.** A base

@@ -167,6 +167,26 @@ def test_register_reuses_a_proved_directory_entry_without_rechecking_exists(
     )
 
 
+def test_established_index_header_paths_use_page_count_without_exists(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = HashIndex(
+        exact_definition(database.table, name="single_size_proof"),
+        database.pool,
+        database.metrics,
+    )
+    candidate.create()
+
+    def redundant_exists(file: str) -> bool:
+        raise AssertionError(f"repeated exists before page_count for {file!r}")
+
+    monkeypatch.setattr(database.device, "exists", redundant_exists)
+
+    assert candidate.is_created()
+    assert candidate.open().digest == candidate.definition.digest()
+    assert candidate.create().digest == candidate.definition.digest()
+
+
 def test_registering_a_store_that_does_not_answer_the_contract_is_refused(
     database: Database, person_table: TableDef
 ) -> None:
