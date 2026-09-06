@@ -174,7 +174,10 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
 ### Wave 2 — medium changes after Wave 1 re-profile
 
 1. WRITE-1, then NATVER-2, with peak-memory and retained-lifetime measurements.
-2. NATVER-3 only after a discriminating CRC microbenchmark.
+2. NATVER-3 only after a discriminating CRC microbenchmark. **Discriminant completed:** against
+   the active `google_crc32c` provider, one collapsed wrapper preserved the full acceptance-corpus
+   answers and measured 2.05x–2.54x faster per call for 32 B, 256 B, 4 KiB and 16,380 B inputs
+   across eight alternating rounds. Implementation remains ordered after the Wave 1 checkpoint.
 3. CKPTCERT-1 with heap and index corruption injected independently.
 4. One generated decode plan for KGRUN-1/LADYBUG-M1/NATVER-1; it must pass a 10,000-case hostile
    corpus with the same exception class, field and offset as the canonical decoder.
