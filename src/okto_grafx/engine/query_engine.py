@@ -55,6 +55,7 @@ from __future__ import annotations
 from _thread import LockType
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from types import MappingProxyType
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from math import isnan
@@ -11808,21 +11809,24 @@ def _evaluate_call(
 
 # One entry per EXACT node class, pointing at the function the isinstance walk reaches for that
 # kind.  A subclass of any node is absent here on purpose and takes the walk, so the table can
-# only shorten the dispatch, never change which function answers.
-_EXACT_EVALUATORS: dict[type, Callable[..., object]] = {
-    Literal: _evaluate_literal,
-    Parameter: _evaluate_parameter,
-    Variable: _evaluate_variable,
-    Property: _evaluate_property,
-    NullCheck: _evaluate_null_check,
-    UnaryOperation: _evaluate_unary,
-    BinaryOperation: _evaluate_binary,
-    ListExpression: _evaluate_list,
-    MapExpression: _evaluate_map,
-    CaseExpression: _evaluate_case,
-    Subscript: _evaluate_subscript,
-    FunctionCall: _evaluate_call,
-}
+# only shorten the dispatch, never change which function answers.  The proxy keeps the table
+# read-only: the grammar of the evaluator is written once at import.
+_EXACT_EVALUATORS: Mapping[type, Callable[..., object]] = MappingProxyType(
+    {
+        Literal: _evaluate_literal,
+        Parameter: _evaluate_parameter,
+        Variable: _evaluate_variable,
+        Property: _evaluate_property,
+        NullCheck: _evaluate_null_check,
+        UnaryOperation: _evaluate_unary,
+        BinaryOperation: _evaluate_binary,
+        ListExpression: _evaluate_list,
+        MapExpression: _evaluate_map,
+        CaseExpression: _evaluate_case,
+        Subscript: _evaluate_subscript,
+        FunctionCall: _evaluate_call,
+    }
+)
 
 
 def _case(expression: CaseExpression, row: _Row, context: _Context) -> object:

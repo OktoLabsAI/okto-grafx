@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -85,13 +85,16 @@ def test_every_expression_kind_answers_the_same_through_both_doors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     through_table = _rows(database, text, parameters)
-    monkeypatch.setattr(engine_module, "_EXACT_EVALUATORS", {})
+    monkeypatch.setattr(engine_module, "_EXACT_EVALUATORS", MappingProxyType({}))
     through_walk = _rows(database, text, parameters)
     assert through_table == through_walk
 
 
 def test_table_holds_exactly_the_walked_kinds_and_their_walk_functions() -> None:
     table = engine_module._EXACT_EVALUATORS
+    assert isinstance(table, MappingProxyType)
+    with pytest.raises(TypeError):
+        table[Literal] = engine_module._evaluate_parameter  # type: ignore[index]
     assert set(table) == {
         Literal,
         Parameter,
