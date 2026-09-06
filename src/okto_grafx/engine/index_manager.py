@@ -6574,7 +6574,10 @@ class IndexManager:
         return True
 
     def _prepare_common_replay_batch(
-        self, records: Sequence[WalRecord]
+        self,
+        records: Sequence[WalRecord],
+        *,
+        _resolved: Sequence[tuple[WalRecord, IndexStore, IndexChange]] | None = None,
     ) -> _CommonReplayBatch | None:
         """Preflight the narrow common index-only replay path without mutating an index.
 
@@ -6592,19 +6595,37 @@ class IndexManager:
         """
         if not records:
             return None
+        resolved: list[tuple[WalRecord, IndexStore, IndexChange]]
+        if _resolved is None:
+            resolved = []
+            for record in records:
+                change = change_of(record)
+                try:
+                    store = self.active_index(change.index)
+                except GrafxIndexError:
+                    # CommitRedo's mandatory preflight normally turns this into its more useful
+                    # recovery-level refusal. Retain the legacy dispatch result if a custom
+                    # caller invokes the capability directly.
+                    return None
+                resolved.append((record, store, change))
+        else:
+            # Passage-local only: apply_partitioned_replay_batch produced these values from the
+            # same concrete sequence immediately above and has not yielded control or mutated
+            # the registry. Reusing them removes a second WAL decode and catalog resolution per
+            # common record without retaining authority on the manager or across replay calls.
+            resolved = list(_resolved)
+            if len(resolved) != len(records) or any(
+                candidate is not record
+                for record, (candidate, _store, _change) in zip(
+                    records, resolved, strict=True
+                )
+            ):
+                return None
         items: list[_CommonReplayItem] = []
         ordered_stores: list[IndexStore] = []
         seen: set[IndexStore] = set()
-        for record in records:
-            change = change_of(record)
+        for record, store, change in resolved:
             if change.operation is IndexOperation.RESET:
-                return None
-            try:
-                store = self.active_index(change.index)
-            except GrafxIndexError:
-                # CommitRedo's mandatory preflight normally turns this into its more useful
-                # recovery-level refusal.  Retain the legacy dispatch result if a custom caller
-                # invokes the capability directly.
                 return None
             if (
                 not self._batch_replay_compatible(store)
@@ -6766,7 +6787,8 @@ class IndexManager:
                 store._batch_replay_settled(moved=store_moved)
 
     def apply_common_replay_batch(
-        self, records: Sequence[WalRecord]
+        self,
+        records: Sequence[WalRecord],
     ) -> tuple[str, ...] | None:
         """Try one common replay as a private, single-use plan.
 
@@ -6783,6 +6805,20 @@ class IndexManager:
         prepared = self._prepare_common_replay_batch(records)
         if prepared is None:
             return None
+        return self._apply_prepared_common_replay_batch(prepared)
+
+    def _apply_prepared_common_replay_batch(
+        self,
+        prepared: _CommonReplayBatch,
+    ) -> tuple[str, ...]:
+        """Apply one private plan produced during the current protected replay passage.
+
+        This door exists only so :meth:`apply_partitioned_replay_batch` can consume the exact
+        decode/resolution it just preflighted.  Keeping the prepared value private avoids adding
+        a caller-supplied shortcut to the public-ish common-batch capability: an external caller
+        must still use :meth:`apply_common_replay_batch`, which performs the canonical decode and
+        catalog resolution itself.
+        """
         moved_by_store: dict[IndexStore, bool] = {
             state.store: False for state in prepared.stores
         }
@@ -6848,10 +6884,28 @@ class IndexManager:
 
         resolved: list[tuple[WalRecord, IndexStore, IndexChange]] = []
         excluded: set[IndexStore] = set()
+        resolution_memo: dict[str, IndexStore] | None = (
+            {} if type(self).active_index is IndexManager.active_index else None
+        )
+        can_reuse_resolved = (
+            resolution_memo is not None
+            and type(self)._prepare_common_replay_batch
+            is IndexManager._prepare_common_replay_batch
+        )
         for record in records:
             change = change_of(record)
             try:
-                store = self.active_index(change.index)
+                key = change.index.lower() if type(change.index) is str else None
+                if (
+                    resolution_memo is not None
+                    and key is not None
+                    and key in resolution_memo
+                ):
+                    store = resolution_memo[key]
+                else:
+                    store = self.active_index(change.index)
+                    if resolution_memo is not None and key is not None:
+                        resolution_memo[key] = store
             except GrafxIndexError:
                 return None
             if change.versioned != store.definition.versioned:
@@ -6900,9 +6954,34 @@ class IndexManager:
         if not common_records:
             return None
         if not excluded:
+            # Preserve an override's observable preparation door. The built-in path can consume
+            # the exact passage-local decode/resolution above; a custom override keeps receiving
+            # the original single positional sequence and retains its complete protocol.
+            if (
+                can_reuse_resolved
+                and type(self).apply_common_replay_batch
+                is IndexManager.apply_common_replay_batch
+            ):
+                prepared = self._prepare_common_replay_batch(
+                    records,
+                    _resolved=resolved,
+                )
+                if prepared is None:
+                    return None
+                return self._apply_prepared_common_replay_batch(prepared)
             return self.apply_common_replay_batch(records)
 
-        prepared = self._prepare_common_replay_batch(common_records)
+        common_resolved = tuple(
+            item for item in resolved if item[1] not in excluded
+        )
+        prepared = (
+            self._prepare_common_replay_batch(
+                common_records,
+                _resolved=common_resolved,
+            )
+            if can_reuse_resolved
+            else self._prepare_common_replay_batch(common_records)
+        )
         if prepared is None:
             return None
 

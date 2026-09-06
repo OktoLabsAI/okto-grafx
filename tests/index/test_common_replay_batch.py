@@ -163,6 +163,52 @@ def test_common_batch_seeds_and_writes_page_zero_once_per_interleaved_store(
     assert len(database.device.write_calls) == writes_before
 
 
+def test_partitioned_replay_reuses_its_passage_local_decode_and_store_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = build_database()
+    records = (
+        _effect(database.exact, IndexOperation.INSERT, 10, ordinal=1),
+        _effect(database.proximity, IndexOperation.INSERT, 11, ordinal=2),
+        _effect(database.exact, IndexOperation.INSERT, 12, ordinal=3),
+        _effect(database.proximity, IndexOperation.INSERT, 13, ordinal=4),
+    )
+    decoded: list[WalRecord] = []
+    original_change_of = index_manager_module.change_of
+
+    def counted_change_of(record: WalRecord) -> IndexChange:
+        decoded.append(record)
+        return original_change_of(record)
+
+    resolved: list[str] = []
+    original_active_index = IndexManager.active_index
+
+    def counted_active_index(
+        manager: IndexManager, name: str, *, catalog: object | None = None
+    ) -> IndexStore:
+        resolved.append(name)
+        return original_active_index(manager, name, catalog=catalog)
+
+    monkeypatch.setattr(index_manager_module, "change_of", counted_change_of)
+    monkeypatch.setattr(IndexManager, "active_index", counted_active_index)
+
+    report = CommitRedo(database.pool, database.manager).apply(_replay(records))
+
+    # CommitRedo performs its independent mandatory preflight through its own decoder alias.
+    # Inside the manager, each record is decoded once and each repeated index name is resolved
+    # once for this passage. Nothing is cached on the manager for a later replay.
+    assert decoded == list(records)
+    names = [record_change.index for record_change in map(original_change_of, records)]
+    assert resolved == [*names, database.exact.name, database.proximity.name]
+    assert report.index_effects_dispatched == len(records)
+
+    decoded.clear()
+    resolved.clear()
+    CommitRedo(database.pool, database.manager).apply(_replay(records))
+    assert decoded == list(records)
+    assert resolved == [*names, database.exact.name, database.proximity.name]
+
+
 def test_common_batch_exposes_no_reusable_prepared_plan() -> None:
     database = build_database()
 
