@@ -114,6 +114,7 @@ from okto_grafx.domain.model.schema import (
     ColumnDef,
     EmbeddingSpaceDef,
     TableDef,
+    _encode_tuple_with_proof,
     encode_tuple,
 )
 from okto_grafx.domain.model.value import (
@@ -992,6 +993,7 @@ class _HeldRow:
     identity: int | None
     reference: object
     token: int | None = None
+    encoding_proof: object = None
 
 
 class _RevisionList(list[object]):
@@ -1272,6 +1274,7 @@ class _Context:
         identity: int | None,
         *,
         token: int | None = None,
+        encoding_proof: object = None,
     ) -> None:
         """Hold one row until the whole statement has been built without refusing.
 
@@ -1283,7 +1286,15 @@ class _Context:
         """
         self._require_statement_write_capacity()
         self.staged_rows.append(
-            _HeldRow(_HELD_INSERT, table, values, identity, None, token)
+            _HeldRow(
+                _HELD_INSERT,
+                table,
+                values,
+                identity,
+                None,
+                token,
+                encoding_proof,
+            )
         )
         self.staged_partitions.append((table.table_id, key))
 
@@ -1371,9 +1382,20 @@ class _Context:
         try:
             for held in self.staged_rows:
                 if held.operation is _HELD_INSERT:
-                    transaction.stage_row_insert(
-                        held.table, held.values or (), record_id=held.identity
+                    proved_stage = getattr(
+                        transaction, "_stage_row_insert_with_encoding_proof", None
                     )
+                    if held.encoding_proof is not None and callable(proved_stage):
+                        proved_stage(
+                            held.table,
+                            held.values or (),
+                            record_id=held.identity,
+                            encoding_proof=held.encoding_proof,
+                        )
+                    else:
+                        transaction.stage_row_insert(
+                            held.table, held.values or (), record_id=held.identity
+                        )
                 elif held.operation is _HELD_UPDATE:
                     transaction.stage_row_update(
                         held.table, held.reference, held.values or ()
@@ -10087,7 +10109,13 @@ def _rewrite_held_insert(
         context.staged_rows.insert(
             position,
             _HeldRow(
-                _HELD_INSERT, held.table, settled, held.identity, None, held.token
+                _HELD_INSERT,
+                held.table,
+                settled,
+                held.identity,
+                None,
+                held.token,
+                None,
             ),
         )
         new_key = _partition_key(binding.table, settled)
@@ -10295,14 +10323,16 @@ def _write_pattern(
     """Materialise and stage the nodes and edges one written pattern names."""
     merging = isinstance(node, MergePattern)
     bindings = dict(row.bindings)
-    staged: list[tuple[TableDef, tuple[Value, ...], int | None, int]] = []
+    staged: list[
+        tuple[TableDef, tuple[Value, ...], int | None, int, object]
+    ] = []
     fresh: set[str] = set()
     for written in node.nodes:
         if written.variable is None:
             continue
         if written.table is None:
             continue
-        values = materialise_row(
+        values, encoding_proof = _materialise_row_with_proof(
             engine, written.table, written.properties, row, context
         )
         if merging:
@@ -10315,24 +10345,45 @@ def _write_pattern(
             engine, written.table, values, context, also=[held[1] for held in staged]
         )
         pending = _pending_binding(written.variable, written.table, values)
-        staged.append((written.table, values, None, context.token_for(pending)))
+        staged.append(
+            (
+                written.table,
+                values,
+                None,
+                context.token_for(pending),
+                encoding_proof,
+            )
+        )
         fresh.add(written.variable)
         bindings[written.variable] = pending
-    edges: list[tuple[TableDef, tuple[Value, ...]]] = []
+    edges: list[tuple[TableDef, tuple[Value, ...], object]] = []
     for edge in node.relationships:
-        materialised = _materialise_edge(engine, edge, bindings, fresh, row, context)
-        if merging and _matching_edge(engine, edge, materialised, context):
+        table, values, encoding_proof = _materialise_edge(
+            engine, edge, bindings, fresh, row, context
+        )
+        if merging and _matching_edge(engine, edge, (table, values), context):
             context.count("relationships_matched")
             continue
-        edges.append(materialised)
+        edges.append((table, values, encoding_proof))
     _require_write_transaction(context.txn)
-    for table, values, identity, token in staged:
+    for table, values, identity, token, encoding_proof in staged:
         context.hold(
-            table, values, _partition_key(table, values), identity, token=token
+            table,
+            values,
+            _partition_key(table, values),
+            identity,
+            token=token,
+            encoding_proof=encoding_proof,
         )
         context.count("rows_created")
-    for table, values in edges:
-        context.hold(table, values, _partition_key(table, values), None)
+    for table, values, encoding_proof in edges:
+        context.hold(
+            table,
+            values,
+            _partition_key(table, values),
+            None,
+            encoding_proof=encoding_proof,
+        )
         context.count("relationships_created")
     return _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
@@ -10744,7 +10795,7 @@ def _materialise_edge(
     fresh: set[str],
     row: _Row,
     context: _Context,
-) -> tuple[TableDef, tuple[Value, ...]]:
+) -> tuple[TableDef, tuple[Value, ...], object]:
     """Return the stored tuple of one edge, refusing endpoints that cannot be named yet.
 
     An endpoint is a RecordId, and the identity of a row created by THIS statement does not
@@ -10861,7 +10912,7 @@ def _materialise_edge(
                 binding,
             )
         )
-    properties = materialise_row(
+    properties, encoding_proof = _materialise_row_with_proof(
         engine,
         edge.table,
         edge.properties,
@@ -10904,7 +10955,7 @@ def _materialise_edge(
     # before a page is allocated for it.
     for guard in guards:
         context.hold_read(*guard)
-    return edge.table, properties
+    return edge.table, properties, encoding_proof
 
 
 def _pending_binding(
@@ -12188,8 +12239,36 @@ def materialise_row(
     that forbids one -- so a missing primary key is caught here rather than becoming a row nobody
     can find. The final check is the domain model's own ``encode_tuple``, because arity,
     nullability and column type already have exactly one definition and a second one here would
-    be free to drift from it (amendment A24). Its bytes are discarded: this call is the
-    validation, and the heap encodes again when it actually stores the row.
+    be free to drift from it (amendment A24). Internal write paths may retain its bytes behind a
+    sealed, exact-object proof; this public helper exposes only the values and therefore keeps
+    the established return contract.
+    """
+    materialised, _encoding_proof = _materialise_row_with_proof(
+        engine,
+        table,
+        properties,
+        row,
+        context,
+        endpoints=endpoints,
+    )
+    return materialised
+
+
+def _materialise_row_with_proof(
+    engine: QueryEngine,
+    table: TableDef,
+    properties: MapExpression | None,
+    row: _Row,
+    context: _Context,
+    *,
+    endpoints: tuple[int, int] | None = None,
+) -> tuple[tuple[Value, ...], object]:
+    """Materialise one row and retain the exact bytes its validation produced.
+
+    A relationship that still carries a pending endpoint is validated through a fixed-width
+    stand-in and therefore receives no reusable proof: the commit resolves and encodes its real
+    endpoint values before the heap can see them.  Every ordinary row retains both the exact
+    values object and its sealed schema proof, never a bare object id.
     """
     values: list[Value] = [None] * table.arity
     if endpoints is not None:
@@ -12215,8 +12294,14 @@ def materialise_row(
     # validated against the width it will occupy. Nothing about the promise is waved through:
     # the commit path resolves it and re-encodes the resolved row before anything is written,
     # and every column the caller actually wrote is checked here exactly as before.
-    encode_tuple(table, _validatable_row(table, materialised))
-    return materialised
+    validatable = _validatable_row(table, materialised)
+    if validatable is materialised:
+        _payload, encoding_proof = _encode_tuple_with_proof(
+            table, materialised
+        )
+        return materialised, encoding_proof
+    encode_tuple(table, validatable)
+    return materialised, None
 
 
 def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value, ...]:
@@ -12228,10 +12313,9 @@ def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value,
     line, and two doors drawing it differently is how a token eventually walks through one.
     """
     endpoints = ENDPOINT_COLUMN_COUNT if table.kind == "rel" else 0
-    substituted: list[Value] = []
+    substituted: list[Value] | None = None
     for position, value in enumerate(values):
         if not isinstance(value, PendingRowRef):
-            substituted.append(value)
             continue
         if position >= endpoints:
             raise GrafxUnsupportedOperation(
@@ -12244,8 +12328,10 @@ def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value,
                 table=table.name,
                 operation="pending_value",
             )
-        substituted.append(SIZING_ENDPOINT)
-    return tuple(substituted)
+        if substituted is None:
+            substituted = list(values)
+        substituted[position] = SIZING_ENDPOINT
+    return values if substituted is None else tuple(substituted)
 
 
 def _column_named(table: TableDef, key: str) -> ColumnDef:

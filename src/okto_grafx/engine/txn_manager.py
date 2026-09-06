@@ -126,7 +126,12 @@ from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.page.layout import MAX_U64
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
-from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, TableDef, encode_tuple
+from okto_grafx.domain.model.schema import (
+    ENDPOINT_COLUMN_COUNT,
+    TableDef,
+    _encode_tuple_with_proof,
+    _proved_tuple_payload,
+)
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
@@ -167,7 +172,7 @@ from okto_grafx.engine.commit_state_store import (
     CommitStateStore,
 )
 from okto_grafx.engine.commit_redo import CommitRedo
-from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapVacuumPlan
+from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapStore, HeapVacuumPlan
 from okto_grafx.engine.index_manager import IndexManager, IndexStore
 from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.engine.coordination import (
@@ -217,6 +222,12 @@ _CANONICAL_COMMIT_INDEX_PROJECTION_SCOPE = (
     IndexManager._commit_index_projection_scope
 )
 """Exact post-rebase projection door; subclasses retain their observable selection calls."""
+
+_CANONICAL_HEAP_INSERT = HeapStore.insert
+_CANONICAL_HEAP_INSERT_RESERVED = HeapStore.insert_reserved
+_CANONICAL_HEAP_INSERT_INITIAL_RESERVED = HeapStore.insert_initial_reserved
+_CANONICAL_HEAP_UPDATE = HeapStore.update
+"""Heap doors that accept the private tuple-encoding proof without changing collaborators."""
 
 TRANSACTION_MANAGER_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -6076,8 +6087,18 @@ class TransactionManager:
                 continue
             if intent.operation is RowOperation.UPDATE:
                 record_id, ending = self._index_row_at(intent.reference)
-                reference = heap.update(
-                    intent.table, intent.reference, intent.values, provisional
+                update = heap.update
+                update_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(update, "__func__", None) is _CANONICAL_HEAP_UPDATE
+                    else {}
+                )
+                reference = update(
+                    intent.table,
+                    intent.reference,
+                    intent.values,
+                    provisional,
+                    **update_kwargs,
                 )
                 written.append(
                     _RowWrite(
@@ -6099,12 +6120,20 @@ class TransactionManager:
                 # The extent did not exist at the locked planning point.  Install its final
                 # batch floor with the first row; every later row is then below that same floor
                 # and does not rewrite page zero.  This remains one ordinary user commit.
-                reference = heap.insert_initial_reserved(
+                insert_initial = heap.insert_initial_reserved
+                initial_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(insert_initial, "__func__", None)
+                    is _CANONICAL_HEAP_INSERT_INITIAL_RESERVED
+                    else {}
+                )
+                reference = insert_initial(
                     intent.table,
                     record_id,
                     intent.values,
                     provisional,
                     next_record_id=initial_floor,
+                    **initial_kwargs,
                 )
                 initialized_tables.add(table_id)
             elif initial_floor is not None or position in identities.leased_positions:
@@ -6112,19 +6141,37 @@ class TransactionManager:
                 if extent_proof is None:
                     extent_proof = heap.reserved_extent_proof(intent.table, record_id)
                     reserved_extent_proofs[table_id] = extent_proof
-                reference = heap.insert_reserved(
+                insert_reserved = heap.insert_reserved
+                reserved_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(insert_reserved, "__func__", None)
+                    is _CANONICAL_HEAP_INSERT_RESERVED
+                    else {}
+                )
+                reference = insert_reserved(
                     intent.table,
                     record_id,
                     intent.values,
                     provisional,
                     extent_proof=extent_proof,
+                    **reserved_kwargs,
                 )
             else:
                 # The first row of a table has no extent to reserve yet.  Its ordinary insert
                 # creates the extent and advances the floor atomically with the user commit;
                 # leasing starts on the next transaction.
-                reference = heap.insert(
-                    intent.table, record_id, intent.values, provisional
+                insert = heap.insert
+                insert_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(insert, "__func__", None) is _CANONICAL_HEAP_INSERT
+                    else {}
+                )
+                reference = insert(
+                    intent.table,
+                    record_id,
+                    intent.values,
+                    provisional,
+                    **insert_kwargs,
                 )
             written.append(
                 _RowWrite(
@@ -6180,10 +6227,15 @@ class TransactionManager:
                 intent,
                 values=values,
                 record_id=intent.record_id if identity is None else identity,
+                # Resolving a pending endpoint creates a different values tuple.  Its former
+                # proof covered only the fixed-width validation stand-in and must not cross the
+                # heap boundary; _refuse_unresolved_intents seals the resolved row below.
+                _encoding_proof=(
+                    None if slots is not None else intent._encoding_proof
+                ),
             )
         settled_rows = tuple(resolved)
-        self._refuse_unresolved_intents(txn, settled_rows)
-        return settled_rows
+        return self._refuse_unresolved_intents(txn, settled_rows)
 
     def _prepare_identity_plan(
         self, txn: TransactionContext
@@ -6820,7 +6872,7 @@ class TransactionManager:
 
     def _refuse_unresolved_intents(
         self, txn: TransactionContext, intents: Sequence[RowIntent]
-    ) -> None:
+    ) -> tuple[RowIntent, ...]:
         """Refuse anything still carrying a private identity, and re-encode what will be stored.
 
         A typed refusal rather than an ``assert``: this is the boundary that keeps a transient
@@ -6829,8 +6881,10 @@ class TransactionManager:
         will be written are checked against the schema HERE, before the first of them lands, so a
         row whose resolved endpoint does not fit its column refuses while nothing has moved.
         """
+        validated: list[RowIntent] = []
         for position, intent in enumerate(intents):
             if intent.operation is RowOperation.DELETE:
+                validated.append(intent)
                 continue
             for slot, value in enumerate(intent.values):
                 if isinstance(value, PendingRowRef):
@@ -6853,7 +6907,14 @@ class TransactionManager:
                     txn_id=txn.txn_id,
                 )
             self._refuse_unstored_endpoints(txn, intent, position)
-            encode_tuple(intent.table, intent.values)
+            proof = intent._encoding_proof
+            if _proved_tuple_payload(intent.table, intent.values, proof) is None:
+                _payload, proof = _encode_tuple_with_proof(
+                    intent.table, intent.values
+                )
+                intent = replace(intent, _encoding_proof=proof)
+            validated.append(intent)
+        return tuple(validated)
 
     def _refuse_unstored_endpoints(
         self, txn: TransactionContext, intent: RowIntent, position: int

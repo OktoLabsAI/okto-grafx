@@ -16,7 +16,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
+from threading import Lock
 from types import MappingProxyType
+from weakref import WeakKeyDictionary
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.ids import RecordId
@@ -27,6 +29,9 @@ from okto_grafx.domain.model.value import (
     VECTOR_VALUE_TYPES,
     Value,
     ValueType,
+    Timestamp,
+    Uuid,
+    VectorValue,
     _U32,
     _decode_expected_value_body,
     _decode_vector_mode,
@@ -649,6 +654,79 @@ def encode_tuple(table: TableDef, values: Sequence[Value]) -> bytes:
         _check_column_value(table, position, column, value)
         parts.append(encode_value(value))
     return b"".join(parts)
+
+
+def _tuple_encoding_proof_protocol():
+    """Build the private proof that lets one exact immutable row reuse its encoding.
+
+    The registry, proof type and lock live only in this closure.  A proof never authenticates an
+    ``id()`` by itself: its registry entry retains the exact table, values tuple and bytes object
+    produced by :func:`encode_tuple`.  A copied/replaced intent, another tuple with equal values,
+    or a caller-authored object therefore misses and must take the canonical encoder again.
+
+    Weak keys bound retention to the proof's own lifetime.  The lock protects only registry
+    publication/lookup/removal; encoding itself and every heap operation remain concurrent.
+    """
+
+    class Proof:
+        __slots__ = ("__weakref__",)
+
+    entries: WeakKeyDictionary[object, tuple[object, object, bytes]] = WeakKeyDictionary()
+    guard = Lock()
+
+    def proof_safe(value: object) -> bool:
+        """Return whether normal Python code cannot mutate this encoded value in place."""
+        value_type = type(value)
+        if value is None or value_type in (bool, int, float, str, bytes):
+            return True
+        if value_type in (Timestamp, Uuid, VectorValue):
+            return True
+        if value_type is tuple:
+            return all(proof_safe(item) for item in value)
+        # LIST/MAP also accept list/dict and BYTES accepts bytearray.  Their outer row tuple can
+        # retain its identity while a nested value changes, so identity alone cannot authorize
+        # reuse.  Unknown subclasses stay on the canonical path for the same reason.
+        return False
+
+    def encode_with_proof(
+        table: TableDef, values: Sequence[Value]
+    ) -> tuple[bytes, object | None]:
+        payload = encode_tuple(table, values)
+        if type(values) is not tuple or not all(proof_safe(value) for value in values):
+            return payload, None
+        proof = Proof()
+        with guard:
+            entries[proof] = (table, values, payload)
+        return payload, proof
+
+    def proved_payload(
+        table: TableDef, values: Sequence[Value], proof: object
+    ) -> bytes | None:
+        if type(proof) is not Proof:
+            return None
+        with guard:
+            entry = entries.get(proof)
+        if entry is None:
+            return None
+        proved_table, proved_values, payload = entry
+        if proved_table is table and proved_values is values:
+            return payload
+        return None
+
+    def forget(proof: object) -> None:
+        if type(proof) is not Proof:
+            return
+        with guard:
+            entries.pop(proof, None)
+
+    return encode_with_proof, proved_payload, forget
+
+
+(
+    _encode_tuple_with_proof,
+    _proved_tuple_payload,
+    _forget_tuple_encoding_proof,
+) = _tuple_encoding_proof_protocol()
 
 
 def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:
