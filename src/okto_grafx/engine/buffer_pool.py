@@ -1485,6 +1485,51 @@ class BufferPool:
         raw = self._storage.read_page(file, page_index)
         return is_unwritten_image(raw, self._page_size)
 
+    def _install_fresh_frame(
+        self,
+        file: str,
+        page_index: PageIndex,
+        page_type: int,
+        *,
+        pins: int,
+    ) -> Page:
+        """Publish one freshly allocated physical page in this pool.
+
+        The caller owns the pool guard and has already made room for the frame.  Keeping the
+        publication in one helper makes scalar and run allocation share the same load
+        revocation, abandoned-page authority and dirty-candidate bookkeeping; the only semantic
+        difference is whether the returned page remains pinned for a caller to fill.
+        """
+        self._grown.add((file, page_index))
+        key = (file, page_index)
+        loading = self._loads.get(key)
+        if loading is not None:
+            # Allocation installed the current meaning of this physical page while a detached
+            # read still carries its previous bytes. The reservation continues to count until
+            # the loader returns, but those bytes can no longer be published.
+            loading.valid = False
+        existing = self._frames.get(key)
+        if existing is not None:
+            # A sanctioned file never shrinks.  The defensive replacement remains shared with
+            # scalar allocation so neither route can leave an old, unpinned frame authoritative
+            # for a physical index the device has just handed out.
+            del self._frames[key]
+            self._remove_dirty_candidate(key)
+        self._add_dirty_candidate(key)
+        try:
+            page = Page(page_type, page_size=self._page_size, page_index=page_index)
+            page.dirty = True
+            # The device image for a page allocated here is all-zero. Its mutable Page may later
+            # be replaced by redo, but the CAS base remains the image this frame took ownership
+            # of.
+            frame = _Frame(page, device_base_seq=0)
+            frame.pins = pins
+            self._frames[key] = frame
+        except BaseException:
+            self._refresh_dirty_candidate(key)
+            raise
+        return page
+
     @_guarded
     def allocate(self, file: str, page_type: int, *, reuse: bool = True) -> Page:
         """Return a fresh page, pinned, empty and of the requested type, growing the file if need be.
@@ -1539,39 +1584,53 @@ class BufferPool:
         page_index = self._reusable_index(file) if reuse else None
         if page_index is None:
             page_index = self._storage.allocate(file, 1)
-        self._grown.add((file, page_index))
-        key = (file, page_index)
-        loading = self._loads.get(key)
-        if loading is not None:
-            # Allocation installed the current meaning of this physical page while a detached
-            # read still carries its previous bytes. The reservation continues to count until
-            # the loader returns, but those bytes can no longer be published.
-            loading.valid = False
-        existing = self._frames.get(key)
-        if existing is not None:
-            # Two ways to get here and neither leaves a holder behind. The file shrank, which no
-            # sanctioned operation does (G6); or this is a reused index that something read after
-            # it was discarded, which _reusable_index has already established is unpinned. The
-            # original A34 argument -- that no input could reach this branch at all -- stopped
-            # holding when reuse was added, so the pin question moved to where a candidate is
-            # chosen rather than being answered by declaring the branch dead.
-            del self._frames[key]
-            self._remove_dirty_candidate(key)
-        self._add_dirty_candidate(key)
-        try:
-            page = Page(page_type, page_size=self._page_size, page_index=page_index)
-            page.dirty = True
-            # The device image for a page allocated here is all-zero. Its mutable Page may later
-            # be replaced by redo, but the CAS base remains the image this frame took ownership
-            # of.
-            frame = _Frame(page, device_base_seq=0)
-            frame.pins = 1
-            self._frames[key] = frame
-        except BaseException:
-            self._refresh_dirty_candidate(key)
-            raise
+        page = self._install_fresh_frame(file, page_index, page_type, pins=1)
         self._report_usage()
         return page
+
+    @_guarded
+    def allocate_run(self, file: str, page_type: int, count: int) -> PageIndex:
+        """Grow ``file`` once by ``count`` fresh, unpinned pages and return the first index.
+
+        This is the bounded structural-allocation counterpart of :meth:`allocate`.  It exists
+        for eager structures such as a new index directory, where every page is known up front
+        and retaining one descriptor plus one file-size observation for the whole run avoids a
+        pair of filesystem probes per page.  The pages are installed as ordinary dirty frames
+        and may be evicted between admissions, so the operation needs capacity for one page,
+        not for the entire run.
+
+        The budget is proved before the device grows, exactly as for scalar allocation.  Run
+        allocation never consumes abandoned claims: its caller is extending a physical
+        directory to a known length, so handing back an old index would not advance that length.
+        ``StorageDevice.allocate`` remains the authority for the exact name, descriptor identity
+        and maximum allocation size; this door narrows only repeated size observations.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise GrafxUnsupportedOperation(
+                "allocate_run needs a count of one page or more.",
+                reason="invalid_page_count",
+                file=file,
+                count=count,
+            )
+        self._wait_for_evictions(file)
+        try:
+            prospective = self._storage.page_count(file)
+        except GrafxError as failure:
+            if failure.details.get("reason") != "missing_file":
+                raise
+            prospective = 0
+        # One available or evictable slot is sufficient: every page installed below is unpinned
+        # and can become the next victim.  Refusing here, before allocate(), preserves G6 under a
+        # retry loop instead of appending the whole run on every failed attempt.
+        self._make_room(file, prospective)
+        first = self._storage.allocate(file, count)
+        for offset in range(count):
+            page_index = first + offset
+            if offset:
+                self._make_room(file, page_index)
+            self._install_fresh_frame(file, page_index, page_type, pins=0)
+        self._report_usage()
+        return first
 
     @_guarded
     def flush(self, file: str | None = None) -> int:

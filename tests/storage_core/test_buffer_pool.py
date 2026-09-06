@@ -137,6 +137,23 @@ class PresenceRecordingDevice(MemoryDevice):
         return super().exists(file)
 
 
+class AllocationRecordingDevice(MemoryDevice):
+    """Expose physical sizing calls made by scalar and run allocation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.page_count_calls: list[str] = []
+        self.allocate_calls: list[tuple[str, int]] = []
+
+    def page_count(self, file: str) -> int:
+        self.page_count_calls.append(file)
+        return super().page_count(file)
+
+    def allocate(self, file: str, count: int = 1) -> PageIndex:
+        self.allocate_calls.append((file, count))
+        return super().allocate(file, count)
+
+
 def seed_pages(pool: BufferPool, count: int, *, file: str = FILE) -> list[PageIndex]:
     """Allocate and write count pages, returning their indices."""
     indices: list[PageIndex] = []
@@ -1323,6 +1340,59 @@ def test_allocation_does_not_read_a_non_missing_page_count_refusal_as_empty() ->
 
     assert refused.value.details["reason"] == "unaligned_paged_file"
     assert device.exists_calls == []
+
+
+def test_a_run_grows_the_device_once_and_installs_unpinned_typed_pages() -> None:
+    device = AllocationRecordingDevice()
+    device.create(FILE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=2)
+
+    assert pool.allocate_run(FILE, int(PageType.HEAP), 4) == 0
+
+    assert device.page_count_calls == [FILE]
+    assert device.allocate_calls == [(FILE, 4)]
+    assert len(device._pages[FILE]) == 4
+    assert all(pool.pin_count(FILE, page_index) == 0 for page_index in range(4))
+    pool.flush(FILE)
+    pool.invalidate()
+    for page_index in range(4):
+        with pool.pinned(FILE, page_index) as page:
+            assert page.page_type == int(PageType.HEAP)
+
+
+def test_a_run_budget_refusal_happens_before_the_file_grows() -> None:
+    device = AllocationRecordingDevice()
+    device.create(FILE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    held = pool.allocate(FILE, int(PageType.HEAP))
+    before = len(device._pages[FILE])
+    device.allocate_calls.clear()
+    device.page_count_calls.clear()
+
+    with pytest.raises(GrafxBufferBudgetExceeded):
+        pool.allocate_run(FILE, int(PageType.HEAP), 4)
+
+    assert len(device._pages[FILE]) == before
+    assert device.page_count_calls == [FILE]
+    assert device.allocate_calls == []
+    pool.unpin(FILE, held.page_index, page=held)
+
+
+@pytest.mark.parametrize("count", [0, -1, True, False, 1.5, "4", None])
+def test_a_run_refuses_an_invalid_count_without_observing_or_growing_the_file(
+    count: object,
+) -> None:
+    device = AllocationRecordingDevice()
+    device.create(FILE)
+    pool = make_pool(device, RecordingMetrics())
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.allocate_run(FILE, int(PageType.HEAP), count)  # type: ignore[arg-type]
+
+    assert refused.value.details["reason"] == "invalid_page_count"
+    assert device.page_count_calls == []
+    assert device.allocate_calls == []
+    assert len(device._pages[FILE]) == 0
 
 
 def test_the_pool_exposes_the_ports_the_stores_need() -> None:
