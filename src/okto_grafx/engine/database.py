@@ -57,7 +57,14 @@ from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     HEAP_RECLAIM_V1_CAPABILITY,
 )
-from okto_grafx.domain.model.value import Value, VectorValue
+from okto_grafx.domain.model.value import (
+    INT64_MAX,
+    INT64_MIN,
+    Timestamp,
+    Uuid,
+    Value,
+    VectorValue,
+)
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.page.file_header import (
     HEADER_PAGE_INDEX,
@@ -711,6 +718,34 @@ class ScanRowV1:
 
     record_id: int
     values: tuple[Value, ...]
+
+
+_SCAN_EXACT_IMMUTABLE_VALUE_TYPES: frozenset[type[object]] = frozenset(
+    {type(None), bool, int, float, str, bytes, Timestamp, Uuid, VectorValue}
+)
+
+
+def _scan_exact_scalar_values_snapshot(
+    values: tuple[Value, ...], *, max_string_characters: int
+) -> tuple[Value, ...] | None:
+    """Retain one decoded tuple when every leaf is an exact immutable scalar.
+
+    Heap decoding owns this exact tuple and constructs every type admitted here from stored
+    bytes. None of them can retain a page, collaborator or mutable child: UUID owns exact bytes,
+    vectors own a tuple of exact floats, and the remaining shapes are built-in immutables. A
+    compound value or an over-limit string declines to the canonical deep copier, which preserves
+    its public detachment and refusal details. This is deliberately not a general public-value
+    shortcut; it is scoped to the output of ``HeapStore.scan_page``.
+    """
+    for value in values:
+        value_type = type(value)
+        if value_type not in _SCAN_EXACT_IMMUTABLE_VALUE_TYPES:
+            return None
+        if value_type is int and not INT64_MIN <= value <= INT64_MAX:
+            return None
+        if value_type is str and len(value) > max_string_characters:
+            return None
+    return values
 
 
 class ScanCursorV1:
@@ -2645,22 +2680,29 @@ class Database:
             active: set[int] = set()
             rows: list[ScanRowV1] = []
             for row_position, (_ref, version) in enumerate(raw_rows):
+                raw_values = version.values
+                detached_values = _scan_exact_scalar_values_snapshot(
+                    raw_values,
+                    max_string_characters=self._max_query_value_characters,
+                )
+                if detached_values is None:
+                    detached_values = tuple(
+                        _query_value_snapshot(
+                            value,
+                            field=f"scan.rows[{row_position}].values[{value_position}]",
+                            depth=0,
+                            active=active,
+                            max_string_characters=self._max_query_value_characters,
+                        )
+                        for value_position, value in enumerate(raw_values)
+                    )
                 rows.append(
                     ScanRowV1(
                         record_id=_builtin_int(
                             version.record_id,
                             field=f"scan.rows[{row_position}].record_id",
                         ),
-                        values=tuple(
-                            _query_value_snapshot(
-                                value,
-                                field=f"scan.rows[{row_position}].values[{value_position}]",
-                                depth=0,
-                                active=active,
-                                max_string_characters=self._max_query_value_characters,
-                            )
-                            for value_position, value in enumerate(version.values)
-                        ),
+                        values=detached_values,
                     )
                 )
             next_cursor = (
