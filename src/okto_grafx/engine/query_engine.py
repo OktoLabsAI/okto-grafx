@@ -5267,6 +5267,30 @@ _ENCODING_COMPLETE_EXACT_TYPES: frozenset[ValueType] = frozenset(
 """Scalar kinds whose stored bytes are complete for the language's equality relation."""
 
 
+def _string_probe_frontier(
+    table: TableDef, position: int, values: tuple[object, ...]
+) -> int | None:
+    """Return the distinct encoded-key count of exact ``str`` probes of a STRING key column.
+
+    ``index_key`` encodes a STRING value as its tag, length and UTF-8 bytes, an injective map:
+    two ``str`` probes are the same key exactly when they are equal, so the distinct count of
+    the encoding route is known without encoding.  ``None`` is not a count: it means some probe
+    is not an exact ``str`` (a subclass, a number, a compound value), and the caller must take
+    the encoding route, which stays the single oracle for cross-representation probes and for
+    the canonical fallback refusal.  A ``None`` probe is skipped exactly as the encoder skips it.
+    """
+    if table.columns[position].type is not ValueType.STRING:
+        return None
+    distinct: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        if type(value) is not str:
+            return None
+        distinct.add(value)
+    return len(distinct)
+
+
 def _exact_probe_is_encoding_complete(
     table: TableDef,
     positions: Sequence[int],
@@ -6309,21 +6333,25 @@ def _relationship_incident_seek(
 
     empty = _Row(bindings={})
 
-    def encoded_keys(
-        expression: Expression,
-        table: TableDef,
-        position: int,
-    ) -> tuple[tuple[bytes, Value], ...] | None:
+    def probe_values(expression: Expression) -> tuple[object, ...] | None:
+        """Evaluate one probe list exactly once; None keeps the canonical fallback."""
         raw = _evaluate(expression, empty, context)
         if raw is None:
             return ()
         if type(raw) not in (list, tuple):
             # Preserve the canonical IN refusal (and custom Sequence behaviour) in the fallback.
             return None
-        unique: dict[bytes, Value] = {}
         # Freeze a caller-owned list before encoding so one execution never observes a moving
         # parameter frontier while it is opening durable index certificates.
-        for value in tuple(raw):
+        return tuple(raw)
+
+    def encoded_keys(
+        values: tuple[object, ...],
+        table: TableDef,
+        position: int,
+    ) -> tuple[tuple[bytes, Value], ...] | None:
+        unique: dict[bytes, Value] = {}
+        for value in values:
             if value is None:
                 continue
             if not _exact_probe_is_encoding_complete(table, (position,), (value,)):
@@ -6334,9 +6362,9 @@ def _relationship_incident_seek(
             unique.setdefault(key, cast(Value, value))
         return tuple(unique.items())
 
-    from_keys = encoded_keys(node.from_keys, node.from_table, node.from_key_position)
-    to_keys = encoded_keys(node.to_keys, node.to_table, node.to_key_position)
-    if from_keys is None or to_keys is None:
+    from_values = probe_values(node.from_keys)
+    to_values = probe_values(node.to_keys)
+    if from_values is None or to_values is None:
         yield from engine._rows(node.fallback, context)
         return
 
@@ -6350,6 +6378,30 @@ def _relationship_incident_seek(
     # decision happens before validated_versions_many opens the first durable index certificate.
     extent = engine.heap.extent_of(node.table)
     allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
+    # KGRUN-M3: the edge-first scan is chosen BEFORE up to 2 x 500 probes are encoded, when the
+    # distinct frontier is known exactly without encoding.  A STRING key column encodes an exact
+    # ``str`` probe injectively (tag, length, UTF-8 bytes), so distinct strings are distinct keys
+    # and equal strings share one key: the count below is the count the encoding route would
+    # produce, and the branch chosen is therefore the same.  Every other probe shape (subclass,
+    # numeric, mixed) keeps the encoding route, which remains the single oracle for refusals and
+    # cross-representation probes; the scan branch never reads a key it did not encode.
+    exact_from = _string_probe_frontier(
+        node.from_table, node.from_key_position, from_values
+    )
+    exact_to = _string_probe_frontier(node.to_table, node.to_key_position, to_values)
+    if (
+        exact_from is not None
+        and exact_to is not None
+        and allocated_upper * 2 <= exact_from + exact_to
+    ):
+        yield from engine._rows(node.fallback, context)
+        return
+
+    from_keys = encoded_keys(from_values, node.from_table, node.from_key_position)
+    to_keys = encoded_keys(to_values, node.to_table, node.to_key_position)
+    if from_keys is None or to_keys is None:
+        yield from engine._rows(node.fallback, context)
+        return
     probe_frontier = len(from_keys) + len(to_keys)
     if allocated_upper * 2 <= probe_frontier:
         yield from engine._rows(node.fallback, context)

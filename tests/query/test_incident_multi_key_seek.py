@@ -218,6 +218,63 @@ def test_tiny_relationship_frontier_uses_edge_first_scan_before_any_certificate(
     assert calls == 0
 
 
+def test_edge_first_scan_is_chosen_before_any_string_probe_is_encoded(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KGRUN-M3: a STRING frontier is counted, not encoded, when the scan wins."""
+    import okto_grafx.engine.query_engine as query_engine_module
+
+    original_key = query_engine_module.index_key
+    encoded = 0
+
+    def counted_index_key(values, positions):
+        nonlocal encoded
+        encoded += 1
+        return original_key(values, positions)
+
+    monkeypatch.setattr(query_engine_module, "index_key", counted_index_key)
+    # Four edges against a frontier of ten distinct strings: the scan wins.  Repeated and null
+    # probes must count exactly as the encoding route counts them, so they are included.
+    probes = [f"missing-{number}" for number in range(10)] + ["missing-0", None]
+
+    assert database.execute(QUERY, {"node_ids": probes}).rows == ()
+    assert encoded == 0
+
+    # Two distinct strings against four edges: the seek wins and every non-null probe is still
+    # encoded on both endpoint sides, exactly as before (landings encode their own keys after).
+    assert database.execute(QUERY, {"node_ids": ["a1", "a1", "b1"]}).rows == (
+        ("a1", "b1", 0.4),
+        ("a1", "b1", 0.5),
+        ("a2", "b1", 0.6),
+    )
+    assert encoded >= 6
+
+
+def test_probe_frontier_counts_exact_strings_and_declines_everything_else() -> None:
+    from okto_grafx.domain.model.schema import ColumnDef, TableDef
+    from okto_grafx.domain.model.value import ValueType
+    from okto_grafx.engine.query_engine import _string_probe_frontier
+
+    class Tagged(str):
+        """A str subclass must keep the encoding route, not be counted here."""
+
+    table = TableDef(
+        table_id=7,
+        name="A",
+        kind="node",
+        columns=(
+            ColumnDef("id", ValueType.STRING, nullable=False),
+            ColumnDef("n", ValueType.INT64),
+        ),
+        primary_key="id",
+    )
+    assert _string_probe_frontier(table, 0, ("x", "x", None, "y")) == 2
+    assert _string_probe_frontier(table, 0, ()) == 0
+    assert _string_probe_frontier(table, 0, ("x", Tagged("y"))) is None
+    assert _string_probe_frontier(table, 0, ("x", 1)) is None
+    assert _string_probe_frontier(table, 1, (1, 2)) is None
+
+
 @pytest.mark.parametrize(("allocated_upper", "expects_seek"), ((12, False), (60, True)))
 def test_cost_selector_crosses_between_twelve_and_sixty_edges_for_eighty_four_keys(
     database: object,
