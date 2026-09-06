@@ -414,6 +414,53 @@ index creation and repair, buffer allocation, process-global state rules and rea
 Ruff and diff checks were clean. Neither item changes format, WAL, either OCC validation,
 durability, recovery ordering or multi-process admission.
 
+## KG-LOAD-3 — fourth profile and finite implementation order
+
+The user-visible priority remains the time from opening the Pulse Knowledge Graph page until its
+graph can be rendered; a transfer benchmark is supporting evidence, not a substitute for this
+operation. Claude's fourth profile is recorded in `.grafx-tmp/levantamento2/LEVANTAMENTO_4.md`
+against `645afa4`. Its fresh Pulse-shaped transfer median was `60.18 s`, with Grafx accounting for
+`86.8%`. The corresponding synthetic KG page measured `2.75 s` on the hybrid route and `2.52 s`
+on forced scan; the real-board warm observations above (`0.762–0.848 s`) remain the relevant
+end-user denominator.
+
+The joint adversarial selection is closed and ordered by precedence:
+
+1. exact-type dispatch in query evaluation (`KG-6a`) and value encoding (`R-15`), in Claude's
+   isolated branch;
+2. passage-local replay decode/catalog reuse (`R-5`), heap allocation without a redundant eager
+   size probe (`E-1d`), and immutable decoded scan-row publication (`R-13`) in Codex's branch;
+3. one combined focused regression and the already-defined KG-page harness after integration;
+4. the independent Pulse generation-open setting (`D-4`) and active-filter collapse (`KG-5`);
+5. only then, a materialized/replayable design for per-index read certification (`D-2`) and exact
+   path/descriptor reproof (`D-8`), followed by measurements of `R-12` and open high-water work.
+
+Three attractive shortcuts are finite NO-GOs. `R-14` cannot memoize a slotted-page directory as
+proposed because the current buffer frame already stores the decoded `Page`; observed decode
+counts belong to reload/eviction and require proof of duplicate work on the same frame. Replacing
+open-time committed high-water traversal with `next_record_id` is invalid because an allocation
+floor is not a committed-LSN watermark. `D-1` is rejected because it removes canonical-reference
+and two-visible-version fences. None will be silently reintroduced as a moving target.
+
+`dfefe00` implements `R-5`. Partitioned replay now decodes each record once and resolves repeated
+exact built-in index names once inside the same protected replay passage. The canonical
+`CommitRedo` preflight remains independent and complete. Custom managers/stores use the old path,
+and no prepared authority is stored on the manager or accepted through the normal common-batch
+API. Seventy-seven replay tests passed.
+
+`073d042` implements `E-1d`. Buffer admission needs one available frame, not the future physical
+page number, so successful scalar allocation now lets the atomic storage `allocate` call perform
+the sole descriptor-size and index proof. The prospective index remains a lazy callback and is
+resolved before any budget/re-entrancy refusal, preserving exact diagnostics. There is no local
+high-water hint for a foreign writer to stale. All 174 buffer-pool tests passed.
+
+`2cf6820` implements `R-13`. `scan_rows_v1` retains the heap decoder's exact tuple when every leaf
+is an exact immutable stored scalar (`None`, built-in scalar, timestamp, UUID or vector). Compound,
+subclassed or over-limit values take the canonical recursive copier, including the same field and
+limit details. Focused scan/publication tests passed, and an instrumented vector row performs zero
+recursive value-copy calls. These three changes do not alter stored format, WAL, either OCC
+validation, snapshot visibility, durability or multi-reader/multi-writer admission.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -433,5 +480,9 @@ durability, recovery ordering or multi-process admission.
 | Bounded batch endpoint landing / memo B | deferred after adversarial review and live remeasurement | generic batching changes pull-cursor error order and has no byte cap; residual is about 0.08–0.16 s on the live page; only a future narrow/materialized API may reopen it |
 | Structural allocation run (E-1c) | complete and measured | `9d17ed8` + `fcd4e21`; one physical directory grow, partial-repair and one-page-budget tests; Pulse-shaped DDL median `7.95 -> 6.49 s` (`-18.4%`) and short transfer `17.45 -> 15.72 s` (`-9.9%`) |
 | Checkpoint bucket replay (LB-3) | complete and integrated | Claude `d8851a6`, integrated as `81615af`; exact 1–7-effect differential, 1,913 broad author tests, byte-identical index files and clean verify; checkpoint about `-6%`, approximately `0.6%` of refreshed transfer |
+| Replay resolution reuse (R-5) | complete locally | `dfefe00`; independent full recovery preflight retained, passage-local only, custom fallbacks retained; 77 focused tests |
+| Heap allocation sizing (E-1d) | complete locally | `073d042`; no eager page-count probe on successful scalar allocation, atomic device allocation remains authoritative; 174 buffer-pool tests |
+| Immutable scan publication (R-13) | complete locally | `2cf6820`; exact decoded scalar/vector tuples bypass recursive copy, compound/hostile/over-limit fallback retained; focused scan/publication tests |
+| Exact expression/value dispatch (KG-6a/R-15) | implementation complete on Claude branch; measurement pending | Claude `6dfbb6b` + `29641ba`; exact-type table with original isinstance chain for subclasses/hostiles |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |

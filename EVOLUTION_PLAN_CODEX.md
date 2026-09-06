@@ -3725,6 +3725,24 @@ recovery mediu checkpoint aproximadamente `-6%` com dispersão próxima de `+/-5
 do transfer atualizado, portanto registrado como ganho pequeno e não como headline. Formato, WAL,
 as duas OCCs, recovery, durabilidade e multi-reader/multi-writer permanecem intactos.
 
+O quarto levantamento de performance do Claude está registrado em
+`.grafx-tmp/levantamento2/LEVANTAMENTO_4.md` e consolidado em
+`docs/PERFORMANCE_ROUND_0_0_3.md`. O alvo continua finito: latência percebida entre abrir o
+Knowledge Graph do Pulse e poder renderizar seus nós/arestas. O consenso ordenou primeiro
+`KG-6a/R-15`, depois `R-5/E-1d/R-13`, seguido de uma regressão combinada; `D-4/KG-5` são a onda
+Pulse independente, e `D-2/D-8` exigem uma API materializada/replayable com pré-provas físicas,
+pós-prova integral e retry do lote inteiro. `R-14` como cache de slotted page, o atalho de
+high-water por `next_record_id` e `D-1` ficaram NO-GO por falta de trabalho duplicado no mesmo
+frame ou por remover garantias.
+
+O lote local está implementado em `dfefe00`, `073d042` e `2cf6820`: o replay reaproveita decode e
+resolução somente dentro da passagem já prevalidada; a alocação escalar bem-sucedida não faz
+`page_count` antes do `StorageDevice.allocate` atômico; e `scan_rows_v1` publica diretamente a
+tupla decodificada quando todos os valores são escalares imutáveis exatos, mantendo o copier
+canônico para compostos/hostis/limites. Foram verdes, respectivamente, 77 testes de replay, 174
+do buffer pool e os focais de scan/publicação. Não há cache de autoridade entre operações,
+mudança de formato, WAL, OCC, snapshots, durabilidade ou multi-reader/multi-writer.
+
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
 `DELETE p, p` que recusava o segundo nome do mesmo insert. O primeiro agora falha tipado antes do
