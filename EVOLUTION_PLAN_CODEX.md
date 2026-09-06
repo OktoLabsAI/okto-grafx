@@ -3743,6 +3743,23 @@ canônico para compostos/hostis/limites. Foram verdes, respectivamente, 77 teste
 do buffer pool e os focais de scan/publicação. Não há cache de autoridade entre operações,
 mudança de formato, WAL, OCC, snapshots, durabilidade ou multi-reader/multi-writer.
 
+O restante dessa onda foi integrado em `6165bce`, `4de7be9`, `1940466`, `6e29c7e` e `b3e70e5`.
+`R-15` usa uma tabela selada para classes de valores exatas e mantém a cadeia anterior para
+subclasses/hostis; `KG-6a` aplica fast path direto a `Literal` e uma tabela selada aos outros onze
+tipos exatos, chamando os mesmos evaluators e preservando precedência de `computed`, erros e
+fallbacks. No caminho KG alternado, a página de nós caiu de `713` para `667 ms` (`1,069x`) e o
+fan-out híbrido de `2,783` para `2,543 s` (`1,094x`). Um único braço vetorial ficou dentro da
+dispersão e sem causalidade específica; ele não virou um novo gate marginal. A regressão combinada
+de 381 testes e os checks Ruff/diff ficaram verdes.
+
+As otimizações complementares do consumidor estão publicadas em Community
+`perf/v0.3.3-kg-load-grafx@52dbd22` e Core
+`perf/v0.3.3-kg-active-filter@56b4764`. A primeira usa `generation` como padrão apenas nos
+diretórios geracionais gerenciados pelo Pulse, mantendo `strict` disponível e documentado; a
+segunda substitui sete desigualdades de tombstone por um `NOT IN` semanticamente equivalente,
+confirmado nos dois backends. Formato, WAL, ambas as OCCs, recovery, durabilidade e as premissas
+multi-reader/multi-writer continuam inalterados.
+
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
 `DELETE p, p` que recusava o segundo nome do mesmo insert. O primeiro agora falha tipado antes do

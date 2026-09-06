@@ -461,6 +461,30 @@ limit details. Focused scan/publication tests passed, and an instrumented vector
 recursive value-copy calls. These three changes do not alter stored format, WAL, either OCC
 validation, snapshot visibility, durability or multi-reader/multi-writer admission.
 
+`6165bce` + `6e29c7e` integrate `R-15`. Exact built-in value classes use a sealed
+`MappingProxyType` dispatch to the same `ValueType` results, while subclasses, hostile values and
+unsupported values retain the original ordered `isinstance` chain and failures. The focused micro
+measured `value_type_of` around `2.2x` faster; encoded bytes are unchanged. The transfer-level
+effect is below the run-to-run noise and is deliberately not promoted as a wall-clock claim.
+
+`4de7be9` + `1940466` + `b3e70e5` integrate `KG-6a`. Exact `Literal` uses a direct identity fast
+path and the other eleven exact expression classes use a sealed table that invokes the same
+per-kind evaluators; computed values remain first, and subclasses/unknown expressions retain the
+old chain and typed failures. The alternating KG-path sample improved the node page from `713 ms`
+to `667 ms` (`1.069x`) and hybrid fan-out from `2.783 s` to `2.543 s` (`1.094x`). One vector sample
+was noisy and slightly negative, without a code-specific mechanism and within the observed
+single-run dispersion; following the instruction not to create a marginal performance gate, no
+extra long A/B was required. A combined 381-test slice across value dispatch, expression dispatch,
+query memoization, scan publication, replay and buffer allocation passed; Ruff and diff checks
+were clean.
+
+The companion Pulse work is also concrete. Community commit `52dbd22` makes `generation`
+descriptor revalidation the default only for Pulse-managed generation directories and documents
+when `strict` remains required; handles are still closed before restore or generation replacement.
+Core commit `56b4764` collapses seven equivalent active-tombstone inequalities into one `NOT IN`
+predicate with identical null semantics on Grafx and Ladybug. Those changes preserve storage
+format, WAL, both OCC validations, recovery, durability and multi-reader/multi-writer operation.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -480,9 +504,11 @@ validation, snapshot visibility, durability or multi-reader/multi-writer admissi
 | Bounded batch endpoint landing / memo B | deferred after adversarial review and live remeasurement | generic batching changes pull-cursor error order and has no byte cap; residual is about 0.08–0.16 s on the live page; only a future narrow/materialized API may reopen it |
 | Structural allocation run (E-1c) | complete and measured | `9d17ed8` + `fcd4e21`; one physical directory grow, partial-repair and one-page-budget tests; Pulse-shaped DDL median `7.95 -> 6.49 s` (`-18.4%`) and short transfer `17.45 -> 15.72 s` (`-9.9%`) |
 | Checkpoint bucket replay (LB-3) | complete and integrated | Claude `d8851a6`, integrated as `81615af`; exact 1–7-effect differential, 1,913 broad author tests, byte-identical index files and clean verify; checkpoint about `-6%`, approximately `0.6%` of refreshed transfer |
-| Replay resolution reuse (R-5) | complete locally | `dfefe00`; independent full recovery preflight retained, passage-local only, custom fallbacks retained; 77 focused tests |
-| Heap allocation sizing (E-1d) | complete locally | `073d042`; no eager page-count probe on successful scalar allocation, atomic device allocation remains authoritative; 174 buffer-pool tests |
-| Immutable scan publication (R-13) | complete locally | `2cf6820`; exact decoded scalar/vector tuples bypass recursive copy, compound/hostile/over-limit fallback retained; focused scan/publication tests |
-| Exact expression/value dispatch (KG-6a/R-15) | implementation complete on Claude branch; measurement pending | Claude `6dfbb6b` + `29641ba`; exact-type table with original isinstance chain for subclasses/hostiles |
+| Replay resolution reuse (R-5) | complete and integrated | `dfefe00`; independent full recovery preflight retained, passage-local only, custom fallbacks retained; 77 focused tests |
+| Heap allocation sizing (E-1d) | complete and integrated | `073d042`; no eager page-count probe on successful scalar allocation, atomic device allocation remains authoritative; 174 buffer-pool tests |
+| Immutable scan publication (R-13) | complete and integrated | `2cf6820`; exact decoded scalar/vector tuples bypass recursive copy, compound/hostile/over-limit fallback retained; focused scan/publication tests |
+| Exact expression/value dispatch (KG-6a/R-15) | complete and integrated | `6165bce`, `4de7be9`, `1940466`, `6e29c7e`, `b3e70e5`; sealed exact-type tables with original fallback; KG node page `713 -> 667 ms`, fan-out `2.783 -> 2.543 s`; 381 combined focused tests |
+| Pulse generation revalidation default (D-4) | complete on companion Community branch | `perf/v0.3.3-kg-load-grafx@52dbd22`; 60 focused tests with paired Core; strict mode remains available and documented |
+| Active tombstone filter collapse (KG-5) | complete on companion Core branch | `perf/v0.3.3-kg-active-filter@56b4764`; seven focused tests plus Grafx/Ladybug semantic probes |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |
