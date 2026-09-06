@@ -375,7 +375,16 @@ def test_concurrent_landings_never_exceed_the_ceiling_and_answer_correctly() -> 
             raise result
     assert view._cache_enabled is True
     assert view._cache_entries <= 3
-    assert budget._used_bytes == base + view._cache_entries * charge
+    # Which identities survive depends on the interleaving, and identities 10 and 11 carry one
+    # more name character than the others: the budget must equal the tariff of exactly the
+    # retained landings, whichever they are.
+    retained = list(view._cache.values())
+    assert len(retained) == view._cache_entries
+    assert all(
+        kept_charge == _owner_landing_result_bytes(table, found)
+        for found, kept_charge in retained
+    )
+    assert budget._used_bytes == base + sum(kept_charge for _found, kept_charge in retained)
     assert budget._used_bytes <= budget._max_bytes
     stack.engine.settle_schema(71, committed=False)
     assert budget._used_bytes == 0
