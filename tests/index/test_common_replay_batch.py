@@ -298,22 +298,35 @@ def test_partial_failure_marks_touched_store_stale_and_retry_converges(
         _effect(database.exact, IndexOperation.INSERT, 11, ordinal=2),
     )
     original = IndexStore._apply_change
+    original_hot = IndexStore._apply_common_replay_hot_change
     calls = 0
 
-    def fail_second(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+    def second_effect_fails() -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise GrafxIndexError("injected replay failure", field="injected")
+
+    def fail_second(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+        second_effect_fails()
         return original(store, change, lsn)
 
+    def fail_second_hot(
+        store: IndexStore, bucket: object, change: IndexChange, lsn: int
+    ) -> bool:
+        second_effect_fails()
+        return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
+
+    # Both replay doors: the scalar one and the per-bucket directory every touched bucket uses.
     monkeypatch.setattr(IndexStore, "_apply_change", fail_second)
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", fail_second_hot)
     redo = CommitRedo(database.pool, database.manager)
     with pytest.raises(GrafxIndexError, match="injected replay failure"):
         redo.apply(_replay(records))
     assert database.exact.stale is True
 
     monkeypatch.setattr(IndexStore, "_apply_change", original)
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", original_hot)
     redo.apply(_replay(records))
 
     assert len(tuple(database.exact.walk())) == 2
@@ -363,16 +376,28 @@ def test_process_control_signal_does_not_publish_a_new_stale_verdict(
         _effect(database.exact, IndexOperation.INSERT, 11, ordinal=2),
     )
     original = IndexStore._apply_change
+    original_hot = IndexStore._apply_common_replay_hot_change
     calls = 0
 
-    def interrupt(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+    def second_effect_interrupts() -> None:
         nonlocal calls
         calls += 1
         if calls == 2:
             raise signal()
+
+    def interrupt(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+        second_effect_interrupts()
         return original(store, change, lsn)
 
+    def interrupt_hot(
+        store: IndexStore, bucket: object, change: IndexChange, lsn: int
+    ) -> bool:
+        second_effect_interrupts()
+        return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
+
+    # Both replay doors: the scalar one and the per-bucket directory every touched bucket uses.
     monkeypatch.setattr(IndexStore, "_apply_change", interrupt)
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", interrupt_hot)
 
     with pytest.raises(signal):
         CommitRedo(database.pool, database.manager).apply(_replay(records))
@@ -530,6 +555,15 @@ def test_vector_store_stays_scalar_without_poisoning_canonical_store_batch(
             events.append("exact.change")
         return original_change(store, change, lsn)
 
+    original_hot_change = IndexStore._apply_common_replay_hot_change
+
+    def counted_hot_change(
+        store: IndexStore, bucket: object, change: IndexChange, lsn: int
+    ) -> bool:
+        if store is database.exact:
+            events.append("exact.change")
+        return original_hot_change(store, bucket, change, lsn)  # type: ignore[arg-type]
+
     def scalar_guard(store: IndexStore, record: WalRecord) -> None:
         if store is database.exact:
             pytest.fail("canonical store fell back to scalar replay")
@@ -544,6 +578,9 @@ def test_vector_store_stays_scalar_without_poisoning_canonical_store_batch(
     monkeypatch.setattr(IndexStore, "_read_header", counted_read)
     monkeypatch.setattr(IndexStore, "_write_header", counted_write)
     monkeypatch.setattr(IndexStore, "_apply_change", counted_change)
+    monkeypatch.setattr(
+        IndexStore, "_apply_common_replay_hot_change", counted_hot_change
+    )
     monkeypatch.setattr(IndexStore, "apply", scalar_guard)
     monkeypatch.setattr(VectorHnswIndex, "apply", counted_vector)
 
@@ -564,12 +601,13 @@ def test_vector_store_stays_scalar_without_poisoning_canonical_store_batch(
     ]
 
 
-def test_only_buckets_at_the_eight_effect_threshold_bypass_scalar_apply(
+def test_every_touched_bucket_bypasses_scalar_apply_whatever_its_run_length(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = build_database()
-    hot_keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"hot-")
-    cold_keys = _keys_in_bucket(database.exact, 1, 7, prefix=b"cold-")
+    long_keys = _keys_in_bucket(database.exact, 0, 8, prefix=b"long-")
+    short_keys = _keys_in_bucket(database.exact, 1, 7, prefix=b"short-")
+    single_key = _keys_in_bucket(database.exact, 2, 1, prefix=b"single-")
     records = tuple(
         _effect_for(
             database.exact,
@@ -578,7 +616,7 @@ def test_only_buckets_at_the_eight_effect_threshold_bypass_scalar_apply(
             key,
             RecordRef(offset + 1, 1),
         )
-        for offset, key in enumerate((*hot_keys, *cold_keys))
+        for offset, key in enumerate((*long_keys, *short_keys, *single_key))
     )
     scalar_calls: list[bytes] = []
     original = IndexStore._apply_change
@@ -587,12 +625,111 @@ def test_only_buckets_at_the_eight_effect_threshold_bypass_scalar_apply(
         scalar_calls.append(change.key)
         return original(store, change, lsn)
 
+    hot_calls: list[bytes] = []
+    original_hot = IndexStore._apply_common_replay_hot_change
+
+    def counted_hot(
+        store: IndexStore,
+        bucket: object,
+        change: IndexChange,
+        lsn: int,
+    ) -> bool:
+        hot_calls.append(change.key)
+        return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
+
     monkeypatch.setattr(IndexStore, "_apply_change", counted)
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", counted_hot)
 
     CommitRedo(database.pool, database.manager).apply(_replay(records))
 
-    assert scalar_calls == list(cold_keys)
-    assert len(tuple(database.exact.walk())) == 15
+    # A one-effect bucket and a seven-effect bucket are pre-indexed exactly like the eight-effect
+    # run the former floor admitted: the directory walks each touched chain once.
+    assert scalar_calls == []
+    assert hot_calls == [*long_keys, *short_keys, *single_key]
+    assert len(tuple(database.exact.walk())) == 16
+
+
+def test_bucket_runs_of_one_to_seven_effects_match_legacy_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every run length below the former floor replays byte-identically to the scalar path.
+
+    Inserts only: the operation mix under a hot directory is proved by the tests above, and
+    fresh keys keep the per-bucket effect count exactly the declared one.  The test stores carry
+    four buckets, so the seven run lengths are spread over two replays.
+    """
+    batched = build_database(name="short-batched", budget_pages=64)
+    legacy = build_database(name="short-legacy", budget_pages=64)
+    rounds = ({0: 1, 1: 2, 2: 3, 3: 4}, {0: 5, 1: 6, 2: 7})
+    scalar_calls: list[bytes] = []
+    original = IndexStore._apply_change
+
+    def counted(store: IndexStore, change: IndexChange, lsn: int) -> bool:
+        if store is batched.proximity:
+            scalar_calls.append(change.key)
+        return original(store, change, lsn)
+
+    prepared_runs: list[int] = []
+    original_prepare = IndexStore._prepare_common_replay_hot_bucket
+
+    def counted_prepare(store: IndexStore, bucket: int, targets, **options):  # type: ignore[no-untyped-def]
+        if store is batched.proximity:
+            prepared_runs.append(len(targets))
+        return original_prepare(store, bucket, targets, **options)
+
+    monkeypatch.setattr(IndexStore, "_apply_change", counted)
+    monkeypatch.setattr(
+        IndexStore, "_prepare_common_replay_hot_bucket", counted_prepare
+    )
+    batched_redo = CommitRedo(batched.pool, batched.manager)
+    legacy_redo = CommitRedo(legacy.pool, _LegacyManager(legacy.manager))  # type: ignore[arg-type]
+    for round_number, per_bucket in enumerate(rounds):
+        operations: list[tuple[bytes, RecordRef]] = []
+        for bucket, count in per_bucket.items():
+            keys = _keys_in_bucket(
+                batched.proximity,
+                bucket,
+                count,
+                prefix=f"run-{round_number}-{bucket}-".encode(),
+                width=96,
+            )
+            operations.extend(
+                (key, RecordRef(1000 + round_number * 256 + bucket * 32 + ordinal, 1))
+                for ordinal, key in enumerate(keys)
+            )
+        base_lsn = 10 + round_number * 1000
+
+        def records_for(store: IndexStore) -> tuple[WalRecord, ...]:
+            return tuple(
+                _effect_for(store, IndexOperation.INSERT, base_lsn + offset, key, ref)
+                for offset, (key, ref) in enumerate(operations)
+            )
+
+        batched_result = batched_redo.apply(_replay(records_for(batched.proximity)))
+        legacy_result = legacy_redo.apply(_replay(records_for(legacy.proximity)))
+        batched_redo.flush(batched_result)
+        legacy_redo.flush(legacy_result)
+
+    # The legacy arm never prepares a directory, so every recorded run is the batched arm's.
+    assert sorted(prepared_runs) == [1, 2, 3, 4, 5, 6, 7]
+    assert scalar_calls == []
+    assert batched.entries() == legacy.entries()
+    assert batched.proximity.header == legacy.proximity.header
+    assert batched.proximity.missing_targets == legacy.proximity.missing_targets
+    assert (
+        batched.proximity._tombstone_backlog_count  # noqa: SLF001
+        == legacy.proximity._tombstone_backlog_count  # noqa: SLF001
+    )
+    assert batched.device.page_count(batched.proximity.file) == legacy.device.page_count(
+        legacy.proximity.file
+    )
+    assert tuple(
+        batched.device.raw_page(batched.proximity.file, page)
+        for page in range(batched.device.page_count(batched.proximity.file))
+    ) == tuple(
+        legacy.device.raw_page(legacy.proximity.file, page)
+        for page in range(legacy.device.page_count(legacy.proximity.file))
+    )
 
 
 def test_hot_buckets_preserve_global_wal_order_across_interleaved_stores(

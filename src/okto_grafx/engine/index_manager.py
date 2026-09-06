@@ -187,9 +187,6 @@ _DETACHED_GENERATION_NONCE_ATTEMPTS: int = 64
 
 """Per-manager ceiling for immutable schema-provenance comparisons."""
 
-_COMMON_REPLAY_HOT_BUCKET_MIN_EFFECTS: int = 8
-"""Smallest per-bucket replay run worth pre-indexing for this one recovery call."""
-
 _COMMON_REPLAY_HOT_TARGET_LIMIT: int = 65_536
 """Hard ceiling on target identities retained by all hot directories in one replay."""
 
@@ -6671,30 +6668,33 @@ class IndexManager:
                 final = final.reconciled_to(item.change.csn)
             final_by_store[item.store] = final
 
-        bucket_counts: Counter[tuple[IndexStore, int]] = Counter()
+        touched_buckets: set[tuple[IndexStore, int]] = set()
         bounded_bucket_census = True
         for item in items:
             identity = (item.store, item.bucket)
             if (
-                identity not in bucket_counts
-                and len(bucket_counts) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT
+                identity not in touched_buckets
+                and len(touched_buckets) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT
             ):
-                # Counting an unbounded number of cold buckets would make the accelerator's
-                # metadata grow with the WAL.  Decline the whole directory optimization while
-                # retaining the already-prepared common header batch and its scalar semantics.
-                bucket_counts.clear()
+                # Recording an unbounded number of bucket identities would make the
+                # accelerator's metadata grow with the WAL.  Decline the whole directory
+                # optimization while retaining the already-prepared common header batch and
+                # its scalar semantics.
+                touched_buckets.clear()
                 bounded_bucket_census = False
                 break
-            bucket_counts[identity] += 1
+            touched_buckets.add(identity)
         bucket_targets: dict[tuple[IndexStore, int], set[tuple[bytes, RecordRef]]] = {}
         declined_buckets: set[tuple[IndexStore, int]] = set()
         retained_targets = 0
+        # Every bucket the batch touches is pre-indexed once.  A bucket with a single effect
+        # costs one chain walk either way, so no run is too short for the directory; the former
+        # floor of eight effects left the Pulse checkpoint (about two effects per bucket) on the
+        # scalar path, walking each chain once per effect.  The three ceilings below still bound
+        # the directory, and a bucket past them keeps the scalar semantics unchanged.
         for item in items if bounded_bucket_census else ():
             identity = (item.store, item.bucket)
-            if (
-                bucket_counts[identity] < _COMMON_REPLAY_HOT_BUCKET_MIN_EFFECTS
-                or identity in declined_buckets
-            ):
+            if identity in declined_buckets:
                 continue
             targets = bucket_targets.setdefault(identity, set())
             target = (item.change.key, item.change.ref)

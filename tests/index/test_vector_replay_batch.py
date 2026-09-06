@@ -201,13 +201,11 @@ def test_picture_born_during_the_batch_is_replaced_and_never_certified(
     generation_before = vector._graph_generation  # noqa: SLF001
     records = _mixed_records(database, vector)
     original_change = IndexStore._apply_change
+    original_hot_change = IndexStore._apply_common_replay_hot_change
     born = False
 
-    def build_a_picture_mid_batch(
-        store: IndexStore, change: IndexChange, lsn: int
-    ) -> bool:
+    def picture_after(store: IndexStore, moved: bool) -> bool:
         nonlocal born
-        moved = original_change(store, change, lsn)
         if store is vector and not born:
             born = True
             # A reader thread asks for the graph while buckets already moved and the header
@@ -216,12 +214,29 @@ def test_picture_born_during_the_batch_is_replaced_and_never_certified(
             assert vector._snapshot is not None  # noqa: SLF001
         return moved
 
+    def build_a_picture_mid_batch(
+        store: IndexStore, change: IndexChange, lsn: int
+    ) -> bool:
+        return picture_after(store, original_change(store, change, lsn))
+
+    def build_a_picture_mid_hot_batch(
+        store: IndexStore, bucket: object, change: IndexChange, lsn: int
+    ) -> bool:
+        return picture_after(
+            store,
+            original_hot_change(store, bucket, change, lsn),  # type: ignore[arg-type]
+        )
+
     def certify_forbidden(
         store: VectorHnswIndex, picture: object, mark: object
     ) -> None:
         pytest.fail("a picture born under an unmoved header must never be certified")
 
+    # Both replay doors: the scalar one and the per-bucket directory every touched bucket uses.
     monkeypatch.setattr(IndexStore, "_apply_change", build_a_picture_mid_batch)
+    monkeypatch.setattr(
+        IndexStore, "_apply_common_replay_hot_change", build_a_picture_mid_hot_batch
+    )
     monkeypatch.setattr(VectorHnswIndex, "_certify", certify_forbidden)
 
     CommitRedo(database.pool, database.manager).apply(_replay(records))
@@ -289,17 +304,29 @@ def test_foreign_change_of_page_zero_between_effects_refuses_publication(
         _effect(vector, IndexOperation.INSERT, 11, ordinal=2),
     )
     original_change = IndexStore._apply_change
+    original_hot_change = IndexStore._apply_common_replay_hot_change
     foreign: list[IndexHeader] = []
 
-    def swap_after_first_effect(
-        store: IndexStore, change: IndexChange, lsn: int
-    ) -> bool:
-        moved = original_change(store, change, lsn)
+    def swap_after(moved: bool) -> bool:
         if not foreign:
             foreign.append(_rewrite_device_header(database, vector.file, transform))
         return moved
 
+    def swap_after_first_effect(
+        store: IndexStore, change: IndexChange, lsn: int
+    ) -> bool:
+        return swap_after(original_change(store, change, lsn))
+
+    def swap_after_first_hot_effect(
+        store: IndexStore, bucket: object, change: IndexChange, lsn: int
+    ) -> bool:
+        return swap_after(original_hot_change(store, bucket, change, lsn))  # type: ignore[arg-type]
+
+    # Both replay doors: the scalar one and the per-bucket directory every touched bucket uses.
     monkeypatch.setattr(IndexStore, "_apply_change", swap_after_first_effect)
+    monkeypatch.setattr(
+        IndexStore, "_apply_common_replay_hot_change", swap_after_first_hot_effect
+    )
 
     with pytest.raises(GrafxCorruptionDetected, match="changed identity") as failure:
         CommitRedo(database.pool, database.manager).apply(_replay(records))
