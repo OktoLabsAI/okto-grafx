@@ -10142,25 +10142,22 @@ def _visible_identity_with_ref(
         manager = engine.require_indexes()
         # Selection already proved this capability.  Do not catch AttributeError or any other
         # read failure here: after adoption, fallback would hide a generation change or damage.
-        # The landing form is opted into explicitly; the ordinary call keeps its exact shape so
-        # every collaborator implementing validated_versions(index, key, snapshot) still fits.
-        if landing:
-            found = tuple(
-                manager.validated_versions(
-                    identity_index,
-                    record_id_key(record_id),
-                    context.snapshot,
-                    landing=True,
-                )
+        # The landing form is an optional capability asked for by name: a collaborator that
+        # offers validated_identity_landings answers without vector objects, and one that only
+        # implements the ordinary validated_versions(index, key, snapshot) contract answers
+        # through it, with the same rows and the same refusals.  No signature introspection.
+        validate = (
+            getattr(manager, "validated_identity_landings", None) if landing else None
+        )
+        if validate is None:
+            validate = manager.validated_versions
+        found = tuple(
+            validate(
+                identity_index,
+                record_id_key(record_id),
+                context.snapshot,
             )
-        else:
-            found = tuple(
-                manager.validated_versions(
-                    identity_index,
-                    record_id_key(record_id),
-                    context.snapshot,
-                )
-            )
+        )
         if not found:
             return None
         if len(found) > 1:

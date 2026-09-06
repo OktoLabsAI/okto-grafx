@@ -203,8 +203,67 @@ def test_landing_validation_is_refused_for_a_column_derived_index(database: obje
         )
         key = index_key(["n-1", None, None], (0,))
         with pytest.raises(GrafxIndexError):
-            manager.validated_versions(primary, key, snapshot, landing=True)
+            manager.validated_identity_landings(primary, key, snapshot)
         assert manager.validated_versions(primary, key, snapshot)
+
+
+def test_a_collaborator_without_the_landing_capability_is_used_through_validated_versions(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An index collaborator of the old contract answers the landing with full versions."""
+    from okto_grafx.engine.index_manager import IndexManager
+
+    # First with the capability present: one edge lands through the landing door.
+    with database.begin("write") as transaction:
+        transaction.execute(
+            "MATCH (a:N {id: $s}), (b:N {id: $t}) CREATE (a)-[:E {w: 0.5}]->(b)",
+            {"s": "n-0", "t": "n-1"},
+        )
+
+    # Then the collaborator loses the capability: the landing is served by the ordinary
+    # validated_versions contract, with full versions, the same rows and no signature probing.
+    monkeypatch.delattr(IndexManager, "validated_identity_landings")
+    landings = 0
+    full_reads = 0
+    original_landing = HeapStore.read_landing
+    original_read = HeapStore.read
+
+    def counted_landing(heap, ref):
+        nonlocal landings
+        landings += 1
+        return original_landing(heap, ref)
+
+    def counted_read(heap, ref):
+        nonlocal full_reads
+        full_reads += 1
+        return original_read(heap, ref)
+
+    monkeypatch.setattr(HeapStore, "read_landing", counted_landing)
+    monkeypatch.setattr(HeapStore, "read", counted_read)
+    versions: list[object] = []
+    original_endpoint = query_engine_module._require_physical_endpoint
+
+    def observed_endpoint(*args, **kwargs):
+        version = original_endpoint(*args, **kwargs)
+        versions.append(version)
+        return version
+
+    monkeypatch.setattr(
+        query_engine_module, "_require_physical_endpoint", observed_endpoint
+    )
+    with database.begin("write") as transaction:
+        transaction.execute(
+            "MATCH (a:N {id: $s}), (b:N {id: $t}) CREATE (a)-[:E {w: 0.25}]->(b)",
+            {"s": "n-2", "t": "n-3"},
+        )
+    assert landings == 0 and full_reads > 0
+    assert len(versions) == 2
+    for version in versions:
+        assert type(version.values[2]) is VectorValue
+    rows = database.execute(
+        "MATCH (a:N)-[r:E]->(b:N) RETURN a.id, b.id, r.w ORDER BY a.id"
+    ).rows
+    assert rows == (("n-0", "n-1", 0.5), ("n-2", "n-3", 0.25))
 
 
 def test_landing_refuses_a_corrupt_vector_body_exactly_like_a_full_read(

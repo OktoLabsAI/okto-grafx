@@ -7144,32 +7144,41 @@ class IndexManager:
         )
 
     def validated_versions(
-        self,
-        index: IndexStore,
-        key: bytes,
-        snapshot: SnapshotLike,
-        *,
-        landing: bool = False,
+        self, index: IndexStore, key: bytes, snapshot: SnapshotLike
     ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
         """Return the exact candidates and the versions read while validating them.
 
         Keeping the pair inside one stable-view callback is the important part: the page-0
         certificate still brackets both index traversal and heap validation, and callers cannot
         accidentally turn one exact hit into two heap decodes.
-
-        ``landing=True`` is the identity-landing form (RELSEEK-M4): the heap validates every
-        version through :meth:`HeapStore.read_landing`, which performs every check of ``read``
-        but does not build vector objects.  It is accepted only for a record-id derived index,
-        whose key never touches a column, so the sentinel a landing carries in vector positions
-        can neither be compared nor published: the versions it returns are proofs consumed by
-        their header fields, never rows.
         """
         return self._validated_items(
             index,
             key,
             snapshot,
             project=lambda ref, version: (ref, version),
-            landing=landing,
+        )
+
+    def validated_identity_landings(
+        self, index: IndexStore, key: bytes, snapshot: SnapshotLike
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Return validated versions for an identity landing, without vector objects (RELSEEK-M4).
+
+        An optional capability beside :meth:`validated_versions`, with the same contract and the
+        same certificate: a caller that consumes only the header fields of the versions it
+        proves asks for it by name, and a collaborator that does not offer it is used through
+        ``validated_versions`` instead.  The heap validates every version through
+        :meth:`HeapStore.read_landing`, which performs every check of ``read`` but does not
+        build vector objects.  It is accepted only for a record-id derived index, whose key never
+        touches a column, so the sentinel a landing carries in vector positions can neither be
+        compared nor published: the versions it returns are proofs, never rows.
+        """
+        return self._validated_items(
+            index,
+            key,
+            snapshot,
+            project=lambda ref, version: (ref, version),
+            landing=True,
         )
 
     def validated_versions_many(
