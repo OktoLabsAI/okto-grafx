@@ -203,8 +203,8 @@ The accepted Claude batch adds two further internal improvements:
 
 ## KG-LOAD-1 — typed multi-key incident seek
 
-Status: **implemented on the Grafx and Pulse working branches; independent adversarial review in
-progress**.
+Status: **implemented, adversarially reviewed and selected by measured cost on the Grafx and
+Pulse working branches**.
 
 The scale defect left by the first batch was precise: `RelationshipScan` made the current graph
 page tolerable, but it still read every relationship row of every applicable physical layout.
@@ -246,19 +246,43 @@ scan helper measured 1.74–2.08 s. Direct activation of `523e759` is therefore 
 the current cardinality**: the warm experiment is about 1.29× slower than the top of the prior
 band, even though its relationship work no longer grows with unrelated edges.
 
-The operator and primitive remain valid scale building blocks, but they are not presented as the
-current screen-speed win. Before Pulse promotion, the next implementation must remove the repeated
-node-PK probes across relationship statements (or add a proved cost selection that retains the
-scan for small layouts), then repeat the exact ordered-page comparison. This is a fixed follow-up,
-not a new exploratory gate: the consumer must beat the already measured scan path while retaining
-its `O(page keys + incident edges)` scaling advantage.
+The independent review `hof_aecbb8257cb443c198a50634d2d1af2d` compared 540 accelerated and
+fallback executions containing 54,102 rows. It covered catalog v2, v1 without identity indexes,
+self-loops, parallel edges, incoming syntax, types absent from the page, empty/null/duplicate and
+wrong-typed keys, a foreign writer committing between snapshots, read-your-own-writes and stale
+endpoint indexes. Every result multiset agreed. Mutation testing found two missing focused cases
+(wrong-typed INT64 probes and v1 opposite landings outside the key frontier); both are now in the
+repository tests.
 
-Focused validation is 68 Grafx tests plus 10 Pulse consumer tests and Ruff/diff checks. The Grafx
-set includes batch/scalar snapshot parity, page-0 transition retry/refusal, hostile keys, stale and
-proximity refusal, primary/endpoint index near misses, incoming syntax, parallel relationships,
-identity landing batching, owner read-your-writes and differential comparison with the canonical
-fallback. No format, WAL, commit, OCC, lease, recovery, writer admission or reader-snapshot code
-changed.
+`a726744` closes the current-cardinality regression with a deterministic cost choice before the
+first durable index certificate. The relationship table's
+`next_record_id - FIRST_RECORD_ID` is an O(1) durable upper bound on allocated edges. When that
+upper bound is at most `0.5 * (distinct from keys + distinct to keys)`, the operator executes
+`FilterRows(RelationshipScan)` edge-first; otherwise it executes the incident seek. The comparison
+uses integer arithmetic. `page_count` is deliberately not consulted because it is a repairable
+chain hint that may lag an interrupted append. Deletes and identity-reservation gaps can only make
+the allocation bound too high and therefore conservatively select the seek; they cannot make a
+large table look small. Focused tests prove the measured crossover (`12 edges / 84 keys` scans,
+`60 / 84` seeks), no multi-key certificate on the scan branch and independence from a drifted
+`page_count`.
+
+The exact ordered Pulse page was then repeated against the live generation. It still returned
+500 nodes and exactly 777 edges with zero failed layouts. The hybrid reduced the typed fanout from
+248 multi-key calls / 17,116 probes to 54 / 4,355 (`-78.2%` calls, `-74.6%` probes). Node-PK work
+fell from 7,844 to 2,082 probes. In two paired runs, the first hybrid pass measured 1.827–2.056 s
+against 2.377–2.736 s for forced edge-first scan; subsequent passes measured 0.763–0.967 s against
+2.273–2.724 s. This is direct provider/engine time rather than an HTTP claim, but it changes the
+Pulse consumer from the earlier measured NO-GO to **GO on the candidate branches**. The remaining
+1,582 repeated node-PK probes are the bounded next optimization (transaction-lexical memo B), not
+a condition for recognising this completed gain.
+
+Focused validation includes the multi-key primitive, incident operator, relationship-scan and
+path suites plus 10 Pulse consumer tests and Ruff/diff checks. The Grafx set covers batch/scalar
+snapshot parity, page-0 transition retry/refusal, hostile and wrong-typed keys, stale and proximity
+refusal, primary/endpoint index near misses, v1 landings, incoming syntax, parallel relationships,
+identity landing batching, owner read-your-writes, both cost branches and differential comparison
+with the canonical fallback. No format, WAL, commit, OCC, lease, recovery, writer admission or
+reader-snapshot code changed.
 
 Two apparent follow-ups are deliberately not being smuggled into this wave. R-3 cannot skip the
 commit-time tuple encoding solely because `intent.values` retained object identity: the direct
@@ -282,6 +306,6 @@ the same endpoint visibility and canonical-reference validation as ordinary trav
 | HNSW replay and structural catalog batch | complete | `477fd45`, `36cea9b`; 230 focused tests and Ruff pass |
 | Statement authority memo | complete | `4786496`; identity/catalog/revision/DDL fences, 39 integrated focused tests and Ruff pass |
 | Exact multi-key index validation | complete | `1926fcd`; one durable certificate per index batch, 3.2× for 300 on-disk PK keys |
-| Typed incident-edge operator | engine building block complete; direct Pulse activation NO-GO pending repeated-PK removal | Grafx `bcfa395`, Pulse experiment `523e759`; actual ordered page preserved 500/777, but edge phase measured 2.677 s warm versus prior 1.74–2.08 s |
+| Typed incident-edge operator and cost selection | complete and GO on candidate branches | Grafx `bcfa395` + `a726744`, Pulse `523e759`; adversarial review `hof_aecbb8257cb443c198a50634d2d1af2d` PASS; ordered page preserved 500/777, calls/probes `248/17,116 -> 54/4,355`, paired warm hybrid `0.763–0.967 s` versus forced scan `2.273–2.724 s` |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |

@@ -3647,11 +3647,25 @@ O primeiro ensaio tipado usou uma página diagnóstica sem a ordenação do Puls
 o claim visual. A repetição com a query exata da tela mediu 0,960 s para obter 500 nós e preservou
 as mesmas 777 relações do baseline; a fase de arestas consultou 66/70 layouts, fez 248 chamadas e
 17.116 probes multi-chave, mas mediu 4,392 s cold e 2,677 s warm contra 1,74–2,08 s do scan bounded.
-Logo a ativação direta do consumidor `523e759` está em **NO-GO no cardinal atual**, embora o access
-path já não cresça com arestas alheias à página. O próximo passo fixo é eliminar a resolução de PK
-repetida entre statements (ou selecionar por custo comprovado o scan em layouts pequenos) e repetir
-essa comparação exata. Foram aprovados 68 testes Grafx e 10 testes Pulse focais; a revisão
-adversarial Nexus `hof_aecbb8257cb443c198a50634d2d1af2d` permanece em andamento.
+Essa ativação ingênua foi corretamente marcada como NO-GO e não virou claim.
+
+A revisão adversarial Nexus `hof_aecbb8257cb443c198a50634d2d1af2d`, agora PASS, executou 540
+comparações/54.102 linhas contra o fallback, incluindo v1/v2, MVCC com writer estrangeiro, RYOW,
+self-loops, paralelas, incoming, stale e chaves hostis. O consenso implementado em `a726744` escolhe
+o access path antes de qualquer certificado: usa somente o limite superior durável
+`next_record_id - FIRST_RECORD_ID`; até `0,5 * chaves distintas` faz
+`FilterRows(RelationshipScan)` edge-first, acima disso faz seek incidente. `page_count` fica fora da
+decisão porque é hint reparável e pode atrasar a chain. Deletes/gaps só superestimam e favorecem o
+seek de modo conservador. Os focais cobrem `12 arestas/84 chaves -> scan`, `60/84 -> seek`, deriva
+de `page_count`, INT64 hostil e landings v1 fora do frontier.
+
+Na página exata, o híbrido manteve 500 nós/777 relações e zero falhas, reduziu
+`248/17.116 -> 54/4.355` chamadas/probes (`-78,2%/-74,6%`) e os probes de PK
+`7.844 -> 2.082`. Em duas execuções pareadas, o primeiro passe mediu `1,827–2,056 s` contra
+`2,377–2,736 s` do scan forçado; os passes quentes mediram `0,763–0,967 s` contra
+`2,273–2,724 s`. É medição direta de provider/engine, não alegação HTTP, mas o consumidor
+`523e759` passa a **GO nas branches candidatas**. Os 1.582 probes de PK ainda repetidos alimentam
+o próximo ganho bounded (memo B lexical), sem transformar esse residual em gate móvel.
 
 Esse caminho não altera formato, WAL, recovery, nenhuma das duas OCCs, leases, admissão de writers
 ou snapshots de readers. Tabela/índice ausente, stale ou owner-dirty escolhe o plano canônico antes
