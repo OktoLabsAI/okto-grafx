@@ -9813,6 +9813,11 @@ def _sort_rows(
         yield from _spilled_sort_rows(engine, node, context)
         return
     if node.retained_limit is not None:
+        if type(node.child) is ProjectRows:
+            yield from _top_projected_rows(
+                engine, node, node.child, node.retained_limit, context
+            )
+            return
         yield from _top_rows(engine, node, node.retained_limit, context)
         return
     rows = list(engine._rows(node.child, context))
@@ -10029,8 +10034,17 @@ def _top_rows(
         else 0
     )
     retained = skipped + limit
+    yield from _top_rows_from(
+        node, engine._rows(node.child, context), retained, context
+    )
+
+
+def _top_rows_from(
+    node: SortRows, rows: Iterator[_Row], retained: int, context: _Context
+) -> Iterator[_Row]:
+    """Retain the best ``retained`` rows of a stream in the order the query asked for."""
     heap: list[_TopCandidate] = []
-    for position, row in enumerate(engine._rows(node.child, context)):
+    for position, row in enumerate(rows):
         keys = tuple(
             (_sort_key(_sort_value(key, row, context)), key.descending)
             for key in node.keys
@@ -10054,6 +10068,234 @@ def _top_rows(
     # reversing them restores exact query order in O(K log K), within the O(N log K) bound.
     worst_first = [_top_heap_pop(heap).row for _ in range(len(heap))]
     yield from reversed(worst_first)
+
+
+@dataclass(slots=True)
+class _TopProjectedCandidate(_TopCandidate):
+    """A retained row whose projection may still be partial (KGRUN-3).
+
+    ``row`` carries the columns evaluated so far; ``source`` is the row they were projected
+    from, and ``complete`` says whether every item was already evaluated on it.
+    """
+
+    source: _Row
+    complete: bool
+
+
+_MISSING_BINDING = object()
+
+
+class _DeferredProjection:
+    """The plan of one bounded projection: which items may wait for the retained rows.
+
+    KGRUN-3.  Between a projection and the bounded sort above it, most rows are discarded, yet
+    every one of them was projected.  An item is deferred only when its evaluation is TOTAL on
+    the row -- it can neither raise nor observe anything -- so evaluating it after the retention
+    instead of before is not observable: a literal; a property of a variable bound to a matched
+    row that declares the column (or to a polymorphic match, where an undeclared column is
+    null) or to null; ``label`` of such a variable; a positional ``coalesce`` of those whose
+    result type the planner resolved to something other than DOUBLE (so no coercion can fail).
+    Everything else -- a parameter, an operator, a function, a variable the row does not bind, a
+    map subject, an aggregation memo -- is evaluated for every row exactly where the canonical
+    projection evaluated it, in the same order, so every refusal happens at the same row with
+    the same message.  An item a sort key names as an alias is evaluated for every row as well,
+    because the key reads it from the projected columns.
+    """
+
+    __slots__ = (
+        "eager",
+        "items",
+        "names",
+        "proven_tables",
+        "requirements",
+        "deferred_any",
+    )
+
+    def __init__(self, project: ProjectRows, node: SortRows, context: _Context) -> None:
+        items = project.items
+        self.items = items
+        self.names: tuple[str, ...] | None = None
+        aliased = _sort_key_variables(node.keys)
+        requirements: dict[str, set[str]] = {}
+        eager: list[int] = []
+        for position, item in enumerate(items):
+            if item.name in aliased or not _deferrable(
+                item.expression, requirements, context
+            ):
+                eager.append(position)
+        self.eager = tuple(eager)
+        self.requirements = tuple(
+            (variable, tuple(keys)) for variable, keys in requirements.items()
+        )
+        self.proven_tables: dict[str, TableDef] = {}
+        self.deferred_any = len(eager) < len(items)
+
+    def proven(self, row: _Row) -> bool:
+        """Say whether every deferred item is total on this row."""
+        if row.computed is not None:
+            return False
+        bindings = row.bindings
+        proven_tables = self.proven_tables
+        for variable, keys in self.requirements:
+            binding = bindings.get(variable, _MISSING_BINDING)
+            if binding is None:
+                continue
+            if type(binding) is not RowBinding:
+                return False
+            table = binding.table
+            if table is proven_tables.get(variable):
+                continue
+            if not binding.polymorphic:
+                positions = table.column_positions
+                for key in keys:
+                    if key not in positions:
+                        return False
+            proven_tables[variable] = table
+        return True
+
+
+def _sort_key_variables(keys: tuple[SortItem, ...]) -> frozenset[str]:
+    """Return every variable name a sort key mentions anywhere in its expression."""
+    names: set[str] = set()
+    pending: list[Expression] = [key.expression for key in keys]
+    while pending:
+        expression = pending.pop()
+        if type(expression) is Variable:
+            names.add(expression.name)
+        pending.extend(expression.children())
+    return frozenset(names)
+
+
+def _deferrable(
+    expression: Expression, requirements: dict[str, set[str]], context: _Context
+) -> bool:
+    """Say whether an item is total on every row its proof admits, recording the proof."""
+    kind = type(expression)
+    if kind is Literal:
+        return True
+    if kind is Property:
+        subject = expression.subject
+        if type(subject) is not Variable:
+            return False
+        requirements.setdefault(subject.name, set()).add(expression.key)
+        return True
+    if kind is FunctionCall:
+        if expression.named_arguments or expression.distinct or expression.star:
+            return False
+        name = expression.name.upper()
+        if name == LABEL_FUNCTION:
+            if len(expression.arguments) != 1:
+                return False
+            subject = expression.arguments[0]
+            if type(subject) is not Variable:
+                return False
+            requirements.setdefault(subject.name, set())
+            return True
+        if name == COALESCE_FUNCTION:
+            resolved = context.coalesce_types.get(id(expression))
+            if resolved is None or resolved is ValueType.DOUBLE:
+                return False
+            return bool(expression.arguments) and all(
+                type(argument) is Literal
+                or (
+                    type(argument) is Property
+                    and type(argument.subject) is Variable
+                    and _deferrable(argument, requirements, context)
+                )
+                for argument in expression.arguments
+            )
+    return False
+
+
+def _top_projected_rows(
+    engine: QueryEngine,
+    node: SortRows,
+    project: ProjectRows,
+    retained_limit: Expression,
+    context: _Context,
+) -> Iterator[_Row]:
+    """Order a bounded, projected result while projecting the discarded rows only partially.
+
+    The canonical shape is ``SortRows(retained) -> ProjectRows -> child``.  This door consumes
+    the child's rows itself, evaluates on every row exactly the items the canonical projection
+    could refuse on (and the ones a sort key reads by alias), retains the best rows with the
+    same heap, and evaluates the remaining, provably total items on the retained rows only.
+    Every row is still admitted to the projection's intermediate-row budget in the same
+    position, the names are rendered once on the first row, and a LIMIT of zero keeps the
+    canonical path, so the child, its budgets and every refusal stay observable.
+    """
+    limit = _window(retained_limit, context, "LIMIT")
+    skipped = (
+        _window(node.retained_skip, context, "SKIP")
+        if node.retained_skip is not None
+        else 0
+    )
+    retained = skipped + limit
+    if retained == 0:
+        yield from _top_rows_from(
+            node, engine._rows(project, context), retained, context
+        )
+        return
+    plan = _DeferredProjection(project, node, context)
+    if not plan.deferred_any:
+        yield from _top_rows_from(
+            node, engine._rows(project, context), retained, context
+        )
+        return
+    items = plan.items
+    eager = plan.eager
+    names: tuple[str, ...] | None = None
+    admit = context.admit_intermediate
+    heap: list[_TopCandidate] = []
+    for position, source in enumerate(engine._rows(project.child, context)):
+        if names is None:
+            names = tuple(item.name for item in items)
+        if plan.proven(source):
+            complete = False
+            columns = {
+                names[index]: _evaluate(items[index].expression, source, context)
+                for index in eager
+            }
+        else:
+            complete = True
+            columns = {
+                name: _evaluate(item.expression, source, context)
+                for name, item in zip(names, items)
+            }
+        admit(project)
+        row = _Row(bindings=source.bindings, computed=source.computed, columns=columns)
+        keys = tuple(
+            (_sort_key(_sort_value(key, row, context)), key.descending)
+            for key in node.keys
+        )
+        candidate = _TopProjectedCandidate(
+            keys=keys,
+            position=position,
+            row=row,
+            source=source,
+            complete=complete,
+        )
+        if len(heap) < retained:
+            _top_heap_push(heap, candidate)
+        elif candidate.precedes(heap[0]):
+            _top_heap_replace(heap, candidate)
+    worst_first = [_top_heap_pop(heap) for _ in range(len(heap))]
+    for candidate in reversed(worst_first):
+        row = candidate.row
+        if candidate.complete:
+            yield row
+            continue
+        partial = row.columns
+        source = candidate.source
+        columns = {
+            name: (
+                partial[name]  # type: ignore[index]
+                if index in eager
+                else _evaluate(item.expression, source, context)
+            )
+            for index, (name, item) in enumerate(zip(names, items))  # type: ignore[arg-type]
+        }
+        yield _Row(bindings=source.bindings, computed=source.computed, columns=columns)
 
 
 def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:
