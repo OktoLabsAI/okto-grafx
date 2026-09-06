@@ -26,6 +26,7 @@ from okto_grafx.domain.index import (
     index_key,
     wal_record_for,
 )
+from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
@@ -59,7 +60,7 @@ from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import EXTENT_FIRST_SLOT, TableExtent
-from okto_grafx.engine.heap_store import HeapStore
+from okto_grafx.engine.heap_store import HeapStore, HeapVersion
 from okto_grafx.engine.index_manager import HashIndex, IndexManager
 
 from .conftest import HEAP_FILE, PAGE_SIZE, Stack
@@ -1247,14 +1248,160 @@ def test_builtin_indexes_share_one_catalog_table_scan_and_heap_resolution(
     assert report.index_entries_checked == len(rows) * len(indexes)
     assert catalog_reads == 1
     assert table_scans == 1
-    assert heap_reads == len(rows)
+    # CKPTCERT-1: the one scan already resolved every reference the entries point at.
+    assert heap_reads == 0
 
     repeated = verifier.verify(SCOPE_INDEXES)
 
     assert repeated == report
     assert catalog_reads == 2
     assert table_scans == 2
-    assert heap_reads == len(rows) * 2
+    assert heap_reads == 0
+
+
+def _builtin_indexes(
+    stack: Stack,
+    table: TableDef,
+    rows: tuple[tuple[RecordRef, HeapVersion], ...],
+    *,
+    stray: RecordRef | None = None,
+) -> list[HashIndex]:
+    """Register two hash indexes over the rows; the second may also point at a stray ref."""
+    manager = IndexManager(stack.pool, stack.heap, stack.metrics)
+    indexes: list[HashIndex] = []
+    for name, positions in (("person_by_id", (0,)), ("person_by_name", (1,))):
+        definition = IndexDefinition(
+            name=name,
+            table_id=table.table_id,
+            table_name=table.name,
+            positions=positions,
+            visibility=IndexVisibility.EXACT,
+        )
+        index = HashIndex(definition, stack.pool, stack.metrics)
+        manager.register(index)
+        indexes.append(index)
+        entries = [(ref, index_key(version.values, positions)) for ref, version in rows]
+        if stray is not None and name == "person_by_name":
+            entries.append((stray, index_key((0, "stray"), positions)))
+        for ordinal, (ref, key) in enumerate(entries, start=1):
+            index.apply(
+                wal_record_for(
+                    IndexChange(
+                        index=index.name,
+                        operation=IndexOperation.INSERT,
+                        key=key,
+                        ref=ref,
+                        csn=NO_CSN,
+                        versioned=False,
+                    )
+                ).with_lsn(ordinal)
+            )
+    stack.pool.flush()
+    return indexes
+
+
+def _count_heap_reads(stack: Stack, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count HeapStore.read calls on this stack's heap; the list holds the running total."""
+    reads = [0]
+    original_heap_read = HeapStore.read
+
+    def counted_heap_read(store: HeapStore, ref: RecordRef):  # type: ignore[no-untyped-def]
+        if store is stack.heap:
+            reads[0] += 1
+        return original_heap_read(store, ref)
+
+    monkeypatch.setattr(HeapStore, "read", counted_heap_read)
+    return reads
+
+
+def test_the_scan_seeds_entry_resolution_only_through_the_heaps_own_catalog(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CKPTCERT-1 never hides what a per-entry read would have found.
+
+    ``HeapStore.read`` resolves the table through the catalog the heap holds; the scan decodes
+    with the physical catalog image.  While the two disagree, or the heap's catalog cannot name
+    the table at all, every entry keeps its own read and its own finding.
+    """
+    table = _populate(stack, rows=3)
+    rows = tuple(stack.heap.scan_all(table))
+    indexes = _builtin_indexes(stack, table, rows)
+    reads = _count_heap_reads(stack, monkeypatch)
+    original_table_by_id = Catalog.table_by_id
+    verifier = Verifier(
+        stack.pool, stack.metrics, heap=stack.heap, catalog=stack.catalog, indexes=indexes
+    )
+
+    def refusing(catalog: Catalog, table_id: int) -> TableDef:
+        if catalog is stack.catalog.catalog and table_id == table.table_id:
+            raise GrafxCorruptionDetected(
+                f"There is no table with id {table_id} in this catalog.",
+                field="table_id",
+                value=table_id,
+            )
+        return original_table_by_id(catalog, table_id)
+
+    monkeypatch.setattr(Catalog, "table_by_id", refusing)
+    report = verifier.verify(SCOPE_INDEXES)
+    unresolved = report.findings_of(FindingKind.INDEX_ENTRY_UNRESOLVED)
+    assert len(unresolved) == len(rows) * len(indexes)
+    assert all("no table with id" in finding.detail for finding in unresolved)
+    assert reads[0] == len(rows) * len(indexes)
+
+    def renamed(catalog: Catalog, table_id: int) -> TableDef:
+        found = original_table_by_id(catalog, table_id)
+        if catalog is stack.catalog.catalog and table_id == table.table_id:
+            return replace(found, name="Somebody")
+        return found
+
+    reads[0] = 0
+    monkeypatch.setattr(Catalog, "table_by_id", renamed)
+    report = verifier.verify(SCOPE_INDEXES)
+    assert report.findings == ()
+    assert reads[0] == len(rows)  # every entry read once; the second index shares the proofs
+
+    reads[0] = 0
+    monkeypatch.setattr(Catalog, "table_by_id", original_table_by_id)
+    report = verifier.verify(SCOPE_INDEXES)
+    assert report.findings == ()
+    assert reads[0] == 0
+
+
+def test_a_failing_table_scan_leaves_every_entry_to_its_own_read_and_is_still_reported(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken heap scan never hides a broken index, and the broken index never hides it."""
+    table = _populate(stack, rows=3)
+    rows = tuple(stack.heap.scan_all(table))
+    stray = RecordRef(900, 4)
+    indexes = _builtin_indexes(stack, table, rows, stray=stray)
+    reads = _count_heap_reads(stack, monkeypatch)
+
+    def broken_scan(store: HeapStore, selected: TableDef):  # type: ignore[no-untyped-def]
+        raise GrafxCorruptionDetected(
+            f"The page chain of table {selected.name!r} returns to page 3.",
+            file=HEAP_FILE,
+            page=3,
+            field="cycle",
+        )
+
+    monkeypatch.setattr(HeapStore, "scan_all", broken_scan)
+    report = Verifier(
+        stack.pool, stack.metrics, heap=stack.heap, catalog=stack.catalog, indexes=indexes
+    ).verify(SCOPE_INDEXES)
+
+    assert [finding.kind for finding in report.findings] == [
+        FindingKind.INDEX_UNREADABLE,
+        FindingKind.INDEX_ENTRY_UNRESOLVED,
+        FindingKind.INDEX_UNREADABLE,
+    ]
+    assert f"page {stray.page} slot {stray.slot}" in report.findings[1].detail
+    assert all("returns to page 3" in finding.detail for finding in report.findings_of(FindingKind.INDEX_UNREADABLE))
+    assert report.index_entries_checked == len(rows) * len(indexes) + 1
+    # The first index read every row itself, the second only the reference nothing resolves.
+    assert reads[0] == len(rows) + 1
 
 
 def test_custom_indexes_keep_their_per_index_observation_protocol(

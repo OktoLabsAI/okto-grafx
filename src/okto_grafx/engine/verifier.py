@@ -151,6 +151,7 @@ class _CanonicalIndexVerification:
         "remaining_indexes",
         "resolved_refs",
         "scan_failures",
+        "seeded",
         "tables",
         "versions",
     )
@@ -163,6 +164,7 @@ class _CanonicalIndexVerification:
         ] = {}
         self.scan_failures: dict[tuple[int, str], GrafxError] = {}
         self.resolved_refs: dict[tuple[int, str], set[int]] = {}
+        self.seeded: set[tuple[int, str]] = set()
         self.remaining_indexes: dict[tuple[int, str], int] = {}
 
     def register(self, index: object) -> None:
@@ -184,6 +186,7 @@ class _CanonicalIndexVerification:
         self.versions.pop(identity, None)
         self.scan_failures.pop(identity, None)
         self.resolved_refs.pop(identity, None)
+        self.seeded.discard(identity)
 
 
 def _index_table_identity(index: object) -> tuple[int, str] | None:
@@ -1174,6 +1177,13 @@ class Verifier:
             if shared is not None and table_identity is not None
             else None
         )
+        if resolved_refs is not None and self._heap is not None:
+            self._seed_resolved_refs(
+                index,
+                table_identity,  # type: ignore[arg-type]
+                shared,  # type: ignore[arg-type]
+                resolved_refs,
+            )
         for entry in entries:
             checked += 1
             location = FindingLocation(
@@ -1227,6 +1237,76 @@ class Verifier:
             )
         )
         return checked, findings
+
+    def _canonical_versions(
+        self,
+        identity: tuple[int, str],
+        table: TableDef,
+        shared: _CanonicalIndexVerification,
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Return the one canonical scan of a table for this call, or raise its one failure.
+
+        The scan runs at most once per table per verification; a failure is kept and raised
+        again to every later asker, so each index reports it where it always did.
+        """
+        failure = shared.scan_failures.get(identity)
+        if failure is not None:
+            raise failure
+        versions = shared.versions.get(identity)
+        if versions is None:
+            try:
+                versions = tuple(self._heap.scan_all(table))  # type: ignore[union-attr]
+            except GrafxError as caught:
+                shared.scan_failures[identity] = caught
+                raise
+            shared.versions[identity] = versions
+        return versions
+
+    def _seed_resolved_refs(
+        self,
+        index: object,
+        identity: tuple[int, str],
+        shared: _CanonicalIndexVerification,
+        resolved_refs: set[int],
+    ) -> None:
+        """Seed the references the canonical scan of the table already proved resolvable.
+
+        CKPTCERT-1.  ``HeapStore.read`` and ``HeapStore.scan_all`` open the same doors to a
+        slot: the walk accepts a page only as a data page owned by this table, skips the
+        descriptor slot, and decodes the same bytes with the same decoder.  The one thing
+        ``read`` does on its own is resolve the table through the catalog the heap holds, so
+        the scan is trusted for a reference only while that catalog names a definition equal to
+        the one the scan decoded with; otherwise every entry keeps its own read and its own
+        finding.  The scan runs only where the coverage check would run it, and a scan that
+        fails seeds nothing and is reported where it always was, by that check, while the
+        entries are still resolved one by one -- a broken heap never hides a broken index and a
+        broken index never hides a broken heap.  Nothing here outlives the verification of the
+        table's last index.
+        """
+        if identity in shared.seeded:
+            return
+        shared.seeded.add(identity)
+        if shared.catalog_failure is not None:
+            return
+        definition = getattr(index, "definition", None)
+        if not getattr(definition, "positions", None):
+            return
+        table = shared.tables.get(identity)
+        if table is None or not index_definition_matches_table(definition, table):
+            return
+        try:
+            held = self._heap.catalog.catalog.table_by_id(table.table_id)  # type: ignore[union-attr]
+        except GrafxError:
+            return
+        if held != table:
+            return
+        try:
+            versions = self._canonical_versions(identity, table, shared)
+        except GrafxError:
+            return
+        resolved_refs.update(
+            ref.encode() for ref, _version in versions if type(ref) is RecordRef
+        )
 
     def _verify_index_covers_the_heap(
         self,
@@ -1290,17 +1370,7 @@ class Verifier:
                     self._heap.scan_all(table)
                 )
             else:
-                scan_failure = shared.scan_failures.get(identity)
-                if scan_failure is not None:
-                    raise scan_failure
-                versions = shared.versions.get(identity, ())
-                if identity not in shared.versions:
-                    try:
-                        versions = tuple(self._heap.scan_all(table))
-                    except GrafxError as failure:
-                        shared.scan_failures[identity] = failure
-                        raise
-                    shared.versions[identity] = versions
+                versions = self._canonical_versions(identity, table, shared)
         except GrafxError as failure:
             return [
                 VerificationFinding(
