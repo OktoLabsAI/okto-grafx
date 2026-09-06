@@ -293,6 +293,14 @@ _STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES: int = _PARSE_CACHE_MAX_ENTRIES
 _IN_LIST_MEMO_MAX_TOTAL_ELEMENTS: int = 4_096
 _PLAN_CACHE_MAX_ENTRIES: int = 128
 _PREPARED_PLAN_VERSION: int = 1
+_COMPILED_PREDICATE_MAX_ENTRIES: int = 256
+"""Ceiling of the engine-local compiled WHERE predicates (EXEC-CSE).
+
+A compiled predicate is a tree of closures derived from one plan expression -- no row, no
+value, no snapshot, nothing a later statement could reuse as authority -- kept by the identity
+of the expression object of a cached plan, so a plan executed again never compiles again.  The
+oldest entry leaves when the ceiling is reached; the plan cache itself holds 128 plans.
+"""
 
 # An endpoint locator is derived, transaction-local acceleration.  These two ceilings are its
 # complete memory contract: identifiers and the exact page-chain proof share one budget, and a
@@ -2941,6 +2949,7 @@ class QueryEngine:
         "_plan_cache",
         "_owned_prepared_plans",
         "_statement_authority_memo",
+        "_compiled_predicates",
     )
 
     def __init__(
@@ -2998,6 +3007,7 @@ class QueryEngine:
             max_entries=_OWNER_LANDING_MAX_ENTRIES,
             guard=self._endpoint_guard,
         )
+        self._compiled_predicates: dict[int, _CompiledPredicate] = {}
         self._endpoint_memo: dict[int, _EndpointTxnMemo] = {}
         self._endpoint_budget = _EndpointLocatorBudget(
             max_bytes=_ENDPOINT_LOCATOR_MAX_BYTES,
@@ -3134,6 +3144,27 @@ class QueryEngine:
             authority=authority,
             cache_text=text,
         ).root
+
+    def _compiled_predicate(
+        self, expression: Expression, context: _Context
+    ) -> _CompiledPredicate:
+        """Return the closures of one WHERE predicate, compiling it at most once per plan.
+
+        Keyed by the identity of the expression object, which the cached plan keeps alive; the
+        entry is reused only while it is for that exact object and the planner's coalesce types
+        it was compiled with still hold.  Bounded by ``_COMPILED_PREDICATE_MAX_ENTRIES``; the
+        oldest entry leaves first.  It holds no row, value or snapshot: nothing here is
+        authority beyond the life of the statement that runs it.
+        """
+        cache = self._compiled_predicates
+        entry = cache.get(id(expression))
+        if entry is not None and entry.serves(expression, context):
+            return entry
+        entry = _compile_predicate(expression, context)
+        if len(cache) >= _COMPILED_PREDICATE_MAX_ENTRIES:
+            cache.pop(next(iter(cache)))
+        cache[id(expression)] = entry
+        return entry
 
     def _planned_for(
         self,
@@ -6747,9 +6778,282 @@ def _filter_rows(
             yield row
 
 
+_COMPILED_MISS: object = object()
+"""The per-row memo slot value of a shared subexpression not yet reached on this row."""
+
+
+class _CompiledPredicate:
+    """One WHERE predicate compiled to closures over the executor's own leaf functions.
+
+    EXEC-CSE (with KGRUN-M1 inside): the recursive walk of :func:`_evaluate` decides the kind of
+    every node on every row; here each node is resolved once, at compile time, to a closure that
+    calls the very same leaf functions (``_truth``, ``_equal``, ``_ordered``, ``_read_variable``,
+    ``_evaluate_parameter``, ``RowBinding.value``, the coalesce body) in the same order, with
+    the same short-circuit and the same refusals.  Every node kind without a closure of its own
+    (``IN``, text operators, arithmetic, CASE, lists, maps, subscripts, other functions) is a
+    closure that calls :func:`_evaluate` on that subtree, so the canonical walk remains the single
+    oracle there.  ``coalesce`` resolves its name at compile time and shares the executor's
+    selection body.  Structurally identical subtrees (the seven ``coalesce(n.revocation_reason,
+    '')`` of the Pulse page) share one per-row memo slot filled the first time the path reaches
+    it -- never earlier -- which preserves short-circuit and the order of errors.  A row carrying
+    ``computed`` (aggregation) never takes the compiled form: ``_evaluate`` consults that memo at
+    every node and the compiled form consults it at none.
+    """
+
+    __slots__ = ("expression", "function", "slots", "calls")
+
+    def __init__(
+        self,
+        expression: Expression,
+        function: Callable[[_Row, _Context, list[object] | None], object],
+        slots: int,
+        calls: tuple[tuple[int, ValueType | None], ...],
+    ) -> None:
+        self.expression = expression
+        self.function = function
+        self.slots = slots
+        self.calls = calls
+
+    def serves(self, expression: Expression, context: _Context) -> bool:
+        """Say whether this compilation is for this exact expression under this context."""
+        if self.expression is not expression:
+            return False
+        types = context.coalesce_types
+        for call_id, resolved in self.calls:
+            if types.get(call_id) is not resolved:
+                return False
+        return True
+
+
+def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPredicate:
+    """Compile one expression tree to closures; see :class:`_CompiledPredicate`."""
+    keys: dict[int, tuple] = {}
+    counts: dict[tuple, int] = {}
+    calls: list[tuple[int, ValueType | None]] = []
+    coalesce_types = context.coalesce_types
+
+    def key_of(node: Expression) -> tuple:
+        known = keys.get(id(node))
+        if known is not None:
+            return known
+        kind = type(node)
+        if kind is Literal:
+            value = node.value
+            key: tuple = ("L", type(value).__name__, repr(value))
+        elif kind is Parameter:
+            key = ("P", node.name)
+        elif kind is Variable:
+            key = ("V", node.name)
+        elif kind is Property:
+            key = ("R", node.key, key_of(node.subject))
+        elif kind is NullCheck:
+            key = ("N", bool(node.negated), key_of(node.operand))
+        elif kind is UnaryOperation:
+            key = ("U", node.operator, key_of(node.operand))
+        elif kind is BinaryOperation:
+            key = ("B", node.operator, key_of(node.left), key_of(node.right))
+        elif kind is FunctionCall:
+            # Two calls share a slot only when the planner resolved the same result type for
+            # both; the type is part of the key and is re-checked on every reuse (serves()).
+            resolved = coalesce_types.get(id(node))
+            calls.append((id(node), resolved))
+            key = (
+                "F",
+                node.name.upper(),
+                bool(node.distinct),
+                bool(node.star),
+                tuple(key_of(argument) for argument in node.arguments),
+                tuple(
+                    (argument.name, key_of(argument.value))
+                    for argument in node.named_arguments
+                ),
+                resolved,
+            )
+        else:
+            key = ("X", id(node))
+            for child in node.children():
+                key_of(child)
+        keys[id(node)] = key
+        counts[key] = counts.get(key, 0) + 1
+        return key
+
+    key_of(expression)
+    slot_of: dict[tuple, int] = {}
+
+    def shared(node: Expression, function: Callable[..., object]) -> Callable[..., object]:
+        kind = type(node)
+        if kind is Literal or kind is Parameter or kind is Variable:
+            return function
+        key = keys[id(node)]
+        if counts.get(key, 0) < 2:
+            return function
+        slot = slot_of.get(key)
+        if slot is None:
+            slot = slot_of[key] = len(slot_of)
+
+        def memoized(row: _Row, ctx: _Context, memo: list[object]) -> object:
+            value = memo[slot]
+            if value is _COMPILED_MISS:
+                value = memo[slot] = function(row, ctx, memo)
+            return value
+
+        return memoized
+
+    def compile_node(node: Expression) -> Callable[..., object]:
+        kind = type(node)
+        if kind is Literal:
+            constant = node.value
+
+            def literal(row: _Row, ctx: _Context, memo: object) -> object:
+                return constant
+
+            return literal
+        if kind is Parameter:
+
+            def parameter(row: _Row, ctx: _Context, memo: object) -> object:
+                return _evaluate_parameter(node, row, ctx, None)
+
+            return parameter
+        if kind is Variable:
+
+            def variable(row: _Row, ctx: _Context, memo: object) -> object:
+                return _read_variable(node, row, None)
+
+            return variable
+        if kind is Property:
+            subject = shared(node.subject, compile_node(node.subject))
+            key = node.key
+
+            def prop(row: _Row, ctx: _Context, memo: object) -> object:
+                value = subject(row, ctx, memo)
+                if value is None:
+                    return None
+                if type(value) is RowBinding:
+                    return value.value(key)
+                # A mapping subject or a refusal: the canonical walk answers exactly as before.
+                return _evaluate_property(node, row, ctx, None)
+
+            return prop
+        if kind is NullCheck:
+            operand = shared(node.operand, compile_node(node.operand))
+            negated = bool(node.negated)
+
+            def null_check(row: _Row, ctx: _Context, memo: object) -> object:
+                value = operand(row, ctx, memo)
+                return (value is not None) if negated else (value is None)
+
+            return null_check
+        if kind is UnaryOperation and node.operator == "NOT":
+            operand = shared(node.operand, compile_node(node.operand))
+
+            def negation(row: _Row, ctx: _Context, memo: object) -> object:
+                truth = _truth(operand(row, ctx, memo))
+                return None if truth is None else (not truth)
+
+            return negation
+        if kind is BinaryOperation:
+            operator = node.operator
+            if operator in ("AND", "OR", "XOR", "=", "<>", "<", "<=", ">", ">="):
+                left = shared(node.left, compile_node(node.left))
+                right = shared(node.right, compile_node(node.right))
+                if operator == "AND":
+
+                    def conjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_truth = _truth(left(row, ctx, memo))
+                        if left_truth is False:
+                            return False
+                        right_truth = _truth(right(row, ctx, memo))
+                        if right_truth is False:
+                            return False
+                        if left_truth is None or right_truth is None:
+                            return None
+                        return left_truth and right_truth
+
+                    return conjunction
+                if operator == "OR":
+
+                    def disjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_truth = _truth(left(row, ctx, memo))
+                        if left_truth is True:
+                            return True
+                        right_truth = _truth(right(row, ctx, memo))
+                        if right_truth is True:
+                            return True
+                        if left_truth is None or right_truth is None:
+                            return None
+                        return left_truth or right_truth
+
+                    return disjunction
+                if operator == "XOR":
+
+                    def exclusive(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_value = left(row, ctx, memo)
+                        right_value = right(row, ctx, memo)
+                        left_truth, right_truth = _truth(left_value), _truth(right_value)
+                        if left_truth is None or right_truth is None:
+                            return None
+                        return left_truth != right_truth
+
+                    return exclusive
+                if operator == "=":
+
+                    def equality(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_value = left(row, ctx, memo)
+                        right_value = right(row, ctx, memo)
+                        if left_value is None or right_value is None:
+                            return None
+                        return _equal(left_value, right_value)
+
+                    return equality
+                if operator == "<>":
+
+                    def inequality(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_value = left(row, ctx, memo)
+                        right_value = right(row, ctx, memo)
+                        if left_value is None or right_value is None:
+                            return None
+                        return not _equal(left_value, right_value)
+
+                    return inequality
+
+                def ordering(row: _Row, ctx: _Context, memo: object) -> object:
+                    return _ordered(operator, left(row, ctx, memo), right(row, ctx, memo))
+
+                return ordering
+        if (
+            kind is FunctionCall
+            and node.name.upper() == COALESCE_FUNCTION
+            and not node.named_arguments
+            and not node.distinct
+            and not node.star
+        ):
+            arguments = tuple(
+                shared(argument, compile_node(argument)) for argument in node.arguments
+            )
+
+            def coalesce(row: _Row, ctx: _Context, memo: object) -> object:
+                values = tuple(argument(row, ctx, memo) for argument in arguments)
+                return _coalesce_selected(node, values, ctx)
+
+            return coalesce
+
+        def canonical(row: _Row, ctx: _Context, memo: object) -> object:
+            return _evaluate(node, row, ctx)
+
+        return canonical
+
+    function = shared(expression, compile_node(expression))
+    return _CompiledPredicate(expression, function, len(slot_of), tuple(calls))
+
+
 def _predicate_admits(expression: Expression, row: _Row, context: _Context) -> bool:
     """Apply the executor's exact three-valued WHERE rule to one already-bound row."""
-    value = _evaluate(expression, row, context)
+    if row.computed is None:
+        compiled = context.engine._compiled_predicate(expression, context)
+        memo = [_COMPILED_MISS] * compiled.slots if compiled.slots else None
+        value = compiled.function(row, context, memo)
+    else:
+        value = _evaluate(expression, row, context)
     if value is None:
         return False
     if not isinstance(value, bool):
@@ -12075,6 +12379,10 @@ def _evaluate_property(
     subject = _evaluate(expression.subject, row, context)
     if subject is None:
         return None
+    if type(subject) is RowBinding:
+        # KGRUN-M1: the matched row is the common case; the abstract Mapping test below walks
+        # the ABC registry and is only reached by a map subject or a refusal.
+        return subject.value(expression.key)
     if isinstance(subject, Mapping):
         return _map_property_value(subject, expression)
     if not isinstance(subject, RowBinding):
@@ -13981,6 +14289,13 @@ def _coalesce(expression: FunctionCall, row: _Row, context: _Context) -> object:
     values = tuple(
         _evaluate(argument, row, context) for argument in expression.arguments
     )
+    return _coalesce_selected(expression, values, context)
+
+
+def _coalesce_selected(
+    expression: FunctionCall, values: tuple[object, ...], context: _Context
+) -> object:
+    """Select and coerce the coalesce answer from already evaluated arguments."""
     selected = next((value for value in values if value is not None), None)
     if selected is None:
         return None

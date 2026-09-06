@@ -1,0 +1,354 @@
+"""EXEC-CSE: a WHERE predicate compiled to closures answers exactly as the canonical walk."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+import okto_grafx
+import okto_grafx.engine.query_engine as query_engine_module
+from okto_grafx.domain.errors import GrafxError
+from okto_grafx.domain.query.ast import (
+    BinaryOperation,
+    FunctionCall,
+    ListExpression,
+    Literal,
+    NullCheck,
+    Parameter,
+    Property,
+    UnaryOperation,
+    Variable,
+)
+from okto_grafx.domain.query.plan import FilterRows
+from okto_grafx.engine.query_engine import (
+    _COMPILED_MISS,
+    _COMPILED_PREDICATE_MAX_ENTRIES,
+    _Row,
+    _evaluate,
+)
+
+N = Variable(name="n")
+M = Variable(name="m")
+LIT = {True: Literal(value=True), False: Literal(value=False), None: Literal(value=None)}
+BOOM = Property(subject=N, key="coluna_que_nao_existe")
+PARAMS = {"escalar": 7, "mapa": {"k": 1}, "x": -1, "layer": "canonical"}
+
+
+def P(key: str) -> Property:
+    return Property(subject=N, key=key)
+
+
+def CO(*arguments: object) -> FunctionCall:
+    return FunctionCall(name="coalesce", arguments=tuple(arguments))  # type: ignore[arg-type]
+
+
+def B(operator: str, left: object, right: object) -> BinaryOperation:
+    return BinaryOperation(operator=operator, left=left, right=right)  # type: ignore[arg-type]
+
+
+def corpus() -> list[tuple[str, object]]:
+    """The hostile corpus of the L6 EXEC dimension, plus the CSE-specific attacks."""
+    out: list[tuple[str, object]] = []
+    operands = {
+        "T": LIT[True],
+        "F": LIT[False],
+        "N": LIT[None],
+        "i5": Literal(value=5),
+        "s": Literal(value="x"),
+    }
+    for operator in ("AND", "OR", "XOR"):
+        for a, ea in operands.items():
+            for b, eb in operands.items():
+                out.append((f"{operator}_{a}_{b}", B(operator, ea, eb)))
+    for a, ea in operands.items():
+        out.append((f"NOT_{a}", UnaryOperation(operator="NOT", operand=ea)))
+        out.append((f"NEG_{a}", UnaryOperation(operator="-", operand=ea)))
+    for operator in ("<", "<=", ">", ">=", "=", "<>"):
+        out.append((f"null_col_{operator}", B(operator, P("revocation_reason"), Literal(value="a"))))
+        out.append((f"col_{operator}_null", B(operator, P("title"), LIT[None])))
+    pairs = [
+        ("str_int", P("title"), Literal(value=5)),
+        ("int_str", P("created_at"), Literal(value="a")),
+        ("bool_int", P("p14"), Literal(value=True)),
+        ("int_bool", Literal(value=1), P("p16")),
+        ("true_eq_1", LIT[True], Literal(value=1)),
+        ("int_eq_float", P("created_at"), Literal(value=1.0)),
+        ("double_ge_int", P("source_confidence"), Literal(value=0)),
+        ("str_ge_str", P("title"), Literal(value="conteudo")),
+        ("param_eq_col", Parameter(name="layer"), P("graph_layer")),
+    ]
+    for name, left, right in pairs:
+        for operator in ("<", ">=", "=", "<>"):
+            out.append((f"{name}_{operator}", B(operator, left, right)))
+    for key in ("revocation_reason", "title", "coluna_que_nao_existe"):
+        out.append((f"isnull_{key}", NullCheck(operand=P(key), negated=False)))
+        out.append((f"isnotnull_{key}", NullCheck(operand=P(key), negated=True)))
+    out.append(("coluna_inexistente", B(">=", BOOM, Literal(value=1))))
+    out.append(("variavel_nao_ligada", B(">=", Property(subject=M, key="id"), Literal(value=1))))
+    out.append(("parametro_ausente", B(">=", P("created_at"), Parameter(name="nao_existe"))))
+    out.append(("sujeito_nao_binding", Property(subject=Parameter(name="escalar"), key="k")))
+    out.append(("sujeito_mapping", Property(subject=Parameter(name="mapa"), key="k")))
+    out.append(("sujeito_mapping_ausente", Property(subject=Parameter(name="mapa"), key="zzz")))
+    out.append(("curto_and_falso", B("AND", LIT[False], B(">=", BOOM, Literal(value=1)))))
+    out.append(("curto_or_verdadeiro", B("OR", LIT[True], B(">=", BOOM, Literal(value=1)))))
+    out.append(("curto_and_nulo_direita_erra", B("AND", LIT[None], B(">=", BOOM, Literal(value=1)))))
+    out.append(
+        (
+            "ordem_de_erro_esquerda_primeiro",
+            B(
+                "AND",
+                B(">=", BOOM, Literal(value=1)),
+                B(">=", Property(subject=M, key="id"), Literal(value=1)),
+            ),
+        )
+    )
+    out.append(
+        (
+            "coalesce_null_str",
+            B("<>", CO(P("revocation_reason"), Literal(value="")), Literal(value="source_deleted")),
+        )
+    )
+    out.append(("coalesce_todos_nulos", CO(P("revocation_reason"), LIT[None])))
+    out.append(("coalesce_familias_misturadas", CO(P("title"), Literal(value=5))))
+    out.append(("coalesce_int_float", CO(P("created_at"), Literal(value=1.5))))
+    out.append(("coalesce_float_int", CO(P("source_confidence"), Literal(value=1))))
+    out.append(("coalesce_bool", CO(P("p14"), LIT[True])))
+    out.append(("coalesce_um_arg", CO(P("revocation_reason"))))
+    out.append(("coalesce_lista", CO(ListExpression(elements=(LIT[True],)), LIT[True])))
+    out.append(
+        (
+            "coalesce_aninhado",
+            B("=", CO(CO(P("revocation_reason"), LIT[None]), Literal(value="x")), Literal(value="x")),
+        )
+    )
+    out.append(
+        (
+            "in_lista",
+            B("IN", P("graph_layer"), ListExpression(elements=(Literal(value="canonical"), LIT[None]))),
+        )
+    )
+    out.append(("starts_with", B("STARTS WITH", P("title"), Literal(value="t"))))
+    out.append(("arith", B(">", B("+", P("created_at"), Literal(value=1)), Literal(value=3))))
+    # --- CSE attacks: the same subtree repeated, first reached on a branch that may be skipped.
+    tomb = B("<>", CO(P("revocation_reason"), Literal(value="")), Literal(value="r"))
+    out.append(("cse_twice", B("AND", tomb, B("<>", CO(P("revocation_reason"), Literal(value="")), Literal(value="q")))))
+    seven = None
+    for index in range(7):
+        term = B("<>", CO(P("revocation_reason"), Literal(value="")), Literal(value=f"reason-{index}"))
+        seven = term if seven is None else B("AND", seven, term)
+    out.append(("cse_seven", seven))
+    boom = B(">=", BOOM, Literal(value=1))
+    out.append(("cse_first_in_skipped_branch", B("OR", B("AND", LIT[False], boom), boom)))
+    out.append(("cse_raises_once", B("AND", boom, boom)))
+    out.append(("cse_first_in_null_and", B("AND", B("AND", LIT[None], boom), boom)))
+    shared_null = P("revocation_reason")
+    out.append(("cse_null_property", B("AND", NullCheck(operand=shared_null), NullCheck(operand=shared_null, negated=True))))
+    out.append(("cse_key_collision", B("AND", B("=", P("p16"), Literal(value=1)), B("=", P("p16"), LIT[True]))))
+    out.append(("cse_zero_collision", B("OR", B("=", P("source_confidence"), Literal(value=0.0)), B("=", P("source_confidence"), Literal(value=-0.0)))))
+    coalesce_double = CO(P("source_confidence"), Literal(value=1))
+    out.append(("cse_coalesce_double", B("=", coalesce_double, CO(P("source_confidence"), Literal(value=1)))))
+    return out
+
+
+@pytest.fixture
+def database(tmp_path: Path) -> Iterator[object]:
+    handle = okto_grafx.connect(tmp_path / "db", page_size=4096)
+    with handle.begin("write") as transaction:
+        transaction.execute(
+            "CREATE NODE TABLE Node(id STRING, title STRING, created_at INT64, "
+            "revocation_reason STRING, graph_layer STRING, p14 BOOL, p16 INT64, "
+            "source_confidence DOUBLE, PRIMARY KEY(id))"
+        )
+    with handle.begin("write") as transaction:
+        rows = [
+            ("n-0", "title zero", 0, None, "canonical", True, 1, 0.0),
+            ("n-1", "conteudo", 1, "source_deleted", "shadow", False, 0, 0.5),
+            ("n-2", "t2", 2, "", "canonical", None, None, None),
+            ("n-3", None, 3, "x", "canonical", True, 7, -0.0),
+        ]
+        for values in rows:
+            transaction.execute(
+                "CREATE (:Node {id: $id, title: $title, created_at: $created_at, "
+                "revocation_reason: $rr, graph_layer: $gl, p14: $p14, p16: $p16, "
+                "source_confidence: $sc})",
+                dict(
+                    zip(
+                        ("id", "title", "created_at", "rr", "gl", "p14", "p16", "sc"),
+                        values,
+                    )
+                ),
+            )
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def _capture(database: object, monkeypatch: pytest.MonkeyPatch) -> tuple[list[_Row], object]:
+    """Capture the real rows and statement context of one filtered scan."""
+    captured: dict[str, object] = {}
+    original = query_engine_module._filter_rows
+
+    def grab(engine, node, context):
+        if "rows" not in captured:
+            captured["context"] = context
+            rows = []
+            for row in engine._rows(node.child, context):
+                rows.append(row)
+                yield row
+            captured["rows"] = rows
+            return
+        yield from original(engine, node, context)
+
+    monkeypatch.setattr(query_engine_module, "_filter_rows", grab)
+    for kind, handler in list(query_engine_module._HANDLERS.items()):
+        if handler is original:
+            monkeypatch.setitem(query_engine_module._HANDLERS, kind, grab)
+    database.execute("MATCH (n:Node) WHERE n.created_at >= $x RETURN n.id", dict(PARAMS))
+    context = captured["context"]
+    context.parameters.update(PARAMS)  # type: ignore[attr-defined]
+    return captured["rows"], context  # type: ignore[return-value]
+
+
+def _snapshot(function, row: _Row, context: object) -> tuple:
+    try:
+        value = function(row, context)
+    except GrafxError as failure:
+        return ("erro", json.dumps(failure.to_dict(), sort_keys=True, default=repr))
+    except Exception as failure:  # noqa: BLE001 - the shape of a Python error is the fixture
+        return ("erro_py", type(failure).__name__, str(failure))
+    return ("valor", type(value).__name__, repr(value))
+
+
+def _compiled(engine, expression, context):
+    compiled = engine._compiled_predicate(expression, context)
+
+    def run(row: _Row, ctx: object) -> object:
+        memo = [_COMPILED_MISS] * compiled.slots if compiled.slots else None
+        return compiled.function(row, ctx, memo)
+
+    return run
+
+
+def test_every_hostile_case_answers_exactly_as_the_canonical_walk(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows, context = _capture(database, monkeypatch)
+    assert len(rows) == 4
+    engine = database._queries  # type: ignore[attr-defined]
+    binding = rows[0].bindings["n"]
+    short = replace(binding.version, values=binding.version.values[:3])
+    subjects = [(f"row-{index}", row) for index, row in enumerate(rows)]
+    subjects.append(("tupla_curta", _Row(bindings={"n": replace(binding, version=short)})))
+    comparisons = 0
+    mismatches = []
+    for name, expression in corpus():
+        compiled = _compiled(engine, expression, context)
+        for label, row in subjects:
+            expected = _snapshot(lambda r, c: _evaluate(expression, r, c), row, context)
+            observed = _snapshot(compiled, row, context)
+            comparisons += 1
+            if observed != expected:
+                mismatches.append((name, label, expected, observed))
+    assert comparisons >= 600
+    assert mismatches == []
+
+
+def test_a_computed_row_takes_the_canonical_walk_not_the_closures(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows, context = _capture(database, monkeypatch)
+    computed_row = _Row(bindings=dict(rows[0].bindings), computed={Literal(value=1): 1})
+    # _evaluate consults the aggregation memo at every node: Literal(True) == Literal(1) there.
+    expression = B("AND", LIT[True], LIT[True])
+    assert _evaluate(expression, computed_row, context) is None
+    assert query_engine_module._predicate_admits(expression, computed_row, context) is False
+    plain_row = _Row(bindings=dict(rows[0].bindings))
+    assert query_engine_module._predicate_admits(expression, plain_row, context) is True
+
+
+def test_shared_subtrees_are_evaluated_once_per_row_and_only_when_reached(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows, context = _capture(database, monkeypatch)
+    engine = database._queries  # type: ignore[attr-defined]
+    reads = 0
+    original_value = query_engine_module.RowBinding.value
+
+    def counted_value(self, key):
+        nonlocal reads
+        reads += 1
+        return original_value(self, key)
+
+    monkeypatch.setattr(query_engine_module.RowBinding, "value", counted_value)
+    seven = None
+    for index in range(7):
+        term = B("<>", CO(P("revocation_reason"), Literal(value="")), Literal(value=f"reason-{index}"))
+        seven = term if seven is None else B("AND", seven, term)
+    compiled = engine._compiled_predicate(seven, context)
+    assert compiled.slots >= 1
+    run = _compiled(engine, seven, context)
+    reads = 0
+    assert run(rows[0], context) is True
+    assert reads == 1, "seven identical coalesce terms read the property once per row"
+    reads = 0
+    _evaluate(seven, rows[0], context)
+    assert reads == 7
+    # A shared subtree first met on a skipped branch is evaluated where the walk meets it.
+    boom = B(">=", BOOM, Literal(value=1))
+    skipped = B("OR", B("AND", LIT[False], boom), B("AND", LIT[True], LIT[True]))
+    assert _compiled(engine, skipped, context)(rows[0], context) is True
+
+
+def test_the_compiled_cache_is_bounded_and_keyed_by_expression_identity(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows, context = _capture(database, monkeypatch)
+    engine = database._queries  # type: ignore[attr-defined]
+    cache = engine._compiled_predicates
+    cache.clear()
+    first = B("=", P("title"), Literal(value="t2"))
+    twin = B("=", P("title"), Literal(value="t2"))
+    assert first == twin and first is not twin
+    entry = engine._compiled_predicate(first, context)
+    assert engine._compiled_predicate(first, context) is entry
+    assert engine._compiled_predicate(twin, context) is not entry
+    for index in range(_COMPILED_PREDICATE_MAX_ENTRIES + 10):
+        engine._compiled_predicate(B("=", P("created_at"), Literal(value=index)), context)
+    assert len(cache) <= _COMPILED_PREDICATE_MAX_ENTRIES
+    for compiled in cache.values():
+        assert compiled.__slots__ == ("expression", "function", "slots", "calls")
+
+
+def test_filter_and_vector_style_admission_agree_with_the_walk_end_to_end(database: object) -> None:
+    rows = database.execute(
+        "MATCH (n:Node) WHERE (coalesce(n.revocation_reason, '') <> 'source_deleted' "
+        "AND coalesce(n.revocation_reason, '') <> 'x') AND n.p14 IS NOT NULL "
+        "RETURN n.id ORDER BY n.id"
+    ).rows
+    assert rows == (("n-0",),)
+    with pytest.raises(GrafxError) as refused:
+        database.execute("MATCH (n:Node) WHERE n.created_at RETURN n.id")
+    assert refused.value.details["field"] == "predicate"
+    with pytest.raises(GrafxError) as missing:
+        database.execute("MATCH (n:Node) WHERE n.nope = 1 RETURN n.id")
+    assert missing.value.details["field"] == "column"
+
+
+def test_plan_filter_nodes_are_compiled_once_per_cached_plan(database: object) -> None:
+    engine = database._queries  # type: ignore[attr-defined]
+    engine._compiled_predicates.clear()
+    statement = "MATCH (n:Node) WHERE n.created_at >= $x AND n.title IS NOT NULL RETURN n.id"
+    for _ in range(3):
+        database.execute(statement, {"x": 0})
+    predicates = [entry.expression for entry in engine._compiled_predicates.values()]
+    assert len(predicates) == 1
+    assert isinstance(predicates[0], BinaryOperation)
+    plan = database.planned(statement) if hasattr(database, "planned") else None
+    if plan is not None:
+        filters = [node for node in plan.plan.walk() if isinstance(node, FilterRows)]
+        assert filters and filters[0].predicate == predicates[0]
