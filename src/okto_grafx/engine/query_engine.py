@@ -11623,48 +11623,42 @@ def _evaluate(expression: Expression, row: _Row, context: _Context) -> object:
     computed = row.computed
     if computed is not None and expression in computed:
         return computed[expression]
+    evaluator = _EXACT_EVALUATORS.get(type(expression))
+    if evaluator is not None:
+        return evaluator(expression, row, context, computed)
+    return _evaluate_by_kind(expression, row, context, computed)
+
+
+def _evaluate_by_kind(
+    expression: Expression,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    """Walk the node kinds in their fixed order; every subclass and unknown node comes here.
+
+    The exact-type table in :func:`_evaluate` only shortcuts this walk for a node whose class
+    is exactly one of the kinds below, and it dispatches to the very same function the walk
+    would reach, so the two doors cannot answer differently.
+    """
     if isinstance(expression, Literal):
-        return expression.value
+        return _evaluate_literal(expression, row, context, computed)
     if isinstance(expression, Parameter):
-        if expression.name not in context.parameters:
-            raise GrafxPlanError(
-                f"The query needs the parameter ${expression.name}, which was not supplied.",
-                field="parameter",
-                value=expression.name,
-            )
-        return context.parameters[expression.name]
+        return _evaluate_parameter(expression, row, context, computed)
     if isinstance(expression, Variable):
-        return _read_variable(expression, row, computed)
+        return _evaluate_variable(expression, row, context, computed)
     if isinstance(expression, Property):
-        subject = _evaluate(expression.subject, row, context)
-        if subject is None:
-            return None
-        if isinstance(subject, Mapping):
-            return _map_property_value(subject, expression)
-        if not isinstance(subject, RowBinding):
-            raise GrafxPlanError(
-                f"A property is read from a matched row; {expression.describe()} reads a "
-                f"{type(subject).__name__}.",
-                field="property",
-                value=expression.key,
-            )
-        return subject.value(expression.key)
+        return _evaluate_property(expression, row, context, computed)
     if isinstance(expression, NullCheck):
-        value = _evaluate(expression.operand, row, context)
-        return (value is not None) if expression.negated else (value is None)
+        return _evaluate_null_check(expression, row, context, computed)
     if isinstance(expression, UnaryOperation):
         return _unary(expression, row, context)
     if isinstance(expression, BinaryOperation):
         return _binary(expression, row, context)
     if isinstance(expression, ListExpression):
-        return tuple(
-            _evaluate(element, row, context) for element in expression.elements
-        )
+        return _evaluate_list(expression, row, context, computed)
     if isinstance(expression, MapExpression):
-        return {
-            entry.key: _evaluate(entry.value, row, context)
-            for entry in expression.entries
-        }
+        return _evaluate_map(expression, row, context, computed)
     if isinstance(expression, CaseExpression):
         return _case(expression, row, context)
     if isinstance(expression, Subscript):
@@ -11676,6 +11670,154 @@ def _evaluate(expression: Expression, row: _Row, context: _Context) -> object:
         field="expression",
         value=type(expression).__name__,
     )
+
+
+def _evaluate_literal(
+    expression: Literal,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return expression.value
+
+
+def _evaluate_parameter(
+    expression: Parameter,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    if expression.name not in context.parameters:
+        raise GrafxPlanError(
+            f"The query needs the parameter ${expression.name}, which was not supplied.",
+            field="parameter",
+            value=expression.name,
+        )
+    return context.parameters[expression.name]
+
+
+def _evaluate_variable(
+    expression: Variable,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return _read_variable(expression, row, computed)
+
+
+def _evaluate_property(
+    expression: Property,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    subject = _evaluate(expression.subject, row, context)
+    if subject is None:
+        return None
+    if isinstance(subject, Mapping):
+        return _map_property_value(subject, expression)
+    if not isinstance(subject, RowBinding):
+        raise GrafxPlanError(
+            f"A property is read from a matched row; {expression.describe()} reads a "
+            f"{type(subject).__name__}.",
+            field="property",
+            value=expression.key,
+        )
+    return subject.value(expression.key)
+
+
+def _evaluate_null_check(
+    expression: NullCheck,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    value = _evaluate(expression.operand, row, context)
+    return (value is not None) if expression.negated else (value is None)
+
+
+def _evaluate_list(
+    expression: ListExpression,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return tuple(_evaluate(element, row, context) for element in expression.elements)
+
+
+def _evaluate_map(
+    expression: MapExpression,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return {
+        entry.key: _evaluate(entry.value, row, context) for entry in expression.entries
+    }
+
+
+def _evaluate_unary(
+    expression: UnaryOperation,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return _unary(expression, row, context)
+
+
+def _evaluate_binary(
+    expression: BinaryOperation,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return _binary(expression, row, context)
+
+
+def _evaluate_case(
+    expression: CaseExpression,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return _case(expression, row, context)
+
+
+def _evaluate_subscript(
+    expression: Subscript,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return _subscript(expression, row, context)
+
+
+def _evaluate_call(
+    expression: FunctionCall,
+    row: _Row,
+    context: _Context,
+    computed: Mapping[Expression, object] | None,
+) -> object:
+    return _call(expression, row, context)
+
+
+# One entry per EXACT node class, pointing at the function the isinstance walk reaches for that
+# kind.  A subclass of any node is absent here on purpose and takes the walk, so the table can
+# only shorten the dispatch, never change which function answers.
+_EXACT_EVALUATORS: dict[type, Callable[..., object]] = {
+    Literal: _evaluate_literal,
+    Parameter: _evaluate_parameter,
+    Variable: _evaluate_variable,
+    Property: _evaluate_property,
+    NullCheck: _evaluate_null_check,
+    UnaryOperation: _evaluate_unary,
+    BinaryOperation: _evaluate_binary,
+    ListExpression: _evaluate_list,
+    MapExpression: _evaluate_map,
+    CaseExpression: _evaluate_case,
+    Subscript: _evaluate_subscript,
+    FunctionCall: _evaluate_call,
+}
 
 
 def _case(expression: CaseExpression, row: _Row, context: _Context) -> object:
