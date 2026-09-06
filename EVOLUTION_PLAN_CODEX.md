@@ -3670,8 +3670,23 @@ o próximo ganho bounded (memo B lexical), sem transformar esse residual em gate
 Esse caminho não altera formato, WAL, recovery, nenhuma das duas OCCs, leases, admissão de writers
 ou snapshots de readers. Tabela/índice ausente, stale ou owner-dirty escolhe o plano canônico antes
 da primeira leitura acelerada; depois da adoção, troca de geração, erro de leitura e corrupção
-continuam fail-closed. A próxima leva somente será ordenada após o novo levantamento do Claude e o
-consenso explícito no Nexus, evitando criar alvos móveis.
+continuam fail-closed.
+
+O refresh foi concluído sobre `a726744` e substitui o baseline antigo: o transfer limpo caiu de
+`86,81 s` para mediana de `58,49 s` (`1,48x`). No caminho exato da tela, o perfil isolou custos de
+landing/certificação por linha, re-encode de endpoint apenas para tarifar memo, `IN $lista` linear
+e decode das linhas largas. O consenso finito da segunda leva está detalhado em
+`docs/PERFORMANCE_ROUND_0_0_3.md`: KG-3 → KG-1/KG-4 → KG-2 bounded, com R-11 no decode. KG-3 foi
+publicado em `8d806b0` usando somente o `payload_len` já autenticado pelo heap; versão sintética ou
+alterada perde a testemunha e mantém o encode canônico. R-11 foi publicado em `a610b55`, inlinando
+o corpo de `STRING` já tipado sem alterar bytes, validação UTF-8 ou taxonomia de corrupção. Os
+testes focais passaram (50 para KG-3; 197 no codec/schema para R-11). Na página real, o resultado
+permaneceu 500 nós/777 relações/zero falhas; uma amostra mediu nós em `0,858 s`, híbrido quente em
+`1,036–1,103 s` e scan forçado em `2,334–2,547 s`, sem atribuir a variação inteira aos dois patches.
+Hashing de `IN` só poderá reter parâmetros profundamente destacados, tipos exatos
+`str`/`bytes`/`None` e teto por statement; listas numéricas/mistas continuam lineares. O batch de
+landings não poderá materializar o statement inteiro: será limitado por chunks e preservará os
+caminhos v1, RYOW, snapshot e certificado pós-leitura fail-closed.
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um

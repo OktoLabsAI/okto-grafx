@@ -294,6 +294,48 @@ equality query per page node multiplies statement/index work. The scalable follo
 multi-key endpoint seek/incident-edge operator (or an equally explicit structured port), with
 the same endpoint visibility and canonical-reference validation as ordinary traversal.
 
+## KG-LOAD-2 — refreshed hot path and second implementation wave
+
+Status: **finite joint selection; first two removals integrated, evaluator work under review**.
+
+Claude repeated the Amdahl transfer on `a726744` after the earlier optimizations, rather than
+reusing the obsolete baseline. The clean median fell from 86.81 s to 58.49 s (`1.48x`). A
+separate profile of the exact Pulse graph-page shapes found the remaining scan-branch time in
+three bounded mechanisms: landing certification per edge (44%), re-encoding an already decoded
+wide endpoint only to charge its optional memo (18%), and linear `IN $list` evaluation with two
+`_freeze` operations per comparison and no early exit (17%). The node page separately spent 34%
+of its profiled time decoding all 44 columns, including the vector, before returning its selected
+properties. These fractions come from the profiled synthetic board; the live board remains the
+end-user validation target and the percentages are not release gates.
+
+The joint order is deliberately closed: (1) remove re-encoding from landing accounting using an
+authenticated payload-length witness; (2) add bounded statement-local hashing only for detached
+`str`/`bytes`/`None` parameter lists, while every mixed/numeric case retains the canonical walk
+and its `1 = 1.0` semantics; (3) add exact same-type scalar equality and universal membership
+early exit; (4) batch physical endpoint landings only in bounded chunks, using the existing
+`validated_versions_many` certificate and retaining v1/RYOW scalar paths; and (5) reduce wide-row
+decode overhead without changing the stored format or corruption oracle. Row-independent
+expression folding and unbounded relationship materialization are not part of this wave because
+their error-order and memory semantics are not yet proved.
+
+`8d806b0` completed the first item. `HeapVersion` now carries the `RecordHeader.payload_len` that
+the heap already authenticated while decoding. Optional landing accounting consumes that exact
+witness and falls back to canonical encoding only for synthetic or modified versions that do not
+have it. Tests prove zero re-encodes for a disk row and prove that `dataclasses.replace` drops the
+witness and therefore cannot undercharge changed values.
+
+`a610b55` completed the first safe part of wide-row decode: a planned matching `STRING` body is
+decoded directly in the tuple loop, avoiding one Python dispatch per ordinary graph string. The
+length bounds, UTF-8 validation and `GrafxCorruptionDetected` details are the same as the canonical
+body decoder; mismatched tags, nulls and compound values still use the existing oracle. The full
+schema/value codec selection passed 197 tests.
+
+After those changes, the exact live Pulse page still returned 500 nodes and 777 edges across 66
+queried layouts with zero failures. The node query measured 0.858 s in that run. Alternating arms
+measured the hybrid relationship phase at 1.036–1.103 s warm, versus 2.334–2.547 s for forced
+edge-first scan. This is a compatibility/non-regression observation, not an isolated attribution
+of the wall-time delta to the two new commits.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -307,5 +349,9 @@ the same endpoint visibility and canonical-reference validation as ordinary trav
 | Statement authority memo | complete | `4786496`; identity/catalog/revision/DDL fences, 39 integrated focused tests and Ruff pass |
 | Exact multi-key index validation | complete | `1926fcd`; one durable certificate per index batch, 3.2× for 300 on-disk PK keys |
 | Typed incident-edge operator and cost selection | complete and GO on candidate branches | Grafx `bcfa395` + `a726744`, Pulse `523e759`; adversarial review `hof_aecbb8257cb443c198a50634d2d1af2d` PASS; ordered page preserved 500/777, calls/probes `248/17,116 -> 54/4,355`, paired warm hybrid `0.763–0.967 s` versus forced scan `2.273–2.724 s` |
+| Landing accounting without row re-encode | complete | `8d806b0`; authenticated durable payload length on disk rows, canonical fallback for synthetic/modified rows; 50 focused tests and Ruff pass |
+| Planned STRING body decode | complete | `a610b55`; same byte validation/error taxonomy, 197 schema/value codec tests and Ruff pass; live ordered page preserved 500/777 |
+| Bounded `IN` memo and scalar equality | in adversarial review | Claude worktree `perf/claude-kg1`; exact scalar/null/mixed-numeric/cap tests required before integration |
+| Bounded batch endpoint landing | selected, not started | must use finite chunks and the existing exact multi-key certificate; v1 and RYOW retain canonical semantics |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |
