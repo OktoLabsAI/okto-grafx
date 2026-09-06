@@ -13049,9 +13049,9 @@ def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value,
 
 def _column_named(table: TableDef, key: str) -> ColumnDef:
     """Return one column of a table, refusing a name it does not declare."""
-    for column in table.columns:
-        if column.name == key:
-            return column
+    position = table.column_positions.get(key)
+    if position is not None:
+        return table.columns[position]
     declared = ", ".join(column.name for column in table.columns)
     raise GrafxPlanError(
         f"Table {table.name!r} has no column named {key!r}; it declares {declared}.",

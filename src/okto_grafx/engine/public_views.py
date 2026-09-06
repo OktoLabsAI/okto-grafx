@@ -1785,11 +1785,26 @@ def _query_parameters_snapshot(
     marker = id(value)
     active = {marker}
     detached: dict[str, Value] = {}
-    for position, (raw_name, raw_value) in enumerate(
-        _bounded_mapping_pairs(value, limit=MAX_PARAMETERS, field="parameters")
-    ):
-        name = _builtin_text(
-            raw_name, field=f"parameters[{position}].name", empty=False
+    exact_parameters = type(value) is dict
+    pairs = (
+        dict.items(value)
+        if exact_parameters
+        else _bounded_mapping_pairs(value, limit=MAX_PARAMETERS, field="parameters")
+    )
+    for position, (raw_name, raw_value) in enumerate(pairs):
+        if position >= MAX_PARAMETERS:
+            raise GrafxConfigurationError(
+                f"The parameters mapping may hold at most {MAX_PARAMETERS} entries.",
+                field="parameters",
+                value=position + 1,
+                limit=MAX_PARAMETERS,
+            )
+        name = (
+            raw_name
+            if exact_parameters and type(raw_name) is str and raw_name
+            else _builtin_text(
+                raw_name, field=f"parameters[{position}].name", empty=False
+            )
         )
         if len(name) > MAX_NAME_CHARACTERS:
             raise GrafxConfigurationError(
@@ -1805,13 +1820,28 @@ def _query_parameters_snapshot(
                 value=name,
                 reason="duplicate",
             )
-        detached[name] = _query_value_snapshot(
-            raw_value,
-            field=f"parameters.{name}",
-            depth=0,
-            active=active,
-            max_string_characters=max_string_characters,
-        )
+        field = f"parameters.{name}"
+        raw_type = type(raw_value)
+        if exact_parameters and (raw_value is None or raw_type is bool):
+            detached[name] = raw_value
+        elif exact_parameters and raw_type is int:
+            detached[name] = _require_int64(raw_value, field=field)
+        elif exact_parameters and raw_type is float:
+            detached[name] = raw_value
+        elif exact_parameters and raw_type is str:
+            detached[name] = _require_text_length(
+                raw_value, field=field, limit=max_string_characters
+            )
+        elif exact_parameters and raw_type is bytes:
+            detached[name] = raw_value
+        else:
+            detached[name] = _query_value_snapshot(
+                raw_value,
+                field=field,
+                depth=0,
+                active=active,
+                max_string_characters=max_string_characters,
+            )
     return detached
 
 
