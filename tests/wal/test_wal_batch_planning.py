@@ -10,6 +10,7 @@ import pytest
 
 import okto_grafx.engine.wal_manager as wal_module
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError, GrafxStaleEpoch
+from okto_grafx.domain.ids import PROVISIONAL_CSN
 from okto_grafx.domain.wal import WalRecord, WalRecordType
 from okto_grafx.engine.wal_manager import WalManager, _canonical_record
 
@@ -223,7 +224,7 @@ def test_the_append_reuses_the_canonical_form_the_preview_validated(
     assert calls[0] == 3
     assert wal.append_many(records, expected_terminal_lsn=planned) == planned
     assert calls[0] == 3  # nothing canonicalised twice
-    assert wal._planned_canonical == {} and wal._planned_records == ()
+    assert wal._planned_canonical == {}
 
     # A batch whose objects the preview never saw is canonicalised again, in full.
     fresh = (_exact(make_record(4)), _exact(make_record(5, record_type=WalRecordType.COMMIT)))
@@ -285,19 +286,19 @@ def test_the_memo_is_empty_after_any_outcome(wal: WalManager) -> None:
     """Success, refusal at the append, refusal at the preview: nothing is kept."""
     good = (_exact(make_record(1)), _exact(make_record(2, record_type=WalRecordType.COMMIT)))
     planned = wal.planned_terminal_lsn(good)
-    assert wal._planned_canonical and wal._planned_records
+    assert wal._planned_canonical
     wal.append_many(good, expected_terminal_lsn=planned)
-    assert wal._planned_canonical == {} and wal._planned_records == ()
+    assert wal._planned_canonical == {}
 
     wal.planned_terminal_lsn(good)
     with pytest.raises(GrafxConfigurationError):
         wal.append_many((replace(good[0], lsn=7), good[1]))
-    assert wal._planned_canonical == {} and wal._planned_records == ()
+    assert wal._planned_canonical == {}
 
     wal.planned_terminal_lsn(good)
     with pytest.raises(GrafxConfigurationError):
         wal.planned_terminal_lsn((replace(good[0], lsn=7), good[1]))
-    assert wal._planned_canonical == {} and wal._planned_records == ()
+    assert wal._planned_canonical == {}
 
 
 def test_a_second_preview_replaces_the_first(wal: WalManager, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -311,3 +312,65 @@ def test_a_second_preview_replaces_the_first(wal: WalManager, monkeypatch: pytes
     assert calls[0] == 4
     wal.append_many(first)
     assert calls[0] == 6  # the first preview was forgotten, so its objects are planned anew
+
+
+def test_the_memo_is_consumed_before_any_door_of_the_append_can_refuse(
+    wal: WalManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review: a refusal of the tail refresh or of the health check keeps nothing."""
+    good = (_exact(make_record(1)), _exact(make_record(2, record_type=WalRecordType.COMMIT)))
+
+    def refuse(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise GrafxConfigurationError("refused at the door", field="door", value="test")
+
+    for door in ("_refresh_tail_if_needed", "_require_healthy", "_require_open"):
+        wal.planned_terminal_lsn(good)
+        assert wal._planned_canonical
+        with monkeypatch.context() as scoped:
+            scoped.setattr(WalManager, door, refuse)
+            with pytest.raises(GrafxConfigurationError) as refused:
+                wal.append_many(good)
+        assert refused.value.details["field"] == "door"
+        assert wal._planned_canonical == {}, door
+    # The log is untouched and still serves.
+    assert wal.append_many(good) == wal.last_lsn
+
+
+def test_a_preview_refused_after_validation_publishes_nothing(
+    wal: WalManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review: the memo is published only once the whole plan passed."""
+    good = (_exact(make_record(1)), _exact(make_record(2, record_type=WalRecordType.COMMIT)))
+    wal.planned_terminal_lsn(good)
+    assert wal._planned_canonical
+    # A refusal that comes after every record validated: the sequence-number space is spent.
+    monkeypatch.setattr(wal, "_last_lsn", PROVISIONAL_CSN - 1)
+    with pytest.raises(GrafxConfigurationError) as refused:
+        wal.planned_terminal_lsn(good)
+    assert refused.value.details["field"] == "last_lsn"
+    assert wal._planned_canonical == {}
+    # And a refusal at a door before the plan forgets the earlier preview as well.
+    monkeypatch.undo()
+    wal.planned_terminal_lsn(good)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            WalManager,
+            "_require_healthy",
+            lambda self: (_ for _ in ()).throw(
+                GrafxConfigurationError("unhealthy", field="door", value="test")
+            ),
+        )
+        with pytest.raises(GrafxConfigurationError):
+            wal.planned_terminal_lsn(good)
+    assert wal._planned_canonical == {}
+
+
+def test_the_memo_holds_the_source_beside_its_canonical_form(wal: WalManager) -> None:
+    """One retention: the dict value keeps the object whose id is the key."""
+    first = _exact(make_record(1))
+    commit = _exact(make_record(2, record_type=WalRecordType.COMMIT))
+    wal.planned_terminal_lsn((first, commit))
+    assert set(wal._planned_canonical) == {id(first), id(commit)}
+    assert wal._planned_canonical[id(first)][0] is first
+    assert wal._planned_canonical[id(commit)][0] is commit
+    assert not hasattr(wal, "_planned_records")

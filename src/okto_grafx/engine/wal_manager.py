@@ -358,7 +358,6 @@ class WalManager:
 
     __slots__ = (
         "_planned_canonical",
-        "_planned_records",
         "_storage",
         "_clock",
         "_metrics",
@@ -390,9 +389,10 @@ class WalManager:
         descriptor: str,
     ) -> None:
         """Build the manager over its three ports. Nothing touches the device until ``open``."""
-        # WRITE-4: the canonical form of the records the last preview validated, by object
-        # identity, consumed by the append that follows (see _plan_batch).
-        self._planned_records: tuple[WalRecord, ...] = ()
+        # WRITE-4: the canonical form of the records the last preview validated, keyed by the
+        # identity of the source record and holding it (so the id keeps naming that object),
+        # published only by a preview that succeeded whole and consumed by the append that
+        # follows before it opens any door that can fail (see _plan_batch).
         self._planned_canonical: dict[int, tuple[WalRecord, WalRecord]] = {}
         _require_port("storage", storage, STORAGE_PORT_METHODS)
         _require_port("clock", clock, CLOCK_PORT_METHODS)
@@ -887,9 +887,8 @@ class WalManager:
         checks immediately before it writes, so a foreign tail change becomes a clean refusal
         instead of a batch whose payload names a different commit number.
         """
-        self._require_open()
-        self._planned_records = ()
         self._planned_canonical = {}
+        self._require_open()
         self._refresh_tail_if_needed()
         self._require_healthy()
         _batch, _body_length, _rolling, terminal = self._plan_batch(
@@ -914,15 +913,16 @@ class WalManager:
         :meth:`barrier` returns, and this method deliberately does not take one, so a caller can
         group many appends behind a single barrier.
         """
+        # WRITE-4: the preview's memo is consumed here, before any door that can refuse, so
+        # whatever this call does next -- refuse, fail, write -- leaves nothing behind.
+        planned = self._planned_canonical
+        self._planned_canonical = {}
         self._require_open()
         # CF-6: an unheld call re-derives the shared tail before assigning a sequence number. A
         # commit that already owns COMMIT_SECTION may instead reuse the picture established by
         # hold_tail(); no foreign append can move it until that context is released.
         self._refresh_tail_if_needed()
         self._require_healthy()
-        planned = self._planned_canonical
-        self._planned_records = ()
-        self._planned_canonical = {}
         batch, _body_length, rolling, terminal = self._plan_batch(
             records, planned=planned
         )
@@ -1042,7 +1042,9 @@ class WalManager:
         roll, the terminal number, the segment ceiling) is re-derived on every plan.  The memo
         lives from one preview to the next append and holds nothing but the caller's own records.
         """
-        batch = self._validate_batch(records, remember=remember, planned=planned)
+        batch, remembered = self._validate_batch(
+            records, remember=remember, planned=planned
+        )
         body_length = sum(record.encoded_length() for record in batch)
         rolling = self._needs_roll(body_length)
         header_length = (
@@ -1073,6 +1075,9 @@ class WalManager:
                 field="last_lsn",
                 value=self._last_lsn,
             )
+        if remember:
+            # Published only now, after every check of the plan passed.
+            self._planned_canonical = remembered
         return batch, body_length, rolling, terminal
 
     def _validate_batch(
@@ -1081,8 +1086,11 @@ class WalManager:
         *,
         remember: bool = False,
         planned: Mapping[int, tuple[WalRecord, WalRecord]] | None = None,
-    ) -> tuple[WalRecord, ...]:
+    ) -> tuple[tuple[WalRecord, ...], dict[int, tuple[WalRecord, WalRecord]]]:
         """Return the batch, stamped with this log's descriptor, or refuse it whole.
+
+        The second value is what a remembering plan may publish once it succeeds whole: the
+        canonical form of every record by the identity of its source, the source held with it.
 
         Nothing here touches the device, which is what makes the epoch refusal of BR-7 exact:
         a stale writer is turned away before a single byte can reach the disk.
@@ -1151,11 +1159,7 @@ class WalManager:
                     position=position,
                 )
             batch.append(record)
-        if remember:
-            # The sources are held so their identities stay meaningful until the append.
-            self._planned_records = tuple(source for source, _record in remembered.values())
-            self._planned_canonical = remembered
-        return tuple(batch)
+        return tuple(batch), remembered
 
     def _needs_roll(self, body_length: int) -> bool:
         """Return True when this batch has to start a new segment."""
