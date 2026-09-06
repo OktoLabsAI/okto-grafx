@@ -552,3 +552,146 @@ def test_near_misses_keep_the_existing_traversal(text: str, database: object) ->
 
     assert not any(type(node) is RelationshipIncidentSeek for node in planned.walk())
     assert any(type(node) is TraverseRelationship for node in planned.walk())
+
+
+@pytest.fixture
+def empty_database(tmp_path: Path) -> Iterator[object]:
+    """The seeded schema and nodes, but a relationship table that never allocated a row."""
+    handle = okto_grafx.connect(tmp_path / "db-empty", page_size=512)
+    with handle.begin("write") as transaction:
+        transaction.execute("CREATE NODE TABLE A(id STRING, PRIMARY KEY(id))")
+        transaction.execute("CREATE NODE TABLE B(id STRING, PRIMARY KEY(id))")
+        transaction.execute("CREATE REL TABLE R(FROM A TO B, confidence DOUBLE)")
+    with handle.begin("write") as transaction:
+        for name in ("a1", "a2", "a3"):
+            transaction.execute("CREATE (:A {id: $id})", {"id": name})
+        for name in ("b1", "b2", "b3"):
+            transaction.execute("CREATE (:B {id: $id})", {"id": name})
+    handle.ensure_identity_indexes()
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def _doors(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count every door the incident union may open: certificates, probes, encodes, scans."""
+    import okto_grafx.engine.query_engine as query_engine_module
+    from okto_grafx.engine.heap_store import HeapStore
+
+    counts = {"many": 0, "encoded": 0, "scans": 0, "certificates": 0}
+    original_many = IndexManager.validated_versions_many
+    original_key = query_engine_module.index_key
+    original_scan = HeapStore.scan
+    original_begin = HashIndex.begin_exact_read
+
+    def many(manager, index, keys, snapshot):  # type: ignore[no-untyped-def]
+        counts["many"] += 1
+        return original_many(manager, index, keys, snapshot)
+
+    def key(values, positions):  # type: ignore[no-untyped-def]
+        counts["encoded"] += 1
+        return original_key(values, positions)
+
+    def scan(heap, table, snapshot):  # type: ignore[no-untyped-def]
+        if table.kind == "rel":
+            counts["scans"] += 1
+        return original_scan(heap, table, snapshot)
+
+    def begin(index, lsn):  # type: ignore[no-untyped-def]
+        counts["certificates"] += 1
+        return original_begin(index, lsn)
+
+    monkeypatch.setattr(IndexManager, "validated_versions_many", many)
+    monkeypatch.setattr(query_engine_module, "index_key", key)
+    monkeypatch.setattr(HeapStore, "scan", scan)
+    monkeypatch.setattr(HashIndex, "begin_exact_read", begin)
+    return counts
+
+
+def _outcome(database: object, probes: object) -> tuple:
+    from okto_grafx.domain.errors import GrafxError
+
+    try:
+        result = database.execute(QUERY, {"node_ids": probes})  # type: ignore[attr-defined]
+    except GrafxError as failure:
+        return ("erro", type(failure).__name__, repr(sorted(failure.to_dict().items())))
+    return ("linhas", tuple(sorted(result.rows)), tuple(sorted(result.statistics.items())))
+
+
+def test_a_table_that_never_allocated_a_relationship_answers_empty_without_opening_anything(
+    empty_database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BATCH-REL-1: the durable authority proves the union empty before scan or certificate."""
+    counts = _doors(monkeypatch)
+    probes = [f"missing-{number}" for number in range(66)] + ["a1", "b1"]
+    result = empty_database.execute(QUERY, {"node_ids": probes})  # type: ignore[attr-defined]
+    assert result.rows == ()
+    assert counts == {"many": 0, "encoded": 0, "scans": 0, "certificates": 0}
+    # The statistic of the branch that answered is the one the scan reported.
+    assert result.statistics.get("edge_scans") == 1
+
+
+def test_the_empty_answer_still_refuses_what_the_encoder_refused_before_it(
+    empty_database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from okto_grafx.domain.model.errors import SchemaMismatchError
+
+    counts = _doors(monkeypatch)
+    with pytest.raises(SchemaMismatchError) as refused:
+        empty_database.execute(QUERY, {"node_ids": ["\ud800", "a1"]})  # type: ignore[attr-defined]
+    assert "surrogates not allowed" in refused.value.to_dict()["message"]
+    assert counts["many"] == 0 and counts["certificates"] == 0 and counts["scans"] == 0
+
+
+@pytest.mark.parametrize(
+    "probes",
+    ([], [None], ["a1"], ["a1", "b1"], [None, 1, "b3"], ["ação"], "a1", 7, ["a1", "a1", None]),
+)
+def test_the_empty_answer_is_differentially_equal_to_the_scan_of_the_empty_table(
+    empty_database: object, monkeypatch: pytest.MonkeyPatch, probes: object
+) -> None:
+    """Rows, statistics and refusals: the same as the canonical scan of the empty table."""
+    proved = _outcome(empty_database, probes)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(IndexManager, "validated_versions_many", None, raising=False)
+        scanned = _outcome(empty_database, probes)
+    assert proved == scanned
+
+
+def test_a_materialised_extent_at_the_first_id_keeps_the_canonical_scan(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review: only a missing extent proves the union empty.
+
+    A table whose pages exist while next_record_id still sits at the first id is walked and
+    validated by the canonical scan; the durable counter alone is not the proof.  The seeded
+    table has rows, so a scan that was omitted would answer nothing where these rows are due.
+    """
+    from okto_grafx.engine.heap_store import HeapStore
+
+    extent_of = HeapStore.extent_of
+
+    def at_first_id(heap, table):  # type: ignore[no-untyped-def]
+        extent = extent_of(heap, table)
+        if extent is not None and table.name == "R":
+            return replace(extent, next_record_id=FIRST_RECORD_ID)
+        return extent
+
+    monkeypatch.setattr(HeapStore, "extent_of", at_first_id)
+    counts = _doors(monkeypatch)
+    rows = database.execute(QUERY, {"node_ids": ["a1", "b1"]}).rows  # type: ignore[attr-defined]
+    assert rows == (("a1", "b1", 0.4), ("a1", "b1", 0.5), ("a2", "b1", 0.6))
+    assert counts["scans"] == 1 and counts["many"] == 0
+
+
+def test_a_table_whose_relationships_were_all_deleted_keeps_the_selector(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ids once allocated are not the empty proof: the old rule and its scan still run."""
+    with database.begin("write") as transaction:  # type: ignore[attr-defined]
+        transaction.execute("MATCH (a:A)-[r:R]->(b:B) DELETE r")
+    counts = _doors(monkeypatch)
+    probes = [f"missing-{number}" for number in range(10)]
+    assert database.execute(QUERY, {"node_ids": probes}).rows == ()  # type: ignore[attr-defined]
+    assert counts["scans"] == 1 and counts["many"] == 0

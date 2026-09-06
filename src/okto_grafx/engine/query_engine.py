@@ -6957,6 +6957,31 @@ def _relationship_incident_seek(
     # decision happens before validated_versions_many opens the first durable index certificate.
     extent = engine.heap.extent_of(node.table)
     allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
+
+    def proved_empty() -> bool:
+        """Answer the union of a table that has no page at all without reading anything.
+
+        BATCH-REL-1.  A table without an extent never allocated a page, so it holds no stored
+        relationship; the pending ones of this transaction were excluded above (a dirty table
+        keeps the canonical plan).  The proof is exclusively the missing extent: a table whose
+        pages exist while ``next_record_id`` still sits at the first id keeps the canonical
+        scan, which walks and validates that physical chain and may reveal its corruption.
+
+        The scan the former rule chose for a pageless table cost 8-19 ms a layout on the
+        production board (its fixed setup: the probe memo, the operator chain) against
+        0.6-1.5 ms for the seek, and about forty of its sixty-six layouts are pageless: the old
+        selector answered the fan-out in 1.27-1.47 s where every seek took 0.77-0.89 s and the
+        per-layout oracle 0.69-0.72 s.  Answering empty here opens no index and reads no page,
+        so nothing becomes observable that the scan of nothing left unobserved, and every
+        refusal that precedes this point still fires: in the exact-ASCII branch nothing was
+        encoded and nothing needs to be; any other probe shape does not enter that branch, so
+        the encoder runs first and an unencodable string or a mixed frontier is refused exactly
+        as before.  The edge-first branch is what answered, so its statistic is kept.
+        """
+        if extent is not None:
+            return False
+        context.count("edge_scans")
+        return True
     # KGRUN-M3: the edge-first scan is chosen BEFORE up to 2 x 500 probes are encoded, when the
     # distinct frontier is known exactly without encoding.  A STRING key column encodes an exact
     # ``str`` probe injectively (tag, length, UTF-8 bytes), so distinct strings are distinct keys
@@ -6973,7 +6998,8 @@ def _relationship_incident_seek(
         and exact_to is not None
         and allocated_upper * 2 <= exact_from + exact_to
     ):
-        yield from engine._rows(node.fallback, context)
+        if not proved_empty():
+            yield from engine._rows(node.fallback, context)
         return
 
     from_keys = encoded_keys(from_values, node.from_table, node.from_key_position)
@@ -6983,7 +7009,8 @@ def _relationship_incident_seek(
         return
     probe_frontier = len(from_keys) + len(to_keys)
     if allocated_upper * 2 <= probe_frontier:
-        yield from engine._rows(node.fallback, context)
+        if not proved_empty():
+            yield from engine._rows(node.fallback, context)
         return
 
     def aligned_many(
