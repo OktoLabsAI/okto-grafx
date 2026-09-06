@@ -3707,15 +3707,23 @@ reabertura exige API estreita/materializada, limites simultâneos de linhas e by
 do mapa local após saturação e nenhuma mudança na semântica de cursor, v1, stale, RYOW ou recusa
 fail-closed. Não há gate adicional criado por essa decisão.
 
-A execução avançou então para custos medidos do transfer. `9d17ed8` implementa a primitiva E-1c
+A execução avançou então para custos medidos do transfer. `9d17ed8` implementou a primitiva E-1c
 `BufferPool.allocate_run`: uma estrutura eager cresce fisicamente em uma única chamada e observa
 o tamanho inicial uma vez, mas instala frames sujos não pinados individualmente sob o mesmo
 budget, `_grown`, revogação de loads e write-back existentes; recusa de budget continua anterior
-ao crescimento. Passaram 174 testes do buffer pool. O wiring do diretório de buckets será feito
-somente após integrar LB-3 para evitar conflito no mesmo arquivo. LB-3 foi delegado formalmente ao
-Claude: agrupar efeitos de replay por balde e varrer cada balde uma vez, com ordem por chave/LSN e
-SHA/imagens finais byte a byte como critérios de integração. Nenhuma das duas frentes altera
-formato, WAL, as duas OCCs, durabilidade ou multi-reader/multi-writer.
+ao crescimento. `fcd4e21` ligou a primitiva ao diretório de buckets: índice novo aloca page 0 e o
+run completo; arquivo parcialmente crescido preserva páginas existentes e aloca apenas o sufixo.
+O A/B Pulse-shaped com 92 DDLs mediu a mediana da fase em `7,95 -> 6,49 s` (`-18,4%`) e do transfer
+curto em `17,45 -> 15,72 s` (`-9,9%`), sem extrapolar esse percentual para cargas grandes.
+
+LB-3 foi entregue por Claude em `d8851a6` e integrado como `81615af`. O diretório bounded de replay
+passa a atender todo bucket tocado, inclusive os runs de aproximadamente dois efeitos do Pulse,
+em vez de exigir oito; os três tetos de identidades/alvos/páginas e o fallback escalar permanecem.
+O diferencial exato de 1–7 efeitos produziu imagens finais byte a byte idênticas ao oracle escalar;
+1.913 testes amplos do branch autoral e 281 testes combinados após integração passaram. O A/B de
+recovery mediu checkpoint aproximadamente `-6%` com dispersão próxima de `+/-5%`, cerca de `0,6%`
+do transfer atualizado, portanto registrado como ganho pequeno e não como headline. Formato, WAL,
+as duas OCCs, recovery, durabilidade e multi-reader/multi-writer permanecem intactos.
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um

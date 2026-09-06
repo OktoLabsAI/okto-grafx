@@ -376,15 +376,43 @@ the canonical v1, stale, RYOW and pending-row routes.
 
 ### Transfer/storage continuation
 
-With the KG screen batch closed, the next two measured transfer costs are being implemented in
-parallel without overlapping source files. `9d17ed8` adds `BufferPool.allocate_run`: an eager
+The first transfer/storage pair is complete. `9d17ed8` adds `BufferPool.allocate_run`: an eager
 structural directory can grow its physical file with one `StorageDevice.allocate(file, count)`
 and one initial `page_count`, while admitting ordinary unpinned dirty frames one at a time under
 the same buffer budget. Budget refusal still occurs before growth; every page remains in the
-existing `_grown`, load-revocation, dirty-candidate and write-back accounting. The index-directory
-wiring is intentionally held until LB-3 is integrated. Claude owns LB-3: group checkpoint replay
-effects by bucket and scan each bucket once while proving per-key/LSN order and byte-identical
-final page images. Neither item changes format, WAL, OCC, durability or multi-process admission.
+existing `_grown`, load-revocation, dirty-candidate and write-back accounting. `fcd4e21` wires the
+primitive into `IndexStore._grow_buckets`: a new index now makes one scalar allocation for page 0
+and one allocation for the whole fixed bucket directory. A partially recovery-grown file keeps
+all existing pages and allocates only the missing suffix. Tests exercise both that repair and a
+complete directory under a one-page buffer budget.
+
+An alternating two-round Pulse-shaped DDL measurement used the same Core `ea11b76`, Community
+`523e759`, 92 DDL statements and minimal data cardinality in both arms. The scalar directory arm
+measured `7.85–8.04 s` for `begin_candidate` (median `7.95 s`) and `17.19–17.70 s` for the complete
+short transfer (median `17.45 s`). The run-allocation arm measured `6.25–6.74 s` (median `6.49 s`,
+`-18.4%`) and `15.48–15.96 s` (median `15.72 s`, `-9.9%`) respectively. This deliberately short
+A/B isolates the fixed DDL-heavy shape; it is not promoted as the expected percentage for a large
+data transfer. Raw reports are `e1c_scalar_baseline_short.json` and
+`e1c_batch_candidate_short.json` under the ignored `.grafx-tmp/amdahl` evidence directory.
+
+Claude's LB-3 arrived as `d8851a6` and was integrated as `81615af`. The existing bounded replay
+directory was already correct but applied only to buckets with at least eight effects; Pulse
+places roughly two effects in most buckets, leaving them on a chain scan per effect. Every touched
+bucket now uses one prepared directory, while the unchanged ceilings still bound bucket
+identities, retained targets and retained pages and fall back to scalar semantics when exceeded.
+The identity census is a set because effect counts are no longer consumed. Differential tests
+cover exactly one through seven inserts per bucket, all page bytes, header, missing targets and
+tombstone backlog against the scalar oracle; failure, interruption, page-0 replacement and active
+vector-picture injections cover the newly selected door. The author branch passed 1,913 index,
+recovery, WAL and transaction tests. Its alternating crash-replay A/B measured checkpoint
+`3.31/3.55/3.35 s -> 3.15/3.16/3.06 s` (about `-6%`, with roughly `+/-5%` dispersion), identical
+index-file hashes and clean verification. This is about `0.35 s`, or `0.6%`, of the refreshed
+transfer and is recorded as a small bounded gain rather than a headline result.
+
+After integrating both changes, one combined 281-test slice covering common/vector replay,
+index creation and repair, buffer allocation, process-global state rules and real devices passed;
+Ruff and diff checks were clean. Neither item changes format, WAL, either OCC validation,
+durability, recovery ordering or multi-process admission.
 
 ## Milestone log
 
@@ -403,7 +431,7 @@ final page images. Neither item changes format, WAL, OCC, durability or multi-pr
 | Planned STRING body decode | complete | `a610b55`; same byte validation/error taxonomy, 197 schema/value codec tests and Ruff pass; live ordered page preserved 500/777 |
 | Bounded `IN` memo and scalar equality | complete | Claude `1c1a57e` + `2672fce`, integrated as `216319e` + `d12602f`; 2,107 complete query tests, 240 post-integration focused tests, 11 killed mutations; live 500/777 preserved |
 | Bounded batch endpoint landing / memo B | deferred after adversarial review and live remeasurement | generic batching changes pull-cursor error order and has no byte cap; residual is about 0.08–0.16 s on the live page; only a future narrow/materialized API may reopen it |
-| Structural allocation run (E-1c) | pool primitive complete; index wiring pending LB-3 integration | `9d17ed8`; one physical grow and one initial page count, ordinary per-page pool accounting, pre-growth budget refusal; 174 buffer-pool tests pass |
-| Checkpoint bucket replay (LB-3) | in progress with Claude | separate worktree; differential final-page/SHA and per-key/LSN-order proof required before integration |
+| Structural allocation run (E-1c) | complete and measured | `9d17ed8` + `fcd4e21`; one physical directory grow, partial-repair and one-page-budget tests; Pulse-shaped DDL median `7.95 -> 6.49 s` (`-18.4%`) and short transfer `17.45 -> 15.72 s` (`-9.9%`) |
+| Checkpoint bucket replay (LB-3) | complete and integrated | Claude `d8851a6`, integrated as `81615af`; exact 1–7-effect differential, 1,913 broad author tests, byte-identical index files and clean verify; checkpoint about `-6%`, approximately `0.6%` of refreshed transfer |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |
