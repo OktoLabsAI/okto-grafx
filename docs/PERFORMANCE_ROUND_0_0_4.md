@@ -319,11 +319,33 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    combinado pós-WAL/recovery passou 411 testes de WAL, protocolo de commit, integração WAL e
    crash recovery. Vector, transfer e concorrência serão medidos uma única vez no fechamento da
    Wave 3, não após cada patch.
-5. **Decisão material:** CURSOR-1 e BATCH-REL-1 permanecem no escopo; não foram adicionados
-   residuais menores. BATCH-REL-1 vem primeiro porque a seleção/preparação pode ser corrigida sem
-   mudança de formato e já perde para o scan no perfil real. CURSOR-1 vem depois porque o custo
-   observado continua `O(P*N)` e sua solução exige uma cerca explícita de geração/snapshot ou um
-   access path persistido com migração e recovery.
+5. **Decisão material:** BATCH-REL-1 foi executado antes de CURSOR-1; não foram adicionados
+   residuais menores. A solução integrada em `567a6a3` é deliberadamente estreita: somente a
+   ausência do extent — prova durável de que nenhuma página relacional foi alocada — responde
+   vazio sem abrir o scan ou certificados dos índices. `next_record_id == FIRST_RECORD_ID` não é
+   prova suficiente quando há página física, pois o scan canônico ainda deve validá-la e revelar
+   eventual corrupção. O corpus focado passou 47/47 casos e quatro mutantes; a regressão de query
+   executada no handoff passou 2.191/2.191 casos. No board real, o resultado permaneceu em 824
+   edges/66 layouts/zero falhas e as aberturas de scan relacional caíram de 47 para 4. As rodadas
+   quentes ficaram em `1,117-1,135 s` na base e `1,208-1,225 s` no candidato, sem ganho de parede
+   material comprovado; o checkpoint aceita a redução estrutural de 43 scans sem inflar a
+   conclusão. Dois modelos de custo calibrados foram rejeitados: um regrediu a tabela densa do
+   frontier 500 de aproximadamente `1,8 s` para `9,4 s`, e o segundo introduziria constantes
+   dependentes de máquina para ganhos residuais. Handoff Nexus
+   `hof_2b5c1046401c4d3db22b03e01f6cb4ea` concluído e verificado.
+6. **Experimento delimitador de CURSOR-1:** reutilizar diretamente o `QueryCursor` público não é
+   a solução selecionada para a paginação HTTP do Pulse. Uma consulta única com teto suficiente
+   para todo o resultado e lotes de 500 fez a primeira entrega em `1,658 s` e a segunda em
+   `0,075 s`, depois de varrer as 2.184 linhas uma única vez. Isso melhora a continuação, mas
+   triplica aproximadamente a latência inicial observada e mantém uma transação/snapshot de
+   leitura aberta entre consumos. O cursor foi fechado sem vazamento de transação. CURSOR-1 só
+   avança com uma materialização destacada e limitada ou um acesso ordenado persistido que prove
+   a geração/snapshot, preserve as recusas fail-closed e não retenha leitores durante o tempo de
+   interação do usuário; o atalho ingênuo foi encerrado como **NO-GO**.
+7. **Próximo alvo:** CURSOR-1 permanece estrutural porque o custo observado continua `O(P*N)`.
+   Sua solução exige uma cerca explícita de geração/snapshot ou um access path persistido com
+   migração e recovery; nenhuma das duas alternativas será introduzida como efeito colateral de
+   um ajuste local de planner.
 
 ## Explicit decision queue
 
@@ -384,5 +406,8 @@ Claude delivered the WAL planning lane in `hof_ab1156bc405346f3b767bbef80a0eeb3`
 its first retained-lifetime design, Claude corrected the three findings in `f0fc97d`, and the
 handoff then passed independent review and the accumulated 411-test checkpoint. The real-board
 re-profile kept only BATCH-REL-1 and CURSOR-1 as material next work, in that order; the decision
-and measurements are recorded in Wave 3 above. No item in this wave changes writer/reader
+and measurements are recorded in Wave 3 above. BATCH-REL-1 was then closed in `567a6a3`: the
+adversarial review narrowed the proof from an allocation counter to the exclusive absence of an
+extent, and the real board confirmed 43 fewer relationship scans with identical results, though
+without a material wall-time gain. No item in this wave changes writer/reader
 participation, snapshot visibility, either OCC validation or durability semantics.

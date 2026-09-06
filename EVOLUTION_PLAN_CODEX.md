@@ -28,9 +28,19 @@
   reutiliza apenas a parte intrínseca de objetos exatos e recalcula época, cauda, rotação e LSN;
   o corpus diferencial de 160 lotes/73 rotações ficou idêntico, 328 testes WAL e o checkpoint
   combinado de 411 testes passaram, com ganhos isolados de `1,42x` no preview e `1,73x` no append.
-  O re-profile real manteve BATCH-REL-1 e CURSOR-1 como os únicos próximos alvos materiais: o
-  fan-out híbrido quente (`1,167 s`) ainda perdeu do scan (`0,866 s`), e cada página de 500 nodes
-  ainda varreu 2.171 linhas. Rastreabilidade e medições estão em
+  O re-profile real manteve BATCH-REL-1 e CURSOR-1 como os únicos próximos alvos materiais. O
+  BATCH-REL-1 foi integrado em `567a6a3`: tabelas relacionais comprovadamente sem extent deixam
+  de abrir a varredura canônica, sem estender a prova a páginas físicas vazias. No board real,
+  a mesma leitura retornou 824 arestas/66 layouts/zero falhas e caiu de 47 para 4 aberturas de
+  scan relacional (`-43`); a latência quente permaneceu ruidosa (`1,117-1,135 s` na base contra
+  `1,208-1,225 s` no candidato), portanto o ganho registrado é estrutural, não de parede. Dois
+  seletores calibrados por constantes foram rejeitados para não criar um alvo dependente de
+  hardware. Cada página de 500 nodes ainda varreu 2.171 linhas. O uso ingênuo do `QueryCursor`
+  para atravessar páginas foi medido e
+  rejeitado: tornou a segunda página rápida (`0,075 s`), mas elevou a primeira para `1,658 s` e
+  manteria um snapshot/leitor aberto entre requisições. CURSOR-1 permanece estrutural e só pode
+  avançar com materialização destacada limitada ou acesso ordenado persistido, ambos cercados por
+  geração/snapshot e sem relaxar recusas fail-closed. Rastreabilidade e medições estão em
   `docs/PERFORMANCE_ROUND_0_0_4.md`.
 
 - **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
