@@ -1989,6 +1989,12 @@ def _owner_landing_result_bytes(
     """Return a conservative charge, or decline optional retention without changing the row."""
     if found is None:
         return _OWNER_LANDING_MISS_BYTES
+    authenticated = found[1].stored_payload_bytes
+    if authenticated is not None:
+        return (
+            _OWNER_LANDING_RESULT_BASE_BYTES
+            + authenticated * _OWNER_LANDING_PAYLOAD_MULTIPLIER
+        )
     try:
         stored_bytes = len(encode_tuple(table, found[1].values))
     except (GrafxError, MemoryError):

@@ -3209,7 +3209,7 @@ class HeapStore:
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
         payload = self._validated_payload(table, header, content)
-        return HeapVersion(
+        version = HeapVersion(
             record_id=header.record_id,
             xmin=header.xmin,
             xmax=header.xmax,
@@ -3219,6 +3219,12 @@ class HeapStore:
             deleted=bool(header.flags & RECORD_FLAG_DELETED),
             table_id=table.table_id,
         )
+        # _validated_payload has authenticated this exact header length against the inline or
+        # overflow payload.  Carry the already-paid fact for optional decoded-result accounting;
+        # the field is excluded from construction, equality and representation so no public row
+        # or snapshot contract changes.
+        object.__setattr__(version, "_stored_payload_bytes", header.payload_len)
+        return version
 
     def _validated_payload(
         self, table: TableDef, header: RecordHeader, content: bytes

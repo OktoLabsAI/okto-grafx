@@ -23,7 +23,7 @@ snapshot of that reader, and the heap never applies that decision on its own.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -221,6 +221,22 @@ class HeapVersion:
     schema_version: int
     deleted: bool
     table_id: int
+    _stored_payload_bytes: int | None = field(
+        default=None,
+        init=False,
+        compare=False,
+        repr=False,
+    )
+
+    @property
+    def stored_payload_bytes(self) -> int | None:
+        """Return the authenticated stored payload length when this version came from the heap.
+
+        Synthetic and transaction-private versions deliberately answer ``None``.  Callers may
+        use this only as derived accounting evidence; row identity, visibility and contents
+        continue to be decided by the ordinary fields and the owning snapshot.
+        """
+        return self._stored_payload_bytes
 
     @property
     def live(self) -> bool:

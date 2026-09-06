@@ -24,6 +24,7 @@ from okto_grafx.engine.query_engine import (
     _OWNER_LANDING_VIEW_BASE_BYTES,
     _OwnerLandingBudget,
     _OwnerLandingCapacity,
+    _owner_landing_result_bytes,
     _owner_landing_txn_memo,
     _owner_landing_view,
 )
@@ -110,6 +111,49 @@ def test_requested_landing_payload_corruption_is_not_hidden() -> None:
     assert raised.value.details["declared"] == header.payload_len + 1
     assert raised.value.details["observed"] == header.payload_len
     stack.engine.settle_schema(71, committed=False)
+
+
+def test_on_disk_landing_reuses_the_authenticated_payload_length_for_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_query_stack()
+    ref = _insert_people(stack, 1)[0]
+    table = stack.table("Person")
+    version = stack.heap.read(ref)
+    expected_payload_bytes = len(encode_tuple(table, version.values))
+    assert version.stored_payload_bytes == expected_payload_bytes
+
+    def unexpected_encode(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("an authenticated on-disk payload must not be re-encoded")
+
+    monkeypatch.setattr(query_engine_module, "encode_tuple", unexpected_encode)
+
+    assert _owner_landing_result_bytes(table, (ref, version)) == (
+        query_engine_module._OWNER_LANDING_RESULT_BASE_BYTES
+        + expected_payload_bytes * _OWNER_LANDING_PAYLOAD_MULTIPLIER
+    )
+
+
+def test_changed_or_synthetic_landing_keeps_the_canonical_encoding_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = build_query_stack()
+    ref = _insert_people(stack, 1)[0]
+    table = stack.table("Person")
+    changed = replace(stack.heap.read(ref), values=(1, "changed", 9, "city"))
+    assert changed.stored_payload_bytes is None
+    original = encode_tuple
+    calls = 0
+
+    def observed_encode(table_arg: object, values: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        return original(table_arg, values)
+
+    monkeypatch.setattr(query_engine_module, "encode_tuple", observed_encode)
+
+    assert _owner_landing_result_bytes(table, (ref, changed)) is not None
+    assert calls == 1
 
 
 @pytest.mark.parametrize(
