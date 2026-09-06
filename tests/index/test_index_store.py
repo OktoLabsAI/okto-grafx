@@ -680,17 +680,55 @@ def test_using_an_index_whose_file_was_never_created_is_refused(
 
 
 def test_a_file_a_redo_grew_before_anything_reserved_page_zero_is_repaired(
-    person_table: Any, pool: Any, metrics: RecordingMetrics, device: MemoryDevice
+    monkeypatch: pytest.MonkeyPatch,
+    person_table: Any,
+    pool: Any,
+    metrics: RecordingMetrics,
+    device: MemoryDevice,
 ) -> None:
     """Amendment A22 lets recovery grow a file before its header page exists."""
     index = HashIndex(exact_definition(person_table), pool, metrics)
     device.create(index.file)
     device.allocate(index.file, 3)
+    allocations: list[tuple[str, int]] = []
+    original_allocate = device.allocate
+
+    def counted_allocate(file: str, count: int = 1) -> int:
+        allocations.append((file, count))
+        return original_allocate(file, count)
+
+    monkeypatch.setattr(device, "allocate", counted_allocate)
 
     header = index.create()
 
     assert header.bucket_count == TEST_BUCKET_COUNT
     assert device.page_count(index.file) == 1 + TEST_BUCKET_COUNT
+    assert allocations == [(index.file, 2)]
+
+
+def test_a_new_bucket_directory_grows_in_one_run_under_a_one_page_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    person_table: Any,
+    metrics: RecordingMetrics,
+) -> None:
+    """The fixed directory needs one append, but never pins the whole run at once."""
+    device = MemoryDevice()
+    pool = make_pool(device, metrics, budget_pages=1)
+    index = HashIndex(exact_definition(person_table), pool, metrics)
+    allocations: list[tuple[str, int]] = []
+    original_allocate = device.allocate
+
+    def counted_allocate(file: str, count: int = 1) -> int:
+        allocations.append((file, count))
+        return original_allocate(file, count)
+
+    monkeypatch.setattr(device, "allocate", counted_allocate)
+
+    header = index.create()
+
+    assert header.bucket_count == TEST_BUCKET_COUNT
+    assert device.page_count(index.file) == 1 + TEST_BUCKET_COUNT
+    assert allocations == [(index.file, 1), (index.file, TEST_BUCKET_COUNT)]
 
 
 def test_a_written_page_zero_that_is_not_a_header_is_not_reserved_over(

@@ -854,11 +854,13 @@ class IndexStore:
         """Give every bucket a head page, repairing a file a redo grew before this ran."""
         storage = self._pool.storage
         wanted = 1 + self._definition.bucket_count
-        while storage.page_count(self.file) < wanted:
-            # reuse=False: the loop waits on the file's length, so a hand-out that does not
-            # lengthen it just goes round again and spends an abandoned page on the way.
-            page = self._pool.allocate(self.file, self.page_type, reuse=False)
-            self._pool.unpin(self.file, page.page_index, dirty=True)
+        present = storage.page_count(self.file)
+        if present < wanted:
+            # This directory has a fixed, schema-bounded length. Grow the missing physical run
+            # through one descriptor acquisition and one append rather than re-proving the file
+            # size for every bucket. allocate_run admits the frames one at a time, unpinned, so a
+            # one-page buffer budget still suffices and every existing repair page is preserved.
+            self._pool.allocate_run(self.file, self.page_type, wanted - present)
         for bucket in range(self._definition.bucket_count):
             index = self._bucket_head(bucket)
             with self._pool.pinned(self.file, index) as page:
