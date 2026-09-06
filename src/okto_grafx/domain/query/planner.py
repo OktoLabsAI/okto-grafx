@@ -124,6 +124,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    RelationshipIncidentSeek,
     SetProperties,
     SingleRow,
     SkipRows,
@@ -2910,6 +2911,18 @@ class _Planner:
         first_variable = first.variable or self._anonymous()
         target_variable = target.variable or self._anonymous()
         r_variable = relationship.variable
+        incident = self._relationship_incident_shape(
+            pipeline,
+            terms,
+            relationship,
+            first_variable,
+            target_variable,
+            table,
+            first_table,
+            target_table,
+        )
+        if incident is not None:
+            return incident
         r_only: list[Expression] = []
         rest: list[Expression] = []
         for term in terms:
@@ -2958,6 +2971,163 @@ class _Planner:
             ),
             rest,
         )
+
+    def _relationship_incident_shape(
+        self,
+        pipeline: PlanNode,
+        terms: list[Expression],
+        relationship: RelationshipPattern,
+        first_variable: str,
+        target_variable: str,
+        table: TableDef,
+        first_table: TableDef,
+        target_table: TableDef,
+    ) -> tuple[PlanNode, list[Expression]] | None:
+        """Select the exact multi-key incident-edge shape, retaining its canonical fallback."""
+
+        if (
+            type(pipeline) is not SingleRow
+            or not self.prefer_full_relationship_scan
+            or relationship.variable is None
+            or relationship.direction is Direction.UNDIRECTED
+            or len(terms) != 1
+            or table.from_table is None
+            or table.to_table is None
+        ):
+            return None
+        predicate = terms[0]
+        keys = self._incident_key_expressions(
+            predicate,
+            first_variable,
+            target_variable,
+            first_table,
+            target_table,
+        )
+        if keys is None:
+            return None
+
+        first_pk = first_table.primary_key
+        target_pk = target_table.primary_key
+        if first_pk is None or target_pk is None:
+            return None
+        first_index = self._index_for(first_table, (first_pk,))
+        target_index = self._index_for(target_table, (target_pk,))
+        if first_index is None or target_index is None:
+            return None
+        first_definition, first_columns = first_index
+        target_definition, target_columns = target_index
+        if (
+            first_definition.visibility is not IndexVisibility.EXACT
+            or target_definition.visibility is not IndexVisibility.EXACT
+            or first_columns != (first_pk,)
+            or target_columns != (target_pk,)
+        ):
+            return None
+
+        relationship_indexes: dict[int, IndexDefinition] = {}
+        for definition in self.indexes:
+            if (
+                index_definition_matches_table(definition, table)
+                and definition.visibility is IndexVisibility.EXACT
+                and definition.key_derivation == COLUMN_KEY_DERIVATION
+                and definition.positions in {(0,), (1,)}
+            ):
+                relationship_indexes.setdefault(definition.positions[0], definition)
+        if relationship_indexes.keys() != {0, 1}:
+            return None
+
+        self.tables[first_variable] = first_table
+        self.tables[target_variable] = target_table
+        self.tables[relationship.variable] = table
+        canonical = TraverseRelationship(
+            child=NodeScan(
+                child=pipeline,
+                variable=first_variable,
+                table=first_table,
+            ),
+            source=first_variable,
+            target=target_variable,
+            relationship=relationship.variable,
+            table=table,
+            direction=relationship.direction,
+            min_hops=1,
+            max_hops=1,
+            target_table=target_table,
+            target_bound=False,
+        )
+        fallback: PlanNode = FilterRows(child=canonical, predicate=predicate)
+
+        if relationship.direction is Direction.OUTGOING:
+            from_variable, to_variable = first_variable, target_variable
+            from_table_def, to_table_def = first_table, target_table
+            from_keys, to_keys = keys[first_variable], keys[target_variable]
+            from_definition, to_definition = first_definition, target_definition
+        else:
+            from_variable, to_variable = target_variable, first_variable
+            from_table_def, to_table_def = target_table, first_table
+            from_keys, to_keys = keys[target_variable], keys[first_variable]
+            from_definition, to_definition = target_definition, first_definition
+
+        return (
+            RelationshipIncidentSeek(
+                fallback=fallback,
+                from_variable=from_variable,
+                to_variable=to_variable,
+                relationship=relationship.variable,
+                table=table,
+                from_table=from_table_def,
+                to_table=to_table_def,
+                from_keys=from_keys,
+                to_keys=to_keys,
+                from_key_position=from_table_def.column_index(
+                    str(from_table_def.primary_key)
+                ),
+                to_key_position=to_table_def.column_index(str(to_table_def.primary_key)),
+                from_index=from_definition.name,
+                to_index=to_definition.name,
+                relationship_from_index=relationship_indexes[0].name,
+                relationship_to_index=relationship_indexes[1].name,
+            ),
+            [],
+        )
+
+    @staticmethod
+    def _incident_key_expressions(
+        predicate: Expression,
+        first_variable: str,
+        target_variable: str,
+        first_table: TableDef,
+        target_table: TableDef,
+    ) -> dict[str, Expression] | None:
+        """Recognise exactly ``first.pk IN keys OR target.pk IN keys`` in either arm order."""
+
+        if not isinstance(predicate, BinaryOperation) or predicate.operator != "OR":
+            return None
+        expected = {
+            first_variable: first_table.primary_key,
+            target_variable: target_table.primary_key,
+        }
+        if any(value is None for value in expected.values()):
+            return None
+        found: dict[str, Expression] = {}
+        for arm in (predicate.left, predicate.right):
+            if not isinstance(arm, BinaryOperation) or arm.operator != "IN":
+                return None
+            subject = arm.left
+            if (
+                not isinstance(subject, Property)
+                or not isinstance(subject.subject, Variable)
+                or subject.subject.name not in expected
+                or subject.key != expected[subject.subject.name]
+                or not isinstance(arm.right, (Parameter, ListExpression))
+                or free_variables(arm.right)
+            ):
+                return None
+            name = subject.subject.name
+            if name in found:
+                return None
+            found[name] = arm.right
+        return found if found.keys() == expected.keys() else None
 
     def _require_path_projection_schema(self, table: TableDef) -> None:
         """Require the exact relationship declaration the projected path was frozen against.

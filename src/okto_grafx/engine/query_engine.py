@@ -82,6 +82,7 @@ from okto_grafx.domain.index.catalog import (
     identity_index_name,
 )
 from okto_grafx.domain.index.definition import (
+    COLUMN_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
@@ -202,6 +203,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    RelationshipIncidentSeek,
     RelationshipScan,
     SetProperties,
     SingleRow,
@@ -6080,6 +6082,337 @@ def _relationship_scan(
             yield _Row(bindings=bindings)
 
 
+def _relationship_incident_seek(
+    engine: QueryEngine, node: RelationshipIncidentSeek, context: _Context
+) -> Iterator[_Row]:
+    """Read a closed endpoint-key union through four exact multi-key indexes.
+
+    Capability selection happens before the first lookup. A missing/stale store or an engine
+    without the multi-key door executes the retained canonical plan. Once all four exact stores
+    are adopted, every refusal propagates: falling back after a partial certified read could hide
+    a generation replacement or corrupt heap candidate.
+    """
+
+    manager = engine._indexes
+    many = getattr(manager, "validated_versions_many", None)
+    authority = context.index_authority
+    if manager is None or not callable(many) or authority is None:
+        yield from engine._rows(node.fallback, context)
+        return
+
+    def exact_store(
+        name: str,
+        table: TableDef,
+        positions: tuple[int, ...],
+    ) -> object | None:
+        store = authority.named(name)
+        definition = getattr(store, "definition", None)
+        if (
+            store is None
+            or not isinstance(definition, IndexDefinition)
+            or definition.name != name
+            or definition.table_id != table.table_id
+            or definition.table_name != table.name
+            or definition.positions != positions
+            or definition.key_derivation != COLUMN_KEY_DERIVATION
+            or definition.visibility is not IndexVisibility.EXACT
+            or getattr(store, "stale", True) is not False
+        ):
+            return None
+        return store
+
+    from_node_index = exact_store(
+        node.from_index, node.from_table, (node.from_key_position,)
+    )
+    to_node_index = exact_store(node.to_index, node.to_table, (node.to_key_position,))
+    from_edge_index = exact_store(node.relationship_from_index, node.table, (0,))
+    to_edge_index = exact_store(node.relationship_to_index, node.table, (1,))
+    if any(
+        store is None
+        for store in (
+            from_node_index,
+            to_node_index,
+            from_edge_index,
+            to_edge_index,
+        )
+    ):
+        yield from engine._rows(node.fallback, context)
+        return
+
+    dirty = _intent_table_ids(engine, context.txn)
+    if dirty & {
+        node.table.table_id,
+        node.from_table.table_id,
+        node.to_table.table_id,
+    }:
+        yield from engine._rows(node.fallback, context)
+        return
+
+    empty = _Row(bindings={})
+
+    def encoded_keys(
+        expression: Expression,
+        table: TableDef,
+        position: int,
+    ) -> tuple[tuple[bytes, Value], ...] | None:
+        raw = _evaluate(expression, empty, context)
+        if raw is None:
+            return ()
+        if type(raw) not in (list, tuple):
+            # Preserve the canonical IN refusal (and custom Sequence behaviour) in the fallback.
+            return None
+        unique: dict[bytes, Value] = {}
+        # Freeze a caller-owned list before encoding so one execution never observes a moving
+        # parameter frontier while it is opening durable index certificates.
+        for value in tuple(raw):
+            if value is None:
+                continue
+            if not _exact_probe_is_encoding_complete(table, (position,), (value,)):
+                return None
+            template: list[Value] = [None] * table.arity
+            template[position] = cast(Value, value)
+            key = index_key(template, (position,))
+            unique.setdefault(key, cast(Value, value))
+        return tuple(unique.items())
+
+    from_keys = encoded_keys(node.from_keys, node.from_table, node.from_key_position)
+    to_keys = encoded_keys(node.to_keys, node.to_table, node.to_key_position)
+    if from_keys is None or to_keys is None:
+        yield from engine._rows(node.fallback, context)
+        return
+
+    def aligned_many(
+        store: object,
+        keys: tuple[bytes, ...],
+    ) -> tuple[tuple[tuple[object, HeapVersion], ...], ...]:
+        batches = tuple(many(store, keys, context.snapshot))
+        if len(batches) != len(keys):
+            raise GrafxIndexError(
+                f"Multi-key validation for index {getattr(store, 'name', None)!r} returned "
+                f"{len(batches)} result groups for {len(keys)} keys.",
+                field="index_batch",
+                index=getattr(store, "name", None),
+                expected=len(keys),
+                observed=len(batches),
+            )
+        return batches
+
+    def resolve_nodes(
+        store: object,
+        keyed: tuple[tuple[bytes, Value], ...],
+        table: TableDef,
+        position: int,
+    ) -> dict[RecordId, tuple[object, HeapVersion]]:
+        keys = tuple(key for key, _value in keyed)
+        groups = aligned_many(store, keys)
+        resolved: dict[RecordId, tuple[object, HeapVersion]] = {}
+        for (_key, value), hits in zip(keyed, groups, strict=True):
+            for ref, version in hits:
+                if not _equal(version.values[position], value):
+                    continue
+                previous = resolved.setdefault(version.record_id, (ref, version))
+                if previous[0] != ref:
+                    raise GrafxCorruptionDetected(
+                        f"Primary-key index {getattr(store, 'name', None)!r} resolved one "
+                        f"snapshot-visible key to multiple rows of {table.name!r}.",
+                        table=table.name,
+                        table_id=table.table_id,
+                        field="primary_key",
+                        index=getattr(store, "name", None),
+                    )
+        return resolved
+
+    from_nodes = resolve_nodes(
+        from_node_index,
+        from_keys,
+        node.from_table,
+        node.from_key_position,
+    )
+    if (
+        to_node_index is from_node_index
+        and node.to_table.table_id == node.from_table.table_id
+        and node.to_key_position == node.from_key_position
+        and to_keys == from_keys
+    ):
+        to_nodes = from_nodes
+    else:
+        to_nodes = resolve_nodes(
+            to_node_index,
+            to_keys,
+            node.to_table,
+            node.to_key_position,
+        )
+
+    def edge_keys(record_ids: Collection[RecordId], position: int) -> tuple[bytes, ...]:
+        return tuple(
+            index_key(
+                (record_id, None) if position == 0 else (None, record_id),
+                (position,),
+            )
+            for record_id in record_ids
+        )
+
+    candidates: dict[object, HeapVersion] = {}
+    for store, keys in (
+        (from_edge_index, edge_keys(from_nodes, 0)),
+        (to_edge_index, edge_keys(to_nodes, 1)),
+    ):
+        for hits in aligned_many(store, keys):
+            for ref, version in hits:
+                existing = candidates.setdefault(ref, version)
+                if existing != version:
+                    raise GrafxCorruptionDetected(
+                        f"Exact endpoint indexes disagree about relationship row {ref!r} of "
+                        f"{node.table.name!r}.",
+                        table=node.table.name,
+                        table_id=node.table.table_id,
+                        field="index_candidate",
+                    )
+
+    ordered = sorted(candidates.items(), key=lambda item: cast(RecordRef, item[0]).encode())
+    endpoint_rows: list[tuple[object, HeapVersion, RecordId, RecordId]] = []
+    source_ids: set[RecordId] = set()
+    target_ids: set[RecordId] = set()
+    for ref, version in ordered:
+        source_id = node.table.source_of(version.values)
+        target_id = node.table.target_of(version.values)
+        if source_id not in from_nodes and target_id not in to_nodes:
+            raise GrafxCorruptionDetected(
+                f"An endpoint index returned relationship row {ref!r} under a key the row no "
+                "longer carries after exact validation.",
+                table=node.table.name,
+                table_id=node.table.table_id,
+                field="index_key",
+            )
+        endpoint_rows.append((ref, version, source_id, target_id))
+        source_ids.add(source_id)
+        target_ids.add(target_id)
+
+    def batch_landings(
+        table: TableDef,
+        cached: dict[RecordId, tuple[object, HeapVersion]],
+        record_ids: Collection[RecordId],
+    ) -> tuple[dict[RecordId, tuple[object, HeapVersion]], bool]:
+        """Resolve the opposite landings through one identity-index certificate when present."""
+
+        resolved = dict(cached)
+        missing = tuple(record_id for record_id in record_ids if record_id not in resolved)
+        if not missing:
+            return resolved, True
+        identity_index = _endpoint_identity_index(engine, context, table)
+        if identity_index is None:
+            return resolved, False
+        groups = aligned_many(
+            identity_index,
+            tuple(record_id_key(record_id) for record_id in missing),
+        )
+        for record_id, hits in zip(missing, groups, strict=True):
+            if len(hits) > 1:
+                raise GrafxCorruptionDetected(
+                    f"Identity index {identity_index.name!r} resolved record {record_id} of "
+                    f"table {table.name!r} to {len(hits)} snapshot-visible versions.",
+                    file=identity_index.file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    record_id=record_id,
+                    field="record_id",
+                    index=identity_index.name,
+                    count=len(hits),
+                )
+            if hits:
+                resolved[record_id] = hits[0]
+        return resolved, True
+
+    if node.from_table.table_id == node.to_table.table_id:
+        shared = dict(from_nodes)
+        for record_id, hit in to_nodes.items():
+            previous = shared.setdefault(record_id, hit)
+            if previous[0] != hit[0]:
+                raise GrafxCorruptionDetected(
+                    f"Endpoint indexes disagree about record {record_id} of self-relationship "
+                    f"table {node.table.name!r}.",
+                    table=node.table.name,
+                    table_id=node.table.table_id,
+                    record_id=record_id,
+                    field="record_id",
+                )
+        shared, shared_definitive = batch_landings(
+            node.from_table,
+            shared,
+            source_ids | target_ids,
+        )
+        from_landings = to_landings = shared
+        from_definitive = to_definitive = shared_definitive
+    else:
+        from_landings, from_definitive = batch_landings(
+            node.from_table,
+            from_nodes,
+            source_ids,
+        )
+        to_landings, to_definitive = batch_landings(
+            node.to_table,
+            to_nodes,
+            target_ids,
+        )
+
+    def landing(
+        table: TableDef,
+        cached: dict[RecordId, tuple[object, HeapVersion]],
+        definitive: bool,
+        record_id: RecordId,
+    ) -> tuple[object, HeapVersion] | None:
+        found = cached.get(record_id)
+        if found is not None or definitive:
+            return found
+        return _visible_identity_with_ref(engine, context, table, record_id)
+
+    charge_expansions = engine._max_traversal_expansions is not None
+    charge_paths = engine._max_traversal_paths is not None
+    for ref, version, source_id, target_id in endpoint_rows:
+        if charge_expansions:
+            context.admit_traversal_expansion()
+        source = landing(
+            node.from_table,
+            from_landings,
+            from_definitive,
+            source_id,
+        )
+        target = landing(
+            node.to_table,
+            to_landings,
+            to_definitive,
+            target_id,
+        )
+        if source is None or target is None:
+            continue
+        if charge_paths:
+            context.admit_traversal_path()
+        bindings = {
+            node.from_variable: RowBinding(
+                variable=node.from_variable,
+                table=node.from_table,
+                ref=source[0],
+                version=source[1],
+            ),
+            node.to_variable: RowBinding(
+                variable=node.to_variable,
+                table=node.to_table,
+                ref=target[0],
+                version=target[1],
+            ),
+        }
+        if node.relationship is not None:
+            bindings[node.relationship] = RowBinding(
+                variable=node.relationship,
+                table=node.table,
+                ref=ref,
+                version=version,
+            )
+        context.count("edge_multi_key_lookups")
+        context.count("rows_scanned")
+        yield _Row(bindings=bindings)
+
+
 def _filter_rows(
     engine: QueryEngine, node: FilterRows, context: _Context
 ) -> Iterator[_Row]:
@@ -11205,6 +11538,7 @@ _HANDLERS: dict[type, _Handler] = {
     TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
     RelationshipScan: _relationship_scan,  # type: ignore[dict-item]
+    RelationshipIncidentSeek: _relationship_incident_seek,  # type: ignore[dict-item]
     FilterRows: _filter_rows,  # type: ignore[dict-item]
     VectorSearch: _vector_search,  # type: ignore[dict-item]
     AggregateRows: _aggregate_rows,  # type: ignore[dict-item]

@@ -67,6 +67,7 @@ __all__ = [
     "ProjectRows",
     "PropertyAssignment",
     "RelationshipScan",
+    "RelationshipIncidentSeek",
     "SetProperties",
     "SingleRow",
     "SkipRows",
@@ -414,6 +415,62 @@ class RelationshipScan(PlanNode):
         if self.predicate is not None:
             details["predicate"] = self.predicate.describe()
         return details
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipIncidentSeek(PlanNode):
+    """Resolve a bounded set of incident edges through exact multi-key indexes.
+
+    The operator is admitted only for the closed predicate
+    ``from.pk IN keys OR to.pk IN keys`` over one directed typed hop. ``fallback`` is the full
+    canonical traversal and predicate tree for the same statement: a missing/stale capability
+    therefore changes only the access path, never the answer. The runtime still validates every
+    exact-index candidate against the heap under the transaction snapshot and resolves both
+    endpoint rows before yielding an edge.
+    """
+
+    fallback: PlanNode
+    from_variable: str
+    to_variable: str
+    relationship: str | None
+    table: TableDef
+    from_table: TableDef
+    to_table: TableDef
+    from_keys: Expression
+    to_keys: Expression
+    from_key_position: int
+    to_key_position: int
+    from_index: str
+    to_index: str
+    relationship_from_index: str
+    relationship_to_index: str
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the exact canonical fallback retained by this access path."""
+        return (self.fallback,)
+
+    def details(self) -> Mapping[str, object]:
+        """Describe the closed predicate and the four exact indexes it needs."""
+        return {
+            "from": self.from_variable,
+            "to": self.to_variable,
+            "table": self.table.name,
+            "relationship": self.relationship or "",
+            "predicate": (
+                f"{self.from_variable}.{self.from_table.primary_key} IN "
+                f"{self.from_keys.describe()} OR "
+                f"{self.to_variable}.{self.to_table.primary_key} IN "
+                f"{self.to_keys.describe()}"
+            ),
+            "indexes": ", ".join(
+                (
+                    self.from_index,
+                    self.to_index,
+                    self.relationship_from_index,
+                    self.relationship_to_index,
+                )
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)
