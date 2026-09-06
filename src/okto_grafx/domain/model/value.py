@@ -411,6 +411,25 @@ def encode_value(value: Value, *, depth: int = 0) -> bytes:
     storage dtype (SPEC-VEC BR-5). The check against the DECLARED dimension of the embedding
     space is not here and cannot be: this function is given a value, not a catalog. C9 owns it.
     """
+    encoded = bytearray()
+    _append_encoded_value(encoded, value, depth=depth)
+    return bytes(encoded)
+
+
+def _append_encoded_value(
+    encoded: bytearray,
+    value: Value,
+    *,
+    depth: int = 0,
+    kind: ValueType | None = None,
+) -> None:
+    """Append the canonical value bytes without building one bytes object per value.
+
+    ``kind`` is supplied only by the tuple encoder after it has already classified the same
+    value for its column check. Recursive values classify their own children exactly as the
+    public encoder did. The destination is private to one encode operation, so a refusal can
+    never expose a partially built durable value.
+    """
     if depth > MAX_VALUE_DEPTH:
         raise SchemaMismatchError(
             f"A value may nest at most {MAX_VALUE_DEPTH} levels deep; this one goes further.",
@@ -418,11 +437,14 @@ def encode_value(value: Value, *, depth: int = 0) -> bytes:
             value=depth,
             limit=MAX_VALUE_DEPTH,
         )
-    kind = value_type_of(value)
+    if kind is None:
+        kind = value_type_of(value)
+    encoded.append(int(kind))
     if kind is ValueType.NULL:
-        return _TAG.pack(int(kind))
+        return
     if kind is ValueType.BOOL:
-        return _TAG.pack(int(kind)) + _TAG.pack(1 if value else 0)
+        encoded.append(1 if value else 0)
+        return
     if kind is ValueType.INT64:
         number = int(value)  # type: ignore[arg-type]
         if not INT64_MIN <= number <= INT64_MAX:
@@ -431,32 +453,45 @@ def encode_value(value: Value, *, depth: int = 0) -> bytes:
                 field="value",
                 value=number,
             )
-        return _TAG.pack(int(kind)) + _I64.pack(number)
+        encoded.extend(_I64.pack(number))
+        return
     if kind is ValueType.DOUBLE:
-        return _TAG.pack(int(kind)) + _F64.pack(float(value))  # type: ignore[arg-type]
+        encoded.extend(_F64.pack(float(value)))  # type: ignore[arg-type]
+        return
     if kind is ValueType.STRING:
         body = _utf8(str(value))
-        return _TAG.pack(int(kind)) + _U32.pack(len(body)) + body
+        encoded.extend(_U32.pack(len(body)))
+        encoded.extend(body)
+        return
     if kind is ValueType.BYTES:
         body = bytes(value)  # type: ignore[arg-type]
-        return _TAG.pack(int(kind)) + _U32.pack(len(body)) + body
+        encoded.extend(_U32.pack(len(body)))
+        encoded.extend(body)
+        return
     if kind is ValueType.TIMESTAMP:
-        return _TAG.pack(int(kind)) + _I64.pack(value.micros)  # type: ignore[union-attr]
+        encoded.extend(_I64.pack(value.micros))  # type: ignore[union-attr]
+        return
     if kind is ValueType.UUID:
-        return _TAG.pack(int(kind)) + value.raw  # type: ignore[union-attr]
+        encoded.extend(value.raw)  # type: ignore[union-attr]
+        return
     if kind is ValueType.LIST:
         elements = tuple(value)  # type: ignore[arg-type]
-        parts = [_TAG.pack(int(kind)), _U32.pack(len(elements))]
-        parts.extend(encode_value(element, depth=depth + 1) for element in elements)
-        return b"".join(parts)
+        encoded.extend(_U32.pack(len(elements)))
+        for element in elements:
+            _append_encoded_value(encoded, element, depth=depth + 1)
+        return
     if kind is ValueType.MAP:
         pairs = tuple(value.items())  # type: ignore[union-attr]
-        parts = [_TAG.pack(int(kind)), _U32.pack(len(pairs))]
+        encoded.extend(_U32.pack(len(pairs)))
         for key, item in pairs:
-            parts.append(encode_value(key, depth=depth + 1))
-            parts.append(encode_value(item, depth=depth + 1))
-        return b"".join(parts)
-    return _encode_vector(value, kind)  # type: ignore[arg-type]
+            _append_encoded_value(encoded, key, depth=depth + 1)
+            _append_encoded_value(encoded, item, depth=depth + 1)
+        return
+    # Vector validation and its dense component pack remain one canonical operation.  Appending
+    # those bytes here still avoids an additional tuple-level list and join.
+    vector = _encode_vector(value, kind)  # type: ignore[arg-type]
+    # _encode_vector includes the tag that this single-buffer path already emitted.
+    encoded.extend(vector[1:])
 
 
 def _encode_vector(vector: VectorValue, kind: ValueType) -> bytes:

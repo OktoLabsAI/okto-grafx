@@ -33,12 +33,12 @@ from okto_grafx.domain.model.value import (
     Uuid,
     VectorValue,
     _U32,
+    _append_encoded_value,
     _decode_expected_value_body,
     _decode_vector_mode,
     _require,
     _validate_value,
     decode_value,
-    encode_value,
     value_type_of,
 )
 from okto_grafx.domain.ports.vectormath import DistanceMetric
@@ -562,11 +562,13 @@ def _reject(table: TableDef, column: ColumnDef, position: int, detail: str) -> S
     )
 
 
-def _check_column_value(table: TableDef, position: int, column: ColumnDef, value: Value) -> None:
-    """Refuse a value that the column does not declare, instead of coercing it."""
+def _check_column_value(
+    table: TableDef, position: int, column: ColumnDef, value: Value
+) -> ValueType:
+    """Return the checked value type, refusing a value the column does not declare."""
     if value is None:
         if column.nullable:
-            return
+            return ValueType.NULL
         raise _reject(table, column, position, "a null is not allowed in this column.")
     observed = value_type_of(value)
     if observed is not column.type:
@@ -576,6 +578,7 @@ def _check_column_value(table: TableDef, position: int, column: ColumnDef, value
             position,
             f"a {observed.name} value cannot be stored in a {column.type.name} column.",
         )
+    return observed
 
 
 def endpoint_column_defs() -> tuple[ColumnDef, ColumnDef]:
@@ -649,11 +652,11 @@ def encode_tuple(table: TableDef, values: Sequence[Value]) -> bytes:
             expected_arity=table.arity,
             observed_arity=len(values),
         )
-    parts: list[bytes] = []
+    encoded = bytearray()
     for position, (column, value) in enumerate(zip(table.columns, values)):
-        _check_column_value(table, position, column, value)
-        parts.append(encode_value(value))
-    return b"".join(parts)
+        kind = _check_column_value(table, position, column, value)
+        _append_encoded_value(encoded, value, kind=kind)
+    return bytes(encoded)
 
 
 def _tuple_encoding_proof_protocol():
