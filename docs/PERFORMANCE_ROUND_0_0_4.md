@@ -275,8 +275,17 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
 
 ### Wave 3 — small residuals and one re-profile
 
-1. WRITE-4/M1/M2 with a crash matrix at every segment boundary — **em execução no handoff Nexus
-   `hof_ab1156bc405346f3b767bbef80a0eeb3`; ainda não integrado**.
+1. WRITE-4/M1/M2 with a crash matrix at every segment boundary — **implementado e integrado** em
+   `b444d09`, `74514e2` e `f0fc97d`; handoff Nexus
+   `hof_ab1156bc405346f3b767bbef80a0eeb3` concluído e verificado. Registros já canônicos não são
+   reconstruídos, o descritor é aplicado uma única vez e o resultado intrínseco do preview é
+   reutilizado somente para os mesmos objetos exatos. Cauda, época, rotação, teto do segmento e
+   LSN terminal continuam recalculados imediatamente antes do append. A primeira revisão foi
+   recusada porque o memo sobrevivia a portas falíveis, podia ser publicado antes do plano inteiro
+   e retinha as fontes em duplicidade; `f0fc97d` passou a consumi-lo antes de qualquer porta,
+   publicá-lo só após o último check e manter uma única retenção. O corpus diferencial de 160
+   lotes/73 rotações permaneceu byte a byte idêntico; 328 testes WAL e oito mutantes passaram. No
+   benchmark pareado, preview e append melhoraram `1,42x` e `1,73x`, respectivamente.
 2. WRITE-M3 and WRITE-5 — **implementados em `b8906f6`**. O snapshot de parâmetros usa um
    caminho linear especializado somente para o `dict` embutido com valores escalares imutáveis
    exatos; subclasses, mappings customizados, compostos e valores hostis continuam no copiador
@@ -301,8 +310,20 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    o canônico, preservando o replay escalar e a falha fail-closed. Os 27 testes do batch comum e
    a regressão combinada de replay/recovery ficaram verdes.
 4. Re-run the direct KG page, relationship fan-out, vector, transfer, open, recovery and
-   concurrent-reader workloads once for the accumulated implementation.
-5. Decide whether CURSOR-1 and BATCH-REL-1 remain material; do not add smaller residuals.
+   concurrent-reader workloads once for the accumulated implementation. **Checkpoint parcial
+   concluído:** no board real `generation-1`, a página de 500 nodes ficou em mediana `0,514 s` e a
+   continuação em `0,469 s`, mas ambas ainda escanearam 2.171 linhas. O fan-out retornou 793 edges
+   em 66 tabelas; o caminho híbrido/indexado quente ficou em `1,167 s`, contra `0,866 s` forçando
+   scan, com mesmo digest, 73 chamadas multi-key e 4.808 probes. Open mediu `1,210 s`, autocommit
+   relacional `2,260 s` e o mesmo batch sob um snapshot `0,890 s` para 3.256 rows. O checkpoint
+   combinado pós-WAL/recovery passou 411 testes de WAL, protocolo de commit, integração WAL e
+   crash recovery. Vector, transfer e concorrência serão medidos uma única vez no fechamento da
+   Wave 3, não após cada patch.
+5. **Decisão material:** CURSOR-1 e BATCH-REL-1 permanecem no escopo; não foram adicionados
+   residuais menores. BATCH-REL-1 vem primeiro porque a seleção/preparação pode ser corrigida sem
+   mudança de formato e já perde para o scan no perfil real. CURSOR-1 vem depois porque o custo
+   observado continua `O(P*N)` e sua solução exige uma cerca explícita de geração/snapshot ou um
+   access path persistido com migração e recovery.
 
 ## Explicit decision queue
 
@@ -359,7 +380,9 @@ measured repeated-PK residual without changing the fail-closed contract.
 
 Wave 3 started with two independent low-risk lanes. Codex integrated the exact-type parameter
 and O(1) column lookup in `b8906f6`, then the Windows exact-name storage proof in `fd111cd`.
-Claude owns only the WAL planning lane in `hof_ab1156bc405346f3b767bbef80a0eeb3`; its output must
-still pass Codex's byte-parity, boundary-crash and recovery review before integration. No item in
-this wave changes writer/reader participation, snapshot visibility, either OCC validation or
-durability semantics.
+Claude delivered the WAL planning lane in `hof_ab1156bc405346f3b767bbef80a0eeb3`. Codex rejected
+its first retained-lifetime design, Claude corrected the three findings in `f0fc97d`, and the
+handoff then passed independent review and the accumulated 411-test checkpoint. The real-board
+re-profile kept only BATCH-REL-1 and CURSOR-1 as material next work, in that order; the decision
+and measurements are recorded in Wave 3 above. No item in this wave changes writer/reader
+participation, snapshot visibility, either OCC validation or durability semantics.

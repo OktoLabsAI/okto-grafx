@@ -23,9 +23,15 @@
   especializado/injetado; a alternativa escalar continua obrigatória nesses casos. Um fixture
   antigo de recovery também passou a construir uma página HEAP estruturalmente válida, mantendo
   a recusa tardia que ele pretendia provar.
-  A otimização de planejamento WAL está isolada no handoff
-  `hof_ab1156bc405346f3b767bbef80a0eeb3` e só será integrada após paridade byte a byte e matriz de
-  crash/recuperação. Rastreabilidade e testes estão em `docs/PERFORMANCE_ROUND_0_0_4.md`.
+  A otimização de planejamento WAL foi integrada em `b444d09`, `74514e2` e `f0fc97d` após a
+  primeira revisão adversarial recusar três falhas de ciclo de vida do memo. O desenho corrigido
+  reutiliza apenas a parte intrínseca de objetos exatos e recalcula época, cauda, rotação e LSN;
+  o corpus diferencial de 160 lotes/73 rotações ficou idêntico, 328 testes WAL e o checkpoint
+  combinado de 411 testes passaram, com ganhos isolados de `1,42x` no preview e `1,73x` no append.
+  O re-profile real manteve BATCH-REL-1 e CURSOR-1 como os únicos próximos alvos materiais: o
+  fan-out híbrido quente (`1,167 s`) ainda perdeu do scan (`0,866 s`), e cada página de 500 nodes
+  ainda varreu 2.171 linhas. Rastreabilidade e medições estão em
+  `docs/PERFORMANCE_ROUND_0_0_4.md`.
 
 - **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
   estão publicados até `ed3ce95`; o memo transacional de resolução de PK entrou em `04aa244` com
