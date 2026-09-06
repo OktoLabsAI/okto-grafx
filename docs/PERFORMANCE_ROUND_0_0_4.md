@@ -275,10 +275,24 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
 
 ### Wave 3 — small residuals and one re-profile
 
-1. WRITE-4/M1/M2 with a crash matrix at every segment boundary.
-2. WRITE-M3 and WRITE-5.
-3. STORID-M1: Windows exact-path fast path with a secure cross-platform fallback and parity for
-   Unicode, case, symlinks and junctions.
+1. WRITE-4/M1/M2 with a crash matrix at every segment boundary — **em execução no handoff Nexus
+   `hof_ab1156bc405346f3b767bbef80a0eeb3`; ainda não integrado**.
+2. WRITE-M3 and WRITE-5 — **implementados em `b8906f6`**. O snapshot de parâmetros usa um
+   caminho linear especializado somente para o `dict` embutido com valores escalares imutáveis
+   exatos; subclasses, mappings customizados, compostos e valores hostis continuam no copiador
+   canônico e nos mesmos limites/erros. A resolução de coluna usa a autoridade
+   `TableDefinition.column_positions`, eliminando a busca linear sem mudar o erro de ausência.
+   Os microbenchmarks isolados mediram `2,80x` e `3,01x`, respectivamente; 133 testes públicos de
+   query/escrita mais a regressão completa do query engine passaram.
+3. STORID-M1 — **implementado em `fd111cd`**. No Windows, a prova de nome exato usa
+   `FindFirstFileExW` sobre caminho estendido e compara o nome armazenado, sem enumerar irmãos;
+   ausência continua ausência, colisão de caixa continua tipada e todo outro erro de SO continua
+   traduzido/fail-closed. A identidade do diretório permanece cercada antes/depois, e `lstat`
+   mais a recusa de reparse point continuam obrigatórios. Hosts sem a API e todas as demais
+   plataformas retêm a caminhada portátil. O teste nativo cobre raiz física Unicode, 688 irmãos,
+   acerto, ausência e colisão sem permitir `listdir`; a matriz proporcional cobre também troca
+   por junction/symlink, descritores e durabilidade. Nesse diretório, 300 resoluções do último
+   filho caíram de mediana 0,411 s para 0,185 s (`2,22x`).
 4. Re-run the direct KG page, relationship fan-out, vector, transfer, open, recovery and
    concurrent-reader workloads once for the accumulated implementation.
 5. Decide whether CURSOR-1 and BATCH-REL-1 remain material; do not add smaller residuals.
@@ -335,3 +349,10 @@ accepted as a NO-GO, not as an implementation: the measured `19.7x` indexed path
 removed a currently pinned non-incident corruption refusal, so its patch and test relaxation
 were excluded. STO-M1 then proceeded on the canonical branch and removed the independently
 measured repeated-PK residual without changing the fail-closed contract.
+
+Wave 3 started with two independent low-risk lanes. Codex integrated the exact-type parameter
+and O(1) column lookup in `b8906f6`, then the Windows exact-name storage proof in `fd111cd`.
+Claude owns only the WAL planning lane in `hof_ab1156bc405346f3b767bbef80a0eeb3`; its output must
+still pass Codex's byte-parity, boundary-crash and recovery review before integration. No item in
+this wave changes writer/reader participation, snapshot visibility, either OCC validation or
+durability semantics.
