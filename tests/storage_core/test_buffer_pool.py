@@ -125,6 +125,18 @@ class DescriptorIdentityRecordingDevice(MemoryDevice):
         super().write_page(file, page_index, data)
 
 
+class PresenceRecordingDevice(MemoryDevice):
+    """Expose redundant namespace walks without changing the storage contract."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.exists_calls: list[str] = []
+
+    def exists(self, file: str) -> bool:
+        self.exists_calls.append(file)
+        return super().exists(file)
+
+
 def seed_pages(pool: BufferPool, count: int, *, file: str = FILE) -> list[PageIndex]:
     """Allocate and write count pages, returning their indices."""
     indices: list[PageIndex] = []
@@ -1281,6 +1293,38 @@ def test_an_allocated_page_comes_back_pinned_and_survives_pressure() -> None:
         assert reread.read_slot(0) == b"written into a fresh page"
 
 
+def test_allocation_uses_page_count_instead_of_a_redundant_presence_walk() -> None:
+    device = PresenceRecordingDevice()
+    device.create(FILE)
+    device.exists_calls.clear()
+    pool = make_pool(device, RecordingMetrics())
+
+    page = pool.allocate(FILE, int(PageType.HEAP))
+    pool.unpin(FILE, page.page_index, page=page)
+
+    assert device.exists_calls == []
+    assert device.page_count(FILE) == 1
+
+
+def test_allocation_does_not_read_a_non_missing_page_count_refusal_as_empty() -> None:
+    class RefusingPageCountDevice(PresenceRecordingDevice):
+        def page_count(self, file: str) -> int:
+            raise GrafxCorruptionDetected(
+                "unaligned test file",
+                reason="unaligned_paged_file",
+                file=file,
+            )
+
+    device = RefusingPageCountDevice()
+    pool = make_pool(device, RecordingMetrics())
+
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        pool.allocate(FILE, int(PageType.HEAP))
+
+    assert refused.value.details["reason"] == "unaligned_paged_file"
+    assert device.exists_calls == []
+
+
 def test_the_pool_exposes_the_ports_the_stores_need() -> None:
     device = MemoryDevice()
     codec = PageCodecV1(device.page_size)
@@ -2008,6 +2052,19 @@ def test_a_redo_may_bridge_a_gap_left_by_an_interrupted_allocation() -> None:
     allocated = grow_to(pool, FILE, present + 3)
     assert allocated == 4
     assert pool.storage.page_count(FILE) == present + 4
+
+
+def test_redo_growth_avoids_a_presence_walk_for_every_page() -> None:
+    device = PresenceRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    reserve_header(pool)
+    device.exists_calls.clear()
+    present = device.page_count(FILE)
+
+    assert grow_to(pool, FILE, present + 3) == 4
+
+    assert device.exists_calls == []
+    assert device.page_count(FILE) == present + 4
 
 
 def test_a_page_index_far_past_the_end_is_refused_instead_of_allocated() -> None:

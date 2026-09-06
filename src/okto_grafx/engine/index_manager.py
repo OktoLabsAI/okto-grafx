@@ -57,7 +57,6 @@ from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
 from typing import NamedTuple, TypeVar
 
 from okto_grafx.domain.errors import (
@@ -186,7 +185,6 @@ INDEX_READ_RETRY_BUDGET: int = 2
 _DETACHED_GENERATION_NONCE_ATTEMPTS: int = 64
 """Bounded provider draws used to find one unowned physical-generation name."""
 
-_DEFINITION_MATCH_MEMO_LIMIT: int = 1024
 """Per-manager ceiling for immutable schema-provenance comparisons."""
 
 _COMMON_REPLAY_HOT_BUCKET_MIN_EFFECTS: int = 8
@@ -4171,14 +4169,12 @@ class IndexManager:
         self._schema_observed: dict[int, dict[IndexStore, int]] = {}
         self._schema_new_table_observed: dict[int, set[IndexStore]] = {}
         self._registry_revision = 0
-        # This is schema normalization, not index authority.  The complete immutable physical
-        # definition (including generation nonce/bucket count) and complete immutable TableDef
-        # form the key, so DDL or rehash cannot inherit a prior answer.  The manager lifetime and
-        # finite ceiling avoid process-global retention while a large schema transaction asks the
-        # same comparison quadratically often.
-        self._definition_match = lru_cache(
-            maxsize=_DEFINITION_MATCH_MEMO_LIMIT, typed=True
-        )(index_definition_matches_table)
+        # TableDef already memoizes its automatic projection.  Caching this cheap comparison by
+        # VALUE made every hit hash every column of the table and was materially slower than
+        # simply comparing the immutable definitions.  Keep the seam for compatibility tests
+        # and narrow collaborators, but make it the canonical comparison itself: there is no
+        # process-global retention, identity-reuse hazard or DDL answer to invalidate.
+        self._definition_match = index_definition_matches_table
 
     # --- registry ---------------------------------------------------------------------------
 

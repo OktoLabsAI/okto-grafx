@@ -100,7 +100,7 @@ def test_automatic_definition_normalization_is_bounded_to_the_table_value(
     assert index_definition_matches_table(exact_definition(database.table), database.table)
 
 
-def test_manager_definition_match_memo_does_not_cross_ddl_or_generation(
+def test_manager_definition_match_does_not_cross_ddl_or_generation(
     database: Database,
 ) -> None:
     canonical = automatic_index_definitions(database.table)[0]
@@ -111,23 +111,16 @@ def test_manager_definition_match_memo_does_not_cross_ddl_or_generation(
     assert database.manager._definition_matches_table_tolerantly(
         canonical, database.table
     )
-    after_repeat = database.manager._definition_match.cache_info()
-    assert after_repeat.hits == 1
-    assert after_repeat.misses == 1
-    assert after_repeat.maxsize == 1024
 
     generation = replace(canonical, bucket_count=256, artifact_nonce=91)
     assert database.manager._definition_matches_table_tolerantly(
         generation, database.table
     )
-    assert database.manager._definition_match.cache_info().misses == 2
 
     changed = replace(database.table, primary_key="name")
     assert not database.manager._definition_matches_table_tolerantly(generation, changed)
-    assert database.manager._definition_match.cache_info().misses == 3
 
     custom = exact_definition(database.table)
     assert database.manager._definition_matches_table_tolerantly(
         custom, database.table
     )
-    assert database.manager._definition_match.cache_info().misses == 4

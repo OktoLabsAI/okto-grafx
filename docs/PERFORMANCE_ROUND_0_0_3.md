@@ -104,6 +104,61 @@ The candidates above do not relax multiwriter/multireader admission, WAL, OCC, r
 validation. Any implementation that cannot retain those properties is rejected rather than
 treated as an acceptable latency tradeoff.
 
+## Joint Claude/Codex selection — 2026-09-06
+
+Status: **closed and finite**. Claude's 15-agent survey was checked against the current code and
+the direct KG-load profile above. The survey's Amdahl denominator is a Pulse logical transfer of
+86.81 s at `acf63c8`; the main remaining fractions are DDL execution (20.8%), relationship
+execution (18.1%), checkpoint (12.7%), node commit (11.1%) and verification (6.7%). These numbers
+are prioritisation evidence, not new pass/fail gates.
+
+The implementation order is:
+
+1. **KG load, first visible result:** select the existing endpoint-validating
+   `RelationshipScan` for Pulse's directed typed single hop with an explicit relationship
+   variable and without a predicate only when the consumer cannot benefit from the small-frontier
+   path: aggregation, no `LIMIT`, or a literal `LIMIT` greater than the named frontier threshold
+   of 64. Literal limits 64 and 65 are boundary tests; anonymous relationships retain the
+   canonical traversal order, so adding a small limit remains a prefix of the same query.
+   Endpoint predicates remain on the existing path in this change. Pulse will separately omit
+   its tautological endpoint predicate, publish `/graph` independently of health/statistics and
+   stop the duplicate mount request.
+2. **Small storage/index removals:** E-1 removes the redundant `exists()` from
+   `BufferPool.allocate` with a narrow `missing_file` match; E-2 deduplicates checkpoint barrier
+   file names before proving presence; E-4 asks `page_count` before the missing-file creation
+   path in `grow_to`; R-2 removes the value-keyed definition-match LRU whose hash is slower than
+   the immutable comparison it caches. The exact-name proof is narrowed from per-page to
+   per-allocation/replay loop, while descriptor identity and all corruption refusals remain.
+3. **Medium engine batch:** E-3 admits HNSW stores to logical replay only through an explicit
+   capability and a once-at-end invalidation/certification hook, with a cross-process generation
+   replacement test; R-4 replaces serialize/deserialize DDL working-catalog clones with a
+   structural clone of immutable definitions. This is owned by Claude in a separate worktree and
+   will be adversarially reviewed before integration.
+4. **Pulse projection:** execute the 70 relationship reads in one fixed read snapshot, push the
+   current-page endpoint restriction down instead of discarding unrelated rows in Python, group
+   node statistics in one scan, and batch endpoint-map reads. A native incident-edge access path
+   remains the scale fix if an `IN` predicate still scans all relationship rows.
+5. **Second engine batch after focused remeasurement:** statement-identity authority memo (R-1),
+   bulk page allocation with complete buffer-pool accounting (E-1 complete), HNSW/string decode
+   residue (R-11), and the other small validated items R-3/R-6/R-10. P-1 sizing is measured only
+   after E-1 because its reported DDL time overlaps that same redundant presence work.
+
+Explicitly not selected in this round are D-1 (removing endpoint identity/canonical-reference
+proofs), D-2/D-5 (weakening physical generation or exact-name revalidation), P-5 (reducing Pulse
+verification scope), fewer commits, `executemany`, or any other proposal that changes durability,
+snapshot/OCC, multiwriter admission or corruption detection. D-3/D-6/D-7 and large format changes
+remain separate product/format decisions, not implicit consequences of the performance mandate.
+
+### First-batch focused result
+
+With the guarded planner change applied to the local 0.0.3 source, all 69 relationship tables
+present in the active generation planned as `RelationshipScan` for the Pulse-sized literal
+`LIMIT 5000`. Three direct runs returned the same 3,004 logical relationship rows; the 69
+autocommit statements took 1.10–1.23 s total, versus 4.48 s for the prior node-first shape in the
+baseline. This is a 3.6–4.1× reduction in that engine-local fanout, before the Pulse snapshot,
+endpoint and frontend changes. Literal `LIMIT 64` remains node-first and `LIMIT 65` becomes
+edge-first, while aggregate input remains edge-first even with `LIMIT 1`.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -111,5 +166,5 @@ treated as an acceptable latency tradeoff.
 | 0.0.2 frozen and pushed | complete | `feature/v0.0.2@acf63c8` |
 | 0.0.3 branch and version bump | complete | `feature/v0.0.3@1f2172d` |
 | Real Pulse KG load-path baseline | complete | measurements and source mapping above |
-| Claude/Codex final selection | pending | Nexus notification and adversarial consensus |
-| First implementation batch | pending | focused correctness tests before grouped regression |
+| Claude/Codex final selection | complete | finite selection and rejected guarantee changes above |
+| First implementation batch | in progress | focused correctness tests before grouped regression |

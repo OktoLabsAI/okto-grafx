@@ -152,6 +152,7 @@ from okto_grafx.domain.query.tokens import (
 __all__ = [
     "ANONYMOUS_VARIABLE_PREFIX",
     "COLUMN_VALUE_TYPES",
+    "RELATIONSHIP_LOOKUP_FRONTIER_LIMIT",
     "SCORE_COLUMN",
     "THRESHOLD_OPERATORS",
     "PlannedQuery",
@@ -162,6 +163,15 @@ __all__ = [
     "conjuncts_of",
     "subscript_argument_types",
 ]
+
+RELATIONSHIP_LOOKUP_FRONTIER_LIMIT: int = 64
+"""Largest literal LIMIT that keeps a no-predicate typed hop on endpoint lookups.
+
+Below this boundary a seek/lookup frontier can stop before reading the whole relationship table;
+above it the edge-first scan wins by avoiding the source-node scan.  The executor imports this
+same value for its hybrid lookup-to-grouped-scan transition, so the planner and runtime cannot
+drift onto different cost boundaries.
+"""
 
 ANONYMOUS_VARIABLE_PREFIX: str = "anonymous pattern element "
 """The name an unnamed pattern element is bound under while a query runs.
@@ -512,6 +522,7 @@ class _Planner:
         default_factory=dict
     )
     seek_rechecks: list[Expression] = field(default_factory=list)
+    prefer_full_relationship_scan: bool = False
     anonymous: int = 0
 
     # --- entry -------------------------------------------------------------------------------
@@ -1329,6 +1340,18 @@ class _Planner:
             # aggregates nothing. Recompute from the statement the gate actually approved so
             # neither literal can be widened through its analysis argument.
             self.analysis = analyze(statement)
+        returned = statement.return_clause
+        literal_limit = None if returned is None else returned.limit
+        self.prefer_full_relationship_scan = bool(
+            self.analysis.aggregated
+            or returned is None
+            or returned.limit is None
+            or (
+                isinstance(literal_limit, Literal)
+                and type(literal_limit.value) is int
+                and literal_limit.value > RELATIONSHIP_LOOKUP_FRONTIER_LIMIT
+            )
+        )
         pipeline: PlanNode = SingleRow()
         if statement.unwind_clause is not None:
             self._require_batch_shape(statement)
@@ -2780,9 +2803,10 @@ class _Planner:
         """
         if len(pattern.relationships) != 1 or len(pattern.nodes) != 2:
             return None
-        if pattern.variable is not None:
-            # A named path -- projected or merely decorative -- keeps today's traversal
-            # shape; the frozen path form and its refusals are not this fast path's to touch.
+        if pattern is self.path_projection:
+            # A projected named path needs the traversal to construct its public path value.
+            # A decorative name is deliberately allowed below: the query analysis has already
+            # proved nobody can read it, so it must not change the unnamed pattern's plan.
             return None
         relationship = pattern.relationships[0]
         if len(relationship.types) != 1:
@@ -2898,9 +2922,18 @@ class _Planner:
                 r_only.append(term)
             else:
                 rest.append(term)
-        if not r_only:
-            # The scan earns its keep by judging the r-only predicate before any endpoint is
-            # resolved; a hop with no such predicate keeps the traversal it always had.
+        if not r_only and (
+            terms
+            or relationship.variable is None
+            or not self.prefer_full_relationship_scan
+        ):
+            # A relationship predicate earns the scan by rejecting rows before endpoint
+            # resolution.  With no predicate, use it only when the result shape consumes the
+            # full/large frontier; a small LIMIT keeps the indexed node-first path that can stop
+            # early.  Anonymous relationships retain traversal order so adding a small LIMIT is
+            # still the canonical prefix of the same query; Pulse binds `r`, and therefore takes
+            # the edge-first path. Variable-free and endpoint predicates retain their existing
+            # semantics and placement in this first bounded change.
             return None
         self.tables[first_variable] = first_table
         self.tables[target_variable] = target_table

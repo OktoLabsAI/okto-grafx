@@ -29,6 +29,7 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxDurabilityBarrierFailed,
+    GrafxError,
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import MAX_PAGE_INDEX, NO_PAGE, PageIndex
@@ -1522,9 +1523,18 @@ class BufferPool:
         point.
         """
         self._wait_for_evictions(file)
-        prospective = (
-            self._storage.page_count(file) if self._storage.exists(file) else 0
-        )
+        try:
+            prospective = self._storage.page_count(file)
+        except GrafxError as failure:
+            # page_count is the cheaper presence question and, unlike exists(), does not walk
+            # every sibling name merely to calculate the budget position of the append.  Only
+            # absence has the old zero answer.  A case collision, an unaligned paged file and
+            # every other typed refusal remain corruption/incompatibility rather than being
+            # mistaken for an empty file.  storage.allocate below still re-proves the exact
+            # descriptor identity before it grows anything.
+            if failure.details.get("reason") != "missing_file":
+                raise
+            prospective = 0
         self._make_room(file, prospective)
         page_index = self._reusable_index(file) if reuse else None
         if page_index is None:
@@ -3099,9 +3109,17 @@ def grow_to(pool: BufferPool, file: str, page_index: PageIndex) -> int:
     """
     _require_page_index("page_index", page_index)
     storage = pool.storage
-    if not storage.exists(file):
+    try:
+        present = storage.page_count(file)
+    except GrafxError as failure:
+        # This is the one sanctioned creation route.  Asking page_count first removes an
+        # O(namespace) exact-name walk from every already-present redo page while preserving
+        # the old exact spelling proof at the loop boundary.  Never turn malformed or
+        # case-colliding storage into a new file.
+        if failure.details.get("reason") != "missing_file":
+            raise
         storage.create(file)
-    present = storage.page_count(file)
+        present = 0
     if page_index >= present + MAX_REDO_GAP_PAGES:
         raise GrafxCorruptionDetected(
             f"A page image names page {page_index} of {file!r}, which holds {present} pages; "

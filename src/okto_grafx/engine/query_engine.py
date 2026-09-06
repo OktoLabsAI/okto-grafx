@@ -216,6 +216,7 @@ from okto_grafx.domain.query.plan import (
     validate_plan,
 )
 from okto_grafx.domain.query.planner import (
+    RELATIONSHIP_LOOKUP_FRONTIER_LIMIT,
     union_common_type,
     SCORE_COLUMN,
     PlannedQuery,
@@ -5265,7 +5266,7 @@ def _index_seek(
             yield _Row(bindings=bindings)
 
 
-_EDGE_LOOKUP_FAN_LIMIT: int = 64
+_EDGE_LOOKUP_FAN_LIMIT: int = RELATIONSHIP_LOOKUP_FRONTIER_LIMIT
 """Distinct starts from an unknown/bounded producer served before a grouped scan wins.
 
 Chosen from the shape of the two costs, not tuned to a machine: a lookup costs a few bucket-page

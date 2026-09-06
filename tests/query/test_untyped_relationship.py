@@ -352,10 +352,11 @@ def test_a_resembling_statement_still_earns_its_original_refusal() -> None:
     assert "names exactly one type" in str(failure.value)
 
 
-def test_a_typed_hop_plans_exactly_as_it_did() -> None:
-    """The route this milestone did not touch is the route this milestone did not touch."""
+def test_a_typed_hop_with_a_small_frontier_keeps_its_traversal() -> None:
+    """The untyped route does not widen the typed hop's small-frontier cost rule."""
     plan = build_plan(
-        parse("MATCH (a:Decision)-[r:supports]->(b) RETURN a.id"), catalog=_catalog()
+        parse("MATCH (a:Decision)-[r:supports]->(b) RETURN a.id LIMIT 64"),
+        catalog=_catalog(),
     )
     assert any("TraverseRelationship(" in line for line in plan.root.render())
     assert not any("TraverseAnyRelationship" in line for line in plan.root.render())

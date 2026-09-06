@@ -61,7 +61,9 @@ def test_two_patterns_nest_into_one_tree_rather_than_two_queries() -> None:
 
 
 def test_a_traversal_hangs_off_the_operator_that_bound_its_source() -> None:
-    planned = plan_text("MATCH (a:Person)-[:Knows]->(b:Person) RETURN b.name")
+    planned = plan_text(
+        "MATCH (a:Person)-[:Knows]->(b:Person) RETURN b.name LIMIT 64"
+    )
     traversal = find_operator(planned.root, "TraverseRelationship")
     assert isinstance(traversal, TraverseRelationship)
     assert traversal.source == "a"
@@ -732,7 +734,9 @@ def test_a_traversal_that_could_match_nothing_is_refused_rather_than_run() -> No
 
 
 def test_an_incoming_traversal_checks_the_other_endpoint() -> None:
-    planned = plan_text("MATCH (d:Doc)<-[:BELONGS_TO]-(n:Chunk) RETURN n.id")
+    planned = plan_text(
+        "MATCH (d:Doc)<-[:BELONGS_TO]-(n:Chunk) RETURN n.id LIMIT 64"
+    )
     traversal = find_operator(planned.root, "TraverseRelationship")
     assert isinstance(traversal, TraverseRelationship)
     assert traversal.direction is Direction.INCOMING

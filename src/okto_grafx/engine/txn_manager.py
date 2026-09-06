@@ -3797,9 +3797,12 @@ class TransactionManager:
                 # rename, so only names that still exist are durable targets. Foreign images
                 # skipped as already-newer are covered by the canonical inventory below.
                 with self._close_wait_hazard():
+                    modified_files = {
+                        file for file, _page_index in self._pool.modified_pages()
+                    }
                     barrier_files.update(
                         file
-                        for file, _page_index in self._pool.modified_pages()
+                        for file in modified_files
                         if self._pool.storage.exists(file)
                     )
                 manager = self._index_manager
