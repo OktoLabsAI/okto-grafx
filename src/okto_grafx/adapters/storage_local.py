@@ -305,6 +305,9 @@ _FILE_SHARE_DELETE: int = 0x00000004
 _CREATE_NEW: int = 1
 _OPEN_EXISTING: int = 3
 _FILE_ATTRIBUTE_NORMAL: int = 0x00000080
+_FIND_EX_INFO_BASIC: int = 1
+_FIND_EX_SEARCH_NAME_MATCH: int = 0
+_WINDOWS_MISSING_PATH_ERRORS: frozenset[int] = frozenset((2, 3, 267))
 
 _T = TypeVar("_T")
 
@@ -370,6 +373,98 @@ def _load_windows_opener() -> tuple[object, object, int] | None:
 
 _WINDOWS_OPENER: tuple[object, object, int] | None = _load_windows_opener()
 """The prepared CreateFileW entry point, or None when this family does not need one."""
+
+
+def _load_windows_exact_name_probe() -> tuple[object, object, object, int] | None:
+    """Prepare an O(1) exact-name observation on Windows, or retain the portable fallback."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        library = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class _Win32FindData(ctypes.Structure):
+            _fields_ = (
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("dwReserved0", wintypes.DWORD),
+                ("dwReserved1", wintypes.DWORD),
+                ("cFileName", wintypes.WCHAR * 260),
+                ("cAlternateFileName", wintypes.WCHAR * 14),
+            )
+
+        library.FindFirstFileExW.argtypes = (
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+            ctypes.POINTER(_Win32FindData),
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        library.FindFirstFileExW.restype = wintypes.HANDLE
+        library.FindClose.argtypes = (wintypes.HANDLE,)
+        library.FindClose.restype = wintypes.BOOL
+        invalid = ctypes.c_void_p(-1).value
+    except (ImportError, AttributeError, OSError, ValueError):  # pragma: no cover - hostile host
+        return None
+    return library, ctypes, _Win32FindData, int(invalid)
+
+
+_WINDOWS_EXACT_NAME_PROBE: tuple[object, object, object, int] | None = (
+    _load_windows_exact_name_probe()
+)
+"""FindFirstFileExW and its exact result shape; absent means the portable listdir proof."""
+
+
+def _windows_extended_path(path: str) -> str:
+    """Give a direct Win32 call Python's long-path spelling without changing its target."""
+    absolute = os.path.abspath(path)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute[2:]
+    return "\\\\?\\" + absolute
+
+
+def _windows_stored_child_name(path: str) -> str | None:
+    """Return the on-disk final-component spelling selected by an exact Windows path.
+
+    Windows resolves the supplied path case-insensitively, while ``cFileName`` reports the
+    stored spelling.  Comparing those two values is therefore the same exact-case proof as
+    scanning the parent directory, without making its cost proportional to sibling count.
+    Missing paths remain ``None``; every other OS failure is translated by the caller.
+    """
+    probe = _WINDOWS_EXACT_NAME_PROBE
+    if probe is None:  # pragma: no cover - caller selects the portable path in this state
+        raise OSError(errno.ENOSYS, "FindFirstFileExW is unavailable")
+    library, ctypes_module, find_data_type, invalid = probe
+    data = find_data_type()  # type: ignore[operator]
+    handle = library.FindFirstFileExW(  # type: ignore[attr-defined]
+        _windows_extended_path(path),
+        _FIND_EX_INFO_BASIC,
+        ctypes_module.byref(data),  # type: ignore[attr-defined]
+        _FIND_EX_SEARCH_NAME_MATCH,
+        None,
+        0,
+    )
+    if int(handle) == invalid:
+        winerror = ctypes_module.get_last_error()  # type: ignore[attr-defined]
+        if winerror in _WINDOWS_MISSING_PATH_ERRORS:
+            return None
+        raise ctypes_module.WinError(winerror)  # type: ignore[attr-defined]
+    try:
+        return str(data.cFileName)
+    finally:
+        if not library.FindClose(handle):  # type: ignore[attr-defined]
+            raise ctypes_module.WinError(  # type: ignore[attr-defined]
+                ctypes_module.get_last_error()  # type: ignore[attr-defined]
+            )
 
 SHARE_DELETE_AVAILABLE: bool = _WINDOWS_OPENER is not None or not IS_WINDOWS
 """True when a handle of this device does not block another process from deleting the file."""
@@ -1768,16 +1863,29 @@ class LocalStorageDevice:
         )
         if not parent_is_prevalidated_root:
             self._require_directory_identity(label, directory, identity)
-        try:
-            entries = tuple(os.listdir(directory))
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-        except OSError as failure:
-            raise self._device_failure("list", name, failure) from failure
-
-        exact = segment in entries
-        conflict = None if exact else find_case_conflict(segment, entries)
         candidate = os.path.join(directory, segment)
+        if _WINDOWS_EXACT_NAME_PROBE is None:
+            try:
+                entries = tuple(os.listdir(directory))
+            except (FileNotFoundError, NotADirectoryError):
+                return None
+            except OSError as failure:
+                raise self._device_failure("list", name, failure) from failure
+            exact = segment in entries
+            conflict = None if exact else find_case_conflict(segment, entries)
+        else:
+            try:
+                stored = _windows_stored_child_name(candidate)
+            except OSError as failure:
+                raise self._device_failure("list", name, failure) from failure
+            exact = stored == segment
+            conflict = (
+                stored
+                if stored is not None
+                and not exact
+                and stored.casefold() == segment.casefold()
+                else None
+            )
         information: os.stat_result | None = None
         if exact:
             try:

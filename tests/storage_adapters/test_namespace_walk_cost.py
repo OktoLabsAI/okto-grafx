@@ -395,6 +395,60 @@ def test_identity_namespace_doors_do_not_rederive_real_paths(
     assert remove_calls["realpath"] == 0, dict(remove_calls)
 
 
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name != "nt", reason="FindFirstFileExW is a Windows fast path.")
+def test_exact_child_resolution_is_constant_in_sibling_count_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The logical namespace is deliberately portable ASCII; the physical root need not be.
+    root = tmp_path / "ação" / "database"
+    index = root / "index"
+    index.mkdir(parents=True)
+    for number in range(688):
+        (index / f"artifact-{number:04d}.idx").write_bytes(b"x")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+
+    def no_directory_listing(_path: str) -> list[str]:
+        raise AssertionError("an exact child proof listed all 688 siblings")
+
+    monkeypatch.setattr(storage_local.os, "listdir", no_directory_listing)
+    try:
+        assert device.exists("index/artifact-0687.idx")
+        assert device.exists("index/absent.idx") is False
+        with pytest.raises(GrafxUnsupportedOperation) as collision:
+            device.exists("index/ARTIFACT-0687.IDX")
+        assert collision.value.details["reason"] == "case_collision"
+        assert collision.value.details["stored"] == "artifact-0687.idx"
+    finally:
+        device.close()
+
+
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name != "nt", reason="The fallback selection is Windows-specific here.")
+def test_an_unavailable_windows_probe_retains_the_portable_exact_case_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "ação" / "database"
+    root.mkdir(parents=True)
+    (root / "state.dat").write_bytes(b"x")
+    device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
+    real_listdir = storage_local.os.listdir
+    listings = 0
+
+    def counted(path: str) -> list[str]:
+        nonlocal listings
+        listings += 1
+        return real_listdir(path)
+
+    monkeypatch.setattr(storage_local, "_WINDOWS_EXACT_NAME_PROBE", None)
+    monkeypatch.setattr(storage_local.os, "listdir", counted)
+    try:
+        assert device.exists("state.dat")
+        assert listings == 1
+    finally:
+        device.close()
+
+
 def test_parent_prevalidation_never_skips_an_intermediate_directory_proof(
     board: tuple[LocalStorageDevice, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -455,6 +509,7 @@ def _exchange_parent_after_its_entries_were_listed(
     original = root / "spool-original"
     device = LocalStorageDevice(root, page_size=PAGE_SIZE, create_root=False)
     real_listdir = storage_local.os.listdir
+    real_probe = storage_local._windows_stored_child_name
     target = os.path.normcase(str(spool))
     swapped = False
 
@@ -467,7 +522,19 @@ def _exchange_parent_after_its_entries_were_listed(
             swapped = True
         return entries
 
-    monkeypatch.setattr(storage_local.os, "listdir", swapping_listdir)
+    def swapping_probe(path: str) -> str | None:
+        nonlocal swapped
+        stored = real_probe(path)
+        if os.path.normcase(os.path.dirname(path)) == target and not swapped:
+            spool.rename(original)
+            make_redirect(spool, victim)
+            swapped = True
+        return stored
+
+    if storage_local._WINDOWS_EXACT_NAME_PROBE is None:
+        monkeypatch.setattr(storage_local.os, "listdir", swapping_listdir)
+    else:
+        monkeypatch.setattr(storage_local, "_windows_stored_child_name", swapping_probe)
     try:
         with pytest.raises(GrafxUnsupportedOperation) as raised:
             device.exists("spool/state.bin")
@@ -477,6 +544,7 @@ def _exchange_parent_after_its_entries_were_listed(
     finally:
         device.close()
         monkeypatch.setattr(storage_local.os, "listdir", real_listdir)
+        monkeypatch.setattr(storage_local, "_windows_stored_child_name", real_probe)
         if spool.is_symlink():
             spool.unlink()
         elif swapped and spool.exists():
