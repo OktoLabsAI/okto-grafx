@@ -137,8 +137,18 @@ Engine/query lane:
    1.79x median speedup (round ratios 1.96x/2.11x/1.62x/1.45x), with an identical digest across
    1,375 edges. The synthetic capacity-cliff workload improved 1.33x minimum/1.37x median,
    removed the observed capacity refusal (1 to 0), and retained an identical digest.
-4. EXEC-CSE, including KGRUN-M1: closures, exact `coalesce` leaf, lazy per-row CSE and the
-   `row.computed` guard. No `exec` code generation in this wave.
+4. EXEC-CSE, including KGRUN-M1. **Implemented and integrated** in `aee6002`; the adversarial
+   repairs in `01f3438` and `8599f15` keep mapping subjects single-evaluation, forbid CSE across
+   observable mapping/fallback reads, compile only on the first real non-computed row, and use a
+   closed literal-key domain rather than arbitrary `repr`/hash authority. Cache mutation is
+   locked while execution remains outside the lock; zero-row queries preserve their previous
+   behavior. `3c71cf1` also removes a flaky concurrent landing assertion that confused unequal
+   identifier sizes with unequal cache charges. The production-shaped 500-node page improved
+   1.37x median across six alternating rounds (all six faster; 1.15x--2.12x band), with identical
+   result digests. The 69-row `IN` fan-out remained effectively neutral at 1.05x, as expected for
+   its canonical fallback, and the vector sample showed no regression claim. Ten focal tests,
+   108 proportional tests, seven killed mutants and the accumulated full `tests/query` slice
+   pass. No `exec` code generation was introduced.
 5. KGRUN-M2(a): stateless pure cosine scorer preparation; no authority-bearing memo outside the
    HNSW generation fence. **Implemented and pushed** in `71b4110`: `PureVectorMath` now exposes
    the existing exact prepared-norm capability while retaining no adapter state; HNSW publishes a candidate
