@@ -183,7 +183,19 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
 
 ### Wave 2 — medium changes after Wave 1 re-profile
 
-1. WRITE-1, then NATVER-2, with peak-memory and retained-lifetime measurements.
+1. WRITE-1, then NATVER-2, with peak-memory and retained-lifetime measurements. **WRITE-1 is
+   implemented and integrated** in `5904821`: query materialization may carry the exact encoded
+   payload through a private, revocable proof bound to the same table and values objects. Copied
+   or replaced tuples, pending endpoints, custom heap doors and every unproved value fall back to
+   the canonical encoder. Nested mutable values (`list`, `dict`, `bytearray`) never receive an
+   identity-only proof. Optional retained payload is capped at 8 MiB per transaction; exhaustion
+   costs another canonical encode rather than changing admission or correctness. In six paired
+   300-row wide-write rounds, median commit time fell from about 629 ms to 452 ms (`1.39x`,
+   `-28%`) and total time fell about 11.9%; all twelve runs produced the same 499,712-byte
+   `heap.dat` SHA-256. The measured pre-commit memory delta was about 478 KiB for 399 KiB of
+   proved payload, and proof authority is revoked at discard, commit and abort. Five initial plus
+   one budget-fallback adversarial tests and the 16-file proportional write/transaction/heap
+   slice pass; Ruff, compileall and `git diff --check` are clean.
 2. NATVER-3 only after a discriminating CRC microbenchmark. **Discriminant completed:** against
    the active `google_crc32c` provider, one collapsed wrapper preserved the full acceptance-corpus
    answers and measured 2.05x–2.54x faster per call for 32 B, 256 B, 4 KiB and 16,380 B inputs
