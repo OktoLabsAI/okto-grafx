@@ -122,15 +122,26 @@ the new exact dirty-table seek, and its focused rerun passed. Ruff and `git diff
 Engine/query lane:
 
 1. KGRUN-M4: fix landing-memo charging so the cache does not fall from a performance cliff;
-   enforce a deterministic memory cap and canonical fallback.
-2. KGRUN-M3: choose scan versus seek before encoding up to two 500-key sets.
+   enforce a deterministic memory cap and canonical fallback. **Implemented and integrated** in
+   `cd52c33` (with the call-compatibility repair `90f4717`). The bounded LRU charges by landing
+   shape, and exhaustion still takes the canonical uncached path.
+2. KGRUN-M3: choose scan versus seek before encoding up to two 500-key sets. **Implemented and
+   integrated** in `0e30b20`; `05acb7f` closes an adversarially found parity gap by restricting
+   the fast string frontier to ASCII and returning surrogates/non-ASCII probes to the canonical
+   encoder.
 3. RELSEEK-M4: avoid vector materialization only for an internal endpoint landing that does not
-   project the vector; all validation and refusal paths remain.
+   project the vector; all validation and refusal paths remain. **Implemented and integrated**
+   in `88fedc9`; `69b2a51` makes the optimized identity landing an optional collaborator
+   capability and preserves the prior `validated_versions` fallback for custom index managers.
+   On the production-board relationship fan-out, the accumulated M3/M4/RELSEEK batch measured
+   1.79x median speedup (round ratios 1.96x/2.11x/1.62x/1.45x), with an identical digest across
+   1,375 edges. The synthetic capacity-cliff workload improved 1.33x minimum/1.37x median,
+   removed the observed capacity refusal (1 to 0), and retained an identical digest.
 4. EXEC-CSE, including KGRUN-M1: closures, exact `coalesce` leaf, lazy per-row CSE and the
    `row.computed` guard. No `exec` code generation in this wave.
 5. KGRUN-M2(a): stateless pure cosine scorer preparation; no authority-bearing memo outside the
-   HNSW generation fence. **Implemented locally:** `PureVectorMath` now exposes the existing
-   exact prepared-norm capability while retaining no adapter state; HNSW publishes a candidate
+   HNSW generation fence. **Implemented and pushed** in `71b4110`: `PureVectorMath` now exposes
+   the existing exact prepared-norm capability while retaining no adapter state; HNSW publishes a candidate
    norm only after a successful score and binds it to the immutable backing object of that node
    generation. A paired 384-dimensional/300-candidate scorer microbenchmark measured 2.00x
    (`0.1544 s` to `0.0771 s`, 50.1% less scorer time); the workload-level estimate remains ~8%.
@@ -138,9 +149,9 @@ Engine/query lane:
    base** (`c77d414`): `_seal_materialized_candidates` validates the space/index/cost gate before
    it even obtains the witness iterator, and the query layer supplies a lazy generator. No new
    implementation is due in this round.
-7. LV-3: resolve active indexes once per row in commit accounting/staging. **Implemented
-   locally:** the canonical manager now carries one immutable table-local projection from WAL
-   quota prediction into delete/insert staging, while custom managers and overridden hooks keep
+7. LV-3: resolve active indexes once per row in commit accounting/staging. **Implemented and
+   pushed** in `b3d2ae3`: the canonical manager now carries one immutable table-local projection
+   from WAL quota prediction into delete/insert staging, while custom managers and overridden hooks keep
    the observable legacy path. The produced-versus-expected WAL invariant remains mandatory.
 
 Storage/identity lane:
@@ -213,6 +224,9 @@ snapshot, OCC or consistency.
 
 Claude and Codex reached consensus on 2026-09-06 after the L5/L6 surveys and adversarial review.
 The first isolated implementation handoff is
-`hof_75b4003eac9f4ebe84f16b2f2bf42f68` (KGRUN-M4 + KGRUN-M3 + RELSEEK-M4), with creator
-verification required. Codex owns Wave 0, the first storage/identity lane and final integration.
-Pulse-specific work remains in Community adapters and composition roots.
+`hof_75b4003eac9f4ebe84f16b2f2bf42f68` (KGRUN-M4 + KGRUN-M3 + RELSEEK-M4). Its six commits were
+integrated as `0e30b20..69b2a51` after adversarial fixes for Unicode encoding parity and optional
+index collaborators. The focused combined-head gate passed 127 tests; the single accumulated
+query/vector/storage-core regression passed 3,835 tests in 358.35 seconds. Codex owns Wave 0,
+the first storage/identity lane and final integration. Pulse-specific work remains in Community
+adapters and composition roots.
