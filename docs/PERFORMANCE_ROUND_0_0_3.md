@@ -141,7 +141,7 @@ The implementation order is:
    remains the scale fix if an `IN` predicate still scans all relationship rows.
 5. **Second engine batch after focused remeasurement:** statement-identity authority memo (R-1),
    bulk page allocation with complete buffer-pool accounting (E-1 complete), HNSW/string decode
-   residue (R-11), and the other small validated items R-3/R-6/R-10. P-1 sizing is measured only
+   residue (R-11), and the other small validated items R-6/R-10. P-1 sizing is measured only
    after E-1 because its reported DDL time overlaps that same redundant presence work.
 
 Explicitly not selected in this round are D-1 (removing endpoint identity/canonical-reference
@@ -174,6 +174,15 @@ causes a second `/graph` request, explicit refresh still refreshes both projecti
 responses are fenced by per-request generations. This removes the 12.01 s statistics endpoint
 from the critical rendering path without hiding or weakening its diagnostics.
 
+The same Pulse branch now removes the 81-query statistics fan-out without making statistics a
+cached or eventually consistent answer. The 11 node-type counts are grouped by `label(n)` in one
+filtered scan, while the 70 physical relationship counts run in one immutable read snapshot.
+On the active generation the two direct helpers took 0.662 s and 2.178 s respectively, returned
+2,001 nodes and 3,004 relationships, and reported zero failed relationship tables. Providers
+without the optional batch capability retain the scalar path; a rejected batch is retried per
+table so the existing partial-failure diagnostics remain exact. The Pulse commits are `e2b6053`
+for the critical rendering path and `880db68` for statistics batching.
+
 The accepted Claude batch adds two further internal improvements:
 
 - HNSW logical replay can compose WAL records only when the exact store explicitly declares the
@@ -185,6 +194,16 @@ The accepted Claude batch adds two further internal improvements:
   directions; subclasses retain the defensive serialize/deserialize round trip. This removes
   the former O(tables x columns) encode/decode from every DDL statement.
 
+Two apparent follow-ups are deliberately not being smuggled into this wave. R-3 cannot skip the
+commit-time tuple encoding solely because `intent.values` retained object identity: the direct
+`TransactionContext.stage_row_insert/update` port does not schema-encode unless byte quota
+accounting happens to be enabled. It needs an authenticated, rollback-bounded validation witness
+and a fresh gain measurement before it is safe; the simple identity shortcut is rejected. For
+KG endpoint pushdown, adding `IN $ids` above `RelationshipScan` would still scan O(E), while one
+equality query per page node multiplies statement/index work. The scalable follow-up is a real
+multi-key endpoint seek/incident-edge operator (or an equally explicit structured port), with
+the same endpoint visibility and canonical-reference validation as ordinary traversal.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -195,4 +214,5 @@ The accepted Claude batch adds two further internal improvements:
 | Claude/Codex final selection | complete | finite selection and rejected guarantee changes above |
 | First Grafx implementation batch | complete | `4638204`, 3.6–4.1× relationship-fanout reduction |
 | HNSW replay and structural catalog batch | complete | `477fd45`, `36cea9b`; 230 focused tests and Ruff pass |
-| Pulse critical rendering path | implemented, validation in progress | one-snapshot fanout 1.74–2.08 s; backend and frontend focused tests |
+| Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
+| Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |

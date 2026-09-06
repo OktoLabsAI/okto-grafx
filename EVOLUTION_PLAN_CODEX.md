@@ -18,9 +18,12 @@
   está publicada até `feature/v0.0.3@2562853`: o fan-out do engine caiu de 4,48 s para 1,10–1,23 s
   no grafo ativo; replay HNSW em lote só ocorre por capacidade explícita com revalidação da
   geração; e DDL passou a clonar estruturalmente definições imutáveis. O companion Pulse
-  `perf/v0.3.3-kg-load-grafx@e2b6053` libera o canvas sem aguardar stats/health, elimina o segundo
-  `/graph` do mount e agrupa os layouts relacionais em um snapshot, preservando fallback e
-  diagnóstico por tabela. Escopo, números, invariantes, rejeições e próximos itens finitos estão
+  `perf/v0.3.3-kg-load-grafx@880db68` libera o canvas sem aguardar stats/health, elimina o segundo
+  `/graph` do mount, agrupa os layouts relacionais em um snapshot e reduz o fan-out de estatísticas
+  de 81 leituras para uma contagem agrupada de nós mais um batch relacional. No grafo ativo, os
+  dois helpers de contagem mediram 0,662 s e 2,178 s, com 2.001 nós, 3.004 arestas e zero tabelas
+  falhas; fallback e diagnóstico exato por tabela foram preservados. Escopo, números, invariantes,
+  rejeições e próximos itens finitos estão
   em `docs/PERFORMANCE_ROUND_0_0_3.md`. O próximo lote R-1 já foi delegado para revisão por
   identidade de statement e revisão do registry; multiwriter/multireader, WAL, ambas as OCC,
   durabilidade e consistência continuam invariantes não negociáveis.
