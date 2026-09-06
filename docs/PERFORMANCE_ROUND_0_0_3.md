@@ -193,6 +193,13 @@ The accepted Claude batch adds two further internal improvements:
   previously validated serialized image. Mutation dictionaries remain independent in both
   directions; subclasses retain the defensive serialize/deserialize round trip. This removes
   the former O(tables x columns) encode/decode from every DDL statement.
+- Statement-scoped index authority is retained by exact parsed-statement identity only while the
+  catalog object, concrete manager and registry revision remain identical. A transaction with
+  speculative DDL never uses the memo; parse-cache eviction removes the corresponding entry and
+  the independent memo bound is 256. The component dropped from 48.2 to 5.4 microseconds per
+  node statement and from 100.4 to 5.6 microseconds per relationship statement in Claude's
+  alternating harness. This is an 8.9–18× local gain but only about 0.5% of the measured Pulse
+  transfer, so it is recorded as a safe small removal rather than a headline end-to-end gain.
 
 Two apparent follow-ups are deliberately not being smuggled into this wave. R-3 cannot skip the
 commit-time tuple encoding solely because `intent.values` retained object identity: the direct
@@ -214,5 +221,6 @@ the same endpoint visibility and canonical-reference validation as ordinary trav
 | Claude/Codex final selection | complete | finite selection and rejected guarantee changes above |
 | First Grafx implementation batch | complete | `4638204`, 3.6–4.1× relationship-fanout reduction |
 | HNSW replay and structural catalog batch | complete | `477fd45`, `36cea9b`; 230 focused tests and Ruff pass |
+| Statement authority memo | complete | `4786496`; identity/catalog/revision/DDL fences, 39 integrated focused tests and Ruff pass |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |

@@ -23,9 +23,11 @@
   de 81 leituras para uma contagem agrupada de nós mais um batch relacional. No grafo ativo, os
   dois helpers de contagem mediram 0,662 s e 2,178 s, com 2.001 nós, 3.004 arestas e zero tabelas
   falhas; fallback e diagnóstico exato por tabela foram preservados. Escopo, números, invariantes,
-  rejeições e próximos itens finitos estão
-  em `docs/PERFORMANCE_ROUND_0_0_3.md`. O próximo lote R-1 já foi delegado para revisão por
-  identidade de statement e revisão do registry; multiwriter/multireader, WAL, ambas as OCC,
+  rejeições e próximos itens finitos estão em `docs/PERFORMANCE_ROUND_0_0_3.md`. O R-1 foi
+  integrado em `4786496`: a projeção de autoridade dos índices só é memoizada para a identidade
+  exata do statement sob o mesmo objeto de catálogo, manager concreto e revisão do registry;
+  DDL especulativo recusa o atalho. O componente caiu 8,9–18× no harness alternado, mas representa
+  apenas cerca de 0,5% do transfer Pulse medido. Multiwriter/multireader, WAL, ambas as OCC,
   durabilidade e consistência continuam invariantes não negociáveis.
 
 - **Lote de escala 53 — histórico de intents indexado por tabela.** `a0b0508`, endurecido em
