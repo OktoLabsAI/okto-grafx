@@ -646,6 +646,36 @@ class Catalog:
             self._serialized_memo = encoded
         return encoded
 
+    def copy(self) -> Catalog:
+        """Return an independent catalog holding exactly this state.
+
+        Every definition is an immutable value and every sanctioned change installs a
+        replacement through one of the installers above, so an exact catalog is cloned by
+        copying its dictionaries: the clone shares the ``TableDef``, ``EmbeddingSpaceDef`` and
+        ``CatalogIndexDefinition`` instances and the already-validated serialized image, and a
+        mutation of either side clears only that side's derived values.  Decoding the serialized
+        bytes again -- the previous way to obtain a working copy -- validated nothing the
+        installers had not already validated, and cost O(tables x columns) for every DDL
+        statement of a transaction.  Whatever the serializer refuses about this state is still
+        refused at the next serialization of either copy, because a refused state never earns
+        an image.  A subclass keeps the serialized round trip: it may observe serialization.
+        """
+        if type(self) is not Catalog:
+            return Catalog.deserialize(self.serialize())
+        clone = Catalog()
+        clone._tables = dict(self._tables)
+        clone._tables_by_id = dict(self._tables_by_id)
+        clone._spaces = dict(self._spaces)
+        clone._spaces_by_id = dict(self._spaces_by_id)
+        clone._format_version = self._format_version
+        clone._required_capabilities = self._required_capabilities
+        clone._indexes = dict(self._indexes)
+        clone._indexes_by_key = dict(self._indexes_by_key)
+        clone._index_definitions_by_table = dict(self._index_definitions_by_table)
+        clone._active_index_definitions_memo = self._active_index_definitions_memo
+        clone._serialized_memo = self._serialized_memo
+        return clone
+
     @classmethod
     def deserialize(cls, raw: bytes) -> Catalog:
         """Parse a serialised catalog, refusing foreign bytes, a future format or a bad sum."""

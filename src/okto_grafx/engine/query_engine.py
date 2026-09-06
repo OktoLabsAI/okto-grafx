@@ -3653,7 +3653,11 @@ class QueryEngine:
         # never by pruning against a catalog, because another open transaction's attachments
         # are absent from every catalog this statement can see.
         base = self._working_catalog(txn)
-        catalog = Catalog.deserialize(base.serialize())
+        # A structural copy: the immutable definitions are shared and only the dictionaries
+        # are new, so the clone is still adopted whole or discarded whole.  The serialized
+        # round trip this replaces validated nothing the installers had not, at O(tables x
+        # columns) per statement.
+        catalog = base.copy()
         undo: list[_SchemaEffect] = []
         take_mark = getattr(txn, "staging_mark", None)
         discard = getattr(txn, "discard_since", None)
