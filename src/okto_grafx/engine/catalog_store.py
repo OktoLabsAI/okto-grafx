@@ -51,7 +51,14 @@ MINIMUM_FRAMES: int = 2
 class CatalogStore:
     """Load, save and repair the catalog of one database through its own paged file."""
 
-    __slots__ = ("_pool", "_file", "_catalog", "_loaded_epoch", "_persisted_image")
+    __slots__ = (
+        "_pool",
+        "_file",
+        "_catalog",
+        "_loaded_epoch",
+        "_persisted_image",
+        "_bootstrapped_epoch",
+    )
 
     def __init__(self, pool: BufferPool, *, file: str = CATALOG_FILE) -> None:
         """Bind the store to a buffer pool and a file, starting from an empty catalog."""
@@ -78,6 +85,9 @@ class CatalogStore:
         # that the invariant is total -- a store that never read is still a store whose empty
         # catalog would overwrite whatever a replay put under it.
         self._loaded_epoch: int = self._pool.structure_epoch(self._file)
+        # This memo belongs only to internal require doors. ``is_bootstrapped`` remains an
+        # authoritative physical probe every time a public caller asks it.
+        self._bootstrapped_epoch: int | None = None
 
     def has_unsaved_changes(self) -> bool:
         """Return True when this store holds a catalog the pages do not.
@@ -86,6 +96,44 @@ class CatalogStore:
         boundary and never on a read that finds nothing has happened.
         """
         return self._catalog.serialize() != self._persisted_image
+
+    def persisted_image(self) -> bytes:
+        """Return the immutable catalog image last adopted from the current page view.
+
+        This does not refresh or serialize the mutable catalog object.  Transaction boundaries
+        use the value on both sides of :meth:`refresh` to distinguish a cache/view invalidation
+        from a real catalog-authority change without rescanning every index artifact.
+        """
+
+        return self._persisted_image
+
+    def rebase_unsaved_view_if_persisted_unchanged(self) -> bool:
+        """Rebase a dirty live catalog only when durable authority is unchanged.
+
+        Establishing a first or unproved read view may discard clean catalog frames even when
+        no catalog page changed.  That cache event moves :meth:`_view_epoch`, and the ordinary
+        :meth:`refresh` door must then refuse a live catalog with unsaved changes because
+        replacing it would lose the caller's work.
+
+        Transaction authority synchronization has one safe narrower answer: read the newly
+        attached pages without adopting them and compare their complete canonical image with
+        the image this live catalog was derived from.  Equality proves that only the local view
+        changed, so advancing the view epoch preserves the unsaved delta.  A different image,
+        malformed pages, or any read failure is never converted into permission; the caller
+        proceeds through the established refusing refresh path (or propagates corruption).
+
+        This door deliberately does nothing for a clean catalog.  Clean state belongs to
+        :meth:`refresh`, which must adopt the newly read object rather than merely move a token.
+        """
+
+        current = self._view_epoch()
+        if current == self._loaded_epoch or not self.has_unsaved_changes():
+            return False
+        observed = self.read_from_pages().serialize()
+        if observed != self._persisted_image:
+            return False
+        self._loaded_epoch = current
+        return True
 
     def refresh(self) -> bool:
         """Re-read the catalog when the pages under it may have moved, and say whether it did.
@@ -159,11 +207,14 @@ class CatalogStore:
         """
         storage = self._pool.storage
         if not storage.exists(self._file) or storage.page_count(self._file) == 0:
+            self._bootstrapped_epoch = None
             return False
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
+                self._bootstrapped_epoch = None
                 return False
             self._require_header_page(page)
+        self._bootstrapped_epoch = self._pool.derived_epoch(self._file)
         return True
 
     def bootstrap(self) -> Catalog:
@@ -642,6 +693,14 @@ class CatalogStore:
 
     def _require_bootstrapped(self) -> None:
         """Refuse to work against a catalog file that has not been created yet."""
+        if self._bootstrapped_epoch == self._pool.derived_epoch(self._file):
+            # Reuse only the device-existence/page-count proof.  A resident header can still be
+            # modified without moving the pool's derived epoch, so keep the cheap hot-frame pin
+            # and structural validation that prevents an in-memory corruption from being hidden
+            # behind this optimization.
+            with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
+                self._require_header_page(page)
+            return
         if not self.is_bootstrapped():
             raise GrafxCorruptionDetected(
                 f"The catalog file {self._file!r} has no header page; call bootstrap() first.",

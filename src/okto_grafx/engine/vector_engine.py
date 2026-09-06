@@ -73,8 +73,10 @@ from typing import Protocol
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
+    GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
+    GrafxUnsupportedOperation,
     GrafxVectorValidationError,
 )
 from okto_grafx.domain.ids import NO_LSN, Csn, Lsn, RecordId, RecordRef
@@ -83,6 +85,7 @@ from okto_grafx.domain.index.definition import (
     index_definition_matches_table,
 )
 from okto_grafx.domain.index.entry import IndexEntry
+from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.records import IndexChange, IndexOperation
 from okto_grafx.domain.index.visibility import (
     IndexVisibility,
@@ -96,6 +99,7 @@ from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.events import EventSink
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.vectormath import DistanceMetric, VectorMath
+from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.vector.filter import CandidateFilter
 from okto_grafx.domain.vector.key import (
     VECTOR_KEY_SIZE,
@@ -185,6 +189,15 @@ _SPACES_RETIRED = metric("oktografx_vector_space_retired_total").name
 _COVERAGE = metric("oktografx_vector_space_coverage_ratio").name
 _INDEX_AGE = metric("oktografx_vector_index_age_seconds").name
 
+_EXACT_WITNESS_COST_FACTOR: int = 4
+"""Minimum headroom required before exact search probes materialised candidate refs.
+
+One targeted authentication still scans the vector key's hash bucket. Requiring the number of
+witnesses, multiplied by four, to fit below BOTH the live corpus and the bucket directory keeps
+that work to at most a quarter of either conservative bound. Broad filters retain the canonical
+whole-index walk, which is the cheaper and simpler route for them.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class ScoredEntry:
@@ -229,6 +242,77 @@ class VectorSearchResult:
     requested_k: int
     space: str
     filter_cardinality: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializedCandidateFilter:
+    """An internal, immutable proof of the exact heap refs a query materialised.
+
+    A public :class:`CandidateFilter` says only which record ids it admits.  It cannot authorize
+    point reads because an arbitrary predicate carries no proof of where those records live.
+    The query engine obtains this private shape from the owning :class:`VectorEngine` only after
+    it has materialised ``RowBinding`` objects, and the owner token prevents a shape minted by a
+    different engine from being treated as local authority.
+
+    This is a search acceleration, not a global integrity check.  Every witness and vector-index
+    bucket actually visited is authenticated; damage in an unrelated bucket remains the remit of
+    the index verifier/full scan and need not be discovered by a selective search.
+    """
+
+    record_ids: frozenset[RecordId]
+    witnesses: tuple[tuple[RecordId, RecordRef], ...]
+    space: str
+    table_id: int
+    position: int
+    read_lsn: Lsn
+    owner: object
+
+    @property
+    def cardinality(self) -> int:
+        """Return the exact number of distinct record ids represented by the proof."""
+        return len(self.record_ids)
+
+    def admits(self, record_id: RecordId) -> bool:
+        """Admit exactly the records materialised by the query child."""
+        return record_id in self.record_ids
+
+
+@dataclass(frozen=True, slots=True)
+class _FilteredCandidateProof:
+    """A bounded proof produced while the vector index still owns candidate discovery.
+
+    ``candidates`` is present only when the certified index was exhausted at or below the exact
+    threshold.  The proof then carries the complete, already space-validated set and its physical
+    references, so scoring does not repeat either the heap scan or the predicate.  ``None`` means
+    that ``threshold + 1`` admitted rows were witnessed: it proves only the approximate regime and
+    deliberately retains neither an O(N) id set nor a false exact cardinality.
+    """
+
+    space: EmbeddingSpaceDef
+    index: VectorHnswIndex
+    table_id: int
+    position: int
+    read_lsn: Lsn
+    candidates: tuple[tuple[RecordId, tuple[float, ...]], ...] | None
+    locations: tuple[tuple[RecordId, RecordRef], ...] | None
+    owner: object
+
+
+@dataclass(frozen=True, slots=True)
+class _LazyFilteredCandidateFilter:
+    """The predicate used by HNSW after a bounded proof established an approximate regime."""
+
+    record_predicate: Callable[[RecordId], bool]
+    entry_predicate: Callable[[RecordId, RecordRef], bool]
+
+    @property
+    def cardinality(self) -> None:
+        """Keep the selective size honest: the proof established a lower bound, not a count."""
+        return None
+
+    def admits(self, record_id: RecordId) -> bool:
+        """Resolve membership lazily so rejected HNSW nodes remain traversal bridges."""
+        return self.record_predicate(record_id)
 
 
 def _require_positive_k(k: int) -> int:
@@ -351,6 +435,31 @@ def _guarded_admits(
     return admits
 
 
+def _guarded_entry_admits(
+    candidate_filter: _LazyFilteredCandidateFilter,
+) -> Callable[[RecordId, RecordRef], bool]:
+    """Contain a private ref-aware predicate without dropping a membership failure."""
+    inner = candidate_filter.entry_predicate
+
+    def admits(record_id: RecordId, ref: RecordRef) -> bool:
+        """Ask about the exact HNSW entry whose score may influence the traversal."""
+        try:
+            return bool(inner(record_id, ref))
+        except GrafxError:
+            raise
+        except Exception as failure:  # noqa: BLE001 - translated, never swallowed
+            raise GrafxIndexError(
+                f"The candidate filter of this search failed on record {record_id}: "
+                f"{type(failure).__name__}.",
+                field="candidate_filter",
+                value=record_id,
+                page=ref.page,
+                slot=ref.slot,
+            ) from failure
+
+    return admits
+
+
 class GraphGuard(Protocol):
     """What the derived graph needs from a lock: a context manager that can wait, wake, and say
     which thread is asking.
@@ -461,11 +570,12 @@ class _GraphSnapshot:
     walk (then the picture is ahead of its mark, which costs one rebuild) or not (then the mark
     says so). The maps are mutated in place by the warm path, under the same
     discipline as the graph -- an entry is registered before its node becomes reachable -- and a
-    search that captured this picture keeps every part of it for as long as it runs.
+    search that captured this picture keeps every part of it for as long as it runs.  The derived
+    planner count is deliberately separate: only the graph guard reads or writes it.
     """
 
     graph: HnswGraph
-    node_of_ref: dict[int, int]
+    node_of_entry: dict[tuple[bytes, int], int]
     entry_of_node: dict[int, IndexEntry]
     record_of_node: dict[int, RecordId]
     mark: Lsn
@@ -474,7 +584,7 @@ class _GraphSnapshot:
         """Return this same picture -- same graph, same maps -- carrying a newer mark."""
         return _GraphSnapshot(
             graph=self.graph,
-            node_of_ref=self.node_of_ref,
+            node_of_entry=self.node_of_entry,
             entry_of_node=self.entry_of_node,
             record_of_node=self.record_of_node,
             mark=mark,
@@ -508,9 +618,13 @@ class VectorHnswIndex(ProximityIndex):
         "_neighbours",
         "_ef_construction",
         "_ef_search",
+        "_compact_vectors",
         "_guard",
         "_refresh",
         "_snapshot",
+        "_live_count",
+        "_live_count_mark",
+        "_live_count_generation",
         "_graph_generation",
         "_building",
         "_builder",
@@ -534,6 +648,7 @@ class VectorHnswIndex(ProximityIndex):
         neighbours: int = DEFAULT_NEIGHBOURS,
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         ef_search: int = DEFAULT_EF_SEARCH,
+        _compact_vectors: bool = False,
         guard: GraphGuard | None = None,
         refresh: Callable[[str, object], None] | None = None,
     ) -> None:
@@ -556,11 +671,19 @@ class VectorHnswIndex(ProximityIndex):
         self._neighbours = neighbours
         self._ef_construction = ef_construction
         self._ef_search = search_width
+        self._compact_vectors = _compact_vectors
         self._guard: GraphGuard = _UnguardedBuild() if guard is None else guard
         self._refresh = refresh
         # The published picture, or None while there is none. Replaced by ONE assignment under
         # the guard, captured by ONE read; never edited into a different picture in place.
         self._snapshot: _GraphSnapshot | None = None
+        # The planner needs the cardinality of the durable entry set, not a
+        # snapshot-relative count.  Keep that answer process-local beside the
+        # graph it describes.  It is never a certificate: every read still
+        # enters ``_stable_view`` and rejects/rebases it when page 0 moved.
+        self._live_count: int | None = None
+        self._live_count_mark: Lsn | None = None
+        self._live_count_generation: object | None = None
         # Identity of the paged generation from which a graph may be published. A durable cache
         # rebase replaces this token even when built_through_lsn stays equal, so a build that
         # started over the superseded pages cannot publish after the rebase.
@@ -670,11 +793,137 @@ class VectorHnswIndex(ProximityIndex):
             VectorValue(tuple(components), self._space_id, self._storage_dtype)
         )
 
+    def _authenticate_exact_witnesses_unchecked(
+        self, witnesses: Sequence[tuple[bytes, RecordRef]]
+    ) -> bool:
+        """Authenticate a selective batch inside the caller's stable index view.
+
+        Keys are grouped by bucket so a collision never makes the same page chain run once per
+        witness. Every selected bucket is decoded in full, so corruption in a bucket this search
+        actually relies on is still reported. Unselected buckets are intentionally outside this
+        search proof; the global verifier remains responsible for diagnosing them.
+
+        This is not asymptotic O(K) while the directory has a fixed bucket count: expected work
+        is ``Theta(U * E / B)`` for ``U`` selected buckets, ``E`` entries and ``B`` buckets. The
+        engine's separate cost guard limits ``U <= witnesses <= B/4`` and falls back to the full
+        canonical walk for broad filters.
+        """
+        expected_by_bucket: dict[int, set[tuple[bytes, RecordRef]]] = {}
+        for key, ref in witnesses:
+            own_key = self.require_own_key(key)
+            bucket = bucket_of(own_key, self.definition.bucket_count)
+            expected_by_bucket.setdefault(bucket, set()).add((own_key, ref))
+        for bucket in sorted(expected_by_bucket):
+            expected = expected_by_bucket[bucket]
+            found: set[tuple[bytes, RecordRef]] = set()
+            for page_index in self._bucket_pages(bucket):
+                for entry in self._entries_on(page_index):
+                    identity = (entry.key, entry.ref)
+                    if identity in expected:
+                        found.add(identity)
+            if found != expected:
+                return False
+        return True
+
     # --- counting ---------------------------------------------------------------------------
 
     def live_count(self) -> int:
-        """Return how many entries have not been ended by any commit."""
-        return sum(1 for entry in self._stable_entries(NO_LSN) if entry.live)
+        """Return the exact durable live cardinality under one page-0 fence.
+
+        A hot count avoids an index walk, but never avoids the index view
+        proof.  A foreign writer therefore either leaves the same certificate
+        in place (and the cached count is exact), or causes ``begin_exact_read``
+        to rebase this handle and discard the derived count before it can be
+        observed.  The cold fallback deliberately remains the old exact walk.
+        """
+
+        def count(certificate: object) -> tuple[int, Lsn, object]:
+            """Resolve the exact count bound to one validated index certificate."""
+            mark = getattr(
+                getattr(certificate, "header", None), "built_through_lsn", None
+            )
+            if not isinstance(mark, int):
+                raise GrafxIndexError(
+                    f"Index {self.name!r} supplied no durable build position for live count.",
+                    field="certificate",
+                    index=self.name,
+                    file=self.file,
+                )
+            with self._guard:
+                if (
+                    self._live_count is not None
+                    and self._live_count_mark == mark
+                    and self._live_count_generation is self._graph_generation
+                ):
+                    return self._live_count, mark, self._graph_generation
+                generation = self._graph_generation
+            # No pool or store operation occurs while the graph guard is held.
+            return (
+                self._entry_counts_from_headers()[1],
+                mark,
+                generation,
+            )
+
+        live, mark, generation = self._stable_view(NO_LSN, count)
+        with self._guard:
+            # A cache rebase while the stable read was finishing makes this
+            # measurement old immediately.  It may still be returned because
+            # the read fence proved it; it simply is not retained.
+            if generation is self._graph_generation:
+                self._live_count = live
+                self._live_count_mark = mark
+                self._live_count_generation = generation
+        return live
+
+    def snapshot_frontier_live_count(self, snapshot: SnapshotLike) -> int | None:
+        """Return the live count only when this snapshot is the index's exact frontier.
+
+        This is the narrow proof used by the query engine's whole-table vector access path.  A
+        cached count by itself is not enough: an older snapshot may see tombstoned entries and
+        must keep the materialised candidate filter that describes that historical view.  The
+        count is therefore read inside the ordinary pre/post page-0 certificate, and is returned
+        only when that certificate's durable frontier is exactly ``snapshot.read_lsn``.
+
+        ``None`` is a cost-only verdict.  It asks the caller to use its canonical materialised
+        candidate path; it never weakens freshness, visibility or the stale-index refusal.
+        """
+        read_lsn = self._require_exact_read_lsn(snapshot)
+
+        def count(
+            certificate: object,
+        ) -> tuple[int, Lsn, object] | None:
+            """Count one certified frontier, or decline a historical/ahead view."""
+            header = getattr(certificate, "header", None)
+            mark = getattr(header, "built_through_lsn", None)
+            if mark != read_lsn:
+                return None
+            with self._guard:
+                if (
+                    self._live_count is not None
+                    and self._live_count_mark == mark
+                    and self._live_count_generation is self._graph_generation
+                ):
+                    return self._live_count, mark, self._graph_generation
+                generation = self._graph_generation
+            # No pool operation occurs while the graph guard is held.  The header pass validates
+            # every stored image but avoids materialising entry DTOs; D-12 makes every later
+            # query at this generation O(1).
+            return (
+                self._entry_counts_from_headers()[1],
+                mark,
+                generation,
+            )
+
+        measured = self._stable_view(read_lsn, count)
+        if measured is None:
+            return None
+        live, mark, generation = measured
+        with self._guard:
+            if generation is self._graph_generation:
+                self._live_count = live
+                self._live_count_mark = mark
+                self._live_count_generation = generation
+        return live
 
     def visible_count(self, snapshot: SnapshotLike) -> int:
         """Return how many entries one snapshot may see."""
@@ -706,7 +955,19 @@ class VectorHnswIndex(ProximityIndex):
         """
         with self._guard:
             self._snapshot = None
+            self._discard_live_count_locked()
             self._graph_generation = object()
+
+    def _discard_live_count_locked(self) -> None:
+        """Forget a derived count while the graph guard is already held."""
+        self._live_count = None
+        self._live_count_mark = None
+        self._live_count_generation = None
+
+    def _discard_live_count(self) -> None:
+        """Forget a count whose source moved but has no warm picture to update."""
+        with self._guard:
+            self._discard_live_count_locked()
 
     def graph(self) -> HnswGraph:
         """Return the graph of the current picture, building one when there is none or it is behind."""
@@ -858,16 +1119,50 @@ class VectorHnswIndex(ProximityIndex):
                 seed=self._seed ^ self._space_id,
                 neighbours=self._neighbours,
                 ef_construction=self._ef_construction,
+                _component_typecode=(
+                    "f"
+                    if self._compact_vectors and self._storage_dtype == "float32"
+                    else "d"
+                    if self._compact_vectors
+                    else None
+                ),
+                _cache_construction_link_scores=(
+                    type(self._math).__dict__.get(
+                        "_stable_pair_scores_for_construction"
+                    )
+                    is True
+                ),
             ),
-            node_of_ref={},
+            node_of_entry={},
             entry_of_node={},
             record_of_node={},
             mark=mark,
         )
-        for entry in sorted(
-            self.walk(), key=lambda item: (item.born_csn, item.ref.encode())
-        ):
-            self._install(picture, entry)
+        try:
+            for header in sorted(
+                self._entry_headers(),
+                key=lambda item: (item.born_csn, item.encoded_ref),
+            ):
+                # The header walk has already validated every persisted image before this first
+                # fallible heap/vector operation.  Construct the final graph-owned DTO once,
+                # with its physical location, instead of decode + ``located_at`` constructing it
+                # twice.
+                self._install(
+                    picture,
+                    IndexEntry(
+                        key=header.key,
+                        ref=RecordRef.decode(header.encoded_ref),
+                        versioned=header.versioned,
+                        born_csn=header.born_csn,
+                        dead_csn=header.dead_csn,
+                        page=header.page,
+                        slot=header.slot,
+                    ),
+                )
+        finally:
+            # Success publishes no duplicate score residency; failure discards the local graph
+            # and also drops the potentially large transient cache before propagating.
+            picture.graph._finish_construction()
         return picture
 
     def _retire(self, picture: _GraphSnapshot) -> None:
@@ -880,6 +1175,7 @@ class VectorHnswIndex(ProximityIndex):
         with self._guard:
             if self._snapshot is picture:
                 self._snapshot = None
+                self._discard_live_count_locked()
 
     def _certify(self, picture: _GraphSnapshot, mark: Lsn) -> None:
         """Republish ``picture`` carrying ``mark``, if it is still the published one.
@@ -890,7 +1186,13 @@ class VectorHnswIndex(ProximityIndex):
         """
         with self._guard:
             if self._snapshot is picture:
-                self._snapshot = picture.certified(mark)
+                certified = picture.certified(mark)
+                self._snapshot = certified
+                if (
+                    self._live_count_generation is self._graph_generation
+                    and self._live_count_mark == picture.mark
+                ):
+                    self._live_count_mark = mark
 
     def _install(self, picture: _GraphSnapshot, entry: IndexEntry) -> None:
         """Put one stored entry into a picture, resolving its components through the resolver.
@@ -900,15 +1202,15 @@ class VectorHnswIndex(ProximityIndex):
         refusal inside ``graph.insert`` can leave the graph half-linked and a half-linked graph
         is discarded, never repaired.
         """
-        encoded = entry.ref.encode()
-        node = picture.node_of_ref.get(encoded)
+        identity = (entry.key, entry.ref.encode())
+        node = picture.node_of_entry.get(identity)
         if node is not None:
             picture.entry_of_node[node] = entry
             return
-        self._install_fresh(picture, entry, encoded)
+        self._install_fresh(picture, entry, identity)
 
     def _install_fresh(
-        self, picture: _GraphSnapshot, entry: IndexEntry, encoded: int
+        self, picture: _GraphSnapshot, entry: IndexEntry, identity: tuple[bytes, int]
     ) -> None:
         """Resolve, check and insert one entry that the picture does not hold yet."""
         try:
@@ -951,20 +1253,48 @@ class VectorHnswIndex(ProximityIndex):
         entries[node] = entry
         picture.record_of_node[node] = record_id
         picture.graph.insert(node, components)
-        picture.node_of_ref[encoded] = node
+        picture.node_of_entry[identity] = node
+
+    def _adjust_live_count(self, picture: _GraphSnapshot, delta: int) -> None:
+        """Apply one exact warm entry delta to the separately guarded count cache.
+
+        ``_note`` calls this only after locating the exact durable entry
+        identity, ``(key, ref)``.  The graph/maps retain their established
+        warm-path publication discipline; this scalar is never stored in that
+        mutable picture and never read or written outside the graph guard.
+        """
+        with self._guard:
+            if (
+                self._snapshot is picture
+                and self._live_count is not None
+                and self._live_count_mark == picture.mark
+                and self._live_count_generation is self._graph_generation
+            ):
+                next_count = self._live_count + delta
+                if next_count < 0:
+                    # The entry change is already durable.  A broken derived
+                    # metric must never turn that fact into a failed commit or
+                    # a recovery path: forget it and let the next fenced read
+                    # take the canonical walk.
+                    self._discard_live_count_locked()
+                    return
+                self._live_count = next_count
 
     def _note(self, picture: _GraphSnapshot, change: IndexChange) -> bool:
-        """Bring one published picture in line with one applied change; say whether it survived.
+        """Bring a warm picture in line with one proven durable entry change.
 
-        Returns False when the change retired the picture -- a RESET, a removal, or a refusal on
-        the way in -- so the caller stops noting into a picture nobody can reach any more and,
-        above all, does not certify it.
+        The index manager is intentionally idempotent: a duplicate INSERT or
+        a TOMBSTONE whose target is absent reports no failure at its durable
+        door.  A ref alone is not an entry identity, so every warm lookup uses
+        the pair the paged store uses, ``(key, ref)``.  Consequently a key
+        mismatch is a no-op here too, while the same ref under a second key
+        becomes a distinct graph node and increments the guarded count.
         """
         if change.operation is IndexOperation.RESET:
             self._retire(picture)
             return False
-        encoded = change.ref.encode()
-        node = picture.node_of_ref.get(encoded)
+        identity = (change.key, change.ref.encode())
+        node = picture.node_of_entry.get(identity)
         if change.operation is IndexOperation.INSERT:
             if node is None:
                 try:
@@ -978,24 +1308,20 @@ class VectorHnswIndex(ProximityIndex):
                         ),
                     )
                 except BaseException:
-                    # EVERY refusal on the way into the graph discards the picture, not only
-                    # the late one inside graph.insert: the two early refusals used to re-raise
-                    # with the graph intact, and a search then answered out of a graph missing
-                    # the row (C9 round-2 B4: five nodes, live_count six, stale False).
                     self._retire(picture)
                     raise
+                self._adjust_live_count(picture, 1)
             return True
         if node is None:
             return True
         if change.operation is IndexOperation.TOMBSTONE:
-            picture.entry_of_node[node] = picture.entry_of_node[node].ended_at(
-                change.csn
-            )
+            previous = picture.entry_of_node[node]
+            picture.entry_of_node[node] = previous.ended_at(change.csn)
+            if previous.live:
+                self._adjust_live_count(picture, -1)
             return True
-        # A removal mutates the graph's neighbour lists and unlinks a node; done in place under
-        # a traversal on another thread, that traversal can step onto a node that is no longer
-        # there. Derived state is discarded rather than edited, and rebuilt on the next search
-        # (a reconcile pass removes many entries in one go and pays one rebuild for all of them).
+        # A physical removal mutates graph links, so it remains a whole-picture
+        # retirement and the next planner recounts from the durable entries.
         self._retire(picture)
         return False
 
@@ -1017,6 +1343,10 @@ class VectorHnswIndex(ProximityIndex):
         current = picture is not None and picture.mark == self.built_through_lsn
         applied = super().commit(txn, csn)
         if picture is None:
+            # Metrics may have asked for a cold count before this commit.  No
+            # picture exists to receive the delta, so retaining it would let
+            # the next planner see the prior durable cardinality.
+            self._discard_live_count()
             return applied
         if not current:
             self._retire(picture)
@@ -1035,13 +1365,44 @@ class VectorHnswIndex(ProximityIndex):
         picture = self._snapshot
         current = picture is not None and picture.mark == self.built_through_lsn
         super().apply(record)
-        if change.index != self.name or picture is None:
+        if change.index != self.name:
+            return
+        if picture is None:
+            self._discard_live_count()
             return
         if not current:
             self._retire(picture)
             return
         if self._note(picture, change):
             self._certify(picture, self.built_through_lsn)
+
+    def _batch_replay_admits(self) -> bool:
+        """Join a composed replay batch only while no published picture could observe it.
+
+        With no picture, :meth:`apply` degenerates to the canonical protocol plus forgetting the
+        derived live count, and both are what :meth:`_batch_replay_settled` reproduces once at
+        the end.  With a picture the per-record ``_note``/``_certify`` discipline needs the
+        header to move per record, which a composed header does not, so the scalar protocol
+        stays.  Only this exact type answers: a subclass may have changed what ``apply`` means.
+        """
+        if type(self) is not VectorHnswIndex:
+            return False
+        with self._guard:
+            return self._snapshot is None
+
+    def _batch_replay_settled(self, *, moved: bool) -> None:
+        """Forget derived state once, after the composed header decision of a batch.
+
+        The buckets moved under a header that did not advance until now.  A picture that was
+        built meanwhile may therefore describe entries beyond its mark, so it is REPLACED (never
+        certified), exactly as :meth:`invalidate_graph` does; with no picture the live count is
+        the only derived value and it is forgotten as the scalar path would have done per record.
+        """
+        with self._guard:
+            if self._snapshot is not None:
+                self._snapshot = None
+                self._graph_generation = object()
+            self._discard_live_count_locked()
 
     def mark_stale(self, reason: str, *, persist: bool = True) -> None:
         """Record staleness as requested, and drop the graph derived from doubtful entries."""
@@ -1077,6 +1438,7 @@ class VectorHnswIndex(ProximityIndex):
         admits: Callable[[RecordId], bool] | None = None,
         *,
         ef: int | None = None,
+        entry_admits: Callable[[RecordId, RecordRef], bool] | None = None,
     ) -> tuple[tuple[ScoredEntry, ...], TraversalStats]:
         """Return the best visible, admitted versions for a query, with traversal statistics.
 
@@ -1096,6 +1458,12 @@ class VectorHnswIndex(ProximityIndex):
         the build verified (commits landing during the build are caught up, in bounded passes),
         a commit past the last pass leaves the mark behind, and the NEXT search takes it.
         """
+        if admits is not None and entry_admits is not None:
+            raise GrafxConfigurationError(
+                "A vector traversal accepts either a record filter or a ref-aware entry "
+                "filter, never both.",
+                field="candidate_filter",
+            )
         predicate = _require_snapshot(snapshot)
         read_lsn = self._require_exact_read_lsn(predicate)
 
@@ -1119,10 +1487,12 @@ class VectorHnswIndex(ProximityIndex):
                 entry = entries.get(node)
                 if entry is None or not entry_visible(entry, predicate):
                     return False
-                if admits is None:
-                    return True
                 record = records.get(node)
-                return record is not None and bool(admits(record))
+                if record is None:
+                    return False
+                if entry_admits is not None:
+                    return bool(entry_admits(record, entry.ref))
+                return admits is None or bool(admits(record))
 
             ranked, stats = picture.graph.search(query, width, visible_and_admitted)
             scored = [
@@ -1172,6 +1542,8 @@ class VectorEngine:
         "_durable_by_space",
         "_maintained_at",
         "_guard",
+        "_catalog_changes_are_wal_logged",
+        "_candidate_filter_seal",
     )
 
     def __init__(
@@ -1191,6 +1563,7 @@ class VectorEngine:
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
         ef_search: int = DEFAULT_EF_SEARCH,
         guard: GraphGuard | None = None,
+        catalog_changes_are_wal_logged: bool = False,
     ) -> None:
         """Build the engine over one catalog, one heap and one index registry.
 
@@ -1234,6 +1607,14 @@ class VectorEngine:
         self._durable_by_space: dict[str, VectorHnswIndex] = {}
         self._maintained_at: dict[str, float] = {}
         self._guard = guard
+        if type(catalog_changes_are_wal_logged) is not bool:
+            raise GrafxConfigurationError(
+                "catalog_changes_are_wal_logged must be exactly True or False.",
+                field="catalog_changes_are_wal_logged",
+                value=repr(catalog_changes_are_wal_logged),
+            )
+        self._catalog_changes_are_wal_logged = catalog_changes_are_wal_logged
+        self._candidate_filter_seal = object()
 
     # --- spaces -------------------------------------------------------------------------------
 
@@ -1241,6 +1622,16 @@ class VectorEngine:
     def exact_scan_threshold(self) -> int:
         """Return the filtered cardinality at or below which a search scans exactly."""
         return self._threshold
+
+    def _supports_bounded_filtered_k(self, k: int) -> bool:
+        """Say whether private filtered HNSW keeps its configured, non-linear work bound.
+
+        The public vector API may widen ``ef`` to honour a larger requested ``k``.  The query
+        optimizer has a canonical materialising fallback which can clamp ``k`` to the actual
+        filtered cardinality, so this private path declines requests that would widen its HNSW
+        beam beyond the configured search width.
+        """
+        return type(k) is int and 1 <= k <= self._ef_search
 
     def spaces(self) -> tuple[EmbeddingSpaceDef, ...]:
         """Return every embedding space of the catalog, ordered by numeric identity."""
@@ -1267,6 +1658,15 @@ class VectorEngine:
                 field="definition",
                 value=type(definition).__name__,
             )
+        if self._catalog_changes_are_wal_logged:
+            raise GrafxUnsupportedOperation(
+                "Direct VectorEngine.create_space() is disabled in this composition because "
+                "catalog changes must be staged through a write transaction; execute CREATE "
+                "VECTOR SPACE instead.",
+                operation="create_space",
+                field="catalog_mutation",
+                value="direct",
+            )
         self._catalog.catalog.add_space(definition)
         self._catalog.save()
         self._emit(
@@ -1277,6 +1677,14 @@ class VectorEngine:
 
     def retire_space(self, name: str) -> None:
         """Close the write door of one embedding space, leaving it readable forever (FR-3)."""
+        if self._catalog_changes_are_wal_logged:
+            raise GrafxUnsupportedOperation(
+                "Direct VectorEngine.retire_space() is disabled in this composition because "
+                "catalog changes must be staged through a write transaction.",
+                operation="retire_space",
+                field="catalog_mutation",
+                value="direct",
+            )
         retired = self._catalog.catalog.retire_space(name)
         self._catalog.save()
         self._metrics.increment(_SPACES_RETIRED)
@@ -1425,6 +1833,11 @@ class VectorEngine:
             neighbours=self._neighbours,
             ef_construction=self._ef_construction,
             ef_search=self._ef_search,
+            # D-13H is intentionally selected only by the already-explicit NumPy adapter.
+            # The pure oracle keeps tuple iteration because the immutable-buffer view cost is a
+            # material regression there.  This changes derived residency only; space bytes and
+            # every durable/index identity remain exactly the same.
+            _compact_vectors=self._math.name == "numpy",
             guard=self._guard,
             refresh=self._refresh_heap_view,
         )
@@ -1808,9 +2221,425 @@ class VectorEngine:
 
     # --- searching ------------------------------------------------------------------------------
 
+    def _seal_materialized_candidates(
+        self,
+        witnesses: object,
+        *,
+        space: object,
+        table_id: object,
+        position: object,
+        snapshot: object,
+        candidate_count: object,
+    ) -> CandidateFilter | None:
+        """Seal exact row witnesses produced by this engine's query layer.
+
+        This deliberately remains a private integration seam. Public candidate filters carry
+        membership, not physical authority, and therefore continue to use the canonical exact
+        scan. Repeated copies of the same row/ref pair are harmless (a graph join may materialise
+        them more than once) and are collapsed; conflicting identities are left to the canonical
+        path so its existing duplicate/corruption behaviour remains authoritative.
+        """
+        if (
+            type(space) is not str
+            or not space
+            or type(table_id) is not int
+            or table_id < 1
+            or type(position) is not int
+            or position < 0
+            or type(snapshot) is not Snapshot
+            or type(candidate_count) is not int
+            or candidate_count < 0
+        ):
+            return None
+        index = self._by_space.get(space) or self._durable_by_space.get(space)
+        if (
+            index is None
+            or index.definition.table_id != table_id
+            or index.definition.positions != (position,)
+            or _EXACT_WITNESS_COST_FACTOR * candidate_count
+            > index.definition.bucket_count
+        ):
+            # Decline before consuming the iterable. In particular, a broad/approximate query
+            # does not copy O(N) physical refs merely to discover that the cost gate rejects it.
+            return None
+        try:
+            iterator = iter(witnesses)  # type: ignore[call-overload]
+        except TypeError:
+            return None
+        unique: list[tuple[RecordId, RecordRef]] = []
+        seen_pairs: set[tuple[RecordId, RecordRef]] = set()
+        record_of_ref: dict[RecordRef, RecordId] = {}
+        ref_of_record: dict[RecordId, RecordRef] = {}
+        for witness in iterator:
+            if type(witness) is not tuple or len(witness) != 2:
+                return None
+            record_id, ref = witness
+            if (
+                type(record_id) is not int
+                or record_id < 1
+                or type(ref) is not RecordRef
+            ):
+                return None
+            previous_record = record_of_ref.get(ref)
+            if previous_record is not None and previous_record != record_id:
+                return None
+            previous_ref = ref_of_record.get(record_id)
+            if previous_ref is not None and previous_ref != ref:
+                return None
+            record_of_ref[ref] = record_id
+            ref_of_record[record_id] = ref
+            pair = (record_id, ref)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            unique.append(pair)
+        if len({record_id for record_id, _ref in unique}) != candidate_count:
+            return None
+        return _MaterializedCandidateFilter(
+            record_ids=frozenset(record_id for record_id, _ref in unique),
+            witnesses=tuple(unique),
+            space=space,
+            table_id=table_id,
+            position=position,
+            read_lsn=snapshot.read_lsn,
+            owner=self._candidate_filter_seal,
+        )
+
+    def _eligible_materialized_witnesses(
+        self,
+        candidate_filter: CandidateFilter | None,
+        snapshot: SnapshotLike,
+        index: VectorHnswIndex,
+        space: EmbeddingSpaceDef,
+        space_size: int,
+    ) -> tuple[tuple[RecordId, RecordRef], ...] | None:
+        """Return a complete, cheap internal witness set or decline to the canonical scan.
+
+        Eligibility is intentionally narrower than structural ``CandidateFilter`` conformance:
+        only the immutable shape sealed by this exact engine and an immutable production
+        :class:`Snapshot` qualify. Every admitted id must have exactly one distinct ref. The
+        fixed ``4 * refs <= min(live entries, buckets)`` inequality leaves at least fourfold
+        headroom for each targeted hash-bucket authentication; it is a conservative fixed rule,
+        not a calibration or an HNSW format change.
+        """
+        if (
+            type(candidate_filter) is not _MaterializedCandidateFilter
+            or candidate_filter.owner is not self._candidate_filter_seal
+            or type(snapshot) is not Snapshot
+            or type(candidate_filter.space) is not str
+            or type(candidate_filter.table_id) is not int
+            or type(candidate_filter.position) is not int
+            or type(candidate_filter.read_lsn) is not int
+            or candidate_filter.space != space.name
+            or candidate_filter.table_id != index.definition.table_id
+            or index.definition.positions != (candidate_filter.position,)
+            or candidate_filter.read_lsn != snapshot.read_lsn
+            or type(candidate_filter.record_ids) is not frozenset
+            or type(candidate_filter.witnesses) is not tuple
+        ):
+            return None
+        witnesses = candidate_filter.witnesses
+        if len(witnesses) != len(candidate_filter.record_ids):
+            return None
+        seen_ids: set[RecordId] = set()
+        seen_refs: set[RecordRef] = set()
+        for witness in witnesses:
+            if type(witness) is not tuple or len(witness) != 2:
+                return None
+            record_id, ref = witness
+            if (
+                type(record_id) is not int
+                or record_id < 1
+                or type(ref) is not RecordRef
+                or record_id in seen_ids
+                or ref in seen_refs
+            ):
+                return None
+            seen_ids.add(record_id)
+            seen_refs.add(ref)
+        if seen_ids != candidate_filter.record_ids:
+            return None
+        count = len(witnesses)
+        if count and _EXACT_WITNESS_COST_FACTOR * count > min(
+            space_size, index.definition.bucket_count
+        ):
+            return None
+        return witnesses
+
     def _refresh_heap_view(self, index_file: str, certificate: object) -> None:
         """Attach resolver/scan heap frames to the vector index's durable generation."""
         self._require_registry()._prepare_heap_view(index_file, certificate)
+
+    def snapshot_frontier_live_count(
+        self,
+        space: str,
+        snapshot: SnapshotLike,
+        *,
+        table_id: int,
+        position: int,
+    ) -> int | None:
+        """Return a certified whole-space count only at the snapshot's exact frontier.
+
+        The query engine uses this optional acceleration before letting a ``VectorSearch`` over
+        an unfiltered table drive heap reads from ``VectorHit.ref``.  The caller also names its
+        planned table/column pair: a space can be rebound process-locally while DDL settles, and
+        a count from any other pair cannot prove that this scan's rows and the index are the same
+        candidate set.  Mapping provenance and stale/freshness checks are identical to
+        :meth:`search`; ``None`` means only that the cheap proof is unavailable and the caller
+        must execute its child normally.
+        """
+        definition = self._catalog.catalog.space(space)
+        _require_snapshot(snapshot)
+        index = self.index(space)
+        self._require_committed_search_index(index, definition)
+        if index.definition.table_id != table_id or index.definition.positions != (
+            position,
+        ):
+            return None
+        return index.snapshot_frontier_live_count(snapshot)
+
+    def _prepare_filtered_candidates(
+        self,
+        *,
+        space: object,
+        snapshot: object,
+        table_id: object,
+        position: object,
+        row_admits: object,
+    ) -> _FilteredCandidateProof | None:
+        """Prove a row-filtered regime without materialising an unbounded record-id set.
+
+        This is a private query-engine seam, not a general candidate-filter API.  Its caller has
+        already proved a single-table, row-independent, total predicate and a current immutable
+        snapshot.  The vector index remains the candidate authority: it reads visible heap
+        versions once, asks the predicate about each row, and stops as soon as ``threshold + 1``
+        admissions prove that the ordinary planner must choose the approximate regime.
+
+        If the index is exhausted first, the retained set is complete and at most the configured
+        exact threshold.  Every admitted vector has been validated against the declared embedding
+        space before the proof leaves the stable index view, preserving BR-1's validate-before-
+        score rule.  ``None`` is an optional-gate refusal; corruption and adopted-index failures
+        remain typed failures and are never converted into a different access path.
+        """
+        if (
+            type(space) is not str
+            or not space
+            or type(snapshot) is not Snapshot
+            or type(table_id) is not int
+            or table_id < 1
+            or type(position) is not int
+            or position < 0
+            or not callable(row_admits)
+        ):
+            return None
+        definition = self._catalog.catalog.space(space)
+        index = self.index(space)
+        self._require_committed_search_index(index, definition)
+        if index.definition.table_id != table_id or index.definition.positions != (position,):
+            return None
+        frontier_count = index.snapshot_frontier_live_count(snapshot)
+        if type(frontier_count) is not int or frontier_count <= 0:
+            return None
+        read_lsn = index._require_exact_read_lsn(snapshot)
+
+        def scan(certificate: object) -> _FilteredCandidateProof:
+            """Read one certified generation until exact completion or a strict lower bound."""
+            self._refresh_heap_view(index.file, certificate)
+            candidates: list[tuple[RecordId, tuple[float, ...]]] = []
+            locations: dict[RecordId, RecordRef] = {}
+            scanned: set[int] = set()
+
+            def visible(_record_id: int, xmin: int, xmax: int) -> bool:
+                """Select snapshot-visible rows; membership remains the query predicate's job."""
+                return snapshot.visible(xmin, xmax)
+
+            def visit(ref: RecordRef) -> bool:
+                """Consume one unpinned index ref and stop at the strict regime witness."""
+                encoded = ref.encode()
+                if encoded in scanned:
+                    return True
+                scanned.add(encoded)
+                version = self._heap.read_if(ref, visible)
+                if version is None:
+                    return True
+                if version.table_id != table_id:
+                    raise GrafxCorruptionDetected(
+                        f"Vector index {index.name!r} points to table id {version.table_id}, not "
+                        f"its declared table id {table_id}.",
+                        file=index.file,
+                        field="table_id",
+                        index=index.name,
+                        space=space,
+                        table_id=table_id,
+                        actual_table_id=version.table_id,
+                        page=ref.page,
+                        slot=ref.slot,
+                    )
+                admitted = row_admits(ref, version)
+                if type(admitted) is not bool:
+                    raise GrafxIndexError(
+                        "The internal row filter must return exactly True or False.",
+                        field="candidate_filter",
+                        value=type(admitted).__name__,
+                        record_id=version.record_id,
+                    )
+                if not admitted:
+                    return True
+                stored = self._vector_of_version(definition, version, ref)
+                require_space_identity(definition, stored.space_ref, origin="stored vector")
+                previous = locations.get(version.record_id)
+                if previous is not None:
+                    raise _duplicate_version(definition, version.record_id, ref, previous)
+                locations[version.record_id] = ref
+                candidates.append((version.record_id, stored.values))
+                return len(candidates) <= self._threshold
+
+            exhausted = index._visit_entry_refs_until(visit)
+            if not exhausted:
+                return _FilteredCandidateProof(
+                    space=definition,
+                    index=index,
+                    table_id=table_id,
+                    position=position,
+                    read_lsn=read_lsn,
+                    candidates=None,
+                    locations=None,
+                    owner=self._candidate_filter_seal,
+                )
+
+            return _FilteredCandidateProof(
+                space=definition,
+                index=index,
+                table_id=table_id,
+                position=position,
+                read_lsn=read_lsn,
+                candidates=tuple(candidates),
+                locations=tuple(locations.items()),
+                owner=self._candidate_filter_seal,
+            )
+
+        return index._stable_view(read_lsn, scan)
+
+    def _prepared_filtered_candidate_count(self, proof: object) -> int | None:
+        """Return an exact prepared count, or ``None`` for the lower-bound-only regime."""
+        if type(proof) is not _FilteredCandidateProof or proof.owner is not self._candidate_filter_seal:
+            raise GrafxIndexError(
+                "A filtered candidate count needs a proof minted by this vector engine.",
+                field="candidate_filter_proof",
+            )
+        return None if proof.candidates is None else len(proof.candidates)
+
+    def _search_prepared_filtered_candidates(
+        self,
+        proof: object,
+        *,
+        query: Sequence[float],
+        k: int,
+        snapshot: object,
+        record_admits: object,
+        entry_admits: object,
+    ) -> VectorSearchResult:
+        """Score a proof minted by this engine, preserving the ordinary two-regime contract."""
+        if (
+            type(proof) is not _FilteredCandidateProof
+            or proof.owner is not self._candidate_filter_seal
+            or type(snapshot) is not Snapshot
+            or proof.read_lsn != snapshot.read_lsn
+            or not callable(record_admits)
+            or not callable(entry_admits)
+        ):
+            raise GrafxIndexError(
+                "A prepared filtered vector search must carry this engine's exact snapshot proof.",
+                field="candidate_filter_proof",
+            )
+        definition = self._catalog.catalog.space(proof.space.name)
+        _require_positive_k(k)
+        components = validate_query_components(definition, query)
+        index = self.index(definition.name)
+        self._require_committed_search_index(index, definition)
+        if (
+            definition != proof.space
+            or index is not proof.index
+            or index.definition.table_id != proof.table_id
+            or index.definition.positions != (proof.position,)
+        ):
+            raise GrafxIndexError(
+                "The vector authority changed after the filtered candidate proof was prepared.",
+                field="candidate_filter_proof",
+                space=proof.space.name,
+                retryable=True,
+            )
+
+        if proof.candidates is None:
+            # The preparation proved only ``actual cardinality > threshold``.  Keep the reported
+            # cardinality unknown rather than mislabelling threshold+1 as an exact count.  Since
+            # the certified space itself contains that many admitted rows, the ordinary planner's
+            # conservative space-size estimate selects the same approximate regime.  If a foreign
+            # commit changed the latest live count meanwhile, ``search`` still remains correct and
+            # may conservatively take its exact path over this lazy predicate.
+            return self.search(
+                space=definition.name,
+                query=components,
+                k=k,
+                snapshot=snapshot,
+                candidate_filter=_LazyFilteredCandidateFilter(
+                    record_predicate=record_admits,
+                    entry_predicate=entry_admits,
+                ),
+            )
+
+        locations = dict(proof.locations or ())
+        candidate_count = len(proof.candidates)
+        if len(locations) != candidate_count:
+            raise GrafxIndexError(
+                "A prepared exact vector proof lost its one-to-one physical witnesses.",
+                field="candidate_filter_proof",
+                space=definition.name,
+            )
+        space_size = index.live_count()
+        plan = plan_regime(
+            space_size=space_size,
+            filter_cardinality=candidate_count,
+            threshold=self._threshold,
+        )
+        if not plan.is_exact:
+            raise GrafxIndexError(
+                "A bounded filtered proof cannot be reclassified outside the exact threshold.",
+                field="candidate_filter_proof",
+                space=definition.name,
+                candidate_count=candidate_count,
+                threshold=self._threshold,
+            )
+        started = self._reading()
+        self._observe_phase(plan.regime, PHASE_PLAN, started)
+        started = self._reading()
+        ranked = (
+            self._math.top_k(components, proof.candidates, k, definition.metric)
+            if proof.candidates
+            else []
+        )
+        self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
+        started = self._reading()
+        retired = not definition.is_active
+        hits = tuple(
+            VectorHit(
+                record_id=record_id,
+                score=score,
+                ref=locations[record_id],
+                retired=retired,
+            )
+            for record_id, score in ranked
+        )
+        self._observe_phase(REGIME_EXACT, PHASE_VALIDATE, started)
+        self._publish_search_metrics(plan, len(hits))
+        return VectorSearchResult(
+            hits=hits,
+            regime=plan.regime,
+            achieved_k=len(hits),
+            requested_k=k,
+            space=definition.name,
+            filter_cardinality=candidate_count,
+        )
 
     def search(
         self,
@@ -1842,15 +2671,22 @@ class VectorEngine:
         # ``live_count`` is itself generation-fenced. It either rebases a handle that observed a
         # foreign rebuild or refuses while the durable index is unavailable, before regime
         # selection can turn stale cardinality into either scan or traversal work.
+        space_size = index.live_count()
         plan = plan_regime(
-            space_size=index.live_count(),
+            space_size=space_size,
             filter_cardinality=_filter_cardinality(candidate_filter),
             threshold=self._threshold,
         )
         self._observe_phase(plan.regime, PHASE_PLAN, started)
         if plan.is_exact:
             hits = self._search_exactly(
-                definition, index, components, k, snapshot, candidate_filter
+                definition,
+                index,
+                components,
+                k,
+                snapshot,
+                candidate_filter,
+                space_size=space_size,
             )
         else:
             hits = self._search_approximately(
@@ -1890,6 +2726,8 @@ class VectorEngine:
         k: int,
         snapshot: SnapshotLike,
         candidate_filter: CandidateFilter | None,
+        *,
+        space_size: int,
     ) -> tuple[VectorHit, ...]:
         """Scan the filtered set against the heap, which is the authority on what exists.
 
@@ -1904,32 +2742,109 @@ class VectorEngine:
             """Scan heap candidates bound to one stable durable index generation."""
             self._refresh_heap_view(index.file, certificate)
             started = self._reading()
-            admits = _guarded_admits(candidate_filter)
-            candidates: list[tuple[int, tuple[float, ...]]] = []
-            location: dict[int, RecordRef] = {}
-            scanned: set[int] = set()
-            for entry in index.walk():
-                # Two entries may name one heap location -- an entry filed under a key the row no
-                # longer carries sits beside the one that matches it, and the walk yields both.
-                # The traversal side dedupes by location because the graph holds one node per
-                # location; the refusal below is for two DISTINCT locations showing one record.
-                encoded = entry.ref.encode()
-                if encoded in scanned:
-                    continue
-                scanned.add(encoded)
-                version = self._heap.read(entry.ref)
-                if not snapshot.visible(version.xmin, version.xmax):
-                    continue
-                if admits is not None and not admits(version.record_id):
-                    continue
-                stored = self._vector_of_version(space, version, entry.ref)
-                require_space_identity(space, stored.space_ref, origin="stored vector")
-                if version.record_id in location:
-                    raise _duplicate_version(
-                        space, version.record_id, entry.ref, location[version.record_id]
+
+            def canonical_candidates(
+                candidate_filter: CandidateFilter | None,
+            ) -> tuple[list[tuple[int, tuple[float, ...]]], dict[int, RecordRef]]:
+                """Run the original whole-index exact scan without changing its decisions."""
+                admits = _guarded_admits(candidate_filter)
+                candidates: list[tuple[int, tuple[float, ...]]] = []
+                location: dict[int, RecordRef] = {}
+                scanned: set[int] = set()
+
+                def wanted(record_id: int, xmin: int, xmax: int) -> bool:
+                    """Decide visibility first and filter membership second (VEC-2)."""
+                    if not snapshot.visible(xmin, xmax):
+                        return False
+                    return admits is None or admits(record_id)
+
+                for ref in index._entry_refs_from_headers():
+                    # Two entries may name one heap location -- an entry filed under a key the
+                    # row no longer carries sits beside the matching one. Deduplicate locations;
+                    # two DISTINCT visible locations for one record remain a refusal below.
+                    encoded = ref.encode()
+                    if encoded in scanned:
+                        continue
+                    scanned.add(encoded)
+                    version = self._heap.read_if(ref, wanted)
+                    if version is None:
+                        continue
+                    stored = self._vector_of_version(space, version, ref)
+                    require_space_identity(
+                        space, stored.space_ref, origin="stored vector"
                     )
-                location[version.record_id] = entry.ref
-                candidates.append((version.record_id, stored.values))
+                    if version.record_id in location:
+                        raise _duplicate_version(
+                            space,
+                            version.record_id,
+                            ref,
+                            location[version.record_id],
+                        )
+                    location[version.record_id] = ref
+                    candidates.append((version.record_id, stored.values))
+                return candidates, location
+
+            def targeted_candidates(
+                witnesses: tuple[tuple[RecordId, RecordRef], ...],
+            ) -> (
+                tuple[list[tuple[int, tuple[float, ...]]], dict[int, RecordRef]] | None
+            ):
+                """Point-read and authenticate one complete sealed candidate set."""
+                candidates: list[tuple[int, tuple[float, ...]]] = []
+                location: dict[int, RecordRef] = {}
+                index_witnesses: list[tuple[bytes, RecordRef]] = []
+                try:
+                    for expected_record_id, ref in witnesses:
+
+                        def wanted(record_id: int, xmin: int, xmax: int) -> bool:
+                            """Accept only this visible physical identity from its heap header."""
+                            return (
+                                snapshot.visible(xmin, xmax)
+                                and record_id == expected_record_id
+                            )
+
+                        version = self._heap.read_if(ref, wanted)
+                        if (
+                            version is None
+                            or version.record_id != expected_record_id
+                            or version.table_id != index.definition.table_id
+                        ):
+                            return None
+                        stored = self._vector_of_version(space, version, ref)
+                        require_space_identity(
+                            space, stored.space_ref, origin="stored vector"
+                        )
+                        key = index.key_for(stored.values)
+                        index_witnesses.append((key, ref))
+                        if version.record_id in location:
+                            return None
+                        location[version.record_id] = ref
+                        candidates.append((version.record_id, stored.values))
+                    if not index._authenticate_exact_witnesses_unchecked(
+                        index_witnesses
+                    ):
+                        return None
+                except GrafxCorruptionDetected:
+                    # A selected heap ref or bucket was actually read and found corrupt. Hiding
+                    # that finding behind a successful fallback would make selective search a
+                    # corruption mask, so the located diagnostic remains authoritative.
+                    raise
+                except GrafxError:
+                    # NULL/malformed vectors, absent rows and other incomplete proofs do not
+                    # invent a result. The unchanged canonical scan owns their observable
+                    # outcome and error ordering.
+                    return None
+                return candidates, location
+
+            witnesses = self._eligible_materialized_witnesses(
+                candidate_filter, snapshot, index, space, space_size
+            )
+            selected = targeted_candidates(witnesses) if witnesses is not None else None
+            candidates, location = (
+                selected
+                if selected is not None
+                else canonical_candidates(candidate_filter)
+            )
             self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
             started = self._reading()
             ranked = (
@@ -1963,8 +2878,24 @@ class VectorEngine:
     ) -> tuple[VectorHit, ...]:
         """Traverse the versioned index, evaluating the filter during navigation."""
         started = self._reading()
-        admits = _guarded_admits(candidate_filter)
-        scored, _stats = index.search(query, k, snapshot, admits)
+        entry_admits = (
+            _guarded_entry_admits(candidate_filter)
+            if type(candidate_filter) is _LazyFilteredCandidateFilter
+            else None
+        )
+        admits = None if entry_admits is not None else _guarded_admits(candidate_filter)
+        if entry_admits is None:
+            # Preserve the established positional call for subclasses/adapters implementing the
+            # original VectorHnswIndex.search seam. Only the private filtered path opts into the
+            # new ref-aware keyword.
+            scored, _stats = index.search(query, k, snapshot, admits)
+        else:
+            scored, _stats = index.search(
+                query,
+                k,
+                snapshot,
+                entry_admits=entry_admits,
+            )
         self._observe_phase(REGIME_APPROXIMATE, PHASE_TRAVERSE, started)
         started = self._reading()
         retired = not space.is_active
@@ -2098,7 +3029,9 @@ class VectorEngine:
             labels = {"space": name}
             self._publish(
                 lambda index=index, labels=labels: self._metrics.set_gauge(
-                    _INDEX_ENTRIES, float(len(index.walk())), labels
+                    _INDEX_ENTRIES,
+                    float(index._entry_counts_from_headers()[0]),
+                    labels,
                 )
             )
             share = (live[name] / total) if total else 0.0

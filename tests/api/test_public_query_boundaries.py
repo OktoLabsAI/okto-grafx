@@ -23,6 +23,7 @@ from okto_grafx.domain.model.value import (
     ValueType,
 )
 from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_LIST_ELEMENTS,
     MAX_MAP_ENTRIES,
     MAX_NAME_CHARACTERS,
@@ -41,6 +42,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     SingleRow,
+    TraverseRelationship,
     UnionRows,
     VectorSearch,
 )
@@ -201,6 +203,161 @@ def test_case_and_subscript_survive_the_detached_public_plan_boundary() -> None:
     assert result.rows == ((20,),)
 
 
+def test_repeated_internal_plan_validation_is_memoized_but_public_trees_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    walks = 0
+    original = public_views._query_plan_nodes
+
+    def counted_nodes(value: object):
+        nonlocal walks
+        walks += 1
+        return original(value)
+
+    monkeypatch.setattr(public_views, "_query_plan_nodes", counted_nodes)
+    with connect(":memory:") as database:
+        first = database.explain("RETURN 1 AS value")
+        second = database.explain("RETURN 1 AS value")
+
+    assert walks == 1
+    assert first == second
+    assert first is not second
+    assert all(left is not right for left, right in zip(first.walk(), second.walk()))
+    object.__setattr__(first, "columns", ("changed",))
+    assert second.columns == ("value",)
+
+
+def test_owned_plan_clone_recipe_keeps_mutable_literals_private() -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    source = {"nested": [1]}
+    raw = ProduceResults(
+        child=ProjectRows(
+            child=SingleRow(),
+            items=(ReturnItem(expression=Literal(source), alias="payload"),),
+        ),
+        columns=("payload",),
+    )
+    memo = public_views.OrderedDict()
+    first = public_views._query_plan_view(
+        raw,
+        internally_owned=True,
+        memo=memo,
+    )
+    first_literal = first.child.items[0].expression
+    assert type(first_literal) is Literal
+    assert first_literal.value == {"nested": (1,)}
+    first_literal.value["nested"] = (9,)  # type: ignore[index]
+    object.__setattr__(first, "columns", ("changed",))
+
+    second = public_views._query_plan_view(
+        raw,
+        internally_owned=True,
+        memo=memo,
+    )
+    second_literal = second.child.items[0].expression
+    assert type(second_literal) is Literal
+    assert second.columns == ("payload",)
+    assert second_literal is not first_literal
+    assert second_literal.value == {"nested": (1,)}
+    assert second_literal.value is not first_literal.value
+
+
+def test_owned_relationship_plan_rebuilds_schema_values_and_their_caches() -> None:
+    query = "MATCH (a:A)-[e:E]->(b:A) RETURN a.id, b.id, e.w"
+    with connect(":memory:") as database:
+        schema = database.begin("write")
+        schema.execute("CREATE NODE TABLE A(id INT64, PRIMARY KEY(id))")
+        schema.execute("CREATE REL TABLE E(FROM A TO A, w INT64)")
+        schema.commit()
+
+        first = database.explain(query)
+        second = database.explain(query)
+
+        first_traverse = next(
+            node for node in first.walk() if type(node) is TraverseRelationship
+        )
+        second_traverse = next(
+            node for node in second.walk() if type(node) is TraverseRelationship
+        )
+        first_table = first_traverse.table
+        second_table = second_traverse.table
+        assert first_table is not second_table
+        assert first_table.columns is not second_table.columns
+        assert all(
+            left is not right
+            for left, right in zip(
+                first_table.columns,
+                second_table.columns,
+                strict=True,
+            )
+        )
+        assert dict(second_table.column_positions) == {"_from": 0, "_to": 1, "w": 2}
+        assert all(
+            decode[3] is column
+            for decode, column in zip(
+                second_table._decode_plan,
+                second_table.columns,
+                strict=True,
+            )
+        )
+
+        object.__setattr__(first_table, "name", "Corrupted")
+        object.__setattr__(first_table.columns[-1], "name", "corrupted")
+        third = database.explain(query)
+
+    third_traverse = next(
+        node for node in third.walk() if type(node) is TraverseRelationship
+    )
+    assert third_traverse.table.name == "E"
+    assert third_traverse.table.columns[-1].name == "w"
+    assert dict(third_traverse.table.column_positions) == {"_from": 0, "_to": 1, "w": 2}
+
+
+def test_non_owned_collaborator_plan_never_reaches_the_trusted_clone_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    raw = ProduceResults(child=SingleRow(), columns=("value",))
+    monkeypatch.setattr(QueryEngine, "explain", lambda *_args: raw)
+
+    def should_not_compile(_value: PlanNode) -> object:
+        raise AssertionError("a collaborator plan reached the internally owned clone path")
+
+    monkeypatch.setattr(public_views, "_query_owned_plan_clone_factory", should_not_compile)
+    with connect(":memory:") as database:
+        observed = database.explain("RETURN 1 AS value")
+
+    assert observed == raw
+    assert observed is not raw
+
+
+def test_owned_engine_results_do_not_repeat_the_public_constructor_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = QueryResult.__post_init__
+
+    def counted(result: QueryResult) -> None:
+        nonlocal calls
+        calls += 1
+        original(result)
+
+    monkeypatch.setattr(QueryResult, "__post_init__", counted)
+    with connect(":memory:") as database:
+        observed = database.execute("RETURN 1 AS value")
+
+    assert observed.columns == ("value",)
+    assert observed.rows == ((1,),)
+    assert calls == 0
+
+    QueryResult()
+    assert calls == 1
+
+
 @pytest.mark.parametrize("character", ["\x00", "\U000e0001"])
 def test_maximum_nonprintable_string_literal_fits_rendered_query_bound(
     character: str,
@@ -307,14 +464,14 @@ def test_list_map_string_and_parameter_limits_have_live_edges() -> None:
             == 256
         )
         assert database.execute(
-            "RETURN $x AS x", {"x": "s" * MAX_STRING_CHARACTERS}
-        ).rows == (("s" * 16384,),)
+            "RETURN $x AS x", {"x": "s" * DEFAULT_MAX_QUERY_VALUE_CHARACTERS}
+        ).rows == (("s" * DEFAULT_MAX_QUERY_VALUE_CHARACTERS,),)
         assert database.execute("RETURN $x AS x", accepted_parameters).rows == ((1,),)
 
         refused = (
             list(range(MAX_LIST_ELEMENTS + 1)),
             {str(index): index for index in range(MAX_MAP_ENTRIES + 1)},
-            "s" * (MAX_STRING_CHARACTERS + 1),
+            "s" * (DEFAULT_MAX_QUERY_VALUE_CHARACTERS + 1),
         )
         for value in refused:
             with pytest.raises(GrafxConfigurationError):
@@ -323,6 +480,58 @@ def test_list_map_string_and_parameter_limits_have_live_edges() -> None:
         excessive_parameters["overflow"] = 1
         with pytest.raises(GrafxConfigurationError):
             database.execute("RETURN $x AS x", excessive_parameters)
+
+
+def test_query_value_string_limit_is_configurable_without_becoming_unbounded() -> None:
+    with connect(":memory:", max_query_value_characters=17_000) as database:
+        accepted = "x" * 17_000
+        assert database.execute("RETURN $x AS x", {"x": accepted}).rows == (
+            (accepted,),
+        )
+        with pytest.raises(GrafxConfigurationError) as caught:
+            database.execute("RETURN $x AS x", {"x": "x" * 17_001})
+        assert caught.value.details == {
+            "field": "parameters.x",
+            "value": 17_001,
+            "limit": 17_000,
+        }
+
+    expanded = "x" * (DEFAULT_MAX_QUERY_VALUE_CHARACTERS + 1)
+    with connect(
+        ":memory:", max_query_value_characters=len(expanded)
+    ) as database:
+        assert database.execute("RETURN $x AS x", {"x": expanded}).rows == (
+            (expanded,),
+        )
+
+
+def test_query_value_string_limit_applies_inside_nested_parameter_values() -> None:
+    with connect(":memory:", max_query_value_characters=20_000) as database:
+        accepted = "x" * 20_000
+        assert database.execute("RETURN $x AS x", {"x": [{"body": accepted}]}).rows
+        with pytest.raises(GrafxConfigurationError) as caught:
+            database.execute(
+                "RETURN $x AS x", {"x": [{"body": "x" * 20_001}]}
+            )
+        assert caught.value.details["limit"] == 20_000
+
+
+def test_pulse_sized_string_parameter_crosses_the_create_boundary() -> None:
+    content = "x" * 27_825
+    with connect(":memory:") as database:
+        with database.begin("write") as transaction:
+            transaction.execute(
+                "CREATE NODE TABLE Artifact(id STRING, content STRING, PRIMARY KEY(id))"
+            )
+        with database.begin("write") as transaction:
+            transaction.execute(
+                "CREATE (n:Artifact {id: $id, content: $content})",
+                {"id": "refinement", "content": content},
+            )
+        assert database.execute(
+            "MATCH (n:Artifact {id: $id}) RETURN n.content",
+            {"id": "refinement"},
+        ).rows == ((content,),)
 
 
 def _nested_list(depth: int) -> object:

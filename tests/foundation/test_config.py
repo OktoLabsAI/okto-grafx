@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.index import MAX_EXPECTED_CARDINALITY
 from okto_grafx.domain.page import validate_page_size
+from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_QUERY_VALUE_CHARACTERS,
+)
 from okto_grafx.engine.wal_manager import MAX_SEGMENT_READ_BYTES, MIN_SEGMENT_BYTES
 from okto_grafx.runtime.config import (
     CORE_MAX_PAGE_SIZE,
@@ -21,6 +26,7 @@ from okto_grafx.runtime.config import (
     METRICS_SINKS,
     MIN_PAGE_SIZE,
     MINIMUM_STORE_FRAMES,
+    PAGE_CODEC_SELECTORS,
     RECOVERY_POLICIES,
     VECTOR_MATH_SELECTORS,
     DatabaseConfig,
@@ -34,7 +40,7 @@ def test_defaults_match_the_contract() -> None:
     assert config.partitions_per_table == 64
     assert config.identity_lease_size == 64
     assert config.buffer_budget_bytes == 64 * 1024 * 1024
-    assert config.max_open_files == 128
+    assert config.max_open_files == 256
     assert config.recovery_policy == "replay"
     assert config.lease_ttl_seconds == 5.0
     assert config.lease_timeout_seconds == 10.0
@@ -46,12 +52,19 @@ def test_defaults_match_the_contract() -> None:
     assert config.max_statement_writes is None
     assert config.max_result_rows is None
     assert config.max_intermediate_rows is None
+    assert config.query_memory_budget_bytes is None
+    assert config.max_traversal_expansions is None
+    assert config.max_traversal_paths is None
+    assert config.max_query_value_characters == DEFAULT_MAX_QUERY_VALUE_CHARACTERS
     assert config.max_transaction_rows is None
     assert config.max_transaction_bytes is None
     assert config.max_wal_batch_bytes is None
+    assert config.max_index_build_entries is None
+    assert config.automatic_index_expected_cardinality is None
     assert config.metrics == "noop"
     assert config.metrics_destination is None
     assert config.allow_remote_metrics is False
+    assert config.codec == "pure"
     assert config.vector_math == "auto"
     assert config.vector_exact_scan_threshold == 4096
     assert config.vector_ef_search == 320
@@ -62,18 +75,50 @@ def test_defaults_match_the_contract() -> None:
     assert config.descriptor_revalidation == "strict"
 
 
+def test_automatic_index_expected_cardinality_is_keyword_only_and_bounded() -> None:
+    definition = next(
+        field
+        for field in dataclasses.fields(DatabaseConfig)
+        if field.name == "automatic_index_expected_cardinality"
+    )
+    assert definition.kw_only
+    assert (
+        DatabaseConfig(
+            path=":memory:",
+            automatic_index_expected_cardinality=MAX_EXPECTED_CARDINALITY,
+        ).automatic_index_expected_cardinality
+        == MAX_EXPECTED_CARDINALITY
+    )
+
+    for rejected in (0, -1, MAX_EXPECTED_CARDINALITY + 1, True, 1.5):
+        with pytest.raises(GrafxConfigurationError) as caught:
+            DatabaseConfig(
+                path=":memory:",
+                automatic_index_expected_cardinality=rejected,  # type: ignore[arg-type]
+            )
+        assert caught.value.details["field"] == "automatic_index_expected_cardinality"
+
+
 def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail() -> (
     None
 ):
     """An old positional call must still bind its last argument to ``read_only``."""
     configured = DatabaseConfig(path=":memory:", read_only=True)
-    fields = dataclasses.fields(DatabaseConfig)
-    assert tuple(field.name for field in fields[-2:]) == (
+    fields = tuple(
+        field for field in dataclasses.fields(DatabaseConfig) if not field.kw_only
+    )
+    assert next(
+        field
+        for field in dataclasses.fields(DatabaseConfig)
+        if field.name == "max_index_build_entries"
+    ).kw_only
+    assert tuple(field.name for field in fields[-3:]) == (
         "read_only",
         "descriptor_revalidation",
+        "max_query_value_characters",
     )
 
-    legacy_arguments = dataclasses.astuple(configured)[:-1]
+    legacy_arguments = tuple(getattr(configured, field.name) for field in fields[:-2])
     legacy = DatabaseConfig(*legacy_arguments)
     assert legacy == configured
     assert legacy.read_only is True
@@ -82,6 +127,28 @@ def test_descriptor_revalidation_extends_the_positional_surface_only_at_its_tail
     opted_in = DatabaseConfig(*(legacy_arguments + ("generation",)))
     assert opted_in.read_only is True
     assert opted_in.descriptor_revalidation == "generation"
+
+
+def test_query_value_character_limit_is_bounded_and_extends_the_positional_tail() -> (
+    None
+):
+    base = DatabaseConfig(path=":memory:")
+    positional = tuple(
+        getattr(base, field.name)
+        for field in dataclasses.fields(DatabaseConfig)
+        if not field.kw_only
+    )
+    configured = DatabaseConfig(
+        ":memory:",
+        *(positional[1:-2] + ("generation", 70_000)),
+    )
+    assert configured.descriptor_revalidation == "generation"
+    assert configured.max_query_value_characters == 70_000
+
+    for rejected in (0, -1, MAX_QUERY_VALUE_CHARACTERS + 1):
+        with pytest.raises(GrafxConfigurationError) as caught:
+            DatabaseConfig(path=":memory:", max_query_value_characters=rejected)
+        assert caught.value.details["field"] == "max_query_value_characters"
 
 
 def test_the_config_is_a_frozen_value() -> None:
@@ -221,6 +288,7 @@ def test_a_positive_wal_maximum_is_canonicalized() -> None:
         "max_transaction_rows",
         "max_transaction_bytes",
         "max_wal_batch_bytes",
+        "max_index_build_entries",
     ],
 )
 @pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])
@@ -230,9 +298,18 @@ def test_an_invalid_transaction_budget_is_rejected(field: str, value: object) ->
     assert raised.value.details["field"] == field
 
 
-@pytest.mark.parametrize("field", ["max_result_rows", "max_intermediate_rows"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_result_rows",
+        "max_intermediate_rows",
+        "query_memory_budget_bytes",
+        "max_traversal_expansions",
+        "max_traversal_paths",
+    ],
+)
 @pytest.mark.parametrize("value", [0, -1, "1024", 1024.5, True])
-def test_an_invalid_query_row_budget_is_rejected(field: str, value: object) -> None:
+def test_an_invalid_query_budget_is_rejected(field: str, value: object) -> None:
     with pytest.raises(GrafxConfigurationError) as raised:
         DatabaseConfig(path=":memory:", **{field: value})
     assert raised.value.details["field"] == field
@@ -347,6 +424,11 @@ def test_every_vector_math_selector_is_accepted(selector: str) -> None:
     assert DatabaseConfig(path=":memory:", vector_math=selector).vector_math == selector
 
 
+@pytest.mark.parametrize("selector", sorted(PAGE_CODEC_SELECTORS))
+def test_every_page_codec_selector_is_accepted(selector: str) -> None:
+    assert DatabaseConfig(path=":memory:", codec=selector).codec == selector
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -357,6 +439,9 @@ def test_every_vector_math_selector_is_accepted(selector: str) -> None:
         ("metrics", "prometheus"),
         ("metrics", ""),
         ("metrics", 1),
+        ("codec", "auto"),
+        ("codec", "native"),
+        ("codec", None),
         ("vector_math", "torch"),
         ("vector_math", None),
         ("descriptor_revalidation", "always"),
@@ -731,9 +816,14 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         max_statement_writes=_HostileInt(64),
         max_result_rows=_HostileInt(256),
         max_intermediate_rows=_HostileInt(512),
+        query_memory_budget_bytes=_HostileInt(4096),
+        max_traversal_expansions=_HostileInt(1024),
+        max_traversal_paths=_HostileInt(2048),
+        max_query_value_characters=_HostileInt(65_536),
         max_transaction_rows=_HostileInt(128),
         max_transaction_bytes=_HostileInt(16384),
         max_wal_batch_bytes=_HostileInt(8192),
+        max_index_build_entries=_HostileInt(4096),
         vector_exact_scan_threshold=_HostileInt(128),
         vector_ef_search=_HostileInt(640),
     )
@@ -749,9 +839,14 @@ def test_configuration_canonicalizes_every_integer_leaf_before_using_it() -> Non
         "max_statement_writes",
         "max_result_rows",
         "max_intermediate_rows",
+        "query_memory_budget_bytes",
+        "max_traversal_expansions",
+        "max_traversal_paths",
+        "max_query_value_characters",
         "max_transaction_rows",
         "max_transaction_bytes",
         "max_wal_batch_bytes",
+        "max_index_build_entries",
         "vector_exact_scan_threshold",
         "vector_ef_search",
     ):
@@ -783,6 +878,7 @@ def test_configuration_canonicalizes_every_text_leaf_before_using_it() -> None:
         recovery_policy=_HostileStr("replay"),
         metrics=_HostileStr("json"),
         metrics_destination=_HostileStr("./metrics.json"),
+        codec=_HostileStr("numpy"),
         vector_math=_HostileStr("pure"),
         checksum=_HostileStr("pure"),
         descriptor_revalidation=_HostileStr("generation"),
@@ -793,6 +889,7 @@ def test_configuration_canonicalizes_every_text_leaf_before_using_it() -> None:
         "recovery_policy",
         "metrics",
         "metrics_destination",
+        "codec",
         "vector_math",
         "checksum",
         "descriptor_revalidation",

@@ -1880,6 +1880,15 @@ class WalManager:
         """
         self._require_open()
         self._refresh_tail_if_needed()
+        if self._damage is not None and self._damage.reason in {
+            FailureReason.UNSUPPORTED_VERSION,
+            FailureReason.UNSUPPORTED_REQUIRED_RECORD,
+        }:
+            # Intact bytes whose semantics belong to a newer writer are not a recyclable
+            # prefix boundary.  Refuse before the first segment name is released: otherwise a
+            # downgrade attempt could mutate the retained log before reporting that it cannot
+            # understand the required suffix.
+            raise self._damage.as_error()
         horizon = _require_lsn("horizon_lsn", horizon_lsn)
         if not isinstance(reader_present, bool):
             raise GrafxConfigurationError(

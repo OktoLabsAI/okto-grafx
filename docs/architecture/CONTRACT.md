@@ -14,9 +14,9 @@ this contract is the single agreed realization of them.
 | ID | Rule | Enforcement |
 |----|------|-------------|
 | G1 | **All product surfaces are en-US**: class names, function names, exception messages, metric names & descriptions, CLI help, docstrings. | Code review + `tests/test_language_surface.py` |
-| G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
+| G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. **D-26 diagnostic exception:** only the exact, unaliased import `okto_grafx.engine.txn_manager <- time.perf_counter_ns` is allowed, solely for outcome-neutral commit timings; it never supplies lease/liveness, storage, WAL or visibility decisions. This avoids invoking the host `Clock` under an exclusive window. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
 | G2b | **No `random` in the domain.** Anything needing randomness (HNSW level assignment, sampling) uses `okto_grafx.domain.rand.SplitMix64` — an explicitly seeded, deterministic, reproducible PRNG owned by C1. Reproducibility is a spec requirement (seeded interleavings, seeded corpora), not a preference. | `tests/test_import_boundary.py` |
-| G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in `adapters/vectormath_numpy.py`. `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
+| G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in the closed adapter set `adapters/vectormath_numpy.py` and `adapters/codec_numpy.py`. `google-crc32c` only under extra `[accel]`, imported only in `adapters/checksum_native.py`, and admitted only after the acceptance corpus proves it byte-identical to the pure reference (its successful proof is memoized per process under the provider's strong identity, strictly bounded per closed slot and serialized in the adapter, D-29). `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
 | G4 | **Windows and POSIX are equal citizens.** No test may be silently skipped on a family; a family-specific test must be explicitly marked `@pytest.mark.platform_specific` and have a counterpart. **Extended by A32 (runtime observation, not static prediction) and REPLACED in its attribution rule by A54 (three registered markers: `platform_specific` with a family condition + counterpart, `optional_dependency("<module>")`, `pending`/`xfail`).** | `tests/test_platform_parity.py` |
 | G5 | **Fail-closed ports**: an unfilled port slot refuses startup with `GrafxPortNotConfigured`. No silent default, no no-op fallback (except the explicitly selected `NoOpMetricsSink`). | `runtime/registry.py` + tests |
 | G6 | **No sanctioned operation destroys the main data file.** Recovery, quarantine, recycling and purge never move/rename/delete `heap.dat`, `catalog.dat` or `index/*`. | `tests/test_main_file_untouched.py` |
@@ -77,6 +77,7 @@ okto_grafx/
 │   │   ├── coordination_local.py   # C3
 │   │   ├── clock_system.py         # C3
 │   │   ├── codec_v1.py             # C1
+│   │   ├── codec_numpy.py          # C1 [accel], byte-identical v1
 │   │   ├── metrics_noop.py         # C8
 │   │   ├── metrics_openmetrics.py  # C8 (+ tiny stdlib http publisher)
 │   │   ├── metrics_json.py         # C8
@@ -130,6 +131,7 @@ Concrete classes (`code`, `retryable`) — **exact names, en-US messages**:
 | `GrafxDeviceFull` | `device_full` | **True** |
 | `GrafxDurabilityBarrierFailed` | `durability_barrier_failed` | False |
 | `GrafxRecoveryRefused` | `recovery_refused` | False |
+| `GrafxSnapshotReclaimed` | `snapshot_reclaimed` | **True** |
 | `GrafxBufferBudgetExceeded` | `buffer_budget_exceeded` | **True** |
 | `GrafxTransactionBudgetExceeded` | `transaction_budget_exceeded` | False |
 | `GrafxSchemaVersionMismatch` | `schema_version_mismatch` | False |
@@ -399,7 +401,7 @@ class DatabaseConfig:
     partitions_per_table: int = 64         # calibrated by FR-15, frozen in calibration.json
     identity_lease_size: int = 64          # local burn-only slice; not a format field
     buffer_budget_bytes: int = 64 * 1024 * 1024
-    max_open_files: int = 128              # local descriptor-cache budget; not a format field
+    max_open_files: int = 256              # lazy local descriptor-cache ceiling; not a format field
     recovery_policy: str = "replay"        # "replay" (DEFAULT) | "refuse"
     lease_ttl_seconds: float = 5.0
     lease_timeout_seconds: float = 10.0
@@ -411,17 +413,26 @@ class DatabaseConfig:
     max_statement_writes: int | None = None
     max_result_rows: int | None = None
     max_intermediate_rows: int | None = None
+    query_memory_budget_bytes: int | None = dataclass_field(default=None, kw_only=True)
+    max_traversal_expansions: int | None = None
+    max_traversal_paths: int | None = None
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
+    max_index_build_entries: int | None = dataclass_field(default=None, kw_only=True)
+    automatic_index_expected_cardinality: int | None = dataclass_field(
+        default=None, kw_only=True
+    )
     metrics: str = "noop"                  # "noop" | "openmetrics" | "json"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
+    codec: str = dataclass_field(default="pure", kw_only=True)  # "pure" | "numpy"
     vector_math: str = "auto"              # "auto" | "pure" | "numpy"
     vector_exact_scan_threshold: int = 4096   # calibrated (SPEC-VEC FR-5/FR-8)
     vector_ef_search: int = 320                # calibrated HNSW beam, 1..1_048_576
     read_only: bool = False
     descriptor_revalidation: str = "strict"  # "strict" | "generation"; local adapter policy
+    max_query_value_characters: int = 65536  # per-string; configurable maximum 1048576
 
 class PortRegistry:
     """Fail-closed (G5). Every required slot must be bound before open_database returns."""
@@ -483,7 +494,32 @@ An exceeded limit raises non-retryable `GrafxTransactionBudgetExceeded`. Stateme
 restored to its exact pre-statement staging on refusal. The final WAL-batch limit is checked before
 `append_many`; no budget refusal truncates the WAL or persists a partial statement.
 
-The two query row limits are positive integers when set and disabled by `None`:
+`max_index_build_entries` is a separate, keyword-only shadow-build admission limit. `None` keeps
+the prior unbounded behavior; otherwise it is a positive exact integer. One entry is charged for
+each committed, non-provisional heap version whose target exact-index definition derives a key.
+An ended version still charges one final entry because its tombstone updates that same entry rather
+than adding another. The charge is summed across every detached generation in one activation or
+catalog-v2 DDL batch; a newly declared empty table contributes zero. Preflight stops after N+1 is
+observed and raises `GrafxTransactionBudgetExceeded(field="max_index_build_entries")` before
+catalog staging and before the first exclusive generation-file create. The option is an admission
+guard, not an index-sizing hint and not a persisted format field.
+
+`automatic_index_expected_cardinality` is a separate keyword-only sizing hint for newly
+materialized automatic exact generations. `None` preserves 64 buckets. A value in
+`1..262144` is interpreted per index at 64 expected entries per bucket and rounded up to the next
+power-of-two directory. It applies to automatic PK and relationship endpoint indexes; for the
+automatic `record_id` index it is only a floor beneath the fenced `max(4096, 2 * visible_rows)`
+estimate. The chosen expected cardinality and bucket count are persisted in catalog v2, so a
+later open with another setting adopts the existing generation unchanged. It never sizes custom
+or vector indexes and never triggers an implicit rehash. Because creation, reset, verification
+and full walks remain `O(bucket_count + entries)`, callers should not oversize it speculatively.
+On writable open, the explicit hint promotes an empty v1 catalog through the ordinary
+`ensure_identity_indexes` transaction before returning. A non-empty v1 catalog is not migrated
+implicitly because its complete shadow build can be substantial; table DDL refuses with
+`remedy="maintenance.ensure_identity_indexes"` until the caller performs that explicit migration.
+
+The four query admission limits are positive integers when set and disabled by `None`. The row
+limits are:
 
 * `max_result_rows` incrementally counts rows from the public terminal. It consumes row N+1 only
   to refuse it, before retaining it, before consuming any remaining stream and before
@@ -493,11 +529,66 @@ The two query row limits are positive integers when set and disabled by `None`:
   result is charged only to `max_result_rows`; when there are no public columns, that terminal node
   is instead charged as intermediate.
 
-Either overrun raises non-retryable `GrafxQueryBudgetExceeded`. Refusal does not truncate state and
-does not release any write from the refused statement. These are not cumulative-work, payload-byte,
-RSS, streaming, deadline, traversal or spill limits. Sort, aggregate, distinct and eager operators
-may retain up to the configured rows or states before their first yield; the payload bytes, internal
-structures and auxiliary scans behind those rows are not bounded by these two fields.
+The traversal limits are cumulative across every graph-pattern operator in one execution:
+
+* `max_traversal_expansions` charges variable and untyped traversal as soon as the selected endpoint
+  source yields a candidate, before repeat-edge and landing checks. `RelationshipScan` instead
+  charges each stored or pending relationship it encounters, before its pushed predicate and
+  endpoint checks.
+* `max_traversal_paths` charges a path only after its applicable pushed predicate and landing-node
+  visibility checks, immediately before it can be retained in a variable-length frontier or
+  returned by a one-hop operator.
+
+The N+1 unit is refused before retention or return. These two limits cover Cypher relationship
+traversal and relationship scans; HNSW navigation internal to vector search has its own execution
+regime and is not charged. A candidate is what the selected adjacency source yields; physical rows
+read once while constructing a grouped-scan fallback are auxiliary scan work rather than candidate
+expansions. Disabled traversal limits preserve the previous statistics surface; when enabled, a
+successful query reports the corresponding admitted `traversal_expansions` or `traversal_paths`
+count.
+
+Any overrun raises non-retryable `GrafxQueryBudgetExceeded`. Refusal does not truncate state and
+does not release any write from the refused statement.
+
+`query_memory_budget_bytes` is a separate process-local positive exact integer or `None`, declared
+keyword-only so the pre-existing positional `DatabaseConfig` surface does not shift. `None`
+preserves the old in-memory sort/top-N, result-DISTINCT and aggregate strategies. When configured,
+every `SortRows`, `DistinctRows` and `AggregateRows` gets an independent `LogicalMemoryBudget`
+shared with an internal adapter-owned spill workspace. Sort, result-DISTINCT and
+grouping/aggregation, including aggregate DISTINCT, use versioned external merge runs and retain no
+input-cardinality-sized collection beyond that counter. A buffered/merge-head record costs
+`32 + len(key) + len(payload)` logical bytes. One live
+aggregate group costs 64 bytes plus its versioned detached keys and 64 bytes per aggregate slot;
+retained `COLLECT` and `MIN`/`MAX` values cost 16 bytes plus their versioned detached value. Each
+strong NaN identity costs 64 bytes: the strong reference plus an `is` check preserves the existing
+rule that one repeated NaN object compares as the same frozen key while distinct NaN objects never
+collide through allocator address reuse. A transaction-private held-row identity required to
+reconstruct result-DISTINCT ordering costs 128 bytes plus its versioned detached values. All
+charges use the same operator counter.
+
+The budget is a deterministic portable admission model, **not RSS**. Python object headers,
+allocator arenas, transient encoding/comparison work, OS page cache and the final public result
+are not charged. A single spill record may consume at most half the budget so two merge heads fit.
+An aggregate `COLLECT` whose public tuple itself outgrows the counter is refused; no disk-proxy
+value is introduced. Result-DISTINCT performs one signature/ordinal pass and one ordinal pass, so
+the first occurrence and encounter order remain exact. `EagerRows`, vector candidate
+materialisation, deadlines and public terminal storage remain outside this first byte boundary. `max_result_rows`,
+`max_intermediate_rows` and traversal limits remain independent and authoritative.
+
+Temporary serialization is closed and non-executable: `OGXS` plus a run-version byte frames fixed
+lengths, while keys and payloads use distinct purpose/version prefixes over the complete safe
+`Value` codec. No pickle is admitted. Projected bindings/paths are detached before host I/O; the
+operator retains its original transaction snapshot. The workspace lives outside the database
+namespace and is cleaned on success, error, cancellation and cursor close; cleanup refusal cannot
+turn into success. This option changes no database files, WAL, write atomicity, OCC, durability,
+multiwriter or multireader rule.
+
+`max_query_value_characters` is a separate public-boundary guard. It defaults to 65,536 and may be
+configured from 1 through 1,048,576 characters. It applies to every string parameter (including a
+string nested in a list or map) and every string value copied into a public result. Refusal happens
+before page access for input parameters. It does not widen the lexer: a string literal written in
+query source remains limited to `MAX_STRING_CHARACTERS == 16,384`. This is process-local policy,
+not persisted identity or format state.
 
 Recall has no runtime configuration field. Its floor belongs to the offline calibration gate,
 `bench.harness.gate --recall-target`; it cannot honestly promise recall for an individual query
@@ -601,7 +692,7 @@ Payload = positional tuple encoded per the table schema (see §7.2).
 | off | type | field |
 |---|---|---|
 | 0 | u32 | `magic` = `0x5852474F` |
-| 4 | u16 | `format_version` = 1 |
+| 4 | u16 | `format_version` = 1 or 2 |
 | 6 | u16 | `record_type` |
 | 8 | u16 | `header_len` = 48 |
 | 10 | u16 | `flags` |
@@ -619,9 +710,25 @@ Record types: `1 BEGIN · 2 WRITE_PAGE · 3 COMMIT · 4 ABORT · 5 CHECKPOINT ·
 7 INDEX_RECONCILE · 8 LEDGER_APPEND · 9 CATALOG_WRITE · 10 SPACE_DDL · 11 VECTOR_WRITE ·
 12 SEGMENT_HEADER · 13 PAGE_ALLOC`.
 
-**Decoder rule:** the decoder must accept every `format_version <= CURRENT`. Round-trip tests per
-version are mandatory (TR-4). Changing `partitions_per_table` changes only the descriptor string,
-never the format — no migration.
+**Decoder rule:** the decoder accepts every declared supported header version, then applies the
+closed record-type/flags grammar for that version. Round-trip tests per supported version are
+mandatory (TR-4). WAL v1 flags remain opaque and gain no retrospective meaning. In WAL v2, bit
+`0x0001` means REQUIRED, bit `0x0004` means `PAGE_IMAGE_ZLIB1` and bit `0x0008` means
+SKIPPABLE; the only v2 grammar currently emitted is `WRITE_PAGE` with the first two bits set. An
+unknown v2 type is skippable only with exactly `0x0008`; flags zero are fail-closed so forgetting to
+mark a future required type cannot silently drop it. Unsupported semantics and a known type without
+a v2 grammar are typed schema-version refusals and must not be truncated, appended past or recycled.
+Changing `partitions_per_table`
+changes only the descriptor string, never the format.
+
+The compressed `WRITE_PAGE` v2 payload retains the v1 clear prefix
+`file_name_length u16 | file_name | page_index u32`, followed by
+`uncompressed_image_length u32 | zlib-level-1 bytes`. Inflation is bounded to `MAX_PAGE_SIZE`, must
+consume exactly one complete stream and must produce exactly the declared length before the normal
+page codec validates the image. Emission requires the persistent catalog-v2 capability
+`wal_record_v2`, activated in a preceding v1-only transaction. A raw batch that would roll to a new
+segment remains entirely v1 so compression cannot change the `SEGMENT_HEADER`/terminal-CSN plan.
+See `WAL_PAGE_COMPRESSION_V1.md`.
 
 `COMMIT` payload (canonical, versioned): `snapshot_lsn u64 | read_partition_count u32 |
 write_partition_count u32 | read_partitions[u64...] | write_partitions[u64...] | page_touch_count u32 |
@@ -704,6 +811,17 @@ class BufferPool:
 ```
 Budget is **per Database instance**. No module-level/global state anywhere (BR-8/FR-13).
 
+The public composition injects one re-entrant condition as the pool guard. On a cold `pin`, the
+pool atomically reserves one budget slot per `(file, page)`, then releases the guard before calling
+`StorageDevice.read_page` or `PageCodec.decode_page`. Concurrent callers of the same key wait and
+receive pins on the one published `Page`; a failed load is never cached and wakes all waiters. A
+load reservation occupies one budget slot; a dirty frame detached for eviction retains that same
+slot until it is transferred to the target load. Invalidation, fresh-read-view or structure/cache
+epoch movement while I/O is in flight revokes publication of the detached result, which is
+discarded and retried. This protocol changes neither `used_bytes()`
+(resident frames times page size), eviction policy, on-disk bytes, WAL nor multi-reader/multi-writer
+coordination. The pure core imports no thread, async or OS mechanism.
+
 ### 8.2 `engine/heap_store.py` (C1)
 ```python
 class HeapStore:
@@ -775,7 +893,9 @@ class TransactionManager:
                  identity_lease_size: int = 64,
                  max_transaction_rows: int | None = None,
                  max_transaction_bytes: int | None = None,
-                 max_wal_batch_bytes: int | None = None)
+                 max_wal_batch_bytes: int | None = None,
+                 max_index_build_entries: int | None = None,
+                 automatic_index_expected_cardinality: int | None = None)
     def begin(self, mode: str) -> "TransactionContext"      # "read" | "write"
     def commit(self, txn: "TransactionContext") -> "CommitReport"
     def rollback(self, txn: "TransactionContext") -> None
@@ -868,7 +988,14 @@ Algorithm (FROZEN):
    * CRC valid but not usable (stale epoch, post-truncation) → **REAPPLICABLE** (decoded operation).
    * CRC invalid / undecodable → **FORENSIC** (raw bytes + offset + expected LSN + reason + sha256).
    Every discarded record produces exactly one entry (G8/BR-3).
-5. Redo committed transactions in LSN order, idempotent via `page_lsn`.
+5. Redo committed transactions in LSN order, idempotent via `page_lsn`. A replay containing only
+   `WRITE_PAGE` effects may reduce repeated writes to the same `(file, page)` after every original
+   image has passed full preflight. Reduction is allowed only for strictly increasing embedded
+   `page_lsn` (or equal LSN with identical bytes), applies the final image at the first occurrence,
+   and falls back to the original sequence for an ambiguous location. Mixed page/index replays are
+   never coalesced. Before recovery publishes a newer `commit.state`, every touched page/index file
+   and every ACTIVE index file is flushed and receives its own data durability barrier; a failed or
+   interrupted barrier forbids publication.
 6. Uncommitted transactions require **no undo** — pages are only written at commit.
 7. `recovery_policy="refuse"` raises `GrafxRecoveryRefused` **instead of step 3** and leaves
    everything on disk untouched.
@@ -979,12 +1106,38 @@ class VectorEngine:
   **before any distance computation** (BR-1).
 * Writes to a retired space raise `GrafxSpaceRetired`; reads succeed with `retired=True` (FR-3).
 
+For query-language top-k, `VectorSearch` MAY make the vector index the physical row source only
+for an unfiltered, uncorrelated `NodeScan(SingleRow)` with a fused bound, row-independent arguments
+and the exact engine-owned immutable `Snapshot` (a structural/custom `SnapshotLike` keeps the
+canonical path). The index MUST first return its live cardinality under the ordinary pre/post
+page-0 certificate, only when `built_through_lsn == snapshot.read_lsn`, and only when the
+registered index names the exact table id and vector-column position planned by the scan. Each
+returned `VectorHit.ref` MUST then be fully decoded and revalidated for table, record identity
+and snapshot visibility before a row can be returned. A missing, foreign, malformed or invisible
+witness is a typed fail-closed error. Historical/frontier mismatch, filters, traversal, stale
+indexes, unbounded searches and ambiguous nullable cardinality use the canonical materialised
+child; owner-dirty tables keep the existing fail-closed RYOW refusal. For a nullable column,
+direct execution is admitted only when its certified vector count is
+above the exact threshold and the fused `k` does not exceed that count; this makes the regime and
+HNSW work independent of the unknown number of NULL heap rows. With the direct path,
+`vector_direct_accesses=1` and `vector_rows_materialized=<query-layer returned-hit decodes>` (at
+most the fused K) are reported in `QueryResult.statistics`. The exact regime still performs its
+owned exhaustive heap validation; the counter records the redundant query-child materialisation
+that was removed, not that oracle's work. No WAL, format, HNSW beam, recall rule or concurrency
+premise changes.
+
 ### 8.9 `engine/query_engine.py` (C10)
 ```python
 class QueryEngine:
     def __init__(..., *, max_statement_writes: int | None = None,
                  max_result_rows: int | None = None,
-                 max_intermediate_rows: int | None = None)
+                 max_intermediate_rows: int | None = None,
+                 query_memory_budget_bytes: int | None = None,
+                 query_spill: QuerySpillFactory | None = None,
+                 max_traversal_expansions: int | None = None,
+                 max_traversal_paths: int | None = None,
+                 max_index_build_entries: int | None = None,
+                 automatic_index_expected_cardinality: int | None = None)
     def parse(self, text: str) -> "Statement"
     def plan(self, statement: "Statement", snapshot: Snapshot) -> "PlanNode"
     def execute(self, text: str, txn, parameters: Mapping[str, object] | None = None) -> "QueryResult"
@@ -1229,7 +1382,13 @@ refusal leaves the transaction exactly as it entered the statement.
 
 M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_write_conflicts_total` · `oktografx_commit_retries_total` ·
-`oktografx_active_transactions`{mode=read|write} · `oktografx_fsync_duration_seconds`{target=wal|data} ·
+`oktografx_active_transactions`{mode=read|write} ·
+`oktografx_commit_window_duration_seconds`{window=writer_lease|commit_section,interval=wait|hold} ·
+`oktografx_commit_phase_duration_seconds`{phase=other|occ|materialize|build_records|append|barrier|apply|flush|index|publish} ·
+`oktografx_commit_pages_logged_total` · `oktografx_commit_wal_bytes_total` ·
+`oktografx_commit_frames_examined_total` · `oktografx_commit_flushes_total` ·
+`oktografx_commit_foreign_commits_total` · `oktografx_commit_retargets_total` ·
+`oktografx_fsync_duration_seconds`{target=wal|data} ·
 `oktografx_barrier_failures_total` · `oktografx_read_view_drops_total`{view_origin=own|foreign} ·
 `oktografx_wal_size_bytes` · `oktografx_wal_segments` ·
 `oktografx_wal_truncation_lag_segments`{reader_present=true|false} ·
@@ -1238,7 +1397,10 @@ M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_recovery_discarded_records_total`{origin_class=reapplicable|forensic} ·
 `oktografx_ledger_depth`{origin_class} · `oktografx_ledger_oldest_entry_age_seconds`{origin_class} ·
 `oktografx_quarantine_entries` · `oktografx_buffer_budget_used_bytes`{db} ·
+`oktografx_buffer_retained_estimate_bytes`{db,estimator=python-v2} ·
 `oktografx_buffer_budget_exceeded_total`{db} · `oktografx_database_opens_total` ·
+`oktografx_descriptor_cache_hits_total` · `oktografx_descriptor_cache_misses_total` ·
+`oktografx_descriptor_cache_evictions_total` ·
 `oktografx_recoveries_total`{outcome} ·
 `oktografx_baseline_ceiling_multiple`{ceiling=durable_commit|point_read|open_replay|vector_recall}
 
@@ -1258,7 +1420,39 @@ Query: `oktografx_query_phase_duration_seconds`{phase=parse|plan|execute} ·
 `oktografx_query_rows_returned_count` · `oktografx_query_errors_total`{code}
 
 `db` and `space` labels carry a **short hash / catalog name**, never a path or free text (TR-7).
+The `estimator` label is the closed singleton `python-v2`. Its value identifies the
+pointer-width-calibrated formula: engine-owned Page/frame objects, payload buffers, slot
+directories and buffer bookkeeping are included; allocator arenas, interpreter-specific header
+variations, collaborators, arbitrary read-view tokens and temporary values owned only by an
+executing call stack are excluded. The gauge is an estimate
+of retained Python memory, not process RSS and not the eviction/admission budget. It is sampled
+on reported residency-topology changes; the immutable `Database.pool` health view recomputes the
+current estimate, so routine unpins do not acquire an O(resident frames) telemetry cost.
+Descriptor-cache counters are cumulative per local-device lifetime and deliberately carry no
+file/path label. The adapter snapshots their deltas under its own guard and emits afterward; when
+a pool storage call nests that operation, the existing contained-metrics boundary drains the
+emission only after the pool guard has also been released.
 Every metric here MUST appear in a `dashboards/*.json` panel (OR-5/OR-3) — the CI test asserts it.
+
+**D-26 commit-measurement boundary.** The default/public per-commit lease policy emits one local
+trace only after the participant section, writer lease and `COMMIT_SECTION` are all proven
+released. The D-26 trace adds no metrics-sink or host-`Clock` callback inside those windows:
+phase timestamps use the sole G2 diagnostic exception, the exact `time.perf_counter_ns` symbol,
+and never affect a decision or stored byte. A data-only probe is attached to the buffer pool only
+while the participant section is held
+and is detached before the next local commit can enter. It counts executed flush calls and the
+resident/retired-pinned frames traversed by `flush`, `modified_pages` and `has_dirty_pages`.
+`oktografx_commit_wal_bytes_total` is physical live-WAL growth from successful appends, including an
+implicit segment header; `retargets_total` advances only after retargeting completes. A failed timer
+sample discards that trace's duration series rather than stretching a partial interval across
+unwind. If acquiring or releasing an exclusive boundary fails without proving the boundary is
+free, the whole trace is suppressed before any host callback. Counters remain outcome-neutral.
+
+The private `retain_lease=True` policy intentionally emits none of the D-26 per-commit family. Its
+lease survives the operation, so there is no post-lease sink boundary from which a complete trace
+can be delivered without violating A91. This is an observability limitation of that explicitly
+unsafe/internal performance mode, not a change to its lease semantics; existing coordinator lease
+metrics remain available.
 
 ---
 
@@ -1267,6 +1461,9 @@ Every metric here MUST appear in a `dashboards/*.json` panel (OR-5/OR-3) — the
 ```python
 from okto_grafx import (
     Database,
+    ExecuteManyReport,
+    Query,
+    QueryCursor,
     QueryResult,
     ScanCursorV1,
     ScanPageV1,
@@ -1284,6 +1481,8 @@ with db.begin("write") as txn:
     txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
     txn.execute("CREATE (:Person {id: 1, name: 'Ada'})")
 result = db.execute("MATCH (p:Person) RETURN p.name")     # autocommit read
+with db.query("MATCH (p:Person) RETURN p.name").cursor(batch_size=256) as rows:
+    for row in rows: ...                                  # bounded terminal streaming
 report  = db.verify(scope="all")
 entries = db.ledger.list(origin_class="forensic")
 db.close()
@@ -1293,6 +1492,40 @@ with an open transaction aborts it and never corrupts. Every public method has a
 `Timestamp` and `VectorValue` are the supported parameter/result value types for temporal and
 vector columns; integrations must not import their definitions through `okto_grafx.domain`.
 
+`Database.query(text, parameters=None) -> Query` snapshots the public inputs immediately.
+`Query.cursor(*, batch_size=256) -> QueryCursor` opens an independent read transaction and owns its
+fixed snapshot until EOF, explicit `close()` or context-manager exit. It accepts only a read plan
+with a `RETURN`; any write/schema/non-returning plan is refused before an operator row runs and
+continues to use materialised `execute()`. Each pull returns detached values after leaving page
+access, keeps no page pinned between pulls and retains at most the selected batch at the public
+terminal. `batch_size` is an exact positive integer no greater than 65,536. A full batch need not
+perform hidden look-ahead, so callers must exhaust or close the cursor. The cursor is neither
+serializable nor safe for concurrent consumption. `max_result_rows` remains cumulative over the
+cursor and refuses row N+1; early close accounts only rows actually pulled. Blocking operators
+below the terminal preserve their documented semantics. With `query_memory_budget_bytes=None` they
+retain their prior in-memory state; with it configured, sort, result-DISTINCT and aggregate use the
+bounded spill contract above and cursor close removes their temporary workspace before releasing
+the reader.
+
+`Transaction.executemany(text, parameter_sets) -> ExecuteManyReport` is the additive bulk-write
+door. It accepts exactly one updating `Query` without `RETURN` on an active write transaction;
+DDL, reads, `UNION` and result-producing writes are refused before `parameter_sets` is consumed.
+The text is canonicalized and parsed once. Every parameter mapping is then consumed lazily,
+deeply canonicalized outside page access and executed in input order; planning remains per item
+because an earlier item can dirty a table and make its committed index unsafe for a later item's
+owner-visible read. The result owns only `statements` and a bounded map of summed non-negative
+statistics and retains no parameter mapping, row, plan or `QueryResult`.
+
+The call takes one outer transaction staging mark before consuming the iterable. Every item keeps
+the existing statement-level handover discipline. Any `BaseException`, including iterator and
+canonicalization failures, discards back to the outer mark before it escapes; therefore catching
+the refusal and later committing cannot publish a successful prefix. Staging that preceded the
+call remains intact. Public execute, scan, commit, rollback and retry doors refuse re-entrant use
+of the same transaction while the iterable is being consumed, so executable host callbacks
+cannot commit a prefix. A successful call only settles the mark: it never commits, groups commits
+or changes WAL/OCC/durability. Empty batches are valid but still require write mode. Existing
+statement, transaction row/byte and final WAL-batch budgets are authoritative.
+
 `Transaction.scan_rows_v1(table, *, limit, cursor=None) -> ScanPageV1` is the bounded physical
 transfer door. It is valid only on an active read transaction and therefore reuses that
 transaction's fixed MVCC snapshot. `ScanRowV1.values` follows `TableDef.columns`; relationship
@@ -1300,8 +1533,8 @@ rows include `_from` and `_to` first and retain one row per physical occurrence.
 opaque, process-local, non-serializable, single-use and scoped to the database, transaction and
 table that minted it. Each call decodes at most `limit` rows and retains at most those payloads
 plus one pinned page; it does not use `QueryResult`, sorting or traversal. The DTOs remain detached
-after the transaction closes. This V1 door is not a logical archive, a second snapshot lifecycle
-or bulk import API.
+after the transaction closes. This V1 door is not a logical archive or a second snapshot
+lifecycle; bulk writes use `Transaction.executemany()` and do not share this cursor protocol.
 
 **P2.5 / Fase 1.6 — concrete facade result types (CLOSED).** The detached objects returned at the
 public boundary are named exactly: `Database.recovery_report -> RecoveryReport | None`,
@@ -1704,9 +1937,17 @@ runtime result shape.
   **`MetricsSink.register`** (C8, duplicate/conflict detection at registration). G7 is read as naming
   both.
 * **A52** numpy's home is **`[accel]`** (G3 / SPEC-VEC TR-6 / IR-2 -- the optional accelerator behind
-  the `VectorMath` port). Its additional presence in `[bench]` satisfies SPEC-M1 TR-9 because the
+  the `VectorMath` and byte-identical `PageCodec` ports). Its additional presence in `[bench]` satisfies SPEC-M1 TR-9 because the
   harness needs it too, and is a convenience rather than a second home. No contradiction exists in
   `pyproject.toml`; this records which clause is authoritative if they ever diverge.
+  `google-crc32c` shares that home: it is the optional accelerator behind the checksum slot
+  (PORTS.md), imported only in `adapters/checksum_native.py`, proved against the acceptance corpus
+  before it can be installed, and since D-29 that successful proof is memoized per process under
+  the provider's strong identity (module, attribute, origin, version, function object) -- never for
+  an injected callable, never for `verify_runtime=True`, and never after a refusal. Identity of the
+  raw function is `is`, not equality/hash; each closed module/attribute slot retains only its
+  current identity; and the adapter serializes lookup, both proofs and publication without adding
+  a threading mechanism to the pure domain.
 * **A53 (the battery lock fails CLOSED).** Two hardening rules for the A39-revised lock, after a
   review flagged stale-break logic as the risky part -- correctly, even though the implementation
   refuses while the owner is alive:
@@ -1919,7 +2160,7 @@ runtime result shape.
   never be completed; that is A54's own text, and A54 then rested on one anyway.
   **The argument of `optional_dependency` MUST name a distribution declared in
   `[project.optional-dependencies]` in `pyproject.toml`, and the gate MUST read that table.** Today
-  that set is exactly `{numpy, ladybug}`. A marker naming anything else is a hard failure, whatever
+  that set is exactly `{numpy, google-crc32c, ladybug}`. A marker naming anything else is a hard failure, whatever
   `find_spec` says about it. Absence is then still verified -- a declared dependency that IS
   installed cannot excuse a skip -- but absence is no longer sufficient. The claim becomes checkable
   against a set the author does not control, which is the property the previous three rules lacked.

@@ -118,6 +118,56 @@ def test_a_tombstoned_entry_stays_in_the_index_as_a_bridge(database: VectorFixtu
     assert index.live_count() == before - 1
 
 
+def test_a_broken_warm_count_cannot_turn_a_durable_tombstone_into_a_failed_commit(
+    database: VectorFixture,
+) -> None:
+    """D-12 cache arithmetic is advisory; the durable change remains authoritative."""
+    space, table, refs = _populate(database, 1)
+    index = database.engine.index("space")
+    assert len(index.graph()) == 1
+    assert index.live_count() == 1
+    with index._guard:  # noqa: SLF001 - inject only the derived-cache fault
+        index._live_count = 0  # noqa: SLF001
+
+    database.delete_row(table, refs[0], 1, space, (0.0, 1.0, 2.0, 3.0), csn=40)
+
+    assert index.stale is False
+    assert index.check_freshness(index.built_through_lsn) is False
+    assert index.live_count() == 0
+
+
+def test_a_key_mismatched_tombstone_keeps_the_warm_count_without_guessing(
+    database: VectorFixture,
+) -> None:
+    """A missing durable target is a no-op, not permission to decrement by ref."""
+    space, _table, refs = _populate(database, 1)
+    index = database.engine.index("space")
+    assert len(index.graph()) == 1
+    txn = TransactionDouble()
+    index.stage_delete(txn, index.key_for((90.0, 91.0, 92.0, 93.0)), refs[0], 80)
+    database.engine.commit("space", txn, 80)
+
+    assert index.missing_targets == 1
+    assert index._snapshot is not None  # noqa: SLF001 - no-op kept the warm picture
+    assert index.live_count() == 1
+
+
+def test_an_insert_with_the_same_ref_and_another_key_is_a_distinct_warm_entry(
+    database: VectorFixture,
+) -> None:
+    """An entry identity is ``(key, ref)``; ref alone cannot decide a delta."""
+    space, _table, refs = _populate(database, 1)
+    index = database.engine.index("space")
+    assert len(index.graph()) == 1
+    txn = TransactionDouble()
+    index.stage_insert(txn, index.key_for((90.0, 91.0, 92.0, 93.0)), refs[0], 80)
+    database.engine.commit("space", txn, 80)
+
+    assert index._snapshot is not None  # noqa: SLF001 - second entry patched by full identity
+    assert index.live_count() == 2
+    assert len(index.graph()) == 2
+
+
 def test_the_visible_count_is_what_the_snapshot_can_see(database: VectorFixture) -> None:
     """The size of a space is a snapshot question, because an old reader lives in a smaller one."""
     _populate(database, 6)
@@ -389,6 +439,25 @@ def test_a_redo_record_reaches_a_graph_that_is_already_built(
     database.pool.flush(database.heap.file)
     scored, _stats = index.search((9.0, 9.0, 9.0, 9.0), 1, SnapshotDouble(1000))
     assert [item.record_id for item in scored] == [9]
+
+
+def test_a_replayed_removal_retires_the_warm_count_before_the_canonical_read(
+    database: VectorFixture,
+) -> None:
+    """REMOVE replay also has no inferred delta, even when it lands exactly once."""
+    space, table, refs = _populate(database, 1)
+    index = database.engine.index("space")
+    database.delete_row(table, refs[0], 1, space, (0.0, 1.0, 2.0, 3.0), csn=40)
+    assert len(index.graph()) == 1
+    txn = TransactionDouble()
+    database.engine.reconcile("space", 40, txn)
+    record = txn.records[0]
+    index.rollback(txn)
+    index.apply(record)  # type: ignore[arg-type]
+    database.pool.flush(index.file)
+
+    assert index._snapshot is None  # noqa: SLF001 - replay retired derived state
+    assert index.live_count() == 0
 
 
 def test_a_tombstone_reaches_a_warm_graph_and_the_traversal_drops_the_row(
@@ -714,6 +783,8 @@ def test_a_reset_clears_the_store_and_the_graph_derived_from_it(
     assert txn.records == [record]
     database.engine.commit("space", txn, 100)
     assert index.walk() == ()
+    assert index._snapshot is None  # noqa: SLF001 - RESET retires every derived value
+    assert index.live_count() == 0
     assert len(index.graph()) == 0
     result = database.engine.search(
         space="space", query=(0.0, 1.0, 2.0, 3.0), k=4, snapshot=SnapshotDouble(1000)

@@ -8,6 +8,8 @@ each other untestable unless one is disabled to see the other fire (amendments A
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -20,8 +22,11 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import NO_PAGE, RecordRef
 from okto_grafx.domain.index import (
     INDEX_HEADER_SLOT,
+    IndexChange,
+    IndexDefinition,
     IndexEntry,
     IndexHeader,
+    IndexOperation,
     IndexVisibility,
     bucket_of,
 )
@@ -30,8 +35,11 @@ from okto_grafx.domain.page import (
     FileHeader,
     FileHeaderPage,
     FileKind,
+    Page,
     PageType,
 )
+from okto_grafx.domain.model.schema import TableDef
+from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine import index_manager as index_module
 from okto_grafx.engine.index_manager import HashIndex
 
@@ -56,6 +64,31 @@ MAX_SETUP_ROWS: int = 400
 Amendment A92: a setup loop is bounded by a count and gates on something the code under test does
 not compute, so a regression in the walk cannot turn setup into a run that never ends.
 """
+
+
+def test_definition_digest_is_derived_once_per_store(
+    monkeypatch: pytest.MonkeyPatch,
+    person_table: TableDef,
+    pool: BufferPool,
+    metrics: RecordingMetrics,
+) -> None:
+    """Frozen definition derivatives need not be rebuilt on each header validation."""
+    definition = exact_definition(person_table)
+    original = IndexDefinition.digest
+    calls = 0
+
+    def counted(candidate: IndexDefinition) -> bytes:
+        nonlocal calls
+        calls += 1
+        return original(candidate)
+
+    monkeypatch.setattr(IndexDefinition, "digest", counted)
+    index = HashIndex(definition, pool, metrics)
+
+    index.create()
+    index.open()
+
+    assert calls == 1
 
 
 class ForgetfulSet(set):
@@ -235,6 +268,24 @@ def test_a_bucket_chain_that_returns_to_a_page_is_refused(database: Database) ->
     assert refused.value.details["page"] == pages[0]
 
 
+def test_a_short_bucket_walk_does_not_ask_the_device_for_its_page_count(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anti-corruption size bound is lazy while the ordinary short-chain path stays cheap."""
+
+    calls = 0
+    original = database.device.page_count
+
+    def counted(file: str) -> int:
+        nonlocal calls
+        calls += 1
+        return original(file)
+
+    monkeypatch.setattr(database.device, "page_count", counted)
+    assert database.exact._bucket_pages(0) == (1,)
+    assert calls == 0
+
+
 def test_a_bucket_chain_that_does_not_end_is_refused_when_the_visited_set_is_defeated(
     database: Database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -332,7 +383,9 @@ def test_candidate_and_exact_entry_search_materialize_only_matching_entries(
     wanted = in_bucket[-1]
     pages = database.exact._bucket_pages(crowded)
     calls = 0
+    bucket_pins: list[int] = []
     original = IndexEntry.located_at
+    original_pinned = BufferPool.pinned
 
     def counted(self: IndexEntry, page: int, slot: int) -> IndexEntry:
         nonlocal calls
@@ -341,8 +394,37 @@ def test_candidate_and_exact_entry_search_materialize_only_matching_entries(
 
     monkeypatch.setattr(IndexEntry, "located_at", counted)
 
+    @contextmanager
+    def counted_pin(
+        pool: BufferPool, file: str, page_index: int
+    ) -> Iterator[Page]:
+        if pool is database.pool and file == database.exact.file:
+            bucket_pins.append(page_index)
+        with original_pinned(pool, file, page_index) as page:
+            yield page
+
+    monkeypatch.setattr(BufferPool, "pinned", counted_pin)
+
     assert database.exact._candidates_unchecked(wanted.key) == (wanted,)
     assert calls == 1
+    assert bucket_pins == list(pages), "candidate lookup must pin each chain page once"
+
+    calls = 0
+    bucket_pins.clear()
+    early = in_bucket[0]
+    assert not database.exact._apply_change(
+        IndexChange(
+            index=database.exact.name,
+            operation=IndexOperation.INSERT,
+            key=early.key,
+            ref=early.ref,
+            versioned=False,
+        ),
+        BORN,
+    )
+    assert calls == 1
+    assert bucket_pins == list(pages), "duplicate insert must probe each chain page once"
+
     calls = 0
     assert database.exact._find_entry(pages, wanted.key, wanted.ref) == (
         wanted.page,
@@ -381,6 +463,72 @@ def test_candidate_search_still_refuses_a_corrupt_non_matching_entry(
         database.exact._candidates_unchecked(wanted.key)
 
     assert refused.value.details["field"] == "flags"
+
+
+def test_header_only_index_paths_match_the_full_walk_without_entry_dtos(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-17: count/ref consumers validate slots without decode/located allocations."""
+    _fill_bucket(database, 60)
+    entries = database.exact.walk()
+    expected_counts = (
+        len(entries),
+        sum(1 for entry in entries if entry.live),
+    )
+    expected_refs = tuple(entry.ref for entry in entries)
+    expected_headers = tuple(
+        (
+            entry.page,
+            entry.slot,
+            entry.ref.encode(),
+            entry.born_csn,
+            entry.dead_csn,
+            entry.versioned,
+            entry.key,
+        )
+        for entry in entries
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a header-only path constructed an IndexEntry DTO")
+
+    monkeypatch.setattr(IndexEntry, "decode", classmethod(forbidden))
+    monkeypatch.setattr(IndexEntry, "located_at", forbidden)
+
+    assert database.exact._entry_counts_from_headers() == expected_counts
+    assert database.exact._entry_refs_from_headers() == expected_refs
+    assert database.exact._entry_headers() == expected_headers
+
+
+@pytest.mark.parametrize(
+    "reader",
+    ["_entry_counts_from_headers", "_entry_refs_from_headers", "_entry_headers"],
+)
+@pytest.mark.parametrize("damage", ["flags", "encoded_ref"])
+def test_header_only_index_paths_refuse_damage_in_any_slot(
+    database: Database, reader: str, damage: str
+) -> None:
+    """Skipping DTO construction never turns an unneeded corrupt entry into invisible data."""
+    _fill_bucket(database, 60)
+    damaged = database.exact.walk()[-1]
+    with database.pool.pinned(database.exact.file, damaged.page) as page:
+        image = bytearray(page.read_slot(damaged.slot))
+        if damage == "flags":
+            image[0] |= 0x80
+        else:
+            # The encoded u64 reference starts at byte 3; any non-zero high 16 bits exceed
+            # RecordRef's 48-bit page/slot representation while remaining a valid u64 image.
+            image[9] |= 0x01
+        page.update_slot(damaged.slot, image)
+
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        getattr(database.exact, reader)()
+
+    if damage == "flags":
+        assert refused.value.details["field"] == "flags"
+        assert refused.value.details["value"] == 0x80
+    else:
+        assert refused.value.details["raw"] > 0xFFFFFFFFFFFF
 
 
 def test_a_live_entry_is_the_one_no_commit_has_ended(database: Database) -> None:
@@ -532,17 +680,55 @@ def test_using_an_index_whose_file_was_never_created_is_refused(
 
 
 def test_a_file_a_redo_grew_before_anything_reserved_page_zero_is_repaired(
-    person_table: Any, pool: Any, metrics: RecordingMetrics, device: MemoryDevice
+    monkeypatch: pytest.MonkeyPatch,
+    person_table: Any,
+    pool: Any,
+    metrics: RecordingMetrics,
+    device: MemoryDevice,
 ) -> None:
     """Amendment A22 lets recovery grow a file before its header page exists."""
     index = HashIndex(exact_definition(person_table), pool, metrics)
     device.create(index.file)
     device.allocate(index.file, 3)
+    allocations: list[tuple[str, int]] = []
+    original_allocate = device.allocate
+
+    def counted_allocate(file: str, count: int = 1) -> int:
+        allocations.append((file, count))
+        return original_allocate(file, count)
+
+    monkeypatch.setattr(device, "allocate", counted_allocate)
 
     header = index.create()
 
     assert header.bucket_count == TEST_BUCKET_COUNT
     assert device.page_count(index.file) == 1 + TEST_BUCKET_COUNT
+    assert allocations == [(index.file, 2)]
+
+
+def test_a_new_bucket_directory_grows_in_one_run_under_a_one_page_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    person_table: Any,
+    metrics: RecordingMetrics,
+) -> None:
+    """The fixed directory needs one append, but never pins the whole run at once."""
+    device = MemoryDevice()
+    pool = make_pool(device, metrics, budget_pages=1)
+    index = HashIndex(exact_definition(person_table), pool, metrics)
+    allocations: list[tuple[str, int]] = []
+    original_allocate = device.allocate
+
+    def counted_allocate(file: str, count: int = 1) -> int:
+        allocations.append((file, count))
+        return original_allocate(file, count)
+
+    monkeypatch.setattr(device, "allocate", counted_allocate)
+
+    header = index.create()
+
+    assert header.bucket_count == TEST_BUCKET_COUNT
+    assert device.page_count(index.file) == 1 + TEST_BUCKET_COUNT
+    assert allocations == [(index.file, 1), (index.file, TEST_BUCKET_COUNT)]
 
 
 def test_a_written_page_zero_that_is_not_a_header_is_not_reserved_over(

@@ -28,6 +28,9 @@ from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.engine.database import (
     Database,
     DatabaseIdentity,
+    ExecuteManyReport,
+    Query,
+    QueryCursor,
     ScanCursorV1,
     ScanPageV1,
     ScanRowV1,
@@ -41,7 +44,10 @@ __all__ = [
     "Database",
     "DatabaseConfig",
     "DatabaseIdentity",
+    "ExecuteManyReport",
     "PortRegistry",
+    "Query",
+    "QueryCursor",
     "QueryResult",
     "ScanCursorV1",
     "ScanPageV1",
@@ -53,4 +59,4 @@ __all__ = [
     "connect",
 ]
 
-__version__: str = "0.0.1"
+__version__: str = "0.0.3"

@@ -257,6 +257,45 @@ def test_the_intermediate_budget_is_charged_once_at_the_traversal(
         wide.close()
 
 
+def test_untyped_traversal_uses_the_same_cumulative_work_budgets(tmp_path: Path) -> None:
+    """Candidates from distinct relationship tables share one query-wide counter."""
+    where = tmp_path / "untyped-budget"
+    seeded = okto_grafx.connect(where, page_size=512)
+    _seed(seeded)
+    seeded.close()
+
+    narrow = okto_grafx.connect(
+        where,
+        page_size=512,
+        max_traversal_expansions=2,
+        max_traversal_paths=3,
+    )
+    try:
+        with pytest.raises(GrafxQueryBudgetExceeded) as raised:
+            narrow.execute(ADMITTED)
+    finally:
+        narrow.close()
+    assert raised.value.details == {
+        "field": "max_traversal_expansions",
+        "limit": 2,
+        "observed": 3,
+    }
+
+    exact = okto_grafx.connect(
+        where,
+        page_size=512,
+        max_traversal_expansions=3,
+        max_traversal_paths=3,
+    )
+    try:
+        found = exact.execute(ADMITTED)
+    finally:
+        exact.close()
+    assert found.rows == (("d1",), ("d1",), ("d1",))
+    assert found.statistics["traversal_expansions"] == 3
+    assert found.statistics["traversal_paths"] == 3
+
+
 # --- the statements that only resemble the admitted one -------------------------------------------
 
 
@@ -313,10 +352,11 @@ def test_a_resembling_statement_still_earns_its_original_refusal() -> None:
     assert "names exactly one type" in str(failure.value)
 
 
-def test_a_typed_hop_plans_exactly_as_it_did() -> None:
-    """The route this milestone did not touch is the route this milestone did not touch."""
+def test_a_typed_hop_with_a_small_frontier_keeps_its_traversal() -> None:
+    """The untyped route does not widen the typed hop's small-frontier cost rule."""
     plan = build_plan(
-        parse("MATCH (a:Decision)-[r:supports]->(b) RETURN a.id"), catalog=_catalog()
+        parse("MATCH (a:Decision)-[r:supports]->(b) RETURN a.id LIMIT 64"),
+        catalog=_catalog(),
     )
     assert any("TraverseRelationship(" in line for line in plan.root.render())
     assert not any("TraverseAnyRelationship" in line for line in plan.root.render())

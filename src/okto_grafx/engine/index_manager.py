@@ -52,11 +52,15 @@ with a located error instead of hanging (amendment A42).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import TypeVar
+from typing import NamedTuple, TypeVar
 
 from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
@@ -72,6 +76,8 @@ from okto_grafx.domain.ids import (
     PageIndex,
     RecordRef,
     SlotId,
+    _require_decodable_ref,
+    is_committed_csn,
     is_open_end_csn,
     is_provisional_csn,
 )
@@ -82,8 +88,13 @@ from okto_grafx.domain.index.definition import (
     automatic_index_definitions,
     index_definition_matches_table,
     index_file,
+    index_generation_file,
 )
-from okto_grafx.domain.index.entry import INDEX_ENTRY_HEADER_SIZE, IndexEntry
+from okto_grafx.domain.index.entry import (
+    INDEX_ENTRY_HEADER_SIZE,
+    IndexEntry,
+    _validated_image,
+)
 from okto_grafx.domain.index.header import (
     INDEX_HEADER_FORMAT_VERSION,
     INDEX_HEADER_SLOT,
@@ -95,6 +106,7 @@ from okto_grafx.domain.index.records import (
     IndexOperation,
     change_of,
     lsn_of,
+    record_for_change,
     wal_record_for,
 )
 from okto_grafx.domain.index.visibility import (
@@ -105,6 +117,8 @@ from okto_grafx.domain.index.visibility import (
     is_reclaimable,
 )
 from okto_grafx.domain.model.record import HeapVersion
+from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
+from okto_grafx.domain.model.schema import TableDef
 from okto_grafx.domain.page import (
     HEADER_PAGE_INDEX,
     PAGE_HEADER_SIZE,
@@ -117,7 +131,8 @@ from okto_grafx.domain.page import (
     PageType,
 )
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
-from okto_grafx.domain.txn.context import RowIntent
+from okto_grafx.domain.txn.context import RowIntent, TransactionContext
+from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.buffer_pool import (
@@ -127,6 +142,11 @@ from okto_grafx.engine.buffer_pool import (
 )
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.metrics_catalog import metric
+
+# Bind the shortcut to the implementation audited with the raw-image witness protocol. A
+# dynamic class lookup could otherwise let a later monkeypatch claim ``unchanged`` without the
+# mandatory physical observation.
+_BUFFER_POOL_OBSERVE_FRESH_PAGE = BufferPool._observe_fresh_page
 
 __all__ = [
     "INDEX_DIRECTORY",
@@ -161,6 +181,52 @@ restart that never asks the question again.
 
 INDEX_READ_RETRY_BUDGET: int = 2
 """Fresh exact-index views retried after a concurrent header transition before refusing."""
+
+_DETACHED_GENERATION_NONCE_ATTEMPTS: int = 64
+"""Bounded provider draws used to find one unowned physical-generation name."""
+
+"""Per-manager ceiling for immutable schema-provenance comparisons."""
+
+_COMMON_REPLAY_HOT_TARGET_LIMIT: int = 65_536
+"""Hard ceiling on target identities retained by all hot directories in one replay."""
+
+_COMMON_REPLAY_HOT_PAGE_LIMIT: int = 16_384
+"""Hard ceiling on bucket pages retained by all hot directories in one replay."""
+
+_COMMON_REPLAY_HOT_BUCKET_LIMIT: int = 16_384
+"""Hard ceiling on distinct bucket identities considered by the replay accelerator."""
+
+_LIVE_COMMIT_HOT_BUCKET_MIN_EFFECTS: int = 2
+"""Smallest fenced live-commit run that saves a second bucket scan."""
+
+_LIVE_COMMIT_AUTHORITY_SEAL: object = object()
+"""Module-private proof installed only by the transaction manager's fenced commit door."""
+
+_LIVE_COMMIT_AUTHORITY: ContextVar[object | None] = ContextVar(
+    "okto_grafx_live_commit_authority", default=None
+)
+"""Call-local authority whose mutable scope is revoked before its context is reset."""
+
+_COMMIT_INDEX_PROJECTION_SEAL: object = object()
+"""Module-private proof for one post-rebase index selection inside COMMIT_SECTION."""
+
+_COMMIT_INDEX_PROJECTION: ContextVar[object | None] = ContextVar(
+    "okto_grafx_commit_index_projection", default=None
+)
+"""Attempt-local immutable index selection; never retained across commit-section exit."""
+
+_LIVE_HOT_HOOK_NAMES: tuple[str, ...] = (
+    "_apply_change",
+    "_bucket_pages",
+    "_find_entry",
+    "_place",
+    "_rewrite",
+    "_erase",
+)
+"""Physical hooks a live batch replaces and therefore requires in canonical form."""
+
+_CANONICAL_LIVE_HOT_HOOKS: tuple[object, ...]
+"""Original hook objects, bound after ``IndexStore`` is fully defined."""
 
 TOMBSTONE_BACKLOG: str = "oktografx_vector_tombstone_backlog"
 RECONCILIATION_TOTAL: str = "oktografx_vector_reconciliation_total"
@@ -209,6 +275,18 @@ class IndexFinding:
         }
 
 
+class _IndexEntryHeader(NamedTuple):
+    """Validated index metadata materialised without constructing an ``IndexEntry``."""
+
+    page: PageIndex
+    slot: SlotId
+    encoded_ref: int
+    born_csn: Csn
+    dead_csn: Csn
+    versioned: bool
+    key: bytes
+
+
 @dataclass(slots=True)
 class _Staged:
     """One transaction's index effects, including a proved empty sparse observation.
@@ -231,12 +309,50 @@ class _Staged:
     """
 
 
+@dataclass(slots=True)
+class _LiveCommitAuthority:
+    """Revocable scope for one manager/transaction/store inside the fenced commit call."""
+
+    seal: object
+    manager: IndexManager
+    txn: object
+    store: IndexStore | None = None
+    active: bool = True
+
+
+@dataclass(slots=True)
+class _CommitIndexProjection:
+    """Revocable post-rebase snapshot reused only by one canonical commit attempt."""
+
+    seal: object
+    manager: IndexManager
+    txn: object
+    txn_id: int
+    catalog: object | None
+    indexes: tuple[IndexStore, ...]
+    row_indexes: tuple[IndexStore, ...]
+    rebuild_indexes: tuple[IndexStore, ...]
+    registry_revision: int
+    schema_observed: tuple[tuple[IndexStore, int], ...]
+    new_table_observed: frozenset[IndexStore]
+    detached_claims: tuple[tuple[IndexStore, frozenset[object]], ...]
+    active: bool = True
+
+
 @dataclass(frozen=True, slots=True)
 class _IndexReadCertificate:
     """The durable page-0 state to which this process's bucket cache is attached."""
 
     seq: int
     header: IndexHeader
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshCertificateMemo:
+    """One atomically paired pool witness and semantic certificate for the same bytes."""
+
+    witness: object
+    certificate: _IndexReadCertificate
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +377,124 @@ class _RebuildAuthority:
     token: int
     header_seq: int
     through_lsn: Lsn
+
+
+class _FirstFitPages:
+    """Ephemeral first-fit directory for pages proved empty at the start of one build.
+
+    The tree stores the greatest payload capacity below each node, so choosing the leftmost page
+    that can hold an entry is logarithmic and byte-for-byte equivalent to ``_place`` walking the
+    chain from its head.  It is never retained across a commit, recovery call or certificate.
+    """
+
+    __slots__ = ("pages", "_capacities", "_leaf_count", "_positions", "_tree")
+
+    def __init__(self, pages: Sequence[PageIndex], capacities: Sequence[int]) -> None:
+        self.pages: list[PageIndex] = list(pages)
+        self._capacities: list[int] = list(capacities)
+        self._positions: dict[PageIndex, int] = {
+            page: position for position, page in enumerate(self.pages)
+        }
+        self._leaf_count = 1
+        while self._leaf_count < len(self.pages):
+            self._leaf_count *= 2
+        self._tree: list[int] = [-1] * (2 * self._leaf_count)
+        self._rebuild_tree()
+
+    def first_fit(self, payload_size: int) -> int | None:
+        """Return the first chain position that can hold ``payload_size``, if one exists."""
+        if not self.pages or self._tree[1] < payload_size:
+            return None
+        node = 1
+        while node < self._leaf_count:
+            left = node * 2
+            node = left if self._tree[left] >= payload_size else left + 1
+        position = node - self._leaf_count
+        return position if position < len(self.pages) else None
+
+    def update(self, position: int, capacity: int) -> None:
+        """Replace one page's capacity after a successful mutation."""
+        self._capacities[position] = capacity
+        node = self._leaf_count + position
+        self._tree[node] = capacity
+        node //= 2
+        while node:
+            self._tree[node] = max(self._tree[node * 2], self._tree[node * 2 + 1])
+            node //= 2
+
+    def append(self, page: PageIndex, capacity: int) -> None:
+        """Add a new tail page, growing the tree geometrically."""
+        self._positions[page] = len(self.pages)
+        self.pages.append(page)
+        self._capacities.append(capacity)
+        if len(self.pages) > self._leaf_count:
+            self._leaf_count *= 2
+            self._tree = [-1] * (2 * self._leaf_count)
+            self._rebuild_tree()
+            return
+        self.update(len(self.pages) - 1, capacity)
+
+    def position(self, page: PageIndex) -> int | None:
+        """Return one page's chain position without rescanning a replay-hot chain."""
+        return self._positions.get(page)
+
+    def _rebuild_tree(self) -> None:
+        """Recreate the max tree after geometric growth."""
+        start = self._leaf_count
+        self._tree[start : start + len(self._capacities)] = self._capacities
+        for node in range(self._leaf_count - 1, 0, -1):
+            self._tree[node] = max(self._tree[node * 2], self._tree[node * 2 + 1])
+
+
+@dataclass(slots=True)
+class _EmptyIndexBuild:
+    """State derived only after every bucket page was proved empty for this one batch."""
+
+    buckets: dict[int, _FirstFitPages] = field(default_factory=dict)
+    entries: dict[tuple[bytes, RecordRef], tuple[PageIndex, SlotId, IndexEntry]] = (
+        field(default_factory=dict)
+    )
+    valid: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _CommonReplayItem:
+    """One fully decoded item in an ephemeral common index-only replay plan."""
+
+    store: IndexStore
+    change: IndexChange
+    position: Lsn
+    bucket: int
+
+
+@dataclass(slots=True)
+class _CommonReplayHotBucket:
+    """One fully validated, call-local directory over a replay-hot bucket."""
+
+    pages: _FirstFitPages
+    entries: dict[
+        tuple[bytes, RecordRef],
+        tuple[PageIndex, SlotId, IndexEntry] | None,
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _CommonReplayStore:
+    """One store's single seeded header and monotonically composed final image."""
+
+    store: IndexStore
+    initial: IndexHeader
+    final: IndexHeader
+
+
+@dataclass(frozen=True, slots=True)
+class _CommonReplayBatch:
+    """Passage-local proof for the narrow non-vector, non-rebuild replay fast path."""
+
+    owner: IndexManager
+    items: tuple[_CommonReplayItem, ...]
+    stores: tuple[_CommonReplayStore, ...]
+    hot_buckets: Mapping[tuple[IndexStore, int], _CommonReplayHotBucket]
 
 
 _ReadResult = TypeVar("_ReadResult")
@@ -292,6 +526,9 @@ class IndexStore:
 
     __slots__ = (
         "_definition",
+        "_definition_digest",
+        "_file",
+        "_page_type",
         "_creation_nonce",
         "_pool",
         "_metrics",
@@ -303,10 +540,12 @@ class IndexStore:
         "_cache_certificate",
         "_local_certificate",
         "_carried_certificate",
+        "_fresh_certificate_memo",
         "_rebuild_authority",
         "_completed_rebuild_through",
         "_replaying",
         "_table_high_water",
+        "_tombstone_backlog_count",
     )
 
     def __init__(
@@ -320,6 +559,13 @@ class IndexStore:
                 value=type(definition).__name__,
             )
         self._definition: IndexDefinition = definition
+        # IndexDefinition is frozen.  These values sit on every lookup/header-validation path
+        # and deriving them again cannot observe catalog or cross-process state.
+        self._definition_digest: bytes = definition.digest()
+        self._file: str = definition.file
+        self._page_type: int = int(
+            PageType.INDEX_HNSW if definition.versioned else PageType.INDEX_HASH
+        )
         self._creation_nonce: int = 0
         self._pool: BufferPool = pool
         self._metrics: MetricsSink = metrics
@@ -350,6 +596,10 @@ class IndexStore:
         # it is consumed one-shot, dropped by every local page-0 write and by every refusal,
         # and it is never what certifies a traversal -- the fresh post-read still is.
         self._carried_certificate: _IndexReadCertificate | None = None
+        # Lazy and bounded to one raw page image plus its matching semantic certificate. The
+        # pool witness still performs a physical read on every use; it authorises only skipping
+        # decode when every byte is identical to this previously validated image.
+        self._fresh_certificate_memo: _FreshCertificateMemo | None = None
         # Set only after RESET has re-proved the durable stale generation while holding the
         # file's page-0 write section. It is the authority required to publish healthy again.
         self._rebuild_authority: _RebuildAuthority | None = None
@@ -360,6 +610,11 @@ class IndexStore:
         # Bound by IndexManager after a table-aware open and advanced by local commits. ``None``
         # preserves the standalone IndexStore contract, whose caller supplies the whole floor.
         self._table_high_water: Lsn | None = None
+        # Derived process-local metric state only. ``None`` means that no exact count is proved
+        # for the current paged generation; the next gauge emission seeds it with one verified
+        # walk. Thereafter successful logical changes maintain it in O(1), without adding a byte
+        # to the index format or making this diagnostic state an authority for reads.
+        self._tombstone_backlog_count: int | None = None
         if metrics.enabled:
             for descriptor in INDEX_METRICS:
                 metrics.register(descriptor)
@@ -437,7 +692,7 @@ class IndexStore:
     @property
     def file(self) -> str:
         """Return the paged file this index is stored in."""
-        return self._definition.file
+        return self._file
 
     @property
     def page_type(self) -> int:
@@ -447,9 +702,7 @@ class IndexStore:
         which contract wrote it and a verifier reading raw pages needs nothing else to tell them
         apart.
         """
-        if self._definition.versioned:
-            return int(PageType.INDEX_HNSW)
-        return int(PageType.INDEX_HASH)
+        return self._page_type
 
     @property
     def stale_reason(self) -> str | None:
@@ -567,7 +820,7 @@ class IndexStore:
             visibility=self._definition.visibility,
             table_id=self._definition.table_id,
             bucket_count=self._definition.bucket_count,
-            digest=self._definition.digest(),
+            digest=self._definition_digest,
             artifact_nonce=self._creation_nonce,
         )
         if storage.page_count(self.file) == 0:
@@ -601,11 +854,13 @@ class IndexStore:
         """Give every bucket a head page, repairing a file a redo grew before this ran."""
         storage = self._pool.storage
         wanted = 1 + self._definition.bucket_count
-        while storage.page_count(self.file) < wanted:
-            # reuse=False: the loop waits on the file's length, so a hand-out that does not
-            # lengthen it just goes round again and spends an abandoned page on the way.
-            page = self._pool.allocate(self.file, self.page_type, reuse=False)
-            self._pool.unpin(self.file, page.page_index, dirty=True)
+        present = storage.page_count(self.file)
+        if present < wanted:
+            # This directory has a fixed, schema-bounded length. Grow the missing physical run
+            # through one descriptor acquisition and one append rather than re-proving the file
+            # size for every bucket. allocate_run admits the frames one at a time, unpinned, so a
+            # one-page buffer budget still suffices and every existing repair page is preserved.
+            self._pool.allocate_run(self.file, self.page_type, wanted - present)
         for bucket in range(self._definition.bucket_count):
             index = self._bucket_head(bucket)
             with self._pool.pinned(self.file, index) as page:
@@ -620,9 +875,13 @@ class IndexStore:
         written under a different definition answers a different question, and the honest reply
         is to refuse to open it.
         """
+        # Opening is also a sanctioned re-adoption door for a handle that may have been retained
+        # while another participant replaced its durable generation. Never carry a derived
+        # diagnostic count across that boundary.
+        self._invalidate_tombstone_backlog()
         header = self._read_header(proved_present=proved_present)
         definition = self._definition
-        if header.digest != definition.digest():
+        if header.digest != self._definition_digest:
             raise GrafxIndexError(
                 f"The file {self.file!r} was written under a different definition of index "
                 f"{definition.name!r}, so its entries do not answer this index's question.",
@@ -637,6 +896,20 @@ class IndexStore:
                 field="visibility",
                 index=definition.name,
                 file=self.file,
+            )
+        if (
+            definition.artifact_nonce != 0
+            and header.artifact_nonce != definition.artifact_nonce
+        ):
+            raise GrafxIndexError(
+                f"The file {self.file!r} carries artifact nonce "
+                f"{header.artifact_nonce}, but catalog authority selected "
+                f"{definition.artifact_nonce} for index {definition.name!r}.",
+                field="artifact_nonce",
+                index=definition.name,
+                file=self.file,
+                expected=definition.artifact_nonce,
+                observed=header.artifact_nonce,
             )
         wanted = 1 + header.bucket_count
         if self._pool.storage.page_count(self.file) < wanted:
@@ -712,7 +985,7 @@ class IndexStore:
             )
         header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
         definition = self._definition
-        if header.digest != definition.digest():
+        if header.digest != self._definition_digest:
             raise GrafxIndexError(
                 f"The file {self.file!r} was written under a different definition of index "
                 f"{definition.name!r}.",
@@ -728,14 +1001,55 @@ class IndexStore:
                 index=definition.name,
                 file=self.file,
             )
+        if (
+            definition.artifact_nonce != 0
+            and header.artifact_nonce != definition.artifact_nonce
+        ):
+            raise GrafxIndexError(
+                f"The file {self.file!r} carries artifact nonce "
+                f"{header.artifact_nonce}, but catalog authority selected "
+                f"{definition.artifact_nonce} for index {definition.name!r}.",
+                field="artifact_nonce",
+                index=definition.name,
+                file=self.file,
+                expected=definition.artifact_nonce,
+                observed=header.artifact_nonce,
+            )
         return header
 
     def _fresh_certificate(self) -> _IndexReadCertificate:
         """Collect one detached, checksum-verified certificate directly from the device."""
-        page = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
-        return _IndexReadCertificate(
+        memo = self._fresh_certificate_memo
+        if type(self._pool) is not BufferPool:
+            self._fresh_certificate_memo = None
+            page = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
+            return _IndexReadCertificate(
+                seq=page.seq, header=self._decode_header_page(page)
+            )
+        page, witness = _BUFFER_POOL_OBSERVE_FRESH_PAGE(
+            self._pool,
+            self.file,
+            HEADER_PAGE_INDEX,
+            None if memo is None else memo.witness,
+        )
+        if page is None:
+            if memo is not None and witness is memo.witness:
+                return memo.certificate
+            # A custom observer returned an unauthenticated unchanged verdict. Re-read through
+            # the established public door instead of pairing its value with unrelated semantics.
+            self._fresh_certificate_memo = None
+            fallback = self._pool.read_fresh_page(self.file, HEADER_PAGE_INDEX)
+            return _IndexReadCertificate(
+                seq=fallback.seq, header=self._decode_header_page(fallback)
+            )
+        certificate = _IndexReadCertificate(
             seq=page.seq, header=self._decode_header_page(page)
         )
+        self._fresh_certificate_memo = _FreshCertificateMemo(
+            witness=witness,
+            certificate=certificate,
+        )
+        return certificate
 
     def _remember_local_certificate(self) -> _IndexReadCertificate:
         """Bind resident derived state to the page-0 image this handle just published.
@@ -861,6 +1175,7 @@ class IndexStore:
 
     def _cache_rebased(self) -> None:
         """Notify derived in-memory structures that their paged source was discarded."""
+        self._invalidate_tombstone_backlog()
 
     def _required_table_position(self, requested_lsn: Lsn) -> Lsn:
         """Restrict a database snapshot to the covered table's committed history."""
@@ -961,6 +1276,7 @@ class IndexStore:
         # ``_cache_certificate`` alone (position advance, reconciliation watermark); any of
         # them makes a carried certificate a stale impression of the device.
         self._carried_certificate = None
+        self._fresh_certificate_memo = None
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             self._require_file_header(page)
             page.update_slot(INDEX_HEADER_SLOT, header.encode())
@@ -1118,6 +1434,7 @@ class IndexStore:
         the case where the position happens to agree -- a commit at a position the index already
         claimed -- and that is worth attempting even though it cannot be guaranteed here.
         """
+        self._invalidate_tombstone_backlog()
         try:
             self.mark_stale(reason)
         except GrafxError:
@@ -1543,15 +1860,27 @@ class IndexStore:
                 value=len(resets),
             )
         reset = resets[0] if resets else None
+        authority = _LIVE_COMMIT_AUTHORITY.get()
+        live_hot = bool(
+            isinstance(authority, _LiveCommitAuthority)
+            and authority.active
+            and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
+            and authority.txn is txn
+            and authority.store is self
+        )
         if reset is None:
-            applied = self._commit_staged(txn_id, staged, stamp, reset=None)
+            applied = self._commit_staged(
+                txn_id, staged, stamp, reset=None, live_hot=live_hot
+            )
             self._remember_local_certificate()
             return applied
         # The same cross-process section that serialises page-0 CAS covers the dangerous
         # interval from RESET's generation proof through bucket publication and the final
         # healthy certificate. Readers remain optimistic and never acquire it.
         with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
-            applied = self._commit_staged(txn_id, staged, stamp, reset=reset)
+            applied = self._commit_staged(
+                txn_id, staged, stamp, reset=reset, live_hot=live_hot
+            )
             self._remember_local_certificate()
             return applied
 
@@ -1562,33 +1891,51 @@ class IndexStore:
         stamp: Csn,
         *,
         reset: IndexChange | None,
+        live_hot: bool,
     ) -> int:
         """Apply one staged batch; a RESET caller already holds the whole-file fence."""
         applied = 0
         moved_any = False
+        empty_build: _EmptyIndexBuild | None = None
+        try:
+            hot_buckets = (
+                self._prepare_live_hot_buckets(staged)
+                if live_hot and reset is None
+                else {}
+            )
+        except GrafxError as failure:
+            self._note_commit_failure(txn_id, staged, applied, failure)
+            raise
         for change in staged.changes:
             try:
-                moved_any = self._apply_change(change, stamp) or moved_any
-            except GrafxError as failure:
-                if applied == 0 and failure.details.get("field") in {
-                    "rebuild_superseded",
-                    "reset_requires_stale",
-                }:
-                    # A generation proof refused before the first bucket moved. The durable
-                    # header already belongs to the winning rebuild; poisoning it would turn a
-                    # clean arbitration result into needless global unavailability.
-                    raise
-                if self._stale_reason is None:
-                    # Only a commit that found the index HEALTHY may claim to be the reason it is
-                    # stale, because only then is a completed retry proof that nothing else is
-                    # wrong. Failing while the index was already stale leaves that older verdict
-                    # owning the mark, and it needs a rebuild rather than a retry.
-                    self._short_commit = txn_id
-                self._mark_stale_after_failure(
-                    f"Applying a commit to index {self.name!r} failed after {applied} of "
-                    f"{len(staged.changes)} changes, so it is missing entries the heap holds: "
-                    f"{failure.message}"
+                moved: bool
+                hot_bucket = hot_buckets.get(
+                    bucket_of(change.key, self._definition.bucket_count)
                 )
+                if hot_bucket is not None:
+                    moved = self._apply_common_replay_hot_change(
+                        hot_bucket, change, stamp
+                    )
+                else:
+                    accelerated = (
+                        None
+                        if empty_build is None
+                        else self._apply_empty_build_change(empty_build, change, stamp)
+                    )
+                    if accelerated is None:
+                        moved = self._apply_change(change, stamp)
+                        if empty_build is not None:
+                            empty_build = None
+                    else:
+                        moved = accelerated
+                moved_any = moved or moved_any
+                if change.operation is IndexOperation.RESET and moved and applied == 0:
+                    # RESET just validated and cleared every reachable bucket page while this
+                    # rebuild holds the whole-file fence.  The remaining changes may therefore
+                    # use an ephemeral directory without trusting state from another generation.
+                    empty_build = _EmptyIndexBuild()
+            except GrafxError as failure:
+                self._note_commit_failure(txn_id, staged, applied, failure)
                 raise
             applied += 1
         self._staged.pop(txn_id, None)
@@ -1616,6 +1963,29 @@ class IndexStore:
                         "did not claim."
                     )
                     self._stale_device_seq = certificate.seq
+                elif certificate != self._cache_certificate:
+                    # Page 0 moved on the device outside any commit this handle applied: a
+                    # cold open's replay advances a proximity header without a log record
+                    # (ST-7), so no foreign-record sync ever brought it here, and nothing
+                    # before this point re-reads page 0 into the pool. A clean resident page-0
+                    # frame is still bound to the older generation; advancing the header on it
+                    # would meet the page-0 sequence fence in the flush below -- AFTER the
+                    # barrier -- and leave this handle in recovery_required over a conflict
+                    # that was never about this commit. Drop that one clean frame so the
+                    # advance reads the device generation -- through the door header
+                    # transitions already use for a foreign refresh, which dooms a PINNED
+                    # clean frame rather than leaving it resident for the advance to reuse.
+                    # Only page 0, and only when clean: this commit's dirty buckets stay, and
+                    # a dirty page 0 keeps meeting the fence, which is the refusal this must
+                    # not relax.
+                    self._invalidate_tombstone_backlog()
+                    dirty = {
+                        page_index
+                        for file, page_index in self._pool.modified_pages(self.file)
+                        if file == self.file
+                    }
+                    if HEADER_PAGE_INDEX not in dirty:
+                        self._pool.discard_clean_page(self.file, HEADER_PAGE_INDEX)
             if not durably_stale:
                 self._advance(stamp)
                 if moved_any:
@@ -1632,9 +2002,34 @@ class IndexStore:
                 # took, so the rebuild fence no longer describes what it can answer. Releasing
                 # it before the flush would let any failure along the way lift the fence too.
                 self._completed_rebuild_through = None
-        if self._metrics.enabled and self._definition.versioned:
-            self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
+        self._publish_tombstone_backlog()
         return applied
+
+    def _note_commit_failure(
+        self,
+        txn_id: int,
+        staged: _Staged,
+        applied: int,
+        failure: GrafxError,
+    ) -> None:
+        """Preserve the live commit's durable stale/retry protocol after one refusal."""
+        if applied == 0 and failure.details.get("field") in {
+            "rebuild_superseded",
+            "reset_requires_stale",
+        }:
+            # A generation proof refused before the first bucket moved. The durable header
+            # already belongs to the winning rebuild; poisoning it would turn a clean
+            # arbitration result into needless global unavailability.
+            return
+        if self._stale_reason is None:
+            # Only a commit that found the index HEALTHY may claim to be the reason it is stale,
+            # because only then is a completed retry proof that nothing else is wrong.
+            self._short_commit = txn_id
+        self._mark_stale_after_failure(
+            f"Applying a commit to index {self.name!r} failed after {applied} of "
+            f"{len(staged.changes)} changes, so it is missing entries the heap holds: "
+            f"{failure.message}"
+        )
 
     def advance_built_through(self, lsn: Lsn) -> None:
         """Raise the position this index claims to cover, unless it is known to be stale.
@@ -2056,6 +2451,51 @@ class IndexStore:
                 self._discard_replay_frames(failure)
             raise
 
+    def _batch_replay_admits(self) -> bool:
+        """Declare whether a store that overrides :meth:`apply` may join a composed replay batch.
+
+        A canonical store is never asked: its ``apply`` IS the batch's own per-record protocol.
+        A specialised store answers only for its exact type, and only while the part of its
+        ``apply`` that goes beyond the canonical protocol is provably a no-op for the whole
+        batch; :meth:`_batch_replay_settled` then runs exactly once, after the composed header
+        decision, so derived state is never certified against a position the header has not
+        reached.  The default is a refusal, which keeps every unknown subclass on the scalar
+        protocol it was written against.
+        """
+        return False
+
+    def _batch_replay_settled(self, *, moved: bool) -> None:
+        """Hear, once per batch and after the header decision, that this store was batched."""
+        return None
+
+    def _require_same_replay_identity(self, initial: IndexHeader) -> None:
+        """Refuse to publish a composed header over a page 0 that no longer names this generation.
+
+        The composed image was read before the first bucket mutation of the batch.  Writing it
+        back through :meth:`_write_header` only re-checks the file kind and page size, so a
+        participant that replaced the artifact or flagged it stale between two effects would
+        otherwise receive a healthy header describing another generation's buckets.  Identity
+        fields are compared; the built/reconciled positions are exactly what the batch advances.
+        """
+        with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
+            current = self._decode_header_page(page)
+        if (
+            current.digest != initial.digest
+            or current.artifact_nonce != initial.artifact_nonce
+            or current.table_id != initial.table_id
+            or current.bucket_count != initial.bucket_count
+            or current.visibility != initial.visibility
+            or (current.flags & INDEX_FLAG_STALE) != (initial.flags & INDEX_FLAG_STALE)
+        ):
+            raise GrafxCorruptionDetected(
+                f"Index {self.name!r} changed identity while a batched replay was in flight, "
+                "so the composed header was not published.",
+                field="replay_identity",
+                index=self.name,
+                file=self.file,
+                page=HEADER_PAGE_INDEX,
+            )
+
     def _apply_replay_change(self, change: IndexChange, position: Lsn) -> None:
         """Apply one already-validated logical record without choosing its outer fence."""
         self._replaying = True
@@ -2124,6 +2564,7 @@ class IndexStore:
     def _discard_replay_frames(self, failure: BaseException) -> None:
         """Drop every local frame a refused rebuild replay could otherwise write later."""
         self._carried_certificate = None
+        self._invalidate_tombstone_backlog()
         for file, page_index in self._pool.modified_pages(self.file):
             if file != self.file:
                 continue
@@ -2148,7 +2589,7 @@ class IndexStore:
 
     def _require_exact_read_lsn(self, snapshot: object) -> Lsn:
         """Return the durable position an authoritative public lookup must prove."""
-        if not isinstance(snapshot, SnapshotLike):
+        if type(snapshot) is not Snapshot and not isinstance(snapshot, SnapshotLike):
             raise GrafxIndexError(
                 f"A lookup needs a snapshot; got {type(snapshot).__name__}.",
                 field="snapshot",
@@ -2222,12 +2663,10 @@ class IndexStore:
 
     def _candidates_unchecked(self, wanted: bytes) -> tuple[IndexEntry, ...]:
         """Walk one already-validated key; the manager surrounds this with its view fence."""
-        found: list[IndexEntry] = []
-        for page_index in self._bucket_pages(
-            bucket_of(wanted, self._definition.bucket_count)
-        ):
-            found.extend(self._matching_entries_on(page_index, wanted))
-        return tuple(found)
+        _pages, found = self._scan_bucket(
+            bucket_of(wanted, self._definition.bucket_count), wanted
+        )
+        return found
 
     def walk(self) -> tuple[IndexEntry, ...]:
         """Return every stored entry of this index, bucket by bucket.
@@ -2253,8 +2692,120 @@ class IndexStore:
             self._require_index_page(page, page_index)
             return tuple(
                 IndexEntry.decode(payload).located_at(page_index, slot)
-                for slot, payload in page.iter_slots()
+                for slot, payload in page.iter_slot_views()
             )
+
+    def _entry_headers(self) -> tuple[_IndexEntryHeader, ...]:
+        """Materialise every validated entry header in canonical walk order.
+
+        This is the build-only middle ground between scalar/ref-only scans and the public full
+        :meth:`walk`.  It validates the same page and entry images in bucket/chain/slot order,
+        copies only the key which must outlive the page pin, and retains the encoded reference
+        until the consumer actually needs an ``IndexEntry``.  Returning a tuple keeps every pin
+        inside this method and preserves the full-walk rule that all index images are validated
+        before a caller starts fallible heap or vector work.
+        """
+        headers: list[_IndexEntryHeader] = []
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for slot, image in page.iter_slot_views():
+                        (
+                            validated,
+                            encoded_ref,
+                            born_csn,
+                            dead_csn,
+                            versioned,
+                        ) = _validated_image(image)
+                        _require_decodable_ref(encoded_ref)
+                        headers.append(
+                            _IndexEntryHeader(
+                                page=page_index,
+                                slot=slot,
+                                encoded_ref=encoded_ref,
+                                born_csn=born_csn,
+                                dead_csn=dead_csn,
+                                versioned=versioned,
+                                key=bytes(validated[INDEX_ENTRY_HEADER_SIZE:]),
+                            )
+                        )
+        return tuple(headers)
+
+    def _entry_counts_from_headers(self) -> tuple[int, int]:
+        """Return ``(stored, live)`` after validating every entry without DTOs.
+
+        This is a private cost path, not a weaker walk.  It visits buckets, chains and slots in
+        exactly the order :meth:`walk` does and runs the shared entry-image validator on every
+        live slot.  Only the validated ``dead_csn`` field is retained, so callers which need an
+        entry, its key or its physical index location must continue to use :meth:`walk`.
+        """
+        stored = 0
+        live = 0
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for _slot, image in page.iter_slot_views():
+                        _image, _ref, _born_csn, dead_csn, _versioned = (
+                            _validated_image(image)
+                        )
+                        _require_decodable_ref(_ref)
+                        stored += 1
+                        if dead_csn == NO_CSN:
+                            live += 1
+        return stored, live
+
+    def _entry_refs_from_headers(self) -> tuple[RecordRef, ...]:
+        """Materialise every validated heap reference without constructing index DTOs.
+
+        The tuple is complete before the method returns, so no page pin or memoryview escapes to
+        the caller.  This door is intentionally insufficient for verification and maintenance:
+        those consumers need keys and index locations and therefore retain the canonical full
+        :meth:`walk`.
+        """
+        refs: list[RecordRef] = []
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for _slot, image in page.iter_slot_views():
+                        _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
+                            _validated_image(image)
+                        )
+                        refs.append(RecordRef.decode(encoded_ref))
+        return tuple(refs)
+
+    def _visit_entry_refs_until(self, visitor: Callable[[RecordRef], bool]) -> bool:
+        """Visit validated refs until the callback stops, without retaining an O(N) tuple.
+
+        One page is copied and unpinned before the callback runs.  A filtered vector proof may
+        therefore stop after ``threshold + 1`` qualifying rows without first walking every index
+        page, while no page pin crosses into heap I/O or query-predicate code.  ``True`` means the
+        index was exhausted; ``False`` means the callback established its bound and stopped.
+        """
+        for bucket in range(self._definition.bucket_count):
+            for page_index in self._bucket_pages(bucket):
+                refs: list[RecordRef] = []
+                with self._pool.pinned(self.file, page_index) as page:
+                    self._require_index_page(page, page_index)
+                    for _slot, image in page.iter_slot_views():
+                        _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
+                            _validated_image(image)
+                        )
+                        refs.append(RecordRef.decode(encoded_ref))
+                for ref in refs:
+                    keep_going = visitor(ref)
+                    if type(keep_going) is not bool:
+                        raise GrafxIndexError(
+                            "An internal bounded index visitor must return True or False.",
+                            field="index_visitor",
+                            index=self.name,
+                            value=type(keep_going).__name__,
+                        )
+                    if not keep_going:
+                        return False
+        return True
 
     def _matching_entries_on(
         self, page_index: PageIndex, key: bytes, ref: RecordRef | None = None
@@ -2354,8 +2905,12 @@ class IndexStore:
         # different door, and it teaches an operator to ignore the verifier.
         self._pool.flush(self.file)
         if self._metrics.enabled and self._definition.versioned:
+            # Bind the derived count to this handle's own page-0 publication. Otherwise the next
+            # commit mistakes this unlogged local horizon advance for a foreign generation and
+            # pays a needless full backlog walk. Disabled/exact metrics keep their former path.
+            self._remember_local_certificate()
             self._metrics.increment(RECONCILIATION_TOTAL)
-            self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
+            self._publish_tombstone_backlog()
 
     def _record_reconciled(self, horizon: Lsn) -> None:
         """Advance the reconciliation watermark without choosing a flush boundary."""
@@ -2366,17 +2921,502 @@ class IndexStore:
 
     def _tombstone_backlog(self) -> int:
         """Return how many entries carry a tombstone that has not been reclaimed yet."""
-        return sum(1 for entry in self.walk() if not entry.live)
+        count = self._tombstone_backlog_count
+        if count is None:
+            count = sum(1 for entry in self.walk() if not entry.live)
+            self._tombstone_backlog_count = count
+        return count
+
+    def _publish_tombstone_backlog(self) -> None:
+        """Publish the derived backlog, seeding it once when its generation is unknown."""
+        if self._metrics.enabled and self._definition.versioned:
+            self._metrics.set_gauge(TOMBSTONE_BACKLOG, float(self._tombstone_backlog()))
+
+    def _invalidate_tombstone_backlog(self) -> None:
+        """Forget the derived count when this handle cannot prove the paged generation."""
+        self._tombstone_backlog_count = None
+
+    def _adjust_tombstone_backlog(self, delta: int) -> None:
+        """Apply a proved live/dead transition to an already-seeded derived count."""
+        if not self._metrics.enabled or not self._definition.versioned:
+            return
+        count = self._tombstone_backlog_count
+        if count is None:
+            return
+        adjusted = count + delta
+        # A negative diagnostic count proves that some state transition escaped this handle.
+        # Re-seeding on the next gauge is safer than publishing an invented correction.
+        self._tombstone_backlog_count = adjusted if adjusted >= 0 else None
+
+    def _prepare_live_hot_buckets(
+        self, staged: _Staged
+    ) -> dict[int, _CommonReplayHotBucket]:
+        """Build bounded call-local directories for one fully fenced live commit.
+
+        This door is reached only through ``IndexManager._commit_under_write_authority``.  It
+        deliberately declines stale/rebuild/retry state and non-canonical physical hooks; those
+        cases retain the scalar protocol that established their recovery semantics.  Every
+        accepted bucket is completely validated before this store's first mutation, and every
+        page acquisition still passes through the ordinary buffer budget.
+        """
+        if (
+            self._stale_reason is not None
+            or self._rebuild_authority is not None
+            or self._short_commit is not None
+            or staged.defer_clear
+            or any(
+                change.operation is IndexOperation.RESET for change in staged.changes
+            )
+            or not self._uses_canonical_live_hot_hooks()
+        ):
+            return {}
+
+        counts: dict[int, int] = {}
+        for change in staged.changes:
+            bucket = bucket_of(change.key, self._definition.bucket_count)
+            if bucket not in counts and len(counts) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT:
+                return {}
+            counts[bucket] = counts.get(bucket, 0) + 1
+
+        targets_by_bucket: dict[int, set[tuple[bytes, RecordRef]]] = {
+            bucket: set()
+            for bucket, count in counts.items()
+            if count >= _LIVE_COMMIT_HOT_BUCKET_MIN_EFFECTS
+        }
+        if not targets_by_bucket:
+            return {}
+        retained_targets = 0
+        for change in staged.changes:
+            bucket = bucket_of(change.key, self._definition.bucket_count)
+            targets = targets_by_bucket.get(bucket)
+            if targets is None:
+                continue
+            identity = (change.key, change.ref)
+            if identity in targets:
+                continue
+            retained_targets += 1
+            if retained_targets > _COMMON_REPLAY_HOT_TARGET_LIMIT:
+                return {}
+            targets.add(identity)
+
+        prepared: dict[int, _CommonReplayHotBucket] = {}
+        remaining_pages = _COMMON_REPLAY_HOT_PAGE_LIMIT
+        for bucket, targets in targets_by_bucket.items():
+            hot = self._prepare_common_replay_hot_bucket(
+                bucket, targets, page_limit=remaining_pages
+            )
+            if hot is None:
+                continue
+            prepared[bucket] = hot
+            remaining_pages -= len(hot.pages.pages)
+        return prepared
+
+    def _uses_canonical_live_hot_hooks(self) -> bool:
+        """Return whether this store retains every physical hook the fast path replaces.
+
+        Unlike replay, this path does not replace ``apply`` or ``commit``.  A vector
+        store may therefore keep its outer commit semantics while reusing these
+        inherited canonical physical hooks.
+        """
+        resolved: list[object] = []
+        for name in _LIVE_HOT_HOOK_NAMES:
+            hook = getattr(self, name)
+            resolved.append(getattr(hook, "__func__", hook))
+        return tuple(resolved) == _CANONICAL_LIVE_HOT_HOOKS
+
+    @staticmethod
+    def _page_insert_capacity(page: Page) -> int:
+        """Return the largest payload one additional slot can hold after compaction."""
+        return page.compactable_space() - SLOT_ENTRY_SIZE
+
+    def _prepare_common_replay_hot_bucket(
+        self,
+        bucket: int,
+        targets: Collection[tuple[bytes, RecordRef]],
+        *,
+        page_limit: int,
+    ) -> _CommonReplayHotBucket | None:
+        """Validate one hot bucket and retain locations only for this replay's targets.
+
+        A duplicate target makes scalar lookup semantics significant (the legacy path chooses
+        the first match), so that bucket declines acceleration.  Malformed pages or entries are
+        not hidden behind a decline: preparation propagates their typed refusal while the batch
+        is still mutation-free.
+        """
+        if page_limit < 1:
+            return None
+        pages: list[PageIndex] = []
+        entries: dict[
+            tuple[bytes, RecordRef],
+            tuple[PageIndex, SlotId, IndexEntry] | None,
+        ] = dict.fromkeys(targets)
+        targets_by_ref: dict[
+            int,
+            dict[bytes, tuple[bytes, RecordRef]],
+        ] = {}
+        for target in targets:
+            targets_by_ref.setdefault(target[1].encode(), {})[target[0]] = target
+        capacities: list[int] = []
+        duplicate_target = False
+        seen: set[PageIndex] = visited_pages()
+        lazy_bound_after = 8
+        chain_limit: int | None = None
+        page_index: PageIndex = self._bucket_head(bucket)
+        while page_index != NO_PAGE:
+            # A larger chain is not an error, but it is outside this bounded accelerator.  The
+            # scalar path remains authoritative and will validate the rest as it applies.
+            if len(pages) >= page_limit:
+                return None
+            if chain_limit is None and len(pages) >= lazy_bound_after:
+                chain_limit = self._pool.storage.page_count(self.file) + 1
+            if chain_limit is not None:
+                refuse_endless_chain(self.file, len(pages) + 1, chain_limit)
+            if page_index in seen:
+                raise GrafxCorruptionDetected(
+                    f"The bucket chain of {self.file!r} returns to page {page_index}, so it "
+                    "is a cycle.",
+                    file=self.file,
+                    page=page_index,
+                    field="cycle",
+                )
+            seen.add(page_index)
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                capacities.append(self._page_insert_capacity(page))
+                for slot, image in page.iter_slot_views():
+                    (
+                        validated,
+                        encoded_ref,
+                        born_csn,
+                        dead_csn,
+                        versioned,
+                    ) = _validated_image(image)
+                    _require_decodable_ref(encoded_ref)
+                    candidates = targets_by_ref.get(encoded_ref)
+                    if candidates is None:
+                        continue
+                    key_view = validated[INDEX_ENTRY_HEADER_SIZE:]
+                    # ``key_view`` is backed by the mutable page image and is
+                    # therefore not hashable, even when exposed read-only.  Copy
+                    # only slots whose encoded ref matches a target; this keeps
+                    # the common non-target path allocation-free while avoiding
+                    # an O(targets-per-ref) identity scan.
+                    identity = candidates.get(bytes(key_view))
+                    if identity is None:
+                        continue
+                    if entries[identity] is not None:
+                        duplicate_target = True
+                        continue
+                    key, ref = identity
+                    entry = IndexEntry(
+                        key=key,
+                        ref=ref,
+                        versioned=versioned,
+                        born_csn=born_csn,
+                        dead_csn=dead_csn,
+                        page=page_index,
+                        slot=slot,
+                    )
+                    entries[identity] = (
+                        page_index,
+                        slot,
+                        entry,
+                    )
+                following = page.next_page
+            pages.append(page_index)
+            page_index = following
+        if duplicate_target:
+            return None
+        return _CommonReplayHotBucket(_FirstFitPages(pages, capacities), entries)
+
+    def _place_during_common_replay(
+        self,
+        bucket: _CommonReplayHotBucket,
+        entry: IndexEntry,
+        lsn: Lsn,
+    ) -> tuple[PageIndex, SlotId, IndexEntry]:
+        """Place through one accepted hot-bucket directory without an ambiguous fallback."""
+        payload = entry.encode()
+        position = bucket.pages.first_fit(len(payload))
+        while position is not None:
+            page_index = bucket.pages.pages[position]
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                try:
+                    slot = page.insert_slot(payload)
+                except PageFullError:
+                    # The tree is only a selection hint. Page.insert_slot remains the authority
+                    # and promises a refused insertion is mutation-free, so excluding this hint
+                    # and trying the next candidate preserves _place's ordering and semantics.
+                    bucket.pages.update(
+                        position,
+                        min(self._page_insert_capacity(page), len(payload) - 1),
+                    )
+                else:
+                    self._stamp(page, lsn)
+                    bucket.pages.update(position, self._page_insert_capacity(page))
+                    return page_index, slot, entry
+            position = bucket.pages.first_fit(len(payload))
+
+        if not bucket.pages.pages:
+            raise GrafxCorruptionDetected(
+                f"A bucket of {self.file!r} has no head page, so an entry has nowhere to go.",
+                file=self.file,
+                field="bucket",
+            )
+        fresh = self._pool.allocate(self.file, self.page_type)
+        page_index = fresh.page_index
+        try:
+            slot = fresh.insert_slot(payload)
+            self._stamp(fresh, lsn)
+            capacity = self._page_insert_capacity(fresh)
+        finally:
+            self._pool.unpin(self.file, page_index, dirty=True)
+        # Preserve _place_on_new_page's failure ordering: fill the new page before linking it.
+        tail_index = bucket.pages.pages[-1]
+        with self._pool.pinned(self.file, tail_index) as tail:
+            self._require_index_page(tail, tail_index)
+            tail.next_page = page_index
+            tail.dirty = True
+        bucket.pages.append(page_index, capacity)
+        return page_index, slot, entry
+
+    def _apply_common_replay_hot_change(
+        self,
+        bucket: _CommonReplayHotBucket,
+        change: IndexChange,
+        lsn: Lsn,
+    ) -> bool:
+        """Apply one ordered replay effect through a fully prepared hot-bucket directory."""
+        identity = (change.key, change.ref)
+        if identity not in bucket.entries:
+            raise GrafxCorruptionDetected(
+                f"The ephemeral replay directory for index {self.name!r} does not contain an "
+                "identity from its prepared batch.",
+                field="replay_bucket_identity",
+                index=self.name,
+                file=self.file,
+            )
+        located = bucket.entries[identity]
+        if change.operation is IndexOperation.INSERT:
+            self._require_key(change.key)
+            if located is not None:
+                return False
+            entry = IndexEntry(
+                key=change.key,
+                ref=change.ref,
+                versioned=change.versioned,
+                born_csn=change.csn if change.versioned else NO_CSN,
+            )
+            bucket.entries[identity] = self._place_during_common_replay(
+                bucket, entry, lsn
+            )
+            return True
+        if located is None:
+            self._missing_targets += 1
+            return False
+        page_index, slot, entry = located
+        if change.operation is IndexOperation.TOMBSTONE:
+            if not entry.live:
+                return False
+            ended = entry.ended_at(change.csn)
+            try:
+                moved = self._rewrite(page_index, slot, ended, lsn)
+            except BaseException:
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved:
+                bucket.entries[identity] = (
+                    page_index,
+                    slot,
+                    ended,
+                )
+                self._adjust_tombstone_backlog(1)
+            return moved
+
+        position = bucket.pages.position(page_index)
+        if position is None:
+            raise GrafxCorruptionDetected(
+                f"The ephemeral replay directory for index {self.name!r} lost page "
+                f"{page_index} before removing its target.",
+                field="replay_bucket_page",
+                index=self.name,
+                file=self.file,
+                page=page_index,
+            )
+        try:
+            moved = self._erase(page_index, slot, lsn)
+        except BaseException:
+            self._invalidate_tombstone_backlog()
+            raise
+        if moved:
+            bucket.entries[identity] = None
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                bucket.pages.update(position, self._page_insert_capacity(page))
+            if not entry.live:
+                self._adjust_tombstone_backlog(-1)
+        return moved
+
+    def _empty_build_bucket(
+        self, build: _EmptyIndexBuild, bucket: int
+    ) -> _FirstFitPages | None:
+        """Return one batch-local bucket directory after proving every page is still empty."""
+        known = build.buckets.get(bucket)
+        if known is not None:
+            return known
+        pages = self._bucket_pages(bucket)
+        capacities: list[int] = []
+        for page_index in pages:
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                if page.live_slots():
+                    build.valid = False
+                    return None
+                capacities.append(self._page_insert_capacity(page))
+        state = _FirstFitPages(pages, capacities)
+        build.buckets[bucket] = state
+        return state
+
+    def _place_during_empty_build(
+        self,
+        build: _EmptyIndexBuild,
+        bucket: int,
+        entry: IndexEntry,
+        lsn: Lsn,
+    ) -> tuple[PageIndex, SlotId, IndexEntry] | None:
+        """Place one entry through the batch first-fit directory, or decline conservatively."""
+        pages = self._empty_build_bucket(build, bucket)
+        if pages is None:
+            return None
+        payload = entry.encode()
+        position = pages.first_fit(len(payload))
+        if position is not None:
+            page_index = pages.pages[position]
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                try:
+                    slot = page.insert_slot(payload)
+                except PageFullError:
+                    # A cooperating build owns the surrounding publication fence, so this can
+                    # only mean the ephemeral view no longer describes the page.  The canonical
+                    # walk re-establishes truth; no page was changed by the refused insertion.
+                    build.valid = False
+                    return None
+                self._stamp(page, lsn)
+                pages.update(position, self._page_insert_capacity(page))
+            return page_index, slot, entry.located_at(page_index, slot)
+
+        if not pages.pages:
+            build.valid = False
+            return None
+        fresh = self._pool.allocate(self.file, self.page_type)
+        page_index = fresh.page_index
+        try:
+            slot = fresh.insert_slot(payload)
+            self._stamp(fresh, lsn)
+            capacity = self._page_insert_capacity(fresh)
+        finally:
+            self._pool.unpin(self.file, page_index, dirty=True)
+        # Match _place_on_new_page's failure ordering: the new page is complete before the old
+        # tail links it, so an interrupted link leaves unreachable space rather than a bad chain.
+        tail_index = pages.pages[-1]
+        with self._pool.pinned(self.file, tail_index) as tail:
+            self._require_index_page(tail, tail_index)
+            tail.next_page = page_index
+            tail.dirty = True
+        pages.append(page_index, capacity)
+        return page_index, slot, entry.located_at(page_index, slot)
+
+    def _apply_empty_build_change(
+        self, build: _EmptyIndexBuild, change: IndexChange, lsn: Lsn
+    ) -> bool | None:
+        """Apply against a batch proved empty, returning None when canonical fallback is needed."""
+        if not build.valid or change.operation is IndexOperation.RESET:
+            return None
+        bucket = bucket_of(change.key, self._definition.bucket_count)
+        identity = (change.key, change.ref)
+        located = build.entries.get(identity)
+        if change.operation is IndexOperation.INSERT:
+            self._require_key(change.key)
+            if located is not None:
+                return False
+            entry = IndexEntry(
+                key=change.key,
+                ref=change.ref,
+                versioned=change.versioned,
+                born_csn=change.csn if change.versioned else NO_CSN,
+            )
+            placed = self._place_during_empty_build(build, bucket, entry, lsn)
+            if placed is None:
+                return None
+            build.entries[identity] = placed
+            return True
+        if located is None:
+            self._missing_targets += 1
+            return False
+        page_index, slot, entry = located
+        if change.operation is IndexOperation.TOMBSTONE:
+            if not entry.live:
+                return False
+            ended = entry.ended_at(change.csn)
+            try:
+                moved = self._rewrite(page_index, slot, ended, lsn)
+            except BaseException:
+                build.valid = False
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved:
+                build.entries[identity] = (
+                    page_index,
+                    slot,
+                    ended.located_at(page_index, slot),
+                )
+                self._adjust_tombstone_backlog(1)
+            return moved
+        try:
+            moved = self._erase(page_index, slot, lsn)
+        except BaseException:
+            build.valid = False
+            self._invalidate_tombstone_backlog()
+            raise
+        if moved:
+            build.entries.pop(identity, None)
+            pages = build.buckets.get(bucket)
+            if pages is None:
+                build.valid = False
+                return moved
+            position = pages.position(page_index)
+            if position is None:
+                build.valid = False
+                return moved
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                pages.update(position, self._page_insert_capacity(page))
+            if not entry.live:
+                self._adjust_tombstone_backlog(-1)
+        return moved
 
     # --- applying -----------------------------------------------------------------------------
 
     def _apply_change(self, change: IndexChange, lsn: Lsn) -> bool:
         """Apply one change to the pages and say whether anything moved."""
         if change.operation is IndexOperation.RESET:
-            return self._reset(change, lsn)
+            try:
+                moved = self._reset(change, lsn)
+            except BaseException:
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved and self._metrics.enabled and self._definition.versioned:
+                self._tombstone_backlog_count = 0
+            return moved
         bucket = bucket_of(change.key, self._definition.bucket_count)
-        pages = self._bucket_pages(bucket)
-        located = self._find_entry(pages, change.key, change.ref)
+        pages, matches = self._scan_bucket(
+            bucket, change.key, change.ref, first_matching_page=True
+        )
+        located = (
+            None if not matches else (matches[0].page, matches[0].slot, matches[0])
+        )
         if change.operation is IndexOperation.INSERT:
             # The redo path never went through staging, so the key it carries is checked here as
             # well. Both sites call the same helper: a size rule written twice is a size rule
@@ -2410,8 +3450,24 @@ class IndexStore:
         if change.operation is IndexOperation.TOMBSTONE:
             if not entry.live:
                 return False
-            return self._rewrite(page_index, slot, entry.ended_at(change.csn), lsn)
-        return self._erase(page_index, slot, lsn)
+            try:
+                moved = self._rewrite(page_index, slot, entry.ended_at(change.csn), lsn)
+            except BaseException:
+                # A storage/page implementation may mutate before reporting interruption. The
+                # diagnostic count cannot decide which side landed, so it becomes unknown.
+                self._invalidate_tombstone_backlog()
+                raise
+            if moved:
+                self._adjust_tombstone_backlog(1)
+            return moved
+        try:
+            moved = self._erase(page_index, slot, lsn)
+        except BaseException:
+            self._invalidate_tombstone_backlog()
+            raise
+        if moved and not entry.live:
+            self._adjust_tombstone_backlog(-1)
+        return moved
 
     def _reset(self, change: IndexChange, lsn: Lsn) -> bool:
         """Clear every entry of every bucket, keeping the pages and the chains they form."""
@@ -2551,6 +3607,53 @@ class IndexStore:
         """Return the head page of a bucket: buckets follow the header page, in order."""
         return bucket + 1
 
+    def assisted_rehash_pressure(self) -> tuple[int, int]:
+        """Return ``(head_entries, overflow_pages)`` without walking bucket chains.
+
+        ``open`` first proves that the catalog-selected definition still names the physical
+        header, including its digest, visibility and artifact nonce.  The bounded pass then
+        validates and counts slots only on the eager directory's head pages.  It deliberately
+        does not decode entries, follow ``next_page`` or treat this advisory sample as read or
+        commit authority.  Cost is O(bucket_count), capped by the format at 4,096 pages, rather
+        than O(number of index entries).
+
+        Extra append-only pages are a conservative upper bound on retained overflow: an
+        interrupted allocation may leave one unreachable, but counting it can only suggest an
+        early rehash.  It cannot hide pressure or authorize a query result.
+        """
+
+        header = self.open()
+        definition = self._definition
+        if header.bucket_count != definition.bucket_count:
+            raise GrafxIndexError(
+                f"Index {definition.name!r} declares {definition.bucket_count} buckets in "
+                f"the catalog-selected definition but {header.bucket_count} in its header.",
+                field="bucket_count",
+                index=definition.name,
+                file=self.file,
+                expected=definition.bucket_count,
+                observed=header.bucket_count,
+            )
+        page_count = self._pool.storage.page_count(self.file)
+        required_pages = 1 + header.bucket_count
+        if page_count < required_pages:
+            raise GrafxCorruptionDetected(
+                f"Index {definition.name!r} has {page_count} pages but its directory requires "
+                f"at least {required_pages}.",
+                field="page_count",
+                file=self.file,
+                index=definition.name,
+                value=page_count,
+                required=required_pages,
+            )
+        head_entries = 0
+        for bucket in range(header.bucket_count):
+            page_index = self._bucket_head(bucket)
+            with self._pool.pinned(self.file, page_index) as page:
+                self._require_index_page(page, page_index)
+                head_entries += len(page.live_slots())
+        return head_entries, page_count - required_pages
+
     def _bucket_pages(self, bucket: int) -> tuple[PageIndex, ...]:
         """Return the pages of a bucket, in chain order, refusing a chain that does not end.
 
@@ -2559,6 +3662,28 @@ class IndexStore:
         cannot legitimately be longer than the file, so the bound can never refuse a walk that is
         merely unusual -- and it is what turns a damaged link into a located failure rather than
         into a process that never returns (amendments A34, A42).
+        """
+        pages, _matches = self._scan_bucket(bucket)
+        return pages
+
+    def _scan_bucket(
+        self,
+        bucket: int,
+        key: bytes | None = None,
+        ref: RecordRef | None = None,
+        *,
+        first_matching_page: bool = False,
+    ) -> tuple[tuple[PageIndex, ...], tuple[IndexEntry, ...]]:
+        """Validate one chain and optionally collect matches during that same page pass.
+
+        ``_bucket_pages`` remains the structure-only door used by full walks. Point reads and
+        scalar writes already know their key, so paying a second pin pass over every page cannot
+        reveal a fresher authority: their surrounding exact-view/commit fences decide freshness.
+        This fused pass retains chain order, slot order and both termination guards.  Validation
+        is deliberately interleaved: if an early entry and a later page structure are both
+        corrupt, the entry is reported first instead of the later structure; both outcomes remain
+        fail-closed and precede mutation.  ``first_matching_page`` then keeps later pages
+        structure-only, matching the former ``_find_entry`` decode boundary.
         """
         if isinstance(bucket, bool) or not isinstance(bucket, int):
             raise GrafxIndexError(
@@ -2576,11 +3701,21 @@ class IndexStore:
                 index=self.name,
             )
         pages: list[PageIndex] = []
+        matches: list[IndexEntry] = []
+        matching_complete = False
         seen: set[PageIndex] = visited_pages()
-        limit = self._pool.storage.page_count(self.file) + 1
+        # Almost every bucket is one or two pages long. Asking the device for the file size on
+        # every such walk is pure fixed cost; defer that second, independent termination guard
+        # until a chain is unusually long. Once observed, the bound is frozen for this walk so
+        # concurrent growth cannot turn a corrupt chain into an unbounded one.
+        lazy_bound_after = 8
+        limit: int | None = None
         index: PageIndex = self._bucket_head(bucket)
         while index != NO_PAGE:
-            refuse_endless_chain(self.file, len(pages) + 1, limit)
+            if limit is None and len(pages) >= lazy_bound_after:
+                limit = self._pool.storage.page_count(self.file) + 1
+            if limit is not None:
+                refuse_endless_chain(self.file, len(pages) + 1, limit)
             if index in seen:
                 raise GrafxCorruptionDetected(
                     f"The bucket chain of {self.file!r} returns to page {index}, so it is a "
@@ -2592,10 +3727,20 @@ class IndexStore:
             seen.add(index)
             with self._pool.pinned(self.file, index) as page:
                 self._require_index_page(page, index)
+                if key is not None and not matching_complete:
+                    for slot, image in page.iter_slot_views():
+                        entry = IndexEntry.decode_if_matches(image, key, ref)
+                        if entry is not None:
+                            matches.append(entry.located_at(index, slot))
+                    if first_matching_page and matches:
+                        # Scalar mutation historically stopped decoding after the first page
+                        # with a match, while its preceding chain walk still validated every
+                        # page type/link. Preserve that bounded work and error surface exactly.
+                        matching_complete = True
                 following = page.next_page
             pages.append(index)
             index = following
-        return tuple(pages)
+        return tuple(pages), tuple(matches)
 
     def _find_entry(
         self, pages: Sequence[PageIndex], key: bytes, ref: RecordRef
@@ -2697,7 +3842,9 @@ class IndexStore:
 
     def _require_txn(self, txn: object) -> int:
         """Return the transaction number, refusing anything that cannot stage a record."""
-        if not isinstance(txn, StagingTransaction):
+        if type(txn) is not TransactionContext and not isinstance(
+            txn, StagingTransaction
+        ):
             raise GrafxIndexError(
                 "An index change is staged on a transaction that carries a txn_id and can stage "
                 f"a record; got {type(txn).__name__}.",
@@ -2825,6 +3972,11 @@ class ProximityIndex(IndexStore):
             for entry in self._stable_entries(read_lsn)
             if entry_visible(entry, snapshot)
         )
+
+
+_CANONICAL_LIVE_HOT_HOOKS = tuple(
+    getattr(IndexStore, name) for name in _LIVE_HOT_HOOK_NAMES
+)
 
 
 _TableIdentity = tuple[int, str]
@@ -3020,12 +4172,17 @@ class IndexManager:
         "_heap",
         "_metrics",
         "_indexes",
+        "_index_keys_by_table",
         "_published_lsn",
         "_table_watermarks",
         "_heap_cache_certificates",
         "_artifact_nonce",
         "_artifact_claims",
+        "_detached_speculative_indexes",
         "_schema_observed",
+        "_schema_new_table_observed",
+        "_registry_revision",
+        "_definition_match",
     )
 
     def __init__(
@@ -3041,6 +4198,7 @@ class IndexManager:
         self._heap: HeapStore = heap
         self._metrics: MetricsSink = metrics
         self._indexes: dict[str, IndexStore] = {}
+        self._index_keys_by_table: dict[tuple[int, str], set[str]] = {}
         self._published_lsn: Lsn = NO_LSN
         self._table_watermarks: dict[int, Lsn] = {}
         # Exact answers validate index candidates against heap pages.  The index certificate is
@@ -3051,9 +4209,71 @@ class IndexManager:
         self._heap_cache_certificates: dict[str, _IndexReadCertificate] = {}
         self._artifact_nonce = artifact_nonce
         self._artifact_claims: dict[IndexStore, set[object]] = {}
+        self._detached_speculative_indexes: set[IndexStore] = set()
         self._schema_observed: dict[int, dict[IndexStore, int]] = {}
+        self._schema_new_table_observed: dict[int, set[IndexStore]] = {}
+        self._registry_revision = 0
+        # TableDef already memoizes its automatic projection.  Caching this cheap comparison by
+        # VALUE made every hit hash every column of the table and was materially slower than
+        # simply comparing the immutable definitions.  Keep the seam for compatibility tests
+        # and narrow collaborators, but make it the canonical comparison itself: there is no
+        # process-global retention, identity-reuse hazard or DDL answer to invalidate.
+        self._definition_match = index_definition_matches_table
 
     # --- registry ---------------------------------------------------------------------------
+
+    def _publish_registered_index(self, index: IndexStore) -> None:
+        """Publish one raw ownership entry and its table-local structural key."""
+
+        key = index.definition.registry_key
+        previous = self._indexes.get(key)
+        if previous is not None and previous is not index:
+            self._remove_registered_index(key, expected=previous)
+        self._indexes[key] = index
+        identity = (index.definition.table_id, index.definition.table_name)
+        self._index_keys_by_table.setdefault(identity, set()).add(key)
+        self._registry_revision += 1
+
+    def _remove_registered_index(
+        self, key: str, *, expected: IndexStore | None = None
+    ) -> IndexStore | None:
+        """Remove one raw ownership entry without leaving its table bucket stale."""
+
+        current = self._indexes.get(key)
+        if current is None or (expected is not None and current is not expected):
+            return None
+        removed = self._indexes.pop(key)
+        identity = (removed.definition.table_id, removed.definition.table_name)
+        table_keys = self._index_keys_by_table.get(identity)
+        if table_keys is not None:
+            table_keys.discard(key)
+            if not table_keys:
+                self._index_keys_by_table.pop(identity, None)
+        self._registry_revision += 1
+        return removed
+
+    def _registered_indexes_for(
+        self, table_id: int, *, table_name: str | None = None
+    ) -> tuple[IndexStore, ...]:
+        """Return raw registry ownership from only the requested table bucket."""
+
+        if table_name is not None:
+            keys = self._index_keys_by_table.get((table_id, table_name), ())
+        else:
+            keys = {
+                key
+                for (
+                    owned_id,
+                    _owned_name,
+                ), table_keys in self._index_keys_by_table.items()
+                if owned_id == table_id
+                for key in table_keys
+            }
+        return tuple(
+            index
+            for key in sorted(keys)
+            if (index := self._indexes.get(key)) is not None
+        )
 
     def register(
         self,
@@ -3106,7 +4326,9 @@ class IndexManager:
                 index=existing.name,
             )
         created_file = False
-        nonce = self._artifact_nonce() if self._artifact_nonce is not None else 0
+        nonce = index.definition.artifact_nonce
+        if nonce == 0 and self._artifact_nonce is not None:
+            nonce = self._artifact_nonce()
         index._set_creation_nonce(nonce)
         header: IndexHeader
         if existing_only:
@@ -3131,7 +4353,7 @@ class IndexManager:
             )
             if header.artifact_nonce == 0 and nonce != 0:
                 header = index._ensure_artifact_nonce(nonce).header
-        self._indexes[key] = index
+        self._publish_registered_index(index)
         try:
             self._finish_registration(
                 index,
@@ -3157,7 +4379,7 @@ class IndexManager:
             # A re-entrant host callback may have installed a replacement.  This failure owns
             # neither that object nor the companion certificate it published.
             return False
-        self._indexes.pop(key, None)
+        self._remove_registered_index(key, expected=index)
         self._heap_cache_certificates.pop(index.file, None)
         return True
 
@@ -3302,7 +4524,7 @@ class IndexManager:
                     index=existing.name,
                 )
             if self._indexes.get(key) is existing:
-                self._indexes.pop(key, None)
+                self._remove_registered_index(key, expected=existing)
                 self._heap_cache_certificates.pop(existing.file, None)
         creation: list[bool] = []
         try:
@@ -3338,18 +4560,93 @@ class IndexManager:
             raise
         return registered, artifact
 
+    def register_detached_speculative(
+        self,
+        index: IndexStore,
+        *,
+        complete_through: Lsn | None = None,
+    ) -> tuple[IndexStore, _SpeculativeIndexArtifact]:
+        """Observe a prebuilt nonced shadow without replacing committed registry authority.
+
+        A detached generation has already won exclusive ownership of its immutable physical
+        filename and completed verification.  Publishing it in ``_indexes`` before the catalog
+        commit would displace the old ACTIVE generation for every other transaction; routing it
+        through :meth:`register_speculative` would additionally treat its own nonced file as a
+        canonical collision and move the verified bytes aside.  This door validates the file,
+        claims it for rollback/provenance, and leaves it reachable only through the creating
+        transaction's explicit schema observation.
+        """
+        if not isinstance(index, IndexStore) or not isinstance(index, SecondaryIndex):
+            raise GrafxIndexError(
+                "A detached speculative index must implement the paged secondary-index "
+                "contract.",
+                field="index",
+                value=type(index).__name__,
+            )
+        if index.definition.artifact_nonce == 0:
+            raise GrafxIndexError(
+                f"Detached speculative index {index.name!r} needs a non-zero generation "
+                "nonce.",
+                field="artifact_nonce",
+                value=0,
+                index=index.name,
+            )
+        collision = next(
+            (
+                current
+                for current in self._indexes.values()
+                if current.file.casefold() == index.file.casefold()
+            ),
+            None,
+        )
+        if collision is not None:
+            raise GrafxIndexError(
+                f"Detached generation {index.file!r} is already registered as "
+                f"{collision.name!r}.",
+                field="file",
+                file=index.file,
+                index=index.name,
+                registered=collision.name,
+                retryable=True,
+            )
+        index._set_creation_nonce(index.definition.artifact_nonce)
+        if not index.exists() or not index.is_created():
+            raise GrafxIndexError(
+                f"Detached generation {index.file!r} is absent or incomplete.",
+                field="file",
+                file=index.file,
+                index=index.name,
+            )
+        index.open(proved_present=True)
+        self._finish_registration(
+            index,
+            complete_through=complete_through,
+            persist_stale=False,
+        )
+        generation = index._fresh_certificate()
+        artifact = self._claim_speculative(
+            index,
+            generation=generation,
+            created_file=False,
+            detached=True,
+        )
+        return index, artifact
+
     def _claim_speculative(
         self,
         index: IndexStore,
         *,
         generation: _IndexReadCertificate,
         created_file: bool,
+        detached: bool = False,
     ) -> _SpeculativeIndexArtifact:
         """Acquire one process-local DDL claim over an exact registry object."""
         owner = object()
         owners = self._artifact_claims.setdefault(index, set())
         try:
             owners.add(owner)
+            if detached:
+                self._detached_speculative_indexes.add(index)
             return _SpeculativeIndexArtifact(
                 index=index,
                 generation=generation,
@@ -3360,6 +4657,7 @@ class IndexManager:
             owners.discard(owner)
             if self._artifact_claims.get(index) is owners and not owners:
                 self._artifact_claims.pop(index, None)
+                self._detached_speculative_indexes.discard(index)
             raise
 
     def adopt_committed(
@@ -3396,7 +4694,7 @@ class IndexManager:
             existing.open(proved_present=proved_present)
             return existing
         if existing is not None:
-            self._indexes.pop(key, None)
+            self._remove_registered_index(key, expected=existing)
             self._heap_cache_certificates.pop(existing.file, None)
         try:
             return self.register(
@@ -3407,9 +4705,9 @@ class IndexManager:
             )
         except BaseException:
             if self._indexes.get(key) is index:
-                self._indexes.pop(key, None)
+                self._remove_registered_index(key, expected=index)
             if existing is not None:
-                self._indexes[key] = existing
+                self._publish_registered_index(existing)
             raise
 
     def ensure_artifact_identities(self) -> None:
@@ -3420,7 +4718,7 @@ class IndexManager:
         """
         if self._artifact_nonce is None:
             return
-        for index in self.indexes():
+        for index in self.active_indexes():
             # The immediately preceding sync proved one complete directory inventory.  Reuse
             # that proof instead of doubling every per-file existence probe merely to inspect
             # the nonce.
@@ -3450,9 +4748,11 @@ class IndexManager:
         claims = self._artifact_claims.get(expected)
         if claims is None or artifact.owner not in claims:
             return False
+        detached = expected in self._detached_speculative_indexes
         claims.remove(artifact.owner)
         if not claims:
             self._artifact_claims.pop(expected, None)
+            self._detached_speculative_indexes.discard(expected)
         if committed:
             return True
         if claims:
@@ -3460,6 +4760,12 @@ class IndexManager:
         key = expected.definition.registry_key
         current = self._indexes.get(key)
         if current is not expected:
+            if detached:
+                # A detached shadow deliberately never entered the global registry, but
+                # registration may still have bound a companion heap certificate while proving
+                # it.  Once its final rollback claim is gone, that cache key is unreachable too;
+                # retaining it would leak one entry for every refused schema statement.
+                self._heap_cache_certificates.pop(expected.file, None)
             return False
         if self._definition_is_durable(expected):
             return False
@@ -3468,7 +4774,7 @@ class IndexManager:
         except GrafxIndexError as failure:
             if failure.details.get("field") not in {"digest", "visibility"}:
                 return False
-            self._indexes.pop(key, None)
+            self._remove_registered_index(key, expected=expected)
             self._heap_cache_certificates.pop(expected.file, None)
             return True
         except GrafxError:
@@ -3477,24 +4783,23 @@ class IndexManager:
             # Same definition, newer durable generation: another completed transaction adopted
             # the object/file.  It is no longer this rollback's state to release.
             return False
-        removed = self._indexes.pop(key, None)
+        removed = self._remove_registered_index(key)
         if (
             removed is not expected
         ):  # pragma: no cover - participant section serialises locals
             if removed is not None:
-                self._indexes[key] = removed
+                self._publish_registered_index(removed)
             return False
         self._heap_cache_certificates.pop(expected.file, None)
         return True
 
     def _definition_is_durable(self, index: IndexStore) -> bool:
-        """Prove that the refreshed committed catalog declares this automatic definition."""
+        """Prove that the refreshed committed catalog selects this physical definition."""
         try:
-            table = self._heap.catalog.catalog.table_by_id(index.definition.table_id)
-            definitions = automatic_index_definitions(table)
+            definitions = self._catalog_active_definitions()
         except GrafxError:
             return False
-        return any(definition == index.definition for definition in definitions)
+        return definitions is not None and index.definition in definitions
 
     def stage_schema_observation(
         self, index: IndexStore, txn: StagingTransaction
@@ -3504,6 +4809,25 @@ class IndexManager:
         created = index.stage_empty_observation(txn)
         observed = self._schema_observed.setdefault(txn_id, {})
         observed[index] = observed.get(index, 0) + 1
+        try:
+            committed_table = self._heap.catalog.catalog.table_by_id(
+                index.definition.table_id
+            )
+        except GrafxCorruptionDetected as failure:
+            if failure.details.get("field") != "table_id":
+                raise
+            committed_table = None
+        if committed_table is None or (
+            committed_table.name != index.definition.table_name
+            or not self._definition_matches_table_tolerantly(
+                index.definition,
+                committed_table,
+            )
+        ):
+            # A CREATE TABLE observation establishes the initial table watermark because every
+            # sibling index is born at this same schema commit.  An index added to an already
+            # committed table is different: schema bytes did not move that table's heap floor.
+            self._schema_new_table_observed.setdefault(txn_id, set()).add(index)
         return created
 
     def discard_schema_observation(
@@ -3525,6 +4849,11 @@ class IndexManager:
             observed[index] = remaining
         else:
             observed.pop(index, None)
+            new_table = self._schema_new_table_observed.get(txn_id)
+            if new_table is not None:
+                new_table.discard(index)
+                if not new_table:
+                    self._schema_new_table_observed.pop(txn_id, None)
             if not observed:
                 self._schema_observed.pop(txn_id, None)
         if created:
@@ -3553,18 +4882,34 @@ class IndexManager:
                 value=repr(txn_id),
             )
         schema_indexes = tuple(self._schema_observed.get(txn_id, ()))
-        staged_indexes = tuple(index for index in self.indexes() if index.observed(txn))
-        row_indexes = tuple(
-            index
-            for table in row_tables
-            for index in self.indexes_for(
-                getattr(table, "table_id", -1),
-                table_name=getattr(table, "name", None),
-                table=table,
+        staged_indexes = tuple(
+            index for index in self._transaction_indexes(txn) if index.observed(txn)
+        )
+        projection = self._active_commit_index_projection(txn)
+        row_indexes = (
+            projection.row_indexes
+            if projection is not None
+            else tuple(
+                index
+                for table in row_tables
+                for index in self.active_indexes_for(
+                    getattr(table, "table_id", -1),
+                    table_name=getattr(table, "name", None),
+                    table=table,
+                    txn=txn,
+                )
             )
         )
         for index in dict.fromkeys((*schema_indexes, *staged_indexes, *row_indexes)):
-            if self._indexes.get(index.definition.registry_key) is not index:
+            detached = (
+                index in schema_indexes
+                and index in self._detached_speculative_indexes
+                and bool(self._artifact_claims.get(index))
+            )
+            if (
+                self._indexes.get(index.definition.registry_key) is not index
+                and not detached
+            ):
                 raise GrafxIndexError(
                     f"Index {index.name!r} is no longer the registered artifact staged by "
                     f"transaction {txn_id}.",
@@ -3629,31 +4974,24 @@ class IndexManager:
         return True
 
     def _canonical_file_is_declared(self, file: str) -> bool:
-        """Say whether the committed catalog assigns this case-folded name to an index."""
+        """Say whether any committed catalog generation owns this physical file.
+
+        Runtime eligibility and physical ownership are deliberately different questions.  Only
+        the ACTIVE generation may answer queries or receive DML, but BUILDING and STALE files
+        are still catalog-owned bytes and may never be displaced as speculative orphans.
+        """
         wanted = file.casefold()
         try:
-            tables = self._heap.catalog.catalog.tables()
+            catalog = self._heap.catalog.catalog
+            definitions = list(self._catalog_active_definitions(catalog) or ())
+            logical_definitions = getattr(catalog, "index_definitions", None)
+            if callable(logical_definitions):
+                for logical in logical_definitions():
+                    for generation in logical.generations:
+                        definitions.append(logical.runtime_definition(generation))
         except GrafxError:
             return True
-        for table in tables:
-            names: list[str] = []
-            if getattr(table, "kind", None) == "rel":
-                names.extend(
-                    (edge_from_index_name(table.name), edge_to_index_name(table.name))
-                )
-            elif getattr(table, "primary_key", None) is not None:
-                names.append(primary_key_index_name(table.name))
-            for column in getattr(table, "columns", ()):
-                space = getattr(column, "vector_space", None)
-                if isinstance(space, str) and space:
-                    names.append(f"vector_{table.name}_{space}")
-            for name in names:
-                try:
-                    if index_file(name).casefold() == wanted:
-                        return True
-                except GrafxIndexError:
-                    continue
-        return False
+        return any(definition.file.casefold() == wanted for definition in definitions)
 
     def unregister(self, name: str) -> bool:
         """Forget one registered index, leaving its file alone, and say whether one was held.
@@ -3669,7 +5007,7 @@ class IndexManager:
         """
         if not isinstance(name, str):
             return False
-        removed = self._indexes.pop(name.lower(), None)
+        removed = self._remove_registered_index(name.lower())
         if removed is None:
             return False
         self._heap_cache_certificates.pop(removed.file, None)
@@ -3678,6 +5016,24 @@ class IndexManager:
     def indexes(self) -> tuple[IndexStore, ...]:
         """Return every registered index, in the order names sort, so a report is reproducible."""
         return tuple(self._indexes[key] for key in sorted(self._indexes))
+
+    def _registered_artifact_nonces(self) -> frozenset[int]:
+        """Project physical identities without reopening catalog-v2 generations.
+
+        A non-zero nonce in the registered definition is the physical identity already proved
+        when that registry object was admitted.  Legacy definitions do not carry that identity,
+        so their header remains the only conservative source and is opened through the existing
+        validating door.  Zero is never an occupied generation identity.
+        """
+
+        occupied: set[int] = set()
+        for index in self.indexes():
+            nonce = index.definition.artifact_nonce
+            if nonce == 0:
+                nonce = index.open().artifact_nonce
+            if nonce != 0:
+                occupied.add(nonce)
+        return frozenset(occupied)
 
     def index(self, name: str) -> IndexStore:
         """Return the index of that name, refusing a name nothing was registered under."""
@@ -3697,6 +5053,559 @@ class IndexManager:
             )
         return found
 
+    def _catalog_active_definitions(
+        self, catalog: object | None = None
+    ) -> tuple[IndexDefinition, ...] | None:
+        """Return the catalog's runtime projection, or ``None`` for a legacy test double.
+
+        Production heaps always expose a concrete :class:`Catalog`, whose projection is the
+        authority.  A few component collaborators intentionally implement only the old heap
+        surface; retaining the raw-registry fallback for those doubles does not weaken a real
+        database because the fallback is unreachable once a catalog object is present.
+        """
+        authority = catalog
+        if authority is None:
+            try:
+                authority = self._heap.catalog.catalog
+            except AttributeError:
+                return None
+        projection = getattr(authority, "active_index_definitions", None)
+        if callable(projection):
+            return tuple(projection())
+        tables = getattr(authority, "tables", None)
+        if not callable(tables):
+            return None
+        return tuple(
+            definition
+            for table in tables()
+            for definition in automatic_index_definitions(table)
+        )
+
+    def _catalog_authority(self, catalog: object | None = None) -> object | None:
+        """Return the selected catalog object without inventing one for narrow doubles."""
+        if catalog is not None:
+            return catalog
+        try:
+            return self._heap.catalog.catalog
+        except AttributeError:
+            return None
+
+    def _definition_matches_table_tolerantly(
+        self,
+        definition: IndexDefinition,
+        table: object,
+        *,
+        catalog: object | None = None,
+    ) -> bool:
+        """Validate one access path without deriving an invalid sibling accelerator."""
+
+        if definition.table_id != getattr(
+            table, "table_id", None
+        ) or definition.table_name != getattr(table, "name", None):
+            return False
+        try:
+            if isinstance(table, TableDef):
+                return self._definition_match(definition, table)
+            return index_definition_matches_table(  # type: ignore[arg-type]
+                definition, table
+            )
+        except GrafxIndexError:
+            # The legacy compositor constructs scalar and vector siblings together.  A legal
+            # scalar access path must remain usable when only a derived vector name is too long,
+            # so ask Catalog's per-path tolerant projection for the one expected name.
+            authority = self._catalog_authority(catalog)
+            projection = getattr(authority, "active_index_definitions_for", None)
+            if callable(projection):
+                expected = next(
+                    (
+                        candidate
+                        for candidate in projection(
+                            definition.table_id,
+                            table_name=definition.table_name,
+                        )
+                        if candidate.registry_key == definition.registry_key
+                    ),
+                    None,
+                )
+                if expected is not None:
+                    return (
+                        type(definition) is type(expected)
+                        and definition.name == expected.name
+                        and definition.table_id == expected.table_id
+                        and definition.table_name == expected.table_name
+                        and definition.positions == expected.positions
+                        and definition.visibility is expected.visibility
+                        and definition.key_derivation == expected.key_derivation
+                    )
+            columns = getattr(table, "columns", None)
+            if columns is None:
+                return False
+            stored_arity = len(columns) + (
+                2 if getattr(table, "kind", None) == "rel" else 0
+            )
+            return all(position < stored_arity for position in definition.positions)
+
+    def _legacy_active_indexes(self, catalog: object) -> tuple[IndexStore, ...]:
+        """Preserve v1's valid process-local registry semantics.
+
+        Catalog v1 predates persisted logical definitions.  Its schema can prove provenance but
+        cannot distinguish an automatic index from a legitimate low-level custom registration.
+        Consequently every registered definition that still matches a committed table remains
+        eligible in v1; catalog v2 replaces this compatibility rule with exact generation
+        authority.
+        """
+        try:
+            tables = {(table.table_id, table.name): table for table in catalog.tables()}
+        except (AttributeError, GrafxError):
+            return ()
+        return tuple(
+            index
+            for index in self.indexes()
+            if (
+                table := tables.get(
+                    (index.definition.table_id, index.definition.table_name)
+                )
+            )
+            is not None
+            and self._definition_matches_table_tolerantly(
+                index.definition, table, catalog=catalog
+            )
+        )
+
+    def active_indexes(
+        self, *, catalog: object | None = None
+    ) -> tuple[IndexStore, ...]:
+        """Return registered stores selected by the catalog's complete ACTIVE definitions.
+
+        :meth:`indexes` remains the raw ownership registry used by DDL compensation.  This
+        sibling is the committed-data facade: a same-name process-local object, an old physical
+        nonce and BUILDING/STALE generations all fail the exact value comparison and therefore
+        cannot become query, redo, verification or DML authority.  Passing an explicit catalog
+        requests that exact snapshot.  Catalog v1 preserves its historical valid process-local
+        registrations because it has no logical-definition records; strict generation authority
+        begins only with v2.
+        """
+        authority = self._catalog_authority(catalog)
+        if authority is not None and (
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
+        ):
+            return self._legacy_active_indexes(authority)
+        definitions = self._catalog_active_definitions(authority)
+        if definitions is None:
+            return self.indexes()
+        selected: list[IndexStore] = []
+        for definition in definitions:
+            current = self._indexes.get(definition.registry_key)
+            if current is not None and current.definition == definition:
+                selected.append(current)
+        return tuple(selected)
+
+    def active_index(self, name: str, *, catalog: object | None = None) -> IndexStore:
+        """Resolve one name only when its registered store is the catalog-selected generation."""
+        if not isinstance(name, str):
+            raise GrafxIndexError(
+                f"An index is named by a string; got {type(name).__name__}.",
+                field="name",
+                value=type(name).__name__,
+            )
+        authority = self._catalog_authority(catalog)
+        if authority is not None and (
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
+        ):
+            current = self._indexes.get(name.lower())
+            if current is not None:
+                try:
+                    table = authority.table_by_id(current.definition.table_id)
+                    matches = self._definition_matches_table_tolerantly(
+                        current.definition, table, catalog=authority
+                    )
+                except (AttributeError, GrafxError):
+                    matches = False
+                if matches:
+                    return current
+            raise GrafxIndexError(
+                f"No committed-table index named {name!r} is registered in this v1 catalog.",
+                field="index_authority",
+                value=name,
+                index=name,
+                registered=current is not None,
+            )
+        key = name.lower()
+        if authority is not None and (
+            getattr(authority, "format_version", None) != CATALOG_LEGACY_FORMAT_VERSION
+        ):
+            logical_lookup = getattr(authority, "index_definition", None)
+            table_projection = getattr(authority, "active_index_definitions_for", None)
+            if callable(logical_lookup) and callable(table_projection):
+                current = self._indexes.get(key)
+                expected: IndexDefinition | None = None
+                try:
+                    logical = logical_lookup(name)
+                except GrafxConfigurationError:
+                    # Specialized proximity indexes are deliberately schema-derived in v2.
+                    # The registered definition identifies the sole table bucket worth asking;
+                    # exact process-local impostors still fail complete value equality below.
+                    if current is not None:
+                        definitions = tuple(
+                            table_projection(
+                                current.definition.table_id,
+                                table_name=current.definition.table_name,
+                            )
+                        )
+                        expected = next(
+                            (
+                                definition
+                                for definition in definitions
+                                if definition.registry_key == key
+                            ),
+                            None,
+                        )
+                else:
+                    generation = logical.active_generation()
+                    if generation is not None:
+                        expected = logical.runtime_definition(generation)
+                if (
+                    expected is None
+                    or current is None
+                    or current.definition != expected
+                ):
+                    raise GrafxIndexError(
+                        f"No catalog-selected ACTIVE index named {name!r} is registered with "
+                        "its exact physical definition.",
+                        field="index_authority",
+                        value=name,
+                        index=name,
+                        registered=current is not None,
+                    )
+                return current
+        definitions = self._catalog_active_definitions(authority)
+        if definitions is None:
+            return self.index(name)
+        expected = next(
+            (
+                definition
+                for definition in definitions
+                if definition.registry_key == key
+            ),
+            None,
+        )
+        current = self._indexes.get(key)
+        if expected is None or current is None or current.definition != expected:
+            raise GrafxIndexError(
+                f"No catalog-selected ACTIVE index named {name!r} is registered with its "
+                "exact physical definition.",
+                field="index_authority",
+                value=name,
+                index=name,
+                registered=current is not None,
+            )
+        return current
+
+    def _transaction_indexes(
+        self, txn: StagingTransaction, *, catalog: object | None = None
+    ) -> tuple[IndexStore, ...]:
+        """Return ACTIVE stores plus speculative stores explicitly observed by the transaction."""
+        projection = self._active_commit_index_projection(txn)
+        if projection is not None:
+            return projection.indexes
+        _committed, selected = self._statement_indexes(txn=txn, catalog=catalog)
+        return selected
+
+    def _active_commit_index_projection(
+        self, txn: StagingTransaction
+    ) -> _CommitIndexProjection | None:
+        """Return this call's valid projection, or None outside its exact transaction scope."""
+        projection = _COMMIT_INDEX_PROJECTION.get()
+        if not (
+            isinstance(projection, _CommitIndexProjection)
+            and projection.active
+            and projection.seal is _COMMIT_INDEX_PROJECTION_SEAL
+            and projection.manager is self
+            and projection.txn is txn
+        ):
+            return None
+        self._validate_commit_index_projection(projection)
+        return projection
+
+    @contextmanager
+    def _commit_index_projection_scope(
+        self,
+        txn: StagingTransaction,
+        *,
+        catalog: object | None = None,
+        row_tables: Sequence[object] = (),
+    ) -> Iterator[_CommitIndexProjection]:
+        """Select index authority once after rebase and revoke it at commit-section exit.
+
+        This is deliberately neither a database cache nor a transaction-lifetime cache. The
+        transaction manager enters it only after its first OCC pass and committed-catalog sync,
+        while holding ``COMMIT_SECTION``. Repeated artifact, WAL-multiset, retarget and live-apply
+        checks keep their full semantics but consume the same immutable selection.
+        """
+        if type(self) is not IndexManager:
+            raise GrafxIndexError(
+                "A commit index projection is available only to the canonical IndexManager.",
+                field="index_authority",
+                value=type(self).__name__,
+            )
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "A commit index projection needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        authority = self._catalog_authority(catalog)
+        if authority is not self._catalog_authority():
+            raise GrafxIndexError(
+                "A commit index projection must use the manager's current committed catalog.",
+                field="index_authority",
+                txn_id=txn_id,
+            )
+        observed = self._schema_observed.get(txn_id, {})
+        identities: dict[tuple[int, str], object] = {}
+        for table in row_tables:
+            table_id = getattr(table, "table_id", None)
+            table_name = getattr(table, "name", None)
+            if (
+                isinstance(table_id, bool)
+                or not isinstance(table_id, int)
+                or table_id < 0
+                or not isinstance(table_name, str)
+            ):
+                raise GrafxIndexError(
+                    "A commit index projection needs complete row-table identities.",
+                    field="table_identity",
+                    value=repr((table_id, table_name)),
+                )
+            identities.setdefault((table_id, table_name), table)
+
+        pending = getattr(txn, "pending_records", ())
+        scoped = bool(identities or observed) and not pending
+        if scoped:
+            committed = tuple(
+                sorted(
+                    dict.fromkeys(
+                        index
+                        for (table_id, table_name), table in identities.items()
+                        for index in self.active_indexes_for(
+                            table_id,
+                            table_name=table_name,
+                            table=table,
+                            catalog=authority,
+                        )
+                    ),
+                    key=lambda index: index.definition.registry_key,
+                )
+            )
+            indexes = tuple(dict.fromkeys((*committed, *observed)))
+            row_indexes = tuple(
+                dict.fromkeys(
+                    (
+                        *committed,
+                        *(
+                            index
+                            for index in observed
+                            if (
+                                index.definition.table_id,
+                                index.definition.table_name,
+                            )
+                            in identities
+                        ),
+                    )
+                )
+            )
+            rebuild_indexes = indexes
+        else:
+            # Rebuild and other direct low-level staging have no row intent from which a closed
+            # footprint can be proved. Preserve their global authority walk, but take it once.
+            indexes = self._transaction_indexes(txn, catalog=authority)
+            row_indexes = tuple(
+                dict.fromkeys(
+                    index
+                    for (table_id, table_name), table in identities.items()
+                    for index in self.active_indexes_for(
+                        table_id,
+                        table_name=table_name,
+                        table=table,
+                        txn=txn,
+                        catalog=authority,
+                    )
+                )
+            )
+            rebuild_indexes = tuple(self._indexes.values()) if pending else indexes
+        projection = _CommitIndexProjection(
+            seal=_COMMIT_INDEX_PROJECTION_SEAL,
+            manager=self,
+            txn=txn,
+            txn_id=txn_id,
+            catalog=authority,
+            indexes=indexes,
+            row_indexes=row_indexes,
+            rebuild_indexes=rebuild_indexes,
+            registry_revision=self._registry_revision,
+            schema_observed=tuple(observed.items()),
+            new_table_observed=frozenset(
+                self._schema_new_table_observed.get(txn_id, ())
+            ),
+            detached_claims=tuple(
+                (index, frozenset(self._artifact_claims.get(index, ())))
+                for index in observed
+                if index in self._detached_speculative_indexes
+            ),
+        )
+        token = _COMMIT_INDEX_PROJECTION.set(projection)
+        try:
+            yield projection
+        finally:
+            projection.active = False
+            _COMMIT_INDEX_PROJECTION.reset(token)
+
+    def _validate_commit_index_projection(
+        self, projection: _CommitIndexProjection
+    ) -> None:
+        """Refuse reuse when any fact underlying an active commit projection drifted."""
+        txn_id = getattr(projection.txn, "txn_id", None)
+        if txn_id != projection.txn_id:
+            raise GrafxIndexError(
+                "The transaction identity changed inside its commit index projection.",
+                field="txn_id",
+                value=repr(txn_id),
+                expected=projection.txn_id,
+            )
+        if self._registry_revision != projection.registry_revision:
+            raise GrafxIndexError(
+                "The registered index inventory changed inside its commit projection.",
+                field="index_registry",
+                txn_id=projection.txn_id,
+                retryable=True,
+            )
+        observed = self._schema_observed.get(projection.txn_id, {})
+        new_tables = self._schema_new_table_observed.get(projection.txn_id, set())
+        claims = tuple(
+            (index, frozenset(self._artifact_claims.get(index, ())))
+            for index in observed
+            if index in self._detached_speculative_indexes
+        )
+        if (
+            tuple(observed.items()) != projection.schema_observed
+            or frozenset(new_tables) != projection.new_table_observed
+            or claims != projection.detached_claims
+        ):
+            raise GrafxIndexError(
+                "Schema staging changed inside its commit index projection.",
+                field="index_registry",
+                txn_id=projection.txn_id,
+                retryable=True,
+            )
+
+    def _statement_indexes(
+        self,
+        *,
+        txn: StagingTransaction | None = None,
+        catalog: object | None = None,
+    ) -> tuple[tuple[IndexStore, ...], tuple[IndexStore, ...]]:
+        """Project committed and transaction-visible stores with one authority walk.
+
+        Query planning consumes only the first tuple. Runtime DML also sees stores this
+        transaction created through its schema journal, supplied by the second tuple.
+        """
+        active = self.active_indexes(catalog=catalog)
+        if txn is None:
+            return active, active
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "Transaction-scoped index authority needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        observed = tuple(self._schema_observed.get(txn_id, ()))
+        return active, tuple(dict.fromkeys((*active, *observed)))
+
+    def _statement_indexes_for_tables(
+        self,
+        tables: Sequence[object],
+        *,
+        txn: StagingTransaction | None = None,
+        catalog: object | None = None,
+    ) -> tuple[tuple[IndexStore, ...], tuple[IndexStore, ...]]:
+        """Project one statement's closed table footprint without a global registry walk.
+
+        ``QueryEngine`` calls this door only after proving that every table a statement can
+        reach is present in ``tables``. Each per-table projection retains the same v1/v2 and
+        transaction-observation rules as :meth:`active_indexes_for`; this method merely unions
+        those authoritative buckets. An unprovable footprint never reaches this door and keeps
+        the conservative global :meth:`_statement_indexes` path.
+        """
+        identities: dict[tuple[int, str], object] = {}
+        for table in tables:
+            table_id = getattr(table, "table_id", None)
+            table_name = getattr(table, "name", None)
+            if (
+                isinstance(table_id, bool)
+                or not isinstance(table_id, int)
+                or table_id < 0
+                or not isinstance(table_name, str)
+            ):
+                raise GrafxIndexError(
+                    "A scoped statement index projection needs complete table identities.",
+                    field="table_identity",
+                    value=repr((table_id, table_name)),
+                )
+            identities.setdefault((table_id, table_name), table)
+
+        committed = tuple(
+            sorted(
+                dict.fromkeys(
+                    index
+                    for (table_id, table_name), table in identities.items()
+                    for index in self.active_indexes_for(
+                        table_id,
+                        table_name=table_name,
+                        table=table,
+                        catalog=catalog,
+                    )
+                ),
+                key=lambda index: index.definition.registry_key,
+            )
+        )
+        if txn is None:
+            return committed, committed
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "Transaction-scoped index authority needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        observed = tuple(self._schema_observed.get(txn_id, ()))
+        if not any(
+            (index.definition.table_id, index.definition.table_name) in identities
+            for index in observed
+        ):
+            # The common DML transaction has no speculative DDL.  Its runtime and planning
+            # authority are therefore the same immutable tuple; repeating every table-local
+            # catalog projection would prove no additional fact.
+            return committed, committed
+        runtime = tuple(
+            sorted(
+                dict.fromkeys(
+                    index
+                    for (table_id, table_name), table in identities.items()
+                    for index in self.active_indexes_for(
+                        table_id,
+                        table_name=table_name,
+                        table=table,
+                        txn=txn,
+                        catalog=catalog,
+                    )
+                ),
+                key=lambda index: index.definition.registry_key,
+            )
+        )
+        return committed, runtime
+
     def indexes_for(
         self,
         table_id: int,
@@ -3712,20 +5621,115 @@ class IndexManager:
         """
         return tuple(
             index
-            for index in self.indexes()
-            if index.definition.table_id == table_id
-            and (table_name is None or index.definition.table_name == table_name)
-            and (
+            for index in self._registered_indexes_for(table_id, table_name=table_name)
+            if (
                 table is None
                 or not hasattr(table, "columns")
-                or index_definition_matches_table(index.definition, table)
+                or self._definition_matches_table_tolerantly(index.definition, table)
             )
         )
 
+    def active_indexes_for(
+        self,
+        table_id: int,
+        *,
+        table_name: str | None = None,
+        table: object | None = None,
+        txn: StagingTransaction | None = None,
+        catalog: object | None = None,
+    ) -> tuple[IndexStore, ...]:
+        """Return authoritative indexes owned by one complete table identity.
+
+        Supplying ``txn`` adds only stores that transaction previously observed through the DDL
+        journal.  This narrow exception preserves CREATE-TABLE-plus-DML in one transaction
+        without granting another process-local registration committed authority.
+        """
+
+        def belongs_to_requested_table(index: IndexStore) -> bool:
+            definition = index.definition
+            if definition.table_id != table_id or (
+                table_name is not None and definition.table_name != table_name
+            ):
+                return False
+            return (
+                table is None
+                or not hasattr(table, "columns")
+                or self._definition_matches_table_tolerantly(
+                    definition, table, catalog=authority
+                )
+            )
+
+        authority = self._catalog_authority(catalog)
+        is_v1 = authority is not None and (
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
+        )
+        table_projection = getattr(authority, "active_index_definitions_for", None)
+        if not is_v1 and callable(table_projection):
+            definitions = tuple(table_projection(table_id, table_name=table_name))
+            committed = tuple(
+                current
+                for definition in definitions
+                if (current := self._indexes.get(definition.registry_key)) is not None
+                and current.definition == definition
+                and belongs_to_requested_table(current)
+            )
+        elif is_v1:
+            # v1 has no persisted logical authority: every valid process-local access path for
+            # the committed table remains eligible, including with an explicit catalog photo.
+            # Resolve only that table's raw ownership bucket; calling active_indexes() here
+            # would reintroduce an O(total_indexes) projection for every row.
+            try:
+                catalog_table = authority.table_by_id(table_id)
+            except (AttributeError, GrafxError):
+                committed = ()
+            else:
+                if table_name is not None and catalog_table.name != table_name:
+                    committed = ()
+                else:
+                    committed = tuple(
+                        index
+                        for index in self._registered_indexes_for(
+                            table_id, table_name=catalog_table.name
+                        )
+                        if belongs_to_requested_table(index)
+                        and self._definition_matches_table_tolerantly(
+                            index.definition, catalog_table, catalog=authority
+                        )
+                    )
+        else:
+            # Narrow component doubles have no persisted authority surface.  Their historical
+            # contract is the raw registry, now reached through the same table-local structure.
+            committed = tuple(
+                index
+                for index in self._registered_indexes_for(
+                    table_id, table_name=table_name
+                )
+                if belongs_to_requested_table(index)
+            )
+
+        if txn is None:
+            return committed
+        txn_id = getattr(txn, "txn_id", None)
+        if isinstance(txn_id, bool) or not isinstance(txn_id, int) or txn_id < 0:
+            raise GrafxIndexError(
+                "Transaction-scoped index authority needs a non-negative integer txn_id.",
+                field="txn_id",
+                value=repr(txn_id),
+            )
+        observed = tuple(
+            index
+            for index in self._schema_observed.get(txn_id, ())
+            if belongs_to_requested_table(index)
+        )
+        return tuple(dict.fromkeys((*committed, *observed)))
+
     def unregistered_persistent_indexes_for(
-        self, tables: Sequence[object]
+        self,
+        tables: Sequence[object],
+        *,
+        catalog: object | None = None,
     ) -> tuple[str, ...]:
-        """Name durable automatic indexes of ``tables`` absent from this registry.
+        """Name catalog-selected indexes of ``tables`` absent or physically mismatched.
 
         A long-lived participant can adopt a table committed by another process while its
         process-local index registry still predates that DDL.  In that state row materialisation
@@ -3734,43 +5738,95 @@ class IndexManager:
         silence for a complete replay and certify a short index.
 
         This is the pre-WAL proof used by the transaction manager after its existing-only
-        registry synchronisation.  Only files that actually exist are obligations: an automatic
-        accelerator that was deliberately skipped because its name is illegal or collides keeps
-        the established scan fallback.  A path alone is not proof: the registry definition and
-        the durable header must both match the complete automatic definition, so a speculative
-        artifact that reused the same folded name cannot satisfy another table's obligation.
+        registry synchronisation.  In v1 only legacy automatic files that actually exist are
+        obligations, preserving the established scan fallback.  In v2 every ACTIVE generation
+        is an explicit catalog promise, so absence, unreadable bytes or any header/nonce mismatch
+        is an obligation and blocks the write before WAL publication.
         """
 
+        authority = catalog
+        if authority is None:
+            try:
+                authority = self._heap.catalog.catalog
+            except AttributeError:
+                authority = None
+        identities = {
+            (getattr(table, "table_id", None), getattr(table, "name", None))
+            for table in tables
+        }
+        table_projection = getattr(authority, "active_index_definitions_for", None)
+        if type(authority) is Catalog and callable(table_projection):
+            definitions = tuple(
+                definition
+                for table_id, table_name in identities
+                if isinstance(table_id, int) and not isinstance(table_id, bool)
+                for definition in table_projection(table_id, table_name=table_name)
+            )
+        else:
+            definitions = self._catalog_active_definitions(authority)
+            if definitions is None:
+                definitions = tuple(index.definition for index in self.indexes())
+        is_v2 = (
+            getattr(authority, "format_version", CATALOG_LEGACY_FORMAT_VERSION)
+            != CATALOG_LEGACY_FORMAT_VERSION
+        )
+        relevant: list[IndexDefinition] = []
+        seen: set[str] = set()
+        for definition in definitions:
+            if (definition.table_id, definition.table_name) not in identities:
+                continue
+            file = definition.file
+            if file in seen:
+                continue
+            seen.add(file)
+            relevant.append(definition)
+
+        unresolved = tuple(
+            definition
+            for definition in relevant
+            if (
+                (current := self._indexes.get(definition.registry_key)) is None
+                or current.definition != definition
+            )
+        )
+        if not unresolved:
+            # Registry equality proves the logical staging target. Physical ownership is still
+            # revalidated through the fresh certificate in validate_staged_artifacts before WAL;
+            # repeating a directory inventory here adds no authority to that stronger proof.
+            return ()
+
+        # Materialise at most once, and only when an unresolved catalog promise requires the
+        # legacy existence/mismatch classification below. Per-definition exists() calls would
+        # retain the same directory-scan cost on local storage.
         persisted = frozenset(self._pool.storage.list_files(f"{INDEX_DIRECTORY}/"))
         missing: list[str] = []
-        seen: set[str] = set()
-        for table in tables:
-            try:
-                definitions = automatic_index_definitions(table)  # type: ignore[arg-type]
-            except GrafxError:
-                continue
-            for definition in definitions:
-                file = definition.file
-                if file in seen or file not in persisted:
-                    continue
-                seen.add(file)
-                current = self._indexes.get(definition.registry_key)
-                if current is not None and current.definition == definition:
-                    continue
-                try:
-                    page = self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
-                    header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
-                except GrafxError:
-                    # An unreadable/torn file was not proved to be this automatic accelerator;
-                    # the normal sync/open refusal retains its own classification.
-                    continue
-                if (
-                    header.digest == definition.digest()
-                    and header.visibility is definition.visibility
-                    and header.table_id == definition.table_id
-                    and header.bucket_count == definition.bucket_count
-                ):
+        for definition in unresolved:
+            file = definition.file
+            strict_generation = is_v2 and definition.artifact_nonce != 0
+            exists = file in persisted
+            if not exists:
+                if strict_generation:
                     missing.append(definition.name)
+                continue
+            try:
+                page = self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
+                header = IndexHeader.decode(page.read_slot(INDEX_HEADER_SLOT))
+            except GrafxError:
+                if strict_generation:
+                    missing.append(definition.name)
+                continue
+            matches = (
+                header.digest == definition.digest()
+                and header.visibility is definition.visibility
+                and header.table_id == definition.table_id
+                and header.bucket_count == definition.bucket_count
+                and (
+                    not strict_generation
+                    or header.artifact_nonce == definition.artifact_nonce
+                )
+            )
+            if matches or strict_generation:
+                missing.append(definition.name)
         return tuple(missing)
 
     # --- freshness --------------------------------------------------------------------------
@@ -3786,20 +5842,90 @@ class IndexManager:
             high_waters[table_id] = self._heap.committed_high_water(table)
         return high_waters
 
-    def table_watermark_photo(self) -> dict[int, Lsn]:
+    def replay_watermark_meta_baseline(self, file: str, page: Page) -> Page | None:
+        """Read the detached current heap META image needed by the redo scope proof."""
+        if (
+            file != self._heap.file
+            or page.page_type != int(PageType.META)
+            or page.page_index != HEADER_PAGE_INDEX
+        ):
+            return None
+        try:
+            return self._pool.read_fresh_page(file, HEADER_PAGE_INDEX)
+        except GrafxError:
+            # Scope inference must never turn an unreadable baseline into permission to omit a
+            # table. Canonical redo/freshness remains responsible for reporting the damage.
+            return None
+
+    def replay_watermark_scope(
+        self, file: str, page: Page, *, meta_baseline: Page | None = None
+    ) -> tuple[bool, frozenset[int]]:
+        """Classify whether and whose committed watermark a replayed page can move.
+
+        The redo preflight calls this only on the concrete ``IndexManager`` and on a decoded,
+        checksum-verified image.  Non-heap files and heap overflow pages are proved irrelevant
+        to ``committed_high_water``.  A heap data page must expose its validated physical owner
+        even when the logical change had no secondary-index effect.  Heap META is accepted only
+        when a device-fresh baseline proves which extent roots changed. Any other heap-file image
+        returns an unknown scope, requiring the canonical full photograph rather than a guess.
+        """
+        if file != self._heap.file or page.page_type == int(PageType.OVERFLOW):
+            return True, frozenset()
+        if page.page_type == int(PageType.HEAP):
+            return True, frozenset((self._heap._page_table_id(page),))
+        if page.page_type == int(PageType.META) and meta_baseline is not None:
+            try:
+                before = self._heap._watermark_extent_roots(meta_baseline)
+                after = self._heap._watermark_extent_roots(page)
+            except GrafxError:
+                return False, frozenset()
+            table_ids = before.keys() | after.keys()
+            return True, frozenset(
+                table_id
+                for table_id in table_ids
+                if before.get(table_id) != after.get(table_id)
+            )
+        return False, frozenset()
+
+    def table_watermark_photo(
+        self, *, refresh_table_ids: Collection[int] | None = None
+    ) -> dict[int, Lsn]:
         """Photograph each covered table's committed watermark once, for one recovery holder.
 
         Valid only while the photographer holds the section and applies nothing: a caller that
         replays pages or adopts a catalog re-photographs before asking again, and the boot-time
         :meth:`open`, which runs after the section is released into the regime where foreign
         commits move the heap, always takes its own (ST-7).
+
+        An exact ``refresh_table_ids`` proof narrows the physical walk to tables whose heap data
+        pages occur in the verified replay plus newly-active tables absent from this manager's
+        last complete photograph.  The returned mapping remains complete for every active index;
+        callers therefore keep the same fail-closed freshness checks.  ``None`` is the canonical
+        full scan used by recovery, catalog changes, and every unproved/custom replay path.
         """
-        return self._table_high_waters(self.indexes())
+        indexes = self.active_indexes()
+        if refresh_table_ids is None:
+            return self._table_high_waters(indexes)
+        active_table_ids = {index.definition.table_id for index in indexes}
+        refresh = (set(refresh_table_ids) & active_table_ids) | (
+            active_table_ids - self._table_watermarks.keys()
+        )
+        refreshed = self._table_high_waters(
+            tuple(index for index in indexes if index.definition.table_id in refresh)
+        )
+        return {
+            table_id: (
+                refreshed[table_id]
+                if table_id in refreshed
+                else self._table_watermarks[table_id]
+            )
+            for table_id in active_table_ids
+        }
 
     def _replace_table_watermarks(self, high_waters: Mapping[int, Lsn]) -> None:
         """Bind every index to one open-time physical table-watermark picture."""
         self._table_watermarks = dict(high_waters)
-        for index in self.indexes():
+        for index in self.active_indexes():
             index._table_high_water = high_waters.get(index.definition.table_id)
 
     def _record_table_watermark(
@@ -3808,7 +5934,7 @@ class IndexManager:
         """Advance one locally observed table floor and bind all of its indexes to it."""
         position = max(self._table_watermarks.get(table_id, NO_LSN), lsn)
         self._table_watermarks[table_id] = position
-        for index in self.indexes_for(table_id, table_name=table_name):
+        for index in self.active_indexes_for(table_id, table_name=table_name):
             index._table_high_water = position
 
     @property
@@ -3843,16 +5969,31 @@ class IndexManager:
         *,
         persist_stale: bool = True,
         allow_ahead: bool = False,
+        catalog: object | None = None,
+        watermarks: Mapping[int, Lsn] | None = None,
     ) -> tuple[IndexStore, ...]:
         """Check every registered index against the position the database has published.
 
         Returns the indexes that are stale, which is what a caller needs in order to decide
         between rebuilding them and running without them. Nothing is repaired here: a repair
         writes to the log and therefore belongs inside a transaction the caller owns.
+
+        ``watermarks`` may carry a complete photograph taken by the same holder without an
+        intervening mutation, as checkpoint does after redo.  A newly-active table absent from
+        that picture is still read fresh here; the optimization can remove duplicate walks but
+        cannot remove a freshness question.
         """
         published = _require_position("published_lsn", published_lsn)
-        indexes = self.indexes()
-        high_waters = self._table_high_waters(indexes)
+        indexes = self.active_indexes(catalog=catalog)
+        if watermarks is None:
+            high_waters = self._table_high_waters(indexes)
+        else:
+            high_waters = dict(watermarks)
+            for index in indexes:
+                table_id = index.definition.table_id
+                if table_id not in high_waters:
+                    table = self._heap.catalog.catalog.table_by_id(table_id)
+                    high_waters[table_id] = self._heap.committed_high_water(table)
         for index in indexes:
             required = high_waters[index.definition.table_id]
             if required > published:
@@ -3905,7 +6046,7 @@ class IndexManager:
         pass -- is read fresh here, never guessed at (ST-7).
         """
         floor = _require_position("checkpoint_lsn", checkpoint_lsn)
-        indexes = self.indexes()
+        indexes = self.active_indexes()
         if watermarks is None:
             high_waters = self._table_high_waters(indexes)
         else:
@@ -3954,7 +6095,7 @@ class IndexManager:
         out of the stale state.
         """
         position = _require_position("lsn", lsn)
-        indexes = self.indexes()
+        indexes = self.active_indexes()
         photo = (
             dict(watermarks)
             if watermarks is not None
@@ -3980,21 +6121,27 @@ class IndexManager:
         default is in-memory only: the WAL is retained and the failed pass may have refused
         before its first mutation, so poisoning this handle must not invent another disk write.
         """
-        for index in self.indexes():
+        for index in self.active_indexes():
             index.mark_stale(reason, persist=persist)
 
     def validate_staged_records(
         self, txn: StagingTransaction, records: Sequence[object]
-    ) -> None:
+    ) -> bool:
         """Prove that every staged WAL effect is owned by this registry's staging state.
 
         ``TransactionContext.pending_records`` is reachable to callers because indexes stage
         through that protocol. A caller must not be able to inject an ABORT/outcome record or an
         extra logical change that is replayed after restart but was never applied on the live
         commit path. The decoded multiset must exactly match the changes held by the registered
-        indexes for this transaction.
+        indexes for this transaction. The returned RESET fact comes from that same mandatory
+        decode and is trusted only by the exact built-in manager; existing callers may ignore it.
         """
+        authorised = {
+            index.definition.registry_key: index
+            for index in self._transaction_indexes(txn)
+        }
         actual: list[IndexChange] = []
+        contains_index_reset = False
         for position, record in enumerate(records):
             if not isinstance(record, WalRecord):
                 raise GrafxIndexError(
@@ -4020,35 +6167,45 @@ class IndexManager:
                     field="pending_records",
                     position=position,
                 ) from failure
-            if change.index.lower() not in self._indexes:
+            if change.index.lower() not in authorised:
                 raise GrafxIndexError(
-                    f"A staged effect names unregistered index {change.index!r}.",
+                    f"A staged effect names index {change.index!r} without ACTIVE catalog "
+                    "authority for this transaction.",
                     field="index",
                     index=change.index,
                     position=position,
                 )
             actual.append(change)
+            contains_index_reset = (
+                contains_index_reset or change.operation is IndexOperation.RESET
+            )
 
-        expected = [change for index in self.indexes() for change in index.pending(txn)]
-        remaining = list(expected)
-        for change in actual:
-            try:
-                remaining.remove(change)
-            except ValueError as failure:
-                raise GrafxIndexError(
-                    "A staged WAL effect has no matching change in the index registry.",
-                    field="pending_records",
-                    index=change.index,
-                    operation=change.operation.name,
-                ) from failure
-        if remaining or len(actual) != len(expected):
+        expected = [
+            change
+            for index in self._transaction_indexes(txn)
+            for change in index.pending(txn)
+        ]
+        expected_counts = Counter(expected)
+        actual_counts = Counter(actual)
+        unexpected = actual_counts - expected_counts
+        if unexpected:
+            change = next(iter(unexpected))
+            raise GrafxIndexError(
+                "A staged WAL effect has no matching change in the index registry.",
+                field="pending_records",
+                index=change.index,
+                operation=change.operation.name,
+            )
+        missing = expected_counts - actual_counts
+        if missing:
             raise GrafxIndexError(
                 "The transaction's staged WAL effects do not exactly match the index registry.",
                 field="pending_records",
                 expected=len(expected),
                 actual=len(actual),
-                missing=len(remaining),
+                missing=missing.total(),
             )
+        return contains_index_reset
 
     def retarget_staged(
         self, txn: StagingTransaction, old_csn: Csn, new_csn: Csn
@@ -4080,7 +6237,7 @@ class IndexManager:
         staged_replacements: list[tuple[_Staged, list[IndexChange]]] = []
         expected: list[IndexChange] = []
         txn_id = int(txn.txn_id)
-        for index in self.indexes():
+        for index in self._transaction_indexes(txn):
             staged = index._staged.get(txn_id)
             if staged is None:
                 continue
@@ -4105,25 +6262,12 @@ class IndexManager:
             records.append(
                 record
                 if change is original_change
-                else replace(record, payload=change.encode())
+                else record_for_change(record, change)
             )
 
-        remaining = list(expected)
-        for change in actual:
-            try:
-                remaining.remove(change)
-            except (
-                ValueError
-            ) as failure:  # pragma: no cover - guarded before transformation
-                raise GrafxIndexError(
-                    "Retargeting changed the transaction and registry into different effects.",
-                    field="pending_records",
-                ) from failure
-        if remaining or len(actual) != len(
-            expected
-        ):  # pragma: no cover - guarded above
+        if Counter(actual) != Counter(expected):  # pragma: no cover - guarded above
             raise GrafxIndexError(
-                "Retargeting changed the cardinality of the transaction's staged effects.",
+                "Retargeting changed the transaction and registry into different effects.",
                 field="pending_records",
                 expected=len(expected),
                 actual=len(actual),
@@ -4151,15 +6295,28 @@ class IndexManager:
         table_id: int,
         values: Sequence[object],
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
+        txn: StagingTransaction | None = None,
     ) -> int:
-        """Count entries this row owes without deriving or hashing their keys."""
+        """Count entries this row owes without deriving or hashing value keys.
+
+        ``record_id`` is optional only for compatibility with column-derived indexes, whose
+        inclusion predicate ignores it.  A RecordId-derived index validates that the durable
+        logical identity is present here, keeping WAL quota pre-counting on exactly the same
+        domain as staging without trying to encode an empty DELETE value tuple.
+        """
 
         return sum(
             1
-            for index in self.indexes_for(table_id, table_name=table_name, table=table)
-            if index.definition.owes_entry(values)
+            for index in self.active_indexes_for(
+                table_id,
+                table_name=table_name,
+                table=table,
+                txn=txn,
+            )
+            if index.definition.owes_entry_for_record(record_id, values)
         )
 
     def stage_row_insert(
@@ -4170,18 +6327,26 @@ class IndexManager:
         values: Sequence[object],
         csn: Csn,
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the entry this new row version owes it."""
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id, table_name=table_name, table=table):
+        for index in self.active_indexes_for(
+            table_id, table_name=table_name, table=table, txn=txn
+        ):
             definition = index.definition
-            if not definition.owes_entry(values):
+            if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
                 records.append(
-                    index.stage_insert(txn, definition.key_for(values), ref, csn)
+                    index.stage_insert(
+                        txn,
+                        definition.key_for_record(record_id, values),
+                        ref,
+                        csn,
+                    )
                 )
         return tuple(records)
 
@@ -4193,18 +6358,26 @@ class IndexManager:
         values: Sequence[object],
         csn: Csn,
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the end of the entry this row version had."""
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id, table_name=table_name, table=table):
+        for index in self.active_indexes_for(
+            table_id, table_name=table_name, table=table, txn=txn
+        ):
             definition = index.definition
-            if not definition.owes_entry(values):
+            if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
                 records.append(
-                    index.stage_delete(txn, definition.key_for(values), ref, csn)
+                    index.stage_delete(
+                        txn,
+                        definition.key_for_record(record_id, values),
+                        ref,
+                        csn,
+                    )
                 )
         return tuple(records)
 
@@ -4218,6 +6391,7 @@ class IndexManager:
         new_values: Sequence[object],
         csn: Csn,
         *,
+        record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
     ) -> tuple[WalRecord, ...]:
@@ -4229,25 +6403,56 @@ class IndexManager:
         key looks the same would leave the index pointing at a version the row no longer has.
         """
         records: list[WalRecord] = []
-        for index in self.indexes_for(table_id, table_name=table_name, table=table):
+        for index in self.active_indexes_for(
+            table_id, table_name=table_name, table=table, txn=txn
+        ):
             definition = index.definition
-            owes_old = definition.owes_entry(old_values)
-            owes_new = definition.owes_entry(new_values)
+            owes_old = definition.owes_entry_for_record(record_id, old_values)
+            owes_new = definition.owes_entry_for_record(record_id, new_values)
             if not owes_old and not owes_new:
                 index.stage_empty_observation(txn)
             elif owes_old:
                 records.append(
                     index.stage_delete(
-                        txn, definition.key_for(old_values), old_ref, csn
+                        txn,
+                        definition.key_for_record(record_id, old_values),
+                        old_ref,
+                        csn,
                     )
                 )
             if owes_new:
                 records.append(
                     index.stage_insert(
-                        txn, definition.key_for(new_values), new_ref, csn
+                        txn,
+                        definition.key_for_record(record_id, new_values),
+                        new_ref,
+                        csn,
                     )
                 )
         return tuple(records)
+
+    def _commit_under_write_authority(self, txn: StagingTransaction, csn: Csn) -> int:
+        """Commit through the private door owned by the fully fenced transaction path.
+
+        The surrounding transaction manager already holds its participant section, writer lease
+        and cross-process ``COMMIT_SECTION``. A context-local seal carries only that authority
+        through ordinary/custom ``commit`` overrides; it cannot leak to a direct low-level call
+        in another thread or survive success/failure.
+        """
+        authority = _LiveCommitAuthority(
+            seal=_LIVE_COMMIT_AUTHORITY_SEAL,
+            manager=self,
+            txn=txn,
+        )
+        token = _LIVE_COMMIT_AUTHORITY.set(authority)
+        try:
+            return self.commit(txn, csn)
+        finally:
+            # Context copies retain this same scope object. Revoke it before resetting the
+            # current context so no delayed task can inherit a still-valid capability.
+            authority.active = False
+            authority.store = None
+            _LIVE_COMMIT_AUTHORITY.reset(token)
 
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
         """Apply, on every index, what this transaction staged, and return how many changes moved.
@@ -4261,19 +6466,53 @@ class IndexManager:
         touched: list[str] = []
         written_tables = _tables_written_by(txn)
         observed_tables: set[_TableIdentity] = set(written_tables or ())
-        indexes = self.indexes()
-        observations = {index.name: index.observed(txn) for index in indexes}
+        indexes = self._transaction_indexes(txn)
+        new_table_observations = self._schema_new_table_observed.get(
+            int(txn.txn_id), set()
+        )
+        # One transaction can hold the old committed generation and its detached replacement
+        # under the same logical name.  Object identity, not name, keeps their observations
+        # distinct until the catalog atomically selects the shadow.
+        observations = {index: index.observed(txn) for index in indexes}
         staged_tables = {
-            index.definition.table_id for index in indexes if observations[index.name]
+            index.definition.table_id for index in indexes if observations[index]
         }
+        authority = _LIVE_COMMIT_AUTHORITY.get()
+        authorised_scope = (
+            authority
+            if (
+                isinstance(authority, _LiveCommitAuthority)
+                and authority.active
+                and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
+                and authority.manager is self
+                and authority.txn is txn
+            )
+            else None
+        )
         for index in indexes:
-            observed = observations[index.name]
-            moved = index.commit(txn, csn)
+            observed = observations[index]
+            if authorised_scope is not None:
+                authorised_scope.store = index
+            try:
+                moved = index.commit(txn, csn)
+            finally:
+                if authorised_scope is not None:
+                    authorised_scope.store = None
             identity = (
                 index.definition.table_id,
                 index.definition.table_name,
             )
-            if observed:
+            if observed and (
+                written_tables is None
+                or identity in written_tables
+                or index in new_table_observations
+            ):
+                # A schema-only observation proves the new artifact, not a heap mutation.
+                # Treating it as a row-table high-water advanced every older sibling index to
+                # the DDL commit without advancing its header, making a healthy PK unreadable
+                # immediately after adding an identity generation to that table.  Concrete
+                # transactions expose their exact written-table set; compatibility doubles
+                # without it retain the former observation-based inference.
                 observed_tables.add(identity)
             elif (written_tables is not None and identity in written_tables) or (
                 written_tables is None and index.definition.table_id in staged_tables
@@ -4309,12 +6548,14 @@ class IndexManager:
         for index in indexes:
             self._bind_local_heap_view(index)
         self._schema_observed.pop(int(txn.txn_id), None)
+        self._schema_new_table_observed.pop(int(txn.txn_id), None)
         return applied
 
     def rollback(self, txn: StagingTransaction) -> int:
         """Drop what this transaction staged into every index, and return how many were dropped."""
         dropped = sum(index.rollback(txn) for index in self.indexes())
         self._schema_observed.pop(int(txn.txn_id), None)
+        self._schema_new_table_observed.pop(int(txn.txn_id), None)
         return dropped
 
     def apply(self, record: WalRecord) -> bool:
@@ -4325,11 +6566,477 @@ class IndexManager:
         answer says so rather than raising, and the caller decides.
         """
         change = change_of(record)
-        found = self._indexes.get(change.index.lower())
-        if found is None:
+        try:
+            found = self.active_index(change.index)
+        except GrafxIndexError:
             return False
         found.apply(record)
         return True
+
+    def _prepare_common_replay_batch(
+        self,
+        records: Sequence[WalRecord],
+        *,
+        _resolved: Sequence[tuple[WalRecord, IndexStore, IndexChange]] | None = None,
+    ) -> _CommonReplayBatch | None:
+        """Preflight the narrow common index-only replay path without mutating an index.
+
+        The returned value is deliberately opaque outside this module and belongs to exactly
+        this call.  It is never cached on the manager or a store.  A caller gets ``None`` for any
+        shape whose existing per-record protocol carries extra semantics: RESET, an active
+        rebuild, or a store overriding :meth:`IndexStore.apply` that does not declare, through
+        :meth:`IndexStore._batch_replay_admits`, that its extra semantics are a no-op for this
+        batch (``VectorHnswIndex`` does so only while it publishes no picture).
+
+        Every record is decoded and resolved before page 0 of the first store is seeded.  Header
+        transitions are then composed in WAL order with the same monotonic value objects used by
+        the legacy path.  Consequently a bad position or horizon discovered at the end of the
+        batch refuses before the first bucket mutation.
+        """
+        if not records:
+            return None
+        resolved: list[tuple[WalRecord, IndexStore, IndexChange]]
+        if _resolved is None:
+            resolved = []
+            for record in records:
+                change = change_of(record)
+                try:
+                    store = self.active_index(change.index)
+                except GrafxIndexError:
+                    # CommitRedo's mandatory preflight normally turns this into its more useful
+                    # recovery-level refusal. Retain the legacy dispatch result if a custom
+                    # caller invokes the capability directly.
+                    return None
+                resolved.append((record, store, change))
+        else:
+            # Passage-local only: apply_partitioned_replay_batch produced these values from the
+            # same concrete sequence immediately above and has not yielded control or mutated
+            # the registry. Reusing them removes a second WAL decode and catalog resolution per
+            # common record without retaining authority on the manager or across replay calls.
+            resolved = list(_resolved)
+            if len(resolved) != len(records) or any(
+                candidate is not record
+                for record, (candidate, _store, _change) in zip(
+                    records, resolved, strict=True
+                )
+            ):
+                return None
+        items: list[_CommonReplayItem] = []
+        ordered_stores: list[IndexStore] = []
+        seen: set[IndexStore] = set()
+        for record, store, change in resolved:
+            if change.operation is IndexOperation.RESET:
+                return None
+            if (
+                not self._batch_replay_compatible(store)
+                or store._rebuild_authority is not None
+                or store._replaying
+            ):
+                return None
+            if change.versioned != store.definition.versioned:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} describes a "
+                    f"{'versioned' if change.versioned else 'unversioned'} entry and this index "
+                    f"stores {'versioned' if store.definition.versioned else 'unversioned'} "
+                    "ones, so batched replay was refused before any effect was applied.",
+                    field="versioned",
+                    value=change.versioned,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            if len(change.key) > store.max_key_bytes:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} carries a key of "
+                    f"{len(change.key)} bytes, but this index stores at most "
+                    f"{store.max_key_bytes}; batched replay was refused before any effect was "
+                    "applied.",
+                    field="key",
+                    value=len(change.key),
+                    limit=store.max_key_bytes,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            item = _CommonReplayItem(
+                store,
+                change,
+                lsn_of(record),
+                bucket_of(change.key, store.definition.bucket_count),
+            )
+            items.append(item)
+            if store not in seen:
+                seen.add(store)
+                ordered_stores.append(store)
+
+        initial_by_store: dict[IndexStore, IndexHeader] = {}
+        final_by_store: dict[IndexStore, IndexHeader] = {}
+        for store in ordered_stores:
+            # A process-local stale verdict makes legacy _advance return before reading page 0;
+            # preserve that ordering and do not introduce a new fallible read. A durable STALE
+            # bit not reflected in this handle is still an ordinary immutable header value here:
+            # legacy replay advances/reconciles it without clearing the bit, which composition
+            # below reproduces exactly. Active rebuild authority was rejected above.
+            if store._stale_reason is not None:
+                return None
+            header = store._read_header()
+            initial_by_store[store] = header
+            final_by_store[store] = header
+
+        for item in items:
+            final = final_by_store[item.store].advanced_to(item.position)
+            if item.change.operation is IndexOperation.REMOVE:
+                final = final.reconciled_to(item.change.csn)
+            final_by_store[item.store] = final
+
+        touched_buckets: set[tuple[IndexStore, int]] = set()
+        bounded_bucket_census = True
+        for item in items:
+            identity = (item.store, item.bucket)
+            if (
+                identity not in touched_buckets
+                and len(touched_buckets) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT
+            ):
+                # Recording an unbounded number of bucket identities would make the
+                # accelerator's metadata grow with the WAL.  Decline the whole directory
+                # optimization while retaining the already-prepared common header batch and
+                # its scalar semantics.
+                touched_buckets.clear()
+                bounded_bucket_census = False
+                break
+            touched_buckets.add(identity)
+        bucket_targets: dict[tuple[IndexStore, int], set[tuple[bytes, RecordRef]]] = {}
+        declined_buckets: set[tuple[IndexStore, int]] = set()
+        retained_targets = 0
+        # Every bucket the batch touches is pre-indexed once.  A bucket with a single effect
+        # costs one chain walk either way, so no run is too short for the directory; the former
+        # floor of eight effects left the Pulse checkpoint (about two effects per bucket) on the
+        # scalar path, walking each chain once per effect.  The three ceilings below still bound
+        # the directory, and a bucket past them keeps the scalar semantics unchanged.
+        for item in items if bounded_bucket_census else ():
+            identity = (item.store, item.bucket)
+            if identity in declined_buckets:
+                continue
+            targets = bucket_targets.setdefault(identity, set())
+            target = (item.change.key, item.change.ref)
+            if target in targets:
+                continue
+            if retained_targets >= _COMMON_REPLAY_HOT_TARGET_LIMIT:
+                retained_targets -= len(targets)
+                bucket_targets.pop(identity)
+                declined_buckets.add(identity)
+                continue
+            targets.add(target)
+            retained_targets += 1
+
+        hot_buckets: dict[tuple[IndexStore, int], _CommonReplayHotBucket] = {}
+        remaining_pages = _COMMON_REPLAY_HOT_PAGE_LIMIT
+        for identity, targets in bucket_targets.items():
+            store, bucket = identity
+            prepared_bucket = store._prepare_common_replay_hot_bucket(
+                bucket,
+                targets,
+                page_limit=remaining_pages,
+            )
+            if prepared_bucket is not None:
+                hot_buckets[identity] = prepared_bucket
+                remaining_pages -= len(prepared_bucket.pages.pages)
+        stores = tuple(
+            _CommonReplayStore(store, initial_by_store[store], final_by_store[store])
+            for store in ordered_stores
+        )
+        return _CommonReplayBatch(self, tuple(items), stores, hot_buckets)
+
+    @staticmethod
+    def _batch_replay_compatible(store: IndexStore) -> bool:
+        """Return whether ``store`` may take part in a composed replay batch.
+
+        A store whose ``apply`` is exactly the canonical one always may.  Any override must
+        declare, for its exact type and for this moment, that the batch protocol is complete for
+        it; an undeclared override keeps the scalar protocol it was written against.
+        """
+        if type(store).apply is IndexStore.apply:
+            return True
+        return bool(store._batch_replay_admits())
+
+    def _publish_common_replay_headers(
+        self,
+        prepared: _CommonReplayBatch,
+        moved_by_store: Mapping[IndexStore, bool],
+    ) -> None:
+        """Publish each composed header once, then let a specialised store settle derived state.
+
+        One composed header image is both the monotonic built/reconciled advance and, when a
+        bucket moved, the final page-0 clock the caller's existing flush boundary publishes
+        after those buckets.  Before it is written the resident page 0 must still name the
+        generation the batch prepared against.  A store that joined through
+        :meth:`IndexStore._batch_replay_admits` hears about the batch exactly once, here, after
+        the header decision for that store.
+        """
+        for state in prepared.stores:
+            store = state.store
+            store_moved = moved_by_store[store]
+            if state.final != state.initial or store_moved:
+                store._require_same_replay_identity(state.initial)
+                store._write_header(state.final)
+                if store_moved:
+                    store._cache_certificate = None
+            if type(store).apply is not IndexStore.apply:
+                store._batch_replay_settled(moved=store_moved)
+
+    def apply_common_replay_batch(
+        self,
+        records: Sequence[WalRecord],
+    ) -> tuple[str, ...] | None:
+        """Try one common replay as a private, single-use plan.
+
+        ``None`` asks the caller to dispatch the *whole* replay through the legacy per-record
+        protocol.  Keeping preparation and application inside one call prevents a captured
+        header image from being retained and replayed after a later generation or STALE mark.
+
+        The production caller reaches this door during committed redo while holding its local
+        participant section and the cross-process ``COMMIT_SECTION``.  Readers only pin these
+        pages; every local or foreign page mutation needs those writer sections.  A prepared
+        capacity/location therefore cannot change before this call finishes, and the ephemeral
+        directory needs neither persistence nor another concurrency premise.
+        """
+        prepared = self._prepare_common_replay_batch(records)
+        if prepared is None:
+            return None
+        return self._apply_prepared_common_replay_batch(prepared)
+
+    def _apply_prepared_common_replay_batch(
+        self,
+        prepared: _CommonReplayBatch,
+    ) -> tuple[str, ...]:
+        """Apply one private plan produced during the current protected replay passage.
+
+        This door exists only so :meth:`apply_partitioned_replay_batch` can consume the exact
+        decode/resolution it just preflighted.  Keeping the prepared value private avoids adding
+        a caller-supplied shortcut to the public-ish common-batch capability: an external caller
+        must still use :meth:`apply_common_replay_batch`, which performs the canonical decode and
+        catalog resolution itself.
+        """
+        moved_by_store: dict[IndexStore, bool] = {
+            state.store: False for state in prepared.stores
+        }
+        touched: list[IndexStore] = []
+        touched_set: set[IndexStore] = set()
+        try:
+            for item in prepared.items:
+                store = item.store
+                if store not in touched_set:
+                    touched_set.add(store)
+                    touched.append(store)
+                store._replaying = True
+                try:
+                    hot_bucket = prepared.hot_buckets.get((store, item.bucket))
+                    item_moved = (
+                        store._apply_change(item.change, item.position)
+                        if hot_bucket is None
+                        else store._apply_common_replay_hot_change(
+                            hot_bucket, item.change, item.position
+                        )
+                    )
+                finally:
+                    store._replaying = False
+                moved_by_store[store] = moved_by_store[store] or item_moved
+
+            self._publish_common_replay_headers(prepared, moved_by_store)
+            return tuple(store.file for store in touched)
+        except Exception as failure:
+            for store in touched:
+                try:
+                    store._mark_stale_after_failure(
+                        f"Batched logical replay into index {store.name!r} failed after a "
+                        "possibly partial prefix, so the current handle cannot prove the index "
+                        f"complete: {failure!r}"
+                    )
+                except Exception as stale_failure:  # noqa: BLE001 - preserve root failure
+                    failure.add_note(
+                        f"Marking touched index {store.name!r} stale also failed: "
+                        f"{stale_failure!r}"
+                    )
+            raise
+
+    def apply_partitioned_replay_batch(
+        self, records: Sequence[WalRecord]
+    ) -> tuple[str, ...] | None:
+        """Batch canonical stores without forcing specialised stores through that path.
+
+        A single HNSW generation, RESET, active rebuild or locally stale store must retain its
+        complete scalar ``apply`` protocol.  It must not, however, make unrelated canonical
+        stores repeat page-zero reads and writes for every record in the same committed replay.
+        This door excludes an incompatible store as a whole, prepares the remaining stores with
+        the existing all-or-nothing common proof, and then applies every item in original WAL
+        order.  Canonical bucket mutations remain ordered; only their already-supported composed
+        header publication is delayed to the end of the call.
+
+        ``None`` means there was no canonical subset to accelerate, or that its existing common
+        proof declined before any mutation.  The caller then retains the scalar replay unchanged.
+        Production reaches this private capability only after ``CommitRedo`` has preflighted the
+        complete replay and while the ordinary participant/commit sections remain held.
+        """
+        if not records:
+            return None
+
+        resolved: list[tuple[WalRecord, IndexStore, IndexChange]] = []
+        excluded: set[IndexStore] = set()
+        resolution_memo: dict[str, IndexStore] | None = (
+            {} if type(self).active_index is IndexManager.active_index else None
+        )
+        can_reuse_resolved = (
+            resolution_memo is not None
+            and type(self)._prepare_common_replay_batch
+            is IndexManager._prepare_common_replay_batch
+        )
+        for record in records:
+            change = change_of(record)
+            try:
+                key = change.index.lower() if type(change.index) is str else None
+                if (
+                    resolution_memo is not None
+                    and key is not None
+                    and key in resolution_memo
+                ):
+                    store = resolution_memo[key]
+                else:
+                    store = self.active_index(change.index)
+                    if resolution_memo is not None and key is not None:
+                        resolution_memo[key] = store
+            except GrafxIndexError:
+                return None
+            if change.versioned != store.definition.versioned:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} describes a "
+                    f"{'versioned' if change.versioned else 'unversioned'} entry and this "
+                    f"index stores {'versioned' if store.definition.versioned else 'unversioned'} "
+                    "ones, so partitioned replay was refused before any effect was applied.",
+                    field="versioned",
+                    value=change.versioned,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            if len(change.key) > store.max_key_bytes:
+                raise GrafxCorruptionDetected(
+                    f"A record for index {change.index!r} carries a key of "
+                    f"{len(change.key)} bytes, but this index stores at most "
+                    f"{store.max_key_bytes}; partitioned replay was refused before any effect "
+                    "was applied.",
+                    field="key",
+                    value=len(change.key),
+                    limit=store.max_key_bytes,
+                    index=change.index,
+                    file=store.file,
+                    operation=change.operation.name,
+                    lsn=record.lsn,
+                )
+            resolved.append((record, store, change))
+            if (
+                change.operation is IndexOperation.RESET
+                or not self._batch_replay_compatible(store)
+                or store._rebuild_authority is not None
+                or store._replaying
+                or store._stale_reason is not None
+            ):
+                # Exclusion is store-wide.  Mixing a scalar RESET or generation fence with a
+                # composed header for another record of the same store would reuse stale
+                # authority even if the two records are far apart in WAL order.
+                excluded.add(store)
+
+        common_records = tuple(
+            record for record, store, _change in resolved if store not in excluded
+        )
+        if not common_records:
+            return None
+        if not excluded:
+            # Preserve an override's observable preparation door. The built-in path can consume
+            # the exact passage-local decode/resolution above; a custom override keeps receiving
+            # the original single positional sequence and retains its complete protocol.
+            if (
+                can_reuse_resolved
+                and type(self).apply_common_replay_batch
+                is IndexManager.apply_common_replay_batch
+            ):
+                prepared = self._prepare_common_replay_batch(
+                    records,
+                    _resolved=resolved,
+                )
+                if prepared is None:
+                    return None
+                return self._apply_prepared_common_replay_batch(prepared)
+            return self.apply_common_replay_batch(records)
+
+        common_resolved = tuple(
+            item for item in resolved if item[1] not in excluded
+        )
+        prepared = (
+            self._prepare_common_replay_batch(
+                common_records,
+                _resolved=common_resolved,
+            )
+            if can_reuse_resolved
+            else self._prepare_common_replay_batch(common_records)
+        )
+        if prepared is None:
+            return None
+
+        moved_by_store: dict[IndexStore, bool] = {
+            state.store: False for state in prepared.stores
+        }
+        common_items = iter(prepared.items)
+        touched: list[IndexStore] = []
+        touched_set: set[IndexStore] = set()
+        try:
+            for record, store, _change in resolved:
+                if store not in touched_set:
+                    touched_set.add(store)
+                    touched.append(store)
+                if store in excluded:
+                    if not self.apply(record):
+                        raise GrafxIndexError(
+                            f"Partitioned replay could no longer resolve index {store.name!r}.",
+                            field="index",
+                            index=store.name,
+                            lsn=record.lsn,
+                        )
+                    continue
+
+                item = next(common_items)
+                store._replaying = True
+                try:
+                    hot_bucket = prepared.hot_buckets.get((store, item.bucket))
+                    moved = (
+                        store._apply_change(item.change, item.position)
+                        if hot_bucket is None
+                        else store._apply_common_replay_hot_change(
+                            hot_bucket, item.change, item.position
+                        )
+                    )
+                finally:
+                    store._replaying = False
+                moved_by_store[store] = moved_by_store[store] or moved
+
+            self._publish_common_replay_headers(prepared, moved_by_store)
+            return tuple(store.file for store in touched)
+        except Exception as failure:
+            for store in touched:
+                try:
+                    store._mark_stale_after_failure(
+                        f"Partitioned logical replay into index {store.name!r} failed after a "
+                        "possibly partial prefix, so the current handle cannot prove the index "
+                        f"complete: {failure!r}"
+                    )
+                except Exception as stale_failure:  # noqa: BLE001 - preserve root failure
+                    failure.add_note(
+                        f"Marking touched index {store.name!r} stale also failed: "
+                        f"{stale_failure!r}"
+                    )
+            raise
 
     # --- reading ----------------------------------------------------------------------------
 
@@ -4343,13 +7050,37 @@ class IndexManager:
         every call site with a chance of being forgotten. For a PROXIMITY index the entries are
         already the answer and the heap is deliberately not consulted.
         """
-        index = self.index(name)
+        index = self.active_index(name)
         if index.visibility is IndexVisibility.PROXIMITY:
             # Every registered index satisfies the protocol -- register() checks it -- so the
             # index decides its own answer here and the heap is deliberately not consulted.
             reader: SecondaryIndex = index
             return tuple(reader.lookup(key, snapshot))
         return self.validated(index, key, snapshot)
+
+    def lookup_versions(
+        self, name: str, key: bytes, snapshot: SnapshotLike
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Return exact-index locations together with the heap versions that validated them.
+
+        This is an engine-internal sibling of :meth:`lookup`, not a third visibility contract.
+        An EXACT lookup already has to read each candidate while the index certificate is stable;
+        returning that immutable version lets the query executor consume the proof instead of
+        reading and decoding the same heap slot again outside the stable view.  A PROXIMITY index
+        deliberately does not consult the heap, so it keeps using :meth:`lookup` and this door
+        refuses that contract rather than silently changing it.
+        """
+        index = self.active_index(name)
+        if index.visibility is IndexVisibility.PROXIMITY:
+            raise GrafxIndexError(
+                f"Index {index.name!r} has proximity visibility and does not validate heap "
+                "versions during lookup.",
+                field="visibility",
+                value=index.visibility.value,
+                index=index.name,
+                file=index.file,
+            )
+        return self.validated_versions(index, key, snapshot)
 
     def validated(
         self, index: IndexStore, key: bytes, snapshot: SnapshotLike
@@ -4363,14 +7094,124 @@ class IndexManager:
         is the contract rather than a defect. A candidate that cannot be READ is a different
         matter and is raised: the heap is the truth, and a truth that will not decode is damage.
         """
+        return self._validated_items(
+            index,
+            key,
+            snapshot,
+            project=lambda ref, _version: ref,
+        )
+
+    def validated_versions(
+        self, index: IndexStore, key: bytes, snapshot: SnapshotLike
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Return the exact candidates and the versions read while validating them.
+
+        Keeping the pair inside one stable-view callback is the important part: the page-0
+        certificate still brackets both index traversal and heap validation, and callers cannot
+        accidentally turn one exact hit into two heap decodes.
+        """
+        return self._validated_items(
+            index,
+            key,
+            snapshot,
+            project=lambda ref, version: (ref, version),
+        )
+
+    def validated_versions_many(
+        self,
+        index: IndexStore,
+        keys: Sequence[bytes],
+        snapshot: SnapshotLike,
+    ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+        """Validate many exact keys of one index inside ONE durable page-0 certificate.
+
+        One :meth:`validated_versions` call costs one stable view: a page-0 pre-certificate
+        (fresh or carried), the bucket traversal, the heap validation and a fresh page-0
+        post-read.  A consumer resolving hundreds of keys of the same index -- the endpoint
+        landing of an edge scan, an incident-edge seek for a page of node ids -- paid that
+        certificate per key.  Here every key is validated and canonicalised BEFORE the view
+        opens, the companion heap view is prepared once per attempt, every distinct key is
+        probed once and every candidate validated exactly as :meth:`_validated_items` validates
+        it, and the whole batch lives inside one stable view: a page-0 transition during the
+        batch repeats the ENTIRE batch within the existing retry budget and refuses when that
+        budget is exhausted.  A prefix is never returned, because nothing leaves the callback
+        before the post-read.
+
+        The answer is aligned one-to-one with ``keys``: a repeated key (or one given as a
+        ``bytearray``/``memoryview``) is probed once and answered at every position, and a key
+        without a visible row answers an empty tuple.  Only an EXACT index answers; a PROXIMITY
+        index does not validate heap versions and is refused before any view opens.
+        """
+        if index.visibility is IndexVisibility.PROXIMITY:
+            raise GrafxIndexError(
+                f"Index {index.name!r} has proximity visibility and does not validate heap "
+                "versions during lookup.",
+                field="visibility",
+                value=index.visibility.value,
+                index=index.name,
+                file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        definition = index.definition
+        wanted_by_position = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted_by_position))
+        if not distinct:
+            return ()
+
+        def confirm(
+            certificate: _IndexReadCertificate,
+        ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+            """Probe every distinct key and validate every candidate inside this certificate."""
+            self._prepare_heap_view(index.file, certificate)
+            answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
+            for wanted in distinct:
+                accepted: list[tuple[RecordRef, HeapVersion]] = []
+                for entry in index._candidates_unchecked(wanted):
+                    version = self._heap.read(entry.ref)
+                    if version.table_id != definition.table_id:
+                        raise GrafxCorruptionDetected(
+                            f"Index {definition.name!r} points at a row of table "
+                            f"{version.table_id} and covers table {definition.table_id}.",
+                            file=index.file,
+                            page=entry.page,
+                            slot=entry.slot,
+                            index=definition.name,
+                            field="table_id",
+                        )
+                    if not snapshot.visible(version.xmin, version.xmax):
+                        continue
+                    if (
+                        definition.entry_key_for_record(
+                            version.record_id, version.values
+                        )
+                        != entry.key
+                    ):
+                        continue
+                    accepted.append((entry.ref, version))
+                answers[wanted] = tuple(accepted)
+            return tuple(answers[wanted] for wanted in wanted_by_position)
+
+        return index._stable_view(read_lsn, confirm)
+
+    def _validated_items(
+        self,
+        index: IndexStore,
+        key: bytes,
+        snapshot: SnapshotLike,
+        *,
+        project: Callable[[RecordRef, HeapVersion], _ReadResult],
+    ) -> tuple[_ReadResult, ...]:
+        """Validate exact candidates once and project each accepted heap proof."""
         read_lsn = index._require_exact_read_lsn(snapshot)
         definition = index.definition
         wanted = index._require_key(key)
 
-        def confirm(certificate: _IndexReadCertificate) -> tuple[RecordRef, ...]:
+        def confirm(
+            certificate: _IndexReadCertificate,
+        ) -> tuple[_ReadResult, ...]:
             """Validate candidates against heap frames bound to this index generation."""
             self._prepare_heap_view(index.file, certificate)
-            confirmed: list[RecordRef] = []
+            confirmed: list[_ReadResult] = []
             for entry in index._candidates_unchecked(wanted):
                 version = self._heap.read(entry.ref)
                 if version.table_id != definition.table_id:
@@ -4385,9 +7226,12 @@ class IndexManager:
                     )
                 if not snapshot.visible(version.xmin, version.xmax):
                     continue
-                if definition.entry_key_for(version.values) != entry.key:
+                if (
+                    definition.entry_key_for_record(version.record_id, version.values)
+                    != entry.key
+                ):
                     continue
-                confirmed.append(entry.ref)
+                confirmed.append(project(entry.ref, version))
             return tuple(confirmed)
 
         return index._stable_view(read_lsn, confirm)
@@ -4434,11 +7278,11 @@ class IndexManager:
         With a transaction the pass removes and logs; without one it measures. The argument order
         follows the index method it delegates to, which follows CONTRACT.md section 8.7.
         """
-        return tuple(index.reconcile(horizon, txn) for index in self.indexes())
+        return tuple(index.reconcile(horizon, txn) for index in self.active_indexes())
 
     def note_reconciled(self, horizon: Lsn) -> None:
         """Record on every index the horizon a completed reconciliation pass applied."""
-        for index in self.indexes():
+        for index in self.active_indexes():
             index.note_reconciled(horizon)
 
     def rebuild(
@@ -4465,7 +7309,7 @@ class IndexManager:
         publish a partially-built index in between, and that is the state this method exists to
         get out of.
         """
-        index = self.index(name)
+        index = self.active_index(name)
         definition = index.definition
         table = self._heap.catalog.catalog.table_by_id(definition.table_id)
         position = _require_position("through_lsn", through_lsn)
@@ -4486,7 +7330,7 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for(version.values)
+            key = definition.entry_key_for_record(version.record_id, version.values)
             if key is None:
                 continue
             index.stage_insert(txn, key, ref, version.xmin)
@@ -4495,6 +7339,330 @@ class IndexManager:
                 index.stage_delete(txn, key, ref, version.xmax)
                 staged += 1
         return staged
+
+    def _allocate_detached_generation_nonce(self, occupied: Collection[int]) -> int:
+        """Return one provider nonce absent from catalog inventory and physical storage.
+
+        This is discovery, not reservation.  The later detached build's exclusive create is the
+        sole ownership proof; checking storage here only avoids predictably losing that race on
+        an orphan already present.  A provider contract violation refuses immediately, while
+        well-formed collisions are retried under a fixed bound.
+        """
+        if self._artifact_nonce is None:
+            raise GrafxIndexError(
+                "Allocating a detached index generation needs an artifact-nonce provider.",
+                field="artifact_nonce",
+                value=None,
+            )
+        try:
+            occupied_nonces = frozenset(occupied)
+        except TypeError as failure:
+            raise GrafxIndexError(
+                "Occupied artifact nonces must be a finite collection of unsigned integers.",
+                field="occupied",
+                value=type(occupied).__name__,
+            ) from failure
+        for nonce in occupied_nonces:
+            if (
+                isinstance(nonce, bool)
+                or not isinstance(nonce, int)
+                or not 1 <= nonce <= PROVISIONAL_CSN
+            ):
+                raise GrafxIndexError(
+                    "Occupied artifact nonces must be non-zero unsigned 64-bit integers.",
+                    field="occupied",
+                    value=repr(nonce),
+                )
+
+        for _attempt in range(_DETACHED_GENERATION_NONCE_ATTEMPTS):
+            try:
+                nonce = self._artifact_nonce()
+            except StopIteration as failure:
+                raise GrafxIndexError(
+                    "The artifact-nonce provider was exhausted before producing an unused "
+                    "generation.",
+                    field="artifact_nonce",
+                    retryable=True,
+                ) from failure
+            if (
+                isinstance(nonce, bool)
+                or not isinstance(nonce, int)
+                or not 1 <= nonce <= PROVISIONAL_CSN
+            ):
+                raise GrafxIndexError(
+                    "The artifact-nonce provider returned a value outside non-zero u64.",
+                    field="artifact_nonce",
+                    value=repr(nonce),
+                )
+            if nonce in occupied_nonces:
+                continue
+            if self._pool.storage.exists(index_generation_file(nonce)):
+                continue
+            return nonce
+        raise GrafxIndexError(
+            "The artifact-nonce provider did not produce an unused generation within the "
+            f"bounded {_DETACHED_GENERATION_NONCE_ATTEMPTS} attempts.",
+            field="artifact_nonce",
+            attempts=_DETACHED_GENERATION_NONCE_ATTEMPTS,
+            retryable=True,
+        )
+
+    def _detached_exact_generation_source(
+        self,
+        definition: IndexDefinition,
+        through_lsn: Lsn,
+    ) -> tuple[Lsn, TableDef]:
+        """Validate one detached build request and return its fenced table source."""
+
+        if not isinstance(definition, IndexDefinition):
+            raise GrafxIndexError(
+                "A detached index generation needs an IndexDefinition.",
+                field="definition",
+                value=type(definition).__name__,
+            )
+        if definition.visibility is not IndexVisibility.EXACT:
+            raise GrafxIndexError(
+                f"Detached generation {definition.name!r} must be an exact index.",
+                field="visibility",
+                value=definition.visibility.value,
+                index=definition.name,
+            )
+        if definition.artifact_nonce == 0:
+            raise GrafxIndexError(
+                f"Detached generation {definition.name!r} needs its catalog-assigned, "
+                "non-zero artifact nonce before construction.",
+                field="artifact_nonce",
+                value=definition.artifact_nonce,
+                index=definition.name,
+            )
+        position = _require_position("through_lsn", through_lsn)
+        table = self._heap.catalog.catalog.table_by_id(definition.table_id)
+        if not self._definition_matches_table_tolerantly(definition, table):
+            raise GrafxIndexError(
+                f"Detached generation {definition.name!r} does not describe committed table "
+                f"{table.name!r}.",
+                field="definition",
+                index=definition.name,
+                table=table.name,
+                table_id=table.table_id,
+            )
+        return position, table
+
+    def _detached_exact_generation_entries(
+        self,
+        definition: IndexDefinition,
+        position: Lsn,
+        table: TableDef,
+    ) -> Iterator[tuple[RecordRef, bytes, Csn | None]]:
+        """Yield exactly the durable entry images one detached generation will retain."""
+
+        for ref, version in self._heap.scan_all(table):
+            if is_provisional_csn(version.xmin):
+                continue
+            if not is_committed_csn(version.xmin):
+                raise GrafxCorruptionDetected(
+                    f"Record {version.record_id} of table {table.name!r} has invalid birth "
+                    f"stamp {version.xmin} during detached index construction.",
+                    file=self._heap.file,
+                    table=table.name,
+                    table_id=table.table_id,
+                    record_id=version.record_id,
+                    field="xmin",
+                    value=version.xmin,
+                )
+            if version.xmin > position:
+                raise GrafxIndexError(
+                    f"Detached generation {definition.name!r} is fenced through {position}, "
+                    f"but record {version.record_id} was committed at {version.xmin}.",
+                    field="through_lsn",
+                    value=position,
+                    observed=version.xmin,
+                    index=definition.name,
+                    table=table.name,
+                    record_id=version.record_id,
+                )
+
+            ended_at: Csn | None = None
+            if not is_open_end_csn(version.xmax):
+                if not is_committed_csn(version.xmax):
+                    raise GrafxCorruptionDetected(
+                        f"Record {version.record_id} of table {table.name!r} has invalid "
+                        f"end stamp {version.xmax} during detached index construction.",
+                        file=self._heap.file,
+                        table=table.name,
+                        table_id=table.table_id,
+                        record_id=version.record_id,
+                        field="xmax",
+                        value=version.xmax,
+                    )
+                if version.xmax > position:
+                    raise GrafxIndexError(
+                        f"Detached generation {definition.name!r} is fenced through "
+                        f"{position}, but record {version.record_id} ended at "
+                        f"{version.xmax}.",
+                        field="through_lsn",
+                        value=position,
+                        observed=version.xmax,
+                        index=definition.name,
+                        table=table.name,
+                        record_id=version.record_id,
+                    )
+                ended_at = version.xmax
+
+            key = definition.entry_key_for_record(version.record_id, version.values)
+            if key is not None:
+                yield ref, key, ended_at
+
+    def _count_detached_exact_generation_entries(
+        self,
+        definition: IndexDefinition,
+        through_lsn: Lsn,
+        *,
+        remaining: int | None = None,
+    ) -> int:
+        """Count final entries, stopping at ``remaining + 1`` when admission is bounded."""
+
+        if remaining is not None and (
+            isinstance(remaining, bool)
+            or not isinstance(remaining, int)
+            or remaining < 0
+        ):
+            raise GrafxIndexError(
+                "A detached-generation entry remainder must be zero or more.",
+                field="remaining",
+                value=remaining,
+            )
+
+        position, table = self._detached_exact_generation_source(
+            definition, through_lsn
+        )
+        observed = 0
+        for _ref, _key, _ended_at in self._detached_exact_generation_entries(
+            definition, position, table
+        ):
+            observed += 1
+            if remaining is not None and observed > remaining:
+                return observed
+        return observed
+
+    def _build_detached_exact_generation(
+        self,
+        definition: IndexDefinition,
+        through_lsn: Lsn,
+    ) -> IndexStore:
+        """Build one complete, durable exact generation without publishing it.
+
+        The caller has already allocated the catalog-v2 generation nonce and fenced writers at
+        the global durable horizon supplied here.  This door deliberately does neither: it does
+        not allocate an identity, touch the registry, stage logical WAL or publish catalog
+        authority.  Exclusive physical-file creation is the ownership proof, so a competing or
+        orphaned path is refused rather than adopted.
+
+        Every committed heap version is retained, including historical versions, and every
+        committed end becomes a tombstone.  That makes the detached generation usable by
+        snapshots on either side of an update once a later catalog transaction publishes it.
+        Both verification directions run before the final data checkpoint establishes the
+        durability barrier.  A failed attempt leaves its uniquely nonced file unreachable and
+        drops this process's frames so a later unrelated flush cannot continue the orphan.
+        """
+        position, table = self._detached_exact_generation_source(
+            definition, through_lsn
+        )
+
+        index = HashIndex(definition, self._pool, self._metrics)
+        index._set_creation_nonce(definition.artifact_nonce)
+        collision = next(
+            (
+                current
+                for current in self._indexes.values()
+                if current.file.casefold() == index.file.casefold()
+            ),
+            None,
+        )
+        if collision is not None:
+            raise GrafxIndexError(
+                f"Detached generation file {index.file!r} is already owned by registered "
+                f"index {collision.name!r}.",
+                field="file",
+                file=index.file,
+                index=definition.name,
+                registered=collision.name,
+            )
+
+        created = False
+        try:
+            # No preceding exists() observation grants ownership.  Only this exclusive create
+            # distinguishes our new orphan-safe generation from another participant's bytes.
+            self._pool.storage.create(index.file, exclusive=True)
+            created = True
+            index.create(proved_present=True)
+
+            empty_build = _EmptyIndexBuild()
+            for ref, key, ended_at in self._detached_exact_generation_entries(
+                definition, position, table
+            ):
+                insert = IndexChange(
+                    index=definition.name,
+                    operation=IndexOperation.INSERT,
+                    key=key,
+                    ref=ref,
+                )
+                accelerated = index._apply_empty_build_change(
+                    empty_build, insert, position
+                )
+                if accelerated is None:
+                    index._apply_change(insert, position)
+                if ended_at is not None:
+                    tombstone = IndexChange(
+                        index=definition.name,
+                        operation=IndexOperation.TOMBSTONE,
+                        key=key,
+                        ref=ref,
+                        csn=ended_at,
+                    )
+                    accelerated = index._apply_empty_build_change(
+                        empty_build, tombstone, position
+                    )
+                    if accelerated is None:
+                        index._apply_change(tombstone, position)
+
+            # The header claim is flushed before verification, and the final checkpoint below
+            # then barriers the complete verified generation as one unreachable shadow.
+            index.advance_built_through(position)
+            entry_findings = self._verify_entries(index)
+            coverage_findings = self._verify_coverage(index)
+            findings = (*entry_findings, *coverage_findings)
+            if findings:
+                raise GrafxIndexError(
+                    f"Detached generation {definition.name!r} failed bidirectional "
+                    f"verification with {len(findings)} finding(s).",
+                    field="verification",
+                    index=definition.name,
+                    file=index.file,
+                    count=len(findings),
+                    kinds=tuple(finding.kind for finding in findings),
+                )
+            self._pool.checkpoint(index.file)
+            return index
+        except BaseException as failure:
+            if created:
+                self._discard_detached_generation_frames(index.file, failure)
+            raise
+
+    def _discard_detached_generation_frames(
+        self, file: str, failure: BaseException
+    ) -> None:
+        """Drop every local frame owned by one failed, never-published generation."""
+        self._heap_cache_certificates.pop(file, None)
+        try:
+            page_count = self._pool.storage.page_count(file)
+            for page_index in range(page_count):
+                self._pool.discard(file, page_index)
+        except BaseException as cleanup_failure:  # pragma: no cover - defensive note
+            failure.add_note(
+                "Discarding frames of the failed detached generation also failed: "
+                f"{cleanup_failure!r}"
+            )
 
     def validate_staged_rebuild_generations(self, txn: StagingTransaction) -> None:
         """Refuse a staged RESET whose generation another claim has already superseded.
@@ -4505,7 +7673,13 @@ class IndexManager:
         reopen after it. Catching it here costs a retryable refusal; not catching it costs
         a database that will not open.
         """
-        for index in tuple(self._indexes.values()):
+        projection = self._active_commit_index_projection(txn)
+        indexes = (
+            projection.rebuild_indexes
+            if projection is not None
+            else tuple(self._indexes.values())
+        )
+        for index in indexes:
             for change in index.pending(txn):
                 if change.operation is not IndexOperation.RESET:
                     continue
@@ -4541,7 +7715,7 @@ class IndexManager:
         that was staged and never committed changed nothing, and an index that started answering
         at staging time would answer from a structure the log had not yet accepted.
         """
-        index = self.index(name)
+        index = self.active_index(name)
         index.clear_stale(
             through_lsn, advance_to=advance_to, rebuild_token=rebuild_token
         )
@@ -4570,8 +7744,22 @@ class IndexManager:
         an OMISSION, which is a wrong answer under either contract, and it is reported as such
         whichever kind of index left it out.
         """
+        authority = self._catalog_authority()
+        legacy = authority is not None and (
+            getattr(authority, "format_version", None) == CATALOG_LEGACY_FORMAT_VERSION
+        )
+        # Catalog v1 had no persistent access-path authority.  Its verifier historically
+        # inspected the raw registry so that it could diagnose, among other things, an index
+        # bound to a table the catalog no longer knows.  Catalog v2 is different: only its exact
+        # ACTIVE generations may be interpreted as database state, including by diagnostics.
+        if legacy:
+            indexes = self.indexes() if name is None else (self.index(name),)
+        else:
+            indexes = (
+                self.active_indexes() if name is None else (self.active_index(name),)
+            )
         findings: list[IndexFinding] = []
-        for index in self.indexes() if name is None else (self.index(name),):
+        for index in indexes:
             findings.extend(self._verify_entries(index))
             findings.extend(self._verify_coverage(index))
         return tuple(findings)
@@ -4641,7 +7829,10 @@ class IndexManager:
             # Exact indexes may legally retain a candidate for it, and proximity indexes must
             # never have persisted its reserved birth stamp.
             return ()
-        if definition.entry_key_for(version.values) != entry.key:
+        if (
+            definition.entry_key_for_record(version.record_id, version.values)
+            != entry.key
+        ):
             findings.append(
                 IndexFinding(
                     kind="stale_entry"
@@ -4725,7 +7916,7 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for(version.values)
+            key = definition.entry_key_for_record(version.record_id, version.values)
             if key is None:
                 continue
             if (key, ref) in stored:

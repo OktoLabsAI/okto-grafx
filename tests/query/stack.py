@@ -14,10 +14,12 @@ path is asked about.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from okto_grafx.adapters.codec_v1 import PageCodecV1
+from okto_grafx.adapters.query_spill_local import LocalQuerySpillFactory
 from okto_grafx.adapters.vectormath_pure import PureVectorMath
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -30,6 +32,7 @@ from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import Value, ValueType, VectorValue
 from okto_grafx.domain.ports.vectormath import DistanceMetric
+from okto_grafx.domain.ports.query_spill import QuerySpillFactory
 from okto_grafx.domain.txn.context import RowIntent, RowOperation
 from okto_grafx.domain.txn.partitions import partition_of
 from okto_grafx.engine.buffer_pool import BufferPool
@@ -97,7 +100,10 @@ class MemoryDevice:
 
     def file_size(self, file: str) -> int:
         """Return how many bytes the file holds."""
-        return len(self._logs.get(file, b"")) + len(self._pages.get(file, ())) * self._page_size
+        return (
+            len(self._logs.get(file, b""))
+            + len(self._pages.get(file, ())) * self._page_size
+        )
 
     def atomic_replace(self, source: str, target: str) -> None:
         """Publish one file over another."""
@@ -125,7 +131,9 @@ class MemoryDevice:
         pages = self._pages.get(file, [])
         if not 0 <= page_index < len(pages):
             raise GrafxCorruptionDetected(
-                f"Page {page_index} of {file!r} is not allocated.", file=file, page=page_index
+                f"Page {page_index} of {file!r} is not allocated.",
+                file=file,
+                page=page_index,
             )
         return pages[page_index]
 
@@ -134,7 +142,9 @@ class MemoryDevice:
         pages = self._pages.get(file, [])
         if not 0 <= page_index < len(pages) or len(data) != self._page_size:
             raise GrafxCorruptionDetected(
-                f"Refused a page write to {file!r} at {page_index}.", file=file, page=page_index
+                f"Refused a page write to {file!r} at {page_index}.",
+                file=file,
+                page=page_index,
             )
         pages[page_index] = bytes(data)
 
@@ -157,7 +167,8 @@ class MemoryDevice:
         log = self._logs.setdefault(file, bytearray())
         if size > len(log):
             raise GrafxUnsupportedOperation(
-                f"truncate_log only shrinks; {file!r} holds {len(log)} bytes.", file=file
+                f"truncate_log only shrinks; {file!r} holds {len(log)} bytes.",
+                file=file,
             )
         del log[size:]
 
@@ -245,7 +256,9 @@ class SnapshotDouble:
 
     def visible(self, xmin: int, xmax: int) -> bool:
         """Return whether a version born at xmin and ended at xmax belongs to this view."""
-        return xmin != 0 and xmin <= self.read_lsn and (xmax == 0 or xmax > self.read_lsn)
+        return (
+            xmin != 0 and xmin <= self.read_lsn and (xmax == 0 or xmax > self.read_lsn)
+        )
 
 
 @dataclass(slots=True)
@@ -306,7 +319,9 @@ class TransactionDouble:
                 "A staged row must name the table it belongs to.", field="table"
             )
         if record_id is not None and (
-            isinstance(record_id, bool) or not isinstance(record_id, int) or record_id < 1
+            isinstance(record_id, bool)
+            or not isinstance(record_id, int)
+            or record_id < 1
         ):
             raise GrafxConfigurationError(
                 f"A staged row identity must be a positive integer; got {record_id!r}.",
@@ -316,7 +331,9 @@ class TransactionDouble:
             RowIntent(table=table, values=tuple(values), record_id=record_id)
         )
 
-    def stage_row_update(self, table: object, reference: object, values: object) -> None:
+    def stage_row_update(
+        self, table: object, reference: object, values: object
+    ) -> None:
         """Stage a new version of a stored row, refusing what the real context refuses.
 
         The double carries this door because a double weaker than the real adapter certifies
@@ -445,7 +462,9 @@ class QueryStack:
         self.indexes.commit(transaction, csn)
         return ref
 
-    def end(self, table_name: str, ref: RecordRef, values: Sequence[Value], csn: Csn) -> None:
+    def end(
+        self, table_name: str, ref: RecordRef, values: Sequence[Value], csn: Csn
+    ) -> None:
         """End one row with a delete, in the heap and in every index that covers it."""
         table = self.table(table_name)
         self.heap.delete(table, ref, csn)
@@ -474,8 +493,14 @@ def build_query_stack(
     *,
     budget_pages: int = 64,
     with_indexes: bool = True,
+    vector_nullable: bool = True,
+    vector_exact_scan_threshold: int = 4096,
     max_result_rows: int | None = None,
     max_intermediate_rows: int | None = None,
+    query_memory_budget_bytes: int | None = None,
+    query_spill: QuerySpillFactory | None = None,
+    max_traversal_expansions: int | None = None,
+    max_traversal_paths: int | None = None,
 ) -> QueryStack:
     """Assemble a database with a person table, a chunk table and one embedding space."""
     device = MemoryDevice()
@@ -526,7 +551,10 @@ def build_query_stack(
                 ColumnDef(name="id", type=ValueType.INT64, nullable=False),
                 ColumnDef(name="layer", type=ValueType.INT64),
                 ColumnDef(
-                    name="embedding", type=ValueType.VECTOR_F32, vector_space=SPACE_NAME
+                    name="embedding",
+                    type=ValueType.VECTOR_F32,
+                    nullable=vector_nullable,
+                    vector_space=SPACE_NAME,
                 ),
             ),
             primary_key="id",
@@ -581,7 +609,7 @@ def build_query_stack(
         clock=clock,
         pool=pool,
         indexes=indexes,
-        exact_scan_threshold=4096,
+        exact_scan_threshold=vector_exact_scan_threshold,
     )
     # An index covers a (table, space) pair, so it is created when the table declares the
     # column rather than when the space is declared. The fixture builds its tables directly on
@@ -599,8 +627,13 @@ def build_query_stack(
         clock=clock,
         indexes=indexes,
         vectors=vectors,
+        endpoint_locator_guard=threading.RLock(),
         max_result_rows=max_result_rows,
         max_intermediate_rows=max_intermediate_rows,
+        query_memory_budget_bytes=query_memory_budget_bytes,
+        query_spill=(LocalQuerySpillFactory() if query_spill is None else query_spill),
+        max_traversal_expansions=max_traversal_expansions,
+        max_traversal_paths=max_traversal_paths,
     )
     return QueryStack(
         device=device,

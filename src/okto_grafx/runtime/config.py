@@ -7,17 +7,22 @@ the first transaction.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field as dataclass_field, fields
 from ipaddress import ip_address
 from math import isfinite
 
 from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.index.keys import MAX_EXPECTED_CARDINALITY
 from okto_grafx.domain.page import MAX_PAGE_SIZE as CORE_MAX_PAGE_SIZE
 from okto_grafx.domain.page import MIN_PAGE_SIZE as CORE_MIN_PAGE_SIZE
 from okto_grafx.domain.page import validate_page_size
 from okto_grafx.domain.ports.storage import (
     DESCRIPTOR_REVALIDATION_MODES,
     DescriptorRevalidationMode,
+)
+from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_QUERY_VALUE_CHARACTERS,
 )
 from okto_grafx.domain.vector.hnsw import DEFAULT_EF_SEARCH, MAX_EF_SEARCH
 from okto_grafx.engine.catalog_store import MINIMUM_FRAMES as CATALOG_FRAMES
@@ -36,6 +41,7 @@ __all__ = [
     "DESCRIPTOR_REVALIDATION_MODES",
     "RECOVERY_POLICIES",
     "METRICS_SINKS",
+    "PAGE_CODEC_SELECTORS",
     "VECTOR_MATH_SELECTORS",
     "MEMORY_PATH",
     "DEFAULT_OPENMETRICS_DESTINATION",
@@ -64,14 +70,15 @@ MAX_PARTITIONS_PER_TABLE: int = 65535
 MAX_VECTOR_EF_SEARCH: int = MAX_EF_SEARCH
 """Largest HNSW base beam accepted from public database configuration."""
 
-DEFAULT_MAX_OPEN_FILES: int = 128
+DEFAULT_MAX_OPEN_FILES: int = 256
 """Default descriptor-cache budget for a composed local database.
 
-The Windows UCRT available to the supported interpreter starts with 512 stdio descriptors.
-Keeping at most one quarter for each Grafx storage cache lets two databases coexist while still
-leaving half for WAL, coordination, Pulse and the host process.  It also doubles the former
-64-entry cache, avoiding its worst churn on index-heavy databases.  Callers that own the process
-may raise the per-database budget explicitly.
+Descriptors are admitted lazily, so 256 is a bound rather than an up-front reservation.  It
+covers the measured 141-file Pulse working set and a synthetic 64-table/192-artifact set without
+the former 64-entry thrash.  The supported Windows UCRT starts with a 512-entry stdio limit, so
+one full cache leaves half that allowance to Pulse and the host.  Several large databases in one
+process may need a lower per-instance ``max_open_files`` override; retaining that explicit knob
+is safer than guessing from the host at import time.
 """
 
 MINIMUM_STORE_FRAMES: int = max(CATALOG_FRAMES, HEAP_FRAMES)
@@ -82,6 +89,9 @@ RECOVERY_POLICIES: frozenset[str] = frozenset({"replay", "refuse"})
 
 METRICS_SINKS: frozenset[str] = frozenset({"noop", "openmetrics", "json"})
 """The metrics adapters the composition root knows how to build."""
+
+PAGE_CODEC_SELECTORS: frozenset[str] = frozenset({"pure", "numpy"})
+"""Which byte-identical page codec to bind for this database instance."""
 
 VECTOR_MATH_SELECTORS: frozenset[str] = frozenset({"auto", "pure", "numpy"})
 """Which vector math adapter to bind: detect, force the pure oracle, or force the accelerator."""
@@ -266,18 +276,27 @@ class DatabaseConfig:
     max_statement_writes: int | None = None
     max_result_rows: int | None = None
     max_intermediate_rows: int | None = None
+    max_traversal_expansions: int | None = None
+    max_traversal_paths: int | None = None
     max_transaction_rows: int | None = None
     max_transaction_bytes: int | None = None
     max_wal_batch_bytes: int | None = None
+    max_index_build_entries: int | None = dataclass_field(default=None, kw_only=True)
+    automatic_index_expected_cardinality: int | None = dataclass_field(
+        default=None, kw_only=True
+    )
     metrics: str = "noop"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
+    codec: str = dataclass_field(default="pure", kw_only=True)
     vector_math: str = "auto"
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
     vector_ef_search: int = DEFAULT_EF_SEARCH
     read_only: bool = False
     descriptor_revalidation: DescriptorRevalidationMode = "strict"
+    max_query_value_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS
+    query_memory_budget_bytes: int | None = dataclass_field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         """Reject any unusable field with a GrafxConfigurationError that names it."""
@@ -316,6 +335,7 @@ class DatabaseConfig:
             "max_open_files",
             "wal_segment_bytes",
             "checkpoint_interval_records",
+            "max_query_value_characters",
         ):
             object.__setattr__(
                 self, field, _require_positive_int(field, getattr(self, field))
@@ -336,18 +356,39 @@ class DatabaseConfig:
                 self.wal_segment_bytes,
                 f"a value between {MIN_SEGMENT_BYTES} and {MAX_SEGMENT_READ_BYTES} is required.",
             )
+        if self.max_query_value_characters > MAX_QUERY_VALUE_CHARACTERS:
+            raise _reject(
+                "max_query_value_characters",
+                self.max_query_value_characters,
+                f"a value of at most {MAX_QUERY_VALUE_CHARACTERS} is required.",
+            )
         for field in (
             "wal_max_bytes",
             "max_statement_writes",
             "max_result_rows",
             "max_intermediate_rows",
+            "query_memory_budget_bytes",
+            "max_traversal_expansions",
+            "max_traversal_paths",
             "max_transaction_rows",
             "max_transaction_bytes",
             "max_wal_batch_bytes",
+            "max_index_build_entries",
+            "automatic_index_expected_cardinality",
         ):
             value = getattr(self, field)
             if value is not None:
                 object.__setattr__(self, field, _require_positive_int(field, value))
+        if (
+            self.automatic_index_expected_cardinality is not None
+            and self.automatic_index_expected_cardinality > MAX_EXPECTED_CARDINALITY
+        ):
+            raise _reject(
+                "automatic_index_expected_cardinality",
+                self.automatic_index_expected_cardinality,
+                f"a value of at most {MAX_EXPECTED_CARDINALITY} is required by the eager "
+                "hash directory.",
+            )
 
         threshold = _require_int(
             "vector_exact_scan_threshold", self.vector_exact_scan_threshold
@@ -382,6 +423,7 @@ class DatabaseConfig:
         for field, choices in (
             ("recovery_policy", RECOVERY_POLICIES),
             ("metrics", METRICS_SINKS),
+            ("codec", PAGE_CODEC_SELECTORS),
             ("vector_math", VECTOR_MATH_SELECTORS),
             ("checksum", CHECKSUM_SELECTORS),
             ("descriptor_revalidation", DESCRIPTOR_REVALIDATION_MODES),

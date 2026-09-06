@@ -15,6 +15,7 @@ to substitute your own.
     [coordinator](#coordinator--processcoordinator) · [codec](#codec--pagecodec) ·
     [metrics](#metrics--metricssink) · [events](#events--eventsink) ·
     [vector_math](#vector_math--vectormath)
+- [The query spill capability](#the-query-spill-capability-not-a-registry-port)
 - [The checksum slot](#the-checksum-slot-not-a-registry-port)
 - [Writing an adapter](#writing-an-adapter)
 - [Composing a custom registry](#composing-a-custom-registry)
@@ -81,6 +82,14 @@ property, and ST-2 uses it to fetch one exact three-page control image plus a on
 sentinel. Only the write-side `append_log`/`truncate_log` operations impose append-only log
 semantics. A custom storage adapter must preserve this fill-until-EOF behaviour even when it
 internally distinguishes file kinds.
+
+`LocalStorageDevice` additionally declares the adapter-only
+`read_log_if_exists(file, offset, length) -> bytes | None` fast path used by two-slot control
+records. It combines the existence and bounded read under one exact-case namespace observation,
+then compares the observed `(device, inode)` with the warm descriptor. It is intentionally absent
+from the frozen `StorageDevice` signatures. Wrappers opt in only by declaring the method directly;
+otherwise the engine preserves `exists -> read_log`, including a typed failure if the file vanishes
+between those two doors. This optimization does not apply generation stamps to `control/**`.
 
 **`durable_barrier`** must not return until what was written is on the platter. A failure must be
 raised as `GrafxDurabilityBarrierFailed` — never swallowed — because a failed barrier means nothing
@@ -179,6 +188,12 @@ a best-effort page would turn detected damage into a wrong answer.
 | Adapter | Module | Use |
 |---|---|---|
 | **`PageCodecV1`** *(default)* | `adapters/codec_v1.py` | Format version 1: a CRC-32C in the first four bytes, an even sequence counter in a durable image, the page type, and the slot directory |
+| `NumpyPageCodecV1` | `adapters/codec_numpy.py` | Explicit `codec="numpy"`; same format-v1 bytes, with hybrid vectorized slot-directory packing and validation; requires `[accel]` |
+
+The selector is per database and defaults to `"pure"`. There is no automatic selection. A native
+request without NumPy refuses rather than silently measuring the pure adapter. The immutable
+`database.codec` receipt reports both the concrete page codec and the effective process-wide
+process-wide checksum implementation (`process_checksum_implementation`).
 
 ---
 
@@ -257,6 +272,52 @@ with that in mind.
 
 ---
 
+## The query spill capability (not a registry port)
+
+`QuerySpillFactory` is an internal composition capability used only when
+`query_memory_budget_bytes` is configured for sort, result-DISTINCT or aggregation. It deliberately does not extend `PortRegistry.REQUIRED`:
+custom registries keep their frozen seven-slot contract, and callers do not gain a live temporary
+filesystem capability through `Database`.
+
+The boundary is still a ports-and-adapters boundary. `domain/ports/query_spill.py` defines opaque
+append-then-read sorters and an operator workspace; the engine supplies only versioned immutable
+key/payload bytes, a total comparator and one shared `LogicalMemoryBudget`. The shipped
+`LocalQuerySpillFactory` in `adapters/query_spill_local.py` alone imports `tempfile` and `os`, chooses
+host paths and performs bounded two-way external merges. No path crosses into `domain/` or
+`engine/`, and temporary runs never enter the durable database namespace.
+
+The adapter contract is intentionally narrow:
+
+```
+factory.open(budget) -> workspace
+workspace.sorter(total_comparator) -> sorter
+sorter.append(versioned_key, versioned_payload)
+sorter.records() -> ordered iterator[(key, payload)]
+sorter.close(); workspace.close()
+```
+
+Every buffered record and merge head is charged by the same engine-created logical counter as
+`32 + len(key) + len(payload)`. A record must fit within half the limit because a merge retains two
+heads. Before admitting engine-owned aggregate state, `workspace.reserve()` flushes spill buffers
+that can make room. This is deterministic logical accounting, not an RSS claim; Python allocator
+metadata, transient comparisons and OS caches are outside it. Completed runs compact eagerly into
+binary merge levels, so even the adapter's uncharged path metadata is O(log N), not one path per
+input record.
+
+Run files carry an `OGXS` format marker and version byte, fixed-size length headers and the
+engine's purpose/version-tagged safe `Value` records. Pickle and executable deserialization are
+forbidden. Invalid/truncated/oversized records fail as corruption; host I/O errors use the Grafx
+storage taxonomy. All sorters and the isolated temporary directory close on success, exception,
+cancellation and public cursor close. A cleanup failure remains a query failure (or is attached to
+the primary failure); it is not treated as successful completion.
+
+This capability changes only temporary query execution. It is not a durable format, storage,
+transaction, WAL, OCC, reader or writer port. A custom spill adapter is therefore not currently a
+public `connect()` extension point; widening that composition API would be a separate contract
+decision.
+
+---
+
 ## The checksum slot (not a registry port)
 
 CRC-32C is installed **process-wide** rather than injected per object, because every component of one
@@ -273,6 +334,24 @@ about because it behaves differently from the seven above.
 disagrees on any input *before* it becomes the implementation. A provider either produces
 byte-identical digests or never gets installed — so there is no machine-dependent answer to protect
 against, and accelerating is free.
+
+**The corpus proof runs once per process per provider identity (D-29).** `NativeCrc32c` proves the
+closed-list provider (`google_crc32c`, declared in `[accel]`) against the whole acceptance corpus
+when it is constructed, and `connect()` constructs one per open. That proof is memoized under the
+provider's strong identity -- module name, attribute, the file it was loaded from, its version and
+the exact function object -- so the second open in a process pays nothing for it. Only a
+successful proof is memoized; a refusal is reproduced on the next construction. An injected
+provider and an explicit `verify_runtime=True` are never memoized: they keep the per-construction
+proof and the per-call oracle. The domain's installer door keeps an independent memo of its own:
+the adapter names the same strong identity explicitly, and the door skips its replay only for the
+exact wrapper it already proved -- an injected callable never names an identity, so `install_crc32c`
+and the closed-list door prove it every time, as before. Both proof stores are strictly bounded to
+one current identity per closed module/attribute slot; a replacement evicts the old wrapper and
+both old proofs. Raw function identity is compared with `is`, never its equality or hash hooks.
+A process-local lock in the adapter serializes closed-provider lookup, validation and publication,
+including the private domain door; the pure domain remains free of threading mechanisms. Thus
+concurrent first opens run the corpus exactly once in each independent door, while a failure is
+never published or inherited by another opener.
 
 **One consequence a caller should know:** two databases in one process do not get independent
 checksum implementations. `connect(a, checksum="pure")` followed by `connect(b)` leaves both on

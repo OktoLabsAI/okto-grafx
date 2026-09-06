@@ -10,6 +10,7 @@ import okto_grafx
 from okto_grafx.domain.errors import GrafxPlanError
 from okto_grafx.domain.query.ast import Direction
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan, TraverseRelationship
+from okto_grafx.domain.query.planner import RELATIONSHIP_LOOKUP_FRONTIER_LIMIT
 
 
 @pytest.fixture()
@@ -143,6 +144,51 @@ def test_an_unseekable_hop_whose_where_reads_only_r_plans_a_relationship_scan(
     assert TraverseRelationship.__name__ not in operators
     # The r-only predicate is evaluated inside the scan, so no FilterRows remains above it.
     assert "FilterRows" not in operators
+
+
+def test_a_no_predicate_hop_uses_one_relationship_scan_without_a_small_limit(
+    database,
+) -> None:
+    _graph(database)
+    statement = "MATCH (a:A)-[r:E]->(b:B) RETURN a.id, b.id, r.w"
+    operators = _operators(database, statement)
+    assert RELATIONSHIP_LOOKUP_FRONTIER_LIMIT == 64
+    assert "RelationshipScan" in operators
+    assert NodeScan.__name__ not in operators
+    assert TraverseRelationship.__name__ not in operators
+    assert sorted(database.execute(statement).rows) == [
+        (1, 1, 1),
+        (1, 2, 2),
+        (2, 1, 1),
+        (3, 3, 2),
+        (4, 1, 1),
+        (5, 2, 2),
+    ]
+
+
+def test_the_no_predicate_cost_boundary_is_literal_64_versus_65(database) -> None:
+    _graph(database)
+    at_boundary = _operators(
+        database,
+        "MATCH (a:A)-[r:E]->(b:B) RETURN a.id LIMIT 64",
+    )
+    above_boundary = _operators(
+        database,
+        "MATCH (a:A)-[r:E]->(b:B) RETURN a.id LIMIT 65",
+    )
+    assert "RelationshipScan" not in at_boundary
+    assert TraverseRelationship.__name__ in at_boundary
+    assert "RelationshipScan" in above_boundary
+    assert TraverseRelationship.__name__ not in above_boundary
+
+
+def test_an_aggregate_consumes_the_relationship_scan_even_with_limit_one(database) -> None:
+    _graph(database)
+    statement = "MATCH (a:A)-[r:E]->(b:B) RETURN count(r) LIMIT 1"
+    operators = _operators(database, statement)
+    assert "RelationshipScan" in operators
+    assert TraverseRelationship.__name__ not in operators
+    assert database.execute(statement).rows == ((6,),)
 
 
 def test_the_relationship_scan_answers_the_same_rows_and_delete_works(database) -> None:

@@ -228,6 +228,29 @@ def test_the_exact_validation_reads_the_heap_and_the_proximity_lookup_does_not(
     assert counting.reads == 1
 
 
+def test_an_exact_lookup_can_return_the_version_that_discharged_its_heap_proof(
+    pool_and_heap_manager: tuple[IndexManager, CountingHeap, TableDef, HeapStore],
+) -> None:
+    """The internal paired door performs one read and proximity cannot enter it."""
+    manager, counting, table, heap = pool_and_heap_manager
+    exact = manager.index("person_by_name")
+    near = manager.index("person_near_name")
+    ref = _insert(heap, manager, table, 1, "Ada")
+
+    counting.reads = 0
+    found = manager.lookup_versions(
+        exact.name, _key(exact, 1, "Ada"), SnapshotDouble(BORN)
+    )
+
+    assert counting.reads == 1
+    assert tuple(item_ref for item_ref, _version in found) == (ref,)
+    assert found[0][1].values == (1, "Ada")
+    with pytest.raises(GrafxIndexError) as failure:
+        manager.lookup_versions(near.name, _key(near, 1, "Ada"), SnapshotDouble(BORN))
+    assert failure.value.details["field"] == "visibility"
+    assert counting.reads == 1, "a refused proximity pair must not consult the heap"
+
+
 @pytest.fixture
 def pool_and_heap_manager(
     pool: object,

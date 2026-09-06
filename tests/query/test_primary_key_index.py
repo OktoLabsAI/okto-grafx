@@ -22,13 +22,17 @@ cannot repair.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import okto_grafx
 import okto_grafx.engine.index_manager as index_manager_module
+import okto_grafx.engine.query_engine as query_engine_module
 from okto_grafx.domain.errors import GrafxQueryError
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan
+from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager, primary_key_index_name
 
 
@@ -162,6 +166,134 @@ def test_a_seek_and_a_scan_return_the_same_rows(database) -> None:
     ).rows == ()
 
 
+def test_seek_keeps_numeric_equality_when_probe_and_column_have_different_tags(
+    database,
+) -> None:
+    """The language joins INT64 and DOUBLE even though durable index keys do not."""
+
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1})")
+
+    statement = "MATCH (p:P) WHERE p.id = $key RETURN p.id"
+    assert IndexSeek.__name__ in _plan_operators(database, statement, {"key": 1.0})
+    assert database.execute(statement, {"key": 1.0}).rows == ((1,),)
+
+
+def test_an_exact_seek_reuses_the_heap_version_validated_by_the_index(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One exact hit is decoded once, inside the stable index view."""
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE Person(id INT64, name STRING, PRIMARY KEY(id))")
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:Person {id: 1, name: 'ada'})")
+
+    reads: list[object] = []
+    original = HeapStore.read
+
+    def recording(self, ref):
+        reads.append(ref)
+        return original(self, ref)
+
+    monkeypatch.setattr(HeapStore, "read", recording)
+    assert database.execute("MATCH (p:Person) WHERE p.id = 1 RETURN p.name").rows == (
+        ("ada",),
+    )
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize(
+    "reuse_validated_version",
+    (False, True),
+    ids=("ref-only", "lookup-only-manager"),
+)
+def test_index_version_fallback_reads_hits_lazily(
+    reuse_validated_version: bool,
+) -> None:
+    """A LIMIT may stop before a later fallback hit, preserving its corruption surface."""
+    reads: list[str] = []
+
+    class LookupOnlyManager:
+        def lookup(self, name: str, key: bytes, snapshot: object) -> tuple[str, ...]:
+            del name, key, snapshot
+            return ("first", "second", "corrupt-third")
+
+    def read(ref: str) -> str:
+        reads.append(ref)
+        if ref == "corrupt-third":
+            raise AssertionError("a bounded consumer must not read the third hit")
+        return f"version-{ref}"
+
+    engine = SimpleNamespace(heap=SimpleNamespace(read=read))
+    hits = query_engine_module._index_lookup_versions(
+        engine,
+        LookupOnlyManager(),
+        "idx",
+        b"key",
+        object(),
+        reuse_validated_version=reuse_validated_version,
+        ended=(),
+    )
+
+    assert reads == [], "constructing the fallback must not touch the heap"
+    assert next(hits) == ("first", "version-first")
+    assert reads == ["first"]
+
+    reads.clear()
+    owner_filtered = query_engine_module._index_lookup_versions(
+        engine,
+        LookupOnlyManager(),
+        "idx",
+        b"key",
+        object(),
+        reuse_validated_version=reuse_validated_version,
+        ended={"first", "corrupt-third"},
+    )
+    assert next(owner_filtered) == ("second", "version-second")
+    assert reads == ["second"], "ended hits must be filtered before fallback heap reads"
+
+
+def test_selected_exact_index_keeps_manager_validation_for_legacy_double() -> None:
+    """Selecting a store must not bypass an older manager's exact heap validation."""
+
+    class SelectedExact:
+        visibility = IndexVisibility.EXACT
+
+        def lookup(self, key: bytes, snapshot: object) -> tuple[str, ...]:
+            del key, snapshot
+            raise AssertionError("raw exact-index lookup bypassed manager validation")
+
+    calls: list[tuple[str, bytes, object]] = []
+
+    class LegacyManager:
+        def lookup(
+            self, name: str, key: bytes, snapshot: object
+        ) -> tuple[str, ...]:
+            calls.append((name, key, snapshot))
+            return ("confirmed",)
+
+    snapshot = object()
+    engine = SimpleNamespace(
+        heap=SimpleNamespace(read=lambda ref: f"version-{ref}")
+    )
+
+    assert tuple(
+        query_engine_module._index_lookup_versions(
+            engine,
+            LegacyManager(),
+            "idx",
+            b"key",
+            snapshot,
+            reuse_validated_version=False,
+            ended=(),
+            selected_index=SelectedExact(),
+        )
+    ) == (("confirmed", "version-confirmed"),)
+    assert calls == [("idx", b"key", snapshot)]
+
+
 def test_a_deleted_row_is_not_returned_by_a_seek(database) -> None:
     """An EXACT index is a SUPERSET: the entry outlives the row, and the heap is what settles it.
 
@@ -283,17 +415,54 @@ def test_primary_key_uniqueness_crosses_the_central_exact_view_fence(
     with database.begin("write") as txn:
         txn.execute("CREATE (:Person {id: 1})")
     crossed: list[str] = []
-    original = IndexManager.validated
+    reads: list[object] = []
+    original = IndexManager.validated_versions
+    original_read = HeapStore.read
 
     def recording(self, index, key, snapshot):
         crossed.append(index.name)
         return original(self, index, key, snapshot)
 
-    monkeypatch.setattr(IndexManager, "validated", recording)
+    def recording_read(self, ref):
+        reads.append(ref)
+        return original_read(self, ref)
+
+    monkeypatch.setattr(IndexManager, "validated_versions", recording)
+    monkeypatch.setattr(HeapStore, "read", recording_read)
     with pytest.raises(GrafxQueryError):
         with database.begin("write") as txn:
             txn.execute("CREATE (:Person {id: 1})")
     assert primary_key_index_name("Person") in crossed
+    assert len(reads) == 1, "the uniqueness check decoded its exact hit twice"
+
+
+def test_primary_key_uniqueness_preserves_a_custom_validated_hook(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with database.begin("write") as txn:
+        txn.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:Person {id: 1})")
+    original = database._indexes
+    calls: list[str] = []
+
+    class ValidatedOverride:
+        validated_versions = IndexManager.validated_versions
+
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+        def validated(self, index, key, snapshot):
+            calls.append(index.name)
+            return original.validated(index, key, snapshot)
+
+    monkeypatch.setattr(database._queries, "_indexes", ValidatedOverride())
+
+    with pytest.raises(GrafxQueryError):
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:Person {id: 1})")
+
+    assert calls == [primary_key_index_name("Person")]
 
 
 # --- it survives the process --------------------------------------------------------------------

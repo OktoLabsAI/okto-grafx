@@ -37,6 +37,7 @@ from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.adapters.checksum_pure import PureCrc32c
 from okto_grafx.domain.page.checksum import crc32c_implementation
+from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION
 from okto_grafx.adapters.vectormath_pure import PureVectorMath
 from okto_grafx.domain import errors as grafx_errors
 from okto_grafx.domain.errors import (
@@ -397,8 +398,21 @@ def build_clock(context: PortContext) -> object:
 
 
 def build_codec(context: PortContext) -> object:
-    """Build the page codec (C1) at the page size this database is configured for."""
-    return PageCodecV1(context.config.page_size)
+    """Build the selected byte-identical page codec at this database's page size."""
+
+    selector = context.config.codec
+    if selector == "pure":
+        return PageCodecV1(context.config.page_size)
+    try:
+        from okto_grafx.adapters.codec_numpy import NumpyPageCodecV1
+    except ImportError as failure:
+        raise GrafxConfigurationError(
+            "The NumPy page codec needs the optional 'accel' extra; install "
+            "okto-grafx[accel] or configure codec='pure'.",
+            field="codec",
+            value=selector,
+        ) from failure
+    return NumpyPageCodecV1(context.config.page_size)
 
 
 def build_metrics(context: PortContext) -> object:
@@ -759,7 +773,32 @@ def open_database(
         # replaces the seven adapters, not this explicit configuration choice.
         install_checksum(config)
     ports.require_complete()
-    return _assemble_database(config, ports, owns_ports=owns_ports)
+    database = _assemble_database(config, ports, owns_ports=owns_ports)
+    if (
+        config.automatic_index_expected_cardinality is not None
+        and not config.read_only
+        and database._catalog.catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION
+        and not database._catalog.catalog.tables()
+    ):
+        try:
+            # An explicit sizing hint on an empty catalog can select v2 before the first table
+            # exists, so the first PK/endpoint generations receive the requested directory.
+            # A non-empty v1 catalog is never migrated implicitly: its shadow build can be
+            # substantial and remains the operator's explicit ensure_identity_indexes action.
+            database.ensure_identity_indexes()
+        except BaseException as failure:
+            try:
+                database.close()
+            except BaseException as cleanup_failure:
+                try:
+                    failure.add_note(
+                        "Closing the database after automatic-index sizing activation failed "
+                        f"with {type(cleanup_failure).__name__}: {cleanup_failure}"
+                    )
+                except BaseException:
+                    pass
+            raise
+    return database
 
 
 def _builtin_type_name(value: object) -> str:

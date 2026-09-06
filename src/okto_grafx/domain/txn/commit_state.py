@@ -31,6 +31,7 @@ from okto_grafx.domain.page.layout import MAX_U64
 __all__ = [
     "COMMIT_STATE_FILE",
     "COMMIT_STATE_FORMAT_VERSION",
+    "COMMIT_STATE_LEGACY_FORMAT_VERSION",
     "COMMIT_STATE_MAGIC",
     "COMMIT_STATE_SIZE",
     "CommitState",
@@ -42,7 +43,10 @@ COMMIT_STATE_FILE: str = "control/commit.state"
 COMMIT_STATE_MAGIC: int = 0x5343474F
 """Four ASCII bytes, 'OGCS', so a file that is not this record is recognised as such."""
 
-COMMIT_STATE_FORMAT_VERSION: int = 1
+COMMIT_STATE_LEGACY_FORMAT_VERSION: int = 1
+"""Format written until a feature fence explicitly upgrades the database."""
+
+COMMIT_STATE_FORMAT_VERSION: int = 2
 """Version of this record. A reader accepts every version at or below its own."""
 
 _BODY: struct.Struct = struct.Struct("<IHHQQQ")
@@ -73,18 +77,32 @@ class CommitState:
     last_committed_lsn: Lsn = NO_LSN
     last_csn: Csn = NO_CSN
     checkpoint_lsn: Lsn = NO_LSN
+    format_version: int = COMMIT_STATE_LEGACY_FORMAT_VERSION
 
     def __post_init__(self) -> None:
         """Refuse a state whose numbers could not be stored in the record."""
         _require_lsn("last_committed_lsn", self.last_committed_lsn)
         _require_lsn("last_csn", self.last_csn)
         _require_lsn("checkpoint_lsn", self.checkpoint_lsn)
+        if (
+            isinstance(self.format_version, bool)
+            or not isinstance(self.format_version, int)
+            or not COMMIT_STATE_LEGACY_FORMAT_VERSION
+            <= self.format_version
+            <= COMMIT_STATE_FORMAT_VERSION
+        ):
+            raise GrafxConfigurationError(
+                f"format_version must be between {COMMIT_STATE_LEGACY_FORMAT_VERSION} and "
+                f"{COMMIT_STATE_FORMAT_VERSION}; got {self.format_version!r}.",
+                field="format_version",
+                value=repr(self.format_version),
+            )
 
     def encode(self) -> bytes:
         """Return the bytes of the published record, checksum included."""
         body = _BODY.pack(
             COMMIT_STATE_MAGIC,
-            COMMIT_STATE_FORMAT_VERSION,
+            self.format_version,
             0,
             self.last_committed_lsn,
             self.last_csn,
@@ -144,4 +162,16 @@ class CommitState:
                 value=version,
                 supported=COMMIT_STATE_FORMAT_VERSION,
             )
-        return cls(last_committed_lsn=committed, last_csn=csn, checkpoint_lsn=checkpoint)
+        if version < COMMIT_STATE_LEGACY_FORMAT_VERSION:
+            raise GrafxCorruptionDetected(
+                f"The commit state declares invalid format version {version}.",
+                file=COMMIT_STATE_FILE,
+                field="format_version",
+                value=version,
+            )
+        return cls(
+            last_committed_lsn=committed,
+            last_csn=csn,
+            checkpoint_lsn=checkpoint,
+            format_version=version,
+        )

@@ -49,6 +49,14 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
         "oktografx_write_conflicts_total",
         "oktografx_commit_retries_total",
         "oktografx_active_transactions",
+        "oktografx_commit_window_duration_seconds",
+        "oktografx_commit_phase_duration_seconds",
+        "oktografx_commit_pages_logged_total",
+        "oktografx_commit_wal_bytes_total",
+        "oktografx_commit_frames_examined_total",
+        "oktografx_commit_flushes_total",
+        "oktografx_commit_foreign_commits_total",
+        "oktografx_commit_retargets_total",
         # SPEC-M1 OR-2
         "oktografx_fsync_duration_seconds",
         "oktografx_barrier_failures_total",
@@ -66,7 +74,11 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
         "oktografx_quarantine_entries",
         # SPEC-M1 OR-4
         "oktografx_buffer_budget_used_bytes",
+        "oktografx_buffer_retained_estimate_bytes",
         "oktografx_buffer_budget_exceeded_total",
+        "oktografx_descriptor_cache_hits_total",
+        "oktografx_descriptor_cache_misses_total",
+        "oktografx_descriptor_cache_evictions_total",
         "oktografx_database_opens_total",
         "oktografx_recoveries_total",
         "oktografx_baseline_ceiling_multiple",
@@ -91,149 +103,198 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
 """Transcribed from CONTRACT.md section 9 with the renames of amendment A1 applied."""
 
 EXPECTED_METRICS: dict[str, tuple[str, str]] = {
-    'oktografx_lease_wait_seconds': (
-        'histogram',
-        'Time a writer waited for the coordination lease, by outcome.',
+    "oktografx_lease_wait_seconds": (
+        "histogram",
+        "Time a writer waited for the coordination lease, by outcome.",
     ),
-    'oktografx_write_conflicts_total': (
-        'counter',
-        'Transactions refused by optimistic partition validation.',
+    "oktografx_write_conflicts_total": (
+        "counter",
+        "Transactions refused by optimistic partition validation.",
     ),
-    'oktografx_commit_retries_total': (
-        'counter',
-        'Commit attempts retried after a write conflict.',
+    "oktografx_commit_retries_total": (
+        "counter",
+        "Commit attempts retried after a write conflict.",
     ),
-    'oktografx_active_transactions': (
-        'gauge',
-        'Transactions currently open, by mode.',
+    "oktografx_active_transactions": (
+        "gauge",
+        "Transactions currently open, by mode.",
     ),
-    'oktografx_fsync_duration_seconds': (
-        'histogram',
-        'Duration of a durability barrier, by target file class.',
+    "oktografx_commit_window_duration_seconds": (
+        "histogram",
+        "Duration of one write-commit coordination interval, by window and interval.",
     ),
-    'oktografx_barrier_failures_total': (
-        'counter',
-        'Durability barriers that failed.',
+    "oktografx_commit_phase_duration_seconds": (
+        "histogram",
+        "Duration of one write-commit phase while the commit section is held.",
     ),
-    'oktografx_read_view_drops_total': (
-        'counter',
-        'Read views begun over a moved commit token, by publication origin.',
+    "oktografx_commit_pages_logged_total": (
+        "counter",
+        "Page images included in write-commit log batches.",
     ),
-    'oktografx_wal_size_bytes': (
-        'gauge',
-        'Total size of the live write-ahead log.',
+    "oktografx_commit_wal_bytes_total": (
+        "counter",
+        "Physical bytes added to the live WAL by successful write-commit appends.",
     ),
-    'oktografx_wal_segments': (
-        'gauge',
-        'Live write-ahead log segments on disk.',
+    "oktografx_commit_frames_examined_total": (
+        "counter",
+        "Resident and retired-pinned frames traversed by write-commit flush, modified-page, and "
+        "dirty-page scans.",
     ),
-    'oktografx_wal_truncation_lag_segments': (
-        'gauge',
-        'Segments held back from recycling, by presence of a live reader.',
+    "oktografx_commit_flushes_total": (
+        "counter",
+        "Buffer-pool flush calls executed by write commits.",
     ),
-    'oktografx_checksum_verifications_total': (
-        'counter',
-        'Checksum verifications performed, by verified object.',
+    "oktografx_commit_foreign_commits_total": (
+        "counter",
+        "Foreign durable commits completed before a local write commit.",
     ),
-    'oktografx_checksum_failures_total': (
-        'counter',
-        'Checksum verifications that failed, by verified object.',
+    "oktografx_commit_retargets_total": (
+        "counter",
+        "Write-commit log batches retargeted after segment planning.",
     ),
-    'oktografx_recovery_replays_total': (
-        'counter',
-        'Write-ahead log records replayed by recovery.',
+    "oktografx_fsync_duration_seconds": (
+        "histogram",
+        "Duration of a durability barrier, by target file class.",
     ),
-    'oktografx_recovery_discarded_records_total': (
-        'counter',
-        'Records discarded by recovery, by ledger origin class.',
+    "oktografx_barrier_failures_total": (
+        "counter",
+        "Durability barriers that failed.",
     ),
-    'oktografx_ledger_depth': (
-        'gauge',
-        'Number of unapplied-work ledger entries by origin class.',
+    "oktografx_read_view_drops_total": (
+        "counter",
+        "Read views begun over a moved commit token, by publication origin.",
     ),
-    'oktografx_ledger_oldest_entry_age_seconds': (
-        'gauge',
-        'Age of the oldest unapplied-work ledger entry, by origin class.',
+    "oktografx_wal_size_bytes": (
+        "gauge",
+        "Total size of the live write-ahead log.",
     ),
-    'oktografx_quarantine_entries': (
-        'gauge',
-        'Quarantined byte ranges kept for forensic inspection.',
+    "oktografx_wal_segments": (
+        "gauge",
+        "Live write-ahead log segments on disk.",
     ),
-    'oktografx_buffer_budget_used_bytes': (
-        'gauge',
-        'Buffer pool memory currently held, by database.',
+    "oktografx_wal_truncation_lag_segments": (
+        "gauge",
+        "Segments held back from recycling, by presence of a live reader.",
     ),
-    'oktografx_buffer_budget_exceeded_total': (
-        'counter',
-        'Page pins refused because the buffer budget was exhausted, by database.',
+    "oktografx_checksum_verifications_total": (
+        "counter",
+        "Checksum verifications performed, by verified object.",
     ),
-    'oktografx_database_opens_total': (
-        'counter',
-        'Database open operations completed.',
+    "oktografx_checksum_failures_total": (
+        "counter",
+        "Checksum verifications that failed, by verified object.",
     ),
-    'oktografx_recoveries_total': (
-        'counter',
-        'Recovery runs completed, by outcome.',
+    "oktografx_recovery_replays_total": (
+        "counter",
+        "Write-ahead log records replayed by recovery.",
     ),
-    'oktografx_baseline_ceiling_multiple': (
-        'gauge',
-        'Measured multiple of the calibrated baseline ceiling, by ceiling.',
+    "oktografx_recovery_discarded_records_total": (
+        "counter",
+        "Records discarded by recovery, by ledger origin class.",
     ),
-    'oktografx_vector_recall_ratio': (
-        'gauge',
-        'Recall of the most recent calibrated vector search measurement.',
+    "oktografx_ledger_depth": (
+        "gauge",
+        "Number of unapplied-work ledger entries by origin class.",
     ),
-    'oktografx_vector_query_latency_seconds': (
-        'histogram',
-        'Duration of one vector search phase, by regime and phase.',
+    "oktografx_ledger_oldest_entry_age_seconds": (
+        "gauge",
+        "Age of the oldest unapplied-work ledger entry, by origin class.",
     ),
-    'oktografx_vector_exact_fallback_total': (
-        'counter',
-        'Vector searches answered by an exact scan of the filtered set.',
+    "oktografx_quarantine_entries": (
+        "gauge",
+        "Quarantined byte ranges kept for forensic inspection.",
     ),
-    'oktografx_vector_achieved_k': (
-        'histogram',
-        'Neighbors actually returned by a vector search.',
+    "oktografx_buffer_budget_used_bytes": (
+        "gauge",
+        "Buffer pool memory currently held, by database.",
     ),
-    'oktografx_vector_filter_selectivity_ratio': (
-        'histogram',
-        'Fraction of an embedding space that survived the candidate filter.',
+    "oktografx_buffer_retained_estimate_bytes": (
+        "gauge",
+        "Estimated Python memory retained by the buffer pool, by database and estimator.",
     ),
-    'oktografx_vector_tombstone_backlog': (
-        'gauge',
-        'Vector index tombstones awaiting reconciliation.',
+    "oktografx_buffer_budget_exceeded_total": (
+        "counter",
+        "Page pins refused because the buffer budget was exhausted, by database.",
     ),
-    'oktografx_vector_reconciliation_total': (
-        'counter',
-        'Vector index reconciliation passes completed.',
+    "oktografx_descriptor_cache_hits_total": (
+        "counter",
+        "Valid cached descriptors returned without reopening a logical file.",
     ),
-    'oktografx_vector_index_entries': (
-        'gauge',
-        'Live vector index entries, by embedding space.',
+    "oktografx_descriptor_cache_misses_total": (
+        "counter",
+        "Descriptor lookups that found no valid cached handle and required resolution.",
     ),
-    'oktografx_vector_space_retired_total': (
-        'counter',
-        'Embedding spaces moved to the retired state.',
+    "oktografx_descriptor_cache_evictions_total": (
+        "counter",
+        "Cached descriptors released by the bounded least-recently-used admission policy.",
     ),
-    'oktografx_vector_space_coverage_ratio': (
-        'gauge',
-        'Fraction of the rows of an embedding space that carry an index entry.',
+    "oktografx_database_opens_total": (
+        "counter",
+        "Database open operations completed.",
     ),
-    'oktografx_vector_index_age_seconds': (
-        'gauge',
-        'Time since the last vector index build or reconciliation, by space.',
+    "oktografx_recoveries_total": (
+        "counter",
+        "Recovery runs completed, by outcome.",
     ),
-    'oktografx_query_phase_duration_seconds': (
-        'histogram',
-        'Duration of one query phase.',
+    "oktografx_baseline_ceiling_multiple": (
+        "gauge",
+        "Measured multiple of the calibrated baseline ceiling, by ceiling.",
     ),
-    'oktografx_query_rows_returned_count': (
-        'histogram',
-        'Rows returned by one query.',
+    "oktografx_vector_recall_ratio": (
+        "gauge",
+        "Recall of the most recent calibrated vector search measurement.",
     ),
-    'oktografx_query_errors_total': (
-        'counter',
-        'Queries that ended in an error, by error code.',
+    "oktografx_vector_query_latency_seconds": (
+        "histogram",
+        "Duration of one vector search phase, by regime and phase.",
+    ),
+    "oktografx_vector_exact_fallback_total": (
+        "counter",
+        "Vector searches answered by an exact scan of the filtered set.",
+    ),
+    "oktografx_vector_achieved_k": (
+        "histogram",
+        "Neighbors actually returned by a vector search.",
+    ),
+    "oktografx_vector_filter_selectivity_ratio": (
+        "histogram",
+        "Fraction of an embedding space that survived the candidate filter.",
+    ),
+    "oktografx_vector_tombstone_backlog": (
+        "gauge",
+        "Vector index tombstones awaiting reconciliation.",
+    ),
+    "oktografx_vector_reconciliation_total": (
+        "counter",
+        "Vector index reconciliation passes completed.",
+    ),
+    "oktografx_vector_index_entries": (
+        "gauge",
+        "Live vector index entries, by embedding space.",
+    ),
+    "oktografx_vector_space_retired_total": (
+        "counter",
+        "Embedding spaces moved to the retired state.",
+    ),
+    "oktografx_vector_space_coverage_ratio": (
+        "gauge",
+        "Fraction of the rows of an embedding space that carry an index entry.",
+    ),
+    "oktografx_vector_index_age_seconds": (
+        "gauge",
+        "Time since the last vector index build or reconciliation, by space.",
+    ),
+    "oktografx_query_phase_duration_seconds": (
+        "histogram",
+        "Duration of one query phase.",
+    ),
+    "oktografx_query_rows_returned_count": (
+        "histogram",
+        "Rows returned by one query.",
+    ),
+    "oktografx_query_errors_total": (
+        "counter",
+        "Queries that ended in an error, by error code.",
     ),
 }
 """Pinned by hand: the kind and the en-US description of every metric.
@@ -248,6 +309,8 @@ because only the handful of metrics some test happens to emit were protected inc
 EXPECTED_LABELS: dict[str, tuple[str, ...]] = {
     "oktografx_lease_wait_seconds": ("outcome",),
     "oktografx_active_transactions": ("mode",),
+    "oktografx_commit_window_duration_seconds": ("window", "interval"),
+    "oktografx_commit_phase_duration_seconds": ("phase",),
     "oktografx_fsync_duration_seconds": ("target",),
     "oktografx_wal_truncation_lag_segments": ("reader_present",),
     "oktografx_checksum_verifications_total": ("kind",),
@@ -257,6 +320,7 @@ EXPECTED_LABELS: dict[str, tuple[str, ...]] = {
     "oktografx_ledger_depth": ("origin_class",),
     "oktografx_ledger_oldest_entry_age_seconds": ("origin_class",),
     "oktografx_buffer_budget_used_bytes": ("db",),
+    "oktografx_buffer_retained_estimate_bytes": ("db", "estimator"),
     "oktografx_buffer_budget_exceeded_total": ("db",),
     "oktografx_recoveries_total": ("outcome",),
     "oktografx_baseline_ceiling_multiple": ("ceiling",),
@@ -312,7 +376,7 @@ def test_the_catalog_holds_exactly_the_metrics_the_contract_freezes() -> None:
         "missing": sorted(EXPECTED_METRIC_NAMES - names),
         "unexpected": sorted(names - EXPECTED_METRIC_NAMES),
     }
-    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 36
+    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 48
 
 
 def test_the_catalog_matches_section_nine_of_the_contract_itself() -> None:
@@ -360,8 +424,12 @@ def test_every_description_is_an_en_us_sentence(descriptor: MetricDescriptor) ->
     # ASCII, the trailing period and the two-word minimum are enforced by the descriptor
     # validator, so only the two rules this project adds on top of it are asserted here.
     description = descriptor.description
-    assert description[0].isupper(), f"{descriptor.name} does not start its help text with a capital"
-    assert len(description.split()) >= 3, f"{descriptor.name} has a help text that says too little"
+    assert description[0].isupper(), (
+        f"{descriptor.name} does not start its help text with a capital"
+    )
+    assert len(description.split()) >= 3, (
+        f"{descriptor.name} has a help text that says too little"
+    )
 
 
 UNENUMERATED_LABEL_BOUNDS: dict[str, int] = {"db": 64, "space": 64}
@@ -378,7 +446,9 @@ names without the numbers leaves the number free to change in one token.
     sorted(UNENUMERATED_LABEL_BOUNDS.items()),
     ids=sorted(UNENUMERATED_LABEL_BOUNDS),
 )
-def test_the_bound_of_each_unenumerated_label_is_frozen(label_name: str, bound: int) -> None:
+def test_the_bound_of_each_unenumerated_label_is_frozen(
+    label_name: str, bound: int
+) -> None:
     found = [
         (descriptor.name, label)
         for descriptor in METRIC_CATALOG
@@ -410,7 +480,9 @@ def test_no_other_label_is_left_unenumerated() -> None:
 @pytest.mark.parametrize(
     "descriptor", METRIC_CATALOG, ids=[descriptor.name for descriptor in METRIC_CATALOG]
 )
-def test_only_the_two_free_form_labels_are_left_unenumerated(descriptor: MetricDescriptor) -> None:
+def test_only_the_two_free_form_labels_are_left_unenumerated(
+    descriptor: MetricDescriptor,
+) -> None:
     # The forbidden names and the bound of an unenumerated label are refused by the LabelSpec
     # validator at import. What it cannot know is that this catalog allows exactly two labels to
     # go unenumerated, db and space, because those two carry a short hash or a catalog name.
@@ -572,13 +644,18 @@ def test_every_reachable_error_code_can_actually_be_emitted() -> None:
     for error in sorted(_every_reachable_error_class(), key=lambda item: item.code):
         sink.increment("oktografx_query_errors_total", 1.0, {"code": error.code})
     with pytest.raises(GrafxConfigurationError, match="is not one of them"):
-        sink.increment("oktografx_query_errors_total", 1.0, {"code": "not_a_declared_code"})
+        sink.increment(
+            "oktografx_query_errors_total", 1.0, {"code": "not_a_declared_code"}
+        )
 
 
 def test_metric_returns_the_frozen_descriptor_and_refuses_a_stranger() -> None:
     descriptor = metric("oktografx_ledger_depth")
     assert descriptor.kind is MetricKind.GAUGE
-    assert descriptor.description == "Number of unapplied-work ledger entries by origin class."
+    assert (
+        descriptor.description
+        == "Number of unapplied-work ledger entries by origin class."
+    )
     with pytest.raises(GrafxConfigurationError) as failure:
         metric("oktografx_not_a_metric_total")
     assert "not part of the frozen catalog" in str(failure.value)
@@ -594,7 +671,9 @@ def test_register_catalog_declares_everything_and_repeats_without_effect() -> No
     sink = OpenMetricsSink()
     register_catalog(sink)
     register_catalog(sink)
-    assert {descriptor.name for descriptor in sink.aggregator.descriptors()} == metric_names()
+    assert {
+        descriptor.name for descriptor in sink.aggregator.descriptors()
+    } == metric_names()
     assert sink.render().count("# TYPE ") == len(METRIC_CATALOG)
 
 
@@ -631,7 +710,10 @@ def test_the_emitter_forwards_and_keeps_the_guard_visible() -> None:
     assert sink.sample_value("oktografx_write_conflicts_total") == 1.0
     assert sink.sample_value("oktografx_wal_size_bytes") == 4096.0
     assert sink.sample_value("oktografx_vector_achieved_k") == 1.0
-    assert sink.sample_value("oktografx_query_phase_duration_seconds", {"phase": "parse"}) == 1.0
+    assert (
+        sink.sample_value("oktografx_query_phase_duration_seconds", {"phase": "parse"})
+        == 1.0
+    )
 
 
 class _RefusingSink:
@@ -684,7 +766,9 @@ def test_the_emitter_still_hands_back_the_timer_of_a_disabled_sink() -> None:
     # time() is the one call that must go through even when nothing is recorded, because the
     # caller needs a context manager to enter either way.
     sink = _RefusingSink()
-    with MetricEmitter(sink).time("oktografx_fsync_duration_seconds", {"target": "wal"}):
+    with MetricEmitter(sink).time(
+        "oktografx_fsync_duration_seconds", {"target": "wal"}
+    ):
         pass
     assert sink.calls == ["time"]
 

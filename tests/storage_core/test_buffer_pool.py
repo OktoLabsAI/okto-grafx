@@ -42,6 +42,8 @@ from okto_grafx.engine import buffer_pool as pool_module
 from okto_grafx.engine.buffer_pool import (
     BUFFER_BUDGET_EXCEEDED_TOTAL,
     BUFFER_BUDGET_USED_BYTES,
+    BUFFER_RETAINED_ESTIMATE_BYTES,
+    BUFFER_RETAINED_ESTIMATOR_VERSION,
     FSYNC_DURATION_SECONDS,
     CHECKSUM_FAILURES_TOTAL,
     CHECKSUM_VERIFICATIONS_TOTAL,
@@ -57,7 +59,7 @@ from okto_grafx.engine.buffer_pool import (
     write_chain,
 )
 
-from .conftest import MemoryDevice, RecordingMetrics, make_pool
+from .conftest import SMALL_PAGE_SIZE, MemoryDevice, RecordingMetrics, make_pool
 
 FILE: str = "heap.dat"
 
@@ -121,6 +123,35 @@ class DescriptorIdentityRecordingDevice(MemoryDevice):
         """Expose write-back ordering beside the descriptor callback."""
         self.trace.append(f"write:{file}:{page_index}")
         super().write_page(file, page_index, data)
+
+
+class PresenceRecordingDevice(MemoryDevice):
+    """Expose redundant namespace walks without changing the storage contract."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.exists_calls: list[str] = []
+
+    def exists(self, file: str) -> bool:
+        self.exists_calls.append(file)
+        return super().exists(file)
+
+
+class AllocationRecordingDevice(MemoryDevice):
+    """Expose physical sizing calls made by scalar and run allocation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.page_count_calls: list[str] = []
+        self.allocate_calls: list[tuple[str, int]] = []
+
+    def page_count(self, file: str) -> int:
+        self.page_count_calls.append(file)
+        return super().page_count(file)
+
+    def allocate(self, file: str, count: int = 1) -> PageIndex:
+        self.allocate_calls.append((file, count))
+        return super().allocate(file, count)
 
 
 def seed_pages(pool: BufferPool, count: int, *, file: str = FILE) -> list[PageIndex]:
@@ -190,6 +221,115 @@ def test_the_budget_is_reported_as_a_gauge_under_the_database_label() -> None:
     assert metrics.values_of(BUFFER_BUDGET_USED_BYTES)[-1] == pool.used_bytes()
     pool.invalidate()
     assert metrics.values_of(BUFFER_BUDGET_USED_BYTES)[-1] == 0.0
+
+
+def test_retained_memory_estimate_is_versioned_and_tracks_pages_and_slots() -> None:
+    device, metrics = MemoryDevice(), RecordingMetrics()
+    pool = make_pool(device, metrics, budget_pages=4, db_label="alpha")
+    empty = pool.retained_bytes_estimate()
+    assert empty > pool.used_bytes() == 0
+    assert pool.retained_bytes_estimator == BUFFER_RETAINED_ESTIMATOR_VERSION
+
+    device.create(FILE)
+    page = pool.allocate(FILE, int(PageType.HEAP))
+    admitted = pool.retained_bytes_estimate()
+    assert admitted > empty
+    nominal = pool.used_bytes()
+
+    page.insert_slot(b"one")
+    one_slot = pool.retained_bytes_estimate()
+    page.insert_slot(b"two")
+    two_slots = pool.retained_bytes_estimate()
+    assert empty < admitted < one_slot < two_slots
+    assert pool.used_bytes() == nominal == pool.page_size
+
+    labels = metrics.labels_of(BUFFER_RETAINED_ESTIMATE_BYTES)
+    assert labels
+    assert set(labels[-1]) == {"db", "estimator"}
+    assert labels[-1] == {
+        "db": "alpha",
+        "estimator": BUFFER_RETAINED_ESTIMATOR_VERSION,
+    }
+    assert all("path" not in observed and "file" not in observed for observed in labels)
+    sampled = metrics.values_of(BUFFER_RETAINED_ESTIMATE_BYTES)
+    assert sampled[-1] > sampled[0]
+
+
+def test_retained_estimator_never_dispatches_to_a_page_subclass_under_the_guard() -> (
+    None
+):
+    class HostilePage(Page):
+        __slots__ = ("armed", "callbacks")
+
+        def __init__(self) -> None:
+            self.armed = False
+            self.callbacks: list[str] = []
+            super().__init__(int(PageType.HEAP), page_size=SMALL_PAGE_SIZE)
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {"_slots", "_page_size"} and object.__getattribute__(
+                self, "armed"
+            ):
+                object.__getattribute__(self, "callbacks").append(name)
+                raise AssertionError(
+                    "host Page callback entered the retained estimator"
+                )
+            return object.__getattribute__(self, name)
+
+    device = MemoryDevice(page_size=SMALL_PAGE_SIZE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    page = HostilePage()
+    pool._frames[(FILE, 0)] = pool_module._Frame(page)
+    page.armed = True
+
+    assert pool.retained_bytes_estimate() > pool.used_bytes()
+    assert page.callbacks == []
+
+
+def test_retained_estimator_counts_a_retired_pinned_frame_until_its_release() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    seed_pages(pool, 1)
+    held = pool.pin(FILE, 0)
+
+    assert pool.begin_read_view("foreign") is True
+    retired = pool.retained_bytes_estimate()
+    assert pool.used_bytes() == 0
+    assert (FILE, 0) in pool._doomed
+
+    pool.unpin(FILE, 0, page=held)
+    assert (FILE, 0) not in pool._doomed
+    assert pool.retained_bytes_estimate() < retired
+
+
+def test_retained_estimator_lifecycle_is_per_pool_and_does_not_change_admission() -> (
+    None
+):
+    device = MemoryDevice()
+    first = make_pool(device, RecordingMetrics(), budget_pages=1)
+    baseline = first.retained_bytes_estimate()
+    seed_pages(first, 2)
+    assert first.used_bytes() == first.budget_bytes
+    assert first.retained_bytes_estimate() > baseline
+
+    second = make_pool(device, RecordingMetrics(), budget_pages=1)
+    assert second.used_bytes() == 0
+    assert second.retained_bytes_estimate() == baseline
+    assert second.capacity_pages == first.capacity_pages == 1
+
+
+def test_disabled_metrics_never_walk_the_retained_object_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(_pool: BufferPool) -> int:
+        raise AssertionError("disabled metrics invoked the retained-memory estimator")
+
+    monkeypatch.setattr(BufferPool, "_retained_bytes_estimate", forbidden)
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics(enabled=False), budget_pages=1)
+    device.create(FILE)
+    page = pool.allocate(FILE, int(PageType.HEAP))
+    pool.unpin(FILE, page.page_index)
 
 
 def test_the_pool_registers_every_metric_before_it_emits_it() -> None:
@@ -1024,6 +1164,136 @@ def test_the_context_manager_unpins_even_when_the_body_raises() -> None:
     assert pool.flush(FILE) == 1
 
 
+def test_the_pinned_context_is_lazy_single_use_and_returns_the_pinned_page() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    assert pool.pin_count(FILE, 0) == 0
+
+    with context as page:
+        assert page is pool._frames[(FILE, 0)].page  # noqa: SLF001
+        assert pool.pin_count(FILE, 0) == 1
+
+    assert pool.pin_count(FILE, 0) == 0
+    assert context._pool is None  # type: ignore[attr-defined]  # noqa: SLF001
+    assert context._page is None  # type: ignore[attr-defined]  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="single-use"):
+        with context:
+            pass
+
+
+def test_a_pin_failure_does_not_unpin_and_consumes_the_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    failure = RuntimeError("pin")
+    unpins = 0
+
+    def refusing_pin(*_args: object, **_kwargs: object) -> Page:
+        raise failure
+
+    def counted_unpin(*_args: object, **_kwargs: object) -> None:
+        nonlocal unpins
+        unpins += 1
+
+    with monkeypatch.context() as refusal:
+        refusal.setattr(BufferPool, "pin", refusing_pin)
+        refusal.setattr(BufferPool, "unpin", counted_unpin)
+        with pytest.raises(RuntimeError) as raised:
+            with context:
+                pass
+        assert raised.value is failure
+        assert unpins == 0
+        assert context._pool is None  # type: ignore[attr-defined]  # noqa: SLF001
+        assert context._page is None  # type: ignore[attr-defined]  # noqa: SLF001
+        with pytest.raises(RuntimeError, match="single-use"):
+            with context:
+                pass
+        assert unpins == 0
+
+
+@pytest.mark.parametrize("failure", (KeyboardInterrupt(), SystemExit(19)))
+def test_the_pinned_context_releases_on_base_exception(failure: BaseException) -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+
+    with pytest.raises(type(failure)) as raised:
+        with pool.pinned(FILE, 0):
+            raise failure
+
+    assert raised.value is failure
+    assert pool.pin_count(FILE, 0) == 0
+
+
+def test_an_unpin_failure_replaces_but_chains_the_body_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    body_failure = ValueError("body")
+    unpin_failure = RuntimeError("unpin")
+    held: Page | None = None
+    context = pool.pinned(FILE, 0)
+
+    def refusing_unpin(*_args: object, **_kwargs: object) -> None:
+        raise unpin_failure
+
+    try:
+        with monkeypatch.context() as refusal:
+            refusal.setattr(BufferPool, "unpin", refusing_unpin)
+            with pytest.raises(RuntimeError) as raised:
+                with context as page:
+                    held = page
+                    raise body_failure
+        assert raised.value is unpin_failure
+        assert unpin_failure.__context__ is body_failure
+        assert context._pool is None  # type: ignore[attr-defined]  # noqa: SLF001
+        assert context._page is None  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        if held is not None and pool.pin_count(FILE, 0):
+            pool.unpin(FILE, 0, page=held)
+
+
+def test_pinned_context_decorator_recreates_its_authority_per_call() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    observations: list[int] = []
+
+    @context  # type: ignore[misc]
+    def observe() -> None:
+        observations.append(pool.pin_count(FILE, 0))
+
+    observe()
+    observe()
+
+    assert observations == [1, 1]
+    assert pool.pin_count(FILE, 0) == 0
+
+
+def test_a_consumed_pinned_context_cannot_later_recreate_as_a_decorator() -> None:
+    device = MemoryDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    context = pool.pinned(FILE, 0)
+    with context:
+        pass
+
+    @context  # type: ignore[misc]
+    def unexpected() -> None:
+        raise AssertionError("a consumed context recreated its authority")
+
+    with pytest.raises(RuntimeError, match="single-use"):
+        unexpected()
+
+
 def test_an_allocated_page_comes_back_pinned_and_survives_pressure() -> None:
     device = MemoryDevice()
     pool = make_pool(device, RecordingMetrics(), budget_pages=1)
@@ -1038,6 +1308,95 @@ def test_an_allocated_page_comes_back_pinned_and_survives_pressure() -> None:
     pool.invalidate()
     with pool.pinned(FILE, 0) as reread:
         assert reread.read_slot(0) == b"written into a fresh page"
+
+
+def test_successful_allocation_leaves_size_and_identity_to_the_atomic_device_door() -> None:
+    device = AllocationRecordingDevice()
+    device.create(FILE)
+    pool = make_pool(device, RecordingMetrics())
+
+    page = pool.allocate(FILE, int(PageType.HEAP))
+    pool.unpin(FILE, page.page_index, page=page)
+
+    assert device.page_count_calls == []
+    assert device.allocate_calls == [(FILE, 1)]
+    assert len(device._pages[FILE]) == 1
+
+
+def test_allocation_resolves_the_exact_target_before_reporting_an_admission_refusal() -> None:
+    class RefusingPageCountDevice(PresenceRecordingDevice):
+        def page_count(self, file: str) -> int:
+            raise GrafxCorruptionDetected(
+                "unaligned test file",
+                reason="unaligned_paged_file",
+                file=file,
+            )
+
+    device = RefusingPageCountDevice()
+    device.create(FILE)
+    device.allocate(FILE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    pool.pin(FILE, 0)
+    device.exists_calls.clear()
+
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        pool.allocate(FILE, int(PageType.HEAP))
+
+    assert refused.value.details["reason"] == "unaligned_paged_file"
+    assert device.exists_calls == []
+
+
+def test_a_run_grows_the_device_once_and_installs_unpinned_typed_pages() -> None:
+    device = AllocationRecordingDevice()
+    device.create(FILE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=2)
+
+    assert pool.allocate_run(FILE, int(PageType.HEAP), 4) == 0
+
+    assert device.page_count_calls == [FILE]
+    assert device.allocate_calls == [(FILE, 4)]
+    assert len(device._pages[FILE]) == 4
+    assert all(pool.pin_count(FILE, page_index) == 0 for page_index in range(4))
+    pool.flush(FILE)
+    pool.invalidate()
+    for page_index in range(4):
+        with pool.pinned(FILE, page_index) as page:
+            assert page.page_type == int(PageType.HEAP)
+
+
+def test_a_run_budget_refusal_happens_before_the_file_grows() -> None:
+    device = AllocationRecordingDevice()
+    device.create(FILE)
+    pool = make_pool(device, RecordingMetrics(), budget_pages=1)
+    held = pool.allocate(FILE, int(PageType.HEAP))
+    before = len(device._pages[FILE])
+    device.allocate_calls.clear()
+    device.page_count_calls.clear()
+
+    with pytest.raises(GrafxBufferBudgetExceeded):
+        pool.allocate_run(FILE, int(PageType.HEAP), 4)
+
+    assert len(device._pages[FILE]) == before
+    assert device.page_count_calls == [FILE]
+    assert device.allocate_calls == []
+    pool.unpin(FILE, held.page_index, page=held)
+
+
+@pytest.mark.parametrize("count", [0, -1, True, False, 1.5, "4", None])
+def test_a_run_refuses_an_invalid_count_without_observing_or_growing_the_file(
+    count: object,
+) -> None:
+    device = AllocationRecordingDevice()
+    device.create(FILE)
+    pool = make_pool(device, RecordingMetrics())
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.allocate_run(FILE, int(PageType.HEAP), count)  # type: ignore[arg-type]
+
+    assert refused.value.details["reason"] == "invalid_page_count"
+    assert device.page_count_calls == []
+    assert device.allocate_calls == []
+    assert len(device._pages[FILE]) == 0
 
 
 def test_the_pool_exposes_the_ports_the_stores_need() -> None:
@@ -1769,6 +2128,19 @@ def test_a_redo_may_bridge_a_gap_left_by_an_interrupted_allocation() -> None:
     assert pool.storage.page_count(FILE) == present + 4
 
 
+def test_redo_growth_avoids_a_presence_walk_for_every_page() -> None:
+    device = PresenceRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    reserve_header(pool)
+    device.exists_calls.clear()
+    present = device.page_count(FILE)
+
+    assert grow_to(pool, FILE, present + 3) == 4
+
+    assert device.exists_calls == []
+    assert device.page_count(FILE) == present + 4
+
+
 def test_a_page_index_far_past_the_end_is_refused_instead_of_allocated() -> None:
     """Only the gap bound produces this: without it the call succeeds and the file grows.
 
@@ -2405,6 +2777,27 @@ def test_foreign_full_refresh_advances_generation_before_legacy_dirty_publicatio
     assert device.trace == ["identity:None", f"write:{FILE}:0"]
 
 
+def test_observational_full_refresh_refuses_dirty_state_without_writeback() -> None:
+    device = DescriptorIdentityRecordingDevice()
+    pool = make_pool(device, RecordingMetrics())
+    seed_pages(pool, 1)
+    pool.begin_read_view("old")
+    dirty = pool.pin(FILE, 0)
+    dirty.update_slot(0, b"legitimate-local-work")
+    pool.unpin(FILE, 0, dirty=True, page=dirty)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+
+    with pytest.raises(GrafxUnsupportedOperation) as refused:
+        pool.begin_read_view("foreign", allow_writeback=False)
+
+    assert refused.value.details["field"] == "dirty"
+    assert device.identity_invalidations == []
+    assert device.trace == []
+    assert pool.read_view_token() == "old"
+    assert pool.is_resident(FILE, 0)
+
+
 def test_read_fresh_page_revalidates_its_name_before_the_device_read() -> None:
     device = DescriptorIdentityRecordingDevice()
     pool = make_pool(device, RecordingMetrics())
@@ -2422,6 +2815,244 @@ def test_read_fresh_page_revalidates_its_name_before_the_device_read() -> None:
     assert detached.read_slot(0) == b"page-0"
     assert device.identity_invalidations == [FILE]
     assert device.trace == [f"identity:{FILE}", f"read:{FILE}:0"]
+
+
+def test_fresh_page_witness_skips_only_the_repeated_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact witness saves validation work, never the authoritative device observation."""
+    device = DescriptorIdentityRecordingDevice()
+    metrics = RecordingMetrics()
+    pool = make_pool(device, metrics)
+    seed_pages(pool, 1)
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        raw: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(raw))
+        return original_decode(codec, raw, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    device.identity_invalidations.clear()
+    device.trace.clear()
+    device.read_calls.clear()
+
+    first, witness = pool._observe_fresh_page(FILE, 0)
+
+    assert first is not None
+    assert first.read_slot(0) == b"page-0"
+    assert witness is not None
+    assert len(decode_calls) == 1
+    assert len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL)) == 1
+    assert device.read_calls == [(FILE, 0)]
+    assert device.identity_invalidations == [FILE]
+    assert device.trace == [f"identity:{FILE}", f"read:{FILE}:0"]
+
+    device.identity_invalidations.clear()
+    device.trace.clear()
+    device.read_calls.clear()
+    verification_count = len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+    decode_count = len(decode_calls)
+
+    repeated, repeated_witness = pool._observe_fresh_page(FILE, 0, witness)
+
+    assert repeated is None
+    assert repeated_witness is witness
+    assert len(decode_calls) == decode_count
+    assert len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL)) == verification_count
+    assert device.read_calls == [(FILE, 0)]
+    assert device.identity_invalidations == [FILE]
+    assert device.trace == [f"identity:{FILE}", f"read:{FILE}:0"]
+
+
+@pytest.mark.parametrize("wrong_authority", ["pool", "file", "page"])
+def test_fresh_page_witness_with_wrong_authority_takes_the_full_decode_path(
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_authority: str,
+) -> None:
+    """Byte equality cannot cross the process-local pool/location authority boundary."""
+    device = DescriptorIdentityRecordingDevice()
+    source_metrics = RecordingMetrics()
+    source = make_pool(device, source_metrics)
+    seed_pages(source, 2)
+    _page, witness = source._observe_fresh_page(FILE, 0)
+    target_pool = source
+    target_metrics = source_metrics
+    target_file = FILE
+    target_page = 0
+    raw = device.raw_page(FILE, 0)
+
+    if wrong_authority == "pool":
+        target_metrics = RecordingMetrics()
+        target_pool = make_pool(device, target_metrics)
+    elif wrong_authority == "file":
+        target_file = "catalog.dat"
+        device.create(target_file)
+        device.allocate(target_file)
+        device.poke_page(target_file, 0, raw)
+    else:
+        target_page = 1
+        device.poke_page(FILE, target_page, raw)
+
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        image: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(image))
+        return original_decode(codec, image, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    verifications_before = len(target_metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+    device.identity_invalidations.clear()
+    device.trace.clear()
+    device.read_calls.clear()
+
+    observed, replacement = target_pool._observe_fresh_page(
+        target_file,
+        target_page,
+        witness,
+    )
+
+    assert observed is not None
+    assert observed.read_slot(0) == b"page-0"
+    assert replacement is not witness
+    assert len(decode_calls) == 1
+    assert (
+        len(target_metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+        == verifications_before + 1
+    )
+    assert device.read_calls == [(target_file, target_page)]
+    assert device.identity_invalidations == [target_file]
+    assert device.trace == [
+        f"identity:{target_file}",
+        f"read:{target_file}:{target_page}",
+    ]
+
+
+def test_fresh_page_witness_decodes_changed_bytes_even_with_the_same_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shortcut proves the complete raw image, not merely its sequence counter."""
+    device = DescriptorIdentityRecordingDevice()
+    metrics = RecordingMetrics()
+    pool = make_pool(device, metrics)
+    seed_pages(pool, 1)
+    original, witness = pool._observe_fresh_page(FILE, 0)
+    assert original is not None
+    original_seq = original.seq
+    changed = pool.codec.decode_page(device.raw_page(FILE, 0), verify=True)
+    changed.update_slot(0, b"changed")
+    changed.seq = original_seq
+    changed_image = pool.codec.encode_page(changed)
+    assert changed_image != device.raw_page(FILE, 0)
+    device.poke_page(FILE, 0, changed_image)
+
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        image: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(image))
+        return original_decode(codec, image, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    verifications_before = len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+
+    observed, replacement = pool._observe_fresh_page(FILE, 0, witness)
+
+    assert observed is not None
+    assert observed.read_slot(0) == b"changed"
+    assert observed.seq == original_seq
+    assert replacement is not witness
+    assert len(decode_calls) == 1
+    assert (
+        len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+        == verifications_before + 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_checksum_failures"),
+    [
+        ("crc_near_header", TORN_READ_RETRY_BUDGET + 1),
+        ("crc_last_byte", TORN_READ_RETRY_BUDGET + 1),
+        ("odd_sequence", 0),
+    ],
+)
+def test_fresh_page_witness_never_certifies_crc_or_odd_sequence_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    expected_checksum_failures: int,
+) -> None:
+    """Changed invalid bytes retain bounded retries and fail without issuing a witness."""
+    device = MemoryDevice()
+    metrics = RecordingMetrics()
+    pool = make_pool(device, metrics)
+    seed_pages(pool, 1)
+    _page, witness = pool._observe_fresh_page(FILE, 0)
+
+    def damaged_read(_file: str, _page_index: PageIndex, raw: bytes) -> bytes:
+        if damage == "odd_sequence":
+            return torn_image(raw)
+        image = bytearray(raw)
+        offset = PAGE_HEADER_SIZE if damage == "crc_near_header" else len(image) - 1
+        image[offset] ^= 0xFF
+        return bytes(image)
+
+    original_decode = PageCodecV1.decode_page
+    decode_calls: list[bytes] = []
+
+    def counted_decode(
+        codec: PageCodecV1,
+        image: bytes,
+        *,
+        verify: bool = True,
+        page_index: PageIndex | None = None,
+    ) -> Page:
+        decode_calls.append(bytes(image))
+        return original_decode(codec, image, verify=verify, page_index=page_index)
+
+    monkeypatch.setattr(PageCodecV1, "decode_page", counted_decode)
+    device.page_reader = damaged_read
+    device.read_calls.clear()
+    verifications_before = len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+    failures_before = len(metrics.values_of(CHECKSUM_FAILURES_TOTAL))
+    sentinel = object()
+    outcome: object = sentinel
+
+    with pytest.raises(GrafxCorruptionDetected) as raised:
+        outcome = pool._observe_fresh_page(FILE, 0, witness)
+
+    attempts = TORN_READ_RETRY_BUDGET + 1
+    assert outcome is sentinel
+    assert raised.value.details["attempts"] == attempts
+    assert device.read_calls == [(FILE, 0)] * attempts
+    assert len(decode_calls) == attempts
+    assert (
+        len(metrics.values_of(CHECKSUM_VERIFICATIONS_TOTAL))
+        == verifications_before + attempts
+    )
+    assert (
+        len(metrics.values_of(CHECKSUM_FAILURES_TOTAL))
+        == failures_before + expected_checksum_failures
+    )
 
 
 def test_fenced_page_zero_write_revalidates_its_name_before_the_cas_read() -> None:

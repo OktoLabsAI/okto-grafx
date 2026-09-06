@@ -434,14 +434,123 @@ def install_crc32c(function: Callable[[bytes, int], int], *, name: str) -> str:
     )
 
 
+_ClosedProviderIdentity = tuple[str, str, str | None, str | None, object]
+_ClosedProviderSlot = tuple[str, str]
+_MAX_CLOSED_PROVIDER_PROOFS: int = 2
+"""Maximum closed-provider slots the shipped adapter can offer (google-crc32c, crc32c)."""
+
+_validated_closed_identities: tuple[
+    tuple[_ClosedProviderIdentity, Callable[[bytes, int], int]], ...
+] = ()
+"""Closed-list provider identities this door has proved, paired with the exact callable proved.
+
+The identity is the strong one the native adapter hands over explicitly (module, attribute,
+origin, version and the raw function object); the callable is the one that passed, so a
+different object under the same identity is proved again rather than trusted. Only a
+successful proof enters, and only when the caller names an identity, which the adapter does
+for its closed list alone -- never for an injected provider, whatever its runtime setting.
+Published by rebinding an immutable tuple, like the implementation slot below, so no shared
+container is ever mutated in place. There is at most one proof per provider slot and at most
+``_MAX_CLOSED_PROVIDER_PROOFS`` entries overall; replacement evicts the obsolete identity.
+"""
+
+
+def _require_closed_identity(value: object) -> _ClosedProviderIdentity:
+    """Return one exact, inert closed-provider identity or refuse the private fast door.
+
+    Equality of the raw callable is deliberately never consulted. A callable object may define
+    hostile or merely surprising ``__eq__``/``__hash__`` methods; the proof is valid only for the
+    same object kept alive by this tuple.
+    """
+    if type(value) is not tuple or len(value) != 5:
+        raise GrafxConfigurationError(
+            "A CRC-32C memo identity must be a five-item tuple.",
+            field="memo_identity",
+            value=_builtin_type_name(value),
+        )
+    module_name, attribute, origin, version, raw_function = value
+    if (
+        type(module_name) is not str
+        or not module_name
+        or type(attribute) is not str
+        or not attribute
+        or (origin is not None and type(origin) is not str)
+        or (version is not None and type(version) is not str)
+        or not callable(raw_function)
+    ):
+        raise GrafxConfigurationError(
+            "A CRC-32C memo identity has invalid closed-provider fields.",
+            field="memo_identity",
+            value="invalid_fields",
+        )
+    return (module_name, attribute, origin, version, raw_function)
+
+
+def _closed_slot(identity: _ClosedProviderIdentity) -> _ClosedProviderSlot:
+    """Return the bounded module/attribute slot named by an identity."""
+    return identity[0], identity[1]
+
+
+def _same_closed_identity(
+    left: _ClosedProviderIdentity, right: _ClosedProviderIdentity
+) -> bool:
+    """Compare inert metadata by value and the raw function strictly by object identity."""
+    return left[:4] == right[:4] and left[4] is right[4]
+
+
+def _proved_closed_callable(
+    memo_identity: _ClosedProviderIdentity,
+) -> Callable[[bytes, int], int] | None:
+    """Return the callable already proved under this identity, or None."""
+    for identity, function in _validated_closed_identities:
+        if _same_closed_identity(identity, memo_identity):
+            return function
+    return None
+
+
+def _remember_closed_proof(
+    memo_identity: _ClosedProviderIdentity, function: Callable[[bytes, int], int]
+) -> None:
+    """Publish one proof, replacing the prior identity for this bounded provider slot."""
+    global _validated_closed_identities
+    slot = _closed_slot(memo_identity)
+    kept = tuple(
+        pair for pair in _validated_closed_identities if _closed_slot(pair[0]) != slot
+    )
+    _validated_closed_identities = (kept + ((memo_identity, function),))[
+        -_MAX_CLOSED_PROVIDER_PROOFS:
+    ]
+
+
+def _forget_closed_proof(slot: _ClosedProviderSlot) -> None:
+    """Evict the obsolete proof for one provider slot (called under the adapter guard)."""
+    global _validated_closed_identities
+    _validated_closed_identities = tuple(
+        pair for pair in _validated_closed_identities if _closed_slot(pair[0]) != slot
+    )
+
+
+def _forget_closed_proofs() -> None:
+    """Drop every memoized proof so the door replays the corpus (tests)."""
+    global _validated_closed_identities
+    _validated_closed_identities = ()
+
+
 def _install_validated_crc32c(
-    function: Callable[[bytes, int], int], *, name: str
+    function: Callable[[bytes, int], int],
+    *,
+    name: str,
+    memo_identity: object = None,
 ) -> str:
     """Install a corpus-validated callable from the native adapter's closed provider list.
 
     This private door exists so ``checksum='native'`` remains an honest acceleration. It is not
     used for injected providers: :class:`NativeCrc32c` routes those through
     :func:`install_crc32c`, whose runtime oracle makes arbitrary callables fail closed.
+
+    ``memo_identity`` is the explicit permission to memoize (D-29): when the adapter names the
+    strong identity of a closed-list provider and this exact callable already passed under it,
+    the corpus is not replayed. Without it the door proves every time, as it always did.
     """
     if not callable(function):
         observed = _builtin_type_name(function)
@@ -464,7 +573,18 @@ def _install_validated_crc32c(
             field="name",
             value="",
         )
-    _validate_candidate(function, plain_name)
+    accepted_identity = (
+        _require_closed_identity(memo_identity) if memo_identity is not None else None
+    )
+    proved = (
+        _proved_closed_callable(accepted_identity)
+        if accepted_identity is not None
+        else None
+    )
+    if proved is not function:
+        _validate_candidate(function, plain_name)
+        if accepted_identity is not None:
+            _remember_closed_proof(accepted_identity, function)
 
     def checked(data: bytes, crc: int) -> int:
         """Contain one fast-path answer without adding the Python oracle."""

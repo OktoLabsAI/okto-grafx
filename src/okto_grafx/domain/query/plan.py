@@ -46,6 +46,7 @@ __all__ = [
     "MAX_PLAN_DEPTH",
     "AggregateRows",
     "AllNodesScan",
+    "CreateIndex",
     "CreateNodeTable",
     "CreateRelTable",
     "CreateRelationships",
@@ -66,6 +67,7 @@ __all__ = [
     "ProjectRows",
     "PropertyAssignment",
     "RelationshipScan",
+    "RelationshipIncidentSeek",
     "SetProperties",
     "SingleRow",
     "SkipRows",
@@ -416,6 +418,62 @@ class RelationshipScan(PlanNode):
 
 
 @dataclass(frozen=True, slots=True)
+class RelationshipIncidentSeek(PlanNode):
+    """Resolve a bounded set of incident edges through exact multi-key indexes.
+
+    The operator is admitted only for the closed predicate
+    ``from.pk IN keys OR to.pk IN keys`` over one directed typed hop. ``fallback`` is the full
+    canonical edge-first scan and predicate tree for the same statement: a missing/stale capability
+    therefore changes only the access path, never the answer. The runtime still validates every
+    exact-index candidate against the heap under the transaction snapshot and resolves both
+    endpoint rows before yielding an edge.
+    """
+
+    fallback: PlanNode
+    from_variable: str
+    to_variable: str
+    relationship: str | None
+    table: TableDef
+    from_table: TableDef
+    to_table: TableDef
+    from_keys: Expression
+    to_keys: Expression
+    from_key_position: int
+    to_key_position: int
+    from_index: str
+    to_index: str
+    relationship_from_index: str
+    relationship_to_index: str
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the exact canonical fallback retained by this access path."""
+        return (self.fallback,)
+
+    def details(self) -> Mapping[str, object]:
+        """Describe the closed predicate and the four exact indexes it needs."""
+        return {
+            "from": self.from_variable,
+            "to": self.to_variable,
+            "table": self.table.name,
+            "relationship": self.relationship or "",
+            "predicate": (
+                f"{self.from_variable}.{self.from_table.primary_key} IN "
+                f"{self.from_keys.describe()} OR "
+                f"{self.to_variable}.{self.to_table.primary_key} IN "
+                f"{self.to_keys.describe()}"
+            ),
+            "indexes": ", ".join(
+                (
+                    self.from_index,
+                    self.to_index,
+                    self.relationship_from_index,
+                    self.relationship_to_index,
+                )
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class FilterRows(PlanNode):
     """Rows of the child that satisfy a predicate."""
 
@@ -433,13 +491,21 @@ class FilterRows(PlanNode):
 
 @dataclass(frozen=True, slots=True)
 class VectorSearch(PlanNode):
-    """The similarity operator: one pass over the rows the child produced (SPEC-VEC FR-4).
+    """The similarity operator over the candidate set denoted by its child (SPEC-VEC FR-4).
 
     The child is the candidate set -- everything the node predicates, the relationship predicates
     and the traversal left standing -- and it is a CHILD rather than a separate query because
     BR-6 says the combination belongs to the plan. The record identifiers of those rows become
     the candidate filter the two-regime planner of the vector subsystem reads, so the regime is
     chosen from the real filtered cardinality rather than from a guess.
+
+    A runtime may recognise the exact ``NodeScan(SingleRow)`` whole-table shape as an access-path
+    opportunity.  It may bypass physical child materialisation only after proving that the vector
+    index's count belongs to the transaction snapshot's durable frontier and to the exact planned
+    table/column pair, and must fall back to this child for every filtered, correlated, historical,
+    custom-snapshot or otherwise uncertain case.  An owner-dirty table retains the executor's
+    separate fail-closed RYOW refusal.  The child therefore remains both the semantic authority and
+    the inspectable fallback in the one plan.
 
     ``k`` is present only when the query asked for a top-k and nothing above this operator can
     discard a row. When it is None the operator scores every candidate and returns them all,
@@ -645,10 +711,19 @@ class DistinctRows(PlanNode):
 
 @dataclass(frozen=True, slots=True)
 class SortRows(PlanNode):
-    """Rows of the child in the order the query asked for."""
+    """Rows of the child in the order the query asked for.
+
+    ``retained_limit`` is a physical bound, not another semantic window.  When present, the
+    executor may keep only ``retained_skip + retained_limit`` rows while it orders the child;
+    the ordinary :class:`SkipRows` and :class:`LimitRows` above this node still apply the query's
+    window.  Keeping both expressions separate avoids turning two valid INT64 parameters into
+    an overflowing query-language addition merely to communicate an execution bound.
+    """
 
     child: PlanNode
     keys: tuple[SortItem, ...]
+    retained_limit: Expression | None = None
+    retained_skip: Expression | None = None
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are ordered."""
@@ -656,7 +731,17 @@ class SortRows(PlanNode):
 
     def details(self) -> Mapping[str, object]:
         """Return the sort keys and their directions."""
-        return {"keys": ", ".join(key.describe() for key in self.keys)}
+        details: dict[str, object] = {
+            "keys": ", ".join(key.describe() for key in self.keys)
+        }
+        if self.retained_limit is not None:
+            limit = self.retained_limit.describe()
+            details["retains"] = (
+                limit
+                if self.retained_skip is None
+                else f"{self.retained_skip.describe()} + {limit}"
+            )
+        return details
 
 
 @dataclass(frozen=True, slots=True)
@@ -831,6 +916,27 @@ class DeleteEntities(PlanNode):
 
 
 @dataclass(frozen=True, slots=True)
+class CreateIndex(PlanNode):
+    """Build and publish one custom exact index over a committed node table."""
+
+    name: str
+    table: TableDef
+    positions: tuple[int, ...]
+    bucket_count: int
+    expected_cardinality: int | None
+
+    def details(self) -> Mapping[str, object]:
+        """Return the fully resolved logical definition and sizing intent."""
+        return {
+            "index": self.name,
+            "table": self.table.name,
+            "positions": ", ".join(str(position) for position in self.positions),
+            "bucket_count": self.bucket_count,
+            "expected_cardinality": self.expected_cardinality or "none",
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CreateNodeTable(PlanNode):
     """Install one node table in the catalog.
 
@@ -923,8 +1029,56 @@ def validate_plan(root: PlanNode) -> PlanNode:
             field="plan",
             value=type(root).__name__,
         )
+    _refuse_unmatched_sort_retention(root)
     _refuse_post_filtered_search(root)
     return root
+
+
+def _refuse_unmatched_sort_retention(root: PlanNode) -> None:
+    """Refuse a physical top-N bound that is not the exact semantic window above it.
+
+    A retained sort intentionally discards rows.  It is correct only when the immediately
+    enclosing SKIP/LIMIT operators discard those same rows semantically; accepting a forged or
+    future rewrite with any other shape would turn a performance hint into silent under-delivery.
+    """
+    ancestors: list[PlanNode] = []
+    for node, depth in root.traverse():
+        del ancestors[depth:]
+        if (
+            isinstance(node, SortRows)
+            and node.retained_limit is None
+            and node.retained_skip is not None
+        ):
+            raise GrafxPlanError(
+                "A bounded sort cannot retain SKIP without an accompanying LIMIT.",
+                field="operator",
+                value=node.label,
+                reason="unmatched_retention",
+            )
+        if isinstance(node, SortRows) and node.retained_limit is not None:
+            parent = ancestors[-1] if ancestors else None
+            if node.retained_skip is None:
+                matched = (
+                    isinstance(parent, LimitRows)
+                    and parent.count == node.retained_limit
+                )
+            else:
+                grandparent = ancestors[-2] if len(ancestors) >= 2 else None
+                matched = (
+                    isinstance(parent, SkipRows)
+                    and parent.count == node.retained_skip
+                    and isinstance(grandparent, LimitRows)
+                    and grandparent.count == node.retained_limit
+                )
+            if not matched:
+                raise GrafxPlanError(
+                    "A bounded sort must be enclosed by the exact SKIP/LIMIT window whose "
+                    "rows it retains.",
+                    field="operator",
+                    value=node.label,
+                    reason="unmatched_retention",
+                )
+        ancestors.append(node)
 
 
 def _refuse_post_filtered_search(root: PlanNode) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import zlib
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 
@@ -766,3 +767,511 @@ def test_the_native_adapter_produces_digests_identical_to_the_pure_reference(
     adapter.install()
     assert crc32c_implementation() == "native"
     assert crc32c(b"123456789") == 0xE3069283
+
+
+# --- D-29: the corpus proof of a closed-list provider is memoized per process ------------------
+
+
+@pytest.fixture
+def forget_the_memo() -> Iterator[None]:
+    """Start and finish with no memoized proof, whatever earlier tests left in the process."""
+    checksum_native._forget_validated_closed_providers()
+    yield
+    checksum_native._forget_validated_closed_providers()
+
+
+def _google_order(function):
+    """Wrap a ``(data, crc)`` function into google_crc32c's ``(crc, data)`` convention."""
+
+    def extend(crc: int, data: bytes) -> int:
+        return function(data, crc)
+
+    return extend
+
+
+def _closed(
+    function, *, origin: str = "fake/google_crc32c/_crc32c.pyd", version="1.5.0"
+):
+    """Build a closed-list provider exactly the way load_provider does, over a fake module."""
+    module = SimpleNamespace(
+        __spec__=SimpleNamespace(origin=origin), __version__=version, extend=function
+    )
+    return checksum_native._ClosedProvider("google_crc32c", "extend", module, function)
+
+
+class _ReferenceCounter:
+    """Count the pure-reference calls the adapter makes while proving a provider."""
+
+    def __init__(self, patch: pytest.MonkeyPatch) -> None:
+        self.calls = 0
+
+        def counted(data: bytes, crc: int = 0) -> int:
+            self.calls += 1
+            return crc32c_reference(data, crc)
+
+        patch.setattr(checksum_native, "crc32c_reference", counted)
+
+
+def test_a_proved_closed_list_provider_is_not_replayed_on_the_next_construction(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None
+) -> None:
+    provider = _closed(_google_order(mirror))
+    with monkeypatch.context() as patch:
+        counter = _ReferenceCounter(patch)
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", provider)
+        )
+        first = NativeCrc32c()
+        proved = counter.calls
+        second = NativeCrc32c()
+        replayed = counter.calls - proved
+
+    assert proved >= len(CRC32C_ACCEPTANCE_CORPUS), (
+        "the first construction proves the corpus"
+    )
+    assert replayed == 0, (
+        "the second construction over the same identity replays nothing"
+    )
+    assert checksum_native.validated_closed_providers() == ("google_crc32c",)
+    assert first.checksum(b"123456789") == 0xE3069283
+    assert second.checksum(b"123456789", 7) == crc32c_reference(b"123456789", 7)
+    assert first._verify_runtime is False and second._verify_runtime is False
+
+
+@pytest.mark.parametrize("difference", ["function", "origin", "version"])
+def test_the_memo_is_keyed_on_the_strong_identity_not_on_the_module_name(
+    difference: str, monkeypatch: pytest.MonkeyPatch, forget_the_memo: None
+) -> None:
+    proved_first = _closed(_google_order(mirror))
+    if difference == "function":
+        other = _closed(_google_order(mirror))  # a new function object, same module
+    elif difference == "origin":
+        other = _closed(proved_first._function, origin="elsewhere/_crc32c.pyd")
+    else:
+        other = _closed(proved_first._function, version="1.6.0")
+    with monkeypatch.context() as patch:
+        counter = _ReferenceCounter(patch)
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", proved_first)
+        )
+        NativeCrc32c()
+        proved = counter.calls
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", other)
+        )
+        NativeCrc32c()
+        replayed = counter.calls - proved
+
+    assert replayed >= len(CRC32C_ACCEPTANCE_CORPUS), difference
+    assert len(checksum_native._validated_closed_providers) == 1, (
+        "a replacement occupies the same bounded provider slot"
+    )
+
+
+def test_a_refused_provider_never_enters_the_memo(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None
+) -> None:
+    def wrong(data: bytes, crc: int) -> int:
+        return crc32c_reference(data, crc) ^ 1
+
+    broken = _closed(_google_order(wrong))
+    with monkeypatch.context() as patch:
+        counter = _ReferenceCounter(patch)
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", broken)
+        )
+        with pytest.raises(GrafxConfigurationError) as first:
+            NativeCrc32c()
+        assert checksum_native._validated_closed_providers == {}
+        before = counter.calls
+        with pytest.raises(GrafxConfigurationError) as second:
+            NativeCrc32c()
+
+    assert first.value.details["field"] == "provider"
+    assert second.value.details == first.value.details, (
+        "the refusal is reproduced, not cached"
+    )
+    assert checksum_native.validated_closed_providers() == ()
+    # The published vectors refuse before the corpus is reached, so the reference may not run
+    # at all; what matters is that the second attempt was judged again rather than admitted.
+    assert counter.calls >= before
+
+
+def test_an_injected_provider_is_proved_on_every_construction_and_never_memoized(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None
+) -> None:
+    with monkeypatch.context() as patch:
+        counter = _ReferenceCounter(patch)
+        first = NativeCrc32c(mirror, provider_name="mirror")
+        proved = counter.calls
+        second = NativeCrc32c(mirror, provider_name="mirror")
+        replayed = counter.calls - proved
+
+    assert proved >= len(CRC32C_ACCEPTANCE_CORPUS)
+    assert replayed >= len(CRC32C_ACCEPTANCE_CORPUS)
+    assert checksum_native.validated_closed_providers() == ()
+    assert first._verify_runtime is True and second._verify_runtime is True
+
+
+def test_explicit_runtime_verification_never_reads_the_memo(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None
+) -> None:
+    armed = False
+
+    def sometimes_wrong(data: bytes, crc: int) -> int:
+        answer = crc32c_reference(data, crc)
+        return answer ^ 1 if armed else answer
+
+    provider = _closed(_google_order(sometimes_wrong))
+    with monkeypatch.context() as patch:
+        counter = _ReferenceCounter(patch)
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", provider)
+        )
+        NativeCrc32c()  # memoizes this identity on the default path
+        proved = counter.calls
+        strict = NativeCrc32c(verify_runtime=True)
+        replayed = counter.calls - proved
+    armed = True
+
+    assert replayed >= len(CRC32C_ACCEPTANCE_CORPUS), (
+        "explicit verification replays the corpus"
+    )
+    with pytest.raises(GrafxConfigurationError) as refused:
+        strict.checksum(b"runtime")  # and keeps the per-call oracle
+    assert refused.value.details["field"] == "provider"
+    assert strict._verify_runtime is True
+    assert checksum_native.validated_closed_providers() == ("google_crc32c",)
+
+
+def test_the_installer_door_still_replays_the_corpus_after_a_memo_hit(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    provider = _closed(_google_order(mirror))
+    validations: list[str] = []
+    original = checksum_module._validate_candidate
+
+    def counted(function, name: str) -> None:
+        validations.append(name)
+        original(function, name)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            checksum_native, "load_provider", lambda: ("google_crc32c", provider)
+        )
+        NativeCrc32c()
+        memoized = NativeCrc32c()
+        patch.setattr(checksum_module, "_validate_candidate", counted)
+        assert memoized.install() == PURE_IMPLEMENTATION_NAME
+
+    native = checksum_native.NATIVE_ADAPTER_NAME
+    assert validations == [native], "the domain door is not part of the memo"
+    assert crc32c_implementation() == native
+
+
+def test_the_real_provider_carries_a_strong_identity() -> None:
+    google = pytest.importorskip("google_crc32c")
+    name, provider = load_provider()
+
+    assert name == "google_crc32c"
+    assert isinstance(provider, checksum_native._ClosedProvider)
+    module_name, attribute, origin, _version, function = provider.identity
+    assert (module_name, attribute) == ("google_crc32c", "extend")
+    assert function is google.extend
+    assert origin == google.__spec__.origin
+    assert provider(b"123456789", 0) == 0xE3069283
+
+
+def _fake_google_module(function, *, origin: str = "fake/google_crc32c/__init__.py"):
+    """A stand-in for the google_crc32c package, importable through checksum_native."""
+    return SimpleNamespace(
+        __spec__=SimpleNamespace(origin=origin), __version__="1.5.0", extend=function
+    )
+
+
+class _ProviderCounter:
+    """Count the raw provider calls behind a fake closed-list module."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def extend(self, crc: int, data: bytes) -> int:
+        self.calls += 1
+        return crc32c_reference(data, crc)
+
+
+def _install_fake_google(patch: pytest.MonkeyPatch, module) -> None:
+    def import_fake(name: str):
+        if name == "google_crc32c":
+            return module
+        raise ImportError(name)
+
+    patch.setattr(checksum_native, "import_module", import_fake)
+
+
+def test_a_second_connect_cycle_replays_no_corpus_in_either_door(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    """D-29(d): construction AND install of the same closed provider cost no corpus twice."""
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    provider = _ProviderCounter()
+    module = _fake_google_module(provider.extend)
+    reference_calls = 0
+
+    def counted(data: bytes, crc: int = 0) -> int:
+        nonlocal reference_calls
+        reference_calls += 1
+        return crc32c_reference(data, crc)
+
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        patch.setattr(checksum_native, "crc32c_reference", counted)
+        patch.setattr(checksum_module, "crc32c_reference", counted)
+
+        first = NativeCrc32c()
+        first.install()
+        after_first = (reference_calls, provider.calls)
+        second = NativeCrc32c()
+        second.install()
+        assert second.checksum(b"123456789") == 0xE3069283
+        assert crc32c(b"123456789") == 0xE3069283
+        after_second = (reference_calls, provider.calls)
+
+    corpus = len(CRC32C_ACCEPTANCE_CORPUS)
+    assert after_first[0] >= 2 * corpus, (
+        "the first cycle proves the corpus in both doors"
+    )
+    assert after_second[0] == after_first[0], (
+        "the second cycle replays no reference at all"
+    )
+    assert after_second[1] - after_first[1] == 2, "only the two real checksums ran"
+    assert second._provider is first._provider, "one wrapper per strong identity"
+    assert crc32c_implementation() == checksum_native.NATIVE_ADAPTER_NAME
+
+
+def test_replacing_the_provider_function_replays_both_doors_and_a_wrong_one_is_refused(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    module = _fake_google_module(_ProviderCounter().extend)
+    validations: list[str] = []
+    original = checksum_module._validate_candidate
+
+    def counted(function, name: str) -> None:
+        validations.append(name)
+        original(function, name)
+
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        patch.setattr(checksum_module, "_validate_candidate", counted)
+        NativeCrc32c().install()
+        NativeCrc32c().install()
+        assert len(validations) == 1, "the same function object is proved once"
+
+        replacement = _ProviderCounter()
+        module.extend = replacement.extend  # a new function object under the same name
+        adapter = NativeCrc32c()
+        assert adapter._provider.identity[4] is module.extend
+        adapter.install()
+        assert len(validations) == 2, "a replaced function is proved again"
+
+        def wrong(crc: int, data: bytes) -> int:
+            return crc32c_reference(data, crc) ^ 1
+
+        module.extend = wrong
+        with pytest.raises(GrafxConfigurationError):
+            NativeCrc32c()
+        assert checksum_native._validated_closed_providers == {}
+        assert checksum_module._validated_closed_identities == ()
+
+
+class _EqualitySpoofingProvider:
+    """A correct callable whose equality/hash claim it is every other provider."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, crc: int, data: bytes) -> int:
+        self.calls += 1
+        return crc32c_reference(data, crc)
+
+    def __eq__(self, _other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return 1
+
+
+def test_callable_equality_cannot_spoof_either_closed_provider_memo(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    """Only ``is`` authenticates the raw callable in both independent proof doors."""
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    first = _EqualitySpoofingProvider()
+    second = _EqualitySpoofingProvider()
+    assert first == second and hash(first) == hash(
+        second
+    )  # prove the adversarial premise
+    module = _fake_google_module(first)
+    adapter_validations = 0
+    domain_validations = 0
+    original_adapter_validation = NativeCrc32c._require_agreement
+    original_domain_validation = checksum_module._validate_candidate
+
+    def count_adapter_validation(adapter: NativeCrc32c) -> None:
+        nonlocal adapter_validations
+        adapter_validations += 1
+        original_adapter_validation(adapter)
+
+    def count_domain_validation(function, name: str) -> None:
+        nonlocal domain_validations
+        domain_validations += 1
+        original_domain_validation(function, name)
+
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        patch.setattr(NativeCrc32c, "_require_agreement", count_adapter_validation)
+        patch.setattr(checksum_module, "_validate_candidate", count_domain_validation)
+        NativeCrc32c().install()
+        module.extend = second
+        NativeCrc32c().install()
+
+    assert adapter_validations == 2
+    assert domain_validations == 2
+    assert len(checksum_native._closed_providers) == 1
+    assert len(checksum_native._validated_closed_providers) == 1
+    assert len(checksum_module._validated_closed_identities) == 1
+    identity, _wrapper = checksum_module._validated_closed_identities[0]
+    assert identity[4] is second
+
+
+def test_repeated_provider_replacement_keeps_both_memos_strictly_bounded(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    """Reload churn replaces one slot instead of retaining every historical function."""
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    providers = [_EqualitySpoofingProvider() for _ in range(12)]
+    module = _fake_google_module(providers[0])
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        for provider in providers:
+            module.extend = provider
+            NativeCrc32c().install()
+            assert len(checksum_native._closed_providers) == 1
+            assert len(checksum_native._validated_closed_providers) == 1
+            assert len(checksum_module._validated_closed_identities) == 1
+
+    identity, _wrapper = checksum_module._validated_closed_identities[0]
+    assert identity[4] is providers[-1]
+
+
+def test_an_injected_provider_never_inherits_the_installer_memo(
+    monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
+) -> None:
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    validations: list[str] = []
+    original = checksum_module._validate_candidate
+
+    def counted(function, name: str) -> None:
+        validations.append(name)
+        original(function, name)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(checksum_module, "_validate_candidate", counted)
+        NativeCrc32c(mirror, provider_name="vendored", verify_runtime=False).install()
+        NativeCrc32c(mirror, provider_name="vendored", verify_runtime=False).install()
+
+    assert validations == [checksum_native.NATIVE_ADAPTER_NAME] * 2
+    assert checksum_module._validated_closed_identities == ()
+    assert checksum_native.validated_closed_providers() == ()
+
+
+def test_a_memo_identity_that_is_not_a_tuple_is_refused_by_the_door() -> None:
+    from okto_grafx.domain.page.checksum import _install_validated_crc32c
+
+    with pytest.raises(GrafxConfigurationError) as raised:
+        _install_validated_crc32c(mirror, name="native", memo_identity="google_crc32c")
+    assert raised.value.details["field"] == "memo_identity"
+
+
+def test_concurrent_constructions_share_one_proof_and_one_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    forget_the_memo: None,
+    restore_the_reference: None,
+) -> None:
+    import threading
+
+    from okto_grafx.domain.page import checksum as checksum_module
+
+    module = _fake_google_module(_ProviderCounter().extend)
+    adapters: list[NativeCrc32c] = []
+    failures: list[BaseException] = []
+    gate = threading.Barrier(4)
+    adapter_validations = 0
+    domain_validations = 0
+    original_adapter_validation = NativeCrc32c._require_agreement
+    original_domain_validation = checksum_module._validate_candidate
+
+    def count_adapter_validation(adapter: NativeCrc32c) -> None:
+        nonlocal adapter_validations
+        adapter_validations += 1
+        original_adapter_validation(adapter)
+
+    def count_domain_validation(function, name: str) -> None:
+        nonlocal domain_validations
+        domain_validations += 1
+        original_domain_validation(function, name)
+
+    def construct() -> None:
+        try:
+            gate.wait(timeout=10)
+            adapter = NativeCrc32c()
+            adapter.install()
+            adapters.append(adapter)
+        except BaseException as failure:  # pragma: no cover - reported below
+            failures.append(failure)
+
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        patch.setattr(NativeCrc32c, "_require_agreement", count_adapter_validation)
+        patch.setattr(checksum_module, "_validate_candidate", count_domain_validation)
+        threads = [threading.Thread(target=construct) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+    assert failures == []
+    assert len(adapters) == 4
+    assert len({id(adapter._provider) for adapter in adapters}) == 1
+    assert checksum_native.validated_closed_providers() == ("google_crc32c",)
+    assert adapter_validations == 1, "the adapter corpus runs once under contention"
+    assert domain_validations == 1, (
+        "the independent domain corpus runs once under contention"
+    )
+    assert all(adapter.checksum(b"123456789") == 0xE3069283 for adapter in adapters)
+
+
+def test_the_installer_door_never_memoizes_a_refused_candidate(
+    forget_the_memo: None, restore_the_reference: None
+) -> None:
+    from okto_grafx.domain.page import checksum as checksum_module
+    from okto_grafx.domain.page.checksum import _install_validated_crc32c
+
+    def wrong(data: bytes, crc: int) -> int:
+        return crc32c_reference(data, crc) ^ 1
+
+    identity = ("google_crc32c", "extend", "fake", "1.5.0", wrong)
+    for _attempt in range(2):
+        with pytest.raises(GrafxConfigurationError) as raised:
+            _install_validated_crc32c(wrong, name="native", memo_identity=identity)
+        assert raised.value.details["field"] == "crc32c"
+        assert checksum_module._validated_closed_identities == ()
+    assert crc32c_implementation() == PURE_IMPLEMENTATION_NAME

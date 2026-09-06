@@ -7,6 +7,7 @@ import pytest
 from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxSchemaVersionMismatch,
     GrafxStorageError,
@@ -15,6 +16,8 @@ from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_state import (
     COMMIT_STATE_FILE,
     COMMIT_STATE_FORMAT_VERSION,
+    COMMIT_STATE_LEGACY_FORMAT_VERSION,
+    COMMIT_STATE_SIZE,
     CommitState,
 )
 from okto_grafx.engine.commit_state_store import (
@@ -51,6 +54,47 @@ def test_the_strict_reader_propagates_intact_bytes_from_a_newer_format() -> None
 
     with pytest.raises(GrafxSchemaVersionMismatch):
         CommitStateStore(device, owner_id=OWNER).read()
+
+
+def test_feature_fence_keeps_the_legacy_commit_state_layout() -> None:
+    legacy = CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4)
+    fenced = CommitState(
+        last_committed_lsn=9,
+        last_csn=9,
+        checkpoint_lsn=4,
+        format_version=COMMIT_STATE_FORMAT_VERSION,
+    )
+
+    assert legacy.format_version == COMMIT_STATE_LEGACY_FORMAT_VERSION == 1
+    assert fenced.format_version == COMMIT_STATE_FORMAT_VERSION == 2
+    assert len(legacy.encode()) == len(fenced.encode()) == COMMIT_STATE_SIZE == 36
+    assert int.from_bytes(legacy.encode()[4:6], "little") == 1
+    assert int.from_bytes(fenced.encode()[4:6], "little") == 2
+    assert CommitState.decode(legacy.encode()) == legacy
+    assert CommitState.decode(fenced.encode()) == fenced
+
+
+def test_released_v1_decoder_classifies_the_same_size_fence_as_version_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from okto_grafx.domain.txn import commit_state as module
+
+    fenced = CommitState(format_version=COMMIT_STATE_FORMAT_VERSION).encode()
+    monkeypatch.setattr(module, "COMMIT_STATE_FORMAT_VERSION", 1)
+
+    with pytest.raises(GrafxSchemaVersionMismatch) as refused:
+        CommitState.decode(fenced)
+
+    assert refused.value.details["field"] == "format_version"
+    assert refused.value.details["value"] == 2
+
+
+def test_commit_state_refuses_an_invalid_writable_format() -> None:
+    for version in (0, COMMIT_STATE_FORMAT_VERSION + 1, True):
+        with pytest.raises(GrafxConfigurationError) as refused:
+            CommitState(format_version=version)  # type: ignore[arg-type]
+
+        assert getattr(refused.value, "details", {}).get("field") == "format_version"
 
 
 class _RetryingReadDevice:
@@ -114,7 +158,9 @@ def test_checkpoint_hint_is_explicitly_lenient_without_weakening_strict_read() -
         store.read()
 
 
-def test_format_two_checkpoint_hint_hides_length_damage_but_strict_read_refuses() -> None:
+def test_format_two_checkpoint_hint_hides_length_damage_but_strict_read_refuses() -> (
+    None
+):
     device = MemoryStorageDevice()
     store = CommitStateStore(
         device,
@@ -123,7 +169,10 @@ def test_format_two_checkpoint_hint_hides_length_damage_but_strict_read_refuses(
         file_nonce=17,
         control_format_version=2,
     )
-    store.publish(CommitState(last_committed_lsn=7, last_csn=7, checkpoint_lsn=4))
+    store.publish(
+        CommitState(last_committed_lsn=7, last_csn=7, checkpoint_lsn=4),
+        previous=CommitState(),
+    )
     device.append_log(COMMIT_STATE_FILE, b"unexpected-suffix")
 
     assert store.checkpoint_hint() == 0
@@ -140,7 +189,7 @@ def test_publish_uses_an_owner_exclusive_temporary_and_the_frozen_durability_ord
     device.clear_trail()
     state = CommitState(last_committed_lsn=13, last_csn=13, checkpoint_lsn=8)
 
-    CommitStateStore(device, owner_id=OWNER).publish(state)
+    CommitStateStore(device, owner_id=OWNER).publish(state, previous=CommitState())
 
     relevant = [
         (call.method, call.file, call.args_summary)
@@ -173,10 +222,11 @@ def test_format_two_migrates_the_legacy_state_then_uses_one_page_write() -> None
     )
 
     assert store.read() == original
-    store.publish(CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4))
+    intermediate = CommitState(last_committed_lsn=9, last_csn=9, checkpoint_lsn=4)
+    store.publish(intermediate, previous=original)
     device.clear_trail()
     final = CommitState(last_committed_lsn=12, last_csn=12, checkpoint_lsn=4)
-    store.publish(final)
+    store.publish(final, previous=intermediate)
 
     relevant = [
         (call.method, call.file)

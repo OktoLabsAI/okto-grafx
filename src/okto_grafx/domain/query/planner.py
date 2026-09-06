@@ -36,10 +36,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
+from okto_grafx.domain.index.catalog import CatalogIndexDefinition
 from okto_grafx.domain.index.definition import (
+    COLUMN_KEY_DERIVATION,
     IndexDefinition,
+    automatic_index_definitions,
     index_definition_matches_table,
 )
+from okto_grafx.domain.index.keys import custom_index_sizing
+from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType, value_type_of
@@ -62,6 +67,7 @@ from okto_grafx.domain.query.ast import (
     CaseExpression,
     ColumnSpec,
     CreateClause,
+    CreateIndexStatement,
     CreateNodeTableStatement,
     CreateRelTableStatement,
     CreateVectorSpaceStatement,
@@ -100,6 +106,7 @@ from okto_grafx.domain.query.plan import (
     AllNodesScan,
     CreatedNode,
     CreatedRelationship,
+    CreateIndex,
     CreateNodeTable,
     CreateRelationships,
     CreateRelTable,
@@ -117,6 +124,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    RelationshipIncidentSeek,
     SetProperties,
     SingleRow,
     SkipRows,
@@ -145,6 +153,7 @@ from okto_grafx.domain.query.tokens import (
 __all__ = [
     "ANONYMOUS_VARIABLE_PREFIX",
     "COLUMN_VALUE_TYPES",
+    "RELATIONSHIP_LOOKUP_FRONTIER_LIMIT",
     "SCORE_COLUMN",
     "THRESHOLD_OPERATORS",
     "PlannedQuery",
@@ -155,6 +164,15 @@ __all__ = [
     "conjuncts_of",
     "subscript_argument_types",
 ]
+
+RELATIONSHIP_LOOKUP_FRONTIER_LIMIT: int = 64
+"""Largest literal LIMIT that keeps a no-predicate typed hop on endpoint lookups.
+
+Below this boundary a seek/lookup frontier can stop before reading the whole relationship table;
+above it the edge-first scan wins by avoiding the source-node scan.  The executor imports this
+same value for its hybrid lookup-to-grouped-scan transition, so the planner and runtime cannot
+drift onto different cost boundaries.
+"""
 
 ANONYMOUS_VARIABLE_PREFIX: str = "anonymous pattern element "
 """The name an unnamed pattern element is bound under while a query runs.
@@ -504,12 +522,16 @@ class _Planner:
     pulse_expression_types: dict[int, tuple[Expression, ValueType | None]] = field(
         default_factory=dict
     )
+    seek_rechecks: list[Expression] = field(default_factory=list)
+    prefer_full_relationship_scan: bool = False
     anonymous: int = 0
 
     # --- entry -------------------------------------------------------------------------------
 
     def run(self, statement: Statement) -> PlannedQuery:
         """Plan whichever kind of statement this is."""
+        if isinstance(statement, CreateIndexStatement):
+            return self._planned(self._index(statement), writes=True)
         if isinstance(statement, CreateNodeTableStatement):
             return self._planned(self._node_table(statement), writes=True)
         if isinstance(statement, CreateRelTableStatement):
@@ -996,6 +1018,63 @@ class _Planner:
 
     # --- schema ------------------------------------------------------------------------------
 
+    def _index(self, statement: CreateIndexStatement) -> PlanNode:
+        """Resolve a custom exact index against one committed node table."""
+        table = self._table_named(statement.table, "table")
+        if table.kind != "node":
+            raise GrafxPlanError(
+                f"A custom index is declared on a node table; {table.name!r} is a "
+                f"{table.kind} table.",
+                field="table",
+                value=table.name,
+            )
+        bucket_count, expected_cardinality = custom_index_sizing(
+            bucket_count=statement.bucket_count,
+            expected_cardinality=statement.expected_cardinality,
+        )
+        definition = IndexDefinition.on(
+            table,
+            name=statement.name,
+            columns=statement.columns,
+            visibility=IndexVisibility.EXACT,
+            bucket_count=bucket_count,
+        )
+        logical = CatalogIndexDefinition(
+            name=definition.name,
+            table_id=definition.table_id,
+            table_name=definition.table_name,
+            positions=definition.positions,
+            visibility=definition.visibility,
+            expected_cardinality=expected_cardinality,
+        )
+        self._require_new_index_name(logical.name)
+        return CreateIndex(
+            name=logical.name,
+            table=table,
+            positions=logical.positions,
+            bucket_count=definition.bucket_count,
+            expected_cardinality=logical.expected_cardinality,
+        )
+
+    def _require_new_index_name(self, name: str) -> None:
+        """Refuse a logical name already owned by persisted or schema-derived authority."""
+        key = name.lower()
+        collision = self.catalog.has_index_definition(name) or any(
+            definition.registry_key == key for definition in self.indexes
+        )
+        if not collision:
+            collision = any(
+                definition.registry_key == key
+                for table in self.catalog.tables()
+                for definition in automatic_index_definitions(table)
+            )
+        if collision:
+            raise GrafxPlanError(
+                f"An index named {name!r} already exists without regard to case.",
+                field="name",
+                value=name,
+            )
+
     def _node_table(self, statement: CreateNodeTableStatement) -> PlanNode:
         """Plan a CREATE NODE TABLE statement."""
         columns = self._columns(statement.columns, statement.primary_key)
@@ -1209,6 +1288,14 @@ class _Planner:
         for definition in self.indexes:
             if not index_definition_matches_table(definition, table):
                 continue
+            if (
+                definition.key_derivation != COLUMN_KEY_DERIVATION
+                or not definition.positions
+            ):
+                # RecordId and value-derived indexes have dedicated access paths.  In
+                # particular, the identity definition has no column positions, so treating
+                # ``all([])`` as a generic equality match would select it for every predicate.
+                continue
             if not all(position in by_position for position in definition.positions):
                 continue
             columns = tuple(by_position[position] for position in definition.positions)
@@ -1254,6 +1341,18 @@ class _Planner:
             # aggregates nothing. Recompute from the statement the gate actually approved so
             # neither literal can be widened through its analysis argument.
             self.analysis = analyze(statement)
+        returned = statement.return_clause
+        literal_limit = None if returned is None else returned.limit
+        self.prefer_full_relationship_scan = bool(
+            self.analysis.aggregated
+            or returned is None
+            or returned.limit is None
+            or (
+                isinstance(literal_limit, Literal)
+                and type(literal_limit.value) is int
+                and literal_limit.value > RELATIONSHIP_LOOKUP_FRONTIER_LIMIT
+            )
+        )
         pipeline: PlanNode = SingleRow()
         if statement.unwind_clause is not None:
             self._require_batch_shape(statement)
@@ -2112,11 +2211,30 @@ class _Planner:
         self, pipeline: PlanNode, clause: MatchClause
     ) -> tuple[PlanNode, list[Expression]]:
         """Plan the patterns of one MATCH clause and place its residual predicate."""
-        terms = list(conjuncts_of(clause.predicate))
+        original = list(conjuncts_of(clause.predicate))
+        terms = list(original)
+        self.seek_rechecks.clear()
         for pattern in clause.patterns:
             pipeline, terms = self._pattern(pipeline, pattern, terms)
-        residual = [term for term in terms if not self._reads_similarity(term)]
-        deferred = [term for term in terms if self._reads_similarity(term)]
+        # A seek is only the access path that found a candidate.  When another term remains,
+        # reconstruct the original conjunction around every equality the seek consumed.  A
+        # residual such as ``p.name`` is UNKNOWN inside ``p.k = 1 AND p.name`` but is a refused
+        # non-boolean predicate on its own; promoting it therefore changes the query.  Terms
+        # introduced by inline property maps follow the written WHERE terms, matching the
+        # ordering this planner already gives the scan path.
+        retained = {id(term) for term in terms}
+        if terms:
+            retained.update(id(term) for term in self.seek_rechecks)
+        ordered = list(original)
+        known = {id(term) for term in ordered}
+        for term in (*terms, *self.seek_rechecks):
+            if id(term) not in known:
+                ordered.append(term)
+                known.add(id(term))
+        active = [term for term in ordered if id(term) in retained]
+        self.seek_rechecks.clear()
+        residual = [term for term in active if not self._reads_similarity(term)]
+        deferred = [term for term in active if self._reads_similarity(term)]
         predicate = _conjoin(residual)
         if predicate is not None:
             pipeline = FilterRows(child=pipeline, predicate=predicate)
@@ -2422,14 +2540,7 @@ class _Planner:
         terms: list[Expression],
     ) -> tuple[PlanNode | None, list[Expression]]:
         """Return an index seek for this variable when an index answers the predicate exactly."""
-        constrained: dict[str, tuple[Expression, Expression]] = {}
-        for term in terms:
-            binding = self._equality_on(term, variable, table)
-            if binding is None:
-                continue
-            column, value = binding
-            if column not in constrained:
-                constrained[column] = (term, value)
+        constrained = self._leading_equality_constraints(variable, table, terms)
         if not constrained:
             return None, terms
         found = self._index_for(table, tuple(constrained))
@@ -2437,6 +2548,7 @@ class _Planner:
             return None, terms
         definition, columns = found
         used = [constrained[column][0] for column in columns]
+        self.seek_rechecks.extend(used)
         remaining = [term for term in terms if term not in used]
         return (
             IndexSeek(
@@ -2450,6 +2562,42 @@ class _Planner:
             ),
             remaining,
         )
+
+    def _leading_equality_constraints(
+        self, variable: str, table: TableDef, terms: Sequence[Expression]
+    ) -> dict[str, tuple[Expression, Expression]]:
+        """Return the safe leading local equalities an index may use for this binding.
+
+        Seeking on a later conjunct evaluates it before earlier terms and can suppress an
+        observable refusal on every row the seek eliminates.  A leading run of local equality
+        terms is total once its row is decoded, so using any index covered by that run preserves
+        the predicate's written expression order.  The complete conjunction is still replayed
+        over hits by ``_match_clause`` whenever a residual remains.
+        """
+        constrained: dict[str, tuple[Expression, Expression]] = {}
+        for term in terms:
+            binding = self._equality_on(term, variable, table)
+            if binding is None and self._bound_local_equality(term, variable):
+                # A prior scan has already bound this owner.  Its local equality is total and
+                # remains in ``terms`` for the final filter, so it is safe to look past without
+                # pretending this seek consumed it.  This preserves the nested P-scan -> Q-seek
+                # shape for ``p.id = $p AND q.id = $q``.
+                continue
+            if binding is None:
+                break
+            column, value = binding
+            if column not in constrained:
+                constrained[column] = (term, value)
+        return constrained
+
+    def _bound_local_equality(self, term: Expression, variable: str) -> bool:
+        """Whether ``term`` is a total equality on another already-bound table row."""
+        for owner, owner_table in self.tables.items():
+            if owner == variable:
+                continue
+            if self._equality_on(term, owner, owner_table) is not None:
+                return True
+        return False
 
     def _equality_on(
         self, term: Expression, variable: str, table: TableDef
@@ -2656,9 +2804,10 @@ class _Planner:
         """
         if len(pattern.relationships) != 1 or len(pattern.nodes) != 2:
             return None
-        if pattern.variable is not None:
-            # A named path -- projected or merely decorative -- keeps today's traversal
-            # shape; the frozen path form and its refusals are not this fast path's to touch.
+        if pattern is self.path_projection:
+            # A projected named path needs the traversal to construct its public path value.
+            # A decorative name is deliberately allowed below: the query analysis has already
+            # proved nobody can read it, so it must not change the unnamed pattern's plan.
             return None
         relationship = pattern.relationships[0]
         if len(relationship.types) != 1:
@@ -2738,11 +2887,9 @@ class _Planner:
             candidates += list(
                 self._property_terms(node_pattern.variable, node_pattern.properties)
             )
-        constrained: list[str] = []
-        for term in candidates:
-            binding = self._equality_on(term, node_pattern.variable, table)
-            if binding is not None and binding[0] not in constrained:
-                constrained.append(binding[0])
+        constrained = self._leading_equality_constraints(
+            node_pattern.variable, table, candidates
+        )
         if not constrained:
             return False
         return self._index_for(table, tuple(constrained)) is not None
@@ -2764,6 +2911,18 @@ class _Planner:
         first_variable = first.variable or self._anonymous()
         target_variable = target.variable or self._anonymous()
         r_variable = relationship.variable
+        incident = self._relationship_incident_shape(
+            pipeline,
+            terms,
+            relationship,
+            first_variable,
+            target_variable,
+            table,
+            first_table,
+            target_table,
+        )
+        if incident is not None:
+            return incident
         r_only: list[Expression] = []
         rest: list[Expression] = []
         for term in terms:
@@ -2776,9 +2935,18 @@ class _Planner:
                 r_only.append(term)
             else:
                 rest.append(term)
-        if not r_only:
-            # The scan earns its keep by judging the r-only predicate before any endpoint is
-            # resolved; a hop with no such predicate keeps the traversal it always had.
+        if not r_only and (
+            terms
+            or relationship.variable is None
+            or not self.prefer_full_relationship_scan
+        ):
+            # A relationship predicate earns the scan by rejecting rows before endpoint
+            # resolution.  With no predicate, use it only when the result shape consumes the
+            # full/large frontier; a small LIMIT keeps the indexed node-first path that can stop
+            # early.  Anonymous relationships retain traversal order so adding a small LIMIT is
+            # still the canonical prefix of the same query; Pulse binds `r`, and therefore takes
+            # the edge-first path. Variable-free and endpoint predicates retain their existing
+            # semantics and placement in this first bounded change.
             return None
         self.tables[first_variable] = first_table
         self.tables[target_variable] = target_table
@@ -2803,6 +2971,162 @@ class _Planner:
             ),
             rest,
         )
+
+    def _relationship_incident_shape(
+        self,
+        pipeline: PlanNode,
+        terms: list[Expression],
+        relationship: RelationshipPattern,
+        first_variable: str,
+        target_variable: str,
+        table: TableDef,
+        first_table: TableDef,
+        target_table: TableDef,
+    ) -> tuple[PlanNode, list[Expression]] | None:
+        """Select the exact multi-key incident-edge shape, retaining its canonical fallback."""
+
+        if (
+            type(pipeline) is not SingleRow
+            or not self.prefer_full_relationship_scan
+            or relationship.variable is None
+            or relationship.direction is Direction.UNDIRECTED
+            or len(terms) != 1
+            or table.from_table is None
+            or table.to_table is None
+        ):
+            return None
+        predicate = terms[0]
+        keys = self._incident_key_expressions(
+            predicate,
+            first_variable,
+            target_variable,
+            first_table,
+            target_table,
+        )
+        if keys is None:
+            return None
+
+        first_pk = first_table.primary_key
+        target_pk = target_table.primary_key
+        if first_pk is None or target_pk is None:
+            return None
+        first_index = self._index_for(first_table, (first_pk,))
+        target_index = self._index_for(target_table, (target_pk,))
+        if first_index is None or target_index is None:
+            return None
+        first_definition, first_columns = first_index
+        target_definition, target_columns = target_index
+        if (
+            first_definition.visibility is not IndexVisibility.EXACT
+            or target_definition.visibility is not IndexVisibility.EXACT
+            or first_columns != (first_pk,)
+            or target_columns != (target_pk,)
+        ):
+            return None
+
+        relationship_indexes: dict[int, IndexDefinition] = {}
+        for definition in self.indexes:
+            if (
+                index_definition_matches_table(definition, table)
+                and definition.visibility is IndexVisibility.EXACT
+                and definition.key_derivation == COLUMN_KEY_DERIVATION
+                and definition.positions in {(0,), (1,)}
+            ):
+                relationship_indexes.setdefault(definition.positions[0], definition)
+        if relationship_indexes.keys() != {0, 1}:
+            return None
+
+        self.tables[first_variable] = first_table
+        self.tables[target_variable] = target_table
+        self.tables[relationship.variable] = table
+        if relationship.direction is Direction.OUTGOING:
+            from_variable, to_variable = first_variable, target_variable
+            from_table_def, to_table_def = first_table, target_table
+            from_keys, to_keys = keys[first_variable], keys[target_variable]
+            from_definition, to_definition = first_definition, target_definition
+        else:
+            from_variable, to_variable = target_variable, first_variable
+            from_table_def, to_table_def = target_table, first_table
+            from_keys, to_keys = keys[target_variable], keys[first_variable]
+            from_definition, to_definition = target_definition, first_definition
+
+        # Keep the cheap branch edge-first.  The incident predicate needs both endpoint
+        # bindings, so RelationshipScan cannot consume it internally, but it can still avoid
+        # walking the whole source-node table merely to discover a small relationship table.
+        # This is also the fallback for a missing/stale acceleration capability: only the
+        # physical access path changes, never the statement predicate or its snapshot.
+        canonical = RelationshipScan(
+            child=pipeline,
+            from_variable=from_variable,
+            to_variable=to_variable,
+            relationship=relationship.variable,
+            table=table,
+            from_table=from_table_def,
+            to_table=to_table_def,
+            predicate=None,
+        )
+        fallback: PlanNode = FilterRows(child=canonical, predicate=predicate)
+
+        return (
+            RelationshipIncidentSeek(
+                fallback=fallback,
+                from_variable=from_variable,
+                to_variable=to_variable,
+                relationship=relationship.variable,
+                table=table,
+                from_table=from_table_def,
+                to_table=to_table_def,
+                from_keys=from_keys,
+                to_keys=to_keys,
+                from_key_position=from_table_def.column_index(
+                    str(from_table_def.primary_key)
+                ),
+                to_key_position=to_table_def.column_index(str(to_table_def.primary_key)),
+                from_index=from_definition.name,
+                to_index=to_definition.name,
+                relationship_from_index=relationship_indexes[0].name,
+                relationship_to_index=relationship_indexes[1].name,
+            ),
+            [],
+        )
+
+    @staticmethod
+    def _incident_key_expressions(
+        predicate: Expression,
+        first_variable: str,
+        target_variable: str,
+        first_table: TableDef,
+        target_table: TableDef,
+    ) -> dict[str, Expression] | None:
+        """Recognise exactly ``first.pk IN keys OR target.pk IN keys`` in either arm order."""
+
+        if not isinstance(predicate, BinaryOperation) or predicate.operator != "OR":
+            return None
+        expected = {
+            first_variable: first_table.primary_key,
+            target_variable: target_table.primary_key,
+        }
+        if any(value is None for value in expected.values()):
+            return None
+        found: dict[str, Expression] = {}
+        for arm in (predicate.left, predicate.right):
+            if not isinstance(arm, BinaryOperation) or arm.operator != "IN":
+                return None
+            subject = arm.left
+            if (
+                not isinstance(subject, Property)
+                or not isinstance(subject.subject, Variable)
+                or subject.subject.name not in expected
+                or subject.key != expected[subject.subject.name]
+                or not isinstance(arm.right, (Parameter, ListExpression))
+                or free_variables(arm.right)
+            ):
+                return None
+            name = subject.subject.name
+            if name in found:
+                return None
+            found[name] = arm.right
+        return found if found.keys() == expected.keys() else None
 
     def _require_path_projection_schema(self, table: TableDef) -> None:
         """Require the exact relationship declaration the projected path was frozen against.
@@ -3014,9 +3338,18 @@ class _Planner:
         residual filter, DISTINCT and an aggregate each drop rows; a sort by anything other than
         the score means the k best by score are not the k the query wants; a SKIP is fusible only
         by adding it to the limit, because the rows it drops still have to be produced.
+
+        An updating clause is deliberately never fused.  Its following RETURN window controls
+        only the rows delivered to the caller; every matched row must still reach DELETE or SET.
         """
         clause = statement.return_clause
-        if clause is None or residual or clause.distinct or self.analysis.aggregated:
+        if (
+            clause is None
+            or statement.updating_clauses
+            or residual
+            or clause.distinct
+            or self.analysis.aggregated
+        ):
             return None
         if clause.limit is None or len(clause.sort_items) != 1:
             return None
@@ -3195,7 +3528,12 @@ class _Planner:
         if clause.distinct:
             pipeline = DistinctRows(child=pipeline)
         if clause.sort_items:
-            pipeline = SortRows(child=pipeline, keys=clause.sort_items)
+            pipeline = SortRows(
+                child=pipeline,
+                keys=clause.sort_items,
+                retained_limit=clause.limit,
+                retained_skip=clause.skip if clause.limit is not None else None,
+            )
         if clause.skip is not None:
             pipeline = SkipRows(child=pipeline, count=clause.skip)
         if clause.limit is not None:

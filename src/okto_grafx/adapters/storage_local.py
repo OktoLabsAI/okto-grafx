@@ -66,6 +66,8 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from functools import lru_cache, wraps
 from types import TracebackType
 from typing import TypeVar
 
@@ -91,11 +93,13 @@ from okto_grafx.domain.page import (
     MIN_PAGE_SIZE as MIN_PAGE_SIZE,
     validate_page_size,
 )
+from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.ports.storage import (
     DESCRIPTOR_REVALIDATION_MODES,
     DescriptorRevalidationMode,
 )
 from okto_grafx.domain.wal.segment import parse_segment_number
+from okto_grafx.engine.metrics_catalog import metric
 
 __all__ = [
     "MAX_LOGICAL_NAME_LENGTH",
@@ -111,6 +115,11 @@ __all__ = [
     "WRITE_CHUNK_BYTES",
     "IS_WINDOWS",
     "SHARE_DELETE_AVAILABLE",
+    "DESCRIPTOR_CACHE_METRICS",
+    "DESCRIPTOR_CACHE_HITS_TOTAL",
+    "DESCRIPTOR_CACHE_MISSES_TOTAL",
+    "DESCRIPTOR_CACHE_EVICTIONS_TOTAL",
+    "DescriptorCacheStats",
     "normalize_logical_name",
     "find_case_conflict",
     "validate_allocation",
@@ -134,8 +143,18 @@ MAX_LOGICAL_NAME_LENGTH: int = 255
 MAX_NAME_SEGMENT_LENGTH: int = 128
 """Longest single segment of a logical name, well inside the limit of every common file system."""
 
-MAX_OPEN_FILES: int = 64
-"""How many descriptors one device keeps cached before it evicts the least recently used one."""
+_LOGICAL_NAME_VALIDATION_CACHE_SIZE: int = 512
+"""Maximum successful exact-string logical-name proofs retained process-locally."""
+
+MAX_OPEN_FILES: int = 256
+"""Default per-device descriptor-cache budget before least-recently-used eviction.
+
+The cache opens files lazily, so this is a ceiling rather than an up-front reservation.  It
+covers the measured 141-file Pulse working set, plus a synthetic 64-table/192-artifact set,
+without restoring the old 64-entry churn.  On the supported Windows runtime, whose UCRT stdio
+limit starts at 512, it leaves half that allowance to the host.  Processes with several large
+database instances can lower ``max_open_files`` independently on each device.
+"""
 
 MAX_ALLOCATION_PAGES: int = 1 << 20
 """Most pages one allocate call may add, so a wrong number cannot ask for an endless file."""
@@ -148,7 +167,14 @@ that no future file can take over (A17, A27).
 """
 
 RESERVED_DEVICE_NAMES: frozenset[str] = frozenset(
-    {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
 )
 """Names Windows resolves to a character device; refused on every family so names stay portable."""
 
@@ -169,6 +195,20 @@ REALPATH_STABILITY_ATTEMPTS: int = 8
 
 WRITE_CHUNK_BYTES: int = 1 << 20
 """Largest block written by a single system call, so a big allocation stays bounded in memory."""
+
+DESCRIPTOR_CACHE_HITS_TOTAL: str = "oktografx_descriptor_cache_hits_total"
+DESCRIPTOR_CACHE_MISSES_TOTAL: str = "oktografx_descriptor_cache_misses_total"
+DESCRIPTOR_CACHE_EVICTIONS_TOTAL: str = "oktografx_descriptor_cache_evictions_total"
+
+DESCRIPTOR_CACHE_METRICS: tuple[MetricDescriptor, ...] = tuple(
+    metric(name)
+    for name in (
+        DESCRIPTOR_CACHE_HITS_TOTAL,
+        DESCRIPTOR_CACHE_MISSES_TOTAL,
+        DESCRIPTOR_CACHE_EVICTIONS_TOTAL,
+    )
+)
+"""Bounded, unlabelled metrics owned by the local descriptor cache."""
 
 IS_WINDOWS: bool = os.name == "nt"
 """True on the Windows family. The only platform switch of the engine lives in the adapters."""
@@ -234,7 +274,9 @@ for a condition nobody has classified -- ``EMFILE`` and ``ENFILE`` really do cle
 handles close, and an unexplained ``EIO`` may be a transient bus error.
 """
 
-_PERMANENT_WINERRORS: frozenset[int] = frozenset({2, 3, 80, 87, 123, 161, 183, 206, 267})
+_PERMANENT_WINERRORS: frozenset[int] = frozenset(
+    {2, 3, 80, 87, 123, 161, 183, 206, 267}
+)
 """FILE_NOT_FOUND, PATH_NOT_FOUND, FILE_EXISTS, INVALID_PARAMETER, INVALID_NAME, BAD_PATHNAME,
 ALREADY_EXISTS, FILENAME_EXCED_RANGE and DIRECTORY.
 
@@ -265,6 +307,15 @@ _OPEN_EXISTING: int = 3
 _FILE_ATTRIBUTE_NORMAL: int = 0x00000080
 
 _T = TypeVar("_T")
+
+
+@dataclass(frozen=True, slots=True)
+class DescriptorCacheStats:
+    """One immutable, path-free snapshot of the local descriptor-cache counters."""
+
+    hits: int
+    misses: int
+    evictions: int
 
 
 def _load_windows_opener() -> tuple[object, object, int] | None:
@@ -307,7 +358,12 @@ def _load_windows_opener() -> tuple[object, object, int] | None:
         ]
         library.SetFileInformationByHandle.restype = wintypes.BOOL
         invalid = ctypes.c_void_p(-1).value
-    except (ImportError, AttributeError, OSError, ValueError):  # pragma: no cover - hostile host
+    except (
+        ImportError,
+        AttributeError,
+        OSError,
+        ValueError,
+    ):  # pragma: no cover - hostile host
         return None
     return (library, (ctypes, msvcrt), int(invalid))
 
@@ -319,7 +375,9 @@ SHARE_DELETE_AVAILABLE: bool = _WINDOWS_OPENER is not None or not IS_WINDOWS
 """True when a handle of this device does not block another process from deleting the file."""
 
 
-def refuse_operation(reason: str, message: str, **details: object) -> GrafxUnsupportedOperation:
+def refuse_operation(
+    reason: str, message: str, **details: object
+) -> GrafxUnsupportedOperation:
     """Build the typed refusal used for an inadmissible name or an inadmissible request."""
     return GrafxUnsupportedOperation(message, reason=reason, **details)
 
@@ -357,7 +415,9 @@ def refuse_page_not_allocated(
     )
 
 
-def refuse_page_payload(file: str, page_index: object, actual: int, expected: int) -> GrafxCorruptionDetected:
+def refuse_page_payload(
+    file: str, page_index: object, actual: int, expected: int
+) -> GrafxCorruptionDetected:
     """Build the failure raised when a page write does not carry exactly one page of bytes."""
     return GrafxCorruptionDetected(
         f"A page write to {file!r} carried {actual} bytes instead of {expected}.",
@@ -386,7 +446,9 @@ def refuse_not_a_file(file: str) -> GrafxUnsupportedOperation:
     )
 
 
-def barrier_failure(message: str, *, reason: str, retryable: bool = False, **details: object) -> GrafxDurabilityBarrierFailed:
+def barrier_failure(
+    message: str, *, reason: str, retryable: bool = False, **details: object
+) -> GrafxDurabilityBarrierFailed:
     """Build the one failure type a durability barrier is allowed to raise (A28).
 
     The access classification of A11-revised travels in ``details`` rather than in the class,
@@ -420,9 +482,24 @@ def normalize_logical_name(file: object) -> str:
     Windows refuses, names that resolve to a Windows character device and the reserved pending
     delete infix are all refused with GrafxUnsupportedOperation.
     """
+    if type(file) is str:
+        _validate_exact_logical_name(file)
+        return file
+    return _normalize_logical_name_uncached(file)
+
+
+@lru_cache(maxsize=_LOGICAL_NAME_VALIDATION_CACHE_SIZE)
+def _validate_exact_logical_name(file: str) -> None:
+    """Remember a bounded successful proof for one immutable built-in string."""
+    _normalize_logical_name_uncached(file)
+
+
+def _normalize_logical_name_uncached(file: object) -> str:
+    """Apply the canonical portable logical-name grammar without derived state."""
     if not isinstance(file, str):
         raise refuse_operation(
-            "not_a_string", f"A logical file name must be a string, got {type(file).__name__}."
+            "not_a_string",
+            f"A logical file name must be a string, got {type(file).__name__}.",
         )
     if not file:
         raise refuse_operation("empty_name", "A logical file name must not be empty.")
@@ -440,11 +517,15 @@ def normalize_logical_name(file: object) -> str:
         )
     if file.startswith("/"):
         raise refuse_operation(
-            "absolute_name", "A logical file name must be relative to the database directory.", file=file
+            "absolute_name",
+            "A logical file name must be relative to the database directory.",
+            file=file,
         )
     if len(file) >= 2 and file[1] == ":":
         raise refuse_operation(
-            "absolute_name", "A logical file name must not carry a drive letter.", file=file
+            "absolute_name",
+            "A logical file name must not carry a drive letter.",
+            file=file,
         )
     for segment in file.split("/"):
         _validate_segment(file, segment)
@@ -455,15 +536,21 @@ def _validate_segment(file: str, segment: str) -> None:
     """Refuse one segment of a logical name that no portable file system would accept."""
     if not segment:
         raise refuse_operation(
-            "empty_segment", "A logical file name must not hold an empty segment.", file=file
+            "empty_segment",
+            "A logical file name must not hold an empty segment.",
+            file=file,
         )
     if segment == ".":
         raise refuse_operation(
-            "relative_segment", "A logical file name must not hold a '.' segment.", file=file
+            "relative_segment",
+            "A logical file name must not hold a '.' segment.",
+            file=file,
         )
     if segment == "..":
         raise refuse_operation(
-            "parent_traversal", "A logical file name must not climb out of the database directory.", file=file
+            "parent_traversal",
+            "A logical file name must not climb out of the database directory.",
+            file=file,
         )
     if len(segment) > MAX_NAME_SEGMENT_LENGTH:
         raise refuse_operation(
@@ -671,6 +758,14 @@ class LocalStorageDevice:
         self._descriptor_generation = 0
         self._descriptor_identity_generation: dict[str, int] = {}
         self._generation_revalidated_handles: set[str] = set()
+        self._descriptor_cache_hits = 0
+        self._descriptor_cache_misses = 0
+        self._descriptor_cache_evictions = 0
+        self._published_descriptor_cache_hits = 0
+        self._published_descriptor_cache_misses = 0
+        self._published_descriptor_cache_evictions = 0
+        self._descriptor_metrics: MetricsSink | None = None
+        self._descriptor_metric_wrappers_installed = False
         self._root = _validate_root(root)
         self._lock = threading.RLock()
         self._handles: dict[str, int] = {}
@@ -705,7 +800,9 @@ class LocalStorageDevice:
             try:
                 os.makedirs(self._root, exist_ok=True)
             except OSError as failure:
-                raise self._device_failure("open_root", self._root, failure) from failure
+                raise self._device_failure(
+                    "open_root", self._root, failure
+                ) from failure
         try:
             root_information = os.lstat(self._root)
         except OSError as failure:
@@ -742,6 +839,109 @@ class LocalStorageDevice:
         """Absolute path of the directory this device owns."""
         return self._root
 
+    def bind_metrics(self, metrics: MetricsSink) -> None:
+        """Bind the existing metrics port to this adapter without extending StorageDevice.
+
+        Registration and publication happen outside ``_lock``. The composition root invokes
+        this adapter-only capability after it has wrapped the host sink for containment; a local
+        device used directly may opt in the same way. Binding another enabled sink starts that
+        sink's counters from the complete device-lifetime snapshot; rebinding the same enabled
+        sink is idempotent.
+        """
+        with self._lock:
+            self._require_open()
+            if metrics is self._descriptor_metrics:
+                return
+        enabled = metrics.enabled
+        if enabled:
+            for descriptor in DESCRIPTOR_CACHE_METRICS:
+                metrics.register(descriptor)
+        with self._lock:
+            self._require_open()
+            self._descriptor_metrics = metrics if enabled else None
+            self._published_descriptor_cache_hits = 0
+            self._published_descriptor_cache_misses = 0
+            self._published_descriptor_cache_evictions = 0
+        if not enabled:
+            return
+        self._install_descriptor_metric_wrappers()
+        self._publish_descriptor_cache_metrics()
+
+    def descriptor_cache_stats(self) -> DescriptorCacheStats:
+        """Return cumulative cache counters without exposing names, paths or descriptors."""
+        with self._lock:
+            return DescriptorCacheStats(
+                self._descriptor_cache_hits,
+                self._descriptor_cache_misses,
+                self._descriptor_cache_evictions,
+            )
+
+    def _publish_descriptor_cache_metrics(self) -> None:
+        """Move one atomic counter delta to the bound sink, with no storage guard held."""
+        metrics = self._descriptor_metrics
+        if metrics is None or not metrics.enabled:
+            return
+        with self._lock:
+            hits = self._descriptor_cache_hits - self._published_descriptor_cache_hits
+            misses = (
+                self._descriptor_cache_misses - self._published_descriptor_cache_misses
+            )
+            evictions = (
+                self._descriptor_cache_evictions
+                - self._published_descriptor_cache_evictions
+            )
+            self._published_descriptor_cache_hits = self._descriptor_cache_hits
+            self._published_descriptor_cache_misses = self._descriptor_cache_misses
+            self._published_descriptor_cache_evictions = (
+                self._descriptor_cache_evictions
+            )
+        if hits:
+            metrics.increment(DESCRIPTOR_CACHE_HITS_TOTAL, float(hits), None)
+        if misses:
+            metrics.increment(DESCRIPTOR_CACHE_MISSES_TOTAL, float(misses), None)
+        if evictions:
+            metrics.increment(DESCRIPTOR_CACHE_EVICTIONS_TOTAL, float(evictions), None)
+
+    def _install_descriptor_metric_wrappers(self) -> None:
+        """Instrument descriptor-using doors only when a recording sink is enabled.
+
+        The default/no-op composition never installs these instance wrappers, so its storage hot
+        path retains the original call depth and allocations. Each enabled wrapper publishes in
+        ``finally`` after the original public method has released its own guard.
+        """
+        with self._lock:
+            if self._descriptor_metric_wrappers_installed:
+                return
+            self._descriptor_metric_wrappers_installed = True
+        for name in (
+            "create",
+            "file_size",
+            "page_count",
+            "allocate",
+            "read_page",
+            "write_page",
+            "append_log",
+            "read_log",
+            "read_log_if_exists",
+            "log_size",
+            "truncate_log",
+            "durable_barrier",
+        ):
+            original = getattr(self, name)
+
+            @wraps(original)
+            def _reporting(
+                *args: object,
+                __original: Callable[..., object] = original,
+                **kwargs: object,
+            ) -> object:
+                try:
+                    return __original(*args, **kwargs)
+                finally:
+                    self._publish_descriptor_cache_metrics()
+
+            setattr(self, name, _reporting)
+
     # --- namespace ----------------------------------------------------------------------
 
     def exists(self, file: str) -> bool:
@@ -749,7 +949,7 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         with self._lock:
             self._require_open()
-            return self._resolve_identity(name)
+            return self._resolve_identity(name) is not None
 
     def create(self, file: str, *, exclusive: bool = True) -> None:
         """Create an empty file. With exclusive set, an already existing file is refused."""
@@ -759,7 +959,9 @@ class LocalStorageDevice:
             if self._resolve_identity(name):
                 if exclusive:
                     raise refuse_operation(
-                        "file_exists", f"File {name!r} already exists on this device.", file=name
+                        "file_exists",
+                        f"File {name!r} already exists on this device.",
+                        file=name,
                     )
                 # A23: the caller now owns this name again, so whatever deletion was queued for
                 # it is abandoned. The device never destroys bytes it acknowledged.
@@ -808,7 +1010,8 @@ class LocalStorageDevice:
         """Return every logical name starting with the prefix, sorted, deferred deletions apart."""
         if not isinstance(prefix, str):
             raise refuse_operation(
-                "not_a_string", f"A name prefix must be a string, got {type(prefix).__name__}."
+                "not_a_string",
+                f"A name prefix must be a string, got {type(prefix).__name__}.",
             )
         with self._lock:
             self._require_open()
@@ -817,7 +1020,9 @@ class LocalStorageDevice:
             # the root as before. Names outside that directory cannot start with the prefix.
             below = prefix.rpartition("/")[0]
             return tuple(
-                sorted(name for name in self._walk(below=below) if name.startswith(prefix))
+                sorted(
+                    name for name in self._walk(below=below) if name.startswith(prefix)
+                )
             )
 
     def file_size(self, file: str) -> int:
@@ -885,7 +1090,9 @@ class LocalStorageDevice:
             self._require_open()
             if source_name == target_name:
                 raise refuse_operation(
-                    "same_file", "atomic_replace needs two different names.", file=source_name
+                    "same_file",
+                    "atomic_replace needs two different names.",
+                    file=source_name,
                 )
             if not self._resolve_identity(source_name):
                 raise refuse_missing_file(source_name, "atomic_replace")
@@ -904,13 +1111,19 @@ class LocalStorageDevice:
             try:
                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
             except OSError as failure:
-                raise self._device_failure("atomic_replace", target_name, failure) from failure
+                raise self._device_failure(
+                    "atomic_replace", target_name, failure
+                ) from failure
             self._require_directory_parents(target_name)
             self._require_safe_path(source_name, prove_containment=False)
             # _publish_over is the only move that overwrites an existing target on both
             # families: os.rename fails on Windows the moment the target exists, and os.replace
             # fails there whenever another participant holds the target open (CF-5).
-            self._retry("atomic_replace", target_name, lambda: _publish_over(source_path, target_path))
+            self._retry(
+                "atomic_replace",
+                target_name,
+                lambda: _publish_over(source_path, target_path),
+            )
             self._require_safe_path(target_name, prove_containment=False)
             self._acknowledge_namespace(source_path)
             self._acknowledge_namespace(target_path)
@@ -1047,7 +1260,9 @@ class LocalStorageDevice:
                 os.lseek(descriptor, offset, os.SEEK_SET)
                 data = _read_exactly(descriptor, self._page_size)
             except OSError as failure:
-                raise self._device_failure("read_page", name, failure, page=page_index) from failure
+                raise self._device_failure(
+                    "read_page", name, failure, page=page_index
+                ) from failure
             if len(data) != self._page_size:
                 raise GrafxCorruptionDetected(
                     f"Page {page_index} of {name!r} ended after {len(data)} bytes.",
@@ -1073,7 +1288,9 @@ class LocalStorageDevice:
                 os.lseek(descriptor, offset, os.SEEK_SET)
                 written = _write_everything(descriptor, payload)
             except OSError as failure:
-                raise self._device_failure("write_page", name, failure, page=page_index) from failure
+                raise self._device_failure(
+                    "write_page", name, failure, page=page_index
+                ) from failure
             if written != len(payload):
                 raise GrafxDeviceFull(
                     f"A page write to {name!r} stored {written} of {len(payload)} bytes.",
@@ -1107,7 +1324,37 @@ class LocalStorageDevice:
                 os.lseek(descriptor, offset, os.SEEK_SET)
                 return _read_exactly(descriptor, length)
             except OSError as failure:
-                raise self._device_failure("read_log", name, failure, offset=offset) from failure
+                raise self._device_failure(
+                    "read_log", name, failure, offset=offset
+                ) from failure
+
+    def read_log_if_exists(self, file: str, offset: int, length: int) -> bytes | None:
+        """Read one log range when its exact logical name exists, with one namespace proof.
+
+        This is an adapter-only fused observation, deliberately absent from ``StorageDevice``.
+        A warm descriptor is accepted only when its ``fstat`` identity matches the exact-case,
+        no-follow final observation returned by ``_resolve_identity``. A miss or stale handle is
+        reopened through the ordinary bounded open/reprove loop, so fusion removes only the
+        duplicate warm-path proof and does not weaken admission. Empty present files return
+        ``b""`` while an absent file returns ``None``.
+        """
+        name = normalize_logical_name(file)
+        validate_read_range(name, offset, length)
+        with self._lock:
+            self._require_open()
+            observed = self._resolve_identity(name)
+            if observed is None:
+                return None
+            descriptor = self._descriptor_after_observation(name, observed)
+            if length == 0:
+                return b""
+            try:
+                os.lseek(descriptor, offset, os.SEEK_SET)
+                return _read_exactly(descriptor, length)
+            except OSError as failure:
+                raise self._device_failure(
+                    "read_log_if_exists", name, failure, offset=offset
+                ) from failure
 
     def log_size(self, file: str) -> int:
         """Return the current size in bytes of an append-only file."""
@@ -1120,7 +1367,10 @@ class LocalStorageDevice:
         name = normalize_logical_name(file)
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             raise refuse_operation(
-                "invalid_size", "truncate_log needs a size of zero or more.", file=name, size=size
+                "invalid_size",
+                "truncate_log needs a size of zero or more.",
+                file=name,
+                size=size,
             )
         with self._lock:
             descriptor = self._descriptor(name, "write")
@@ -1351,7 +1601,9 @@ class LocalStorageDevice:
         """
         return os.path.join(self._root, *name.split("/"))
 
-    def _require_root_identity(self, name: str, *, prove_real_path: bool = True) -> None:
+    def _require_root_identity(
+        self, name: str, *, prove_real_path: bool = True
+    ) -> None:
         """Refuse a root that was exchanged or redirected after this adapter opened it.
 
         Without ``prove_real_path`` the root is judged by its ``lstat`` alone -- identity and
@@ -1366,7 +1618,9 @@ class LocalStorageDevice:
         if (
             observed != self._root_identity
             or _is_redirected_path(self._root, information)
-            or (prove_real_path and _comparable_real_path(self._root) != self._root_real)
+            or (
+                prove_real_path and _comparable_real_path(self._root) != self._root_real
+            )
         ):
             raise refuse_operation(
                 "redirected_root",
@@ -1397,17 +1651,24 @@ class LocalStorageDevice:
             component=self._relative(path),
         )
 
-    def _require_safe_path(self, name: str, *, prove_containment: bool = True) -> None:
+    def _require_safe_path(
+        self, name: str, *, prove_containment: bool = True
+    ) -> os.stat_result | None:
         """Refuse every existing redirected component of one logical file path.
 
         Without ``prove_containment`` no real path is resolved: every existing component is
         still inspected without being followed and refused when redirected or foreign, but
         containment is taken from the proof made when the name was first resolved. That is the
         fast guard of a warm descriptor hit; a name being resolved anew always proves both.
+        The returned observation is the final component's no-follow identity, or ``None`` when
+        that component is absent. Callers that already need that identity can consume this
+        proof instead of following the same path with a redundant ``stat``.
         """
         self._require_root_identity(name, prove_real_path=prove_containment)
         current = self._root
-        for segment in name.split("/"):
+        segments = name.split("/")
+        final_information: os.stat_result | None = None
+        for position, segment in enumerate(segments):
             current = os.path.join(current, segment)
             try:
                 information = os.lstat(current)
@@ -1427,8 +1688,7 @@ class LocalStorageDevice:
                     component=self._relative(current),
                 )
             if not (
-                stat.S_ISDIR(information.st_mode)
-                or stat.S_ISREG(information.st_mode)
+                stat.S_ISDIR(information.st_mode) or stat.S_ISREG(information.st_mode)
             ):
                 raise refuse_operation(
                     "unsupported_entry_type",
@@ -1440,6 +1700,9 @@ class LocalStorageDevice:
                 )
             if prove_containment:
                 self._require_contained(name, current)
+            if position + 1 == len(segments):
+                final_information = information
+        return final_information
 
     def _require_directory_parents(self, name: str) -> None:
         """Refuse a name whose parent segment is itself a stored file, on both families alike."""
@@ -1447,8 +1710,15 @@ class LocalStorageDevice:
         directory = self._root
         identity = self._root_identity
         prefix = ""
-        for segment in name.split("/")[:-1]:
-            resolved = self._resolved_child(directory, identity, prefix, segment, name)
+        for position, segment in enumerate(name.split("/")[:-1]):
+            resolved = self._resolved_child(
+                directory,
+                identity,
+                prefix,
+                segment,
+                name,
+                parent_prevalidated=position == 0,
+            )
             if resolved is None:
                 return
             candidate, information = resolved
@@ -1477,16 +1747,27 @@ class LocalStorageDevice:
         prefix: str,
         segment: str,
         name: str,
+        *,
+        parent_prevalidated: bool = False,
     ) -> tuple[str, os.stat_result] | None:
         """Resolve one exact-case child while its parent keeps the proved identity.
 
-        The parent is checked before and after both the listing and the child's ``lstat``. Thus
-        a directory exchanged for a junction between either system call is refused without
-        resolving the real path of the child. A plain child inherits containment from that
-        proved parent exactly as entries of ``_walk`` do.
+        The parent is checked before and after both the listing and the child's ``lstat``. The
+        caller may carry the immediately preceding root check into the first step; the final
+        check still brackets the listing, while avoiding two consecutive observations of the
+        same root. Thus a directory exchanged for a junction between either system call is
+        refused without resolving the real path of the child. A plain child inherits containment
+        from that proved parent exactly as entries of ``_walk`` do.
         """
         label = prefix[:-1] if prefix else self._root
-        self._require_directory_identity(label, directory, identity)
+        parent_is_prevalidated_root = (
+            parent_prevalidated
+            and directory == self._root
+            and identity == self._root_identity
+            and prefix == ""
+        )
+        if not parent_is_prevalidated_root:
+            self._require_directory_identity(label, directory, identity)
         try:
             entries = tuple(os.listdir(directory))
         except (FileNotFoundError, NotADirectoryError):
@@ -1521,12 +1802,14 @@ class LocalStorageDevice:
             return None
         return candidate, information
 
-    def _resolve_identity(self, name: str) -> bool:
-        """Return True when the exact name exists; refuse a stored name that differs only by case.
+    def _resolve_identity(self, name: str) -> os.stat_result | None:
+        """Return the final exact-name observation, or None when that name is absent.
 
         Every segment is matched against the real directory entry, so a case insensitive volume
         cannot make ``Wal/x.wal`` resolve to ``wal/x.wal`` behind the back of the engine. The
-        answer is True only for a regular file: a directory is not part of the namespace.
+        answer carries the no-follow stat of the final regular file so a caller that immediately
+        consumes the observation can compare it with an already-open descriptor without walking
+        the namespace a second time. A directory is not part of the namespace.
         """
         self._require_root_identity(name, prove_real_path=False)
         directory = self._root
@@ -1534,18 +1817,25 @@ class LocalStorageDevice:
         prefix = ""
         segments = name.split("/")
         for index, segment in enumerate(segments):
-            resolved = self._resolved_child(directory, identity, prefix, segment, name)
+            resolved = self._resolved_child(
+                directory,
+                identity,
+                prefix,
+                segment,
+                name,
+                parent_prevalidated=index == 0,
+            )
             if resolved is None:
-                return False
+                return None
             candidate, information = resolved
             if index == len(segments) - 1:
-                return stat.S_ISREG(information.st_mode)
+                return information if stat.S_ISREG(information.st_mode) else None
             if not stat.S_ISDIR(information.st_mode):
-                return False
+                return None
             directory = candidate
             identity = (information.st_dev, information.st_ino)
             prefix += segment + "/"
-        return False  # pragma: no cover - normalize_logical_name rejects an empty name
+        return None  # pragma: no cover - normalize_logical_name rejects an empty name
 
     def _walk(self, *, include_pending: bool = False, below: str = "") -> Iterable[str]:
         """Yield regular files without ever following or ignoring a redirected component.
@@ -1574,7 +1864,9 @@ class LocalStorageDevice:
             try:
                 siblings = os.listdir(directory)
             except OSError as failure:
-                raise self._device_failure("list", prefix or self._root, failure) from failure
+                raise self._device_failure(
+                    "list", prefix or self._root, failure
+                ) from failure
             if segment not in siblings:
                 return  # absent, or stored under another case: no stored name starts with it
             candidate = os.path.join(directory, segment)
@@ -1593,7 +1885,9 @@ class LocalStorageDevice:
                 name + "/",
                 (information.st_dev, information.st_ino),
             )
-        pending: list[tuple[str, str, tuple[int, int]]] = [(directory, prefix, identity)]
+        pending: list[tuple[str, str, tuple[int, int]]] = [
+            (directory, prefix, identity)
+        ]
         while pending:
             directory, prefix, identity = pending.pop()
             for entry_name, path, child in self._list_proved_directory(
@@ -1638,7 +1932,9 @@ class LocalStorageDevice:
                     try:
                         information = entry.stat(follow_symlinks=False)
                     except OSError as failure:
-                        raise self._device_failure("inspect_path", name, failure) from failure
+                        raise self._device_failure(
+                            "inspect_path", name, failure
+                        ) from failure
                     self._refuse_foreign_component(name, entry.path, information)
                     # A DirEntry carries no inode on Windows: a subdirectory's identity comes
                     # from its own lstat, taken here while the parent is still the proved one.
@@ -1649,7 +1945,9 @@ class LocalStorageDevice:
                     )
                     snapshot.append((entry.name, entry.path, child))
         except OSError as failure:
-            raise self._device_failure("list", prefix or self._root, failure) from failure
+            raise self._device_failure(
+                "list", prefix or self._root, failure
+            ) from failure
         self._require_directory_identity(label, directory, identity)
         return tuple(snapshot)
 
@@ -1710,17 +2008,24 @@ class LocalStorageDevice:
         """
         if intent not in ("read", "write"):
             raise refuse_operation(
-                "invalid_intent", f"A descriptor is taken to read or to write, not to {intent!r}."
+                "invalid_intent",
+                f"A descriptor is taken to read or to write, not to {intent!r}.",
             )
         self._require_open()
         cached = self._handles.pop(name, None)
-        uses_generation = cached is not None and name in self._generation_revalidated_handles
+        uses_generation = (
+            cached is not None and name in self._generation_revalidated_handles
+        )
         generation_proved = (
             uses_generation
             and self._descriptor_identity_generation.get(name)
             == self._descriptor_generation
         )
-        if cached is not None and not generation_proved and not self._still_names(name, cached):
+        if (
+            cached is not None
+            and not generation_proved
+            and not self._still_names(name, cached)
+        ):
             # The directory entry moved from under the handle: another participant published
             # over this name with atomic_replace, and the cached descriptor now reads the OLD
             # file -- forever. A long-lived process that had once read control/commit.state kept
@@ -1740,7 +2045,9 @@ class LocalStorageDevice:
             self._handles[name] = cached
             if intent == "write":
                 self._acknowledge(name)
+            self._descriptor_cache_hits += 1
             return cached
+        self._descriptor_cache_misses += 1
         if not self._resolve_identity(name):
             raise refuse_missing_file(name, "open")
         path = self._joined_path(name)
@@ -1751,6 +2058,46 @@ class LocalStorageDevice:
         # under FR-5 that means no commit on this device could ever succeed again.
         if intent == "write":
             self._acknowledge(name)
+        return descriptor
+
+    def _descriptor_after_observation(
+        self, name: str, observed: os.stat_result
+    ) -> int:
+        """Return a read descriptor using one preceding exact-name observation.
+
+        The fused read door has already proved every namespace component and retained the final
+        no-follow identity. On a warm hit only ``fstat`` is needed to establish that the cached
+        handle is that observed file. A stale or missing cached handle still enters the normal
+        open/admission proof, including its bounded exact-name reprobe after ``open``.
+        """
+        self._require_open()
+        cached = self._handles.pop(name, None)
+        if cached is not None:
+            try:
+                held = os.fstat(cached)
+                still_current = (observed.st_dev, observed.st_ino) == (
+                    held.st_dev,
+                    held.st_ino,
+                )
+            except OSError:
+                still_current = False
+            if still_current:
+                if name in self._generation_revalidated_handles:
+                    self._descriptor_identity_generation[name] = (
+                        self._descriptor_generation
+                    )
+                self._handles[name] = cached
+                self._descriptor_cache_hits += 1
+                return cached
+            with contextlib.suppress(OSError):
+                os.close(cached)
+            self._paths.pop(name, None)
+            self._descriptor_identity_generation.pop(name, None)
+            self._generation_revalidated_handles.discard(name)
+        self._descriptor_cache_misses += 1
+        path = self._joined_path(name)
+        descriptor = self._open_named_descriptor(name, path, create_new=False)
+        self._admit(name, descriptor, path)
         return descriptor
 
     def _open_named_descriptor(self, name: str, path: str, *, create_new: bool) -> int:
@@ -1786,17 +2133,16 @@ class LocalStorageDevice:
             file=name,
         )
 
-    def _opened_descriptor_still_names(self, name: str, path: str, descriptor: int) -> bool:
+    def _opened_descriptor_still_names(
+        self, name: str, path: str, descriptor: int
+    ) -> bool:
         """Prove a just-opened descriptor is the current exact-case regular file at ``name``."""
         try:
             held = os.fstat(descriptor)
         except OSError:
             return False
-        if not self._resolve_identity(name):
-            return False
-        try:
-            current = os.stat(path)
-        except OSError:
+        current = self._resolve_identity(name)
+        if current is None:
             return False
         if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
             return False
@@ -1862,6 +2208,7 @@ class LocalStorageDevice:
                 for cached_name in self._handles
                 if cached_name not in self._pinned_handles
             )
+            self._descriptor_cache_evictions += 1
             self._release(oldest)
 
     def _still_names(self, name: str, descriptor: int) -> bool:
@@ -1883,13 +2230,15 @@ class LocalStorageDevice:
         file. Containment is not re-derived: it was proved at admission, and a plain component
         cannot have left a root whose identity still holds.
         """
-        path = self._paths.get(name)
-        if path is None:
-            path = self._physical_path(name)  # admitted without a proved path: prove it now
+        if self._paths.get(name) is None:
+            current = self._require_safe_path(
+                name
+            )  # admitted without a proved path: prove it now
         else:
-            self._require_safe_path(name, prove_containment=False)
+            current = self._require_safe_path(name, prove_containment=False)
+        if current is None:
+            return False
         try:
-            current = os.stat(path)
             held = os.fstat(descriptor)
         except OSError:
             return False
@@ -1947,14 +2296,22 @@ class LocalStorageDevice:
             raise refuse_unaligned_file(name, size)
         return size // self._page_size
 
-    def _page_offset(self, name: str, page_index: PageIndex, size: int, operation: str) -> int:
+    def _page_offset(
+        self, name: str, page_index: PageIndex, size: int, operation: str
+    ) -> int:
         """Return the byte offset of an allocated page, refusing an index that was never allocated."""
         count = self._page_count(name, size)
-        if not isinstance(page_index, int) or isinstance(page_index, bool) or not 0 <= page_index < count:
+        if (
+            not isinstance(page_index, int)
+            or isinstance(page_index, bool)
+            or not 0 <= page_index < count
+        ):
             raise refuse_page_not_allocated(name, page_index, count, operation)
         return page_index * self._page_size
 
-    def _prove_no_growth(self, name: str, descriptor: int, page_index: PageIndex, size: int) -> None:
+    def _prove_no_growth(
+        self, name: str, descriptor: int, page_index: PageIndex, size: int
+    ) -> None:
         """Refuse to leave a page write that made the file longer than it was.
 
         The offset was already proved to sit inside the file, so this can only happen when
@@ -1975,7 +2332,9 @@ class LocalStorageDevice:
             observed=after,
         )
 
-    def _append(self, name: str, descriptor: int, payload: bytes, *, rollback_to: int) -> int:
+    def _append(
+        self, name: str, descriptor: int, payload: bytes, *, rollback_to: int
+    ) -> int:
         """Append bytes at the end of a file and return the new size, or undo and refuse."""
         try:
             os.lseek(descriptor, 0, os.SEEK_END)
@@ -2055,7 +2414,9 @@ class LocalStorageDevice:
                 return action()
             except OSError as failure:
                 if attempt == self._retry_attempts or not _is_transient(failure):
-                    raise self._device_failure(operation, name, failure, attempts=attempt) from failure
+                    raise self._device_failure(
+                        operation, name, failure, attempts=attempt
+                    ) from failure
                 time.sleep(min(backoff, MAX_RETRY_SLEEP_SECONDS))
                 backoff *= 2.0
         raise self._exhausted(operation, name)
@@ -2186,7 +2547,10 @@ def _windows_posix_replace(source: str, target: str) -> None:
     try:
         request = _rename_request(ctypes_module, target)
         moved = library.SetFileInformationByHandle(  # type: ignore[attr-defined]
-            handle, _FILE_RENAME_INFO_EX, ctypes_module.byref(request), ctypes_module.sizeof(request)
+            handle,
+            _FILE_RENAME_INFO_EX,
+            ctypes_module.byref(request),
+            ctypes_module.sizeof(request),
         )
         if not moved:
             raise ctypes_module.WinError(ctypes_module.get_last_error())
@@ -2236,7 +2600,10 @@ def validate_allocation(file: str, count: object) -> int:
     """Return a usable page count, refusing zero, a negative number and an endless request."""
     if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
         raise refuse_operation(
-            "invalid_page_count", "allocate needs a count of one page or more.", file=file, count=count
+            "invalid_page_count",
+            "allocate needs a count of one page or more.",
+            file=file,
+            count=count,
         )
     if count > MAX_ALLOCATION_PAGES:
         raise refuse_operation(

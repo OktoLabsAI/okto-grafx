@@ -243,6 +243,8 @@ def test_pool_and_wal_views_do_no_io_or_telemetry_when_pages_are_cold() -> None:
         wal = database.wal
 
         assert pool.used_bytes() == 0
+        assert pool.retained_bytes_estimate() > 0
+        assert pool.retained_bytes_estimator == "python-v2"
         assert wal.last_lsn >= 0
         assert storage.trail() == ()
         assert metrics.calls == []
@@ -784,7 +786,8 @@ def test_autocommit_execute_preserves_primary_when_rollback_cleanup_escapes(
             "SystemExit" in note and "autocommit rollback sentinel" in note
             for note in getattr(statement_failure, "__notes__", ())
         )
-        assert database._transactions.open_transactions == 1
+        assert database.closed is True
+        assert database._transactions.open_transactions == 0
     finally:
         database.close()
 
@@ -1371,12 +1374,7 @@ def test_index_unwind_storage_can_wait_for_cross_thread_close_without_deadlock(
     def read_page(
         self: FaultInjectingStorageDevice, file: str, page_index: int
     ) -> bytes:
-        if (
-            self is storage
-            and armed[0]
-            and not fired[0]
-            and file.startswith("index/")
-        ):
+        if self is storage and armed[0] and not fired[0] and file.startswith("index/"):
             fired[0] = True
 
             def close() -> None:

@@ -6,6 +6,7 @@ import pytest
 
 from okto_grafx.domain.errors import (
     GrafxEmbeddingSpaceMismatch,
+    GrafxIndexError,
     GrafxPlanError,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
@@ -14,6 +15,7 @@ from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.ast import BinaryOperation, Direction, Literal, Parameter
 from okto_grafx.domain.query.plan import (
+    CreateIndex,
     CreateNodeTable,
     CreateRelTable,
     CreateRelationships,
@@ -59,7 +61,9 @@ def test_two_patterns_nest_into_one_tree_rather_than_two_queries() -> None:
 
 
 def test_a_traversal_hangs_off_the_operator_that_bound_its_source() -> None:
-    planned = plan_text("MATCH (a:Person)-[:Knows]->(b:Person) RETURN b.name")
+    planned = plan_text(
+        "MATCH (a:Person)-[:Knows]->(b:Person) RETURN b.name LIMIT 64"
+    )
     traversal = find_operator(planned.root, "TraverseRelationship")
     assert isinstance(traversal, TraverseRelationship)
     assert traversal.source == "a"
@@ -149,11 +153,11 @@ def test_the_conjunct_a_seek_consumed_does_not_stay_as_a_filter() -> None:
     assert "FilterRows" not in operators(planned.root)
 
 
-def test_a_conjunct_the_seek_did_not_consume_stays_as_a_filter() -> None:
+def test_a_seek_rechecks_the_original_conjunction_when_a_filter_remains() -> None:
     planned = plan_text("MATCH (p:Person) WHERE p.id = 7 AND p.age > 3 RETURN p.name")
     predicate = find_operator(planned.root, "FilterRows")
     assert isinstance(predicate, FilterRows)
-    assert predicate.predicate.describe() == "(p.age > 3)"
+    assert predicate.predicate.describe() == "((p.id = 7) AND (p.age > 3))"
 
 
 def test_a_composite_index_is_keyed_in_the_order_it_declared() -> None:
@@ -284,6 +288,23 @@ def test_a_skip_is_added_to_the_neighbour_count_rather_than_dropped() -> None:
     assert search.k == BinaryOperation(
         operator="+", left=Literal(value=10), right=Literal(value=5)
     )
+
+
+@pytest.mark.parametrize("updating", ["DELETE n", "SET n.layer = 9"])
+def test_a_return_window_never_bounds_a_vector_search_that_writes(
+    updating: str,
+) -> None:
+    """DELETE/SET consume the complete match before RETURN applies SKIP or LIMIT."""
+    planned = plan_text(
+        "MATCH (n:Chunk) "
+        "WHERE similarity(n.embedding, $q, space => 'minilm_v2') > 0.2 "
+        f"{updating} "
+        "RETURN n.id, similarity_score() AS score ORDER BY score DESC SKIP 1 LIMIT 2"
+    )
+    search = find_operator(planned.root, "VectorSearch")
+    assert isinstance(search, VectorSearch)
+    assert search.k is None
+    assert search.bounded is False
 
 
 def test_a_search_with_no_limit_scores_every_candidate() -> None:
@@ -475,6 +496,91 @@ def test_a_merge_of_a_longer_path_is_refused() -> None:
 # --- schema ---------------------------------------------------------------------------------
 
 
+def test_a_custom_index_plan_resolves_ordered_positions_and_default_sizing() -> None:
+    planned = plan_text(
+        "CREATE INDEX by_city_age FOR (p:Person) ON (p.city, p.age)"
+    )
+    assert isinstance(planned.root, CreateIndex)
+    assert planned.root.table.name == "Person"
+    assert planned.root.positions == (3, 2)
+    assert planned.root.bucket_count == 64
+    assert planned.root.expected_cardinality is None
+    assert planned.writes is True
+
+
+def test_a_custom_index_plan_resolves_expected_cardinality_sizing() -> None:
+    planned = plan_text(
+        "CREATE INDEX by_name FOR (p:Person) ON (p.name) "
+        "OPTIONS expected_cardinality = 4097"
+    )
+    assert isinstance(planned.root, CreateIndex)
+    assert planned.root.bucket_count == 128
+    assert planned.root.expected_cardinality == 4097
+
+
+def test_a_custom_index_plan_preserves_an_explicit_legal_bucket_count() -> None:
+    planned = plan_text(
+        "CREATE INDEX by_name FOR (p:Person) ON (p.name) OPTIONS bucket_count = 17"
+    )
+    assert isinstance(planned.root, CreateIndex)
+    assert planned.root.bucket_count == 17
+    assert planned.root.expected_cardinality is None
+
+
+@pytest.mark.parametrize(
+    ("text", "error", "field"),
+    [
+        ("CREATE INDEX i FOR (p:Nope) ON (p.name)", GrafxPlanError, "table"),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.nope)",
+            GrafxIndexError,
+            "columns",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name, p.name)",
+            GrafxIndexError,
+            "positions",
+        ),
+        ("CREATE INDEX i FOR (r:Knows) ON (r.since)", GrafxPlanError, "table"),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS bucket_count = 4097",
+            GrafxIndexError,
+            "bucket_count",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) "
+            "OPTIONS expected_cardinality = 262145",
+            GrafxIndexError,
+            "expected_cardinality",
+        ),
+        (
+            "CREATE INDEX rid_t_custom FOR (p:Person) ON (p.name)",
+            GrafxIndexError,
+            "name",
+        ),
+        (
+            "CREATE INDEX g_0000000000000001 FOR (p:Person) ON (p.name)",
+            GrafxIndexError,
+            "name",
+        ),
+        (
+            "CREATE INDEX PERSON_ID FOR (p:Person) ON (p.name)",
+            GrafxPlanError,
+            "name",
+        ),
+    ],
+)
+def test_a_custom_index_plan_refuses_unresolved_or_out_of_domain_definitions(
+    text: str,
+    error: type[Exception],
+    field: str,
+) -> None:
+    with pytest.raises(error) as failure:
+        plan_text(text)
+
+    assert failure.value.details["field"] == field
+
+
 def test_a_node_table_plan_resolves_its_column_types() -> None:
     planned = plan_text("CREATE NODE TABLE Team(id INT64, label STRING, PRIMARY KEY(id))")
     assert isinstance(planned.root, CreateNodeTable)
@@ -628,7 +734,9 @@ def test_a_traversal_that_could_match_nothing_is_refused_rather_than_run() -> No
 
 
 def test_an_incoming_traversal_checks_the_other_endpoint() -> None:
-    planned = plan_text("MATCH (d:Doc)<-[:BELONGS_TO]-(n:Chunk) RETURN n.id")
+    planned = plan_text(
+        "MATCH (d:Doc)<-[:BELONGS_TO]-(n:Chunk) RETURN n.id LIMIT 64"
+    )
     traversal = find_operator(planned.root, "TraverseRelationship")
     assert isinstance(traversal, TraverseRelationship)
     assert traversal.direction is Direction.INCOMING

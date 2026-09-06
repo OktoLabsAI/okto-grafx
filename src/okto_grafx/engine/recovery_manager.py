@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Sequence
+from inspect import getattr_static
 from typing import Protocol, cast, runtime_checkable
 
 from okto_grafx.domain.errors import (
@@ -77,6 +78,10 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import NO_LSN, Lsn
+from okto_grafx.domain.model.catalog import (
+    CATALOG_FORMAT_VERSION,
+    CATALOG_LEGACY_FORMAT_VERSION,
+)
 from okto_grafx.domain.ledger.classification import classify_failure, classify_record
 from okto_grafx.domain.ledger.entry import LedgerOriginClass, LedgerReason
 from okto_grafx.domain.ledger.payload import LedgerPayload
@@ -106,11 +111,11 @@ from okto_grafx.domain.recovery.report import (
     stronger_outcome,
 )
 from okto_grafx.domain.recovery.retry import RETRYABLE_KEY, is_retryable
-from okto_grafx.domain.txn.commit_state import CommitState
-from okto_grafx.domain.txn.records import decode_page_write
+from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FORMAT_VERSION, CommitState
+from okto_grafx.domain.txn.records import decode_page_write_location
 from okto_grafx.domain.wal.record import WalRecordType
 from okto_grafx.engine.buffer_pool import BufferPool
-from okto_grafx.engine.commit_redo import CommitRedo, is_redoable_page_file
+from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.coordination import COMMIT_SECTION
 from okto_grafx.engine.ledger_store import LedgerStore
@@ -293,9 +298,7 @@ than by a caller that skipped the fence.
 """
 
 
-def _control_record_size_allowed(
-    storage: StorageDevice, name: str, size: int
-) -> bool:
+def _control_record_size_allowed(storage: StorageDevice, name: str, size: int) -> bool:
     """Accept legacy records, plus exactly one three-page format-2 writer lease.
 
     A size merely below the slot-file ceiling is not enough: that would let arbitrary oversized
@@ -641,6 +644,7 @@ class RecoveryManager:
         self._require_permit(permit)
         self._check_meta()
         state = self._state_store.read()
+        self._state_store.redundancy_needs_repair(state)
         plan = plan_recovery(self._wal.scan_all(), floor_lsn=state.checkpoint_lsn)
         if plan.unsupported is not None:
             raise GrafxSchemaVersionMismatch(
@@ -691,6 +695,8 @@ class RecoveryManager:
         findings: list[RecoveryFinding] = []
         self._check_meta()
         state, state_was_damaged = self._read_recovery_state()
+        if not state_was_damaged:
+            self._state_store.redundancy_needs_repair(state)
         manager = self._index_manager
         plan = self._scan(findings, floor_lsn=state.checkpoint_lsn)
         if plan.unsupported is not None:
@@ -708,7 +714,9 @@ class RecoveryManager:
         # a conservative stale bit into an index header. A bad effect late in the committed plan
         # must not leave either an applied page prefix or unrelated control/index publication
         # behind merely because static validation used to live inside the later redo step.
-        self._preflight_committed_replay(replay)
+        preflighted, preflight_touched_catalog = self._preflight_committed_replay(
+            replay, permit
+        )
         if manager is not None and not state_was_damaged:
             # The checkpoint is the replay floor. An index already behind it cannot be completed
             # from the retained WAL suffix and must be marked stale BEFORE replay; otherwise the
@@ -758,6 +766,8 @@ class RecoveryManager:
             state=state,
             state_was_damaged=state_was_damaged,
             permit=permit,
+            preflighted=preflighted,
+            preflight_touched_catalog=preflight_touched_catalog,
         )
         self._count_outcome(outcome)
         report = RecoveryReport(
@@ -1349,7 +1359,9 @@ class RecoveryManager:
                 deferred_segments=tuple(report.deferred_segments),
             )
 
-    def _preflight_committed_replay(self, replay: CommittedReplay) -> None:
+    def _preflight_committed_replay(
+        self, replay: CommittedReplay, permit: _RecoveryPermit
+    ) -> tuple[object, bool]:
         """Validate every committed effect before recovery performs its first mutation.
 
         Startup intentionally delays catalog interpretation until recovery owns the commit
@@ -1358,17 +1370,20 @@ class RecoveryManager:
         names introduced by those pages are deferred; payload/image validation still runs now,
         and the index-only subplan is preflighted strictly after adoption inside :meth:`_redo`.
         """
+        self._require_permit(permit)
         touched_catalog = any(
-            decode_page_write(record.payload).file == _CATALOG_FILE
+            decode_page_write_location(record.payload).file == _CATALOG_FILE
             for record in replay.effects
             if record.record_type == int(WalRecordType.WRITE_PAGE)
         )
         if not touched_catalog and self._index_sync is not None:
             self._index_sync()
-        self._redo_engine.preflight(
+        proof = self._redo_engine.preflight(
             replay,
             allow_unregistered_indexes=touched_catalog,
+            _passage=permit,
         )
+        return proof, touched_catalog
 
     def _redo(
         self,
@@ -1379,6 +1394,8 @@ class RecoveryManager:
         state: CommitState,
         state_was_damaged: bool,
         permit: _RecoveryPermit,
+        preflighted: object | None = None,
+        preflight_touched_catalog: bool | None = None,
     ) -> int:
         """Complete committed WAL work and publish it as one fail-closed unit.
 
@@ -1402,29 +1419,11 @@ class RecoveryManager:
             if record.record_type
             in (int(WalRecordType.INDEX_WRITE), int(WalRecordType.INDEX_RECONCILE))
         )
-        touched_catalog = False
-        for record in page_records:
-            write = decode_page_write(record.payload)
-            if not is_redoable_page_file(write.file):
-                findings.append(
-                    RecoveryFinding(
-                        kind=FindingKind.REDO_REFUSED,
-                        detail=(
-                            f"Record {record.lsn} names {write.file!r}, which is not a paged "
-                            "file of this database; commit completion was refused."
-                        ),
-                        file=write.file,
-                        lsn=record.lsn,
-                    )
-                )
-                raise GrafxRecoveryRefused(
-                    f"Committed page record {record.lsn} names non-data file "
-                    f"{write.file!r}; commit-state publication was refused.",
-                    field="file",
-                    file=write.file,
-                    lsn=record.lsn,
-                )
-            touched_catalog = touched_catalog or write.file == _CATALOG_FILE
+        if preflight_touched_catalog is None:
+            preflight_touched_catalog = any(
+                decode_page_write_location(record.payload).file == _CATALOG_FILE
+                for record in page_records
+            )
 
         page_replay = CommittedReplay(
             effects=page_records, last_committed_lsn=replay.last_committed_lsn
@@ -1433,7 +1432,7 @@ class RecoveryManager:
             effects=index_records, last_committed_lsn=replay.last_committed_lsn
         )
         manager = self._index_manager
-        if not touched_catalog and self._index_sync is not None:
+        if not preflight_touched_catalog and self._index_sync is not None:
             # Startup deliberately postpones interpreting catalog bytes until recovery owns the
             # commit section. When this WAL range does not replace catalog pages, the existing
             # catalog is already the authority, so adopt its existing indexes now. This turns
@@ -1443,10 +1442,25 @@ class RecoveryManager:
         # changes. A catalog effect may be the authority that introduces an index to this
         # participant, so only that registry lookup is deferred; after catalog adoption the
         # index-only apply below performs its ordinary strict preflight before dispatch.
-        self._redo_engine.preflight(
+        full_preflight = self._redo_engine._ensure_preflight(
             replay,
-            allow_unregistered_indexes=touched_catalog,
+            preflighted,
+            allow_unregistered_indexes=preflight_touched_catalog,
+            passage=permit,
         )
+        touched_catalog = preflight_touched_catalog
+        page_preflight = self._redo_engine._project_page_preflight(
+            replay,
+            page_replay,
+            full_preflight,
+            allow_unregistered_indexes=touched_catalog,
+            passage=permit,
+        )
+        if page_preflight is None:
+            raise GrafxRecoveryRefused(
+                "The recovery page subplan no longer matches its complete preflight.",
+                field="preflighted_replay",
+            )
         target = max(state.last_committed_lsn, replay.last_committed_lsn)
         # The scan proves that the bytes form complete records; it does not prove that the process
         # which appended them forced them to stable storage. Recovery must establish that proof
@@ -1456,7 +1470,11 @@ class RecoveryManager:
         if target > state.checkpoint_lsn:
             first = NO_LSN + 1 if state_was_damaged else state.checkpoint_lsn + 1
             self._wal.force_barrier_range(first, target)
-        page_result = self._redo_engine.apply(page_replay)
+        page_result = self._redo_engine.apply(
+            page_replay,
+            _preflighted=page_preflight,
+            _passage=permit,
+        )
         if touched_catalog:
             self._adopt_catalog(findings)
         if touched_catalog and self._index_sync is not None:
@@ -1494,15 +1512,43 @@ class RecoveryManager:
             else:
                 marker(target)
 
-        # WAL remains the durability authority; publication below is the last visible act.
-        if target > state.last_committed_lsn or state_was_damaged:
-            self._state_store.publish(
-                CommitState(
-                    last_committed_lsn=target,
-                    last_csn=target,
-                    checkpoint_lsn=state.checkpoint_lsn,
-                )
+        # WAL remains the durability authority; publication below is the last visible act. A
+        # replayed catalog-v2 activation promotes the same-size mixed-fleet fence, including the
+        # crash window after catalog apply and before the original publisher reached commit.state.
+        format_version = self._commit_state_format_for_catalog(state.format_version)
+        needs_publication = (
+            target > state.last_committed_lsn
+            or state_was_damaged
+            or format_version != state.format_version
+        )
+        published_state = (
+            CommitState(
+                last_committed_lsn=target,
+                last_csn=target,
+                checkpoint_lsn=state.checkpoint_lsn,
+                format_version=format_version,
             )
+            if needs_publication
+            else state
+        )
+        if needs_publication:
+            # Recovery publication must not outrun the physical files it certifies.  Flush only
+            # makes dirty frames visible to the device; establish per-file durability after the
+            # index completion marker (which may dirty headers without a logical index record)
+            # and before commit.state becomes the visible authority.  A deterministic, explicit
+            # file set avoids the broader and adapter-dependent ``barrier(None)`` door.
+            durable_files = set(page_result.touched_files)
+            durable_files.update(index_result.touched_files)
+            if manager is not None:
+                durable_files.update(index.file for index in manager.active_indexes())
+            for file in sorted(durable_files):
+                self._pool.durability_barrier(file)
+            self._state_store.publish(
+                published_state,
+                previous=state,
+                previous_was_damaged=state_was_damaged,
+            )
+        self._state_store.repair_redundancy(published_state)
 
         replayed = page_result.effects_replayed + index_result.effects_replayed
         if replayed and self._metrics.enabled:
@@ -1573,8 +1619,71 @@ class RecoveryManager:
         """
         try:
             return self._state_store.read(), False
+        except GrafxCorruptionDetected as failure:
+            if failure.details.get("commit_state_reconstructible", False) is not True:
+                raise
+            minimum_format = failure.details.get(
+                "commit_state_minimum_format_version", 1
+            )
+            return (
+                CommitState(
+                    format_version=self._commit_state_format_for_catalog(
+                        minimum_format, tolerate_unreadable=True
+                    )
+                ),
+                True,
+            )
+
+    def _commit_state_format_for_catalog(
+        self, fallback: int, *, tolerate_unreadable: bool = False
+    ) -> int:
+        """Derive the non-downgradable control fence from durable catalog pages.
+
+        Recovery runs before normal startup adopts the catalog, so it reads through the
+        non-destructive ``read_from_pages`` door. During the initial damaged-state probe a torn
+        catalog may still be repairable by retained WAL and is tolerated; before publication the
+        same uncertainty is a refusal, never permission to emit version 1 over catalog v2.
+        """
+
+        reader = getattr(self._catalog, "read_from_pages", None)
+        if not callable(reader):
+            return fallback
+        bootstrap_probe = getattr(self._catalog, "is_bootstrapped", None)
+        if callable(bootstrap_probe) and not bootstrap_probe():
+            if fallback == COMMIT_STATE_FORMAT_VERSION:
+                raise GrafxRecoveryRefused(
+                    "Commit-state format 2 requires a bootstrapped catalog format 2; recovery "
+                    "will not infer or lower that fleet fence.",
+                    field="format_version",
+                    commit_state_format=fallback,
+                    catalog_bootstrapped=False,
+                )
+            return fallback
+        try:
+            catalog = reader()
         except GrafxCorruptionDetected:
-            return CommitState(), True
+            if tolerate_unreadable:
+                return fallback
+            raise
+        observed = getattr(catalog, "format_version", None)
+        if observed == CATALOG_FORMAT_VERSION:
+            return COMMIT_STATE_FORMAT_VERSION
+        if observed != CATALOG_LEGACY_FORMAT_VERSION:
+            raise GrafxRecoveryRefused(
+                f"Recovery read unsupported catalog format {observed!r} before publication.",
+                field="format_version",
+                value=observed,
+                supported=CATALOG_FORMAT_VERSION,
+            )
+        if fallback == COMMIT_STATE_FORMAT_VERSION:
+            raise GrafxRecoveryRefused(
+                "Commit-state format 2 requires catalog format 2, but durable catalog pages "
+                "still decode as version 1; recovery will not downgrade the fleet fence.",
+                field="format_version",
+                commit_state_format=fallback,
+                catalog_format=observed,
+            )
+        return fallback
 
     def _validate_publication_lineage(
         self,
@@ -1876,14 +1985,33 @@ def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str
 
 
 def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
-    """Refuse a port or collaborator that cannot answer the doors recovery opens (G5)."""
-    missing = [name for name in methods if not hasattr(instance, name)]
+    """Refuse a port or collaborator that cannot answer the doors recovery opens (G5).
+
+    Inspect declared attributes without invoking descriptors.  In particular, ``damage`` is
+    scan-backed on a freshly opened native WAL (and may be on alternative implementations), so
+    ``hasattr`` would perform a full pass merely to validate the port shape.  A dynamic fallback
+    keeps transparent ``__getattr__`` wrappers compatible; as with ``hasattr``, only
+    ``AttributeError`` means that a door is absent and every other exception remains visible.
+    """
+    missing = [name for name in methods if not _port_has_attribute(instance, name)]
     if missing:
         raise GrafxPortNotConfigured(
             f"The {slot} port of recovery is missing {', '.join(missing)}.",
             slot=slot,
             missing=tuple(missing),
         )
+
+
+def _port_has_attribute(instance: object, name: str) -> bool:
+    """Return whether ``instance`` declares or dynamically supplies ``name`` without eager IO."""
+    try:
+        getattr_static(instance, name)
+    except AttributeError:
+        try:
+            getattr(instance, name)
+        except AttributeError:
+            return False
+    return True
 
 
 def _one_policy(recovery_policy: object, policy: object) -> object:

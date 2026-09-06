@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
@@ -59,9 +60,11 @@ from okto_grafx.domain.model.schema import (
     SOURCE_COLUMN,
     TARGET_COLUMN,
     TableDef,
+    decode_relationship_endpoints,
     decode_tuple,
     encode_tuple,
 )
+from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
 from okto_grafx.domain.model.value import Value
 from okto_grafx.domain.page import (
     FILE_HEADER_SIZE,
@@ -101,6 +104,9 @@ __all__ = [
     "TableExtent",
     "RecordIdFloorAdvance",
     "RecordIdFloorPlan",
+    "HeapReclaimFloorPlan",
+    "HeapVacuumPlan",
+    "HeapVacuumTablePlan",
     "HeapVersion",
     "HeapStore",
 ]
@@ -292,6 +298,140 @@ class _HeapScanPosition:
     chain_limit: int
 
 
+class _VisibleRecordCursor:
+    """Resume one canonical, snapshot-filtered header walk without retaining a page pin.
+
+    The cursor is deliberately narrower than :meth:`HeapStore.scan_page`: endpoint validation
+    needs only the identity and physical reference of rows the snapshot can see.  Payloads stay
+    on the heap until the one requested candidate is revalidated and fully decoded.  One page is
+    inspected into a compact tuple before its pin is released, so pausing the cursor never keeps
+    a frame resident by capability.
+
+    ``admit_page`` lets the query engine charge the growing visited-page proof before it grows.
+    Keeping that proof is not optional: it preserves the canonical walk's immediate cycle
+    refusal instead of replacing it with a later chain-length failure.
+    """
+
+    __slots__ = (
+        "_store",
+        "_table",
+        "_snapshot",
+        "_admit_page",
+        "_next_page",
+        "_pending",
+        "_pending_at",
+        "_seen",
+        "_limit",
+        "_steps",
+        "_closed",
+    )
+
+    def __init__(
+        self,
+        store: HeapStore,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        admit_page: Callable[[], None],
+    ) -> None:
+        """Capture the physical end and first page of this canonical walk."""
+        extent = store._find_extent(table.table_id)
+        self._store = store
+        self._table = table
+        self._snapshot = snapshot
+        self._admit_page = admit_page
+        self._next_page = NO_PAGE if extent is None else extent.first_page
+        self._pending: tuple[tuple[RecordRef, RecordId], ...] = ()
+        self._pending_at = 0
+        self._seen: set[PageIndex] = visited_pages()
+        self._limit = store._chain_limit()
+        self._steps = 0
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        """Return whether this cursor has released all of its derived state."""
+        return self._closed
+
+    def close(self) -> None:
+        """Release every retained header/reference and make the cursor terminal."""
+        self._pending = ()
+        self._pending_at = 0
+        self._seen.clear()
+        self._next_page = NO_PAGE
+        self._closed = True
+
+    def next_visible(self) -> tuple[RecordRef, RecordId] | None:
+        """Return the next visible identity in storage order, or None at the captured end."""
+        if self._closed:
+            return None
+        while True:
+            if self._pending_at < len(self._pending):
+                item = self._pending[self._pending_at]
+                self._pending_at += 1
+                return item
+            self._pending = ()
+            self._pending_at = 0
+            index = self._next_page
+            if index == NO_PAGE:
+                self.close()
+                return None
+
+            self._steps += 1
+            self._store._refuse_endless_chain(self._table, self._steps, self._limit)
+            if index in self._seen:
+                raise GrafxCorruptionDetected(
+                    f"The page chain of table {self._table.name!r} returns to page {index}.",
+                    file=self._store._file,
+                    page=index,
+                    field="cycle",
+                )
+            # Admission precedes the set growth.  A caller that refuses it can close this cursor
+            # and fall back to an ordinary canonical lookup without one unaccounted page entry.
+            self._admit_page()
+            self._seen.add(index)
+            selected: list[tuple[RecordRef, RecordId]] = []
+            with self._store._pool.pinned(self._store._file, index) as page:
+                self._store._require_table_page(page, self._table)
+                for slot in page.live_slots():
+                    if slot < FIRST_RECORD_SLOT:
+                        continue
+                    fields = RecordHeader.peek(page.slot_view(slot))
+                    (
+                        _flags,
+                        _reserved,
+                        _schema_version,
+                        _payload_len,
+                        record_id,
+                        xmin,
+                        xmax,
+                        _previous,
+                    ) = fields
+                    if self._snapshot.visible(xmin, xmax):
+                        selected.append((RecordRef(page=index, slot=slot), record_id))
+                following = page.next_page
+            if following != NO_PAGE and following >= self._limit - 1:
+                current_page_ceiling = self._store._chain_limit() - 1
+                if following >= current_page_ceiling:
+                    raise GrafxCorruptionDetected(
+                        f"The page chain of table {self._table.name!r} in "
+                        f"{self._store._file!r} points to page {following}, outside a file "
+                        f"with {current_page_ceiling} pages.",
+                        file=self._store._file,
+                        table=self._table.name,
+                        page=following,
+                        field="next_page",
+                        page_count=current_page_ceiling,
+                    )
+                # A concurrently appended page cannot contain a version visible to this older
+                # snapshot. Validate its type/owner, then keep the physical horizon captured at
+                # cursor creation instead of drifting into an unbounded stream of new pages.
+                with self._store._pool.pinned(self._store._file, following) as appended:
+                    self._store._require_table_page(appended, self._table)
+                following = NO_PAGE
+            self._next_page = following
+            self._pending = tuple(selected)
+
+
 @dataclass(frozen=True, slots=True)
 class TableExtent:
     """Where the pages of one table are: the first, the last, and how many there are."""
@@ -335,7 +475,7 @@ class TableExtent:
         )
 
     @classmethod
-    def decode(cls, raw: bytes) -> TableExtent:
+    def decode(cls, raw: bytes | memoryview) -> TableExtent:
         """Parse a directory entry from the header page of the heap."""
         if len(raw) != DIRECTORY_ENTRY_SIZE:
             raise GrafxCorruptionDetected(
@@ -368,6 +508,33 @@ class TableExtent:
 
 
 @dataclass(frozen=True, slots=True)
+class _ExtentAuthority:
+    """Frozen reservation authority carried by one opaque commit-local proof."""
+
+    owner: object
+    seal: object
+    table_id: int
+    first_page: PageIndex
+    durable_floor: RecordId
+
+
+@dataclass(slots=True)
+class _ExtentCursor:
+    """Mutable physical hint whose authority remains in its frozen sibling."""
+
+    extent: TableExtent
+    derived_epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ExtentProof:
+    """One sealed reservation authority plus its revocable settled-tail cursor."""
+
+    authority: _ExtentAuthority
+    cursor: _ExtentCursor
+
+
+@dataclass(frozen=True, slots=True)
 class RecordIdFloorAdvance:
     """One table's durable identity floor before and after a staged reservation."""
 
@@ -390,10 +557,70 @@ class RecordIdFloorPlan:
     advances: tuple[RecordIdFloorAdvance, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class HeapReclaimFloorPlan:
+    """Detached heap page-zero image advancing the global retained-snapshot floor."""
+
+    page_index: PageIndex
+    image: bytes
+    old_floor: Lsn
+    new_floor: Lsn
+
+
+@dataclass(frozen=True, slots=True)
+class HeapVacuumTablePlan:
+    """Deterministic physical effects selected for one table."""
+
+    table_id: int
+    pages_scanned: int
+    eligible_inline_versions: int
+    reclaimed_versions: int
+    reclaimed_slot_bytes: int
+    relinked_versions: int
+    skipped_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class HeapVacuumPlan:
+    """Detached data-page images and accounting for one bounded heap reclaim pass."""
+
+    horizon_lsn: Lsn
+    page_images: tuple[tuple[PageIndex, bytes], ...]
+    tables: tuple[HeapVacuumTablePlan, ...]
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _HeapBloatSample:
+    """Header-only physical counts for one table at one conservative horizon."""
+
+    table_id: int
+    data_pages: int
+    slot_directory_entries: int
+    free_slots: int
+    stored_versions: int
+    ended_versions: int
+    horizon_eligible_versions: int
+    horizon_retained_versions: int
+    horizon_eligible_slot_bytes: int
+    horizon_retained_slot_bytes: int
+    overflow_versions: int
+    horizon_eligible_overflow_versions: int
+
+
 class HeapStore:
     """Insert, update, delete, read and scan record versions over a paged heap file."""
 
-    __slots__ = ("_pool", "_catalog", "_file", "_tail_cache")
+    __slots__ = (
+        "_pool",
+        "_catalog",
+        "_file",
+        "_tail_cache",
+        "_extent_slots",
+        "_extent_slots_epoch",
+        "_bootstrapped_epoch",
+        "_extent_proof_seal",
+    )
 
     def __init__(
         self, pool: BufferPool, catalog: CatalogStore, *, file: str = HEAP_FILE
@@ -414,6 +641,22 @@ class HeapStore:
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
         # start and another process read (A40.3).
         self._tail_cache: dict[int, tuple[PageIndex, int, int]] = {}
+        # Directory slots are stable within one header image.  Remembering the slot removes
+        # the three page-zero directory walks an inserted row otherwise pays (find, identity
+        # update and tail-hint update).  The entry remains only a hint: every use reads the
+        # current slot view and verifies its table-id prefix before decoding it.
+        self._extent_slots: dict[int, SlotId] = {}
+        self._extent_slots_epoch: tuple[int | None, int] | None = None
+        # Internal operations may reuse a successful header proof only while the exact page
+        # view it proved remains current. The public predicate never trusts this memo.
+        self._bootstrapped_epoch: int | None = None
+        self._extent_proof_seal = object()
+        # TransactionManager and recovery use the shared page-image door directly. Registering
+        # the heap format classifier here lets those paths make the same structural distinction
+        # as HeapStore.apply_page_image without teaching either component the heap layout.
+        self._pool._register_structure_signature(
+            self._file, HeapStore._page_structure_signature
+        )
 
     @property
     def catalog(self) -> CatalogStore:
@@ -460,12 +703,21 @@ class HeapStore:
         """
         storage = self._pool.storage
         if not storage.exists(self._file) or storage.page_count(self._file) == 0:
+            self._set_bootstrapped_epoch(None)
             return False
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
+                self._set_bootstrapped_epoch(None)
                 return False
             self._require_header_page(page)
+        self._set_bootstrapped_epoch(self._pool.derived_epoch(self._file))
         return True
+
+    def _set_bootstrapped_epoch(self, epoch: int | None) -> None:
+        """Move the header proof and invalidate hints derived under another proof."""
+        if self._bootstrapped_epoch != epoch:
+            self._invalidate_extent_slots()
+        self._bootstrapped_epoch = epoch
 
     def bootstrap(self) -> None:
         """Create the heap file and reserve its header page if that has not happened yet."""
@@ -541,14 +793,126 @@ class HeapStore:
         pages included, because recovery replays what the log recorded and the log records page
         images without caring what the page is for.
 
-        Whatever this store walked to and remembered stops being trusted here, though not by
-        this method: the image carries its own next_page, so a redo can take pages out of a chain
-        without touching the page a walk stopped at, and the pool records that by advancing the
-        structure epoch of the file. Every holder of a derived walk reads that epoch before it
-        trusts what it derived. Clearing the cache here as well would answer the same question a
-        second time and make the first answer impossible to test (A34).
+        The heap supplies its structural signature to the shared redo door.  Page type, flags,
+        chain links, data-page ownership and page-zero directory authority move the structure
+        epoch; record payload, MVCC fields, durable hints and LSN/sequence stamps do not.  This
+        keeps a same-handle commit from discarding the tail, extent-slot and locator work it just
+        established while retaining the conservative epoch boundary for every relink or change
+        of ownership.
         """
-        return apply_page_image(self._pool, self._file, page_index, image)
+        before = (
+            self._pool.structure_epoch(self._file),
+            self._pool.cache_drop_epoch(self._file),
+        )
+        applied = apply_page_image(
+            self._pool,
+            self._file,
+            page_index,
+            image,
+            structure_signature=self._page_structure_signature,
+        )
+        after = (
+            self._pool.structure_epoch(self._file),
+            self._pool.cache_drop_epoch(self._file),
+        )
+        if applied and before != after:
+            # Structural images and concurrent cache/view drops revoke the slot proof eagerly.
+            # Pure content images preserve it; its epoch is still revalidated on every use.
+            self._invalidate_extent_slots()
+        return applied
+
+    @staticmethod
+    def _page_structure_signature(page: Page) -> object:
+        """Return only the heap page fields that authorize derived physical locations.
+
+        Data-page rows are intentionally absent.  A record append or MVCC stamp cannot change
+        the chain or page owner, and an older snapshot cannot observe a version appended after
+        its horizon.  Reclamation likewise cannot remove a version admitted by a live snapshot.
+        The record slot directory is therefore content for this purpose, while slot zero is the
+        page-owner authority and remains structural.
+
+        Page zero is narrower than a byte-for-byte signature.  The file header, directory slot
+        topology, table id and first page are authority.  ``last_page``, ``page_count`` and
+        ``next_record_id`` are durable hints/counters updated by ordinary DML and are verified or
+        repaired by their existing readers.  A malformed entry is represented by its complete
+        payload, making the classifier conservative without moving validation out of the
+        canonical heap doors.
+        """
+
+        common = (
+            page.page_type,
+            page.flags,
+            page.header().reserved,
+            page.next_page,
+        )
+        if page.page_type == int(PageType.HEAP):
+            return (*common, "heap", HeapStore._slot_authority(page, DESCRIPTOR_SLOT))
+        if page.page_type != int(PageType.META) or page.page_index != HEADER_PAGE_INDEX:
+            return common
+
+        entries: list[object] = []
+        for slot in range(EXTENT_FIRST_SLOT, page.slot_count):
+            if page.is_slot_free(slot):
+                entries.append((slot, "free"))
+                continue
+            payload = page.slot_view(slot)
+            if len(payload) != DIRECTORY_ENTRY_SIZE:
+                entries.append((slot, "malformed", bytes(payload)))
+                continue
+            table_id, first_page = struct.unpack_from("<II", payload)
+            entries.append((slot, "extent", table_id, first_page))
+        return (
+            *common,
+            "meta",
+            page.slot_count,
+            HeapStore._slot_authority(page, 0),
+            tuple(entries),
+        )
+
+    def _watermark_extent_roots(self, page: Page) -> dict[int, PageIndex]:
+        """Return the complete table-to-chain-root authority of one heap header image.
+
+        ``committed_high_water`` reaches a table only through ``first_page`` and then through
+        data-page links.  The other extent fields are durable allocation/identity hints and do
+        not select a row header.  Comparing this exact projection therefore proves whether a
+        replayed META image can change any table watermark walk, while duplicate/malformed
+        directory authority remains an optimization miss rather than an omitted table.
+        """
+        if page.page_index != HEADER_PAGE_INDEX:
+            raise GrafxCorruptionDetected(
+                f"Heap metadata page {page.page_index} cannot describe the reserved header "
+                f"page {HEADER_PAGE_INDEX}.",
+                file=self._file,
+                page=page.page_index,
+                field="header_page_index",
+                value=page.page_index,
+            )
+        self._require_header_page(page)
+        roots: dict[int, PageIndex] = {}
+        for slot, payload in page.iter_slot_views():
+            if slot < EXTENT_FIRST_SLOT:
+                continue
+            extent = self._require_first_page(TableExtent.decode(payload))
+            if extent.table_id in roots:
+                raise GrafxCorruptionDetected(
+                    f"Table {extent.table_id} has more than one directory entry on the "
+                    f"header page of {self._file!r}.",
+                    file=self._file,
+                    page=HEADER_PAGE_INDEX,
+                    table_id=extent.table_id,
+                    field="directory_entry",
+                )
+            roots[extent.table_id] = extent.first_page
+        return roots
+
+    @staticmethod
+    def _slot_authority(page: Page, slot: SlotId) -> object:
+        """Return a total signature for one authoritative slot, including absence/free state."""
+        if slot >= page.slot_count:
+            return ("missing",)
+        if page.is_slot_free(slot):
+            return ("free",)
+        return ("value", bytes(page.slot_view(slot)))
 
     # --- writing ---------------------------------------------------------------------------
 
@@ -724,6 +1088,306 @@ class HeapStore:
             advances=tuple(advances),
         )
 
+    def reclaim_floor(self) -> Lsn:
+        """Return and validate the global minimum snapshot retained by this heap.
+
+        Heap files predating vacuum use ``(root_page=NO_PAGE, payload_length=0)``.  Vacuum v1
+        reuses these otherwise-unused heap-header fields as ``(HEADER_PAGE_INDEX, floor_lsn)``;
+        the catalog capability makes that interpretation unambiguous across binary versions.
+        """
+
+        with self._pinned_validated_header() as (_page, header):
+            return self._decode_reclaim_floor(header)
+
+    def plan_reclaim_floor(self, floor: Lsn) -> HeapReclaimFloorPlan:
+        """Plan a monotonic durable floor advance without changing resident or durable pages."""
+
+        if (
+            isinstance(floor, bool)
+            or not isinstance(floor, int)
+            or not 1 <= floor < PROVISIONAL_CSN
+        ):
+            raise GrafxConfigurationError(
+                "A heap reclaim floor must be a positive committed LSN.",
+                field="reclaim_floor_lsn",
+                value=repr(floor),
+            )
+        capabilities = self._catalog.catalog.required_capabilities()
+        if HEAP_RECLAIM_V1_CAPABILITY not in capabilities:
+            raise GrafxSchemaVersionMismatch(
+                "A heap reclaim floor requires catalog capability heap_reclaim_v1 to be "
+                "published first.",
+                field="required_capabilities",
+                value=HEAP_RECLAIM_V1_CAPABILITY,
+            )
+
+        self._require_bootstrapped()
+        page = self._pool.read_fresh_page(self._file, HEADER_PAGE_INDEX)
+        header = self._require_header_page(page)
+        old_floor = self._decode_reclaim_floor(header)
+        if floor < old_floor:
+            raise GrafxTransactionStateError(
+                f"The heap reclaim floor is already {old_floor}; it cannot move backward to "
+                f"{floor}.",
+                file=self._file,
+                field="reclaim_floor_lsn",
+                old_floor=old_floor,
+                value=floor,
+            )
+        FileHeaderPage.write(
+            page,
+            replace(
+                header,
+                root_page=HEADER_PAGE_INDEX,
+                payload_length=floor,
+            ),
+        )
+        return HeapReclaimFloorPlan(
+            page_index=HEADER_PAGE_INDEX,
+            image=self._pool.codec.encode_page(page),
+            old_floor=old_floor,
+            new_floor=floor,
+        )
+
+    def _decode_reclaim_floor(self, header: FileHeader) -> Lsn:
+        """Interpret the guarded heap-header floor and reject cross-file disagreement."""
+
+        capabilities = self._catalog.catalog.required_capabilities()
+        capable = HEAP_RECLAIM_V1_CAPABILITY in capabilities
+        if header.root_page == NO_PAGE and header.payload_length == 0:
+            return NO_LSN
+        if header.root_page == HEADER_PAGE_INDEX and header.payload_length > 0:
+            if capable:
+                return header.payload_length
+            raise GrafxCorruptionDetected(
+                f"Heap {self._file!r} declares a reclaim floor without the required catalog "
+                "capability.",
+                file=self._file,
+                page=HEADER_PAGE_INDEX,
+                field="required_capabilities",
+                value=HEAP_RECLAIM_V1_CAPABILITY,
+            )
+        raise GrafxCorruptionDetected(
+            f"Heap {self._file!r} carries an invalid reclaim-floor marker.",
+            file=self._file,
+            page=HEADER_PAGE_INDEX,
+            field="reclaim_floor",
+            root_page=header.root_page,
+            payload_length=header.payload_length,
+        )
+
+    def plan_vacuum(
+        self,
+        tables: Sequence[TableDef],
+        horizon: Lsn,
+        *,
+        max_versions: int | None = None,
+    ) -> HeapVacuumPlan:
+        """Build copy-on-write images that reclaim eligible inline MVCC versions.
+
+        The plan never mutates a resident frame.  Candidate discovery is header-only; a second
+        deterministic pass rewrites retained chain links, frees selected slots, compacts each
+        touched page, and emits full page images for the ordinary WAL path.  Overflow versions
+        are counted but retained by vacuum v1.
+        """
+
+        if (
+            isinstance(horizon, bool)
+            or not isinstance(horizon, int)
+            or not 1 <= horizon < PROVISIONAL_CSN
+        ):
+            raise GrafxConfigurationError(
+                "A heap vacuum horizon must be a positive committed LSN.",
+                field="horizon_lsn",
+                value=repr(horizon),
+            )
+        if max_versions is not None and (
+            isinstance(max_versions, bool)
+            or not isinstance(max_versions, int)
+            or max_versions <= 0
+        ):
+            raise GrafxConfigurationError(
+                "A heap vacuum max_versions limit must be a positive integer or None.",
+                field="max_versions",
+                value=repr(max_versions),
+            )
+        requested = tuple(tables)
+        if any(not isinstance(table, TableDef) for table in requested):
+            raise GrafxConfigurationError(
+                "A heap vacuum plan requires TableDef values.",
+                field="tables",
+            )
+        ordered = tuple(sorted(requested, key=lambda table: table.table_id))
+        if len({table.table_id for table in ordered}) != len(ordered):
+            raise GrafxConfigurationError(
+                "A heap vacuum plan cannot name one table id more than once.",
+                field="tables",
+            )
+        if (
+            HEAP_RECLAIM_V1_CAPABILITY
+            not in self._catalog.catalog.required_capabilities()
+        ):
+            raise GrafxSchemaVersionMismatch(
+                "Physical heap reclaim requires catalog capability heap_reclaim_v1.",
+                field="required_capabilities",
+                value=HEAP_RECLAIM_V1_CAPABILITY,
+            )
+
+        selected: dict[RecordRef, RecordHeader] = {}
+        selected_table: dict[RecordRef, int] = {}
+        selected_by_page: dict[PageIndex, list[RecordRef]] = {}
+        eligible_by_table: dict[int, int] = {}
+        skipped_by_table: dict[int, int] = {}
+        pages_by_table: dict[int, tuple[PageIndex, ...]] = {}
+        reclaimed_bytes_by_table: dict[int, int] = {}
+        selected_by_table: dict[int, int] = {}
+        remaining = max_versions
+        for table in ordered:
+            pages = self.pages_of(table)
+            pages_by_table[table.table_id] = pages
+            eligible = 0
+            skipped = 0
+            for ref, header, _content in self._walk(table, copy_content=False):
+                if not (
+                    is_committed_csn(header.xmin)
+                    and is_committed_csn(header.xmax)
+                    and header.xmin <= header.xmax <= horizon
+                ):
+                    continue
+                if header.has_overflow:
+                    skipped += 1
+                    continue
+                eligible += 1
+                if remaining is None or remaining > 0:
+                    selected[ref] = header
+                    selected_table[ref] = table.table_id
+                    selected_by_page.setdefault(ref.page, []).append(ref)
+                    selected_by_table[table.table_id] = (
+                        selected_by_table.get(table.table_id, 0) + 1
+                    )
+                    if remaining is not None:
+                        remaining -= 1
+            eligible_by_table[table.table_id] = eligible
+            skipped_by_table[table.table_id] = skipped
+
+        relinked_by_table: dict[int, int] = {}
+        page_images: list[tuple[PageIndex, bytes]] = []
+        found: set[RecordRef] = set()
+        for table in ordered:
+            for page_index in pages_by_table[table.table_id]:
+                page = self._pool.read_fresh_page(self._file, page_index)
+                self._require_table_page(page, table)
+                changed = False
+                for slot in page.live_slots():
+                    if slot < FIRST_RECORD_SLOT:
+                        continue
+                    ref = RecordRef(page=page_index, slot=slot)
+                    content = page.read_slot(slot)
+                    header = RecordHeader.decode(content)
+                    candidate = selected.get(ref)
+                    if candidate is not None:
+                        if header != candidate:
+                            raise GrafxTransactionStateError(
+                                "A heap vacuum candidate changed while its detached plan was "
+                                "being built.",
+                                file=self._file,
+                                table=table.name,
+                                page=page_index,
+                                slot=slot,
+                                field="vacuum_candidate",
+                            )
+                        found.add(ref)
+                        continue
+                    previous = header.previous
+                    seen: set[RecordRef] = set()
+                    while previous in selected:
+                        if previous in seen:
+                            raise GrafxCorruptionDetected(
+                                f"The selected version chain of record {header.record_id} in "
+                                f"table {table.name!r} is cyclic.",
+                                file=self._file,
+                                table=table.name,
+                                record_id=header.record_id,
+                                field="cycle",
+                            )
+                        seen.add(previous)
+                        prior = selected[previous]
+                        if (
+                            selected_table[previous] != table.table_id
+                            or prior.record_id != header.record_id
+                        ):
+                            raise GrafxCorruptionDetected(
+                                f"Version {page_index}:{slot} of table {table.name!r} record "
+                                f"{header.record_id} points into unrelated reclaimed history.",
+                                file=self._file,
+                                table=table.name,
+                                page=page_index,
+                                slot=slot,
+                                field="record_id",
+                                expected_record_id=header.record_id,
+                                observed_record_id=prior.record_id,
+                                expected_table_id=table.table_id,
+                                observed_table_id=selected_table[previous],
+                            )
+                        previous = prior.previous
+                    encoded_previous = (
+                        NO_PREVIOUS_VERSION if previous is None else previous.encode()
+                    )
+                    if encoded_previous != header.prev_version:
+                        page.update_slot(
+                            slot,
+                            replace(header, prev_version=encoded_previous).encode()
+                            + content[RECORD_HEADER_SIZE:],
+                        )
+                        relinked_by_table[table.table_id] = (
+                            relinked_by_table.get(table.table_id, 0) + 1
+                        )
+                        changed = True
+
+                for ref in sorted(
+                    selected_by_page.get(page_index, ()),
+                    key=lambda candidate: candidate.slot,
+                ):
+                    reclaimed_bytes_by_table[table.table_id] = (
+                        reclaimed_bytes_by_table.get(table.table_id, 0)
+                        + page.free_slot(ref.slot)
+                    )
+                    changed = True
+                if changed:
+                    page.compact()
+                    page_images.append((page_index, self._pool.codec.encode_page(page)))
+
+        if found != set(selected):
+            missing = tuple(
+                (ref.page, ref.slot)
+                for ref in sorted(set(selected) - found, key=lambda ref: ref.encode())
+            )
+            raise GrafxTransactionStateError(
+                "Heap vacuum candidates disappeared while their detached plan was built.",
+                file=self._file,
+                field="vacuum_candidate",
+                missing=missing,
+            )
+        table_plans = tuple(
+            HeapVacuumTablePlan(
+                table_id=table.table_id,
+                pages_scanned=len(pages_by_table[table.table_id]),
+                eligible_inline_versions=eligible_by_table[table.table_id],
+                reclaimed_versions=selected_by_table.get(table.table_id, 0),
+                reclaimed_slot_bytes=reclaimed_bytes_by_table.get(table.table_id, 0),
+                relinked_versions=relinked_by_table.get(table.table_id, 0),
+                skipped_overflow_versions=skipped_by_table[table.table_id],
+            )
+            for table in ordered
+        )
+        return HeapVacuumPlan(
+            horizon_lsn=horizon,
+            page_images=tuple(sorted(page_images)),
+            tables=table_plans,
+            complete=sum(plan.reclaimed_versions for plan in table_plans)
+            == sum(plan.eligible_inline_versions for plan in table_plans),
+        )
+
     def allocate_record_id(self, table: TableDef) -> RecordId:
         """Take the next row identity of this table and record that it is spent.
 
@@ -777,10 +1441,24 @@ class HeapStore:
         Idempotent by construction: it only ever moves the counter up, so replaying the same
         record twice is the same as replaying it once, which is what A22 asks of every redo.
         """
+        _, changed = self._observe_record_id_extent(table, record_id)
+        return changed
+
+    def _observe_record_id_extent(
+        self, table: TableDef, record_id: RecordId
+    ) -> tuple[TableExtent, bool]:
+        """Raise the identity floor and retain the exact extent that was just settled.
+
+        ``insert`` needs both results: the public boolean and the extent whose identity floor
+        was proved before the row can become reachable.  Returning that already-read value
+        avoids a second page-zero directory lookup.  It is only a local hint: ``_store_version``
+        rejects its proof after any derived-view epoch change, while ``_resolve_tail`` still
+        validates and repairs stale physical tail hints before appending.
+        """
         _require_record_id(record_id)
         extent = self._extent_for(table)
         if record_id < extent.next_record_id:
-            return False
+            return extent, False
         if record_id >= MAX_U64:
             raise GrafxUnsupportedOperation(
                 f"Row identity {record_id} of table {table.name!r} leaves no room for the next "
@@ -790,8 +1468,9 @@ class HeapStore:
                 field="next_record_id",
                 value=record_id,
             )
-        self._write_extent(replace(extent, next_record_id=record_id + 1))
-        return True
+        updated = replace(extent, next_record_id=record_id + 1)
+        self._write_extent(updated)
+        return updated, True
 
     def next_record_id(self, table: TableDef) -> RecordId:
         """Return the id the next row of this table would take, without spending it."""
@@ -818,7 +1497,9 @@ class HeapStore:
         _require_commit_number("xmin", xmin)
         _require_record_id(record_id)
         payload = encode_tuple(table, values)
-        self.observe_record_id(table, record_id)
+        extent_epoch = self._derived_read_epoch()
+        extent, _ = self._observe_record_id_extent(table, record_id)
+        extent_proof = self._new_extent_proof(extent, derived_epoch=extent_epoch)
         header = RecordHeader(
             record_id=record_id,
             xmin=xmin,
@@ -827,7 +1508,7 @@ class HeapStore:
             payload_len=len(payload),
             schema_version=table.schema_version,
         )
-        return self._store_version(table, header, payload)
+        return self._store_version(table, header, payload, extent_proof=extent_proof)
 
     def insert_reserved(
         self,
@@ -835,6 +1516,8 @@ class HeapStore:
         record_id: RecordId,
         values: tuple[Value, ...],
         xmin: Csn,
+        *,
+        extent_proof: object | None = None,
     ) -> RecordRef:
         """Store a row whose identity is already below this table's durable floor.
 
@@ -854,6 +1537,132 @@ class HeapStore:
                 field="record_id",
                 value=record_id,
             )
+        extent_epoch = self._derived_read_epoch()
+        cursor = self._current_extent_cursor(
+            extent_proof, table.table_id, derived_epoch=extent_epoch
+        )
+        if cursor is not None:
+            assert type(extent_proof) is _ExtentProof
+            proof = extent_proof
+            extent = cursor.extent
+            durable_floor = proof.authority.durable_floor
+        else:
+            extent = self._find_extent(table.table_id)
+            proof = (
+                None
+                if extent is None
+                else self._new_extent_proof(extent, derived_epoch=extent_epoch)
+            )
+            durable_floor = None if extent is None else extent.next_record_id
+        if extent is None:
+            raise GrafxTransactionStateError(
+                f"Table {table.name!r} has no heap extent, so record id {record_id} cannot "
+                "belong to a durable reservation.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="table_extent",
+                record_id=record_id,
+            )
+        assert durable_floor is not None
+        if record_id >= durable_floor:
+            raise GrafxTransactionStateError(
+                f"Record id {record_id} of table {table.name!r} is not below its durable "
+                f"identity floor {durable_floor}.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="record_id",
+                record_id=record_id,
+                durable_floor=durable_floor,
+            )
+        payload = encode_tuple(table, values)
+        header = RecordHeader(
+            record_id=record_id,
+            xmin=xmin,
+            xmax=0,
+            prev_version=NO_PREVIOUS_VERSION,
+            payload_len=len(payload),
+            schema_version=table.schema_version,
+        )
+        return self._store_version(table, header, payload, extent_proof=proof)
+
+    def insert_initial_reserved(
+        self,
+        table: TableDef,
+        record_id: RecordId,
+        values: tuple[Value, ...],
+        xmin: Csn,
+        *,
+        next_record_id: RecordId,
+    ) -> RecordRef:
+        """Create a table's first extent with one batch-wide identity floor.
+
+        A transaction that materialises the first rows of a table already planned every identity
+        while holding the global commit section.  Creating the extent at the exclusive upper
+        bound lets the remaining rows use :meth:`insert_reserved` instead of rewriting heap page
+        zero once per row.  The floor is part of the surrounding user transaction's ordinary page
+        image and WAL batch; this door never publishes a metadata subcommit.
+
+        The extent must still be absent.  An existing one means the caller's locked plan no longer
+        describes the materialisation point and is refused before any new page is allocated.
+        Encoding is also completed before allocation so malformed values cannot leave an empty
+        extent behind.
+        """
+        _require_commit_number("xmin", xmin)
+        _require_record_id(record_id)
+        floor = _require_record_id_floor(next_record_id)
+        if record_id < FIRST_RECORD_ID or record_id >= floor:
+            raise GrafxConfigurationError(
+                f"Initial record id {record_id} of table {table.name!r} must be at least "
+                f"{FIRST_RECORD_ID} and below its batch identity floor {floor}.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="record_id",
+                record_id=record_id,
+                next_record_id=floor,
+            )
+        if self._find_extent(table.table_id) is not None:
+            raise GrafxTransactionStateError(
+                f"Table {table.name!r} already has a heap extent, so its initial batch floor "
+                "cannot be installed.",
+                file=self._file,
+                table=table.name,
+                table_id=table.table_id,
+                field="table_extent",
+                record_id=record_id,
+                next_record_id=floor,
+            )
+        payload = encode_tuple(table, values)
+        extent = self._create_extent(table, next_record_id=floor)
+        extent_proof = self._new_extent_proof(extent)
+        header = RecordHeader(
+            record_id=record_id,
+            xmin=xmin,
+            xmax=0,
+            prev_version=NO_PREVIOUS_VERSION,
+            payload_len=len(payload),
+            schema_version=table.schema_version,
+        )
+        return self._store_version(table, header, payload, extent_proof=extent_proof)
+
+    def reserved_extent_proof(self, table: TableDef, record_id: RecordId) -> object:
+        """Prove one durable reserved id and return a revocable, store-bound extent hint.
+
+        The caller may reuse the hint for later ids only through :meth:`insert_reserved`, which
+        rechecks the owner, table and current derived epoch and validates every id against the
+        captured exclusive floor.  A cache drop or foreign read view therefore falls back to the
+        ordinary extent lookup; the proof is never durable authority and never leaves this store.
+        """
+        _require_record_id(record_id)
+        if record_id < FIRST_RECORD_ID:
+            raise GrafxConfigurationError(
+                f"A reserved record id starts at {FIRST_RECORD_ID}; got {record_id}.",
+                field="record_id",
+                value=record_id,
+            )
+        extent_epoch = self._derived_read_epoch()
         extent = self._find_extent(table.table_id)
         if extent is None:
             raise GrafxTransactionStateError(
@@ -876,16 +1685,7 @@ class HeapStore:
                 record_id=record_id,
                 durable_floor=extent.next_record_id,
             )
-        payload = encode_tuple(table, values)
-        header = RecordHeader(
-            record_id=record_id,
-            xmin=xmin,
-            xmax=0,
-            prev_version=NO_PREVIOUS_VERSION,
-            payload_len=len(payload),
-            schema_version=table.schema_version,
-        )
-        return self._store_version(table, header, payload)
+        return self._new_extent_proof(extent, derived_epoch=extent_epoch)
 
     def update(
         self,
@@ -1016,33 +1816,44 @@ class HeapStore:
         abandoned, unpublished attempts and therefore cannot raise the committed watermark.
         """
         high_water: Lsn = NO_LSN
-        for _ref, header, _content in self._walk(table, copy_content=False):
-            if is_committed_csn(header.xmin):
-                high_water = max(high_water, header.xmin)
-            elif header.xmin != NO_CSN and not is_provisional_csn(header.xmin):
+
+        def observe(record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            nonlocal high_water
+            if is_committed_csn(xmin):
+                high_water = max(high_water, xmin)
+            elif xmin != NO_CSN and not is_provisional_csn(xmin):
                 raise GrafxCorruptionDetected(
-                    f"Record {header.record_id} of table {table.name!r} has invalid birth "
-                    f"stamp {header.xmin}.",
+                    f"Record {record_id} of table {table.name!r} has invalid birth "
+                    f"stamp {xmin}.",
                     file=self._file,
                     table=table.name,
                     table_id=table.table_id,
-                    record_id=header.record_id,
+                    record_id=record_id,
                     field="xmin",
-                    value=header.xmin,
+                    value=xmin,
                 )
-            if is_committed_csn(header.xmax):
-                high_water = max(high_water, header.xmax)
-            elif header.xmax != NO_CSN and not is_provisional_csn(header.xmax):
+            if is_committed_csn(xmax):
+                high_water = max(high_water, xmax)
+            elif xmax != NO_CSN and not is_provisional_csn(xmax):
                 raise GrafxCorruptionDetected(
-                    f"Record {header.record_id} of table {table.name!r} has invalid end "
-                    f"stamp {header.xmax}.",
+                    f"Record {record_id} of table {table.name!r} has invalid end "
+                    f"stamp {xmax}.",
                     file=self._file,
                     table=table.name,
                     table_id=table.table_id,
-                    record_id=header.record_id,
+                    record_id=record_id,
                     field="xmax",
-                    value=header.xmax,
+                    value=xmax,
                 )
+            # ``_walk`` performs the same fixed-header unpack before invoking this predicate.
+            # Rejecting every row avoids constructing RecordHeader values and per-page result
+            # lists while still walking and validating every page and both MVCC stamps.
+            return False
+
+        for _unused in self._walk(table, accept=observe, copy_content=False):
+            raise AssertionError(
+                "the high-water observer must not materialize heap versions"
+            )
         return high_water
 
     def read(self, ref: RecordRef) -> HeapVersion:
@@ -1051,16 +1862,134 @@ class HeapStore:
         table = self._catalog.catalog.table_by_id(table_id)
         return self._decode_version(table, content)
 
+    def read_if(
+        self,
+        ref: RecordRef,
+        accept: Callable[[RecordId, Csn, Csn], bool],
+    ) -> HeapVersion | None:
+        """Return the version at that location if the predicate accepts its header, else None.
+
+        The header-first sibling of :meth:`read` (VEC-2). The predicate sees ``record_id``,
+        ``xmin`` and ``xmax`` from one struct unpack of the raw slot -- the same three fields,
+        from the same unpack, that :meth:`_walk` offers its predicate -- and only a version it
+        accepts is decoded: the payload, and the vector inside it, are never materialised for a
+        row a snapshot cannot see or a filter refuses. Everything :meth:`read` checks before it
+        decodes is checked here in the same order: the location names a record slot of a data
+        page, and the table of that page is the table the version is decoded with.
+        """
+        table_id, content = self._read_slot(ref)
+        table = self._catalog.catalog.table_by_id(table_id)
+        fields = RecordHeader.peek(content)
+        if not accept(fields[4], fields[5], fields[6]):
+            return None
+        return self._decode_version_with_header(
+            table, RecordHeader._from_peek(fields), content
+        )
+
+    def _revalidate_visible_ref(
+        self,
+        table: TableDef,
+        ref: RecordRef,
+        record_id: RecordId,
+        snapshot: SnapshotLike,
+    ) -> HeapVersion | None:
+        """Fully decode one expected physical row and reapply the caller's snapshot.
+
+        This is an internal proof door, not an identity lookup.  The caller already has a
+        :class:`RecordRef`; accepting a different table or identity at that location would turn
+        a stale/malformed proof into a different row.  Those mismatches are corruption and are
+        never candidates for fallback.  Ordinary invisibility remains ``None``, matching
+        :meth:`lookup`.
+        """
+        _require_record_id(record_id)
+        table_id, content = self._read_slot(ref)
+        if table_id != table.table_id:
+            raise GrafxCorruptionDetected(
+                f"Endpoint reference {ref.page}:{ref.slot} belongs to table {table_id}, not to "
+                f"{table.name!r} with id {table.table_id}.",
+                file=self._file,
+                page=ref.page,
+                slot=ref.slot,
+                table=table.name,
+                table_id=table_id,
+                expected_table_id=table.table_id,
+                field="table_id",
+            )
+        version = self._decode_version(table, content)
+        if version.record_id != record_id:
+            raise GrafxCorruptionDetected(
+                f"Endpoint reference {ref.page}:{ref.slot} names record {version.record_id}, "
+                f"not record {record_id} of table {table.name!r}.",
+                file=self._file,
+                page=ref.page,
+                slot=ref.slot,
+                table=table.name,
+                table_id=table.table_id,
+                field="record_id",
+                expected_record_id=record_id,
+                observed_record_id=version.record_id,
+            )
+        if not snapshot.visible(version.xmin, version.xmax):
+            return None
+        return version
+
+    def _visible_record_cursor(
+        self,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        *,
+        admit_page: Callable[[], None],
+    ) -> _VisibleRecordCursor:
+        """Return a resumable canonical header cursor for one table and snapshot."""
+        return _VisibleRecordCursor(self, table, snapshot, admit_page)
+
+    def _derived_read_epoch(self) -> int:
+        """Return the conservative epoch that vouches for derived heap walks."""
+        return self._pool.derived_epoch(self._file)
+
     def scan(
         self, table: TableDef, snapshot: SnapshotLike
     ) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every version of the table the snapshot can see, in storage order."""
-        def visible(header: RecordHeader) -> bool:
+
+        def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
             """Return whether this snapshot may observe the record header."""
-            return snapshot.visible(header.xmin, header.xmax)
+            return snapshot.visible(xmin, xmax)
 
         for ref, header, content in self._walk(table, accept=visible):
             yield ref, self._decode_version_with_header(table, header, content)
+
+    def scan_relationship_endpoints(
+        self, table: TableDef, snapshot: SnapshotLike
+    ) -> Iterator[tuple[RecordRef, tuple[RecordId, RecordId]]]:
+        """Yield visible relationship references and endpoints in storage order.
+
+        The complete payload is reconstructed and validated against every declared column.  The
+        only difference from :meth:`scan` is materialisation: properties and ``HeapVersion`` are
+        not retained when the caller needs only the relationship partition.  Rejected headers
+        stay header-only, so an invisible version still incurs no payload or overflow read.
+        """
+        if table.kind != "rel":
+            raise GrafxConfigurationError(
+                f"Table {table.name!r} is a {table.kind} table and has no relationship endpoints.",
+                field="kind",
+                value=table.kind,
+                table=table.name,
+                table_id=table.table_id,
+            )
+
+        def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Return whether this snapshot may observe the relationship header."""
+            return snapshot.visible(xmin, xmax)
+
+        for ref, header, content in self._walk(table, accept=visible):
+            payload = self._validated_payload(table, header, content)
+            endpoints = decode_relationship_endpoints(table, payload)
+            # HeapVersion construction evaluates the tuple before the previous-version
+            # reference.  Preserve both that validation and its order without retaining either
+            # object: a u64 header field is wider than RecordRef's durable 48-bit encoding.
+            _previous = header.previous
+            yield ref, endpoints
 
     def scan_page(
         self,
@@ -1144,9 +2073,20 @@ class HeapStore:
                     if slot < max(start_slot, FIRST_RECORD_SLOT):
                         continue
                     view = page.slot_view(slot)
-                    header = RecordHeader.decode(view)
-                    if not snapshot.visible(header.xmin, header.xmax):
+                    fields = RecordHeader.peek(view)
+                    (
+                        _flags,
+                        _reserved,
+                        _schema_version,
+                        _payload_len,
+                        _record_id,
+                        xmin,
+                        xmax,
+                        _previous,
+                    ) = fields
+                    if not snapshot.visible(xmin, xmax):
                         continue
+                    header = RecordHeader._from_peek(fields)
                     if len(selected) == limit:
                         next_position = _HeapScanPosition(
                             page=index,
@@ -1155,7 +2095,9 @@ class HeapStore:
                             chain_limit=chain_limit,
                         )
                         break
-                    selected.append((RecordRef(page=index, slot=slot), header, bytes(view)))
+                    selected.append(
+                        (RecordRef(page=index, slot=slot), header, bytes(view))
+                    )
 
             if next_position is not None:
                 break
@@ -1206,14 +2148,25 @@ class HeapStore:
         self, table: TableDef, record_id: RecordId, snapshot: SnapshotLike
     ) -> HeapVersion | None:
         """Return the version of that record the snapshot can see, or None when there is none."""
-        def wanted(header: RecordHeader) -> bool:
-            """Return whether this version is the requested row visible to the snapshot."""
-            return header.record_id == record_id and snapshot.visible(
-                header.xmin, header.xmax
-            )
+        found = self._lookup_with_ref(table, record_id, snapshot)
+        return None if found is None else found[1]
 
-        for _ref, header, content in self._walk(table, accept=wanted):
-            return self._decode_version_with_header(table, header, content)
+    def _lookup_with_ref(
+        self, table: TableDef, record_id: RecordId, snapshot: SnapshotLike
+    ) -> tuple[RecordRef, HeapVersion] | None:
+        """Return the first canonical visible version and its physical reference.
+
+        This internal sibling deliberately shares the public lookup's head-to-tail walk.  It is
+        reusable by any executor path that already needs an identity and cannot afford to throw
+        away the reference; it neither changes scan order nor adds a second visibility rule.
+        """
+
+        def wanted(candidate: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Return whether this version is the requested row visible to the snapshot."""
+            return candidate == record_id and snapshot.visible(xmin, xmax)
+
+        for ref, header, content in self._walk(table, accept=wanted):
+            return ref, self._decode_version_with_header(table, header, content)
         return None
 
     def version_chain(self, ref: RecordRef) -> tuple[RecordRef, ...]:
@@ -1301,10 +2254,175 @@ class HeapStore:
             index = following
         return tuple(pages)
 
+    def _measure_bloat(self, table: TableDef, horizon: Lsn) -> _HeapBloatSample:
+        """Measure conservative slot bloat without decoding tuples or following overflow.
+
+        The horizon is the caller's already-derived recyclable horizon.  Only a version with a
+        structurally plausible committed lifetime (committed ``xmin`` and ``xmax`` with
+        ``xmin <= xmax``) can be called horizon-eligible.  Everything else remains merely stored:
+        this diagnostic is not a verifier and must never certify malformed or provisional
+        residue for destructive maintenance.
+
+        Byte counts are the lengths of record slots.  For an overflow-backed version that means
+        the fixed header and pointer only; the separately allocated overflow pages are counted
+        nowhere, intentionally.  Eligible and retained are a partition of ended versions only;
+        live and provisional versions stay in the stored total but are never described as bloat.
+        Slot directory entries are likewise reported but never priced as horizon-eligible because
+        their identifiers cannot currently be reused safely.
+        """
+        if (
+            isinstance(horizon, bool)
+            or not isinstance(horizon, int)
+            or not NO_LSN <= horizon < PROVISIONAL_CSN
+        ):
+            raise GrafxConfigurationError(
+                "A heap-bloat horizon must be a non-negative committed LSN.",
+                field="horizon_lsn",
+                value=repr(horizon),
+            )
+
+        extent = self._find_extent(table.table_id)
+        if extent is None:
+            return _HeapBloatSample(table.table_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+        data_pages = 0
+        directory_entries = 0
+        free_slots = 0
+        stored_versions = 0
+        ended_versions = 0
+        eligible_versions = 0
+        retained_versions = 0
+        eligible_bytes = 0
+        retained_bytes = 0
+        overflow_versions = 0
+        eligible_overflow_versions = 0
+        seen: set[PageIndex] = visited_pages()
+        limit = self._chain_limit()
+        index = extent.first_page
+
+        while index != NO_PAGE:
+            data_pages += 1
+            self._refuse_endless_chain(table, data_pages, limit)
+            if index in seen:
+                raise GrafxCorruptionDetected(
+                    f"The page chain of table {table.name!r} in {self._file!r} returns to "
+                    f"page {index}.",
+                    file=self._file,
+                    table=table.name,
+                    page=index,
+                    field="cycle",
+                )
+            seen.add(index)
+            with self._pool.pinned(self._file, index) as page:
+                self._require_table_page(page, table)
+                directory_entries += max(page.slot_count - FIRST_RECORD_SLOT, 0)
+                for slot in range(FIRST_RECORD_SLOT, page.slot_count):
+                    if page.is_slot_free(slot):
+                        free_slots += 1
+                        continue
+                    view = page.slot_view(slot)
+                    (
+                        flags,
+                        _reserved,
+                        _schema_version,
+                        _payload_len,
+                        _record_id,
+                        xmin,
+                        xmax,
+                        _previous,
+                    ) = RecordHeader.peek(view)
+                    slot_bytes = page.slot_length(slot)
+                    stored_versions += 1
+                    has_overflow = bool(flags & RECORD_FLAG_HAS_OVERFLOW)
+                    if has_overflow:
+                        overflow_versions += 1
+                    if not is_committed_csn(xmax):
+                        continue
+                    ended_versions += 1
+                    horizon_eligible = (
+                        is_committed_csn(xmin) and xmin <= xmax and xmax <= horizon
+                    )
+                    if horizon_eligible:
+                        eligible_versions += 1
+                        eligible_bytes += slot_bytes
+                        if has_overflow:
+                            eligible_overflow_versions += 1
+                    else:
+                        retained_versions += 1
+                        retained_bytes += slot_bytes
+                following = page.next_page
+            index = following
+
+        return _HeapBloatSample(
+            table_id=table.table_id,
+            data_pages=data_pages,
+            slot_directory_entries=directory_entries,
+            free_slots=free_slots,
+            stored_versions=stored_versions,
+            ended_versions=ended_versions,
+            horizon_eligible_versions=eligible_versions,
+            horizon_retained_versions=retained_versions,
+            horizon_eligible_slot_bytes=eligible_bytes,
+            horizon_retained_slot_bytes=retained_bytes,
+            overflow_versions=overflow_versions,
+            horizon_eligible_overflow_versions=eligible_overflow_versions,
+        )
+
     # --- internals ---------------------------------------------------------------------------
 
+    def _new_extent_proof(
+        self,
+        extent: TableExtent,
+        *,
+        derived_epoch: int | None = None,
+    ) -> _ExtentProof:
+        """Seal a frozen reservation boundary around one mutable physical cursor."""
+        epoch = self._derived_read_epoch() if derived_epoch is None else derived_epoch
+        return _ExtentProof(
+            authority=_ExtentAuthority(
+                owner=self,
+                seal=self._extent_proof_seal,
+                table_id=extent.table_id,
+                first_page=extent.first_page,
+                durable_floor=extent.next_record_id,
+            ),
+            cursor=_ExtentCursor(extent, epoch),
+        )
+
+    def _current_extent_cursor(
+        self,
+        proof: object | None,
+        table_id: int,
+        *,
+        derived_epoch: int | None = None,
+    ) -> _ExtentCursor | None:
+        """Return only an exact, sealed and still-current cursor for one table."""
+        if type(proof) is not _ExtentProof:
+            return None
+        authority = proof.authority
+        cursor = proof.cursor
+        epoch = self._derived_read_epoch() if derived_epoch is None else derived_epoch
+        if (
+            type(authority) is not _ExtentAuthority
+            or type(cursor) is not _ExtentCursor
+            or authority.owner is not self
+            or authority.seal is not self._extent_proof_seal
+            or authority.table_id != table_id
+            or cursor.derived_epoch != epoch
+            or cursor.extent.table_id != table_id
+            or cursor.extent.first_page != authority.first_page
+            or cursor.extent.next_record_id < authority.durable_floor
+        ):
+            return None
+        return cursor
+
     def _store_version(
-        self, table: TableDef, header: RecordHeader, payload: bytes
+        self,
+        table: TableDef,
+        header: RecordHeader,
+        payload: bytes,
+        *,
+        extent_proof: _ExtentProof | None = None,
     ) -> RecordRef:
         """Place one encoded version, using an overflow chain when it does not fit inline.
 
@@ -1319,7 +2437,20 @@ class HeapStore:
         instead is the property that actually matters to a caller: no version becomes reachable
         until every remaining step has succeeded, so a refusal leaves nothing to meet twice.
         """
-        extent = self._extent_for(table)
+        cursor = self._current_extent_cursor(extent_proof, table.table_id)
+        proof_is_current = cursor is not None
+        if cursor is None:
+            extent = self._extent_for(table)
+        else:
+            authority = extent_proof.authority
+            # Only last_page/page_count are cursor hints.  The table root and reservation floor
+            # remain frozen authority and are restored before any directory rewrite can occur.
+            extent = replace(
+                cursor.extent,
+                table_id=authority.table_id,
+                first_page=authority.first_page,
+                next_record_id=authority.durable_floor,
+            )
         tail, length = self._resolve_tail(table, extent)
         if RECORD_HEADER_SIZE + len(payload) <= self.inline_capacity:
             content = header.encode() + payload
@@ -1329,7 +2460,16 @@ class HeapStore:
             )
             overflowed = replace(header, flags=header.flags | RECORD_FLAG_HAS_OVERFLOW)
             content = overflowed.encode() + encode_overflow_pointer(chain[0])
-        return self._append(table, extent, tail, length, content)
+        reference, settled_extent = self._append(table, extent, tail, length, content)
+        if proof_is_current:
+            # Only this store mutates its private proof.  The exclusive identity floor never
+            # changes here; carrying the tail/count just settled by _append prevents a hot batch
+            # from mistaking its own older hint for directory drift on the next row.
+            assert extent_proof is not None
+            assert cursor is not None
+            cursor.extent = settled_extent
+            cursor.derived_epoch = self._derived_read_epoch()
+        return reference
 
     def _chain_limit(self) -> int:
         """Return the most hops any chain in this file can take before it must be a cycle.
@@ -1452,7 +2592,7 @@ class HeapStore:
         tail: PageIndex,
         length: int,
         content: bytes,
-    ) -> RecordRef:
+    ) -> tuple[RecordRef, TableExtent]:
         """Append one slot to the tail page of the table, growing the chain when it is full.
 
         The tail arrives resolved and checked, because the caller has to settle every refusal
@@ -1462,8 +2602,9 @@ class HeapStore:
         the hint was not where the count said. A count that is never right is worse than no count,
         because the next append walks zero hops and never revisits it (A40.2).
 
-        The frame cost of this method is proven by
-        test_the_extent_hint_is_written_with_the_tail_released and its consequence by
+        The common settled-hint cost is proven by
+        test_a_settled_inline_append_reuses_its_capacity_pin. The drift path's frame cost is
+        proven by test_the_extent_hint_is_written_with_the_tail_released and its consequence by
         test_a_retryable_refusal_never_multiplies_a_row, which reaches the three-frame shape the
         way a caller does: an update whose old version is not on the tail, over a hint an
         ordinary redo has left behind its chain (A85).
@@ -1485,18 +2626,24 @@ class HeapStore:
         fits = False
         with self._pool.pinned(self._file, tail) as page:
             fits = page.can_fit(len(content))
+            if fits and extent.last_page == tail and extent.page_count == length:
+                # The capacity decision and insertion concern the same validated resident page.
+                # With no directory hint to repair, retaining this pin removes a second page
+                # acquisition and also removes its otherwise unnecessary refusal window.
+                return RecordRef(page=tail, slot=page.insert_slot(content)), extent
         if fits:
             if extent.last_page != tail or extent.page_count != length:
                 # The length the walk counted, never the stored count plus the distance
                 # travelled: adding to a count that describes wherever the hint happened to be
                 # is permanently wrong the moment the hint was not where the count said (A40.2).
-                self._write_extent(replace(extent, last_page=tail, page_count=length))
-            # Re-taken with the hint settled. This pin can still refuse -- it can evict a dirty
-            # page, and the write-back is where the device speaks -- and it refuses with nothing
-            # of this row on any page. Once it is held, insert_slot touches only the pinned
-            # frame, so the row cannot half-arrive.
+                extent = replace(extent, last_page=tail, page_count=length)
+                extent = self._write_extent(extent)
+            # Re-taken only after repairing a stale hint. This pin can still refuse -- it can
+            # evict a dirty page, and the write-back is where the device speaks -- and it refuses
+            # with nothing of this row on any page. Once held, insert_slot touches only the
+            # pinned frame, so the row cannot half-arrive.
             with self._pool.pinned(self._file, tail) as page:
-                return RecordRef(page=tail, slot=page.insert_slot(content))
+                return RecordRef(page=tail, slot=page.insert_slot(content)), extent
         fresh = self._pool.allocate(self._file, int(PageType.HEAP))
         new_index = fresh.page_index
         try:
@@ -1508,7 +2655,8 @@ class HeapStore:
         # hint is settled while the row is still invisible. A refusal here leaves an unreferenced
         # page, which G6 forbids reclaiming and which every walk skips because every walk starts
         # at first_page -- a leak, and not a row a reader can meet twice.
-        self._write_extent(replace(extent, last_page=new_index, page_count=length + 1))
+        extent = replace(extent, last_page=new_index, page_count=length + 1)
+        extent = self._write_extent(extent)
         with self._pool.pinned(self._file, tail) as page:
             page.next_page = new_index
         self._tail_cache[table.table_id] = (
@@ -1516,7 +2664,7 @@ class HeapStore:
             length + 1,
             self._pool.derived_epoch(self._file),
         )
-        return RecordRef(page=new_index, slot=slot)
+        return RecordRef(page=new_index, slot=slot), extent
 
     def _initialize_data_page(self, page: Page, table_id: int) -> None:
         """Turn a fresh page into a data page of one table, with its descriptor in slot 0."""
@@ -1530,6 +2678,12 @@ class HeapStore:
         extent = self._find_extent(table.table_id)
         if extent is not None:
             return extent
+        return self._create_extent(table, next_record_id=FIRST_RECORD_ID)
+
+    def _create_extent(
+        self, table: TableDef, *, next_record_id: RecordId
+    ) -> TableExtent:
+        """Create one absent table extent with its already-validated exclusive id floor."""
         # The directory is settled before the device is asked to grow. The other order leaves a
         # page behind on every refusal at the table bound, and no sanctioned operation can take
         # it back (G6), which is the same reasoning BufferPool.allocate states for itself.
@@ -1541,7 +2695,11 @@ class HeapStore:
         finally:
             self._pool.unpin(self._file, index, dirty=True)
         extent = TableExtent(
-            table_id=table.table_id, first_page=index, last_page=index, page_count=1
+            table_id=table.table_id,
+            first_page=index,
+            last_page=index,
+            page_count=1,
+            next_record_id=next_record_id,
         )
         with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
             self._add_directory_entry(header_page, table, extent)
@@ -1579,19 +2737,71 @@ class HeapStore:
         # skip. And the caller has already settled the room with the identical can_fit predicate
         # this insert uses, on a page that never accumulates compactable gaps, so PageFullError
         # cannot come back from here either.
-        header_page.insert_slot(extent.encode())
+        slot = header_page.insert_slot(extent.encode())
+        self._sync_extent_slots_epoch()
+        self._extent_slots[extent.table_id] = slot
 
     def _find_extent(self, table_id: int) -> TableExtent | None:
         """Return the directory entry of the table, or None when the table has no page yet."""
-        self._require_bootstrapped()
-        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
-            for slot, payload in header_page.iter_slots():
+        with self._pinned_validated_header() as (header_page, _header):
+            self._sync_extent_slots_epoch()
+            cached = self._extent_slots.get(table_id)
+            if cached is not None:
+                payload = self._extent_payload_at(header_page, cached, table_id)
+                if payload is not None:
+                    return self._require_first_page(TableExtent.decode(payload))
+                self._extent_slots.pop(table_id, None)
+            for slot, payload in header_page.iter_slot_views():
                 if slot < EXTENT_FIRST_SLOT:
                     continue
-                extent = TableExtent.decode(payload)
-                if extent.table_id == table_id:
-                    return self._require_first_page(extent)
+                if self._extent_table_id(payload) != table_id:
+                    continue
+                extent = self._require_first_page(TableExtent.decode(payload))
+                self._extent_slots[table_id] = slot
+                return extent
         return None
+
+    @staticmethod
+    def _extent_table_id(payload: bytes | memoryview) -> int:
+        """Read only an extent's table-id prefix, while retaining the format length guard."""
+        if len(payload) != DIRECTORY_ENTRY_SIZE:
+            raise GrafxCorruptionDetected(
+                f"A heap directory entry is {DIRECTORY_ENTRY_SIZE} bytes; got {len(payload)}.",
+                field="directory_entry",
+                value=len(payload),
+            )
+        return _DESCRIPTOR.unpack_from(payload)[0]
+
+    @classmethod
+    def _extent_payload_at(
+        cls, header_page: Page, slot: SlotId, table_id: int
+    ) -> memoryview | None:
+        """Return a verified cached slot view, or None when the hint became stale."""
+        if (
+            slot < EXTENT_FIRST_SLOT
+            or slot >= header_page.slot_count
+            or header_page.is_slot_free(slot)
+        ):
+            return None
+        payload = header_page.slot_view(slot)
+        if cls._extent_table_id(payload) != table_id:
+            return None
+        return payload
+
+    def _sync_extent_slots_epoch(self) -> None:
+        """Invalidate directory hints whenever their page view generation changes."""
+        identity = (
+            self._bootstrapped_epoch,
+            self._pool.derived_epoch(self._file),
+        )
+        if self._extent_slots_epoch != identity:
+            self._extent_slots.clear()
+            self._extent_slots_epoch = identity
+
+    def _invalidate_extent_slots(self) -> None:
+        """Forget every directory hint and its page-view identity."""
+        self._extent_slots.clear()
+        self._extent_slots_epoch = None
 
     def _require_first_page(self, extent: TableExtent) -> TableExtent:
         """Refuse a directory entry whose chain would end before it starts.
@@ -1627,16 +2837,37 @@ class HeapStore:
             )
         return extent
 
-    def _write_extent(self, extent: TableExtent) -> None:
-        """Replace the directory entry of a table on the header page."""
-        self._require_bootstrapped()
-        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as header_page:
-            for slot, payload in header_page.iter_slots():
+    def _write_extent(self, extent: TableExtent) -> TableExtent:
+        """Replace one extent while preserving a newer durable identity floor."""
+        with self._pinned_validated_header() as (header_page, _header):
+            self._sync_extent_slots_epoch()
+            cached = self._extent_slots.get(extent.table_id)
+            if cached is not None:
+                payload = self._extent_payload_at(header_page, cached, extent.table_id)
+                if payload is not None:
+                    current = TableExtent.decode(payload)
+                    extent = replace(
+                        extent,
+                        next_record_id=max(
+                            extent.next_record_id, current.next_record_id
+                        ),
+                    )
+                    header_page.update_slot(cached, extent.encode())
+                    return extent
+                self._extent_slots.pop(extent.table_id, None)
+            for slot, payload in header_page.iter_slot_views():
                 if slot < EXTENT_FIRST_SLOT:
                     continue
-                if TableExtent.decode(payload).table_id == extent.table_id:
-                    header_page.update_slot(slot, extent.encode())
-                    return
+                if self._extent_table_id(payload) != extent.table_id:
+                    continue
+                current = TableExtent.decode(payload)
+                extent = replace(
+                    extent,
+                    next_record_id=max(extent.next_record_id, current.next_record_id),
+                )
+                header_page.update_slot(slot, extent.encode())
+                self._extent_slots[extent.table_id] = slot
+                return extent
             raise GrafxCorruptionDetected(
                 f"Table {extent.table_id} has no directory entry on the header page of "
                 f"{self._file!r}, so its extent cannot be updated.",
@@ -1644,8 +2875,41 @@ class HeapStore:
                 table_id=extent.table_id,
             )
 
+    @contextmanager
+    def _pinned_validated_header(self) -> Iterator[tuple[Page, FileHeader]]:
+        """Yield page 0 after the bootstrap and page-integrity checks, pinning it once hot.
+
+        A moved derived epoch retains the canonical ``is_bootstrapped`` probe and its cache
+        invalidation before the caller acquires the operational pin. Under a stable epoch the
+        operational pin itself performs the required resident header check, so a directory
+        lookup or rewrite need not acquire the same page once merely to validate it and again to
+        use it. The yielded pin is never storage authority beyond this context. Detached planners
+        that require the current device image keep the separate ``_require_bootstrapped`` plus
+        ``read_fresh_page`` protocol; this resident helper must not replace that authority path.
+        """
+        if self._bootstrapped_epoch != self._pool.derived_epoch(self._file):
+            self._invalidate_extent_slots()
+            if not self.is_bootstrapped():
+                raise GrafxCorruptionDetected(
+                    f"The heap file {self._file!r} has no header page; call bootstrap() first.",
+                    file=self._file,
+                )
+        with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
+            header = self._require_header_page(page)
+            yield page, header
+
     def _require_bootstrapped(self) -> None:
         """Refuse to work against a heap file that has not been created yet."""
+        if self._bootstrapped_epoch == self._pool.derived_epoch(self._file):
+            # The memo removes the repeated device-level ``exists`` and ``page_count`` probes,
+            # not the page-level integrity check.  The header may have been changed through a
+            # resident writable page without moving the pool's derived epoch; pinning that hot
+            # frame is cheap and preserves the rule that a damaged in-memory header is refused
+            # before any heap operation proceeds.
+            with self._pool.pinned(self._file, HEADER_PAGE_INDEX) as page:
+                self._require_header_page(page)
+            return
+        self._invalidate_extent_slots()
         if not self.is_bootstrapped():
             raise GrafxCorruptionDetected(
                 f"The heap file {self._file!r} has no header page; call bootstrap() first.",
@@ -1871,15 +3135,17 @@ class HeapStore:
         self,
         table: TableDef,
         *,
-        accept: Callable[[RecordHeader], bool] | None = None,
+        accept: Callable[[RecordId, Csn, Csn], bool] | None = None,
         copy_content: bool = True,
     ) -> Iterator[tuple[RecordRef, RecordHeader, bytes]]:
         """Yield every stored version of the table with its location and its raw content.
 
-        One page at a time is pinned. Every header is decoded from a read-only slot view, but only
-        accepted content is copied before the pin is released. Following an overflow chain never
-        needs a second frame while a data page is still held. Header-only callers may also suppress
-        every content copy.
+        One page at a time is pinned. A predicate sees ``record_id``, ``xmin`` and ``xmax`` from
+        one struct unpack of the read-only slot view. Rejected rows never materialize a
+        :class:`RecordHeader`; accepted rows materialize the complete header from those same
+        unpacked fields. Only accepted content is copied before the pin is released. Following an
+        overflow chain never needs a second frame while a data page is still held. Header-only
+        callers may also suppress every content copy.
         """
         extent = self._find_extent(table.table_id)
         if extent is None:
@@ -1902,13 +3168,26 @@ class HeapStore:
             with self._pool.pinned(self._file, index) as page:
                 self._require_table_page(page, table)
                 items: list[tuple[SlotId, RecordHeader, bytes]] = []
-                for slot in page.live_slots():
+                for slot, view in page.iter_slot_views():
                     if slot < FIRST_RECORD_SLOT:
                         continue
-                    view = page.slot_view(slot)
-                    header = RecordHeader.decode(view)
-                    if accept is not None and not accept(header):
-                        continue
+                    if accept is None:
+                        header = RecordHeader.decode(view)
+                    else:
+                        fields = RecordHeader.peek(view)
+                        (
+                            _flags,
+                            _reserved,
+                            _schema_version,
+                            _payload_len,
+                            record_id,
+                            xmin,
+                            xmax,
+                            _previous,
+                        ) = fields
+                        if not accept(record_id, xmin, xmax):
+                            continue
+                        header = RecordHeader._from_peek(fields)
                     items.append((slot, header, bytes(view) if copy_content else b""))
                 following = page.next_page
             for slot, header, content in items:
@@ -1921,12 +3200,36 @@ class HeapStore:
 
     def _decode_version(self, table: TableDef, content: bytes) -> HeapVersion:
         """Turn the raw content of a slot into a decoded version of the table."""
-        return self._decode_version_with_header(table, RecordHeader.decode(content), content)
+        return self._decode_version_with_header(
+            table, RecordHeader.decode(content), content
+        )
 
     def _decode_version_with_header(
         self, table: TableDef, header: RecordHeader, content: bytes
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
+        payload = self._validated_payload(table, header, content)
+        version = HeapVersion(
+            record_id=header.record_id,
+            xmin=header.xmin,
+            xmax=header.xmax,
+            values=decode_tuple(table, payload),
+            prev=header.previous,
+            schema_version=header.schema_version,
+            deleted=bool(header.flags & RECORD_FLAG_DELETED),
+            table_id=table.table_id,
+        )
+        # _validated_payload has authenticated this exact header length against the inline or
+        # overflow payload.  Carry the already-paid fact for optional decoded-result accounting;
+        # the field is excluded from construction, equality and representation so no public row
+        # or snapshot contract changes.
+        object.__setattr__(version, "_stored_payload_bytes", header.payload_len)
+        return version
+
+    def _validated_payload(
+        self, table: TableDef, header: RecordHeader, content: bytes
+    ) -> bytes:
+        """Return one payload after the checks shared by full and projected decoders."""
         if header.schema_version != table.schema_version:
             raise GrafxSchemaVersionMismatch(
                 f"A stored version of table {table.name!r} was written under schema version "
@@ -1948,16 +3251,7 @@ class HeapStore:
                 declared=header.payload_len,
                 observed=len(payload),
             )
-        return HeapVersion(
-            record_id=header.record_id,
-            xmin=header.xmin,
-            xmax=header.xmax,
-            values=decode_tuple(table, payload),
-            prev=header.previous,
-            schema_version=header.schema_version,
-            deleted=bool(header.flags & RECORD_FLAG_DELETED),
-            table_id=table.table_id,
-        )
+        return payload
 
     def _payload_of(self, header: RecordHeader, content: bytes) -> bytes:
         """Return the payload of a version, following its overflow chain when it has one."""

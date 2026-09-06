@@ -111,7 +111,7 @@ connect(path, **options)
   └─ PortRegistry.require      fail closed: name EVERY missing slot in one error
   └─ open the device, the identity file, the catalog, the heap, the log
   └─ RecoveryManager.recover   replay the log idempotently; truncate a torn tail; preserve evidence
-  └─ re-adopt the indexes      primary-key indexes, then declared vector indexes
+  └─ re-adopt the indexes      catalog-selected exact generations, then declared vector indexes
   └─ IndexManager.open         compare each index's claimed position against the published one
   └─ Database                  ready
 ```
@@ -217,9 +217,9 @@ cannot disagree about one invariant.
 ```
 mydb/
   identity.dat     one page: what this database is. A mismatched open is refused, not adapted.
-  catalog.dat      the schema: tables, columns, primary keys, vector spaces
+  catalog.dat      schema plus catalog-v2 logical exact-index/generation authority
   heap.dat         page 0 is the table directory; every other page is a slotted data page
-  index/           one file per secondary index (pk_<Table>.idx, vector_<Table>_<space>.idx)
+  index/           immutable exact generations plus schema-derived vector index files
   wal/             000000000001.wal, … — segments with an LSN mark index
   control/         lease, commit state, reader registrations — published atomically
   ledger/          forensic entries: what was found, where, and what was done
@@ -321,12 +321,17 @@ the exact transition and risk contract.
 
 - **The participant section** is re-entrant and process-wide: the threads of one participant take
   turns at the acquire-commit-release window rather than ending one another's epoch.
-- **The buffer pool runs every door under an injected guard.** The pool is process-wide state that
-  several threads reach at once — a commit applying pages inside the section, and searches and scans
-  pinning pages outside any section. Its doors were sequences of dictionary steps that were
-  individually atomic and jointly not. The guard is *injected* by the composition root, because the
-  pure core imports no mechanism; the default is a no-op context, and the body of `pinned()` runs
-  outside the guard so no caller ever holds the pool's lock while working with a page.
+- **The buffer pool runs every shared-state transition under one injected condition.** The pool is
+  process-wide state that several threads reach at once — a commit applying pages inside the
+  section, and searches and scans pinning pages outside any section. Resident lookup, LRU movement,
+  pin counts, eviction and cold-load reservations are atomic under that condition. A cold miss then
+  releases it for storage read and codec decode; one loader owns each `(file, page)` and competitors
+  wait for the same complete frame. In-flight reservations count against capacity, and a cache-drop
+  or structure epoch moving during I/O prevents late stale publication. Dirty eviction is detached
+  and written before its reserved slot is reused. The condition is *injected* by the composition
+  root because the pure core imports no threading/task/OS mechanism; the default remains suitable
+  for a direct single-thread composition. The body of `pinned()` runs outside the guard so no caller
+  holds the pool's lock while working with a page.
 
 ### Isolation
 
@@ -348,6 +353,13 @@ a primary key be indexed without the index having to understand visibility.
 
 **PROXIMITY** (vector). Entries are versioned with tombstones and a horizon, and they are already the
 answer — the heap is deliberately not consulted.
+
+Catalog v2 is durable authority for exact logical definitions and their immutable physical
+generations. `CREATE INDEX` can add ordered equality keys, endpoint tables can receive an automatic
+unsigned `RecordId -> RecordRef` access path, and `rehash_index()` grows one ACTIVE directory by
+building a distinct foreground shadow before rotating the predecessor to STALE. A statement that
+selected a healthy generation never changes route mid-flight; a later read boundary adopts a
+foreign catalog generation, while a missing/malformed selected file fails closed.
 
 Vector indexes are **sparse for nullable embeddings**. A row whose vector is `NULL` remains a normal
 heap row but has no vector entry, cannot enter either search regime and is omitted by rebuild and
@@ -378,6 +390,15 @@ plan runs, by the components that own those questions.
 
 Operators: `SingleRow`, `NodeScan`, `IndexSeek`, `TraverseRelationship`, `Filter`, `Project`,
 `Aggregate`, `Distinct`, `Sort`, `Skip`, `Limit`, and the write operators.
+
+By default, blocking sort, result-DISTINCT and aggregate operators retain their historical
+in-memory structures. Setting `query_memory_budget_bytes` gives each such operator an independent
+deterministic logical byte counter and routes it through an internal spill port. The pure engine owns safe, versioned,
+capability-free records and total ordering; `LocalQuerySpillFactory` alone owns OS temporary files
+and bounded external merge passes. Spill artifacts sit outside the database directory and close on
+success, failure, cancellation or cursor close. The counter is deliberately not RSS, and the
+existing result/intermediate-row limits remain separate. `docs/architecture/CONTRACT.md` defines
+the exact charges and exclusions.
 
 The planner chooses `IndexSeek` when an index's **whole key** is constrained by equality — the whole
 key and nothing less, because a hash index stores the encoding of all its key columns as one key, so

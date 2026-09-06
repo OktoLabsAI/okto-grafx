@@ -35,12 +35,20 @@ id, so no result depends on the iteration order of a set or a dictionary.
 
 from __future__ import annotations
 
+from array import array
+from bisect import insort
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from heapq import heappop, heappush
 from math import log
 
 from okto_grafx.domain.errors import GrafxConfigurationError
-from okto_grafx.domain.ports.vectormath import DistanceMetric, VectorMath
+from okto_grafx.domain.ports.vectormath import (
+    DistanceMetric,
+    PreparedCosineVectorMath,
+    PreparedVectorMath,
+    VectorMath,
+)
 from okto_grafx.domain.rand import SplitMix64
 
 __all__ = [
@@ -87,6 +95,13 @@ on the configured baseline, not on the result cardinality API.
 MAX_LEVEL: int = 32
 """The tallest tower a node may be given, which bounds the per-node cost of a graph."""
 
+_HEAP_FRONTIER_MIN_NODES: int = 4096
+"""Smallest graph where selective or exhaustive traversal uses a heap frontier.
+
+This private algorithm threshold is independent of the public exact-scan threshold, even when
+their defaults happen to have the same numeric value.
+"""
+
 
 def _require_positive(field: str, value: int) -> int:
     """Return a positive integer parameter, refusing anything that could not build a graph."""
@@ -121,26 +136,30 @@ class TraversalStats:
     exhaustive: bool
 
 
+def _rank_key(item: tuple[float, int]) -> tuple[float, int]:
+    """Return the sort key of one scored node: best score first, then the lower node id."""
+    return (-item[0], item[1])
+
+
 def _insert_ranked(
     ranked: list[tuple[float, int]], score: float, node: int, limit: int | None = None
 ) -> None:
     """Insert one scored node into a list ordered best first, keeping at most ``limit`` of them.
 
     Ordering is descending by score and ascending by node id, which is the tie rule of the
-    ``VectorMath`` port (CONTRACT.md section 4.6). Doing it by hand rather than by a heap keeps
-    the order total and observable: a heap would leave equal scores in whatever order the sift
-    happened to produce.
+    ``VectorMath`` port (CONTRACT.md section 4.6). The position is found by binary search on
+    exactly that key, which keeps this materialized ranking total and observable. The wide
+    traversal frontier may use a heap carrying both score and node id as its total-order key, but
+    its bounded result ranking still passes through this helper. An entry equal to one already
+    present goes after it, where the linear scan this replaces put it (VEC-5); a test holds the
+    two to the same list.
 
-    ``limit`` of None means the list is not truncated. The beam of a traversal uses that,
-    because a node dropped from the beam is a node that was marked visited and will never be
-    expanded -- which would silently break the exhaustiveness the wide-beam case depends on.
+    ``limit`` of None means the list is not truncated. The ordinary traversal beam uses that;
+    the separate wide-frontier heap has the same no-drop property. A node dropped from either
+    frontier was already marked visited and would never be expanded, silently breaking the
+    exhaustiveness the wide-beam case depends on.
     """
-    for position, existing in enumerate(ranked):
-        if score > existing[0] or (score == existing[0] and node < existing[1]):
-            ranked.insert(position, (score, node))
-            break
-    else:
-        ranked.append((score, node))
+    insort(ranked, (score, node), key=_rank_key)
     if limit is not None and len(ranked) > limit:
         del ranked[limit:]
 
@@ -155,15 +174,20 @@ class HnswGraph:
 
     __slots__ = (
         "_math",
+        "_prepare",
+        "_prepare_cosine_with_norm",
         "_metric",
         "_neighbours",
         "_neighbours_zero",
         "_ef_construction",
+        "_component_typecode",
         "_random",
         "_level_scale",
         "_values",
+        "_norms",
         "_levels",
         "_links",
+        "_construction_link_scores",
         "_chain_next",
         "_chain_previous",
         "_chain_head",
@@ -180,18 +204,56 @@ class HnswGraph:
         seed: int,
         neighbours: int = DEFAULT_NEIGHBOURS,
         ef_construction: int = DEFAULT_EF_CONSTRUCTION,
+        _component_typecode: str | None = None,
+        _cache_construction_link_scores: bool = False,
     ) -> None:
-        """Build an empty graph whose shape is decided by the seed and the neighbour count."""
+        """Build an empty graph whose shape is decided by the seed and the neighbour count.
+
+        ``_component_typecode`` is an engine-only residency optimization.  The ordinary public
+        construction keeps tuples exactly as before; an engine that already selected the NumPy
+        vector adapter may ask for ``f`` or ``d`` storage.  Compact components are owned as
+        immutable bytes, and every call into host ``VectorMath`` receives a fresh read-only view,
+        so releasing that view cannot poison the graph retained for a later search.
+        """
         self._math = math
+        self._prepare = math.prepare if isinstance(math, PreparedVectorMath) else None
+        self._prepare_cosine_with_norm = (
+            math.prepare_cosine_with_norm
+            if isinstance(math, PreparedCosineVectorMath)
+            else None
+        )
         self._metric = metric
         self._neighbours = _require_positive("neighbours", neighbours)
         self._neighbours_zero = self._neighbours * 2
         self._ef_construction = _require_positive("ef_construction", ef_construction)
+        if _component_typecode not in (None, "f", "d"):
+            raise GrafxConfigurationError(
+                "A compact vector graph stores either float32 ('f') or float64 ('d') "
+                f"components; got {_component_typecode!r}.",
+                field="component_typecode",
+                value=repr(_component_typecode),
+            )
+        self._component_typecode = _component_typecode
         self._random = SplitMix64(seed)
         self._level_scale = 1.0 / log(self._neighbours) if self._neighbours > 1 else 1.0
-        self._values: dict[int, tuple[float, ...]] = {}
+        self._values: dict[int, tuple[float, ...] | bytes] = {}
+        # Successful candidate norms are exact, process-local derivatives of immutable graph
+        # components.  They are populated only after the ordinary scorer succeeds, so a failed
+        # score retains its established timing and never leaves a cached authorization behind.
+        self._norms: dict[int, tuple[tuple[float, ...] | bytes, float]] = {}
         self._levels: dict[int, int] = {}
         self._links: list[dict[int, list[int]]] = [{}]
+        # A cold engine build may opt into a transient score beside each full adjacency.  Once
+        # a node has overflowed, every later link used to rescore all of its unchanged peers just
+        # to rank one new peer.  The parallel lists retain those already-proved values only while
+        # the graph is being derived; ``_finish_construction`` drops the complete cache before the
+        # picture can be published.  Ordinary/public HnswGraph construction keeps the historical
+        # callback behaviour unless its caller explicitly selects this private capability.
+        self._construction_link_scores: list[
+            dict[int, list[float | None]]
+        ] | None = (
+            [{}] if _cache_construction_link_scores else None
+        )
         self._chain_next: dict[int, int] = {}
         self._chain_previous: dict[int, int] = {}
         self._chain_head: int | None = None
@@ -239,15 +301,18 @@ class HnswGraph:
             ) from failure
 
     def values_of(self, node: int) -> tuple[float, ...]:
-        """Return the components stored for one node."""
+        """Return the components stored for one node as the established public tuple."""
         try:
-            return self._values[node]
+            stored = self._values[node]
         except KeyError as failure:
             raise GrafxConfigurationError(
                 f"The vector graph holds no node {node!r}.",
                 field="node",
                 value=repr(node),
             ) from failure
+        if isinstance(stored, tuple):
+            return stored
+        return tuple(self._view(stored))
 
     def neighbours_of(self, node: int, layer: int) -> tuple[int, ...]:
         """Return the neighbours of a node at one layer, chain edges included at layer zero.
@@ -291,22 +356,31 @@ class HnswGraph:
                 value=repr(node),
             )
         components = tuple(float(component) for component in values)
+        stored: tuple[float, ...] | bytes = components
+        if self._component_typecode is not None:
+            # ``array`` is only the transient packer.  Keeping its bytes, rather than the mutable
+            # array or a releasable memoryview, makes the resident component storage immutable.
+            stored = array(self._component_typecode, components).tobytes()
         level = self._draw_level()
-        self._values[node] = components
+        self._values[node] = stored
         self._levels[node] = level
         self._append_to_chain(node)
         while len(self._links) <= level:
             self._links.append({})
+            scores = self._construction_link_scores
+            if scores is not None:
+                scores.append({})
         if self._entry_point is None:
             self._entry_point = node
             self._top_level = level
             return
+        scorer = self._scorer(self._components(node))
         current = self._entry_point
         for layer in range(self._top_level, level, -1):
-            current = self._descend(components, current, layer)
+            current = self._descend(scorer, current, layer)
         for layer in range(min(level, self._top_level), -1, -1):
             found = self._search_layer(
-                components, (current,), self._ef_construction, layer, None
+                scorer, (current,), self._ef_construction, layer, None
             )
             capacity = self._capacity(layer)
             for _score, neighbour in found[:capacity]:
@@ -316,6 +390,16 @@ class HnswGraph:
         if level > self._top_level:
             self._top_level = level
             self._entry_point = node
+
+    def _finish_construction(self) -> None:
+        """Release transient link scores before this derived graph is published.
+
+        Incremental maintenance intentionally retains the canonical scalar trimming path.  The
+        cache exists only to avoid repeated work while a complete cold picture is assembled in
+        locals, and keeping it afterwards would turn a build-time speedup into permanent O(E)
+        duplicate residency.
+        """
+        self._construction_link_scores = None
 
     def remove(self, node: int) -> None:
         """Take one node out of the graph, keeping the remaining nodes reachable.
@@ -334,14 +418,16 @@ class HnswGraph:
         for layer in range(len(self._links)):
             adjacency = self._links[layer]
             orphans = tuple(adjacency.pop(node, ()))
+            scores = self._construction_link_scores
+            if scores is not None:
+                scores[layer].pop(node, None)
             for neighbour in orphans:
-                peers = adjacency.get(neighbour)
-                if peers is not None and node in peers:
-                    peers.remove(node)
+                self._unlink(neighbour, node, layer)
             for position in range(len(orphans) - 1):
                 self._link(orphans[position], orphans[position + 1], layer)
         self._splice_from_chain(node)
         del self._values[node]
+        self._norms.pop(node, None)
         del self._levels[node]
         if self._entry_point == node:
             self._elect_entry_point()
@@ -365,13 +451,13 @@ class HnswGraph:
             return (), TraversalStats(
                 visited=0, bridges=0, admitted=0, hops=0, exhaustive=True
             )
-        components = tuple(float(component) for component in query)
+        scorer = self._scorer(tuple(float(component) for component in query))
         current = self._entry_point
         hops = 0
         for layer in range(self._top_level, 0, -1):
-            current, layer_hops = self._descend_counted(components, current, layer)
+            current, layer_hops = self._descend_counted(scorer, current, layer)
             hops += layer_hops
-        ranked, stats = self._search_layer_counted(components, (current,), ef, 0, admits)
+        ranked, stats = self._search_layer_counted(scorer, (current,), ef, 0, admits)
         return ranked, TraversalStats(
             visited=stats.visited,
             bridges=stats.bridges,
@@ -410,19 +496,94 @@ class HnswGraph:
         level = int(-log(draw) * self._level_scale)
         return level if level < MAX_LEVEL else MAX_LEVEL
 
-    def _score(self, query: tuple[float, ...], node: int) -> float:
-        """Return the similarity of a stored node to the query, higher meaning closer."""
-        return self._math.score(query, self._values[node], self._metric)
+    def _view(self, stored: bytes) -> memoryview:
+        """Return an ephemeral read-only numeric view over one immutable component body."""
+        typecode = self._component_typecode
+        if (
+            typecode is None
+        ):  # pragma: no cover - guarded by the bytes-only compact invariant
+            raise AssertionError("compact HNSW bytes require a component typecode")
+        return memoryview(stored).cast(typecode)
+
+    def _components(self, node: int) -> Sequence[float]:
+        """Return one node's tuple or a fresh compact view safe for a host to release."""
+        return self._stored_components(self._values[node])
+
+    def _stored_components(
+        self, stored: tuple[float, ...] | bytes
+    ) -> Sequence[float]:
+        """Return a fresh view over one captured immutable backing generation."""
+        return stored if isinstance(stored, tuple) else self._view(stored)
+
+    def _scorer(self, query: Sequence[float]) -> Callable[[int], float]:
+        """Return a function scoring stored nodes against one query, prepared once (VEC-4).
+
+        A traversal scores one query against every node it visits, so whatever depends on the
+        query alone is computed once here and reused, when the math adapter declares the
+        ``PreparedVectorMath`` capability. An adapter that implements only ``VectorMath`` is
+        scored through ``score`` exactly as before. Both paths answer the same number for the
+        same pair, and a test holds them to identical graphs, rankings and traversal counts.
+        """
+        if (
+            self._metric is DistanceMetric.COSINE
+            and self._prepare_cosine_with_norm is not None
+        ):
+            measured, cached = self._prepare_cosine_with_norm(query)
+
+            def cosine(node: int) -> float:
+                stored = self._values[node]
+                retained = self._norms.get(node)
+                if retained is not None and retained[0] is stored:
+                    return cached(self._stored_components(stored), retained[1])
+                # The measuring scorer follows the legacy operation order and returns the norm
+                # it actually used.  Publish only if re-entry did not replace this node's
+                # immutable backing while host math was running; a refusal returns no pair and
+                # therefore caches nothing.
+                result, right_norm = measured(self._stored_components(stored))
+                if self._values.get(node) is stored:
+                    self._norms[node] = (stored, right_norm)
+                    # A thread may remove this generation between the comparison and the cache
+                    # write.  Revalidate after publication and retire only our own stale value;
+                    # this keeps churn bounded without holding a lock across host vector math.
+                    if self._values.get(node) is not stored:
+                        published = self._norms.get(node)
+                        if published is not None and published[0] is stored:
+                            self._norms.pop(node, None)
+                return result
+
+            return cosine
+        if self._prepare is not None:
+            prepared = self._prepare(query, self._metric)
+            return lambda node: prepared(self._components(node))
+        math = self._math
+        metric = self._metric
+        return lambda node: math.score(query, self._components(node), metric)
 
     def _link(self, left: int, right: int, layer: int) -> None:
         """Connect two nodes at one layer and trim both neighbourhoods back to capacity."""
         if left == right or left not in self._values or right not in self._values:
             return
         adjacency = self._links[layer]
+        cached_by_node = (
+            None
+            if self._construction_link_scores is None
+            else self._construction_link_scores[layer]
+        )
         for owner, other in ((left, right), (right, left)):
             peers = adjacency.setdefault(owner, [])
             if other not in peers:
+                cached = None if cached_by_node is None else cached_by_node.get(owner)
+                if cached is not None and len(cached) != len(peers):
+                    # Only an exactly aligned prefix is reusable.  Forget an uncertain cache
+                    # before mutating the adjacency rather than guessing which score belongs to
+                    # which peer.
+                    cached_by_node.pop(owner, None)
+                    cached = None
                 peers.append(other)
+                if cached is not None:
+                    # Underfull adjacencies are not scored early.  The placeholder keeps the
+                    # positional proof until a later overflow actually needs this pair.
+                    cached.append(None)
         self._trim(left, layer)
         self._trim(right, layer)
 
@@ -441,19 +602,62 @@ class HnswGraph:
         capacity = self._capacity(layer)
         if peers is None or len(peers) <= capacity:
             return
-        values = self._values[node]
-        ranked: list[tuple[float, int]] = []
-        for peer in peers:
-            _insert_ranked(ranked, self._score(values, peer), peer, capacity)
-        kept = [peer for _score, peer in ranked]
+        scorer = self._scorer(self._components(node))
+        cached_by_node = (
+            None
+            if self._construction_link_scores is None
+            else self._construction_link_scores[layer]
+        )
+        cached = None if cached_by_node is None else cached_by_node.get(node)
+        if cached is not None and len(cached) == len(peers):
+            # Reuse every proved score and resolve only placeholders, in the canonical peer
+            # order.  ``ranked`` is local: if a later scorer fails, no partially refreshed cache
+            # is published into the disposable graph picture.
+            ranked = [
+                (scorer(peer) if known is None else known, peer)
+                for known, peer in zip(cached, peers, strict=True)
+            ]
+        else:
+            # The first overflow and every uncertain alignment retain the canonical complete
+            # scoring order.  A failed score publishes no cache and leaves the caller to discard
+            # or retire the containing graph exactly as before.
+            ranked = [(scorer(peer), peer) for peer in peers]
+        ranked.sort(key=_rank_key)
+        retained_pairs = ranked[:capacity]
+        kept = [peer for _score, peer in retained_pairs]
         adjacency[node] = kept
+        if cached_by_node is not None:
+            cached_by_node[node] = [score for score, _peer in retained_pairs]
         retained = set(kept)
         for peer in peers:
             if peer in retained:
                 continue
-            other = adjacency.get(peer)
-            if other is not None and node in other:
-                other.remove(node)
+            self._unlink(peer, node, layer)
+
+    def _unlink(self, owner: int, peer: int, layer: int) -> None:
+        """Remove one directed adjacency and retire a transient cache if it is uncertain."""
+        adjacency = self._links[layer]
+        peers = adjacency.get(owner)
+        if peers is None:
+            return
+        try:
+            position = peers.index(peer)
+        except ValueError:
+            return
+        scores = self._construction_link_scores
+        cached_by_node = None if scores is None else scores[layer]
+        cached = None if cached_by_node is None else cached_by_node.get(owner)
+        aligned = cached is not None and len(cached) == len(peers)
+        peers.pop(position)
+        if cached is None:
+            return
+        if aligned:
+            cached.pop(position)
+        else:
+            # Mismatch predates this removal.  The adjacency remains authoritative; only the
+            # uncertain optimization is discarded.
+            assert cached_by_node is not None
+            cached_by_node.pop(owner, None)
 
     def _append_to_chain(self, node: int) -> None:
         """Put a node at the end of the connectivity chain."""
@@ -500,13 +704,13 @@ class HnswGraph:
         self._entry_point = best
         self._top_level = best_level if best is not None else 0
 
-    def _descend(self, query: tuple[float, ...], start: int, layer: int) -> int:
+    def _descend(self, scorer: Callable[[int], float], start: int, layer: int) -> int:
         """Return the closest node to the query reachable by greedy steps at one layer."""
-        node, _hops = self._descend_counted(query, start, layer)
+        node, _hops = self._descend_counted(scorer, start, layer)
         return node
 
     def _descend_counted(
-        self, query: tuple[float, ...], start: int, layer: int
+        self, scorer: Callable[[int], float], start: int, layer: int
     ) -> tuple[int, int]:
         """Greedily walk downhill at one layer, returning the arrival and the steps taken.
 
@@ -516,7 +720,7 @@ class HnswGraph:
         and a correct one never reaches.
         """
         current = start
-        current_score = self._score(query, current)
+        current_score = scorer(current)
         hops = 0
         budget = len(self._values) + 1
         while budget > 0:
@@ -524,7 +728,7 @@ class HnswGraph:
             best = current
             best_score = current_score
             for neighbour in sorted(self.neighbours_of(current, layer)):
-                score = self._score(query, neighbour)
+                score = scorer(neighbour)
                 if score > best_score or (score == best_score and neighbour < best):
                     best = neighbour
                     best_score = score
@@ -537,19 +741,21 @@ class HnswGraph:
 
     def _search_layer(
         self,
-        query: tuple[float, ...],
+        scorer: Callable[[int], float],
         entry_points: Iterable[int],
         ef: int,
         layer: int,
         admits: Callable[[int], bool] | None,
     ) -> tuple[tuple[float, int], ...]:
         """Return the best admitted nodes at one layer, discarding the traversal statistics."""
-        ranked, _stats = self._search_layer_counted(query, entry_points, ef, layer, admits)
+        ranked, _stats = self._search_layer_counted(
+            scorer, entry_points, ef, layer, admits
+        )
         return ranked
 
     def _search_layer_counted(
         self,
-        query: tuple[float, ...],
+        scorer: Callable[[int], float],
         entry_points: Iterable[int],
         ef: int,
         layer: int,
@@ -582,6 +788,14 @@ class HnswGraph:
         The behaviour is therefore left as it is and recorded, so the trade is made deliberately
         by whoever calibrates it rather than accidentally here.
         """
+        node_count = len(self._values)
+        if node_count >= _HEAP_FRONTIER_MIN_NODES and (
+            admits is not None or ef >= node_count
+        ):
+            return self._search_layer_counted_heap(
+                scorer, entry_points, ef, layer, admits
+            )
+
         visited: set[int] = set()
         beam: list[tuple[float, int]] = []
         results: list[tuple[float, int]] = []
@@ -591,7 +805,7 @@ class HnswGraph:
             if node in visited or node not in self._values:
                 continue
             visited.add(node)
-            score = self._score(query, node)
+            score = scorer(node)
             _insert_ranked(beam, score, node)
             if admits is None or admits(node):
                 _insert_ranked(results, score, node, ef)
@@ -606,9 +820,67 @@ class HnswGraph:
                 if neighbour in visited:
                     continue
                 visited.add(neighbour)
-                neighbour_score = self._score(query, neighbour)
+                neighbour_score = scorer(neighbour)
                 if len(results) < ef or neighbour_score > results[-1][0]:
                     _insert_ranked(beam, neighbour_score, neighbour)
+                    if admits is None or admits(neighbour):
+                        _insert_ranked(results, neighbour_score, neighbour, ef)
+                    else:
+                        bridges += 1
+        return tuple(results), TraversalStats(
+            visited=len(visited),
+            bridges=bridges,
+            admitted=len(results),
+            hops=hops,
+            exhaustive=len(visited) >= len(self._values),
+        )
+
+    def _search_layer_counted_heap(
+        self,
+        scorer: Callable[[int], float],
+        entry_points: Iterable[int],
+        ef: int,
+        layer: int,
+        admits: Callable[[int], bool] | None,
+    ) -> tuple[tuple[tuple[float, int], ...], TraversalStats]:
+        """Run the same beam search with a heap only for predictably wide frontiers.
+
+        The ordinary approximate path above intentionally remains the established sorted-list
+        implementation: its list shifts happen in C and win for the usual bounded beam. Large
+        selective searches can fail to fill the result beam, while a beam at least as wide as the
+        graph cannot prune early. In either case the frontier can grow towards N; choosing this
+        helper up front removes quadratic list shifts without adding a per-visit mode branch to
+        the common path.
+        """
+        visited: set[int] = set()
+        # ``(-score, node, score)`` pops score descending and node ascending while retaining the
+        # original score value (including signed zero) for the unchanged strict pruning checks.
+        beam: list[tuple[float, int, float]] = []
+        results: list[tuple[float, int]] = []
+        bridges = 0
+        hops = 0
+        for node in sorted(entry_points):
+            if node in visited or node not in self._values:
+                continue
+            visited.add(node)
+            score = scorer(node)
+            heappush(beam, (-score, node, score))
+            if admits is None or admits(node):
+                _insert_ranked(results, score, node, ef)
+            else:
+                bridges += 1
+        while beam:
+            _priority, node, score = heappop(beam)
+            if len(results) >= ef and score < results[-1][0]:
+                break
+            hops += 1
+            for neighbour in sorted(self.neighbours_of(node, layer)):
+                if neighbour in visited:
+                    continue
+                visited.add(neighbour)
+                neighbour_score = scorer(neighbour)
+                if len(results) < ef or neighbour_score > results[-1][0]:
+                    heappush(beam, (-neighbour_score, neighbour, neighbour_score))
                     if admits is None or admits(neighbour):
                         _insert_ranked(results, neighbour_score, neighbour, ef)
                     else:

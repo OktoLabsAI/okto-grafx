@@ -563,7 +563,10 @@ def test_the_valid_form_still_plans_under_a_supplied_analysis(
     )
 
     planned = build_plan(statement, catalog=catalog, indexes=indexes, analysis=supplied)
-    assert "TraverseRelationship" in tuple(node.label for node in planned.root.walk())
+    # The decorative name changes neither semantics nor the selected access path. A large,
+    # unbounded typed hop may therefore use the same endpoint-validating edge-first scan as its
+    # unnamed twin; only a path value that is actually projected requires traversal material.
+    assert "RelationshipScan" in tuple(node.label for node in planned.root.walk())
 
 
 def test_a_named_path_never_becomes_the_typed_endpoint_form(

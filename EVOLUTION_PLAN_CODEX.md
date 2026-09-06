@@ -7,7 +7,473 @@
 **Ambiente principal:** Windows, Python 3.13.1
 **Escopo:** integridade, recuperação, concorrência, estabilidade, performance, API, configuração e novas capacidades.
 
-## Estado de execução — 2026-09-02
+## Estado de execução — 2026-09-03
+
+- **Linha 0.0.3 em execução com foco no carregamento visível do Knowledge Graph do Pulse.** A base
+  0.0.2 está congelada em `feature/v0.0.2@acf63c8`; a branch `feature/v0.0.3` e o bump foram
+  publicados em `1f2172d`. O baseline real isolou fan-out fixo de 70 consultas de arestas por
+  request, estatísticas separadas de aproximadamente 12 s e uma duplicação da rodada inicial no
+  frontend. Limites de 100 e 500 nós custaram praticamente o mesmo (~6,1 s), indicando que o
+  gargalo medido antecede a renderização. O consenso Claude/Codex foi fechado e a primeira onda
+  está publicada até `feature/v0.0.3@2562853`: o fan-out do engine caiu de 4,48 s para 1,10–1,23 s
+  no grafo ativo; replay HNSW em lote só ocorre por capacidade explícita com revalidação da
+  geração; e DDL passou a clonar estruturalmente definições imutáveis. O companion Pulse
+  `perf/v0.3.3-kg-load-grafx@880db68` libera o canvas sem aguardar stats/health, elimina o segundo
+  `/graph` do mount, agrupa os layouts relacionais em um snapshot e reduz o fan-out de estatísticas
+  de 81 leituras para uma contagem agrupada de nós mais um batch relacional. No grafo ativo, os
+  dois helpers de contagem mediram 0,662 s e 2,178 s, com 2.001 nós, 3.004 arestas e zero tabelas
+  falhas; fallback e diagnóstico exato por tabela foram preservados. Escopo, números, invariantes,
+  rejeições e próximos itens finitos estão em `docs/PERFORMANCE_ROUND_0_0_3.md`. O R-1 foi
+  integrado em `4786496`: a projeção de autoridade dos índices só é memoizada para a identidade
+  exata do statement sob o mesmo objeto de catálogo, manager concreto e revisão do registry;
+  DDL especulativo recusa o atalho. O componente caiu 8,9–18× no harness alternado, mas representa
+  apenas cerca de 0,5% do transfer Pulse medido. Multiwriter/multireader, WAL, ambas as OCC,
+  durabilidade e consistência continuam invariantes não negociáveis.
+
+- **Lote de escala 53 — histórico de intents indexado por tabela.** `a0b0508`, endurecido em
+  `eb1c162`, reutiliza a lista
+  revisionada já pertencente à transação para indexar uma vez o sufixo append-only por `table_id`
+  e memoizar a existência de `DELETE`. Consultas repetidas a uma tabela sem intents deixam de
+  varrer todo o histórico crescente; rewrite/rollback reconstrói do zero e qualquer entrada não
+  canônica preserva o filtro integral anterior. A prova estrutural de 1.500 intents e 500 views
+  fez 1.500 inspeções de tabela, contra 750 mil no algoritmo anterior; o micro de componente
+  mediu medianas `2,545 ms` e `96,337 ms` no shape sintético, sem extrapolação ponta a ponta. Os
+  testes focais, o grupo de relações/endpoints/read-your-own-writes e toda `tests/query` passaram.
+  A revisão Nexus `hof_5a43ddf253974308ab20ad895d29d7fd` foi verificada PASS após fechar dois
+  casos hostis: ID forjado força fallback integral e walk interrompido invalida o prefixo parcial;
+  o harness diferencial terminou com 31 cenários equivalentes e zero divergências. Formato,
+  WAL/OCC, durabilidade e premissas multiwriter/multireader não mudaram.
+
+- **Reconciliação de backlog após o lote 52.** `VERIFY-2` já era o lote 48 (`4d27162`) e não foi
+  reimplementado. `OPEN-1` foi fechado como NO-GO sem formato: o header do índice atestaria a si
+  mesmo, a foto de checkpoint não é persistida e a META não contém o watermark por tabela; criar
+  sidecar/capability para um teto antigo de aproximadamente 2,4% do transfer ampliaria o escopo.
+  A antiga correção de publicação Windows também já está entregue pelo CE-1 de dois slots
+  (`1512199`, `93a3ee3`, `98e52dd`): perfil Pulse-shaped atual observou zero `nt.replace` por commit
+  e cerca de 1% no controle. `W6-WRITE-CEILING.md` foi corrigido para não ressuscitar esse alvo.
+  O consenso final com o Claude (`msg_b5c7c4731b654deeafeec9b1bfeb1722`) confirma que, após
+  `eb1c162`, não resta item de código já aprovado e sustentado por evidência na fila atual; o que
+  sobra mede menos de 3% do transfer RAW ou exige nova decisão sobre formato/concorrência.
+
+- **Paginação do Knowledge Graph e acesso vetorial filtrado Pulse publicados.** A falha de
+  `Load more` foi reproduzida no Pulse real: o cursor ISO era comparado com
+  `Timestamp`, produzindo `UNKNOWN`. O Grafx agora ordena/compara timestamps por micros UTC e o
+  Core converte explicitamente o cursor nas duas queries. A API retornou três páginas de 500 sem
+  repetição e a UI avançou de 500 para 1.000 nós. Em seguida, o caminho Pulse de
+  `FilterRows(NodeScan)` deixou de materializar o child inteiro quando sua forma é estritamente
+  provada: filtros pequenos são preparados uma vez e filtros maiores usam HNSW com resolução lazy
+  pelo índice de identidade. A admissão autentica `(record_id, RecordRef)`, filtro vazio preserva
+  o short-circuit e `k > ef_search` volta ao caminho canônico para não alargar a travessia até
+  O(N). Predicados e ambientes fora da prova continuam integralmente no executor anterior. Treze
+  testes focais, regressão seletiva vetorial/query, Ruff, compileall e diff-check estão verdes. O
+  harness Nexus `hof_978789c9dba543dfa2ebb3d1de295fca`, com 300 nós, quatro seletividades,
+  `k={1,11,100000}` e limites `T-1/T/T+1`, confirmou paridade integral e foi verificado PASS. Não
+  houve mudança de formato, WAL/OCC, durabilidade
+  ou premissas multiwriter/multireader. Detalhes e limitações honestas estão em
+  `docs/PERFORMANCE_ROUND_0_0_2.md`, lote 52. SHAs: Grafx `db89ade`, Pulse Core `4dca9b8` e
+  Pulse Community `72a2df3` (a segunda ativação pós-DDL cria `rid_t_*` antes da ingestão; 12/12
+  testes focais verdes).
+
+- **Milestone de hot paths publicado em `9603115` (2026-09-04).** Foram concluídos os recortes
+  limitados de heap/catalog bootstrap, projeção e sincronização de índices, segunda leitura de
+  controle sob pin válido, caches de query por `Database`, packing/decode de slots, retenção de
+  catalog read view somente na composição WAL-only e a lane vetorial VEC-1..VEC-5. Não houve
+  mudança de formato, WAL, OCC, multiwriter ou multireader. Os ganhos vetoriais medidos variam de
+  `1,47x` a `3,19x` conforme o componente/workload; os ganhos de query continuam estimativas, não
+  números end-to-end. A busca vetorial exata header-first valida integralmente toda linha admitida,
+  mas deixa a corrupção de payload invisível/filtrado para `verify`/scan, registrando honestamente
+  a mudança de momento de detecção. Evidências completas estão em
+  `docs/PERFORMANCE_ROUND_0_0_2.md` e no handoff Nexus
+  `hof_47afe28f5f004696a473718eeca9d980`.
+
+- **Linha `0.0.2` iniciada sob o plano de performance congelado.** A branch canônica de trabalho é
+  `feature/v0.0.2`; o bump de versão, o ambiente P0.0 e o diagnóstico/correção multiprocesso P0.1
+  estão publicados, e o marco de código integrado mais recente é `72694bd`. A auditoria do Pulse Community pinado em `d50c034`
+  (Core `f602c7c`) confirmou que o backfill
+  não chama `rebuild_vector_index`, portanto a cerca process-local de um rebuild manual não é um
+  blocker do fluxo real. D-26, D-01 e D-04 foram promovidos depois dos testes focados: D-26 mede
+  janelas/fases sem callbacks sob lock e separa completion estrangeiro de OCC; D-01 elimina a
+  construção de headers rejeitados; D-04 reutiliza a versão validada somente no acerto de PK,
+  mantendo índices de alta cardinalidade no modo lazy e limitado. O protótipo D-02 cauda-primeiro
+  foi descartado porque poderia ocultar duplicata corrupta; a substituição estrita por prefixo
+  canônico entrou em `49a9b03` + `e26af74` e teve o comentário de quota alinhado em `fb984a7`.
+  Ela mantém `HeapStore.lookup` e a ordem pública intactos, amortiza resoluções repetidas para
+  `O(N+E)` enquanto o working set cabe na quota e cai no lookup canônico quando a quota satura.
+  Memo, tabela, identidade, referência e páginas visitadas são cobrados antes da retenção por um
+  teto global por handle; registro e accounting usam `RLock` injetado sem manter o guard durante
+  I/O. O mesmo reader multiprocesso preservou seu snapshot antes da reconciliação e invalidou para
+  fallback canônico depois dela. D-03 foi promovido em `1e2997e` + `13a5bda`: os três consumidores
+  de pousos agora resolvem apenas as identidades efetivamente nomeadas pelas arestas e reutilizam
+  hits/misses sob uma quota por handle de 32 MiB/131.072 entradas. A primeira revisão bloqueou o
+  candidato por reter o fingerprint bruto e o `_Context` sem cobrança completa; o hardening cobra
+  memo, slots, overlays, todo o histórico do fingerprint e resultados antes da publicação, passa o
+  contexto somente por lookup e mantém I/O fora do guard. `DELETE` entra no fingerprint e paga a
+  carga fixa por entrada, mas seu tuple vazio é marcador de ausência de payload e não é reencodado;
+  a view continua admitida/reutilizável e o settlement devolve a quota. R1 foi mantido e o
+  limiar/R2 não foi selecionado: dentro das quotas D-02 + D-03 o custo é `O(N+E)`, enquanto a
+  saturação de ambas conserva explicitamente o fallback canônico de até `O(N)` por identidade.
+  D-05 foi promovido em `bd12a5c` após 250 testes integrados e duas revisões adversariais: o scan
+  de incidentes valida integralmente cada payload visível, inclusive overflow, propriedades e
+  linhas não incidentes, mas materializa somente os endpoints. Seu microbench integrado mediu
+  `1,365x` no componente sintético de decode; isso não é ganho end-to-end e o scan permanece
+  `O(|R| + bytes dos payloads visíveis)`. D-12 também foi promovido em
+  `df09c2e` + `6f6b410` + `16fbc0a`: depois da primeira contagem canônica, o planejador vetorial
+  reutiliza cardinalidade exata cercada por page 0, invalida em rebase estrangeiro e mantém os
+  deltas locais pelo identificador durável `(key, ref)`. Uma revisão adversarial encontrou e
+  bloqueou a versão que identificava apenas por `ref`; o hardening final também garante que uma
+  inconsistência de cache derivado nunca transforma um commit já durável em falha. P0.2 está concluído: as primitivas fail-closed entraram em `c276dec` e
+  o driver Pulse autenticado em `be286fa` + `2d43d75`, com 46 testes focados e smokes sintéticos.
+  O ferramental P0.3 foi integrado em `8ab6a8b`: perfil py-spy one-shot protegido por READY/GO,
+  localidade dinâmica de endpoints, atividade vetorial e censo agregado read-only; `89cb893`
+  removeu o teto de 100 mil hits por agregação exata por página e acrescentou o preflight de
+  interpretador direto. A regressão combinada passou 98/98 antes desse hardening, e os dois
+  arquivos focados passaram 28/28 depois dele. A execução real de P0.3 e as séries P0.4 continuam
+  aguardando o término do backfill vivo e usarão somente cópias autenticadas; por decisão explícita
+  do usuário, elas são evidência e não bloqueiam promoções que passem os gates de qualidade. A
+  autoridade detalhada e a rastreabilidade por commit estão em `GRAFX_PERFORMANCE_ROUND_FINAL.md`
+  e `docs/PERFORMANCE_ROUND_0_0_2.md`.
+
+- **D-09 promovido sem alterar o protocolo de durabilidade.** `c3ef29f` gera a imagem WAL de uma
+  página materializada localmente por `copy → stamp → encode`, eliminando o antigo
+  `encode → decode(verify) → stamp → encode`; bytes externos pré-estagiados continuam no caminho
+  integral `decode_page(verify=True)`. `69368c3` vincula a cópia reutilizável ao par
+  `(txn_id, csn)` da tentativa e preserva todos os campos de `Page`, impedindo reuso cruzado em
+  retarget. O diferencial contra o gerador antigo é byte-idêntico antes do flush, corrupção externa
+  continua recusada antes do WAL, e um microbench sintético na máquina carregada observou razão
+  p50 de `2,47x` por imagem; isso não é estimativa do ganho total do commit.
+
+- **P1 fechado por composição explícita; P2 selecionado como “nenhuma”.** A regressão ampla
+  terminou com `9.628 passed, 17 skipped, 1 failed`; a única falha foi uma docstring ausente no
+  callback aninhado `count`, corrigida sem mudança de comportamento em `8f0af84`, seguida de 66/66
+  testes do lote afetado. A suíte completa não foi repetida após essa correção documental. O gate
+  multiprocesso passou 500/500 operações em 46,6 s, absorveu 44 conflitos retryable e terminou sem
+  perda, duplicata, phantom ou torn read, com `verify("all")` limpo em live e reopen. O cold
+  read-only real e descartável preservou todos os bytes duráveis e adicionou somente o lock vazio
+  da participant section autenticada; `b445736` torna essa prova fail-closed, publica o inventário
+  bruto e passou 43/43 focados mais revisão Nexus
+  `hof_b0100393646349f095544abdd6137a58`. P2-ID, P2-DIRTY e P2-VAC não atingiram seus gatilhos
+  congelados, portanto nenhuma alteração estrutural foi iniciada por hipótese. A limpeza futura dos
+  `control/txn-*.lock` acumulados permanece dívida explícita e exige ADR mais prova multiprocesso
+  contra split-lock antes de qualquer remoção automática.
+
+- **Fila pós-P1 congelada e autorizada em 2026-09-03.** O fechamento da rodada P1/P2 acima não
+  encerra por colisão de numeração os débitos históricos P1.5--P2.3 deste plano. A execução seguinte
+  tem exatamente estes nove itens antes do próximo checkpoint: (1) acumuladores O(1), incluindo a
+  correção da ordem não total de `NaN`; (2) memoização process-local da validação do provider CRC-32C
+  e alinhamento contratual D-29(c/d); (3) top-N para `ORDER BY ... LIMIT`; (4) budgets de caminhos e
+  expansões de traversal; (5) accounting/telemetria honesta de memória residente e métricas bounded
+  do cache de descriptors; (6) HNSW como access path ponta a ponta, mantendo fallback canônico e sem
+  cache persistido; (7) single-flight de cold miss e I/O fora do lock global sem estreitar as
+  garantias multiwriter/multireader; (8) cursor/streaming, budget em bytes e spill; e (9)
+  `executemany`/bulk ingest atômico sobre o protocolo WAL/OCC existente. Os itens 1--9 não podem
+  alterar bytes duráveis, recovery ou as premissas de concorrência. A exceção descoberta durante o
+  item 1 foi autorizada como correção: `DOUBLE` aceita `NaN`, mas `_sort_key` o entregava ao TimSort
+  sem ordem total; a nova regra deve ser determinística, compartilhada por `ORDER BY` e `MIN/MAX` e
+  coberta por diferencial.
+
+  Estado final desta fila: o item 1 está integrado em `da48d6a`; `COUNT`, `SUM`, `AVG`, `MIN` e
+  `MAX` mantêm estado O(1) por grupo, `COLLECT` continua materializado e `DISTINCT` retém apenas
+  seu conjunto de unicidade. A exceção `NaN` foi fechada com ordem total compartilhada (depois dos
+  demais números em ASC, antes em DESC), preservando estabilidade. O item 2 está integrado em
+  `658760b` + `401e838`: as duas portas de instalação de checksum memoizam a prova fechada do
+  corpus CRC-32C por processo sem confiar em igualdade nem em um `id` reutilizável; a identidade do
+  provider é autenticada por `is`, as entradas são limitadas, validações concorrentes são
+  serializadas e falhas nunca são memorizadas como sucesso. O item 3 está integrado em `b71846d` +
+  `841127a`: `ORDER BY ... SKIP ... LIMIT` consome o child integral, mas retém no máximo
+  `K = SKIP + LIMIT` em heap estável, com memória O(K) e tempo O(N log K); planos com bound físico
+  sem a janela semântica exata são recusados. O item 4 está integrado em `8447ded`:
+  `max_traversal_expansions` e `max_traversal_paths` são limites positivos opt-in, cumulativos por
+  query e aplicados a traversal tipado, sem tipo e scan de relações; N+1 é recusado antes de
+  retenção/retorno. O contrato explicita que a construção do fallback agrupado e o HNSW interno
+  não são cobrados por esses dois contadores.
+
+  O item 5 está integrado em `283cffa`: `used_bytes` preserva o budget nominal compatível e uma
+  métrica/health view separada estima os objetos Python retidos sem alegar RSS nem governar
+  eviction. Hits, misses e evictions do LRU de descriptors são cumulativos por device, sem labels
+  de arquivo/path, e callbacks compostos deixam os guards de storage/buffer antes de alcançar o
+  host. O item 7, integrado em `59af285` + `6e8d261` + `b49f297`, avança esse estimador para
+  `python-v2` e executa um único cold load por `(file, page)`: callers da mesma chave compartilham
+  o resultado; leituras/decode distintos e a publicação da vítima dirty ficam fora do guard global;
+  tickets limitados e epochs de estrutura/drop recusam publicação stale. Testes determinísticos de
+  alocação fecharam três janelas: a vítima dirty mantém autoridade enquanto tickets são criados,
+  toda falha de publicação de frame acorda waiters, e um write físico bem-sucedido cuja
+  pós-publicação falha preserva a evidência da página modificada e libera ambos os flights. A
+  revisão focada de buffer, concorrência pública, telemetria e import boundary passou 396 testes.
+
+  O item 6 está integrado em `2642750` + `1299ad8` + `980ac52`: planos HNSW top-k elegíveis
+  consomem hits já ordenados em vez de revarrer a label inteira, capturam `ref`, `record_id` e
+  score uma vez, revalidam identidade/visibilidade no snapshot exato e retornam ao caminho canônico
+  em formas stale, ambíguas, nullable ou não suportadas. O planner nunca funde a janela de retorno
+  quando há `DELETE`/`SET`; seis combinações adversariais com LIMIT/SKIP provaram que todos os
+  matches são mutados e apenas o retorno é limitado. A auditoria independente final deu PASS.
+
+  O cursor do item 8 está integrado em `c4cba57`: `QueryCursor` mantém uma transação read-only e o
+  snapshot até EOF/close, destaca lotes limitados e preserva `max_result_rows` cumulativo. O budget
+  em bytes e spill estão integrados em `192a497`: `query_memory_budget_bytes` opt-in dá a cada sort,
+  result-DISTINCT ou aggregate bloqueante um contador lógico determinístico e um external merge
+  workspace isolado fora do namespace do banco. Ordem estável/primeira ocorrência, aggregate
+  DISTINCT, mixed values, identidade de NaN, equivalência de zero com sinal inclusive em vetores,
+  cancelamento por cursor e preservação da exceção primária têm diferenciais. Níveis binários de
+  runs e remoção imediata de sorters fechados por grupo evitam metadados O(N). Não há pickle nem
+  mudança de formato; um `COLLECT` cujo próprio resultado excede o limite falha fechado, e `None`
+  preserva os caminhos in-memory/top-N anteriores.
+
+  O item 9 está integrado em `ae5c89f`: `Transaction.executemany` faz parse único,
+  consome/canonicaliza um mapping por vez fora do page access, replana cada DML sem `RETURN` e
+  reverte todo o lote ao mark externo em qualquer falha, sem mudar commit/WAL/OCC. A composição
+  entre o AST `Query` e o novo tipo público homônimo foi corrigida em `f1ab724`. O microbenchmark
+  indicativo de 200 inserts observou `2,77x` sem PK e `1,74x` com PK, sem caráter de SLO; validação
+  de unicidade sobre muitos intents com PK e reconciliação repetida do budget em bytes permanecem
+  débitos superlineares explícitos, não escondidos como ganhos de `executemany`.
+
+  **Checkpoint dos itens 1--9 aprovado em 2026-09-03.** Após integração serial, um gate agrupado
+  sobre todo o subsistema de query, bulk/public boundaries, buffer/single-flight, checksum,
+  descriptor telemetry, metric catalog, configuração, packaging e import boundaries passou
+  **2.916/2.916 testes**. A única falha no run composto anterior revelou que a telemetria de buffer
+  congelava um sink habilitado no assembly; `60fc96b` agora respeita sua desativação posterior sem
+  permitir opt-in tardio inseguro, e o caso falho mais a suíte focada passaram antes do gate final.
+  Ruff lint, `compileall` e `git diff --check` estão verdes. O baseline histórico de Ruff format do
+  repo inteiro não é verde e não foi reformatado mecanicamente; todos os arquivos novos do item 8
+  e cada hot path editado diretamente nesta etapa passaram seu format check escopado.
+
+  O checkpoint aprovado acima libera o segundo grupo já autorizado: (10) P2-ID com sizing,
+  rehash e índices de identidade/secundários; (11) vacuum/compaction MVCC; (12) WAL
+  delta/chunked/fisiológico; e (13) codec nativo além do CRC. Cada item 10--13 ainda exige seu ADR,
+  migração/compatibilidade quando aplicável e gates próprios de recovery, mas não nova decisão de
+  escopo do usuário após o checkpoint. Sharding/layout físico por tabela era o item 14 da lista e
+  permanece fora desta autorização. Group commit continua fora da fila porque a medição histórica
+  foi aproximadamente `1,002x`; plan cache continua somente hipótese a medir.
+
+  **Item 10 / P2-ID iniciado com contrato finito em 2026-09-03.** O ADR aceito
+  [`P2_IDENTITY_SECONDARY_INDEXES_V1.md`](docs/architecture/P2_IDENTITY_SECONDARY_INDEXES_V1.md)
+  congela o catálogo v2 como capability/fence de frota, a migração explícita e idempotente (sem
+  upgrade por mero `connect()`), gerações físicas shadow sem republish do mesmo path, sizing e
+  rehash growth-only sob o `COMMIT_SECTION`, índices exatos customizados/compostos e o fallback
+  versus fail-closed. B+tree, range/full-text, rehash online, sharding e itens 11--13 não entram
+  nesse alvo. O primeiro milestone `fa0c298` implementa e testa o codec canônico de nove bytes
+  `record_id_u64_v1` sobre todo o domínio utilizável `1..2**64-2` e generaliza a derivação interna
+  para receber a identidade completa da versão, sem ainda tornar o novo access path elegível.
+  A auditoria do downgrade fence acrescentou uma exigência necessária, sem ampliar a feature: a
+  ativação do catálogo v2 co-publicará `control/commit.state` v2 no mesmo layout de 36 bytes. Isso
+  impede inclusive um processo `0.0.1` já aberto de mutar recovery/checkpoint depois que o WAL da
+  ativação tiver sido reciclado; publishers posteriores preservarão monotonicamente a versão 2.
+  O milestone `4feec76` conclui o formato antes de torná-lo elegível no runtime: catálogo v1
+  continua byte a byte idêntico e é o default; catálogo v2 persiste apenas access paths exatos
+  compatíveis, com capability obrigatória, definições lógicas, gerações físicas, ordem canônica,
+  unicidade global de nonce e cross-references fail-closed. Vetores/proximity continuam derivados
+  pelo tipo especializado do schema. O mesmo milestone fixa o payload `commit.state` v2 de 36
+  bytes e preserva monotonicamente uma versão já publicada. Gates agrupados: `132 passed` no codec
+  e contratos adjacentes, mais `207 passed` no `CatalogStore`, publicação e visões públicas. A
+  porta transacional de promoção/coativação foi concluída no milestone `12414d0`: somente um
+  commit que efetivamente materializou `catalog.dat` decodifica a autoridade durável após
+  `WAL barrier -> apply/flush`, e então publica `commit.state` v2 como último ato; commits comuns,
+  checkpoints e gap completion preservam monotonicamente o fence sem confundir catálogo LIVE não
+  salvo com estado durável. A primeira promoção substitui os dois slots com preflight do budget de
+  gerações; crash entre as escritas é convergido pelo recovery. Todos os payloads outer-valid são
+  inspecionados antes de replay/publicação: fallback v2, payload futuro, geração ambígua, binding
+  estrangeiro e dano de header que esconda um fence mais forte recusam sem mutação. Dano local
+  reconstruível só usa WAL completo e, após validar checksums independentes e bindings, restaura
+  duas cópias v2. O gate agrupado passou **309/309 testes** (`281` em transação/recovery/API e `28`
+  no formato de controle), com auditoria adversarial adicional em **77/77**, Ruff, format check
+  escopado, `compileall` e `git diff --check` verdes. A próxima entrega finita do item 10 é projetar
+  a autoridade ACTIVE do catálogo v2 sobre registry/planner/redo/staging/verifier/inventory; nenhum
+  índice novo está elegível no runtime antes dessa projeção.
+
+  Essa entrega foi concluída em `99622af`. Catálogo e registry agora mantêm projeções estruturais
+  por identidade completa de tabela; resolução por nome no v2 consulta diretamente a definição
+  lógica e sua geração ACTIVE, e count/staging por linha visitam somente `K_t` índices da tabela
+  mais as observações especulativas da própria transação, sem materializar `O(total_indexes)`.
+  Catálogo v1 preserva sua semântica anterior: qualquer registro process-local válido de uma
+  tabela committed continua público, verificável e utilizável, inclusive quando o caller fornece
+  uma foto explícita do catálogo. Cada acelerador automático passa a declinar isoladamente, de
+  modo que um nome vetorial inexpressível não esconda PK/endpoints válidos. No v2, apenas a
+  definição física exata da geração ACTIVE alcança planner, DML, lookup, redo, freshness,
+  reconciliation, rebuild, verifier e inventário; BUILDING, STALE, nonce antigo e registros rogue
+  permanecem apenas sob ownership físico/compensação. `verify()` recusa cobertura incompleta se
+  uma geração exact ACTIVE estiver ausente ou divergente, em vez de produzir relatório falsamente
+  limpo. O fallback de colaboradores legados mantém a validação exact do manager e nunca desce
+  para lookup bruto do store. O gate agrupado dos 15 módulos afetados passou **242/242 testes**;
+  testes discriminantes adicionais, Ruff, `compileall` e `git diff --check` também passaram, e as
+  duas revisões adversariais terminaram sem blocker deste milestone.
+
+  O lifecycle record-aware foi concluído em `0d353ae`: quota/count, INSERT, UPDATE, DELETE,
+  lookup validado, rebuild e verifier derivam `record_id_u64_v1` da identidade durável completa;
+  UPDATE conserva o mesmo ID entre referências físicas e DELETE usa ID/valores lidos do heap,
+  sem reencodar o tuple vazio do intent para quota. O catálogo v1 recuperou apenas sua superfície
+  diagnóstica histórica para reportar registros inválidos; catálogo v2 continua estritamente
+  ACTIVE-only. O gate agrupado passou 435/435 testes, com Ruff lint, `compileall`, diff-check e
+  revisão adversarial sem blocker. O WAL permanece deliberadamente lógico por nome, como
+  congelado no ADR: o significado de uma definição não pode mudar, o shadow de rehash cobre
+  integralmente o horizonte cercado e redo anterior é idempotente sobre a nova geração. A matriz
+  de rehash/recovery deverá provar essas premissas, sem adicionar nonce ou novo formato WAL.
+
+  O roteamento de identidade de endpoint foi concluído em `01c496d`. Cada statement fixa uma
+  única decisão por identidade completa `(table_id, table_name)`: catálogo v1, ausência de geração
+  ACTIVE ou store já stale escolhem o caminho canônico; uma geração ACTIVE íntegra escolhe o
+  índice e não pode depois cair silenciosamente para scan. A consulta usa a projeção estrutural
+  `O(K_t)`, a chave u64 do `RecordId` e versões já validadas contra heap/snapshot; miss é definitivo,
+  duplicidade visível é corrupção e falha posterior propaga fail-closed. Os testes discriminam
+  store ausente, definição física divergente e framework sem validação, além de identidade acima
+  de `2**63`; rota + locator passaram 26/26, a regressão relacional focada permaneceu verde e a
+  revisão adversarial não encontrou blocker. Cold reopen com `IndexManager` real permanece
+  corretamente vinculado ao próximo milestone de ativação física, que cria o artefato necessário.
+
+  A ativação física e o crescimento automático do schema v2 foram concluídos em `ba8ca9a`.
+  `ensure_identity_indexes()` é explícito/idempotente, migra v1 em um único commit e constrói como
+  shadows nonced todas as gerações automáticas exatas mais os índices u64 das tabelas de endpoint.
+  NODE/REL criados depois da migração publicam suas gerações ACTIVE no mesmo commit do schema; um
+  REL também cria ou substitui identidades ausentes/stale dos endpoints antes de ficar visível.
+  Builds sobre heap committed mantêm todas as partições na OCC até o commit, enquanto gerações
+  vazias de tabela nova cruzam durability barrier antes de o catálogo poder referenciá-las.
+  `max_index_build_entries`, keyword-only e opt-in, soma entradas finais exatas do lote e recusa em
+  N+1 antes de `catalog.stage` ou do primeiro `g_*`; rollback limpa claims/cache e retry usa nonce
+  novo. Colisões case-fold continuam scan-only e índices RID não entram no planner genérico. O gate
+  agrupado activation/DDL/quota/planner/config passou 367 testes; o slice DDL pós-formatação passou
+  5/5, Ruff lint, compile e diff-check ficaram verdes, e duas revisões adversariais encerraram sem
+  blocker residual.
+
+  A criação de índices secundários exatos customizados foi concluída em `2fa81b1`. A gramática
+  `CREATE INDEX` e a porta `Database.create_index()` compartilham análise, planner, sizing e o
+  mesmo protocolo transacional: migração/reparo automático v2 e shadow custom são admitidos como
+  um lote, construídos sob writer lease + `COMMIT_SECTION`, barrierados antes do catálogo e
+  publicados por um único commit WAL/OCC. Índices compostos preservam a ordem declarada;
+  `bucket_count` e `expected_cardinality` são exclusivos; o default continua 64 e o sizing por
+  cardinalidade usa `next_pow2(ceil(N/64))` dentro de `1..4096` buckets. A porta Python exige uma
+  `Sequence` ordenada, recusa set/dict/generator antes de abrir transação e retorna `IndexView`
+  ACTIVE destacado com nonce, metadados e horizons recém-certificados. O executor preserva a
+  igualdade da linguagem: `NULL` não casa, e representações que a query considera equivalentes
+  mas o codec distingue (INT64/DOUBLE, zero com sinal e valores aninhados) escolhem scan canônico
+  antes de consumir o índice. A fronteira pública canonicaliza definições lógicas sem callbacks
+  hostis e mantém índices vector/proximity derivados do schema no catálogo v2.
+
+  Gates do marco: 394/394 no slice grammar/planner/query/txn/API e 281/281 no slice público,
+  concorrência de fronteira, activation/v2/reopen; `verify("all")` live e cold passou, além de
+  Ruff, `compileall` e `diff --check`. A revisão adversarial encontrou quatro blockers reais
+  (callback lógico hostil, perda de vector no inventário v2, receipt sem horizons e coleções não
+  ordenadas) e confirmou todos fechados, sem blocker residual.
+
+  **Item 10 / P2-ID concluído em `72694bd`.** `Database.rehash_index()` e a facade de manutenção
+  exigem exatamente um hint e crescimento estrito, constroem uma geração shadow imutável sob o
+  writer lease + `COMMIT_SECTION`, preservam as duas OCC e só publicam o novo ACTIVE após a
+  barreira física. No catálogo v1, a coativação v2 redimensiona a geração planejada e constrói o
+  alvo uma única vez; custom v1 sem autoridade durável é recusado. No v2, somente o predecessor
+  imediato fica descrito como STALE; arquivos históricos permanecem órfãos não reutilizáveis até
+  existir reclamador seguro. O WAL continua lógico por nome e recovery converge para autoridade
+  antiga completa ou nova completa. Handles long-lived adotam mudança de catálogo antes do próximo
+  statement/`verify()`, sem rescan de inventário para DML comum, checkpoint ou delta CE-3 grande
+  quando os bytes persistidos do catálogo não mudaram. Geração ACTIVE ausente/malformada mantém um
+  latch e faz toda nova fronteira falhar fechada até reparo. O gate focal integrado passou 163/163,
+  com recovery/fault injection, multiprocesso `strict`/`generation`, read-only, cold reopen e
+  `verify("all")`; Ruff, `compileall`, diff-check e duas revisões adversariais ficaram verdes.
+  O gate adjacente também revelou um drift test-only anterior: a métrica
+  `oktografx_buffer_retained_estimate_bytes` era emitida e constava do contrato desde `283cffa`,
+  mas não do roster executável do storage-core; `0374dc9` alinhou o teste e o lote focal passou.
+  Assim, o próximo item autorizado é exatamente o **11 — vacuum/compaction MVCC**; itens 12--13 e
+  sharding não entram nele.
+
+  **Item 11 / P2-VAC iniciou pelo marco read-only de medição.**
+  `db.maintenance.bloat(table=None)` faz um censo header-only numa observação sem pruning do
+  horizonte reciclável limitado pelo checkpoint; reader records parados por TTL continuam pins.
+  A porta retorna DTOs imutáveis por tabela e agregados. A nomenclatura ficou fechada:
+  `horizon_eligible + horizon_retained == ended`; versões vivas/provisórias são
+  `stored - ended`, e bytes de overflow/diretório não são atribuídos ao potencial reclaim. O
+  relatório mantém `vacuum_safety_established=False`, não escreve WAL/páginas, recusa estado dirty
+  em vez de fazer flush e não constitui permissão para exclusão. O gate focal passou 196 testes,
+  somado aos testes de buffer/read-view/coordenação, Ruff, `compileall` e diff-check.
+
+  A análise adversarial do protocolo mutante encontrou uma fronteira real, não um novo alvo: o
+  TTL do registry não prova quiescência de um processo antigo já dentro de um statement, e
+  `RecordRef(page, slot)` sem incarnation impede reuso durável seguro por ABA. O usuário autorizou
+  explicitamente o menor contrato v1: manual/foreground, process-quiescent, com floor global
+  monotônico no header do heap e capability obrigatória de catálogo v2; sem vacuum online,
+  truncagem, overflow reclamation nem reuso de `RecordRef` nesta etapa.
+
+  **Item 11 / P2-VAC concluído em `75e799f`.** `maintenance.vacuum(...)` exige a asserção exata
+  `confirm_quiescent=True`, catálogo v2 já ativo e nenhum outro processo/handle Grafx ou transação
+  local durante toda a chamada. A primeira execução publica `heap_reclaim_v1`; a remoção física,
+  floor durável, relink de sucessoras retidas e reconcile de todos os índices ACTIVE selecionados
+  são co-publicados pelo WAL/commit comum. `max_versions` limita deterministicamente apenas slots
+  inline; overflow é contado e retido. Snapshot abaixo do floor falha com
+  `GrafxSnapshotReclaimed`, retryable, e build antigo recusa o capability bit. O segundo passe sem
+  trabalho é zero-write. A matriz de crash atravessou barreira WAL, heap, índice e commit.state;
+  query live/cold, vector, verifier e retry de rehash interrompido ficaram limpos. Gates agrupados:
+  490/490 diretamente afetados e 736/736 transacionais/fronteira, além de Ruff, format,
+  `compileall` e diff-check. Quatro falhas do comando transacional sem filtro foram reproduzidas no
+  baseline `6d3e62c` e excluídas por node id, sem serem reclassificadas como sucesso. A revisão
+  Nexus `hof_df837d11c96a430786856895c7f7c744` foi corrigida após contraditório e verificada PASS.
+  O ganho é remover payload inline morto e evitar seu decode futuro; páginas históricas, diretórios
+  de slot e tamanho do arquivo permanecem, portanto ainda existem percursos `O(history pages)`.
+
+  **Item 12 / WAL — recorte definitivo concluído e publicado.** O commit `24f2f63` implementa o
+  contrato convergido na revisão adversarial: compressão zlib nível 1 da imagem completa de
+  `WRITE_PAGE`, sob `format_version=2` e capability persistente `wal_record_v2`. A ativação é
+  explícita, one-way e
+  ocorre em transação anterior inteiramente v1; somente commits posteriores podem emitir v2, e
+  apenas quando a codificação completa fica estritamente menor. O prefixo `(file, page_index)`
+  permanece legível sem inflate, a descompressão é limitada a `MAX_PAGE_SIZE`, o CRC do record
+  cobre bytes comprimidos e o page codec valida a imagem expandida antes de mutação.
+  `max_wal_batch_bytes` cobra os records finais comprimidos. Para eliminar feedback entre tamanho,
+  roll, `SEGMENT_HEADER` e CSN materializado, todo lote raw que já exigiria roll permanece v1;
+  compressão só encurta lotes cujo terminal já foi provado no segmento atual. Tipos/flags v2
+  obrigatórios desconhecidos recusam read/append/recycle/recovery sem alterar o WAL, enquanto
+  capability de catálogo mantém o downgrade fechado mesmo depois de reciclar os records v2.
+
+  O escopo não se move: block-delta fica futuro e exige pre-image/base LSN, FPW pós-checkpoint e
+  redo de quatro vias; chunk físico é **NO-GO** neste protocolo porque kill entre `append_log`s
+  deixa effects completos sem COMMIT, estado que recovery corretamente trata como ambíguo;
+  WAL fisiológico também é **NO-GO** por duplicar semântica de mutação no redo. O contrato e seus
+  prós/contras estão em
+  [`WAL_PAGE_COMPRESSION_V1.md`](docs/architecture/WAL_PAGE_COMPRESSION_V1.md). O parecer Nexus
+  `hof_44e3743219b2476a95ecc02d00ac0eb6` foi corrigido duas vezes no contraditório e verificado
+  PASS na revisão 3. A revisão da implementação
+  `hof_b192c61ffcea4297852c7b2b8f00064b` também foi verificada PASS depois de fechar a gramática
+  explícita de records desconhecidos `SKIPPABLE`; não há gate de performance nem etapa de
+  pre-image adicionada a este marco. O gate agrupado terminou em 1.496/1.496 casos verdes após
+  excluir nominalmente quatro falhas históricas reproduzidas fora do caminho alterado; os gates
+  focais, Ruff, `compileall` e `git diff --check` também ficaram verdes. Uma
+  amostra indicativa de uma transação de 50 linhas/3 páginas de 8 KiB mediu 31.510 bytes v1 contra
+  7.966 bytes finais (`-74,72%`, razão `3,96x`), sem elevar esse número a SLO ou critério de aceite.
+
+  **Item 13 / codec NumPy v1 concluído em `d644dc3`.** `DatabaseConfig(codec="numpy")`, opt-in e
+  por instância, liga um adapter híbrido que preserva byte a byte o page format v1. Encode usa
+  packing vetorizado a partir de 16 slots; decode usa validação vetorizada a partir de 96; abaixo
+  desses limiares e em toda entrada inválida, `PageCodecV1` continua o oráculo único. Não há
+  `auto`, capability, migração, cache global ou mudança de WAL/locks/multiwriter/multireader.
+  `database.codec` distingue o implementation por handle do
+  `process_checksum_implementation`, global por desenho preexistente. O diferencial cobre bytes,
+  freed/compacted pages, corrupções explícitas, 1.000 mutações semeadas em cada page size
+  4/8/32 KiB, cold reopen e dois handles no mesmo processo. A revisão adversarial inicial retirou
+  seu NO-GO após separar CRC puro do custo do diretório; a revisão final
+  `hof_19b2cca000214564832d7ff15cf77618` fechou os seis blockers e foi verificada PASS. O
+  microbenchmark final de 200 slots/8 KiB com CRC nativo mediu encode `164,85→53,87 us` (`3,06x`)
+  e decode `150,48→82,12 us` (`1,83x`), somente como evidência de componente. O commit
+  `b720f7e` fechou as duas dívidas arquiteturais reveladas pelo gate ampliado: tabelas constantes
+  de catálogo agora são imutáveis e `zlib` está explicitamente admitido como algoritmo
+  determinístico da gramática WAL v2; o regex de nome físico foi removido sem perder `g_`/`G_`.
+
+- **Run real do Pulse 0.3.3 na pasta padrão — reconstrução Grafx em andamento, SQLite preservado.**
+  Antes da troca foi criado backup consistente do SQLite (`quick_check=ok`, zero violações de FK)
+  e os artefatos Ladybug foram movidos, sem exclusão, para quarentena operacional. Os bindings de
+  Board e Global foram materializados com `backend=grafx` e `descriptor_revalidation=generation`.
+  O run real revelou e fechou dois defeitos no Pulse Community: o `kg backfill --apply` standalone
+  não registrava o provider de coordenação antes de adquirir o writer lease, e o fechamento terminal
+  da transação tentava resetar em worker thread um token `ContextVar` criado no contexto async. As
+  correções estão em `okto-pulse@d50c034`; 54 testes focados passaram. O limite textual abaixo está
+  em `okto-grafx@58e2e7d`; 367 testes focados e Ruff passaram. A fila interrompida por reboot é
+  retomada pelo protocolo público de expiração/recuperação de claim, preservando at-least-once e a
+  serialização por board. Auditoria final e liberação para uso só ocorrem após a fila chegar a zero.
+
+- **Hotfix de integração Pulse — limite textual corrigido localmente; I64 permanece gap explícito.**
+  A criação do refinement `876eb7b0-189c-4499-8bb8-9ca8c6568d82` expôs que o limite léxico de
+  16.384 caracteres estava sendo reutilizado indevidamente para dados parametrizados: no SQLite
+  preservado, `screen_mockups` tem 27.825 e `description` 18.718 caracteres. A correção separa as
+  superfícies: literais na query continuam em 16.384, enquanto `max_query_value_characters` passa a
+  governar parâmetros/resultados com default 65.536 e hard cap configurável de 1.048.576, sem mudar
+  formato ou tocar WAL/durabilidade. A outra mensagem observada, `kg.scoring.fetch_failed`, vem da
+  consulta `_fetch_node_inputs` com três `OPTIONAL MATCH` encadeados e dois `WITH` agregadores; ela é
+  exatamente a família I64 já congelada como `generic_gap/runtime_current`, não uma regressão do
+  subconjunto prometido. Portanto I64 continua dívida funcional declarada e não foi mascarada por
+  widening parcial do parser neste hotfix.
 
 - **Decisão normativa de 2026-09-01 — gates de performance aposentados.** Throughput, latências,
   RSS, CPU, contadores de syscall, o antigo piso `same-10 >= 7,5/s`, D5 e paridade temporal com
@@ -1640,6 +2106,28 @@ Adicionar:
 - recusa fail-closed para tipo obrigatório desconhecido;
 - fixtures de compatibilidade n−1/n/n+1.
 
+### P2.10 — Mesma marca certificada não implica mesma figura HNSW
+
+A abertura fria constrói a figura em ordem canônica: `_build` insere
+`sorted(walk(), key=(born_csn, ref.encode()))` em
+[`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L1041). O caminho quente **não**
+reconstrói: `commit` ([`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L1230)) e `apply`
+([`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L1260)) chamam `_note` por mudança
+encenada, inserindo na figura **viva em ordem de encenação**, e só então `_certify` avança a marca.
+
+Como o HNSW é sensível à ordem de inserção, **dois handles na mesma marca certificada podem manter
+grafos diferentes** e responder rankings diferentes para a mesma consulta no mesmo snapshot. Isso
+já é verdade hoje, sem parametrizar nada, e é a premissa que mata a opção C de P1.16.
+
+Não é necessariamente defeito. O docstring de `HnswGraph` promete determinismo para "a mesma
+semente e as mesmas inserções", e "as mesmas inserções" inclui a ordem, portanto é literalmente
+correto; e o contrato já recusa prometer recall para uma consulta individual. **A lacuna é de
+documentação no nível do engine**, e é ali que precisa ser escrita: mesma marca e mesmo conjunto
+não implicam mesma figura.
+
+Distinto de P1.2: lá o problema é frescor, um processo que não percebe que outro marcou o índice
+stale. Aqui nada está stale — as duas figuras estão corretas e atualizadas, e mesmo assim divergem.
+
 ## 5. Performance e escalabilidade
 
 ### P1.5 — A busca vetorial aproximada ainda possui custo O(N)
@@ -1796,6 +2284,14 @@ Sequência recomendada:
 
 ### P1.12 — Hash indexes têm escala fixa
 
+**Parcial estrutural concluída em 0.0.2:** índices automáticos exatos recém-materializados podem
+ser dimensionados por `connect(..., automatic_index_expected_cardinality=N)`. A dica vale por
+índice, é persistida na nova geração v2 e não redimensiona artefatos existentes. PK e `ef_`/`et_`
+usam o mesmo número porque cada um contém uma entrada por linha; o índice `record_id` usa a dica
+somente como piso sobre `max(4096, 2 * visible_rows)`. Um catálogo vazio e gravável é ativado em
+v2 no open; catálogo v1 não vazio mantém migração explícita e recusa novo DDL em vez de ignorar a
+dica. `None` preserva 64 buckets.
+
 Índices automáticos recebem 64 buckets por padrão em [`keys.py`](src/okto_grafx/domain/index/keys.py#L49). O lookup percorre toda a cadeia daquele bucket em [`index_manager.py`](src/okto_grafx/engine/index_manager.py#L942).
 
 São necessários:
@@ -1806,6 +2302,20 @@ São necessários:
 - `CREATE INDEX`;
 - índices compostos;
 - B+tree para range, prefix e `ORDER BY`.
+
+
+Ressalva medida na rodada de escala de 2026-09-04, a considerar antes de aumentar buckets por
+padrão: `walk()` custa O(buckets + entradas) e **piora com diretório esparso** — 73,5 ms com 1.024
+buckets para apenas 1.000 entradas. `walk()` é o caminho de `verify('indexes')`, de `reconcile` e
+da reconstrução, então dimensionar por cardinalidade esperada precisa vir junto de um percurso que
+não pague pelos buckets vazios. O `CREATE INDEX` já aceita as duas opções de dimensionamento
+([`parser.py`](src/okto_grafx/domain/query/parser.py#L384)) e o valor é persistido. Os índices de
+identidade v2 também são uma exceção já entregue: `identity_index_sizing(visible_rows)` escolhe o
+diretório a partir da cardinalidade cercada. O gap de configuração dos índices automáticos foi
+fechado sem alterar `TableDef` ou a projeção lógica de `automatic_index_definitions`: o sizing é
+aplicado somente quando QueryEngine/TransactionManager planejam uma nova geração física. Continuam
+como evoluções separadas o crescimento automático/rehash sob carga e um diretório extensível ou
+esparso; não são pré-condição para usar a dica entregue.
 
 ### P1.13 — Traversal ainda paga landing scan
 
@@ -1869,6 +2379,47 @@ Recomenda-se:
 - exigir `allow_remote_metrics=True` para override;
 - emitir aviso de segurança;
 - testar binds reais IPv4 e IPv6, não apenas parsing da configuração.
+
+### P1.16 — Os três parâmetros de construção do HNSW são inalcançáveis
+
+Levantamento de 2026-09-04 (base `de24b7b`, reconferido em `22d9694`). `DEFAULT_NEIGHBOURS = 16` e
+`DEFAULT_EF_CONSTRUCTION = 200` estão em [`hnsw.py`](src/okto_grafx/domain/vector/hnsw.py#L61) e
+[`hnsw.py`](src/okto_grafx/domain/vector/hnsw.py#L70); `DEFAULT_INDEX_SEED` está em
+[`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L154). O `VectorEngine` aceita os três
+na assinatura ([`vector_engine.py`](src/okto_grafx/engine/vector_engine.py#L583)), mas
+[`assembly.py`](src/okto_grafx/api/assembly.py#L378) nunca os passa: são alcançados por omissão e
+não existe caminho público para nenhum deles. Ao lado, `vector_ef_search` e
+`vector_exact_scan_threshold` são configuráveis em
+[`config.py`](src/okto_grafx/runtime/config.py#L290).
+
+Quatro desenhos foram avaliados com adversário dedicado e os quatro morreram:
+
+| Opção | Por que não sobrevive |
+|---|---|
+| A — campo imutável no catálogo, com bit de capacidade | O default de compatibilidade referencia a própria constante, então todo espaço já existente continua preso a ela; e o bit só existe em catálogo v2, enquanto um banco nasce em v1. Só se justifica como pré-requisito de **persistir o grafo**, não como botão. |
+| B — derivar de campos já presentes no catálogo | Não dá alavanca ao usuário e transforma a fórmula em parte do build: duas versões do Grafx divergiriam sobre o mesmo banco sem bit de capacidade que detecte. |
+| C — configuração por processo com prova de acordo | O conjunto de entradas **não é função** de `built_through_lsn` (ver P2.10), então a prova certificaria a proposição errada. Nenhum dos três mecanismos existentes — registro de leitores, lease de escritor, digest de cabeçalho — serve. |
+| D — heurística na criação, gravada uma vez | No `CREATE` a cardinalidade é zero, e o espaço existe antes de qualquer tabela declarar coluna nele. A metade que resolve é a opção A; a metade exclusiva de D quebra a compatibilidade preguiçosa. |
+
+**Recomendação registrada.** Expor `ef_construction` e `neighbours` como controle **operacional do
+processo**, exatamente como `vector_ef_search` já é exposto — o que a §7 deste plano já prevê na
+linha `VectorOptions` —, acrescentando teto superior (hoje a validação só exige `>= 1`) e mantendo
+o `HNSW_FROZEN` do arnês de recall independente da configuração pública. Custo de formato: zero.
+O fundamento é duplo: o contrato já recusa prometer recall por consulta
+([`CONTRACT.md`](docs/architecture/CONTRACT.md#L576)), e a concordância entre processos que
+justificaria travar o valor **já não existe** na forma que se supunha (P2.10).
+
+**Condição de entrada acordada com o Codex, antes de expor qualquer botão:** perfil completo de
+recall em 8.192 × 384 medido nos dois valores candidatos e recongelamento deliberado do
+`HNSW_FROZEN` em `bench/harness/recall_worker.py`. A divergência entre as duas posições é de
+**sequência**, não de mérito: um parâmetro exposto sem perfil convida a ser girado, e o custo cai
+em recall, que é o que menos se percebe quando degrada.
+
+**Retirado por medição cega, não repropor sem experimento novo:** a medição que sugeria
+`ef_construction = 64` equivalente a 200 (recall@10 de 0,915 contra 0,910) usou 2.000 vetores
+uniformes em dimensão 64, faixa em que a travessia visita 97,6% do grafo. Com a busca praticamente
+exaustiva a qualidade das vizinhanças não influencia o recall, então o experimento estava cego
+para o efeito que deveria medir.
 
 ### P2.4 — Contrato de adapters customizados é ambíguo
 
@@ -1960,6 +2511,12 @@ Ao abrir um banco existente, esses valores devem ser descobertos da identidade. 
 
 O alvo de recall pertence a `bench.harness.gate --recall-target`, não a `DatabaseConfig`: é um SLO
 de benchmark, não uma promessa que cada query possa garantir sem um oracle exato.
+
+
+A linha `VectorOptions` carrega hoje um item bloqueado: `neighbours` e `ef_construction` não têm
+caminho público nenhum, e a decisão de expô-los está registrada em P1.16 com condição de entrada
+explícita (perfil de recall 8.192 × 384 antes do botão). A semente do índice fica fora dessa lista:
+mudá-la muda a figura, e P2.10 mostra que a figura já não é única entre processos.
 
 ## 8. Novas capacidades recomendadas
 
@@ -3011,7 +3568,206 @@ começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidên
 | RELEASE-0.0.1 — regressão Community pós-M-PULSE-7 | fechada por regressão ampla + repetição focada do único caso residual; auditoria instalável fechada na linha seguinte | Community `perf/st2-pulse-generation@159ef75328dc68493379d95b9f72826b660b8d84`; Core `milestone/grafx-mpulse6-logical-transfer-manifest@341bccdbb1232ee7ed6a9bcce380fdf9616c1600`; Grafx preservado em `8cee82b9b92529f2ba767519c01c161f20876dce`; diagnósticos Nexus `hof_1b1010756f4e49d59a5985b98992d4dc` e `hof_e31712f8b255489aa1834b5454be10b9` verificados/PASS; JUnit focado SHA-256 `9fdfa522c70202d93e03c04af51f1f0810fc331b22402206597d293be4bdd1f6` | O primeiro run amplo teve 5 falhas e 5.183 passes; todas foram fechadas sem remover asserções. O segundo teve 5.187 passes e uma única incompatibilidade de HEAD provocada pelo commit Core documental exigido pelo F16. O teste final mantém o runner fail-closed, prova ancestralidade imediata, diff exclusivo em README, `src` Core bit-idêntico e catálogo produtivo integral idêntico ao receipt a05; happy path e pins forjados continuam cobertos. O lote final passou 10/10. A conclusão `5187 + 1` é composição explícita, não uma terceira corrida ampla. Código produtivo, manifesto, watchdog semântico de 30 s e receipt não mudaram; upload PyPI permanece manual/conjunto. |
 | RELEASE-0.0.1 — auditoria dos artefatos e smoke instalado | concluída; artefatos posteriormente publicados sem alteração | Grafx `perf/st2-descriptor-revalidation@744d450f5c199d06fa34e2f831dd443fbd15375d`; árvore produtiva `a00e55461daf93e3ab639790899079ad30a699b8`; wheel SHA-256 `3acc1bbc17bb4629caea3cbca60ff503c5cea1f8891cd829227a08eb5bc75070`; sdist SHA-256 `ccdc368cb73781f04512023f4cfa54aaf89f6e7dab0881a86112ad8bdff9359e`; JUnit Pulse instalado `0f2e6f7a170833a4b80de20d54ea7db3c0cd055cf2898ec9e4a3faade020a9ff`; evidência `821e42136ed9c8ea04671cb2bc93fbc6dc2668c14dc33e3c7d0b393bc7d27b3c`; auditoria Nexus `hof_a8c2280dc3be489792d4f51b54ba8a69` PASS | Regressão Grafx fechada honestamente por `11381 + 1`, com 485/485 no lote afetado após correção exclusiva do allowlist de teste. Build isolado, `twine check --strict`, inventário/metadata/licença e smokes core-only/`[accel]` verdes. O gate Pulse offline instalou os três wheels fora dos checkouts e passou 1/1 em 277,82 s, autenticando versões, origens, payloads, runtime Python 3.11, MCP, paridade de projeção, concorrência e crash-resume. Zero blocker objetivo aberto. |
 | RELEASE-0.0.1 — publicação e reinstalação do PyPI | concluída em 2026-09-02; release pública verificada | `https://pypi.org/project/okto-grafx/0.0.1/`; wheel SHA-256 `3acc1bbc17bb4629caea3cbca60ff503c5cea1f8891cd829227a08eb5bc75070`; sdist SHA-256 `ccdc368cb73781f04512023f4cfa54aaf89f6e7dab0881a86112ad8bdff9359e`; venv `D:\GrafxBenchEvidence\grafx-0.0.1-release-audit-20260902\venv-pypi-a01`; lock Community `92ece5d` | A API pública confirma `okto-grafx==0.0.1` e os dois artefatos exatos. Download sem cache repetiu o SHA do wheel; instalação pública `[accel]`, `pip check`, origem/version/CLI, checksum nativo, NumPy, busca vetorial, verify, checkpoint e cold reopen passaram. O lock passou a conter URLs/hashes públicos sem mudar as demais resoluções. A ferramenta do usuário foi atualizada para Pulse/Core `0.3.3` + Grafx `0.0.1`; o diretório de dados existente permaneceu intocado. Nenhum segredo foi persistido. |
-| Roadmaps complementares pós-Pulse | incorporados por referência; gate `0.0.1` cumprido, linha `0.0.2` liberada e ainda não iniciada | `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | Ambos os arquivos integrais são autoridades versionadas da linha `0.0.2`. Database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia milestones Pulse correntes; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
+| Roadmaps complementares pós-Pulse | incorporados por referência; gate `0.0.1` cumprido e linha `0.0.2` executada pela rodada delimitada em `GRAFX_PERFORMANCE_ROUND_FINAL.md` | marco de código `feature/v0.0.2@b445736`; P0.2 originado em `perf/v002-p0-instruments-claude@9635146` e `perf/v002-p0-card-driver@e8a6be0`; P0.3 originado em `perf/v002-p0-census@7cdb204`, integrado em `8ab6a8b`, endurecido em `89cb893` e corrigido no censo frio em `b445736`; D-26 integrado em `7aa410d` + `59020a4`; D-01 em `b23bcbc` + `07dfb02`; D-04 em `2e6bbf9` + `f6e7531` + `873f419` + `bc3ede4`; D-02 em `49a9b03` + `e26af74` + `fb984a7`; D-03 originado em `e977285` + `7b152a9` e integrado em `1e2997e` + `13a5bda`; D-05 originado em `7751ea1` e integrado em `bd12a5c`; D-12 em `df09c2e` + `6f6b410` + `16fbc0a`; D-09 em `c3ef29f` + `69368c3`; `GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md` (`GX-CAP-0..11`, `GX-AGENT-0/1`) e `AGENT_FIRST_EVOLUTION_PLAN_CODEX.md` (`AGENT-0..8`) | P0.0/P0.1/P0.2 e o ferramental P0.3 estão concluídos; sua execução real e P0.4 continuam apenas como evidência pós-backfill por decisão explícita do usuário. D-26, D-01, D-04, D-02, o R1 de D-03, D-05, D-09 e a contagem vetorial D-12 foram promovidos com gates focados verdes e sem mudar formato, WAL ou multiwriter/multireader; o limiar/R2 de D-03 foi explicitamente não selecionado. D-02 + D-03 amortizam pousos repetidos para `O(N+E)` dentro das quotas e preservam fallback canônico quando saturadas. Em D-03, `DELETE` paga a entrada fixa do fingerprint sem reencodar seu tuple vazio. D-05 reduz materialização no scan de incidentes, mas continua honestamente `O(|R|)`. D-12 elimina o walk `O(N)` repetido do planejador após o primeiro count cercado e preserva a atualização incremental do HNSW; D-09 reduz materialização redundante mantendo o caminho de verificação de imagens externas. P1 foi fechado pela composição documentada de regressão ampla, correção documental focada, 500/500 multiprocesso e cold read-only; P2 foi selecionado finitamente como `nenhuma`, pois nenhum gatilho congelado foi atingido. Ambos os roadmaps integrais continuam autoridades versionadas depois desta rodada: database-first governa ownership/ordem no core; agent-first preserva todos os requisitos e gates detalhados da camada opcional. Nenhum item amplia retroativamente o lote de performance; sobreposição usa o conjunto compatível mais estrito e conflito exige ADR explícita |
+| 0.0.2 / checkpoint 1–9 — item 6, access path vetorial ponta a ponta | integrado, auditado e aprovado no checkpoint | `2642750` + `1299ad8` + `980ac52`; origem `perf/v002-ann-query`; código em `query_engine.py`/`vector_engine.py`; contrato, README, performance e regressões dedicadas atualizados | `VectorSearch` usa `VectorHit.ref` somente no shape bounded/unfiltered certificado no frontier exato do snapshot e no par físico tabela/coluna planejado; exact e approximate retornam o mesmo ranking do fallback e a camada de query materializa 3 hits contra 8 rows do `NodeScan` no discriminante. O oracle exact mantém sua validação exaustiva própria; o ganho ali é remover o segundo scan redundante. Nullable pequeno/`k` amplo, filtro, snapshot histórico/custom, budget intermediário e índice stale declinam para o child canônico; dirty owner mantém a recusa existente; refs ausentes/estrangeiras falham fechado. Hits capturam identidade e score uma vez, e LIMIT/SKIP nunca reduz o conjunto mutado por `DELETE`/`SET`. Cold reopen, `verify(all)` e a auditoria independente estão verdes. Sem mudança de beam/recall, formato, WAL, locks ou multiwriter/multireader |
+| 0.0.2 / item 11 — vacuum MVCC v1 | concluído, auditado e publicado na branch | `75e799f`; ADR `docs/architecture/MVCC_VACUUM_V1.md`; revisão Nexus `hof_df837d11c96a430786856895c7f7c744` corrigida e verificada PASS | Vacuum manual/foreground/process-quiescent com capability requerida, floor heap-global monotônico, recusa retryable de snapshot reclamado, relink de cadeia e reconcile ACTIVE atômicos. Remove somente versões inline; overflow, truncagem e reuso físico continuam fora. Fault injection e 1.226 testes agrupados verdes no delta; quatro falhas históricas foram reproduzidas no baseline e nominadamente excluídas |
+| 0.0.2 / item 12 — full-page WAL zlib v2 | concluído, auditado e publicado na branch | `24f2f63` + `d806652`; ADR `docs/architecture/WAL_PAGE_COMPRESSION_V1.md`; revisões `hof_44e3743219b2476a95ecc02d00ac0eb6` e `hof_b192c61ffcea4297852c7b2b8f00064b` verificadas PASS | Ativação explícita/one-way por capability `wal_record_v2`, transação de ativação integralmente v1, inflate limitado e semântica unknown-v2 fail-closed. Lotes com segment roll e imagens incompressíveis preservam v1. Amostra 50 linhas/3 páginas reduziu `31.510→7.966` bytes (`-74,72%`); gate agrupado 1.496/1.496 no delta |
+| 0.0.2 / item 13 — codec NumPy byte-idêntico | concluído, auditado e publicado na branch | `b720f7e` + `d644dc3`; ADR `docs/architecture/NATIVE_PAGE_CODEC_V1.md`; parecer inicial `hof_fd26b1d96ce74dac80c9671e00a55999` e validação final `hof_19b2cca000214564832d7ff15cf77618` verificados PASS | Selector explícito `codec="numpy"`, por banco, sem `auto`; page format v1, WAL e concorrência inalterados. Caminho híbrido 16/96 slots, montagem canônica de `Page`, oracle único de recusa, paridade `u16` em NumPy 1.x/2.x, 3.000 mutações diferenciais e receipt processo/instância. Micro final: encode `3,06x`, decode `1,83x` em 200 slots/8 KiB; sem alegação end-to-end. Focado 556/556; gate ampliado fechou uma dívida imutável via 661/661 e reteve as mesmas quatro falhas transacionais históricas fora do delta |
+| 0.0.2 / item 14 — hot paths limitados de query/heap/txn/vetor | concluído, auditado e publicado na branch | `9603115`; revisão Nexus `hof_47afe28f5f004696a473718eeca9d980` verificada PASS | Caches por `Database` limitados a 256/128/128 e sem autoridade de storage; bootstrap elimina device probes redundantes mas continua validando o header; CE-3 evita sync sem mudança; uma projeção ACTIVE por statement; retenção de catálogo só sob composição WAL-only; packing/decode e VEC-1..VEC-5. Sem mudança de formato/WAL/OCC/concorrência. Evidência vetorial: `1,47–3,19x` conforme componente/workload e ranking idêntico; ganhos de query permanecem estimados. Payload vetorial invisível/filtrado passa a ser auditado por verifier/scan, mantendo fail-closed para linhas admitidas. 21/21 mutantes, gates focais e checks estáticos verdes; 29 arquivos históricos seguem fora do baseline de formatação, sem reformat amplo |
+| 0.0.2 / lote de escala 1 — recovery, storage e heap | concluído e publicado na branch | `c1d537e`, `9ee51f3`, `2be59c9`, `2afd876`, `210b685`, `c12e67c`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Coalescência permanece exclusiva de replay originalmente page-only e inequívoco; replay misto é sequencial. Preflight passage/content-bound reduz decode sem pular validação; barreiras de dados precedem `commit.state`. Leitura control fundida preserva identidade strict; dirty candidates eliminam scan de frames e revalidam cada candidato. Diretório de extents usa hint defensivo e fallback canônico; default lazy de descritores passa a 256 com override. Evidência de componente: flush 8.192 frames cai a microssegundos, extent 200 tabelas `6,19x`, e cache de 192 artefatos elimina evicções. Nenhuma premissa multiwriter/multireader, OCC, WAL ou formato foi alterada |
+| 0.0.2 / lote de escala 1 — índice incremental | concluído e publicado na branch | `8604661`; testes `test_registry_and_format.py` e `test_provisional_csn.py` | Gauge de tombstones deixa de varrer o índice por commit após uma semeadura exata; reopen/rebase/falha invalidam, métricas off não pagam. Comparação de efeitos preserva multiconjunto com `Counter` em O(K), incluindo recusa de duplicada e ausente. Micro de 1.000 mudanças `~33x`; 73 testes independentes e Ruff verdes. O Pulse 0.3.3 instalado usa o sink noop por default, então o ganho do gauge é estrutural para observabilidade, não alegação de throughput Pulse atual |
+| 0.0.2 / lote de escala 1 — inventário ACTIVE | concluído e publicado na branch | `592fd22`; teste `test_index_manager_authoritative_facade.py` | O fast path com todos os ACTIVE relevantes registrados e definição integral exata não executa mais `list_files("index/")`; qualquer unresolved/mismatch usa um único inventário. A fresh certificate posterior continua a prova física pré-WAL. V1 opcional, v2 obrigatório, nonce/definição divergentes e catálogo estrangeiro permanecem cobertos; 9/9 focados e Ruff verdes |
+| 0.0.2 / lote de escala 2 — PK, planos, catálogo e LIMIT | concluído e publicado na branch | `02e6f41`, `e0e18f8`, `855c9cf`, `3b72d4a`, `82bd176`; detalhes e evidências em `docs/PERFORMANCE_ROUND_0_0_2.md` | Fold incremental remove O(K²) de unicidade e reconstrói pelo redutor canônico em rewrite/rollback; plano preparado usa imagem imutável em vez de identidade Python; projeção ACTIVE vive somente na autoridade corrente; catálogo residente só atravessa same-token/own/CE-3 sem DDL; travessia 1-hop sob LIMIT usa endpoint index e short-circuit, enquanto operadores bloqueantes, shapes amplos e índice stale mantêm scan. Evidência de componente: PK K=1.000 `67,16x`, CAT-1 N=64 `~3,02x`, QUERY-2 E=2.000 `2,56x`. Sem alteração de multiwriter/multireader, WAL, OCC ou formato |
+| 0.0.2 / lote de escala 3 — build, recovery, commit e checkpoint | concluído e publicado na branch | `c1f1a1f`, `b8eff8a`, `26baa86`, `46fa9fe`, `aaf72f2`; detalhes e evidências em `docs/PERFORMANCE_ROUND_0_0_2.md` | Diretório first-fit efêmero acelera geração vazia mantendo imagem byte-idêntica (`2,05x–9,43x`); recovery nativo faz um único WAL walk; stamps MVCC deixam `O(P×R)` por `O(R+A)`; commits somente de conteúdo preservam caches estruturais; checkpoint compartilha uma observação exata de reader horizon. Gates focais agrupados verdes, sem alteração de multiwriter/multireader, WAL, OCC, formato, visibilidade ou durabilidade. A alegação antiga de `1,11x–1,35x` foi retirada de `e0e18f8`: o ganho era do churn CAT-1 resolvido por `3b72d4a`, enquanto `e0e18f8` permanece hardening estrutural |
+| 0.0.2 / lote de escala 4 — vetor seletivo, identidade registrada e estabilidade de seek | VEC-4/CAT-5/seek concluídos; EDGE transparente não selecionado após dois NO-GO | `c77d414`, `40552df`; pushdown `b236697` retirado por `030b39d`; replay `bf8ed4e` retirado por `4bcdad0`; seek `f5152de` + `5938a03`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | VEC-4 reduz 64→4 leituras no caso focal sem alegar O(K). CAT-5 mede `5,8x` no allocator N=64 e `1,37x` no DDL. O pushdown EDGE podia suprimir erro/budget; o replay media `~3,6x`, mas violou A63 ao ocultar corrupção de uma passagem física posterior e permitir commit, portanto ambos foram removidos e o cliff permanece. A correção de seek elimina semântica dependente da presença de índice e preserva padrões posteriores seguros. Multiwriter/multireader, WAL, OCC e formato não mudaram; HNSW continua deferido até perfil/recall válidos |
+| 0.0.2 / lote de escala 5 — observação WAL e inventário CAT-4 | dois NO-GO fechados; nenhum código promovido | base `22d9694`; revisão TXN-1 `hof_0dc74badf8504e09af643bd9ae4357bd`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | TXN-1 media `2,71x` no componente, mas autenticava só o delta novo, não todo o plano físico de `read_from`, ocultava corrupção antiga/quente e mudava o budget físico de `read_bounded`; foi removido integralmente. CAT-4 por lifetime seria invisível a mutações de namespace de outro processo; o único recorte seguro, por uma `COMMIT_SECTION`, mantém O(N), tem esforço médio e ganho baixo no porte Pulse, portanto não foi implementado. As decisões encerram os alvos sem enfraquecer multiwriter/multireader, WAL/OCC, durabilidade ou fail-closed |
+| 0.0.2 / lote de escala 6 — D-17 walks de índice sem DTO | concluído e publicado | `b7fb52d`, `82ea61b`; revisão Nexus `hof_1d4c091b7f1a49a99a8e7c44282eeabb` verificada PASS | Contagem/refs header-only compartilham a validação fail-closed integral; full walk permanece em verifier/reconcile/build. Micro final full/count/refs `166,87/33,20/65,98 ms` (`5,03x`/`2,53x`) e diferencial de 40.010 imagens sem divergência |
+| 0.0.2 / lote de escala 7 — D-13H residência HNSW compacta | concluído e publicado | `eebc497`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Bytes f32/f64 imutáveis por nó somente no HNSW+NumPy; Pure/APIs públicas seguem tuple e formato/WAL/OCC/concorrência não mudam. Micro 128×384: memória `7,59x` menor, build `1,48x` e busca `1,22x`; 121 focais + 18 NumPy e revisão adversarial verdes |
+| 0.0.2 / lote de escala 8 — D-14 scoring em lote | NO-GO fechado; nenhum código promovido | revisão Nexus `hof_1b20013e41154a00b21d65af4153af42` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O exact alcançável mede `1,26–2,04x` porque materializar tuples consome `99,5%` do lote relevante. HNSW precisa score escalar exato antes de qualquer entrada em beam/results; lote serve apenas para rejeições provadas. O teto otimista real ficou `1,70–2,18x`, somente em DOT e antes do custo de intervalos; cosine/Euclidean exigiriam provas próprias. Pela relação risco/ganho e ausência de benefício ao Pulse cosine, o alvo foi encerrado sem criar capability, alterar ranking ou tocar formato/WAL/OCC/multiwriter |
+| 0.0.2 / lote de escala 9 — D-15(b) delta HNSW estrangeiro | NO-GO fechado; draft removido antes de commit | revisão Nexus `hof_52f3f82fe7f34175ab704d40a9bbd1e8` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Delta lógico vazio não prova ausência de efeito vetorial esparso. Aplicar `_note/_install` alteraria um HNSW já publicado enquanto leitores o percorrem; a cópia atômica segura do grafo mutável custa `O(N)` e consome o ganho `O(i)`. Reentrada do `VectorMath` pelo `begin` e topologia permanentemente dependente do histórico de cada processo completam o NO-GO. Nenhuma mudança em formato, WAL/OCC, durabilidade ou multiwriter/multireader foi aceita |
+| 0.0.2 / lote de escala 10 — fronteira HNSW larga | concluído e auditado | `f1d1a75`; revisão Nexus `hof_cad8d1a0ae734da19db0903334cc5c3c` verificada PASS; evidência completa em `docs/PERFORMANCE_ROUND_0_0_2.md` | `_trim` usa score único + sort/slice; somente filtro ou exaustão com `N>=4096` recebe heap total-order, mantendo o caminho aproximado comum legado. A fronteira seletiva melhora `5,94x` em 4.096 e `33,09x` em 50 mil; build 512×64 melhora `1,074x`. Ranking, signed zero, callback order, stats e shape são diferenciais exatos; nenhum formato, WAL/OCC, lock ou princípio multiwriter/multireader mudou |
+| 0.0.2 / lote de escala 11 — D-30 decode vetorial | NO-GO fechado; nenhum código promovido | análise de endpoint real registrada em `docs/PERFORMANCE_ROUND_0_0_2.md` | O corpo do vetor isolado acelera `20,98x`, mas ocupa só `6,4–12,1%` dos endpoints alcançáveis: teto total `~1,07–1,11x`, e `~0,07%` no build HNSW. A otimização local foi recusada por ser marginal; ganho material fica condicionado a um desenho contíguo de ownership/cursor, sem criar API paralela nem afrouxar validação |
+| 0.0.2 / lote de escala 12 — projeção vetorial e escopo NumPy | concluído e publicado na branch | `cd32623`; revisão Nexus `hof_c5ee0c49b2ec43beb0406f77e6f8eebf` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | A projeção de resultados decodificados elimina validação Python por dimensão somente para tupla exata de floats exatos; consulta externa e qualquer tipo estrangeiro mantêm o caminho integral. Ganho medido: componente `6,71x`, `scan_rows_v1` `2,11–2,87x` e build HNSW NumPy `1,153x`. Os dois atalhos preservam erros, callbacks, warnings, ownership, formato, WAL/OCC e as premissas multiwriter/multireader |
+| 0.0.2 / lote de escala 13 — hot paths imutáveis compostos | concluído na branch | `69f9cea`, `40e7514`, `60850b5`, `0fa3406`; detalhes e testes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Quatro ganhos simples precedem o próximo redesenho de recovery: finitude escalar sem redispatch NumPy; header walk de build `2,503x`; normalização automática por `TableDef` e memo bounded de proveniência (`~44%` no matcher); norma cosine HNSW exata por geração imutável (`1,350x` em buscas repetidas). Cache vetorial publica somente após score+norm atômicos, valida backing antes/depois e não retém órfãos sob remove/reuse concorrente. Nenhuma API existente, formato, WAL/OCC, durabilidade ou premissa multiwriter/multireader foi reduzida |
+| 0.0.2 / lote de escala 14 — replay lógico comum em batch | concluído, auditado e publicado na branch | `ae8d01e`; revisão Nexus `hof_e04db78c505a4ea0922fc19e8b278d5b` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Page 0 é semeada e publicada no máximo uma vez por índice comum, mantendo `_apply_change` na ordem WAL e compondo os mesmos watermarks monotônicos. Mixed/RESET/rebuild/stale/unknown/vector preservam fallback integral. O draft reutilizável que podia limpar STALE foi rejeitado; a capability final é atômica, privada entre preparação/aplicação e coberta por regressão. Micro 500 efeitos `2,14x`; perfil público aponta checkpoint `~1,69–1,82x` e redo `~2,57x`; 13 focais + 136 regressões + 14 multiprocesso verdes. A tentativa seguinte de compartilhar exact-view em `executemany` foi fechada como NO-GO sem código: teto inseguro `26,6%`, mas a forma segura mudaria lazy/callback/freshness. Formato, WAL/OCC, durabilidade e multiwriter/multireader seguem intactos |
+| 0.0.2 / lote de escala 15 — extent reservado, buckets quentes e ordem de publicação | concluído e auditado na branch | `da58471`, `d50eab2`, `90f0560`; revisão Nexus `hof_0b518924b36444a595988f6e0151a117` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | `insert_reserved` elimina a segunda leitura do extent com prova restrita à chamada/derived epoch (`1,362x`). O replay comum troca walks repetidos `O(K*N)` de buckets com ≥8 efeitos por preparação `O(N)` e lookups/first-fit bounded, sob tetos 16.384/65.536/16.384 e o mesmo `COMMIT_SECTION`; micros `7,88x` e `38,75x` em 250/1.000 efeitos no mesmo bucket. A regressão corrigiu ainda a perda de page-0-last introduzida pelo dirty-candidate set, mantendo flush `O(D)` e impedindo certificado à frente dos dados. Perfil público direcional: total `2,478 s`, checkpoint `0,477 s`, redo `0,228 s`. Diferenciais, fault injection, fences e multiprocesso verdes; formato, WAL/OCC, durabilidade e multiwriter/multireader permanecem intactos |
+| 0.0.2 / lote de escala 16 — materialização seletiva no preflight de replay | concluído e auditado na branch | `28dd5d4`; 24 focais, 125 agrupados, Ruff/diff-check e revisão adversarial independente PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Todos os slots continuam estruturalmente validados e com `RecordRef` autenticado, mas somente alvos `(key, ref)` constroem DTO completo. O índice efêmero `encoded_ref -> key` evita alocação comum e busca interna linear mesmo sob refs compartilhadas; nenhuma view de página escapa do pin. Scanner focal 4.000 entradas/400 páginas/8 alvos: `2,76x`; formato, WAL/OCC, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 17 — metadados e buckets vivos | concluído e auditado na branch | `d47eaec`, `3657c47`, `5fc25f0`; revisões Nexus `hof_f9015f5ba1264be69404ed2427698444` e `hof_70a7620b5b35472aa889cde8faa22d52` PASS; 19 focais, 590 agrupados e 15 multiprocesso; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Derivados imutáveis são retidos por store, a travessia física funde walk/match sem perder validação estrutural e o pipeline transacional interno pode preparar um diretório efêmero limitado para buckets com ≥2 efeitos. Dois blockers adversariais foram fechados: override em instância e autoridade sobrevivente em contexto copiado. Chamadas diretas, customizações, RESET/rebuild/stale/retry e saturação usam o escalar; HNSW preserva o `commit` externo e reutiliza apenas os hooks físicos herdados. Estimativa focal `~1,70x` distribuído e `~9,16–21,04x` em colisões; baseline público anterior até `26df492` já mediu `1,53x` agregado, sem incluir este lote. Formato, WAL/OCC, durabilidade, writer lease e multiwriter/multireader não mudaram |
+| 0.0.2 / lote de escala 18 — dirty tables e inputs float | concluído e auditado na branch | `3c847ea`, `00299ed`, `787a464`, `3888830`; correção de test drift `ea11621`; revisões Nexus `hof_a2d2ceffff124c77a48fa9e5c9287cfa` e `hof_c1cfada9144b44d7a7d764fe2482b131` PASS; 371 regressões agrupadas + 81 focais pós-correção | Intents append-only deixam de ser rescaneadas a cada operação: o cursor revisionado consome somente o sufixo e rebuilda em qualquer rewrite/rollback/replacement, com fallback integral para iteráveis não rastreáveis. Tuples exatos de floats exatos são snapshots imutáveis prontos; lists exatas são destacadas uma vez, e todo tipo estrangeiro/limite mantém o canonicalizador. A auditoria encontrou e fechou um bypass de profundidade exatamente no limite 64. O caso em memória de 500 itens mediu `1,49x`, mas o perfil em storage limita a contribuição desse trecho a `~2,2%`; o componente de snapshot mediu `17,96x`/`9,58x` em tuple/list e a família representava `~7%` da escrita. Nenhuma autoridade durável, formato, WAL/OCC ou regra multiwriter/multireader mudou. A alternativa de prova de identidade por intervalo foi posteriormente encerrada como NO-GO no lote 21 e não virou gate móvel |
+| 0.0.2 / lote de escala 19 — decisões heap sob pin único | concluído e auditado na branch | `08c0197`, `526e882`; revisões Nexus `hof_627aebc2a59a4e7981052ef87eb8c1ae` e `hof_942f47dd6b06455fa4614b892587c777` PASS/GO; 369 regressões agrupadas | O append comum mantém o pin entre capacidade e inserção quando nenhum extent hint exige reparo; drift/growth continuam na ordem directory-before-row/relink. Extent read/write e reclaim-floor unem validação e uso de page 0, mas mudança de epoch ainda executa bootstrap e uma segunda validação operacional; planners device-fresh não foram tocados. No commit público focal de 100 linhas, pins totais caíram `1.176→876` e page-0 `606→306`; o componente reservado foi direcionalmente `~1,42x`, sem alegar ganho wall-clock estável no endpoint. Não existe cache/bundle de autoridade novo, e formato, WAL/OCC, writer lease, durabilidade e multiwriter/multireader permanecem intactos |
+| 0.0.2 / lote de escala 20 — extent observado e exact hit sem releitura | concluído e auditado na branch | `51543a7`, `b9cfa10`; revisões independentes PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O insert comum elimina a segunda resolução do extent com uma prova local revogada por mudança do derived epoch; criação inicial, stale-tail repair e growth preservam o floor já avançado. A unicidade PK reutiliza a versão imutável produzida no certificado exact somente com hooks canônicos, sem cache entre chamadas e sem contornar customizações. Commit focal de 100 linhas: pins `876→776`, page-0 `306→206`, `_find_extent 201→101` e `_extent_for 200→100`; duplicata focal lê cada hit uma vez (`100→50` em 50 recusas, `~1,09x`). O batch físico maior foi recusado por teto agregado `~1,034x` frente à superfície de risco. Nenhum formato, WAL/OCC, durabilidade, writer lease ou princípio multiwriter/multireader mudou |
+| 0.0.2 / lote de escala 21 — identidade final no-follow | concluído e auditado na branch | `b5cff4a`; revisão Nexus `hof_a701a6b052134462be310aeb1bc78b0e` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | A prova obrigatória de namespace passa a devolver o `lstat` fresco do componente final para a comparação com `fstat`, removendo exatamente um `stat(path)` redundante por revalidação. O walk no-follow integral, o fallback com containment, os boundaries strict/generation, a detecção de replacement e recusas de redirect/junction/reparse permanecem. Teste estrutural `stat 1→0` por warm hit e nove discriminantes POSIX passaram no Ubuntu/WSL. STOR-1 foi encerrado por medição: máximo `1,65x` na contagem de provas e `~1,02x` agregado não justifica nova autoridade. Formato, WAL/OCC, durabilidade, writer lease e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 22 — quota única e scans quentes sem alocação redundante | concluído e auditado na branch | `7b5ce1f`; revisão adversarial independente PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | A contagem canônica que determina o COMMIT LSN é reutilizada pela verificação da quantidade efetivamente produzida dentro da mesma seção; qualquer manager/hook customizado conserva a dupla chamada anterior. Scans de bucket usam diretamente views readonly sob pin e o diretório quente deixa `page/slot` somente na tupla efêmera, sem cópias de DTO. Ganhos são pequenos e cumulativos (`~1,015x` e `~1,01x` como tetos dos trechos medidos); 80 testes selecionados e checks estáticos verdes. Formato, WAL/OCC, durabilidade, writer lease e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 23 — contexto de pin sem gerador | concluído e auditado na branch | `b964155`; revisão adversarial independente PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O context manager privado/slotted reduz custo fixo de cada pin preservando aquisição lazy, dirty/identidade no unpin, BaseException/chaining, nesting, uso único, decorator e liberação de toda autoridade após sucesso/falha. Com todos os contratos, o micro mede `1,316x` no componente e tetos públicos modestos `~1,006x` read/`~1,003x` write; por isso nenhum contexto adicional vira alvo. 521 testes selecionados e checks estáticos verdes; formato, WAL/OCC, durabilidade, writer lease e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 24 — scores transitórios no cold-build HNSW | concluído e auditado na branch | `cdcf8c4`; revisões Nexus `hof_1fbc7385740a457cbed30c71ab3b6cd4` e `hof_7df9f6701ce04867aaeb773949f8c356` PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Reutiliza scores exatos de peers inalterados durante um único build e descarta todo o cache antes da publicação. Opt-in é da classe concreta Pure/NumPy; customizações não herdam. Caminho público padrão forçado mediu `1,55x`, com topologia, scores, stats e respostas idênticos sob churn; 165 testes agrupados passaram. O ganho só se aplica ao regime HNSW acima do threshold padrão, que não foi reduzido; HNSW durável continua fora sem protocolo de geração/LSN/atomicidade. WAL/OCC, formato, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 25 — descritor participant desbloqueado no `executemany` | concluído e auditado na branch | `429d192`; revisão adversarial independente PASS após blocker corrigido; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Reusa apenas o descritor aberto do lock file dentro de um batch; cada acesso continua adquirindo/liberando o lock do SO, e nenhum commit section, lease ou autoridade durável é amortizado. Scope thread-local, falhas/timeout/unlock incerto/BaseException fecham o fd e coordenadores sem capability mantêm o legado. A regressão pós-acquire impede vazamento de lock. Em três itens: um open e cinco acquires/releases, com interleaving real; 572 regressões passaram. Ganho conservador `~1,06x`, cumulativo e sem gate; WAL/OCC, formato, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 26 — scores HNSW alinhados sob adjacency underfull | concluído e auditado na branch | `8602abf`; revisões independente e Nexus `hof_157e6798ef814a778409b1aa57b72549` PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Mantém scores transitórios alinhados por posição através de unlink/reinsert, usa sentinela apenas para peer ainda não pontuado e resolve faltantes na ordem canônica somente no overflow. Falha intermediária não publica refresh parcial e mismatch cai no scoring integral. Em N=256/d64 Pure, `71.173→48.332` chamadas (`-32,1%`) sobre o lote 24 e `~1,20x` wall conservador; 94% dos trims de overflow usaram o cache. Pure/NumPy com churn preservaram topologia, scores, respostas e stats bit a bit; 167 testes agrupados passaram. Cache permanece efêmero/bounded e cai antes de publicação/falha; formato, WAL/OCC, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 27 — decode direto após tag VECTOR provada | concluído e auditado na branch | `bed6846`; revisão adversarial independente PASS; 485 regressões adjacentes e diferencial adicional de 40 mil buffers; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Depois de `_decode_tuple` provar a tag contra o schema, F32/F64 entram no mesmo decoder de corpo sem reler e redistribuir a tag. LIST/MAP, truncation, header/body bounds, offset e trailing-payload mantêm o caminho/erro canônico. Tuplas mistas d64/d384 mediram `1,042x`/`1,057x`: melhoria simples e transversal, registrada sem novo gate e sem reabrir o redesenho amplo recusado no lote 11. Formato, política de corrupção, WAL/OCC, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 28 — descritor participant revalidado entre statements | concluído e auditado na branch | `764c546`; auditorias local e Nexus `hof_8bdda5e6dda34172bf688bd1aa54f279` PASS; correção de fixtures stale em `674e420`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Reusa apenas o descritor aberto e desbloqueado durante a vida da transação; cada statement/commit/settle ainda adquire e libera o lock real. Revalidação física por borrow, fallback frio fail-closed, opt-in por classe concreta e drenagem em commit/rollback/retry/OCC/pós-barreira/close preservam concorrência e durabilidade. Quatro statements reduzem opens participant `6→3` sem reduzir `6/6` acquires/releases; amostra de 1.000 PK seeks observou `1,124x`, sem criar gate temporal. 203 testes passaram e um skip de plataforma foi declarado. Formato, WAL/OCC, writer lease, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 29 — clonagem defensiva de planos compilada | concluído e auditado na branch | `c06463f`; revisão Nexus `hof_93cce5a9688049988570694a4588ecea` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Planos provados como internos compilam, somente após snapshot e validação completos, uma receita limitada pelo LRU existente de 128 entradas. Cada resultado continua dono de uma árvore nova; `TableDef`/`ColumnDef` refazem seus caches e `Literal` mutável recebe novo snapshot. Externos/subclasses nunca usam o atalho. O componente mediu `1,983x`, enquanto o endpoint curto mostrou apenas `~1,02x` ruidoso, sem gate nem extrapolação. Auditoria encontrou zero nós/mutáveis compartilhados; 62 focais e slices de 180/85 testes passaram. Formato, WAL/OCC, locks, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 30 — publicação confiável de resultados e Protocols concretos exatos | concluído e auditado na branch | `e572227`; revisão Nexus `hof_9016dfc426f5439c9d204f9792dea69d` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O engine exato e a fronteira pública pós-snapshot não repetem a guarda hostil de `QueryResult`; o construtor público e toda entrada colaboradora mantêm a validação integral. `Snapshot`, `TransactionContext` e `WalRecord` exatos evitam reflexão estrutural, mas subclasses, doubles e incompletos continuam pelo Protocol e pelas mesmas recusas. Um quarto atalho foi descartado por ciclo real de importação e ganho pontual. O auditor reconstruiu oito resultados publicados pela porta pública e confirmou tipos/imports em processos novos. Foram aprovados 422 testes focais/adjacentes e checks estáticos; a leitura trivial indicou `~1,08x`, enquanto a escrita mostrou apenas ganho pequeno e ruidoso, sem gate. Formato, checks de corrupção, WAL/OCC, locks, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 31 — witnesses bounded da gramática de nomes exatos | concluído e auditado na branch | `c228b0a`; auditoria independente GO sem gate; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Validações bem-sucedidas de strings built-in exatas usam LRU process-local de 512 entradas, com chave `(label,value,limit)` no controle e `file` integral no storage. Falhas nunca entram no cache; limites distintos, subclasses e objetos hostis preservam o caminho e a taxonomia, e o retorno mantém a identidade do argumento corrente. Nenhum cache extra por segmento foi criado. Ganhos de componente foram `~4,6x`/`~13,7x`, mas o teto plausível em PK seek NTFS é `<1%`: melhoria cumulativa, sem gate. Suítes 26/26 e 147/147 e checks estáticos verdes. Autoridade de path/descriptor, formato, WAL/OCC, locks, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 32 — um descritor desbloqueado por autocommit read | concluído e auditado na branch | `1038ddb`; revisão Nexus `hof_6b1f9e6b31b54c5a97ebed76a2214a32` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O ciclo público `begin→execute→commit/rollback` fica numa transição externa e na capability de descritor já auditada. `os.open` do participant cai `4→1`, mantendo exatamente quatro acquires/releases reais. Falha de commit reverte somente contexto ACTIVE; rollback que deixa contexto inalcançável sela e drena o facade. Scope custom não suprime falha primária nem deixa exit substituí-la. API 80/80, coordination 29 + 1 skip de plataforma e multiprocesso 5/5; checks estáticos verdes. Amostra indicou `~1,11x`, sem gate; a contagem estrutural é a evidência promovida. Lock duration, formato, WAL/OCC, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 33 — dimensionamento de novas gerações automáticas | concluído e auditado na branch | `2dbc367`; revisão Nexus `hof_37ec8f454ada4a668678ebd943b5df6d` verificada PASS | `automatic_index_expected_cardinality` dimensiona somente novas gerações v2; banco v1 vazio e gravável é ativado antes do primeiro DDL, enquanto v1 não vazio não sofre migração implícita e recusa novo DDL com remediação explícita. O índice `record_id` usa a estimativa apenas como piso; reabertura preserva gerações existentes. A sonda física confirmou `64→4096` buckets no máximo configurável sem alterar artefatos legados; o custo máximo é `4097` páginas por artefato automático e multiplica pelo número de PKs/identidades/endpoints. O padrão permanece 64 para evitar custo de buckets vazios em grafos pequenos. Formato existente, WAL/OCC, durabilidade e multiwriter/multireader permanecem intactos |
+| 0.0.2 / lote de escala 34 — reaproveitamento da prova imediata de raiz | concluído e auditado na branch | `bce884c`; revisão Nexus `hof_8995dc6efa8848f0be519389b1a35a84` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | A resolução de nome exato e a validação de pais reutilizam no primeiro componente a prova no-follow da raiz feita imediatamente antes, eliminando uma observação literalmente duplicada. Postcheck após listagem e checks before/after dos pais intermediários continuam integrais. O fast path exige raiz, identidade capturada e prefixo vazio, com regressão que impede uso indevido em diretório intermediário. Um `exists` de dois componentes cai `7→6` `lstat`; a sonda curta de cinco writes caiu `956→874` (`-8,6%`), sem elevar isso a gate de parede. 55 casos coletados, sete skips de plataforma declarados, Ruff e diff-check verdes. Case exato, redirect refusal, formato, WAL/OCC, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 35 — rehash assistido bounded | concluído e auditado na branch | `8c13d0f`; revisão adversarial GO e Nexus `hof_0c6e83b53d60466397ea63cd6c453019` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | `rehash_index_if_needed` resolve e prova a geração física antes de qualquer `None`; abaixo do teto, conta slots somente nos `B<=4096` head pages e usa `page_count` como sinal secundário, sem decodificar entradas, seguir overflow ou fazer censo O(N). Pressão `64*B` ou ratio físico solicita exatamente um degrau `B→2B` no protocolo shadow/OCC/WAL existente. O teto pula o scan após provar identidade. Não existe automação em commit/background, `None` não é certificado de saúde e corrida exige reavaliação sem garantia universal de retryable. Ensaio direcional alinhou o trigger entre 4.000 e 5.000 linhas para 64 buckets; slices 31+67 e revisão independente 107 verdes. Formato, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 36 — witness revogável de replay local no checkpoint | concluído e auditado na branch | `2792701`; Nexus `hof_fbf973af72084c928938aa64dcb522d4` verificada PASS após corrigir um blocker de eficácia; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Checkpoint completo semeia um witness O(1), não persistido, que cobre apenas o prefixo exato já aplicado/flushado/publicado por este processo. DML comum e reserva CN-1 só o estendem após as respectivas garantias; qualquer writer estrangeiro, DDL/generation/RESET, página suja, recovery/falha/close ou colaborador custom revoga/recusa. A leitura, checksum, continuidade e preflight integral do WAL continuam obrigatórios; apenas o apply/flush estrutural redundante é omitido. Carga de 4.000 linhas ativou 7/16 atalhos e reduziu chamadas `CommitRedo.apply` `32→18`; micro isolado mediu `1,47x`, sem promessa ponta a ponta. Slices 101+11 e checks estáticos verdes; WAL/OCC, durabilidade e multiwriter/multireader intactos |
+| 0.0.2 / lote de escala 37 — preflight lógico estrito sem duplicação | concluído e auditado na branch | `75b0fdc`; Nexus `hof_6a091147d30e460eb85518398c096ee0` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Como o shortcut exige catálogo intocado, o full preflight já é estrito e percorre as mesmas validações de nome/generation/versioned/key limit; o segundo preflight do subplano lógico apenas repetia decode sem mutação intermediária possível. A sequência focal passou `[3,2,0]→[3,0]`, e a auditoria de 2.000 linhas confirmou um único passe estrito com efeitos por shortcut. Slice 62 e checks estáticos verdes; sem claim temporal, formato ou mudança nas garantias |
+| 0.0.2 / lote de escala 38 — fatos RESET reaproveitados das validações obrigatórias | concluído e auditado na branch | `6b142ba`; Nexus `hof_a85992ce987045a7ac73b2bb42ac822c` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O preflight integral e o validator de staging passam a transportar o fato `contains_index_reset` já decodificado, removendo dois rescans lineares. O checkpoint só consome proof verificado por seal/owner/replay/passage/signature e cai no replay canônico em qualquer dúvida. O commit só confia no manager/validator built-in exatos e continua revalidando após retarget. RESET é identificado pela operação, não pelo tipo WAL. As medianas A/B de 2.000/8/8 foram `11,397→11,166 s`, mas os ranges sobrepostos não sustentam claim temporal; o ganho promovido é estrutural. Payload corrompido, provas incompatíveis e validator substituído foram cobertos. Sem gate ou alteração de WAL/OCC, durabilidade e concorrência |
+| 0.0.2 / lote de escala 39 — certificado fresco byte-idêntico | concluído e auditado na branch | `f28c686`; Nexus `hof_0f5a8046fe2844d79b0c3bbd5a90ae72` verificada PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | A leitura física e a invalidação de descriptor permanecem obrigatórias; somente igualdade byte-a-byte reutiliza o witness e certificado semântico pareados. Instrumentação `1.015→12` decodes genéricos e `1.007→4` semânticos, sem claim baseado nos timings ruidosos. Retém uma raw page por IndexStore acessado (~8 KiB default; ~1,1 MiB/141), não contabilizada pelo retained estimate do BufferPool. A cobertura adversarial inclui mudança estrangeira, interleaving, customização e corrupção exclusiva do último byte; 17 focais e 298 agrupados passaram. Zero alteração em OCC, WAL, durabilidade ou multiwriter/multireader. |
+| 0.0.2 / lote de escala 40 — piso atômico inicial e cursor de extent selado | concluído e auditado na branch | revisão adversarial independente GO; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O primeiro row de uma tabela vazia instala no mesmo commit o piso final já planejado; os demais usam reserva sem reescrever page zero por identidade. A autoridade frozen/selada fixa tabela, raiz e piso; somente tail/count/epoch são hints, e `_write_extent` preserva monotonamente piso mais novo. Em 500 rows: insert/observe `500→0`, 1 criação inicial, 499 reservados, 1 proof, 3 lookups e 62 rewrites para exatamente 62 crescimentos. Regressões cobrem stale floor, cursor adulterado, raiz adulterada, corrida multiprocesso vazia, falha pré-WAL+retry e lote misto vazio/CN-1. Nenhum gate temporal ou alteração de WAL/OCC, durabilidade e multiwriter/multireader. |
+| 0.0.2 / lote de escala 41 — autoridade de índices local ao statement e commit | concluído e auditado na branch | Grafx `613bff6`; consumidor Pulse `e4ac346`; revisões estrutural e de correção independentes GO; regressão agrupada Grafx 321/321 e consumidor Pulse 57/57; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Statements built-in com footprint fechado e o commit canônico consultam somente índices das tabelas tocadas. A projeção transitória nasce após OCC/rebase/sync, dentro do writer lease, WAL-tail e `COMMIT_SECTION`, e é revogada em toda saída; formas desconhecidas/polimórficas, registros pre-staged e colaboradores custom preservam o caminho global. Três scans adjacentes de schema/registry também foram tornados table-local. Com 1 ou 80 tabelas, CREATE Person v1/v2 fez zero `Catalog.tables()`, scans globais de definições ou walks globais do registry; apenas Person foi inspecionada. A integração Pulse ativa v2/identity indexes somente no candidate novo, exclusivo e vazio antes do DDL, sem adotar paths existentes. Quota, artifacts, multiset, RESET, retarget/rebuild, WAL, ambas OCC, durabilidade e multiwriter/multireader permanecem integrais. |
+| 0.0.2 / lote de escala 42 — precheck de DELETE em relacionamentos | implementado; gate focal verde, revisão adversarial em andamento | descoberta/reprodução Claude `art_dac31d35a797468ea30dda80cd8c248e`; evidências `art_8eb4af8d3ede4c38916d22203a181a67`; consenso Nexus `msg_0f9531e438074cbfa72feb9341a3ec86`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Transações insert-only deixam de reconstruir a view completa de todas as tabelas sujas em cada seek: o precheck passa de `O(T*P)` para uma passagem `O(P)` e delega integralmente ao caminho canônico se houver DELETE/held-delete. Harness Pulse-shaped T=30/1.500 relações mediu `60,17→2,03` views/relação e `-44,7%` na fase, com resultado/verify idênticos. Testes focais cobrem short-circuit, delegação, MERGE após DELETE, relação já encerrada e pending-ref inválida na própria tabela. Sem alteração de formato, WAL/OCC, durabilidade ou multiwriter/multireader. |
+| 0.0.2 / lote de escala 43 — descriptor bounded por transação lexical | implementado; gate focal Grafx e consumidor Pulse verdes | revisão independente Codex; A/B `D:\GrafxBenchEvidence\descriptor-conservative-codex-20260905\ab_conservative.py`; consenso Nexus `msg_0f9531e438074cbfa72feb9341a3ec86`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | `Database.transaction()` reutiliza somente o fd destravado durante sua própria fronteira lexical e reprova identidade física antes de cada aquisição. Contagem independente: `4,0→1,0` opens/txn e `0→3,0` revalidações aprovadas; tempos direcionais melhores, sem promover número exato porque as bandas se sobrepuseram. O Pulse usa autocommit otimizado para leitura simples e a fronteira lexical para o par no mesmo snapshot. Locks reais, cleanup, thread-hop, close e retry/OCC permanecem cobertos; nenhuma retenção entre transações, formato/WAL/OCC ou mudança multiwriter/multireader. |
+| 0.0.2 / lote de escala 44 — publicação exata sem cópias repetidas | concluído e auditado na branch | `19882b9`; Nexus `hof_d48f29fa9bbe46f9951912e7f50af166` PASS; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | Valores escalares built-in exatos e nomes de projeção deixam de ser normalizados/construídos por linha após as guardas canônicas. `bool`, subclasses, hostis, limites e child vazio mantêm a semântica anterior. Em 20 mil linhas, chamadas de `ReturnItem.name` `40.040→30`, `_builtin_int` `60.054→46` e `_builtin_text` `40.053→50`; 479 focais do executor e validação independente passaram. O ganho promovido é estrutural, sem gate de parede; formato, API, WAL/OCC, durabilidade e multiwriter/multireader intactos. |
+| 0.0.2 / lote de escala 45 — watermarks de checkpoint escopados por páginas provadas | concluído e auditado na branch | `5a85af8`; consenso/perfil Nexus `msg_1006735489434349b58051d3d7294485`; testes delegados `hof_fc109137ae1343feb44c52358465b6ef` PASS; gate agrupado 99/99; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O preflight integral identifica os owners físicos de páginas HEAP já autenticadas. O manager canônico refresca só tabelas tocadas e devolve a foto completa; o `open()` final reutiliza essa foto na mesma seção. Catálogo, reclaim/META/FREE, prova ausente/forjada e colaboradores custom preservam a fotografia global. Um writer estrangeiro alterando A diante de A/B/C causou walks somente de A; DDL e scope desconhecido causaram walks de todas. O baseline do hotspot era `25,9–26,5%` em T=40 populado; não há claim temporal pós-patch. Formato, WAL, ambas OCC, durabilidade e multiwriter/multireader intactos. |
+| 0.0.2 / lote de escala 46 — prova device-fresh das raízes META do heap | concluído e auditado na branch | `2b936f6`; gates Nexus `hof_13ed0382ed514771925bd36e9cf1b877` e `hof_d28a9d1d8df14ab7878659857054768f` PASS; regressão agrupada 112/112; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | A baseline durável de page 0 é lida uma vez por preflight e a imagem META verificada é projetada em `(table_id, first_page)`, única autoridade que escolhe os walks de high-water. Raízes adicionadas/removidas/movidas escopam as tabelas exatas; dano, duplicata, tipo/local inesperado, FREE, catálogo, manager custom ou prova incompatível mantêm o caminho global fail-closed. Em T=40 populado, 15/16 fotos ficaram escopadas, walks `440/480→168/172` e a fatia observada `17,5/20,4%→3,6/4,4%`; os tempos são evidência diagnóstica, não gate. Treze testes específicos e a regressão agrupada passaram, com `verify(all)` íntegro. O residual barato não vira alvo móvel. Formato, WAL, ambas OCC, durabilidade, leases e multiwriter/multireader intactos. |
+| 0.0.2 / lote de escala 47 — replay lógico particionado por store | implementado; gate focal verde | perfil/recomendação Amdahl `hof_943a87ae57ce431e8986ff3e504c9285` verificado PASS; 25 testes focais e Ruff; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O replay heterogêneo deixa de perder a otimização comum por causa de um único store especializado. RESET, HNSW/override, rebuild, replay ativo e stale ficam escalares por store e na ordem WAL; os stores canônicos usam uma semente e uma publicação de page 0. O preflight comum permanece anterior à primeira mutação e a publicação canônica ocorre somente após todos os efeitos escalares, eliminando a janela de header composto com scalar pendente. Falha parcial conserva stale-on-failure e retry idempotente. O perfil de origem tinha 14.881 de 18.181 efeitos canônicos contaminados pelos 3.300 vetoriais e estima teto de 7–10% no transfer (`~1,08–1,11x`), sem transformar a estimativa em gate. Formato, WAL/OCC, recovery, durabilidade e multiwriter/multireader intactos. |
+| 0.0.2 / lote de escala 48 — verifier table-local e bounded | implementado; gates focal/adjacente verdes | perfil Amdahl `hof_943a87ae57ce431e8986ff3e504c9285`; 78 testes do verifier, 87 adjacentes, Ruff/compile/diff-check; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O verifier canônico captura uma foto de catálogo por chamada, varre cada tabela uma vez para todos os seus índices e autentica cada ref física repetida uma vez. Estado `O(linhas da tabela corrente)` é descartado no último índice da tabela e jamais cruza duas chamadas. Em dois índices/duas linhas, `read_from_pages 2→1`, `scan_all 2→1`, `heap.read 4→2`; a repetição da chamada refaz todo o trabalho. Colaboradores custom preservam o protocolo observável anterior. O perfil original limita a oportunidade a 4,4–7% do transfer; não há novo gate nem promessa temporal pós-patch. Findings, contagens, formato, WAL/OCC, durabilidade e multiwriter/multireader intactos. |
+| 0.0.2 / lote de escala 49 — serialização memoizada por estado do catálogo | implementado; 83 testes focais e Ruff verdes | perfil Amdahl `hof_943a87ae57ce431e8986ff3e504c9285`; provas de identidade da imagem e contagem de `_encode_table`; detalhes em `docs/PERFORMANCE_ROUND_0_0_2.md` | O `Catalog` built-in reaproveita os bytes checksummed somente enquanto representa a mesma autoridade. Toda mutação sancionada de tabela, espaço, índice ou capability invalida o derivado; desserialização não confia/copia memo e subclasses conservam o protocolo observável anterior. Com duas tabelas, chamadas repetidas ficam em `2` encodes e cada mutação real acrescenta apenas os `2` encodes inevitáveis. O perfil original limita a oportunidade a 8–9% do transfer, sem gate temporal ou claim pós-patch. Um único `bytes` pertence ao snapshot vivo; não há compartilhamento de autoridade, nem mudança de formato, WAL/OCC, durabilidade ou multiwriter/multireader. |
+| 0.0.2 / lote de escala 50 — publicação lazy do clone de plano | implementado; 1.047 testes consumidores, 88 focais pós-hardening, Ruff/compile/diff-check verdes; Nexus `hof_2bb1bbbef090442ba192903b6826daed` PASS | Planos preparados do engine exato são reconstruídos e validados eager uma vez numa receita bounded; cada `QueryResult` carrega uma porta privada e só cria sua árvore se `.plan` for lido. Cinco executes sem leitura mantêm `1` compilação e `0` clones. Resultados distintos produzem nós e literais independentes; duas threads lendo o mesmo resultado recebem a única árvore materializada sob cerca local. `explain`, construtor público, subclasses e raízes não provadas preservam rebuild/validação eager. O teto prévio é 5,5–7,3% do transfer e 33–40% das leituras perfiladas, sem claim temporal pós-patch. Campos/equality/repr/replace da dataclass, formato, WAL/OCC, durabilidade e multiwriter/multireader intactos. |
+| 0.0.2 / estabilização do catálogo após read-view sem mudança durável | concluído em `01114bd`; 12 testes focais verdes | `CatalogStore` preserva um catálogo local sujo quando a queda conservadora de frames mudou apenas o epoch e uma leitura não destrutiva prova que a imagem durável completa continua idêntica à base. Catálogo estrangeiro diferente continua no refusal fail-closed e o caso idêntico não chama sincronização redundante de índice. Nenhum trabalho local é descartado; formato, WAL/OCC, durabilidade e multiwriter/multireader intactos. |
+| 0.0.2 / lote de escala 51 — autoridade runtime validada reaproveitada | implementado e auditado; Nexus `hof_97c7f64cc8e141ee8ccba381d15c0d6b` PASS após dois reworks; 412 testes independentes, 1.922 adjacentes e sonda reflexiva verdes | `CatalogIndexDefinition` retém uma única definição runtime pela identidade do descriptor owned. `WalRecord` exato retém prova ligada ao payload somente depois de produzir ou decodificar os próprios bytes; cada hit compara o encode canônico ao payload, impedindo poisoning até com token extraído da closure. Persistido, stand-in, subclass, mutável, corrupto, deepcopy e pickle mantêm validação integral. Relações: construções `14,04→0,02`/relação e decodes repetidos `2→0`; vetor: `911→3` construções e `2→0` decodes/nó; checkpoint continua um decode por registro durável e reduz construções `1,02→0,02`. Hit `~6,1x` mais barato que decode no componente, sem claim end-to-end. O residual de retarget C6 fica encerrado como marginal, evitando alvo móvel. Formato, WAL/OCC, durabilidade e multiwriter/multireader intactos. |
+
+### Rodada 0.0.3 — carregamento visível do Knowledge Graph no Pulse
+
+O ponto de dor reportado pelo usuário está registrado como alvo prioritário e finito em
+`docs/PERFORMANCE_ROUND_0_0_3.md`. O baseline real mostrou `/graph` em `5,894–6,947 s`, `/stats`
+em `12,010 s` e o frontend bloqueando a publicação do grafo por diagnósticos independentes. O
+primeiro lote (`4638204`, Pulse `e2b6053`/`880db68`) reduziu o fanout de relações no engine em
+`3,6–4,1x`, fixou os 70 reads num snapshot, removeu `/stats` da rota crítica visual e eliminou a
+duplicação de requests.
+
+O sublote seguinte cria o access path que pode fechar a degradação `O(E)` da projeção paginada sem
+trocar as premissas do banco.
+O primitive multi-chave `1926fcd` usa um único certificado durável por índice; o operador fechado
+`bcfa395` faz seek da união incidente pelos PK/endpoint indexes e valida heap, snapshot, geração e
+landings; o consumidor Pulse `523e759` envia IDs por tipo de endpoint e evita layouts impossíveis.
+O primeiro ensaio tipado usou uma página diagnóstica sem a ordenação do Pulse e não podia sustentar
+o claim visual. A repetição com a query exata da tela mediu 0,960 s para obter 500 nós e preservou
+as mesmas 777 relações do baseline; a fase de arestas consultou 66/70 layouts, fez 248 chamadas e
+17.116 probes multi-chave, mas mediu 4,392 s cold e 2,677 s warm contra 1,74–2,08 s do scan bounded.
+Essa ativação ingênua foi corretamente marcada como NO-GO e não virou claim.
+
+A revisão adversarial Nexus `hof_aecbb8257cb443c198a50634d2d1af2d`, agora PASS, executou 540
+comparações/54.102 linhas contra o fallback, incluindo v1/v2, MVCC com writer estrangeiro, RYOW,
+self-loops, paralelas, incoming, stale e chaves hostis. O consenso implementado em `a726744` escolhe
+o access path antes de qualquer certificado: usa somente o limite superior durável
+`next_record_id - FIRST_RECORD_ID`; até `0,5 * chaves distintas` faz
+`FilterRows(RelationshipScan)` edge-first, acima disso faz seek incidente. `page_count` fica fora da
+decisão porque é hint reparável e pode atrasar a chain. Deletes/gaps só superestimam e favorecem o
+seek de modo conservador. Os focais cobrem `12 arestas/84 chaves -> scan`, `60/84 -> seek`, deriva
+de `page_count`, INT64 hostil e landings v1 fora do frontier.
+
+Na página exata, o híbrido manteve 500 nós/777 relações e zero falhas, reduziu
+`248/17.116 -> 54/4.355` chamadas/probes (`-78,2%/-74,6%`) e os probes de PK
+`7.844 -> 2.082`. Em duas execuções pareadas, o primeiro passe mediu `1,827–2,056 s` contra
+`2,377–2,736 s` do scan forçado; os passes quentes mediram `0,763–0,967 s` contra
+`2,273–2,724 s`. É medição direta de provider/engine, não alegação HTTP, mas o consumidor
+`523e759` passa a **GO nas branches candidatas**. Os 1.582 probes de PK ainda repetidos foram
+mensurados, mas não constituem automaticamente o próximo ganho: o `memo B` foi posteriormente
+deferido pela decisão adversarial registrada abaixo, sem transformar o residual em gate móvel.
+
+Esse caminho não altera formato, WAL, recovery, nenhuma das duas OCCs, leases, admissão de writers
+ou snapshots de readers. Tabela/índice ausente, stale ou owner-dirty escolhe o plano canônico antes
+da primeira leitura acelerada; depois da adoção, troca de geração, erro de leitura e corrupção
+continuam fail-closed.
+
+O refresh foi concluído sobre `a726744` e substitui o baseline antigo: o transfer limpo caiu de
+`86,81 s` para mediana de `58,49 s` (`1,48x`). No caminho exato da tela, o perfil isolou custos de
+landing/certificação por linha, re-encode de endpoint apenas para tarifar memo, `IN $lista` linear
+e decode das linhas largas. O consenso finito da segunda leva está detalhado em
+`docs/PERFORMANCE_ROUND_0_0_3.md`: KG-3 → KG-1/KG-4 → decisão KG-2, com R-11 no decode. KG-3 foi
+publicado em `8d806b0` usando somente o `payload_len` já autenticado pelo heap; versão sintética ou
+alterada perde a testemunha e mantém o encode canônico. R-11 foi publicado em `a610b55`, inlinando
+o corpo de `STRING` já tipado sem alterar bytes, validação UTF-8 ou taxonomia de corrupção. Os
+testes focais passaram (50 para KG-3; 197 no codec/schema para R-11). Na página real, o resultado
+permaneceu 500 nós/777 relações/zero falhas; uma amostra mediu nós em `0,858 s`, híbrido quente em
+`1,036–1,103 s` e scan forçado em `2,334–2,547 s`, sem atribuir a variação inteira aos dois patches.
+Hashing de `IN` só poderá reter parâmetros profundamente destacados, tipos exatos
+`str`/`bytes`/`None` e teto por statement; listas numéricas/mistas continuam lineares.
+
+KG-1/KG-4 foram então integrados em `216319e`/`d12602f` após o rework adversarial. O memo só
+consulta o hash para LHS exato `str`/`bytes` e RHS `Parameter` destacado contendo apenas tipos
+exatos `str`/`bytes`/`None`; todo binding, coleção, número, booleano, `bytearray` e RHS misto mantém
+o walk. O teto é 4.096 elementos por statement e a identidade do objeto é reprovada em cada hit.
+A saída antecipada universal preserva `NULL` quando não há match, e listas numéricas mantêm
+`1 = 1.0`. Foram verdes 2.107 testes de query no branch autoral e 240 testes combinados depois do
+cherry-pick. No board real, 500 nós/777 relações/zero falhas permaneceram; o run seguinte mediu
+nós em `0,866 s`, híbrido quente em `0,762–0,848 s` e scan forçado em `0,811–0,818 s`. A queda
+frente ao scan imediatamente anterior é evidência direcional e não promessa estatística isolada.
+
+A revisão adversarial subsequente fechou KG-2 e `memo B` como **deferidos nesta onda**. Mesmo um
+chunk geométrico resolve linhas futuras antes do primeiro `yield` e, portanto, pode antecipar ou
+reordenar corrupção que um cursor encerrado por `LIMIT` não observaria; 256 linhas também não
+limitam bytes de payload, e o mecanismo alcançaria todo `RelationshipScan`. Com a página real já
+em `0,762–0,848 s` no híbrido e `0,811–0,818 s` no scan, o residual plausível é somente
+`0,08–0,16 s`. Claude concordou que a medida real prevalece sobre o modelo sintético. Uma futura
+reabertura exige API estreita/materializada, limites simultâneos de linhas e bytes, consumo exato
+do mapa local após saturação e nenhuma mudança na semântica de cursor, v1, stale, RYOW ou recusa
+fail-closed. Não há gate adicional criado por essa decisão.
+
+A execução avançou então para custos medidos do transfer. `9d17ed8` implementou a primitiva E-1c
+`BufferPool.allocate_run`: uma estrutura eager cresce fisicamente em uma única chamada e observa
+o tamanho inicial uma vez, mas instala frames sujos não pinados individualmente sob o mesmo
+budget, `_grown`, revogação de loads e write-back existentes; recusa de budget continua anterior
+ao crescimento. `fcd4e21` ligou a primitiva ao diretório de buckets: índice novo aloca page 0 e o
+run completo; arquivo parcialmente crescido preserva páginas existentes e aloca apenas o sufixo.
+O A/B Pulse-shaped com 92 DDLs mediu a mediana da fase em `7,95 -> 6,49 s` (`-18,4%`) e do transfer
+curto em `17,45 -> 15,72 s` (`-9,9%`), sem extrapolar esse percentual para cargas grandes.
+
+LB-3 foi entregue por Claude em `d8851a6` e integrado como `81615af`. O diretório bounded de replay
+passa a atender todo bucket tocado, inclusive os runs de aproximadamente dois efeitos do Pulse,
+em vez de exigir oito; os três tetos de identidades/alvos/páginas e o fallback escalar permanecem.
+O diferencial exato de 1–7 efeitos produziu imagens finais byte a byte idênticas ao oracle escalar;
+1.913 testes amplos do branch autoral e 281 testes combinados após integração passaram. O A/B de
+recovery mediu checkpoint aproximadamente `-6%` com dispersão próxima de `+/-5%`, cerca de `0,6%`
+do transfer atualizado, portanto registrado como ganho pequeno e não como headline. Formato, WAL,
+as duas OCCs, recovery, durabilidade e multi-reader/multi-writer permanecem intactos.
+
+O quarto levantamento de performance do Claude está registrado em
+`.grafx-tmp/levantamento2/LEVANTAMENTO_4.md` e consolidado em
+`docs/PERFORMANCE_ROUND_0_0_3.md`. O alvo continua finito: latência percebida entre abrir o
+Knowledge Graph do Pulse e poder renderizar seus nós/arestas. O consenso ordenou primeiro
+`KG-6a/R-15`, depois `R-5/E-1d/R-13`, seguido de uma regressão combinada; `D-4/KG-5` são a onda
+Pulse independente, e `D-2/D-8` exigem uma API materializada/replayable com pré-provas físicas,
+pós-prova integral e retry do lote inteiro. `R-14` como cache de slotted page, o atalho de
+high-water por `next_record_id` e `D-1` ficaram NO-GO por falta de trabalho duplicado no mesmo
+frame ou por remover garantias.
+
+O lote local está implementado em `dfefe00`, `073d042` e `2cf6820`: o replay reaproveita decode e
+resolução somente dentro da passagem já prevalidada; a alocação escalar bem-sucedida não faz
+`page_count` antes do `StorageDevice.allocate` atômico; e `scan_rows_v1` publica diretamente a
+tupla decodificada quando todos os valores são escalares imutáveis exatos, mantendo o copier
+canônico para compostos/hostis/limites. Foram verdes, respectivamente, 77 testes de replay, 174
+do buffer pool e os focais de scan/publicação. Não há cache de autoridade entre operações,
+mudança de formato, WAL, OCC, snapshots, durabilidade ou multi-reader/multi-writer.
+
+O restante dessa onda foi integrado em `6165bce`, `4de7be9`, `1940466`, `6e29c7e` e `b3e70e5`.
+`R-15` usa uma tabela selada para classes de valores exatas e mantém a cadeia anterior para
+subclasses/hostis; `KG-6a` aplica fast path direto a `Literal` e uma tabela selada aos outros onze
+tipos exatos, chamando os mesmos evaluators e preservando precedência de `computed`, erros e
+fallbacks. No caminho KG alternado, a página de nós caiu de `713` para `667 ms` (`1,069x`) e o
+fan-out híbrido de `2,783` para `2,543 s` (`1,094x`). Um único braço vetorial ficou dentro da
+dispersão e sem causalidade específica; ele não virou um novo gate marginal. A regressão combinada
+de 381 testes e os checks Ruff/diff ficaram verdes.
+
+As otimizações complementares do consumidor estão publicadas em Community
+`perf/v0.3.3-kg-load-grafx@6ae14ed` e Core
+`perf/v0.3.3-kg-active-filter@7ebc849`. A primeira usa `generation` como padrão apenas nos
+diretórios geracionais gerenciados pelo Pulse, mantendo `strict` disponível e documentado; a
+segunda substitui sete desigualdades de tombstone por um `NOT IN` semanticamente equivalente,
+confirmado nos dois backends. Formato, WAL, ambas as OCCs, recovery, durabilidade e as premissas
+multi-reader/multi-writer continuam inalterados.
+
+O test run instalado encontrou e fechou a paginação vazia do Knowledge Graph. O cursor mantinha
+`created_at` como texto: Ladybug fazia cast implícito, mas Grafx preservava corretamente os
+domínios `STRING`/`TIMESTAMP`, fazendo a segunda página voltar vazia. Core `7ebc849` passa um
+`datetime` UTC ao executor sem tirar a string estável da chave de cache; Community `6ae14ed`
+converte os parâmetros tipados para o domínio público imutável do Grafx. Cinco testes Core, 34
+Community, um probe Ladybug e a instância real passaram. As páginas reais retornaram 500/777 e
+500/775 nós/arestas, sem IDs sobrepostos; no navegador, o grafo avançou de 500 para 1000 nós e o
+controle de `Load more (500+)` para `Load more (1000+)`.
 
 O hardening `aef1df7` existe por causa de evidência, não por expansão de escopo: a auditoria
 reproduziu um `DETACH DELETE` que confirmava sucesso enquanto deixava viva uma relação staged, e um
@@ -3068,14 +3824,15 @@ evita split-brain e retrabalho no Core do Pulse.
 
 ### Fase 2 — Performance estrutural
 
-1. identity-range leasing;
+1. identity-range leasing — concluído em `40b2b43`;
 2. reduzir `os.walk`, `stat/fstat` e locks globais;
 3. transformar HNSW em access path real;
 4. corrigir agregadores e top-N;
 5. implementar bulk ingest;
-6. corrigir publicação Windows;
-7. adicionar group commit;
-8. adicionar vacuum, índice de identidade e rehash/rebuild de índices.
+6. corrigir publicação Windows — concluído pelo CE-1 two-slot em `1512199`/`93a3ee3`/`98e52dd`;
+7. adicionar group commit — rejeitado após teto medido de aproximadamente `1,002x`;
+8. adicionar vacuum, índice de identidade e rehash/rebuild de índices;
+9. decidir P1.16 (parâmetros de construção do HNSW) depois do perfil de recall exigido.
 
 #### Gate de saída
 

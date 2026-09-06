@@ -49,6 +49,13 @@ class ReadOnlyStorageDevice:
         if callable(invalidate):
             invalidate(file)
 
+    def descriptor_cache_stats(self) -> object:
+        """Forward the optional path-free descriptor-cache diagnostics capability."""
+        snapshot = getattr(self.__device, "descriptor_cache_stats", None)
+        if not callable(snapshot):
+            return None
+        return snapshot()
+
     def exists(self, file: str) -> bool:
         """Return whether ``file`` exists, preserving the wrapped observation."""
         return self.__device.exists(file)
@@ -99,6 +106,24 @@ class ReadOnlyStorageDevice:
 
     def read_log(self, file: str, offset: int, length: int) -> bytes:
         """Return the fill-until-EOF byte range produced by the wrapped device."""
+        return self.__device.read_log(file, offset, length)
+
+    def read_log_if_exists(
+        self, file: str, offset: int, length: int
+    ) -> bytes | None:
+        """Forward an explicitly declared fused read, else use the literal port sequence.
+
+        A wrapped type that only exposes unknown attributes through ``__getattr__`` has not
+        opted into the fused identity contract. In that case absence is observed through
+        ``exists`` and a present name is read normally; a race that removes it is allowed to
+        propagate the wrapped ``read_log`` refusal unchanged.
+        """
+        implementation = vars(type(self.__device)).get("read_log_if_exists")
+        if callable(implementation):
+            fused_read = getattr(self.__device, "read_log_if_exists")
+            return fused_read(file, offset, length)
+        if not self.__device.exists(file):
+            return None
         return self.__device.read_log(file, offset, length)
 
     def log_size(self, file: str) -> int:

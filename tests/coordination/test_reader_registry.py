@@ -105,6 +105,32 @@ def test_a_stalled_reader_is_pruned_and_the_horizon_advances(
     assert stale_handle.reader_id not in reader_files(database_root)
 
 
+def test_observing_the_horizon_keeps_stalled_empty_and_temporary_records(
+    make_coordinator: CoordinatorFactory, database_root: Path
+) -> None:
+    observer_clock = ManualClock(monotonic=1_000.0)
+    observer = make_coordinator(owner_id="p1-observer", clock=observer_clock)
+    gone = make_coordinator(owner_id="p2-gone", monotonic_origin=90.0)
+    stale = gone.register_reader(10)
+    assert observer.reader_horizon() == 10  # establish the ordinary liveness sample
+    observer_clock.advance(16.0)
+
+    readers = database_root / "control" / "readers"
+    empty = readers / "p8-crashed-r0001.reader"
+    temporary = readers / "p9-crashed-r0001.reader.p9-crashed.tmp"
+    empty.write_bytes(b"")
+    temporary.write_bytes(b"partial")
+    before = sorted(path.name for path in readers.iterdir())
+
+    assert observer.observe_reader_horizon() == 10
+    assert sorted(path.name for path in readers.iterdir()) == before
+    assert f"{stale.reader_id}.reader" in before
+
+    # The ordinary lifecycle operation retains its established pruning semantics.
+    assert observer.reader_horizon() is None
+    assert f"{stale.reader_id}.reader" not in reader_files(database_root)
+
+
 def test_a_live_reader_is_never_pruned_however_far_behind_it_falls(
     make_coordinator: CoordinatorFactory, database_root: Path
 ) -> None:

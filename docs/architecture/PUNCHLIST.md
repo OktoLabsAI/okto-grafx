@@ -1083,12 +1083,13 @@ carries this key". They stay because the doors are public.
 
 ## Traversal after CF-17: the two levers left (C7/C10; recorded)
 
-- **The landing scan.** A traversal whose target is FREE resolves each landing table once per
-  traversal by a full scan, because edges store record IDENTITIES and nothing maps an identity to a
-  heap location. That is the 29 ms in a forward hop whose index work is microseconds, and the bulk
-  of the 221 ms reverse case. The structural fix is an identity index (a third automatic index per
-  node table) or storing refs with a repair protocol for the update case; both are format-adjacent
-  and W6-sized.
+- **The landing scan — CLOSED by P2-ID in `0.0.2`.** A traversal whose target is FREE historically
+  resolved each landing table once per traversal by a full scan because edges store record
+  identities. Catalog-v2 activation now creates an automatic unsigned `RecordId -> RecordRef`
+  exact index for endpoint tables; eligible landings use a hash-directed lookup followed by heap
+  validation. Catalog v1, an ineligible/stale path or a deliberate scan-only collision retains the
+  canonical fallback. The original 29 ms/221 ms measurements remain historical rather than a new
+  post-P2 benchmark claim.
 - **The planner does not reorder a pattern to start from its seekable side.**
   `MATCH (c)-[:M]->(e {id: k})` walks from `c` -- a whole-table frontier -- when seeking `e` and
   traversing INCOMING would touch a handful of rows. Frontier-aware execution now avoids the 64
@@ -1293,10 +1294,12 @@ option 4), and the recommended sequence: `docs/architecture/W6-WRITE-CEILING.md`
   public terminal is result-only, while a terminal with no public columns counts as intermediate.
 - **CLOSED** — both overruns raise non-retryable `GrafxQueryBudgetExceeded`. Refusal neither
   truncates state nor releases a partial write statement to the transaction.
-- **BOUNDARY** — these two fields do not limit cumulative work, payload bytes, internal structures,
-  auxiliary scans, RSS, streaming, deadlines, traversal or spill. Sort, aggregate, distinct and
-  eager operators may retain up to the admitted rows or states before their first yield; this is
-  row admission, not a complete query-memory budget.
+- **HISTORICAL BOUNDARY** — these two *row* fields do not limit cumulative work, payload bytes,
+  internal structures, auxiliary scans, RSS, streaming, deadlines, traversal or spill. At this
+  2026-08-25 milestone, sort, aggregate, distinct and eager operators could retain up to the
+  admitted rows or states before their first yield. The later, independent
+  `query_memory_budget_bytes` contract now bounds sort, result-DISTINCT and aggregate logical
+  retention; `README.md` and `CONTRACT.md` describe its exact coverage and exclusions.
 
 ## P1.15 / Fase 1.4 — OpenMetrics bind boundary (CLOSED, 2026-08-25)
 

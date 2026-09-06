@@ -71,6 +71,31 @@ def test_a_page_round_trips_through_the_codec() -> None:
     assert [payload for _slot, payload in decoded.iter_slots()] == [b"alpha", b"beta", b"gamma"]
 
 
+def test_a_dense_directory_keeps_the_scalar_v1_byte_layout() -> None:
+    """Batch packing changes the computation, never the durable page image."""
+
+    page = Page(int(PageType.HEAP), page_size=4096, page_index=9)
+    for slot in range(40):
+        page.insert_slot(bytes((slot,)) * (slot % 17 + 1))
+    for slot in range(0, 40, 7):
+        page.free_slot(slot)
+
+    encoded = page.to_bytes()
+    expected = bytearray(page.page_size)
+    expected[PAGE_HEADER_SIZE : page._free_start] = page._data[
+        PAGE_HEADER_SIZE : page._free_start
+    ]
+    position = page.page_size
+    for offset, length in page._slots:
+        position -= SLOT_ENTRY_SIZE
+        struct.pack_into("<HH", expected, position, offset, length)
+    expected[0:PAGE_HEADER_SIZE] = page.header().encode()
+    expected[0:4] = crc32c(bytes(expected[4:])).to_bytes(4, "little")
+
+    assert encoded == bytes(expected)
+    assert PageCodecV1(page.page_size).decode_page(encoded, page_index=9) == page
+
+
 def test_encoding_a_page_of_another_size_is_refused() -> None:
     codec = PageCodecV1(PAGE_SIZE)
     with pytest.raises(GrafxCorruptionDetected):

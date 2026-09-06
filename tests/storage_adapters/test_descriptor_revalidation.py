@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,12 @@ from okto_grafx.domain.control_record import (
     ControlRecordKind,
     TwoSlotControlRecordStore,
 )
-from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError,
+    GrafxCorruptionDetected,
+    GrafxStorageError,
+    GrafxUnsupportedOperation,
+)
 
 
 PAGE_SIZE: int = 512
@@ -48,6 +54,23 @@ def _count_warm_identity_proofs(
     return calls
 
 
+def _count_exact_identity_observations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Record exact-case namespace walks independently from warm handle comparisons."""
+    calls: list[str] = []
+    original = LocalStorageDevice._resolve_identity
+
+    def counted(
+        self: LocalStorageDevice, name: str
+    ) -> os.stat_result | None:
+        calls.append(name)
+        return original(self, name)
+
+    monkeypatch.setattr(LocalStorageDevice, "_resolve_identity", counted)
+    return calls
+
+
 @pytest.mark.parametrize("policy", ["eager", "GENERATION", None, 7])
 def test_the_local_constructor_refuses_an_unknown_descriptor_policy_before_creating_a_root(
     tmp_path: Path, policy: object
@@ -80,6 +103,71 @@ def test_strict_revalidates_every_warm_descriptor_hit(
             assert reader.read_log(HEAP, 0, 4) == b"heap"
 
         assert calls == [HEAP, HEAP, HEAP]
+
+
+def test_safe_path_returns_only_the_final_component_observation(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"control"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        observed = device._require_safe_path(CONTROL, prove_containment=False)
+
+        assert observed is not None
+        expected = os.lstat(root / "control" / "commit.state")
+        parent = os.lstat(root / "control")
+        assert (observed.st_dev, observed.st_ino) == (
+            expected.st_dev,
+            expected.st_ino,
+        )
+        assert (observed.st_dev, observed.st_ino) != (parent.st_dev, parent.st_ino)
+
+
+@pytest.mark.parametrize("name", ["control/absent.state", "absent/commit.state"])
+def test_safe_path_returns_none_when_the_final_or_an_intermediate_component_is_absent(
+    tmp_path: Path, name: str
+) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"control"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        assert device._require_safe_path(name, prove_containment=False) is None
+
+
+def test_warm_descriptor_without_a_remembered_path_repeats_the_containment_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "database"
+    _seed(root, (HEAP, b"heap"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        assert device.read_log(HEAP, 0, 4) == b"heap"
+        device._paths.pop(HEAP)
+        proofs: list[bool] = []
+        original = LocalStorageDevice._require_safe_path
+
+        def counted(
+            self: LocalStorageDevice,
+            name: str,
+            *,
+            prove_containment: bool = True,
+        ) -> os.stat_result | None:
+            proofs.append(prove_containment)
+            return original(self, name, prove_containment=prove_containment)
+
+        monkeypatch.setattr(LocalStorageDevice, "_require_safe_path", counted)
+
+        assert device.read_log(HEAP, 0, 4) == b"heap"
+        assert proofs == [True]
+
+
+def test_warm_descriptor_is_not_used_after_its_name_disappears(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    _seed(root, (HEAP, b"heap"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        assert device.read_log(HEAP, 0, 4) == b"heap"
+        (root / HEAP).unlink()
+
+        with pytest.raises(GrafxCorruptionDetected):
+            device.read_log(HEAP, 0, 4)
+
+        assert HEAP not in device._handles
 
 
 def test_generation_classification_is_closed_and_canonical(tmp_path: Path) -> None:
@@ -300,13 +388,109 @@ def test_two_slot_control_io_keeps_one_strict_proof_per_actual_descriptor_hit(
         assert store.publish(b"one") == 1
         assert store.read() is not None  # cold descriptor admission
         calls = _count_warm_identity_proofs(monkeypatch)
+        observations = _count_exact_identity_observations(monkeypatch)
 
         observed = store.read()
 
         assert observed is not None
         assert observed.payload == b"one"
-        assert calls == [CONTROL]
+        assert observations == [CONTROL]
+        assert calls == []
 
         calls.clear()
+        observations.clear()
         assert store.publish(b"two") == 2
-        assert calls == [CONTROL, CONTROL, CONTROL]
+        assert observations == [CONTROL]
+        assert calls == [CONTROL, CONTROL]
+
+
+@pytest.mark.parametrize("policy", ["strict", "generation"])
+def test_fused_control_read_never_calls_the_independent_exists_door(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"control"))
+    with LocalStorageDevice(
+        root,
+        page_size=PAGE_SIZE,
+        descriptor_revalidation=policy,  # type: ignore[arg-type]
+    ) as device:
+        assert device.read_log_if_exists(CONTROL, 0, 7) == b"control"
+
+        def independent_exists_must_not_run(
+            _self: LocalStorageDevice, _file: str
+        ) -> bool:
+            raise AssertionError("fused read regressed to exists + read_log")
+
+        monkeypatch.setattr(
+            LocalStorageDevice, "exists", independent_exists_must_not_run
+        )
+        assert device.read_log_if_exists(CONTROL, 0, 7) == b"control"
+
+
+def test_fused_read_distinguishes_an_absent_name_from_a_present_empty_file(
+    tmp_path: Path,
+) -> None:
+    with LocalStorageDevice(tmp_path / "database", page_size=PAGE_SIZE) as device:
+        assert device.read_log_if_exists("control/absent.state", 0, 1) is None
+        device.create("control/empty.state")
+        assert device.read_log_if_exists("control/empty.state", 0, 1) == b""
+
+
+def test_fused_read_refuses_a_case_only_alias(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"control"))
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as device:
+        with pytest.raises(GrafxUnsupportedOperation) as refused:
+            device.read_log_if_exists("CONTROL/commit.state", 0, 7)
+
+    assert refused.value.details["reason"] == "case_collision"
+
+
+@pytest.mark.parametrize("policy", ["strict", "generation"])
+def test_fused_control_read_observes_an_atomic_replacement_on_the_next_call(
+    tmp_path: Path,
+    policy: str,
+) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"old"))
+    with LocalStorageDevice(
+        root,
+        page_size=PAGE_SIZE,
+        descriptor_revalidation=policy,  # type: ignore[arg-type]
+    ) as reader:
+        assert reader.read_log_if_exists(CONTROL, 0, 3) == b"old"
+        with LocalStorageDevice(root, page_size=PAGE_SIZE) as publisher:
+            publisher.create("control/commit.state.next")
+            publisher.append_log("control/commit.state.next", b"new")
+            publisher.atomic_replace("control/commit.state.next", CONTROL)
+
+        assert reader.read_log_if_exists(CONTROL, 0, 3) == b"new"
+
+
+def test_fused_cold_open_fails_closed_when_the_observed_name_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "database"
+    _seed(root, (CONTROL, b"control"))
+    original = LocalStorageDevice._open_named_descriptor
+
+    def remove_before_open(
+        self: LocalStorageDevice,
+        name: str,
+        path: str,
+        *,
+        create_new: bool,
+    ) -> int:
+        Path(path).unlink()
+        return original(self, name, path, create_new=create_new)
+
+    with LocalStorageDevice(root, page_size=PAGE_SIZE) as reader:
+        monkeypatch.setattr(
+            LocalStorageDevice, "_open_named_descriptor", remove_before_open
+        )
+        with pytest.raises(GrafxStorageError):
+            reader.read_log_if_exists(CONTROL, 0, 7)

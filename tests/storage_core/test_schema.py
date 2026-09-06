@@ -27,11 +27,19 @@ from okto_grafx.domain.model.schema import (
     ColumnDef,
     EmbeddingSpaceDef,
     TableDef,
+    decode_relationship_endpoints,
     decode_tuple,
     encode_tuple,
     is_identifier,
 )
-from okto_grafx.domain.model.value import Timestamp, Uuid, ValueType, VectorValue
+from okto_grafx.domain.model.value import (
+    MAX_VALUE_DEPTH,
+    Timestamp,
+    Uuid,
+    ValueType,
+    VectorValue,
+    encode_value,
+)
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 
 
@@ -139,6 +147,28 @@ def test_decode_tuple_compares_the_stored_tag_without_reclassifying_valid_values
     monkeypatch.setattr(schema_module, "value_type_of", refuse_reclassification)
 
     assert decode_tuple(table, payload) == (7, "Ada", 3.5)
+
+
+def test_planned_string_body_is_inlined_without_changing_other_scalar_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = person_table()
+    payload = encode_tuple(table, (7, "Ada", 3.5))
+    original = schema_module._decode_expected_value_body
+    observed: list[ValueType] = []
+
+    def observe_dispatch(
+        buf: memoryview,
+        offset: int,
+        expected: ValueType,
+    ) -> tuple[object, int]:
+        observed.append(expected)
+        return original(buf, offset, expected)
+
+    monkeypatch.setattr(schema_module, "_decode_expected_value_body", observe_dispatch)
+
+    assert decode_tuple(table, payload) == (7, "Ada", 3.5)
+    assert observed == [ValueType.INT64, ValueType.DOUBLE]
 
 
 def test_a_relationship_table_needs_both_endpoints() -> None:
@@ -293,6 +323,42 @@ def test_a_tuple_round_trips_through_its_schema() -> None:
     assert decode_tuple(table, raw) == values
 
 
+def test_scalar_tuple_decoding_uses_the_schema_plan_without_generic_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching scalar tag takes the planned decoder; compound and mismatched tags keep the oracle."""
+
+    table = TableDef(
+        table_id=77,
+        name="ScalarRow",
+        kind="node",
+        columns=(
+            ColumnDef(name="flag", type=ValueType.BOOL, nullable=False),
+            ColumnDef(name="count", type=ValueType.INT64, nullable=False),
+            ColumnDef(name="ratio", type=ValueType.DOUBLE, nullable=False),
+            ColumnDef(name="text", type=ValueType.STRING, nullable=False),
+            ColumnDef(name="raw", type=ValueType.BYTES, nullable=False),
+            ColumnDef(name="instant", type=ValueType.TIMESTAMP, nullable=False),
+            ColumnDef(name="uuid", type=ValueType.UUID, nullable=False),
+        ),
+    )
+    values = (
+        True,
+        -9,
+        0.25,
+        "planned",
+        b"bytes",
+        Timestamp(123),
+        Uuid(bytes(range(16))),
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("matching scalar columns must not use generic tag dispatch")
+
+    monkeypatch.setattr(schema_module, "decode_value", forbidden)
+    assert decode_tuple(table, encode_tuple(table, values)) == values
+
+
 def test_a_null_is_allowed_only_where_the_column_says_so() -> None:
     table = person_table()
     assert decode_tuple(table, encode_tuple(table, (7, None, 1.0))) == (7, None, 1.0)
@@ -396,6 +462,160 @@ def test_every_value_type_can_be_a_column() -> None:
         VectorValue((0.1, 0.2), space_ref=2, dtype="float64"),
     )
     assert decode_tuple(table, encode_tuple(table, values)) == values
+
+
+def test_relationship_endpoint_projection_validates_every_type_without_retaining_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    columns = (
+        ColumnDef(name="a", type=ValueType.BOOL),
+        ColumnDef(name="b", type=ValueType.INT64),
+        ColumnDef(name="c", type=ValueType.DOUBLE),
+        ColumnDef(name="d", type=ValueType.STRING),
+        ColumnDef(name="e", type=ValueType.BYTES),
+        ColumnDef(name="f", type=ValueType.LIST),
+        ColumnDef(name="g", type=ValueType.MAP),
+        ColumnDef(name="h", type=ValueType.TIMESTAMP),
+        ColumnDef(name="i", type=ValueType.UUID),
+        ColumnDef(name="j", type=ValueType.VECTOR_F32, vector_space="small"),
+        ColumnDef(name="k", type=ValueType.VECTOR_F64, vector_space="big"),
+    )
+    table = TableDef(
+        table_id=3,
+        name="EverythingEdge",
+        kind="rel",
+        columns=columns,
+        from_table="Person",
+        to_table="Person",
+    )
+    values = (
+        11,
+        22,
+        True,
+        -5,
+        0.25,
+        "text",
+        b"\x00\x01",
+        (1, (2, 3)),
+        {"key": ("nested", 7)},
+        Timestamp(123456789),
+        Uuid(bytes(range(16))),
+        VectorValue((0.5, 0.25), space_ref=1),
+        VectorValue((0.1, 0.2), space_ref=2, dtype="float64"),
+    )
+    payload = encode_tuple(table, values)
+    assert decode_tuple(table, payload) == values
+    calls: list[int] = []
+    original = schema_module.decode_value
+
+    def counted(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[object, int]:
+        calls.append(offset)
+        return original(buf, offset, depth=depth)
+
+    monkeypatch.setattr(schema_module, "decode_value", counted)
+
+    assert decode_relationship_endpoints(table, payload) == (11, 22)
+    assert calls == [0, 9], "only the two selected INT64 values are materialised"
+
+
+def _relationship_with_property(kind: ValueType, *, nullable: bool = False) -> TableDef:
+    """Return the smallest relationship schema for decoder-parity cases."""
+    return TableDef(
+        table_id=4,
+        name="Edge",
+        kind="rel",
+        columns=(
+            ColumnDef(
+                name="property",
+                type=kind,
+                nullable=nullable,
+                vector_space="small" if kind is ValueType.VECTOR_F32 else None,
+            ),
+        ),
+        from_table="Person",
+        to_table="Person",
+    )
+
+
+def _refusal(
+    call: object,
+) -> tuple[type[BaseException], str, bool, str, dict[str, object], object]:
+    """Return the observable refusal fingerprint of one decoder call."""
+    try:
+        call()  # type: ignore[operator]
+    except (GrafxCorruptionDetected, SchemaMismatchError) as failure:
+        cause = failure.__cause__
+        return (
+            type(failure),
+            failure.code,
+            failure.retryable,
+            failure.message,
+            dict(failure.details),
+            None if cause is None else (type(cause), str(cause)),
+        )
+    raise AssertionError("the malformed payload was accepted")
+
+
+_ENDPOINT_BYTES = encode_value(11) + encode_value(22)
+_TAG_LIST_ONE = bytes([int(ValueType.LIST)]) + (1).to_bytes(4, "little")
+_TAG_MAP_EMPTY = bytes([int(ValueType.MAP)]) + (0).to_bytes(4, "little")
+_UNHASHABLE_MAP_KEY = (
+    bytes([int(ValueType.MAP)])
+    + (1).to_bytes(4, "little")
+    + _TAG_LIST_ONE
+    + _TAG_MAP_EMPTY
+    + bytes([int(ValueType.NULL)])
+)
+_TOO_DEEP = bytes([int(ValueType.NULL)])
+for _depth in range(MAX_VALUE_DEPTH + 2):
+    _TOO_DEEP = _TAG_LIST_ONE + _TOO_DEEP
+
+
+@pytest.mark.parametrize(
+    ("kind", "property_bytes", "nullable", "trailing"),
+    (
+        (ValueType.STRING, encode_value(7), False, b""),
+        (ValueType.STRING, bytes([int(ValueType.NULL)]), False, b""),
+        (ValueType.STRING, bytes([int(ValueType.STRING)]) + b"\x01\x00\x00\x00\xff", False, b""),
+        (ValueType.BOOL, bytes([int(ValueType.BOOL), 2]), False, b""),
+        (ValueType.BYTES, bytes([int(ValueType.BYTES)]) + b"\x04\x00\x00\x00x", False, b""),
+        (ValueType.MAP, _UNHASHABLE_MAP_KEY, False, b""),
+        (ValueType.LIST, _TOO_DEEP, False, b""),
+        (
+            ValueType.VECTOR_F32,
+            bytes([int(ValueType.VECTOR_F32)])
+            + (2).to_bytes(4, "little")
+            + (1).to_bytes(4, "little")
+            + b"\x00\x00\x00\x00",
+            False,
+            b"",
+        ),
+        (ValueType.STRING, encode_value("valid"), False, b"\x00"),
+    ),
+    ids=(
+        "wrong-tag",
+        "not-null",
+        "invalid-utf8",
+        "invalid-bool",
+        "truncated-bytes",
+        "unhashable-map-key",
+        "nesting-limit",
+        "truncated-vector",
+        "trailing-byte",
+    ),
+)
+def test_relationship_endpoint_projection_has_full_decoder_refusal_parity(
+    kind: ValueType,
+    property_bytes: bytes,
+    nullable: bool,
+    trailing: bytes,
+) -> None:
+    table = _relationship_with_property(kind, nullable=nullable)
+    payload = _ENDPOINT_BYTES + property_bytes + trailing
+
+    assert _refusal(lambda: decode_relationship_endpoints(table, payload)) == _refusal(
+        lambda: decode_tuple(table, payload)
+    )
 
 
 def test_a_vector_of_the_wrong_precision_does_not_fit_the_column() -> None:

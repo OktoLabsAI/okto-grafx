@@ -15,6 +15,7 @@ import pytest
 
 from txn_support import ManualClock, Stack, build_stack, make_page_image
 
+from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.wal_manager import WalManager
 
 HEAP = "heap.dat"
@@ -194,6 +195,53 @@ def test_a_begin_inside_the_refresh_interval_publishes_nothing(tmp_path: Path) -
     )
     stack.manager.commit(second)
     assert spy.unregisters == 0
+
+
+def test_a_begin_inside_the_refresh_interval_reads_the_published_floor_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A visible standing pin makes the second CF-2 read redundant only in the stable regime."""
+
+    stack = build_stack(tmp_path, reader_stall_threshold=15.0)
+    first = stack.manager.begin("read")
+    stack.manager.commit(first)
+    original = CommitStateStore.read
+    reads = 0
+
+    def counted(store: CommitStateStore):
+        nonlocal reads
+        if store is stack.manager._commit_state_store:
+            reads += 1
+        return original(store)
+
+    monkeypatch.setattr(CommitStateStore, "read", counted)
+    second = stack.manager.begin("read")
+    assert reads == 1
+    stack.manager.commit(second)
+
+
+def test_a_due_begin_keeps_the_second_cf2_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Republishing a due pin preserves the window in which a foreign commit can land."""
+
+    stack = build_stack(tmp_path, reader_stall_threshold=15.0)
+    first = stack.manager.begin("read")
+    stack.manager.commit(first)
+    stack.clock.advance(6.0)
+    original = CommitStateStore.read
+    reads = 0
+
+    def counted(store: CommitStateStore):
+        nonlocal reads
+        if store is stack.manager._commit_state_store:
+            reads += 1
+        return original(store)
+
+    monkeypatch.setattr(CommitStateStore, "read", counted)
+    second = stack.manager.begin("read")
+    assert reads == 2
+    stack.manager.commit(second)
 
 
 def test_an_operation_longer_than_the_interval_republishes_at_commit(

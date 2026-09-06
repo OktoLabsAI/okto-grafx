@@ -34,7 +34,11 @@ from okto_grafx.domain.wal.record import (
     SUPPORTED_FORMAT_VERSIONS,
     WAL_FORMAT_VERSION,
     WAL_HEADER_LENGTH,
+    WAL_LEGACY_FORMAT_VERSION,
     WAL_MAGIC,
+    WAL_V2_FLAG_PAGE_IMAGE_ZLIB1,
+    WAL_V2_FLAG_REQUIRED,
+    WAL_V2_FLAG_SKIPPABLE,
     WalRecord,
     WalRecordType,
     header_length_of,
@@ -96,7 +100,7 @@ def test_each_header_field_sits_at_the_offset_the_contract_names() -> None:
     """A field that moves is a format change, so the offsets are asserted against the table."""
     raw = _record(flags=0x1234).encode()
     assert struct.unpack_from("<I", raw, 0)[0] == WAL_MAGIC
-    assert struct.unpack_from("<H", raw, 4)[0] == WAL_FORMAT_VERSION
+    assert struct.unpack_from("<H", raw, 4)[0] == WAL_LEGACY_FORMAT_VERSION
     assert struct.unpack_from("<H", raw, 6)[0] == int(WalRecordType.COMMIT)
     assert struct.unpack_from("<H", raw, 8)[0] == WAL_HEADER_LENGTH
     assert struct.unpack_from("<H", raw, 10)[0] == 0x1234
@@ -104,7 +108,9 @@ def test_each_header_field_sits_at_the_offset_the_contract_names() -> None:
     assert struct.unpack_from("<Q", raw, 16)[0] == 42
     assert struct.unpack_from("<Q", raw, 24)[0] == 3
     assert struct.unpack_from("<Q", raw, 32)[0] == 77
-    assert struct.unpack_from("<I", raw, 40)[0] == len("hash-v1;partitions_per_table=64")
+    assert struct.unpack_from("<I", raw, 40)[0] == len(
+        "hash-v1;partitions_per_table=64"
+    )
     assert struct.unpack_from("<I", raw, 44)[0] == len(b"payload-bytes")
 
 
@@ -120,7 +126,13 @@ def test_the_checksum_is_crc32c_over_everything_before_it() -> None:
 @pytest.mark.parametrize("version", SUPPORTED_FORMAT_VERSIONS)
 def test_a_record_round_trips_in_every_supported_version(version: int) -> None:
     """TR-4 asks for a round trip per version, and this is the closed set of them."""
-    record = _record(format_version=version)
+    overrides: dict[str, object] = {"format_version": version}
+    if version == WAL_FORMAT_VERSION:
+        overrides.update(
+            record_type=WalRecordType.WRITE_PAGE,
+            flags=WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_PAGE_IMAGE_ZLIB1,
+        )
+    record = _record(**overrides)
     outcome = decode_record(record.encode())
     assert outcome.record == record
     assert outcome.consumed == record.encoded_length()
@@ -131,7 +143,13 @@ def test_a_record_round_trips_in_every_supported_version(version: int) -> None:
 @pytest.mark.parametrize(
     "payload",
     [b"", b"\x00", bytes(range(256)), b"\x1a" * 300, MAGIC_BYTES * 8],
-    ids=["empty", "one-zero", "every-byte", "windows-eof-byte", "payload-looks-like-a-header"],
+    ids=[
+        "empty",
+        "one-zero",
+        "every-byte",
+        "windows-eof-byte",
+        "payload-looks-like-a-header",
+    ],
 )
 def test_a_payload_survives_whatever_bytes_it_holds(payload: bytes) -> None:
     """A payload is opaque: a run of the magic inside it must not confuse the decoder."""
@@ -178,7 +196,9 @@ def test_the_descriptor_round_trips_at_its_declared_ceiling() -> None:
         ("txn_id", MAX_U64 + 1),
     ],
 )
-def test_a_field_outside_its_width_is_refused_by_name(field: str, value: object) -> None:
+def test_a_field_outside_its_width_is_refused_by_name(
+    field: str, value: object
+) -> None:
     """A41: the refusal names the field, and no raw struct error reaches a public door."""
     with pytest.raises(GrafxConfigurationError) as caught:
         _record(**{field: value})
@@ -397,19 +417,23 @@ def _planted_record(*, descriptor: bytes, payload: bytes = b"", lsn: int = 1) ->
     one here by hand is the only way to plant a record the WRITE side would have refused.
     """
     total = WAL_HEADER_LENGTH + len(descriptor) + len(payload) + CHECKSUM_LENGTH
-    body = HEADER.pack(
-        WAL_MAGIC,
-        WAL_FORMAT_VERSION,
-        int(WalRecordType.WRITE_PAGE),
-        WAL_HEADER_LENGTH,
-        0,
-        total,
-        lsn,
-        1,
-        1,
-        len(descriptor),
-        len(payload),
-    ) + descriptor + payload
+    body = (
+        HEADER.pack(
+            WAL_MAGIC,
+            WAL_LEGACY_FORMAT_VERSION,
+            int(WalRecordType.WRITE_PAGE),
+            WAL_HEADER_LENGTH,
+            0,
+            total,
+            lsn,
+            1,
+            1,
+            len(descriptor),
+            len(payload),
+        )
+        + descriptor
+        + payload
+    )
     return body + struct.pack("<I", crc32c(body))
 
 
@@ -465,6 +489,58 @@ def test_an_unknown_record_type_still_decodes() -> None:
     assert outcome.record is not None
     assert outcome.record.record_type == 250
     assert outcome.record.is_known_type is False
+
+
+def test_an_unknown_explicitly_skippable_v2_record_can_be_stepped_over() -> None:
+    """Only an unknown v2 record with the exact SKIPPABLE flag is safe to skip."""
+    raw = bytearray(_record().encode())
+    struct.pack_into("<H", raw, 4, WAL_FORMAT_VERSION)
+    struct.pack_into("<H", raw, 6, 250)
+    struct.pack_into("<H", raw, 10, WAL_V2_FLAG_SKIPPABLE)
+    body = bytes(raw[:-CHECKSUM_LENGTH])
+    raw[-CHECKSUM_LENGTH:] = struct.pack("<I", crc32c(body))
+
+    outcome = decode_record(bytes(raw))
+
+    assert outcome.record is not None
+    assert outcome.record.record_type == 250
+    assert outcome.record.format_version == WAL_FORMAT_VERSION
+
+
+@pytest.mark.parametrize(
+    ("record_type", "flags"),
+    [
+        (250, 0),
+        (250, WAL_V2_FLAG_REQUIRED),
+        (int(WalRecordType.WRITE_PAGE), 0),
+        (int(WalRecordType.COMMIT), 0),
+    ],
+)
+def test_unsupported_required_v2_semantics_are_a_checked_upgrade_refusal(
+    record_type: int,
+    flags: int,
+) -> None:
+    raw = bytearray(_record().encode())
+    struct.pack_into("<H", raw, 4, WAL_FORMAT_VERSION)
+    struct.pack_into("<H", raw, 6, record_type)
+    struct.pack_into("<H", raw, 10, flags)
+    body = bytes(raw[:-CHECKSUM_LENGTH])
+    raw[-CHECKSUM_LENGTH:] = struct.pack("<I", crc32c(body))
+
+    outcome = decode_record(bytes(raw))
+
+    assert outcome.record is None
+    assert outcome.reason is FailureReason.UNSUPPORTED_REQUIRED_RECORD
+    assert outcome.consumed == len(raw)
+    assert outcome.checked is True
+    failure = ScanFailure(
+        reason=outcome.reason,
+        segment="wal/000000000001.wal",
+        offset=0,
+        length=len(raw),
+        detail=outcome.detail,
+    )
+    assert isinstance(failure.as_error(), GrafxSchemaVersionMismatch)
 
 
 def test_the_decoder_refuses_a_non_buffer_without_raising() -> None:

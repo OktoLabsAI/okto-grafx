@@ -16,10 +16,10 @@ the tail was cut there. So every damaged range that is not a checksum failure is
 ``TRUNCATED_TAIL``, and the decoder's own verdict travels in the payload envelope, where it is
 exact and constrains nothing.
 
-One reason is deliberately NOT reachable from a scan: ``UNSUPPORTED_VERSION``. A record written by
-a newer build is not damage, and truncating it would destroy work that build committed. That case
-never becomes a ledger entry -- it stops recovery with ``schema_version_mismatch``, and
-:func:`refuses_recovery` is the predicate that says so.
+Two reasons are deliberately NOT reachable from a discard: ``UNSUPPORTED_VERSION`` and a
+checksum-valid required record whose semantics this build lacks. Those bytes are not damage, and
+truncating them would destroy work another build committed. They stop recovery with a typed schema
+refusal, and :func:`refuses_recovery` is the predicate that says so.
 """
 
 from __future__ import annotations
@@ -46,8 +46,9 @@ FORENSIC_REASONS: frozenset[FailureReason] = frozenset(
 """Every scan verdict that means the bytes did not decode, so only the range survives.
 
 ``LSN_DISCONTINUITY`` is absent because the record it reports DID decode -- the walk yields it
-immediately afterwards and it is classified on its own -- and ``UNSUPPORTED_VERSION`` is absent
-because it stops recovery instead of producing an entry.
+immediately afterwards and it is classified on its own -- and ``UNSUPPORTED_VERSION`` plus
+``UNSUPPORTED_REQUIRED_RECORD`` are absent because they stop recovery instead of producing an
+entry.
 """
 
 
@@ -59,7 +60,10 @@ def refuses_recovery(reason: FailureReason) -> bool:
     truncating them would turn an upgrade problem into data loss. Failing closed here is what
     keeps FR-8's replay from becoming a downgrade.
     """
-    return reason is FailureReason.UNSUPPORTED_VERSION
+    return reason in {
+        FailureReason.UNSUPPORTED_VERSION,
+        FailureReason.UNSUPPORTED_REQUIRED_RECORD,
+    }
 
 
 def classify_failure(reason: FailureReason) -> tuple[LedgerOriginClass, LedgerReason]:
@@ -69,7 +73,9 @@ def classify_failure(reason: FailureReason) -> tuple[LedgerOriginClass, LedgerRe
     return LedgerOriginClass.FORENSIC, LedgerReason.TRUNCATED_TAIL
 
 
-def classify_record(*, stale_epoch: bool = False) -> tuple[LedgerOriginClass, LedgerReason]:
+def classify_record(
+    *, stale_epoch: bool = False
+) -> tuple[LedgerOriginClass, LedgerReason]:
     """Return the class and the reason code for a record that decoded but cannot be used.
 
     Both cases section 8.6 names are reapplicable, and they differ only in why the record is

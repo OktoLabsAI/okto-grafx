@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
+from math import isnan
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,8 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import Timestamp, ValueType
+from okto_grafx.domain.query.analysis import Aggregation
+from okto_grafx.domain.query.ast import FunctionCall, Parameter
 from okto_grafx.domain.query.plan import NodeScan, ProduceResults, SingleRow, VectorSearch
 from okto_grafx.engine.query_engine import (
     PHASE_EXECUTE,
@@ -27,8 +30,10 @@ from okto_grafx.engine.query_engine import (
     QueryEngine,
     QueryResult,
     RowBinding,
+    _Accumulator,
     _Row,
     _node_scan,
+    _sort_key,
 )
 from tests.query.stack import QueryStack, build_query_stack, vector
 
@@ -740,6 +745,62 @@ def test_timestamp_reads_iso_forms_into_utc_microseconds(
 
 
 @pytest.mark.parametrize(
+    ("operator", "expected"),
+    (("<", True), ("<=", True), (">", False), (">=", False)),
+)
+def test_timestamp_values_support_chronological_ordering(
+    stack: QueryStack, operator: str, expected: bool
+) -> None:
+    """TIMESTAMP is an ordered scalar, not an opaque value that yields UNKNOWN."""
+
+    found = run(
+        stack,
+        f"RETURN timestamp($earlier) {operator} timestamp($later)",
+        {
+            "earlier": "2024-01-02T03:04:05.123456Z",
+            "later": "2024-01-02T03:04:05.123457Z",
+        },
+    )
+
+    assert found.rows == ((expected,),)
+
+
+def test_timestamp_keyset_pagination_orders_by_instant_then_id() -> None:
+    """The Pulse cursor shape returns the rows strictly after a tied boundary."""
+
+    built = build_query_stack()
+    ddl = built.transaction()
+    built.engine.execute(
+        "CREATE NODE TABLE Event(id STRING, created_at TIMESTAMP, PRIMARY KEY(id))",
+        ddl,
+    )
+    built.apply_schema(ddl)
+    built.insert("Event", 1, ("newest", Timestamp(_INSTANT_MICROS + 2)))
+    built.insert("Event", 2, ("tie-c", Timestamp(_INSTANT_MICROS + 1)))
+    built.insert("Event", 3, ("tie-b", Timestamp(_INSTANT_MICROS + 1)))
+    built.insert("Event", 4, ("oldest", Timestamp(_INSTANT_MICROS)))
+
+    page = built.engine.execute(
+        "MATCH (n:Event) "
+        "WHERE n.created_at < timestamp($cursor_ts) "
+        "OR (n.created_at = timestamp($cursor_ts) AND n.id < $cursor_id) "
+        "RETURN n.id, n.created_at "
+        "ORDER BY n.created_at DESC, n.id DESC LIMIT $max_rows",
+        built.transaction(read_lsn=1000),
+        {
+            "cursor_ts": "2024-01-02T03:04:05.000001Z",
+            "cursor_id": "tie-c",
+            "max_rows": 2,
+        },
+    )
+
+    assert page.rows == (
+        ("tie-b", Timestamp(_INSTANT_MICROS + 1)),
+        ("oldest", Timestamp(_INSTANT_MICROS)),
+    )
+
+
+@pytest.mark.parametrize(
     ("written", "micros"),
     (
         ("1970-01-01T00:00:00Z", 0),
@@ -1299,6 +1360,47 @@ def test_null_sorts_last_ascending_and_first_descending(stack: QueryStack) -> No
     assert descending[0] is None
 
 
+def _add_double_ordering_rows(stack: QueryStack) -> None:
+    """Add finite and NaN doubles in an order that proves stable total ordering."""
+    stack.catalog_store.catalog.add_table(
+        TableDef(
+            table_id=4,
+            name="Measurement",
+            kind="node",
+            columns=(
+                ColumnDef(name="id", type=ValueType.INT64, nullable=False),
+                ColumnDef(name="value", type=ValueType.DOUBLE),
+            ),
+            primary_key="id",
+        )
+    )
+    stack.catalog_store.save()
+    stack.insert("Measurement", 1, (1, float("nan")), csn=1)
+    stack.insert("Measurement", 2, (2, 0.0), csn=1)
+    stack.insert("Measurement", 3, (3, float("nan")), csn=1)
+    stack.insert("Measurement", 4, (4, -1.0), csn=1)
+
+
+def test_nan_sorts_after_every_number_ascending_and_before_them_descending(
+    stack: QueryStack,
+) -> None:
+    _add_double_ordering_rows(stack)
+
+    ascending = run(
+        stack,
+        "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value",
+    )
+    descending = run(
+        stack,
+        "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value DESC",
+    )
+
+    assert tuple(row[0] for row in ascending.rows) == (4, 2, 1, 3)
+    assert tuple(row[0] for row in descending.rows) == (1, 3, 2, 4)
+    assert all(isnan(row[1]) for row in ascending.rows[-2:])
+    assert all(isnan(row[1]) for row in descending.rows[:2])
+
+
 def test_two_sort_keys_are_applied_most_significant_first(stack: QueryStack) -> None:
     found = run(
         stack,
@@ -1393,6 +1495,116 @@ def test_each_aggregate_reports_what_it_names(
 ) -> None:
     found = run(stack, f"MATCH (p:Person) RETURN {expression} AS value")
     assert found.rows[0][0] == pytest.approx(expected)
+
+
+def _fold_values(
+    function: str, values: tuple[object, ...], *, distinct: bool = False
+) -> _Accumulator:
+    """Fold direct parameter values through one production accumulator."""
+    accumulator = _Accumulator(
+        Aggregation(
+            position=0,
+            call=FunctionCall(
+                name=function,
+                arguments=(Parameter(name="value"),),
+                distinct=distinct,
+            ),
+        )
+    )
+    context = SimpleNamespace(parameters={"value": None})
+    row = _Row(bindings={})
+    for value in values:
+        context.parameters["value"] = value
+        accumulator.add(row, context)  # type: ignore[arg-type]
+    return accumulator
+
+
+@pytest.mark.parametrize(
+    ("function", "expected"),
+    (
+        ("COUNT", 130),
+        ("SUM", 8128.0),
+        ("AVG", 8128.0 / 130),
+    ),
+)
+def test_count_sum_and_avg_keep_constant_state_per_group(
+    function: str, expected: object
+) -> None:
+    values = (*range(128), None, True, "not numeric")
+    accumulator = _fold_values(function, values)
+
+    assert accumulator.result() == expected
+    assert accumulator._values is None  # noqa: SLF001
+    assert accumulator._seen is None  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("function", "expected"),
+    (("COUNT", 2), ("SUM", 5.0), ("AVG", 2.5)),
+)
+def test_distinct_count_sum_and_avg_retain_only_the_distinct_filter(
+    function: str, expected: object
+) -> None:
+    accumulator = _fold_values(function, (None, 2, 2, 3, 3), distinct=True)
+
+    assert accumulator.result() == expected
+    assert accumulator._values is None  # noqa: SLF001
+    assert accumulator._seen is not None  # noqa: SLF001
+    assert len(accumulator._seen) == 2  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("function", "values", "expected_position"),
+    (
+        ("MIN", (1, 1.0), 0),
+        ("MAX", (1, 1.0), 1),
+        ("MIN", (5, True), 1),
+        ("MAX", (5, True), 0),
+    ),
+)
+def test_min_and_max_keep_sort_key_ranking_and_stable_ties(
+    function: str, values: tuple[object, ...], expected_position: int
+) -> None:
+    accumulator = _fold_values(function, values)
+
+    assert accumulator.result() is values[expected_position]
+    assert accumulator._values is None  # noqa: SLF001
+    assert accumulator._extreme_key == _sort_key(values[expected_position])  # noqa: SLF001
+
+
+def test_min_and_max_keep_first_and_last_nan_on_equal_sort_keys() -> None:
+    first = float("nan")
+    last = float("nan")
+    values = (first, -1.0, last)
+
+    minimum = _fold_values("MIN", values)
+    maximum = _fold_values("MAX", values)
+
+    assert minimum.result() == -1.0
+    assert maximum.result() is last
+    assert minimum._values is None  # noqa: SLF001
+    assert maximum._values is None  # noqa: SLF001
+
+
+def test_min_and_max_use_the_same_total_nan_order_as_order_by(
+    stack: QueryStack,
+) -> None:
+    _add_double_ordering_rows(stack)
+
+    found = run(
+        stack,
+        "MATCH (m:Measurement) RETURN min(m.value), max(m.value)",
+    )
+
+    assert found.rows[0][0] == -1.0
+    assert isnan(found.rows[0][1])
+
+
+def test_collect_alone_retains_non_null_values_in_input_order() -> None:
+    accumulator = _fold_values("COLLECT", ("first", None, True, 2))
+
+    assert accumulator.result() == ("first", True, 2)
+    assert accumulator._values == ["first", True, 2]  # noqa: SLF001
 
 
 def test_collect_gathers_the_values_of_its_group(stack: QueryStack) -> None:

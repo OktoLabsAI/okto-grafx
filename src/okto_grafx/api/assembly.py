@@ -51,6 +51,8 @@ from okto_grafx.adapters.coordination_local import (
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
+from okto_grafx.adapters.query_spill_local import LocalQuerySpillFactory
+from okto_grafx.adapters.storage_local import LocalStorageDevice
 from okto_grafx.adapters.storage_read_only import ReadOnlyStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -60,7 +62,9 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.index.definition import index_definition_matches_table
+from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.codec import PageCodec
@@ -76,13 +80,12 @@ from okto_grafx.engine.database import META_FILE, Database, DatabaseIdentity, Me
 from okto_grafx.engine.heap_store import HEAP_FILE, HeapStore
 from okto_grafx.engine.index_manager import (
     INDEX_DIRECTORY,
+    HashIndex,
     IndexManager,
     edge_from_index_name,
     edge_to_index_name,
     index_file,
-    primary_key_index,
     primary_key_index_name,
-    relationship_endpoint_indexes,
 )
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
@@ -293,6 +296,12 @@ def assemble_database(
         # It sits INSIDE the guard so a sink that refuses a descriptor cannot leave the device
         # this composition already opened holding its descriptors.
         register_catalog(metrics)
+        if type(raw_storage) is LocalStorageDevice:
+            # The storage protocol remains frozen: descriptor caching is an adapter detail.
+            # Bind its counters through the metrics port only for the concrete default adapter,
+            # and call the concrete method so a host subclass cannot inject a callback into the
+            # assembly window. LocalStorageDevice publishes outside its own descriptor guard.
+            LocalStorageDevice.bind_metrics(raw_storage, metrics)
         # Computed inside the guard, not before it: it was the one fallible statement in the
         # window between a complete registry and the guard that releases it, so a path it
         # could not encode leaked the device this composition had already opened.
@@ -322,10 +331,15 @@ def assemble_database(
             db_label=label,
             # The pool is reached by every thread of this participant -- a commit applying pages
             # in the participant section, searches and scans pinning outside it -- and its doors
-            # must be atomic against each other. The lock is mechanism, so it is handed in here
-            # rather than imported by the pool (the pure core imports none), and it is
-            # re-entrant because a checkpoint flushes and an invalidation writes back.
-            guard=threading.RLock(),
+            # must be atomic against each other. The condition is mechanism, so it is handed in
+            # here rather than imported by the pool (the pure core imports none). It is
+            # re-entrant because checkpoint/invalidation nest pool doors, and its atomic
+            # wait/wake half lets cold reads leave this guard without duplicating one page load.
+            guard=ConditionGuard(),
+            # This is the trusted composition adapter's existing deferral boundary, passed
+            # explicitly rather than discovered on a host-supplied metrics implementation.
+            # It drains pool and nested descriptor-cache emissions after the pool guard.
+            metrics_defer=metrics.defer,
             # Page 0 is a non-wrapping cross-process freshness clock. BufferPool owns the CAS,
             # while the composition root supplies its mechanism: one deterministic section per
             # index file in this database. Readers never take it; unrelated page-0 protocols are
@@ -378,6 +392,10 @@ def assemble_database(
             indexes=indexes,
             exact_scan_threshold=config.vector_exact_scan_threshold,
             ef_search=config.vector_ef_search,
+            # Production schema changes use QueryEngine staging and the normal WAL commit.
+            # Closing the two legacy direct-save doors is the proof TXN-4 needs to retain a
+            # catalog view across a CE-3 interval containing only ordinary DML.
+            catalog_changes_are_wal_logged=True,
             # P0.5: the derived HNSW graph of every vector index is published under this
             # guard -- one complete picture per reference assignment, one build in flight per
             # index. Mechanism, so it is handed in here like the pool's guard above rather than
@@ -393,17 +411,20 @@ def assemble_database(
         def sync_indexes(*, existing_only: bool) -> tuple[str, ...]:
             """Adopt every declared index from one proved directory inventory."""
             existing_files = frozenset(storage.list_files("index/"))
+            active_definitions = catalog.catalog.active_index_definitions()
             newly_attached = _attach_primary_key_indexes(
                 catalog,
                 indexes,
                 pool,
                 metrics,
+                definitions=active_definitions,
                 existing_only=existing_only,
                 existing_files=existing_files,
             )
             newly_attached += _attach_declared_vector_indexes(
                 catalog,
                 vectors,
+                definitions=active_definitions,
                 storage=storage,
                 existing_only=existing_only,
                 existing_files=existing_files,
@@ -490,10 +511,15 @@ def assemble_database(
             max_transaction_rows=config.max_transaction_rows,
             max_transaction_bytes=config.max_transaction_bytes,
             max_wal_batch_bytes=config.max_wal_batch_bytes,
+            max_index_build_entries=config.max_index_build_entries,
+            automatic_index_expected_cardinality=(
+                config.automatic_index_expected_cardinality
+            ),
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
             process_identity_provider=os.getpid,
+            catalog_changes_are_wal_logged=True,
         )
         # A writable open may create a missing accelerator only under the same artifact section
         # as DDL attach and commit publication.  That section first adopts existing files and
@@ -514,9 +540,21 @@ def assemble_database(
             vectors=vectors,
             page_stager=transactions._stage_page_image,
             schema_artifact_section=transactions.schema_artifact_section,
+            custom_index_preparer=transactions.prepare_custom_exact_index,
+            # Separate from BufferPool's lock: endpoint memo accounting is atomic, while the
+            # heap walk it enables never holds this guard across page I/O.
+            endpoint_locator_guard=threading.RLock(),
             max_statement_writes=config.max_statement_writes,
             max_result_rows=config.max_result_rows,
             max_intermediate_rows=config.max_intermediate_rows,
+            query_memory_budget_bytes=config.query_memory_budget_bytes,
+            query_spill=LocalQuerySpillFactory(),
+            max_traversal_expansions=config.max_traversal_expansions,
+            max_traversal_paths=config.max_traversal_paths,
+            max_index_build_entries=config.max_index_build_entries,
+            automatic_index_expected_cardinality=(
+                config.automatic_index_expected_cardinality
+            ),
         )
         attached = tuple(attached_names)
         adopted = set(attached)
@@ -585,6 +623,7 @@ def assemble_database(
         label=label,
         checkpoint_interval_records=config.checkpoint_interval_records,
         wal_max_bytes=config.wal_max_bytes,
+        max_query_value_characters=config.max_query_value_characters,
         read_only=config.read_only,
         descriptor_revalidation=config.descriptor_revalidation,
         metrics_endpoint=endpoint,
@@ -622,26 +661,28 @@ def _verifier_factory(
 
     def build() -> Verifier:
         """Return a verifier over the index set registered at this moment."""
-        committed_tables = {
-            (table.table_id, table.name): table for table in catalog.catalog.tables()
-        }
-
-        def is_committed(index: object) -> bool:
-            """Return whether ``index`` exactly belongs to the durable catalog."""
-            definition = getattr(index, "definition", None)
-            table = committed_tables.get(
-                (
-                    getattr(definition, "table_id", None),
-                    getattr(definition, "table_name", None),
-                )
-            )
-            return table is not None and index_definition_matches_table(
-                definition, table
-            )
-
-        committed_indexes = tuple(
-            index for index in indexes.indexes() if is_committed(index)
+        authority = catalog.catalog
+        committed_indexes = indexes.active_indexes(
+            catalog=authority,
         )
+        if authority.format_version == CATALOG_FORMAT_VERSION:
+            covered = {
+                index.definition.registry_key: index.definition
+                for index in committed_indexes
+            }
+            missing = tuple(
+                definition.name
+                for definition in authority.active_index_definitions()
+                if definition.visibility is IndexVisibility.EXACT
+                and covered.get(definition.registry_key) != definition
+            )
+            if missing:
+                raise GrafxIndexError(
+                    "Verification cannot cover every exact ACTIVE generation selected by "
+                    f"catalog v2; missing or mismatched registrations: {', '.join(missing)}.",
+                    field="index_authority",
+                    missing=missing,
+                )
         return Verifier(
             pool,
             metrics,
@@ -659,96 +700,81 @@ def _attach_primary_key_indexes(
     pool: BufferPool,
     metrics: MetricsSink,
     *,
+    definitions: tuple[IndexDefinition, ...] | None = None,
     existing_only: bool = False,
     existing_files: frozenset[str] | None = None,
 ) -> tuple[str, ...]:
-    """Register the primary-key index of every table the catalog holds, and name them.
+    """Register every exact index selected by the catalog's runtime authority.
 
-    The DDL that creates a table creates its index, so this is the RE-ADOPTION path: the next
-    process to open the database has an index file on disk and no object for it. It mirrors
-    `_attach_declared_vector_indexes` exactly, and for the same reason -- an index that exists on
-    the device and is registered by nobody is an index the planner cannot see, which is a silent
-    fall back to a full scan rather than an error.
+    In catalog v1 these are the schema-derived primary-key and relationship endpoint definitions.
+    In v2 they are only persisted logical definitions with an ``ACTIVE`` physical generation.
+    The latter names an immutable generation file by nonce; its absence or any header mismatch is
+    an authority failure, never permission for startup to manufacture a new empty file.
 
-    Registering OPENS an existing file rather than replacing it (G6), so this adopts what is there
-    instead of rebuilding it, and `IndexManager.open` decides freshness afterwards. A database
-    written before primary keys were indexed has no such file: one is created, it is empty while
-    the heap is not, and it is therefore STALE -- which is the honest answer and the safe one,
-    because a stale index is excluded from planning and the query falls back to the scan it used
-    to do.
+    Legacy writable composition retains its established compatibility behaviour: a missing
+    derived accelerator may be created and then marked stale against a populated heap. Existing-
+    only sync never creates an artifact in either format.
     """
+    catalog_value = catalog.catalog
+    selected = (
+        catalog_value.active_index_definitions() if definitions is None else definitions
+    )
+    catalog_managed = catalog_value.format_version == CATALOG_FORMAT_VERSION
     attached: list[str] = []
-    for table in catalog.catalog.tables():
+    for definition in selected:
+        if definition.visibility is not IndexVisibility.EXACT:
+            continue
         try:
-            for endpoint in relationship_endpoint_indexes(table, pool, metrics):
-                try:
-                    current = indexes.index(endpoint.name)
-                except GrafxIndexError as failure:
-                    if failure.details.get("field") != "name":
-                        raise
-                    current = None
-                if current is not None and current.definition == endpoint.definition:
-                    continue
-                proved_present = (
-                    existing_files is not None and endpoint.file in existing_files
-                )
-                if existing_only and (
-                    not proved_present
-                    if existing_files is not None
-                    else not pool.storage.exists(endpoint.file)
-                ):
-                    continue
-                attached.append(
-                    (
-                        indexes.adopt_committed(
-                            endpoint,
-                            persist_stale=False,
-                            proved_present=proved_present,
-                        )
-                        if existing_only
-                        else indexes.register(
-                            endpoint,
-                            existing_only=existing_only,
-                            persist_stale=not existing_only,
-                            proved_present=proved_present,
-                        )
-                    ).name
-                )
-            index = primary_key_index(table, pool, metrics)
-            if index is None:
-                continue
+            index = HashIndex(definition, pool, metrics)
             try:
                 current = indexes.index(index.name)
             except GrafxIndexError as failure:
                 if failure.details.get("field") != "name":
                     raise
                 current = None
-            if current is not None and current.definition == index.definition:
-                continue
-            proved_present = existing_files is not None and index.file in existing_files
-            if existing_only and (
-                not proved_present
-                if existing_files is not None
-                else not pool.storage.exists(index.file)
+            if (
+                not catalog_managed
+                and current is not None
+                and current.definition == index.definition
             ):
                 continue
+            proved_present = existing_files is not None and index.file in existing_files
+            present = (
+                proved_present
+                if existing_files is not None
+                else pool.storage.exists(index.file)
+            )
+            if not present:
+                if catalog_managed:
+                    raise GrafxIndexError(
+                        f"Catalog v2 selects active index {index.name!r}, but its physical "
+                        f"generation {index.file!r} is absent.",
+                        field="file",
+                        file=index.file,
+                        index=index.name,
+                        artifact_nonce=definition.artifact_nonce,
+                    )
+                if existing_only:
+                    continue
             attached.append(
                 (
                     indexes.adopt_committed(
                         index,
                         persist_stale=False,
-                        proved_present=proved_present,
+                        proved_present=present,
                     )
-                    if existing_only
+                    if existing_only or catalog_managed
                     else indexes.register(
                         index,
                         existing_only=existing_only,
                         persist_stale=not existing_only,
-                        proved_present=proved_present,
+                        proved_present=present,
                     )
                 ).name
             )
         except (GrafxIndexError, GrafxUnsupportedOperation):
+            if catalog_managed:
+                raise
             # AN INDEX MAY NEVER MAKE A DATABASE UNOPENABLE. A catalog can hold a table whose
             # index name is illegal or collides -- two names differing only by case fold to one
             # file -- and raising here meant every later `connect()` on that database refused,
@@ -763,6 +789,7 @@ def _attach_declared_vector_indexes(
     catalog: CatalogStore,
     vectors: VectorEngine,
     *,
+    definitions: tuple[IndexDefinition, ...] | None = None,
     storage: StorageDevice | None = None,
     existing_only: bool = False,
     existing_files: frozenset[str] | None = None,
@@ -781,6 +808,16 @@ def _attach_declared_vector_indexes(
     transaction the caller owns -- so an index that opens stale is reported through
     :attr:`okto_grafx.engine.database.Database.stale_indexes` rather than silently rebuilt.
     """
+    selected = (
+        catalog.catalog.active_index_definitions()
+        if definitions is None
+        else definitions
+    )
+    active_names = {
+        definition.registry_key
+        for definition in selected
+        if definition.visibility is IndexVisibility.PROXIMITY
+    }
     attached: list[str] = []
     for table in catalog.catalog.tables():
         for column in table.columns:
@@ -788,6 +825,8 @@ def _attach_declared_vector_indexes(
             if space is None:
                 continue
             name = f"vector_{table.name}_{space}"
+            if name.lower() not in active_names:
+                continue
             file = index_file(name)
             proved_present = existing_files is not None and file in existing_files
             if existing_only and (
@@ -1110,7 +1149,7 @@ def _preflight_default_read_only_storage(
         NoOpMetricsSink(),
         budget_bytes=config.buffer_budget_bytes,
         db_label=database_label(config.path),
-        guard=threading.RLock(),
+        guard=ConditionGuard(),
     )
     _read_existing_identity(config, observational, MetaStore(pool))
 
@@ -1156,7 +1195,7 @@ def _observe_default_read_only_identity(
         NoOpMetricsSink(),
         budget_bytes=config.buffer_budget_bytes,
         db_label=database_label(config.path),
-        guard=threading.RLock(),
+        guard=ConditionGuard(),
     )
     meta = MetaStore(pool)
     intent = _read_first_open_intent(observational)

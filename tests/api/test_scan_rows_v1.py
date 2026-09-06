@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+import okto_grafx.engine.database as database_module
 from okto_grafx import ScanCursorV1, ScanPageV1, ScanRowV1, VectorValue, connect
 from okto_grafx.errors import GrafxConfigurationError, GrafxTransactionStateError
 from okto_grafx.engine.heap_store import HeapStore
@@ -171,6 +172,64 @@ def test_rows_preserve_null_vectors_and_each_physical_relationship_occurrence(
     assert relationships[0].values[:2] == (first_id, second_id)
     with pytest.raises(FrozenInstanceError):
         relationships[0].record_id = 999  # type: ignore[misc]
+
+
+def test_decoded_exact_scalar_rows_skip_the_recursive_public_value_copier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "db"
+    with connect(root) as database:
+        with database.begin("write") as schema:
+            schema.execute("CREATE VECTOR SPACE semantic {dimension: 3, metric: 'cosine'}")
+            schema.execute(
+                "CREATE NODE TABLE Item("
+                "id INT64, label STRING, enabled BOOL, score DOUBLE, note STRING, "
+                "embedding VECTOR(semantic), PRIMARY KEY(id))"
+            )
+        with database.begin("write") as writer:
+            writer.execute(
+                "CREATE (:Item {id: 1, label: 'one', enabled: true, score: 1.5, "
+                "note: NULL, embedding: [1.0, 0.0, 0.0]})"
+            )
+
+        copied: list[object] = []
+        original = database_module._query_value_snapshot
+
+        def counted(value: object, **kwargs: object) -> Any:
+            copied.append(value)
+            return original(value, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(database_module, "_query_value_snapshot", counted)
+        with database.begin("read") as reader:
+            page = reader.scan_rows_v1("Item", limit=1)
+
+        assert page.rows[0].values[:5] == (1, "one", True, 1.5, None)
+        assert isinstance(page.rows[0].values[5], VectorValue)
+        assert copied == []
+
+
+def test_scalar_fast_path_retains_the_configured_public_string_bound(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "db"
+    with connect(root) as database:
+        _node_schema(database)
+        with database.begin("write") as writer:
+            writer.execute(
+                "CREATE (:Item {id: 1, label: $label})",
+                {"label": "x" * 18_000},
+            )
+
+    with connect(root, max_query_value_characters=17_000) as database:
+        with database.begin("read") as reader:
+            with pytest.raises(GrafxConfigurationError) as refused:
+                reader.scan_rows_v1("Item", limit=1)
+
+    assert refused.value.details == {
+        "field": "scan.rows[0].values[1]",
+        "value": 18_000,
+        "limit": 17_000,
+    }
 
 
 def test_each_page_decodes_only_its_rows_and_continuation_does_not_restart(

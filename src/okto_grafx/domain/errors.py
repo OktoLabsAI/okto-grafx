@@ -20,6 +20,7 @@ __all__ = [
     "GrafxStorageError",
     "GrafxDurabilityBarrierFailed",
     "GrafxRecoveryRefused",
+    "GrafxSnapshotReclaimed",
     "GrafxBufferBudgetExceeded",
     "GrafxTransactionBudgetExceeded",
     "GrafxSchemaVersionMismatch",
@@ -46,7 +47,9 @@ class GrafxError(Exception):
     code: str = "grafx_error"
     retryable: bool = False
 
-    def __init__(self, message: str, *, retryable: bool | None = None, **details: object) -> None:
+    def __init__(
+        self, message: str, *, retryable: bool | None = None, **details: object
+    ) -> None:
         """Build the error, refusing a non-string message or a non-boolean retry flag.
 
         The refusal is a plain TypeError rather than a GrafxConfigurationError on purpose.
@@ -169,6 +172,18 @@ class GrafxRecoveryRefused(GrafxError):
 
     code: str = "recovery_refused"
     retryable: bool = False
+
+
+class GrafxSnapshotReclaimed(GrafxError):
+    """A persisted cursor or snapshot predates the heap history still retained on disk.
+
+    Reopening the transaction against the current publication is safe, so this is deliberately
+    retryable.  The error is distinct from corruption: an explicit vacuum moved the supported
+    snapshot floor forward exactly as requested and old logical views can no longer be served.
+    """
+
+    code: str = "snapshot_reclaimed"
+    retryable: bool = True
 
 
 class GrafxBufferBudgetExceeded(GrafxError):

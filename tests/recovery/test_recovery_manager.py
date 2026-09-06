@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 
 import pytest
 
@@ -14,6 +15,8 @@ from okto_grafx.domain.errors import (
     GrafxRecoveryRefused,
     GrafxSchemaVersionMismatch,
 )
+from okto_grafx.domain.ids import RecordRef
+from okto_grafx.domain.index import IndexChange, IndexOperation, wal_record_for
 from okto_grafx.domain.ledger.entry import LedgerOriginClass, LedgerReason
 from okto_grafx.domain.recovery.retry import is_retryable
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
@@ -31,6 +34,9 @@ from okto_grafx.domain.recovery.report import (
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.domain.wal.replay import TruncationReport
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FILE, CommitState
+from okto_grafx.domain.txn.records import encode_page_write
+from okto_grafx.engine import commit_redo as commit_redo_module
+from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.ledger_store import LEDGER_FILE, LedgerStore
 from okto_grafx.engine.recovery_manager import (
@@ -60,6 +66,51 @@ from .conftest import (
 )
 
 CATALOG_FILE = "catalog.dat"
+
+
+@dataclass(frozen=True)
+class _RecoveryIndexDefinition:
+    versioned: bool = False
+
+
+@dataclass(frozen=True)
+class _RecoveryIndexDouble:
+    file: str
+    definition: _RecoveryIndexDefinition = _RecoveryIndexDefinition()
+    max_key_bytes: int = 400
+
+
+class _RecoveryIndexManagerDouble:
+    """Expose marker/header files while recording recovery's durability order."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self._indexes = (
+            _RecoveryIndexDouble("index/zeta.idx"),
+            _RecoveryIndexDouble("index/alpha.idx"),
+        )
+
+    def table_watermark_photo(self) -> dict[str, int]:
+        return {}
+
+    def check_replay_floor(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def mark_built_through(self, _lsn: int, **_kwargs: object) -> None:
+        self.events.append("mark")
+
+    def active_indexes(self) -> tuple[_RecoveryIndexDouble, ...]:
+        return self._indexes
+
+    def index(self, name: str) -> _RecoveryIndexDouble:
+        assert name == "by_name"
+        return self._indexes[0]
+
+    active_index = index
+
+    def apply(self, _record: WalRecord) -> bool:
+        self.events.append("index")
+        return True
 
 
 def _commit(stack: Stack, page_index: int, payload: bytes, *, txn_id: int = 1) -> int:
@@ -165,6 +216,73 @@ def test_an_empty_database_recovers_clean(stack: Stack) -> None:
     assert report.outcome == OUTCOME_CLEAN and report.last_good_lsn == 0
 
 
+def test_mixed_recovery_keeps_repeated_page_effects_sequential(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The page split retains the original mixed replay's no-coalescing provenance."""
+    events: list[str] = []
+    manager = _RecoveryIndexManagerDouble(events)
+    for index in manager.active_indexes():
+        stack.storage.create(index.file)  # type: ignore[attr-defined]
+    first = make_page_image(
+        stack.codec, [b"first"], page_index=4, page_lsn=1
+    )
+    final = make_page_image(
+        stack.codec, [b"final"], page_index=4, page_lsn=3
+    )
+    logical = wal_record_for(
+        IndexChange(
+            index="by_name",
+            operation=IndexOperation.INSERT,
+            key=b"ada",
+            ref=RecordRef(4, 0),
+        ),
+        epoch=1,
+        txn_id=77,
+        descriptor=DESCRIPTOR,
+    )
+    stack.wal.append_many(
+        (
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write(HEAP_FILE, 4, first),
+                epoch=1,
+                txn_id=77,
+                descriptor=DESCRIPTOR,
+            ),
+            logical,
+            WalRecord(
+                record_type=int(WalRecordType.WRITE_PAGE),
+                payload=encode_page_write(HEAP_FILE, 4, final),
+                epoch=1,
+                txn_id=77,
+                descriptor=DESCRIPTOR,
+            ),
+            WalRecord(
+                record_type=int(WalRecordType.COMMIT),
+                epoch=1,
+                txn_id=77,
+                descriptor=DESCRIPTOR,
+            ),
+        )
+    )
+    stack.wal.barrier()
+    applied: list[int] = []
+    real_apply = commit_redo_module.apply_page_image
+
+    def observe_apply(pool: object, file: str, page: int, image: bytes) -> bool:
+        applied.append(page)
+        return real_apply(pool, file, page, image)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", observe_apply)
+
+    report = stack.recovery(index_manager=manager).run()
+
+    assert report.records_replayed == 3
+    assert applied == [4, 4]
+
+
 def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
     stack: Stack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -181,9 +299,20 @@ def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
         events.append("barrier")
         return original_barrier(manager, first_lsn, through_lsn)
 
-    def publish(store: CommitStateStore, state: CommitState) -> None:
+    def publish(
+        store: CommitStateStore,
+        state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
         events.append("publish")
-        original_publish(store, state)
+        original_publish(
+            store,
+            state,
+            previous=previous,
+            previous_was_damaged=previous_was_damaged,
+        )
 
     monkeypatch.setattr(WalManager, "force_barrier_range", barrier)
     monkeypatch.setattr(CommitStateStore, "publish", publish)
@@ -192,6 +321,88 @@ def test_writable_recovery_barriers_a_clean_foreign_tail_before_publication(
 
     assert "publish" in events
     assert events.index("barrier") < events.index("publish")
+
+
+def test_recovery_barriers_each_replayed_and_marked_file_before_publication(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _commit(stack, 3, b"durable-shape")
+    stack.storage.truncate_log(COMMIT_STATE_FILE, 0)  # type: ignore[attr-defined]
+    reopened = _reopened(stack)
+    events: list[str] = []
+    manager = _RecoveryIndexManagerDouble(events)
+    original_publish = CommitStateStore.publish
+
+    def barrier(_pool: BufferPool, file: str | None = None) -> None:
+        assert file is not None
+        events.append(f"data:{file}")
+
+    def publish(
+        store: CommitStateStore,
+        state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
+        events.append("publish")
+        original_publish(
+            store,
+            state,
+            previous=previous,
+            previous_was_damaged=previous_was_damaged,
+        )
+
+    monkeypatch.setattr(BufferPool, "durability_barrier", barrier)
+    monkeypatch.setattr(CommitStateStore, "publish", publish)
+
+    reopened.recovery(index_manager=manager).run()
+
+    assert events == [
+        "mark",
+        "data:heap.dat",
+        "data:index/alpha.idx",
+        "data:index/zeta.idx",
+        "publish",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (RuntimeError("recovery data barrier failed"), KeyboardInterrupt()),
+    ids=("runtime-error", "keyboard-interrupt"),
+)
+def test_recovery_never_publishes_when_a_data_barrier_escapes(
+    stack: Stack,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    _commit(stack, 3, b"unpublished")
+    stack.storage.truncate_log(COMMIT_STATE_FILE, 0)  # type: ignore[attr-defined]
+    reopened = _reopened(stack)
+    published = False
+
+    def fail_barrier(_pool: BufferPool, _file: str | None = None) -> None:
+        raise failure
+
+    def forbidden_publish(
+        _store: CommitStateStore,
+        _state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
+        nonlocal published
+        del previous, previous_was_damaged
+        published = True
+
+    monkeypatch.setattr(BufferPool, "durability_barrier", fail_barrier)
+    monkeypatch.setattr(CommitStateStore, "publish", forbidden_publish)
+
+    with pytest.raises(type(failure)) as escaped:
+        reopened.recovery().run()
+
+    assert escaped.value is failure
+    assert published is False
 
 
 @pytest.mark.parametrize(
@@ -214,7 +425,14 @@ def test_recovery_never_publishes_when_its_wal_barrier_escapes(
     ) -> tuple[str, ...]:
         raise failure
 
-    def forbidden_publish(_store: CommitStateStore, _state: CommitState) -> None:
+    def forbidden_publish(
+        _store: CommitStateStore,
+        _state: CommitState,
+        *,
+        previous: CommitState,
+        previous_was_damaged: bool = False,
+    ) -> None:
+        del previous, previous_was_damaged
         raise AssertionError(
             "recovery published state without a successful WAL barrier"
         )
@@ -236,9 +454,7 @@ def test_failed_recovery_poisoning_reaches_vector_indexes_and_preserves_the_prim
     vectors, index = _poisonable_vector(stack)
     primary = RuntimeError("recovery stopped after applying a prefix")
 
-    def fail_after_prefix(
-        _manager: RecoveryManager, _permit: object
-    ) -> RecoveryReport:
+    def fail_after_prefix(_manager: RecoveryManager, _permit: object) -> RecoveryReport:
         raise primary
 
     monkeypatch.setattr(RecoveryManager, "_run_fenced", fail_after_prefix)
@@ -277,12 +493,16 @@ def test_checkpoint_complete_writable_recovery_does_not_barrier_an_idle_wal(
     stack: Stack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     committed = _commit(stack, 3, b"already-checkpointed")
+    checkpoint_state = CommitState(
+        last_committed_lsn=committed,
+        last_csn=committed,
+        checkpoint_lsn=committed,
+    )
     CommitStateStore(stack.storage, owner_id="checkpoint-test").publish(
-        CommitState(
-            last_committed_lsn=committed,
-            last_csn=committed,
-            checkpoint_lsn=committed,
-        )
+        checkpoint_state,
+        previous=CommitStateStore(
+            stack.storage, owner_id="checkpoint-test-reader"
+        ).read(),
     )
     reopened = _reopened(stack)
     calls = 0
@@ -371,6 +591,9 @@ def test_recovery_refuses_to_cut_below_the_checkpoint_before_any_mutation(
     """A cut below the replay floor would let a later WAL batch reuse filtered LSNs."""
     checkpoint = _commit(stack, 3, b"checkpointed")
     device = stack.storage
+    previous = CommitStateStore(  # type: ignore[arg-type]
+        device, owner_id="checkpoint-floor-reader"
+    ).read()
     CommitStateStore(  # type: ignore[arg-type]
         device, owner_id="checkpoint-floor-test"
     ).publish(
@@ -378,7 +601,8 @@ def test_recovery_refuses_to_cut_below_the_checkpoint_before_any_mutation(
             last_committed_lsn=checkpoint,
             last_csn=checkpoint,
             checkpoint_lsn=checkpoint,
-        )
+        ),
+        previous=previous,
     )
 
     segment = _segment(stack)

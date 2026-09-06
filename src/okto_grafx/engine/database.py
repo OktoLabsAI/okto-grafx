@@ -32,7 +32,8 @@ detail is exactly the defect A47 was written about.
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
@@ -47,7 +48,23 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.entry import IndexEntry
-from okto_grafx.domain.model.value import Value, VectorValue
+from okto_grafx.domain.index.keys import (
+    MAX_BUCKET_COUNT,
+    TARGET_ENTRIES_PER_BUCKET,
+)
+from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.model.catalog import (
+    CATALOG_FORMAT_VERSION,
+    HEAP_RECLAIM_V1_CAPABILITY,
+)
+from okto_grafx.domain.model.value import (
+    INT64_MAX,
+    INT64_MIN,
+    Timestamp,
+    Uuid,
+    Value,
+    VectorValue,
+)
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.page.file_header import (
     HEADER_PAGE_INDEX,
@@ -64,6 +81,13 @@ from okto_grafx.domain.ports.events import EventSink
 from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
+from okto_grafx.domain.query.ast import Query as QueryStatement
+from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    MAX_COLUMN_DEFINITIONS,
+    MAX_MAP_ENTRIES,
+    MAX_QUERY_VALUE_CHARACTERS,
+)
 from okto_grafx.domain.query.plan import PlanNode
 from okto_grafx.domain.recovery.report import RecoveryReport
 from okto_grafx.domain.txn.context import (
@@ -82,6 +106,7 @@ from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore, _HeapScanPosition
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.public_views import (
+    BloatReport,
     BufferPoolView,
     CatalogStoreView,
     ClockView,
@@ -89,6 +114,7 @@ from okto_grafx.engine.public_views import (
     ComponentView,
     CoordinatorView,
     HeapStoreView,
+    IndexView,
     IndexRegistryView,
     LedgerView,
     MaintenanceStatus,
@@ -97,10 +123,13 @@ from okto_grafx.engine.public_views import (
     QuarantineView,
     QueryEngineView,
     StorageView,
+    TableBloatReport,
+    TableVacuumReport,
     TransactionManagerView,
     VectorEngineView,
     VectorIndexView,
     VectorMathView,
+    VacuumReport,
     WalView,
     _builtin_bool,
     _builtin_bytes,
@@ -125,6 +154,7 @@ from okto_grafx.engine.public_views import (
     _query_parameters_snapshot,
     _query_plan_view,
     _query_result_view,
+    _query_statistics_snapshot,
     _query_text_snapshot,
     _query_value_snapshot,
     _record_id_filter_snapshot,
@@ -141,7 +171,7 @@ from okto_grafx.engine.public_views import (
     _vectors_view,
     _wal_view,
 )
-from okto_grafx.engine.query_engine import QueryResult
+from okto_grafx.engine.query_engine import QueryEngine, QueryResult
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorSearchResult
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
@@ -160,12 +190,21 @@ __all__ = [
     "VERIFY_SCOPES",
     "Database",
     "DatabaseIdentity",
+    "ExecuteManyReport",
     "MetaStore",
+    "Query",
+    "QueryCursor",
     "ScanCursorV1",
     "ScanPageV1",
     "ScanRowV1",
     "Transaction",
 ]
+
+DEFAULT_QUERY_CURSOR_BATCH_ROWS: int = 256
+"""Rows pulled per iterator refill when a caller does not select a cursor batch size."""
+
+MAX_QUERY_CURSOR_BATCH_ROWS: int = 65_536
+"""Hard guard against turning one streaming pull back into an unbounded materialisation."""
 
 META_FILE: str = "grafx.meta"
 """The identity file of a database (CONTRACT.md section 6.1).
@@ -225,6 +264,54 @@ def _require_text(field: str, value: object) -> str:
     return _builtin_text(value, field=field, empty=False)
 
 
+def _index_columns_snapshot(columns: object) -> tuple[str, ...]:
+    """Detach one bounded ordered column sequence before entering engine coordination."""
+    if issubclass(type(columns), (str, bytes, bytearray, memoryview)):
+        raise GrafxConfigurationError(
+            "Index columns must be a sequence of column names, not a scalar string or buffer.",
+            field="columns",
+            value=_builtin_type_name(columns),
+        )
+    if not isinstance(columns, Sequence):
+        raise GrafxConfigurationError(
+            "Index columns must be an ordered sequence of column names.",
+            field="columns",
+            value=_builtin_type_name(columns),
+        )
+    try:
+        if issubclass(type(columns), tuple):
+            iterator = tuple.__iter__(columns)
+        elif issubclass(type(columns), list):
+            iterator = list.__iter__(columns)
+        else:
+            iterator = iter(columns)  # type: ignore[arg-type]
+        detached: list[str] = []
+        for column in iterator:
+            detached.append(_builtin_text(column, field="columns", empty=False))
+            if len(detached) > MAX_COLUMN_DEFINITIONS:
+                raise GrafxConfigurationError(
+                    f"An index may name at most {MAX_COLUMN_DEFINITIONS} columns.",
+                    field="columns",
+                    value=len(detached),
+                    maximum=MAX_COLUMN_DEFINITIONS,
+                )
+    except GrafxError:
+        raise
+    except (TypeError, ValueError, OverflowError) as failure:
+        raise GrafxConfigurationError(
+            "Index columns must be an iterable of column names.",
+            field="columns",
+            value=_builtin_type_name(columns),
+        ) from failure
+    if not detached:
+        raise GrafxConfigurationError(
+            "An exact index must name at least one column.",
+            field="columns",
+            value=0,
+        )
+    return tuple(detached)
+
+
 def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> None:
     """Attach cleanup evidence without changing the exception that caused the unwind."""
     try:
@@ -238,6 +325,17 @@ def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> Non
     except BaseException:
         # Exception note support is diagnostic only; an exotic exception implementation must
         # not replace either the primary failure or the cleanup result it was meant to report.
+        return
+
+
+def _note_batch_index(failure: GrafxError, batch_index: int) -> None:
+    """Add bounded batch context without letting hostile diagnostics replace the failure."""
+    try:
+        details = object.__getattribute__(failure, "details")
+        if type(details) is dict:
+            dict.setdefault(details, "batch_index", batch_index)
+    except BaseException:
+        # Diagnostic enrichment is optional; the original typed error remains authoritative.
         return
 
 
@@ -609,12 +707,45 @@ def _public_snapshot(value: Snapshot) -> Snapshot:
     return Snapshot(_builtin_int(_domain_field(value, Snapshot, "read_lsn")))
 
 
+def _engine_owns_prepared_plan(engine: object, plan: object) -> bool:
+    """Trust memoization only after the exact built-in engine proves root ownership."""
+    return type(engine) is QueryEngine and engine._owns_prepared_plan(plan)
+
+
 @dataclass(frozen=True, slots=True)
 class ScanRowV1:
     """One detached stored row in table-column order."""
 
     record_id: int
     values: tuple[Value, ...]
+
+
+_SCAN_EXACT_IMMUTABLE_VALUE_TYPES: frozenset[type[object]] = frozenset(
+    {type(None), bool, int, float, str, bytes, Timestamp, Uuid, VectorValue}
+)
+
+
+def _scan_exact_scalar_values_snapshot(
+    values: tuple[Value, ...], *, max_string_characters: int
+) -> tuple[Value, ...] | None:
+    """Retain one decoded tuple when every leaf is an exact immutable scalar.
+
+    Heap decoding owns this exact tuple and constructs every type admitted here from stored
+    bytes. None of them can retain a page, collaborator or mutable child: UUID owns exact bytes,
+    vectors own a tuple of exact floats, and the remaining shapes are built-in immutables. A
+    compound value or an over-limit string declines to the canonical deep copier, which preserves
+    its public detachment and refusal details. This is deliberately not a general public-value
+    shortcut; it is scoped to the output of ``HeapStore.scan_page``.
+    """
+    for value in values:
+        value_type = type(value)
+        if value_type not in _SCAN_EXACT_IMMUTABLE_VALUE_TYPES:
+            return None
+        if value_type is int and not INT64_MIN <= value <= INT64_MAX:
+            return None
+        if value_type is str and len(value) > max_string_characters:
+            return None
+    return values
 
 
 class ScanCursorV1:
@@ -678,6 +809,31 @@ class ScanPageV1:
     next_cursor: ScanCursorV1 | None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecuteManyReport:
+    """Bounded summary of an atomic :meth:`Transaction.executemany` call.
+
+    The report deliberately carries no statement results, plans or input parameter payloads.
+    Its statistics are the per-statement counters added in input order.
+    """
+
+    statements: int
+    statistics: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        """Own the small public summary and reject forged negative counters."""
+        statements = _builtin_int(self.statements, field="executemany.statements")
+        if statements < 0:
+            raise GrafxConfigurationError(
+                "An executemany statement count cannot be negative.",
+                field="executemany.statements",
+                value=statements,
+            )
+        statistics = _query_statistics_snapshot(self.statistics)
+        object.__setattr__(self, "statements", statements)
+        object.__setattr__(self, "statistics", statistics)
+
+
 def _scan_cursor_payload(
     value: object,
     *,
@@ -737,6 +893,205 @@ def _scan_cursor_payload(
     return observed_table_id, observed_schema_version, observed_position, value
 
 
+def _query_cursor_batch_size(value: object) -> int:
+    """Return one bounded exact cursor batch size."""
+    size = _require_positive_integer("batch_size", value)
+    if size > MAX_QUERY_CURSOR_BATCH_ROWS:
+        raise GrafxConfigurationError(
+            f"A query cursor batch may contain at most {MAX_QUERY_CURSOR_BATCH_ROWS} rows; "
+            f"got {size}.",
+            field="batch_size",
+            value=size,
+            maximum=MAX_QUERY_CURSOR_BATCH_ROWS,
+        )
+    return size
+
+
+class Query:
+    """A canonical read statement that can open independent snapshot-owning cursors."""
+
+    __slots__ = ("_database", "_parameters", "_text")
+
+    def __init__(
+        self,
+        database: Database,
+        text: str,
+        parameters: Mapping[str, object] | None,
+    ) -> None:
+        self._database = database
+        self._text = text
+        self._parameters = parameters
+
+    def cursor(
+        self, *, batch_size: int = DEFAULT_QUERY_CURSOR_BATCH_ROWS
+    ) -> QueryCursor:
+        """Open a cursor whose read transaction lives until exhaustion or explicit close."""
+        return self._database._open_query_cursor(
+            self._text,
+            self._parameters,
+            batch_size=_query_cursor_batch_size(batch_size),
+        )
+
+
+class QueryCursor:
+    """A bounded pull cursor over one fixed MVCC read snapshot.
+
+    Iteration refills at most ``batch_size`` detached rows at a time.  The cursor owns its read
+    transaction and releases the reader pin on exhaustion, :meth:`close`, or context-manager
+    exit.  It is intentionally not a write door and is not safe for concurrent consumption.
+    """
+
+    __slots__ = (
+        "_batch_size",
+        "_buffer",
+        "_buffer_position",
+        "_closed",
+        "_database",
+        "_raw",
+        "_source_done",
+        "_transaction",
+        "columns",
+        "plan",
+    )
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        transaction: Transaction,
+        raw: object,
+        columns: tuple[str, ...],
+        plan: PlanNode,
+        batch_size: int,
+    ) -> None:
+        self._database = database
+        self._transaction = transaction
+        self._raw = raw
+        self._batch_size = batch_size
+        self._buffer: tuple[tuple[Value, ...], ...] = ()
+        self._buffer_position = 0
+        self._source_done = False
+        self._closed = False
+        self.columns = columns
+        self.plan = plan
+
+    @property
+    def closed(self) -> bool:
+        """Return whether this cursor has released its snapshot and buffered rows."""
+        return self._closed
+
+    @property
+    def statistics(self) -> Mapping[str, int]:
+        """Return an immutable-shape snapshot of counters observed so far."""
+        observed = getattr(self._raw, "statistics", None)
+        if not isinstance(observed, dict):
+            raise GrafxConfigurationError(
+                "The query cursor collaborator returned malformed statistics.",
+                field="cursor.statistics",
+                value=_builtin_type_name(observed),
+            )
+        # QueryResult performs the same exact integer/name validation as execute().  Return its
+        # copied dictionary rather than exposing the engine's live counter map.
+        return QueryResult(statistics=dict(observed)).statistics
+
+    def fetchone(self) -> tuple[Value, ...] | None:
+        """Return the next detached row, or ``None`` after exhaustion."""
+        batch = self.fetchmany(1)
+        return None if not batch else batch[0]
+
+    def fetchmany(self, size: int | None = None) -> tuple[tuple[Value, ...], ...]:
+        """Return at most ``size`` detached rows without materialising the remaining result."""
+        wanted = self._batch_size if size is None else _query_cursor_batch_size(size)
+        if self._closed:
+            return ()
+        self._require_database_open()
+        selected: list[tuple[Value, ...]] = []
+        while self._buffer_position < len(self._buffer) and len(selected) < wanted:
+            selected.append(self._buffer[self._buffer_position])
+            self._buffer_position += 1
+        if self._buffer_position == len(self._buffer):
+            self._buffer = ()
+            self._buffer_position = 0
+        if len(selected) < wanted and not self._source_done:
+            rows, exhausted = self._database._fetch_query_cursor(
+                self,
+                wanted - len(selected),
+            )
+            selected.extend(rows)
+            self._source_done = exhausted
+        if self._source_done and not self._buffer:
+            self._closed = True
+        return tuple(selected)
+
+    def close(self) -> None:
+        """Discard unread rows and release the owned read snapshot idempotently."""
+        if self._closed:
+            return
+        self._buffer = ()
+        self._buffer_position = 0
+        try:
+            self._database._close_query_cursor(self)
+        finally:
+            self._source_done = True
+            self._closed = True
+
+    def __iter__(self) -> QueryCursor:
+        return self
+
+    def __next__(self) -> tuple[Value, ...]:
+        if self._closed:
+            raise StopIteration
+        self._require_database_open()
+        if self._buffer_position >= len(self._buffer):
+            rows, exhausted = self._database._fetch_query_cursor(
+                self,
+                self._batch_size,
+            )
+            self._buffer = rows
+            self._buffer_position = 0
+            self._source_done = exhausted
+            if not rows:
+                self._closed = True
+                raise StopIteration
+        row = self._buffer[self._buffer_position]
+        self._buffer_position += 1
+        if self._buffer_position == len(self._buffer):
+            self._buffer = ()
+            self._buffer_position = 0
+            if self._source_done:
+                self._closed = True
+        return row
+
+    def __enter__(self) -> QueryCursor:
+        return self
+
+    def _require_database_open(self) -> None:
+        """Make a database close terminal even when this cursor buffered detached rows."""
+        try:
+            self._database._require_open()
+        except BaseException as failure:
+            try:
+                self._database._close_query_cursor(self)
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        if exc_type is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except BaseException as cleanup_failure:
+            if exc is not None:
+                _note_cleanup_failure(exc, cleanup_failure)
+
+
 class Transaction:
     """One open transaction, as CONTRACT.md section 10 hands it to a caller.
 
@@ -756,6 +1111,7 @@ class Transaction:
         "_report",
         "_finished",
         "_scan_owner",
+        "_batch_active",
         "__weakref__",
     )
 
@@ -766,6 +1122,7 @@ class Transaction:
         self._report: CommitReport | None = None
         self._finished: bool = False
         self._scan_owner: object = object()
+        self._batch_active: bool = False
 
     @property
     def mode(self) -> str:
@@ -804,7 +1161,27 @@ class Transaction:
         pretending to run anything.
         """
         self._require_active()
+        self._require_batch_idle("execute")
         return self._database._run_statement(self._context, text, parameters)
+
+    def executemany(
+        self,
+        text: str,
+        parameter_sets: Iterable[Mapping[str, object]],
+    ) -> ExecuteManyReport:
+        """Stage one updating statement for every parameter mapping, atomically as a batch.
+
+        The input is consumed lazily and in order. If any item refuses, every change made by
+        this call is discarded while work staged before the call remains available to commit.
+        The caller still owns the transaction and chooses when to commit it.
+        """
+        self._require_active()
+        self._require_batch_idle("executemany")
+        self._batch_active = True
+        try:
+            return self._database._run_many(self._context, text, parameter_sets)
+        finally:
+            self._batch_active = False
 
     def scan_rows_v1(
         self,
@@ -821,6 +1198,7 @@ class Transaction:
         """
 
         self._require_active()
+        self._require_batch_idle("scan_rows_v1")
         if self._context.mode is not TransactionMode.READ:
             raise GrafxTransactionStateError(
                 "scan_rows_v1 requires a read transaction.",
@@ -856,6 +1234,7 @@ class Transaction:
         """
         with self._database._public_transition():
             self._require_active()
+            self._require_batch_idle("commit")
             try:
                 report = self._database._transactions.commit(self._context)
             except BaseException as failure:
@@ -921,6 +1300,7 @@ class Transaction:
     def rollback(self) -> None:
         """Abandon this transaction. Rolling back twice is a no-op, never an error."""
         with self._database._public_transition():
+            self._require_batch_idle("rollback")
             if self._finished:
                 return
             try:
@@ -973,6 +1353,17 @@ class Transaction:
                 state=self._context.state.value,
             )
 
+    def _require_batch_idle(self, operation: str) -> None:
+        """Keep callbacks from publishing or mutating a partially consumed batch."""
+        if self._batch_active:
+            raise GrafxTransactionStateError(
+                f"Transaction {self._context.txn_id} is consuming an executemany batch and "
+                f"cannot {operation} re-entrantly.",
+                txn_id=self._context.txn_id,
+                operation=operation,
+                active_operation="executemany",
+            )
+
     def __repr__(self) -> str:
         """Return a representation naming the transaction, its mode and its snapshot."""
         return (
@@ -1006,6 +1397,25 @@ class Maintenance:
             oldest_reader_age=None,
         )
 
+    def bloat(self, table: str | None = None) -> BloatReport:
+        """Return a conservative read-only heap-bloat census."""
+        return self._database._bloat(table)
+
+    def vacuum(
+        self,
+        table: str | None = None,
+        *,
+        confirm_quiescent: bool = False,
+        max_versions: int | None = None,
+    ) -> VacuumReport:
+        """Run explicit foreground MVCC reclamation under the v1 quiescence contract."""
+
+        return self._database._vacuum(
+            table,
+            confirm_quiescent=confirm_quiescent,
+            max_versions=max_versions,
+        )
+
     def checkpoint(self) -> RecycleReport:
         """Delegate checkpointing to :meth:`Database.checkpoint`."""
         return self._database.checkpoint()
@@ -1021,6 +1431,58 @@ class Maintenance:
     def rebuild_vector_index(self, space: str) -> VectorIndexView:
         """Delegate the repair to :meth:`Database.rebuild_vector_index`."""
         return self._database.rebuild_vector_index(space)
+
+    def ensure_identity_indexes(self) -> None:
+        """Delegate explicit persistent identity-index activation to the database."""
+        self._database.ensure_identity_indexes()
+
+    def enable_wal_page_compression(self) -> None:
+        """Delegate explicit one-way WAL page-image compression activation."""
+        self._database.enable_wal_page_compression()
+
+    def create_index(
+        self,
+        name: str,
+        table: str,
+        columns: Sequence[str],
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Delegate custom exact-index creation to the database."""
+        return self._database.create_index(
+            name,
+            table,
+            columns,
+            bucket_count=bucket_count,
+            expected_cardinality=expected_cardinality,
+        )
+
+    def rehash_index(
+        self,
+        name: str,
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Delegate growth-only exact-index rehash to the database."""
+        return self._database.rehash_index(
+            name,
+            bucket_count=bucket_count,
+            expected_cardinality=expected_cardinality,
+        )
+
+    def rehash_index_if_needed(
+        self,
+        name: str,
+        *,
+        overflow_pages_per_bucket: int = 1,
+    ) -> IndexView | None:
+        """Grow one physically pressured exact index by at most one directory step."""
+        return self._database.rehash_index_if_needed(
+            name,
+            overflow_pages_per_bucket=overflow_pages_per_bucket,
+        )
 
     def publish_metrics(self) -> None:
         """Delegate explicit metric publication to :meth:`Database.publish_metrics`."""
@@ -1051,6 +1513,7 @@ class Database:
         "_pool",
         "_catalog",
         "_catalog_view_memo",
+        "_plan_view_memo",
         "_heap",
         "_wal",
         "_transactions",
@@ -1069,6 +1532,7 @@ class Database:
         "_descriptor_revalidation",
         "_checkpoint_interval_records",
         "_wal_max_bytes",
+        "_max_query_value_characters",
         "_wal_bytes_latched",
         "_checkpointing",
         "_checkpoint_retry_pending",
@@ -1111,6 +1575,7 @@ class Database:
         label: str,
         checkpoint_interval_records: int = 512,
         wal_max_bytes: int | None = None,
+        max_query_value_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
         read_only: bool = False,
         descriptor_revalidation: str = "strict",
         metrics_endpoint: str | None = None,
@@ -1147,6 +1612,12 @@ class Database:
             tuple[bytes, int, dict[int, object], dict[int, object], CatalogStoreView]
             | None
         ) = None
+        # This cache lives behind the injected facade transition rather than owning a lock.
+        # Strong source identity prevents id reuse; bounded entries contain only immutable plan
+        # values and their already validated, capability-free templates.
+        self._plan_view_memo: OrderedDict[
+            int, tuple[PlanNode, PlanNode]
+        ] = OrderedDict()
         self._heap: HeapStore = heap
         self._wal: WalManager = wal
         self._transactions: TransactionManager = transactions
@@ -1188,6 +1659,18 @@ class Database:
                     field="wal_max_bytes",
                     value=self._wal_max_bytes,
                 )
+        self._max_query_value_characters = _builtin_int(
+            max_query_value_characters, field="max_query_value_characters"
+        )
+        if not 1 <= self._max_query_value_characters <= MAX_QUERY_VALUE_CHARACTERS:
+            raise GrafxConfigurationError(
+                "The query value string ceiling must be between 1 and "
+                f"{MAX_QUERY_VALUE_CHARACTERS} characters.",
+                field="max_query_value_characters",
+                value=self._max_query_value_characters,
+                minimum=1,
+                maximum=MAX_QUERY_VALUE_CHARACTERS,
+            )
         self._checkpointing: bool = False
         self._wal_bytes_latched: bool = False
         self._checkpoint_retry_pending: bool = False
@@ -1484,7 +1967,11 @@ class Database:
                         != epoch
                     ):
                         continue
-                    return _indexes_view(indexes, tables)
+                    return _indexes_view(
+                        indexes,
+                        tables,
+                        catalog=self._catalog._catalog,
+                    )
 
     @property
     def ledger(self) -> LedgerView:
@@ -1612,6 +2099,7 @@ class Database:
             # again in its own participant section.
             self._require_open()
             transaction._require_active()
+            transaction._require_batch_idle("retry")
             context = transaction._context
             # TransactionManager.retry revalidates the CURRENT owned ACTIVE context, aborts it
             # and registers its successor in one participant section. Keeping a second outer
@@ -1653,10 +2141,17 @@ class Database:
 
     @contextmanager
     def transaction(self, mode: str = "write") -> Iterator[Transaction]:
-        """Open a transaction as a block, committing on a clean exit and rolling back otherwise."""
-        txn = self.begin(mode)
-        with txn:
-            yield txn
+        """Open a transaction as a block, committing on a clean exit and rolling back otherwise.
+
+        The lexical boundary also retains this participant section's unlocked descriptor. Its
+        physical identity is revalidated before every later lock acquisition, so a bounded
+        one-statement transaction avoids repeated open/close calls without retaining the lock or
+        weakening another process's admission.
+        """
+        with self._transactions._participant_descriptor_scope(revalidate_identity=True):
+            txn = self.begin(mode)
+            with txn:
+                yield txn
 
     def execute(
         self, text: str, parameters: Mapping[str, object] | None = None
@@ -1668,17 +2163,211 @@ class Database:
         that has been released.
         """
         self._require_open()
-        txn = self.begin("read")
+        with self._public_transition():
+            # Close may win after the preliminary guard but before the transition becomes
+            # visible. Refuse before retaining the unlocked participant descriptor.
+            self._require_open()
+            with self._transactions._participant_descriptor_scope():
+                txn = self.begin("read")
+                try:
+                    result = txn.execute(text, parameters)
+                    txn.commit()
+                except BaseException as failure:
+                    if txn.active:
+                        try:
+                            txn.rollback()
+                        except BaseException as cleanup_failure:
+                            _note_cleanup_failure(failure, cleanup_failure)
+                            if txn.active:
+                                # No caller can recover this local wrapper. Seal the facade so
+                                # leaving the outer transition drains its reader pin and every
+                                # descriptor before lower dependencies are released.
+                                self._closed = True
+                                self._transactions.request_close()
+                    raise
+                return result
+
+    def query(self, text: str, parameters: Mapping[str, object] | None = None) -> Query:
+        """Return a reusable canonical read query whose cursors own their snapshots.
+
+        ``execute`` remains the materialised convenience and the only autocommit door for
+        statements that write.  This builder copies text and parameter values immediately, so
+        mutating the caller's containers after this call cannot change a later cursor.
+        """
+        with self._public_operation("query prepare"):
+            self._require_open()
+            statement = _query_text_snapshot(text)
+            detached_parameters = _query_parameters_snapshot(
+                parameters,
+                max_string_characters=self._max_query_value_characters,
+            )
+            return Query(self, statement, detached_parameters)
+
+    def _open_query_cursor(
+        self,
+        text: str,
+        parameters: Mapping[str, object] | None,
+        *,
+        batch_size: int,
+    ) -> QueryCursor:
+        """Open the internal stream and its owning read transaction as one public outcome."""
+        self._require_open()
+        transaction = self.begin("read")
+        raw: object | None = None
         try:
-            result = txn.execute(text, parameters)
+            with self._public_operation("query cursor open"):
+                self._require_open()
+                engine = self._require_component(
+                    "queries", self._queries, "the query engine (C10)"
+                )
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    if not transaction._context.active:
+                        raise GrafxTransactionStateError(
+                            f"Transaction {transaction.txn_id} cannot open a query cursor.",
+                            txn_id=transaction.txn_id,
+                            state=transaction._context.state.value,
+                            operation="query_cursor",
+                        )
+                    self._public_contexts.setdefault(
+                        transaction.txn_id, transaction._context
+                    )
+                    opener = getattr(engine, "open_cursor", None)
+                    if not callable(opener):
+                        raise GrafxUnsupportedOperation(
+                            "The query engine of this composition has no streaming cursor door.",
+                            field="component",
+                            value="query_cursor",
+                        )
+                    raw = opener(text, transaction._context, parameters)
+                # Rebuild metadata after page access, just like the materialised result door.
+                columns = getattr(raw, "columns", None)
+                plan = getattr(raw, "plan", None)
+                fetch = getattr(raw, "fetch", None)
+                close = getattr(raw, "close", None)
+                if not callable(fetch) or not callable(close):
+                    raise GrafxConfigurationError(
+                        "The query engine returned a malformed cursor collaborator.",
+                        field="cursor",
+                        value=_builtin_type_name(raw),
+                    )
+                metadata = _query_result_view(
+                    QueryResult(columns=columns, plan=plan),  # type: ignore[arg-type]
+                    max_string_characters=self._max_query_value_characters,
+                    internally_owned_plan=_engine_owns_prepared_plan(engine, plan),
+                    plan_memo=self._plan_view_memo,
+                )
+                if metadata.plan is None:
+                    raise GrafxConfigurationError(
+                        "A query cursor must expose the plan that produces it.",
+                        field="cursor.plan",
+                        value=None,
+                    )
+                return QueryCursor(
+                    database=self,
+                    transaction=transaction,
+                    raw=raw,
+                    columns=metadata.columns,
+                    plan=metadata.plan,
+                    batch_size=batch_size,
+                )
         except BaseException as failure:
+            if raw is not None:
+                try:
+                    closer = getattr(raw, "close", None)
+                    if callable(closer):
+                        closer()
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(failure, cleanup_failure)
             try:
-                txn.rollback()
+                if transaction.active:
+                    transaction.rollback()
             except BaseException as cleanup_failure:
                 _note_cleanup_failure(failure, cleanup_failure)
             raise
-        txn.commit()
-        return result
+
+    def _fetch_query_cursor(
+        self, cursor: QueryCursor, limit: int
+    ) -> tuple[tuple[tuple[Value, ...], ...], bool]:
+        """Pull and detach one bounded cursor batch, settling its snapshot at EOF."""
+        if type(cursor) is not QueryCursor or cursor._database is not self:
+            raise GrafxConfigurationError(
+                "A query cursor can only be consumed by the database that opened it.",
+                field="cursor",
+                value=_builtin_type_name(cursor),
+            )
+        try:
+            with self._public_operation("query cursor fetch"):
+                self._require_open()
+                transaction = cursor._transaction
+                transaction._require_active()
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    transaction._require_active()
+                    observed = cursor._raw.fetch(limit)
+                if type(observed) is not tuple or len(observed) != 2:
+                    raise GrafxConfigurationError(
+                        "The query cursor collaborator returned a malformed batch.",
+                        field="cursor.batch",
+                        value=_builtin_type_name(observed),
+                    )
+                raw_rows, raw_exhausted = observed
+                if type(raw_exhausted) is not bool:
+                    raise GrafxConfigurationError(
+                        "The query cursor collaborator returned a malformed EOF marker.",
+                        field="cursor.exhausted",
+                        value=_builtin_type_name(raw_exhausted),
+                    )
+                detached = _query_result_view(
+                    QueryResult(columns=cursor.columns, rows=raw_rows),  # type: ignore[arg-type]
+                    max_string_characters=self._max_query_value_characters,
+                )
+            if raw_exhausted:
+                self._settle_query_cursor(cursor)
+            return detached.rows, raw_exhausted
+        except BaseException as failure:
+            try:
+                self._close_query_cursor(cursor)
+            except BaseException as cleanup_failure:
+                _note_cleanup_failure(failure, cleanup_failure)
+            raise
+
+    def _settle_query_cursor(self, cursor: QueryCursor) -> None:
+        """Release an exhausted cursor's reader pin without re-closing its engine stream."""
+        transaction = cursor._transaction
+        if transaction.active:
+            transaction.rollback()
+
+    def _close_query_cursor(self, cursor: QueryCursor) -> None:
+        """Close a cursor stream and its read transaction, attempting both cleanup halves."""
+        failure: BaseException | None = None
+        try:
+            raw_close = getattr(cursor._raw, "close", None)
+            if callable(raw_close):
+                try:
+                    if not self._closed and cursor._transaction.active:
+                        with self._public_operation("query cursor close"):
+                            with self._transactions.page_access_section():
+                                raw_close()
+                    else:
+                        raw_close()
+                except BaseException as caught:
+                    failure = caught
+            try:
+                if cursor._transaction.active:
+                    cursor._transaction.rollback()
+            except BaseException as caught:
+                if failure is None:
+                    failure = caught
+                else:
+                    _note_cleanup_failure(failure, caught)
+        finally:
+            cursor._buffer = ()
+            cursor._buffer_position = 0
+            cursor._source_done = True
+            cursor._closed = True
+        if failure is not None:
+            raise failure
 
     def explain(self, text: str) -> PlanNode:
         """Plan one statement without exposing the mutable query engine."""
@@ -1693,7 +2382,11 @@ class Database:
                 # turn validation before canonicalisation into a stale permission to plan.
                 self._require_open()
                 raw_plan = engine.explain(statement)  # type: ignore[attr-defined]
-            return _query_plan_view(raw_plan)
+            return _query_plan_view(
+                raw_plan,
+                internally_owned=_engine_owns_prepared_plan(engine, raw_plan),
+                memo=self._plan_view_memo,
+            )
 
     def _run_statement(
         self,
@@ -1708,8 +2401,11 @@ class Database:
                 "queries", self._queries, "the query engine (C10)"
             )
             statement = _query_text_snapshot(text)
-            detached_parameters = _query_parameters_snapshot(parameters)
-            with self._transactions.page_access_section():
+            detached_parameters = _query_parameters_snapshot(
+                parameters,
+                max_string_characters=self._max_query_value_characters,
+            )
+            with self._transactions.page_access_section(transaction=context):
                 self._require_open()
                 if not context.active:
                     raise GrafxTransactionStateError(
@@ -1728,7 +2424,186 @@ class Database:
             # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
             # after leaving page access, while _public_operation still translates ordinary host
             # failures and deliberately lets process-control signals pass unchanged.
-            return _query_result_view(raw_result)
+            return _query_result_view(
+                raw_result,
+                max_string_characters=self._max_query_value_characters,
+                internally_owned_plan=(
+                    type(raw_result) is QueryResult
+                    and _engine_owns_prepared_plan(
+                        engine,
+                        _domain_field(raw_result, QueryResult, "plan"),
+                    )
+                ),
+                plan_memo=self._plan_view_memo,
+            )
+
+    def _run_many(
+        self,
+        context: TransactionContext,
+        text: str,
+        parameter_sets: Iterable[Mapping[str, object]],
+    ) -> ExecuteManyReport:
+        """Run one parsed updating statement over a streaming, atomic parameter batch."""
+        with self._executemany_operation():
+            self._require_open()
+            engine = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            statement_text = _query_text_snapshot(text)
+            with self._transactions.page_access_section():
+                self._require_open()
+                if not context.active:
+                    raise GrafxTransactionStateError(
+                        f"Transaction {context.txn_id} is {context.state.value} and cannot "
+                        "execute a batch.",
+                        txn_id=context.txn_id,
+                        state=context.state.value,
+                        operation="executemany",
+                    )
+                if context.mode is not TransactionMode.WRITE:
+                    raise GrafxTransactionStateError(
+                        "executemany requires a write transaction.",
+                        txn_id=context.txn_id,
+                        mode=context.mode.value,
+                        operation="executemany",
+                    )
+                self._public_contexts.setdefault(context.txn_id, context)
+                statement = engine.parse(statement_text)  # type: ignore[attr-defined]
+                if (
+                    not isinstance(statement, QueryStatement)
+                    or not statement.writes
+                    or statement.return_clause is not None
+                ):
+                    raise GrafxUnsupportedOperation(
+                        "executemany accepts one updating query without RETURN; use execute "
+                        "for reads, schema changes, UNION or result-producing writes.",
+                        field="statement",
+                        operation="executemany",
+                        value=type(statement).__name__,
+                    )
+                mark = context.staging_mark()
+
+            try:
+                if isinstance(parameter_sets, Mapping):
+                    raise GrafxConfigurationError(
+                        "executemany parameter_sets must be an iterable of mappings, not one "
+                        "mapping.",
+                        field="parameter_sets",
+                        value=_builtin_type_name(parameter_sets),
+                    )
+                try:
+                    iterator = iter(parameter_sets)
+                except GrafxError:
+                    raise
+                except Exception as failure:  # noqa: BLE001 - canonicalized public argument
+                    observed = _builtin_type_name(parameter_sets)
+                    raise GrafxConfigurationError(
+                        f"executemany parameter_sets must be iterable; got {observed}.",
+                        field="parameter_sets",
+                        value=observed,
+                        cause=_builtin_type_name(failure),
+                    ) from failure
+
+                completed = 0
+                aggregate: dict[str, int] = {}
+                while True:
+                    try:
+                        raw_parameters = next(iterator)
+                    except StopIteration:
+                        break
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+                    if not isinstance(raw_parameters, Mapping):
+                        raise GrafxConfigurationError(
+                            "Every executemany parameter set must be a mapping.",
+                            field="parameter_sets",
+                            value=_builtin_type_name(raw_parameters),
+                            batch_index=completed,
+                        )
+                    try:
+                        detached_parameters = _query_parameters_snapshot(
+                            raw_parameters,
+                            max_string_characters=self._max_query_value_characters,
+                        )
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+
+                    try:
+                        with self._transactions.page_access_section():
+                            self._require_open()
+                            if not context.active:
+                                raise GrafxTransactionStateError(
+                                    f"Transaction {context.txn_id} is "
+                                    f"{context.state.value} and cannot execute a batch.",
+                                    txn_id=context.txn_id,
+                                    state=context.state.value,
+                                    operation="executemany",
+                                    batch_index=completed,
+                                )
+                            raw_result = engine._execute_parsed(  # type: ignore[attr-defined]
+                                statement,
+                                context,
+                                detached_parameters,
+                                cache_text=statement_text,
+                            )
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+
+                    try:
+                        statistics = _query_statistics_snapshot(raw_result.statistics)
+                    except GrafxError as failure:
+                        _note_batch_index(failure, completed)
+                        raise
+                    for name, count in statistics.items():
+                        if name not in aggregate and len(aggregate) >= MAX_MAP_ENTRIES:
+                            raise GrafxConfigurationError(
+                                "An executemany report may carry at most "
+                                f"{MAX_MAP_ENTRIES} statistic names.",
+                                field="executemany.statistics",
+                                limit=MAX_MAP_ENTRIES,
+                                batch_index=completed,
+                            )
+                        aggregate[name] = aggregate.get(name, 0) + count
+                    completed += 1
+                    # Do not carry the previous item's plan, result or detached payload while
+                    # planning the next one. The iterator may retain its own values; this facade
+                    # retains only the fixed statement and the bounded aggregate.
+                    del raw_result, raw_parameters, detached_parameters, statistics
+
+                report = ExecuteManyReport(
+                    statements=completed,
+                    statistics=aggregate,
+                )
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    if not context.active:
+                        raise GrafxTransactionStateError(
+                            f"Transaction {context.txn_id} is {context.state.value} and cannot "
+                            "finish a batch.",
+                            txn_id=context.txn_id,
+                            state=context.state.value,
+                            operation="executemany",
+                        )
+                    context.settle_staging_mark(mark)
+            except BaseException as failure:
+                try:
+                    context.discard_since(mark)
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(failure, cleanup_failure)
+                raise
+            return report
+
+    @contextmanager
+    def _executemany_operation(self) -> Iterator[None]:
+        """Enter the public batch transition, then bound unlocked descriptor reuse inside it."""
+        with self._public_operation("executemany"):
+            # Every page_access_section in _run_many still takes and drops the operating-system
+            # lock. Only its permanent lock-file descriptor survives between batch items.
+            with self._transactions._participant_descriptor_scope():
+                yield
 
     def _scan_rows_v1(
         self,
@@ -1805,21 +2680,29 @@ class Database:
             active: set[int] = set()
             rows: list[ScanRowV1] = []
             for row_position, (_ref, version) in enumerate(raw_rows):
+                raw_values = version.values
+                detached_values = _scan_exact_scalar_values_snapshot(
+                    raw_values,
+                    max_string_characters=self._max_query_value_characters,
+                )
+                if detached_values is None:
+                    detached_values = tuple(
+                        _query_value_snapshot(
+                            value,
+                            field=f"scan.rows[{row_position}].values[{value_position}]",
+                            depth=0,
+                            active=active,
+                            max_string_characters=self._max_query_value_characters,
+                        )
+                        for value_position, value in enumerate(raw_values)
+                    )
                 rows.append(
                     ScanRowV1(
                         record_id=_builtin_int(
                             version.record_id,
                             field=f"scan.rows[{row_position}].record_id",
                         ),
-                        values=tuple(
-                            _query_value_snapshot(
-                                value,
-                                field=f"scan.rows[{row_position}].values[{value_position}]",
-                                depth=0,
-                                active=active,
-                            )
-                            for value_position, value in enumerate(version.values)
-                        ),
+                        values=detached_values,
                     )
                 )
             next_cursor = (
@@ -1939,6 +2822,213 @@ class Database:
 
     # --- operator surface ---------------------------------------------------------------------
 
+    def create_index(
+        self,
+        name: str,
+        table: str,
+        columns: Sequence[str],
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Create and atomically publish one custom exact index.
+
+        The operation owns a fresh, dedicated write transaction. ``bucket_count`` selects the
+        physical directory directly; ``expected_cardinality`` lets Grafx derive it. Supplying
+        both is refused by the same planner used by textual ``CREATE INDEX``.
+        """
+        with self._public_operation("create_index"):
+            self._require_open()
+            self._require_writable("create an exact index")
+            self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            engine = self._require_component(
+                "queries", self._queries, "the query engine (C10)"
+            )
+            creator = getattr(engine, "create_index", None)
+            if not callable(creator):
+                raise GrafxUnsupportedOperation(
+                    "The query engine of this composition has no custom exact-index door.",
+                    field="component",
+                    value="create_index",
+                )
+
+            wanted_name = _require_text("name", name)
+            wanted_table = _require_text("table", table)
+            wanted_columns = _index_columns_snapshot(columns)
+            wanted_bucket_count = (
+                None
+                if bucket_count is None
+                else _require_positive_integer("bucket_count", bucket_count)
+            )
+            wanted_expected_cardinality = (
+                None
+                if expected_cardinality is None
+                else _require_positive_integer(
+                    "expected_cardinality", expected_cardinality
+                )
+            )
+
+            transaction = self.begin("write")
+            try:
+                with self._transactions.page_access_section():
+                    self._require_open()
+                    transaction._require_active()
+                    self._public_contexts.setdefault(
+                        transaction.txn_id, transaction._context
+                    )
+                    creator(
+                        name=wanted_name,
+                        table=wanted_table,
+                        columns=wanted_columns,
+                        bucket_count=wanted_bucket_count,
+                        expected_cardinality=wanted_expected_cardinality,
+                        txn=transaction._context,
+                    )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return self._committed_index_receipt(wanted_name)
+
+    def rehash_index(
+        self,
+        name: str,
+        *,
+        bucket_count: int | None = None,
+        expected_cardinality: int | None = None,
+    ) -> IndexView:
+        """Grow one exact index through an immutable foreground shadow generation.
+
+        Exactly one sizing hint is required.  The resolved directory must be larger than the
+        current ACTIVE generation; equal-size re-creation and shrinking are deliberately not
+        supported.  The old file remains catalogued as STALE after the new, fully built file and
+        its catalog publication are durable.
+        """
+
+        with self._public_operation("rehash_index"):
+            self._require_open()
+            self._require_writable("rehash an exact index")
+            self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            wanted_name = _require_text("name", name)
+            wanted_bucket_count = (
+                None
+                if bucket_count is None
+                else _require_positive_integer("bucket_count", bucket_count)
+            )
+            wanted_expected_cardinality = (
+                None
+                if expected_cardinality is None
+                else _require_positive_integer(
+                    "expected_cardinality", expected_cardinality
+                )
+            )
+
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_index_rehash(
+                    transaction._context,
+                    name=wanted_name,
+                    bucket_count=wanted_bucket_count,
+                    expected_cardinality=wanted_expected_cardinality,
+                )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return self._committed_index_receipt(wanted_name)
+
+    def rehash_index_if_needed(
+        self,
+        name: str,
+        *,
+        overflow_pages_per_bucket: int = 1,
+    ) -> IndexView | None:
+        """Grow one exact index after a bounded directory-pressure assessment.
+
+        The probe validates the physical identity and only the eager head page of each bucket;
+        it never follows overflow chains or decodes entries.  Its cost is therefore
+        O(bucket_count), capped by the format at 4,096 pages, rather than O(index entries).  One
+        growth step is suggested when average occupied head slots reach the canonical sizing
+        target, or when retained overflow reaches the configured integer ratio to bucket heads.
+        Tombstones and pages retained after an interrupted append can make either signal
+        conservative and cause an early rebuild.  Neither signal certifies index health or
+        authorizes reads: the existing foreground rehash rebuilds and verifies a complete
+        immutable shadow.
+
+        This is an explicit maintenance operation, never a commit hook or background loop.  One
+        call grows by at most one power-of-two step and returns ``None`` below the threshold or at
+        the eager-directory ceiling.  A concurrent participant may supersede the observed ACTIVE
+        generation before preparation; ordinary rehash OCC/generation/growth checks may then
+        refuse the attempt.  The caller should reassess current state rather than retry blindly;
+        no particular refusal is promised to be retryable.
+        """
+
+        with self._public_operation("rehash_index_if_needed"):
+            self._require_open()
+            self._require_writable("rehash an exact index when physically pressured")
+            indexes = self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            wanted_name = _require_text("name", name)
+            wanted_ratio = _require_positive_integer(
+                "overflow_pages_per_bucket", overflow_pages_per_bucket
+            )
+
+            with self._transactions.page_access_section(fresh_read_view=True):
+                self._require_open()
+                active_index = getattr(indexes, "active_index", None)
+                selected = (
+                    active_index(wanted_name, catalog=self._catalog._catalog)
+                    if callable(active_index)
+                    else indexes.index(wanted_name)
+                )
+                definition = selected.definition
+                if definition.visibility is not IndexVisibility.EXACT:
+                    raise GrafxUnsupportedOperation(
+                        "Assisted rehash applies only to exact indexes.",
+                        operation="rehash_index_if_needed",
+                        field="visibility",
+                        value=definition.visibility.value,
+                        index=definition.name,
+                    )
+                bucket_count = definition.bucket_count
+                # Even a no-op proves the selected physical identity.  At the directory ceiling
+                # there is no useful reason to sample thousands of heads after that proof.
+                if bucket_count >= MAX_BUCKET_COUNT:
+                    selected.open()
+                    return None
+                head_entries, overflow_pages = selected.assisted_rehash_pressure()
+                if (
+                    head_entries
+                    < bucket_count * TARGET_ENTRIES_PER_BUCKET
+                    and overflow_pages < bucket_count * wanted_ratio
+                ):
+                    return None
+                target_bucket_count = min(MAX_BUCKET_COUNT, bucket_count * 2)
+
+            # Re-enter the existing public protocol after releasing the read observation.  Its
+            # fresh catalog/OCC checks are the authority; the advisory page-count sample is not.
+            return self.rehash_index(
+                wanted_name,
+                bucket_count=target_bucket_count,
+            )
+
     def verify(self, scope: str = "all") -> VerificationReport:
         """Walk the database and report every finding, precisely located (SPEC-M1 FR-11).
 
@@ -1958,6 +3048,410 @@ class Database:
                 verifier = factory()  # type: ignore[operator]
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def _bloat(self, table: str | None = None) -> BloatReport:
+        """Measure heap bloat at the existing recyclable horizon without changing state.
+
+        The public door lives on :class:`Maintenance`; this private database operation supplies
+        the same lifecycle containment and current-page boundary as verification without adding
+        a second top-level API. The transaction manager observes the checkpoint-capped WAL horizon
+        without pruning TTL-stalled reader records; until mutating vacuum has a stronger
+        reader-lifecycle contract, a more aggressive estimate would advertise bytes beyond even
+        the existing WAL-retention boundary. The returned eligibility counts still state
+        explicitly that vacuum safety is not established.
+        """
+        with self._public_operation("measure heap bloat"):
+            self._require_open()
+            wanted_table = None if table is None else _require_text("table", table)
+            with self._transactions.page_access_section(
+                fresh_read_view=True,
+                allow_writeback=False,
+            ):
+                catalog = self._catalog.catalog
+                tables = (
+                    catalog.tables()
+                    if wanted_table is None
+                    else (catalog.table(wanted_table),)
+                )
+                horizon = self._transactions.observational_recyclable_horizon()
+                samples = tuple(
+                    (table_def, self._heap._measure_bloat(table_def, horizon))
+                    for table_def in tables
+                )
+
+            table_reports = tuple(
+                TableBloatReport(
+                    table=_builtin_text(table_def.name, field="table", empty=False),
+                    table_id=_builtin_int(sample.table_id, field="table_id"),
+                    data_pages=_builtin_int(sample.data_pages, field="data_pages"),
+                    slot_directory_entries=_builtin_int(
+                        sample.slot_directory_entries,
+                        field="slot_directory_entries",
+                    ),
+                    free_slots=_builtin_int(sample.free_slots, field="free_slots"),
+                    stored_versions=_builtin_int(
+                        sample.stored_versions, field="stored_versions"
+                    ),
+                    ended_versions=_builtin_int(
+                        sample.ended_versions, field="ended_versions"
+                    ),
+                    horizon_eligible_versions=_builtin_int(
+                        sample.horizon_eligible_versions,
+                        field="horizon_eligible_versions",
+                    ),
+                    horizon_retained_versions=_builtin_int(
+                        sample.horizon_retained_versions,
+                        field="horizon_retained_versions",
+                    ),
+                    horizon_eligible_slot_bytes=_builtin_int(
+                        sample.horizon_eligible_slot_bytes,
+                        field="horizon_eligible_slot_bytes",
+                    ),
+                    horizon_retained_slot_bytes=_builtin_int(
+                        sample.horizon_retained_slot_bytes,
+                        field="horizon_retained_slot_bytes",
+                    ),
+                    overflow_versions=_builtin_int(
+                        sample.overflow_versions,
+                        field="overflow_versions",
+                    ),
+                    horizon_eligible_overflow_versions=_builtin_int(
+                        sample.horizon_eligible_overflow_versions,
+                        field="horizon_eligible_overflow_versions",
+                    ),
+                )
+                for table_def, sample in samples
+            )
+
+            def total(field: str) -> int:
+                """Sum one exact integer field from the detached per-table reports."""
+                return sum(
+                    _builtin_int(getattr(report, field), field=field)
+                    for report in table_reports
+                )
+
+            return BloatReport(
+                recyclable_horizon_lsn=_builtin_int(
+                    horizon, field="recyclable_horizon_lsn"
+                ),
+                vacuum_safety_established=False,
+                tables=table_reports,
+                data_pages=total("data_pages"),
+                slot_directory_entries=total("slot_directory_entries"),
+                free_slots=total("free_slots"),
+                stored_versions=total("stored_versions"),
+                ended_versions=total("ended_versions"),
+                horizon_eligible_versions=total("horizon_eligible_versions"),
+                horizon_retained_versions=total("horizon_retained_versions"),
+                horizon_eligible_slot_bytes=total("horizon_eligible_slot_bytes"),
+                horizon_retained_slot_bytes=total("horizon_retained_slot_bytes"),
+                overflow_versions=total("overflow_versions"),
+                horizon_eligible_overflow_versions=total(
+                    "horizon_eligible_overflow_versions"
+                ),
+            )
+
+    def _vacuum(
+        self,
+        table: str | None = None,
+        *,
+        confirm_quiescent: bool,
+        max_versions: int | None,
+    ) -> VacuumReport:
+        """Execute the guarded two-transaction vacuum v1 protocol."""
+
+        with self._public_operation("vacuum MVCC history"):
+            self._require_open()
+            self._require_writable("vacuum MVCC history")
+            wanted_table = None if table is None else _require_text("table", table)
+            wanted_limit = (
+                None
+                if max_versions is None
+                else _require_positive_integer("max_versions", max_versions)
+            )
+            with self._transactions.quiescent_maintenance_section(
+                confirm_quiescent=confirm_quiescent
+            ):
+                with self._transactions.page_access_section(fresh_read_view=True):
+                    source = self._catalog.catalog
+                    if source.format_version != CATALOG_FORMAT_VERSION:
+                        raise GrafxUnsupportedOperation(
+                            "MVCC vacuum requires catalog v2; run "
+                            "maintenance.ensure_identity_indexes() first.",
+                            operation="vacuum",
+                            field="format_version",
+                            value=source.format_version,
+                            required=CATALOG_FORMAT_VERSION,
+                            remedy="maintenance.ensure_identity_indexes",
+                        )
+                    selected = (
+                        source.tables()
+                        if wanted_table is None
+                        else (source.table(wanted_table),)
+                    )
+                    floor_before = self._heap.reclaim_floor()
+                    capability_active = (
+                        HEAP_RECLAIM_V1_CAPABILITY in source.required_capabilities()
+                    )
+
+                capability_activated = False
+                capability_wrote = False
+                if not capability_active:
+                    activation = self.begin("write")
+                    try:
+                        capability_activated = (
+                            self._transactions.prepare_heap_reclaim_activation(
+                                activation._context
+                            )
+                        )
+                        activation_report = activation.commit()
+                        capability_wrote = bool(activation_report.wrote)
+                    except BaseException as failure:
+                        if activation.active:
+                            try:
+                                activation.rollback()
+                            except BaseException as cleanup_failure:
+                                _note_cleanup_failure(failure, cleanup_failure)
+                        raise
+                    self._refresh_index_inventory()
+
+                # Re-resolve table objects and the horizon after capability publication.  The
+                # selected LSN is the newest globally published state inside the operator's
+                # quiescent window; no TTL inference participates in it.
+                with self._transactions.page_access_section(fresh_read_view=True):
+                    current = self._catalog.catalog
+                    selected = (
+                        current.tables()
+                        if wanted_table is None
+                        else (current.table(wanted_table),)
+                    )
+                    horizon = self._transactions.published_state().last_committed_lsn
+
+                transaction = self.begin("write")
+                try:
+                    plan, index_reports, planned_floor_before, planned_floor_after = (
+                        self._transactions.prepare_vacuum(
+                            transaction._context,
+                            selected,
+                            horizon,
+                            max_versions=wanted_limit,
+                        )
+                    )
+                    if planned_floor_before != floor_before:
+                        raise GrafxTransactionStateError(
+                            "The heap reclaim floor changed inside an asserted quiescent "
+                            "vacuum window.",
+                            operation="vacuum",
+                            field="reclaim_floor_lsn",
+                            expected=floor_before,
+                            observed=planned_floor_before,
+                        )
+                    commit_report = transaction.commit()
+                except BaseException as failure:
+                    if transaction.active:
+                        try:
+                            transaction.rollback()
+                        except BaseException as cleanup_failure:
+                            _note_cleanup_failure(failure, cleanup_failure)
+                    raise
+
+                tables_by_id = {table_def.table_id: table_def for table_def in selected}
+                table_reports = tuple(
+                    TableVacuumReport(
+                        table=_builtin_text(
+                            tables_by_id[item.table_id].name,
+                            field="table",
+                            empty=False,
+                        ),
+                        table_id=_builtin_int(item.table_id, field="table_id"),
+                        pages_scanned=_builtin_int(
+                            item.pages_scanned, field="pages_scanned"
+                        ),
+                        eligible_inline_versions=_builtin_int(
+                            item.eligible_inline_versions,
+                            field="eligible_inline_versions",
+                        ),
+                        reclaimed_versions=_builtin_int(
+                            item.reclaimed_versions, field="reclaimed_versions"
+                        ),
+                        reclaimed_slot_bytes=_builtin_int(
+                            item.reclaimed_slot_bytes,
+                            field="reclaimed_slot_bytes",
+                        ),
+                        relinked_versions=_builtin_int(
+                            item.relinked_versions, field="relinked_versions"
+                        ),
+                        skipped_overflow_versions=_builtin_int(
+                            item.skipped_overflow_versions,
+                            field="skipped_overflow_versions",
+                        ),
+                    )
+                    for item in plan.tables
+                )
+
+                def total(field: str) -> int:
+                    return sum(
+                        _builtin_int(getattr(item, field), field=field)
+                        for item in table_reports
+                    )
+
+                return VacuumReport(
+                    horizon_lsn=_builtin_int(horizon, field="horizon_lsn"),
+                    reclaim_floor_before=_builtin_int(
+                        floor_before, field="reclaim_floor_before"
+                    ),
+                    reclaim_floor_after=_builtin_int(
+                        planned_floor_after, field="reclaim_floor_after"
+                    ),
+                    capability_activated=_builtin_bool(capability_activated),
+                    wrote=_builtin_bool(capability_wrote or commit_report.wrote),
+                    complete=_builtin_bool(plan.complete),
+                    tables=table_reports,
+                    pages_rewritten=len(plan.page_images),
+                    reclaimed_versions=total("reclaimed_versions"),
+                    reclaimed_slot_bytes=total("reclaimed_slot_bytes"),
+                    relinked_versions=total("relinked_versions"),
+                    skipped_overflow_versions=total("skipped_overflow_versions"),
+                    indexes_reconciled=len(index_reports),
+                    index_entries_removed=sum(
+                        _builtin_int(report.removed, field="index_entries_removed")
+                        for report in index_reports
+                    ),
+                )
+
+    def ensure_identity_indexes(self) -> None:
+        """Persist and activate every exact access path required by endpoint identities.
+
+        This is the explicit, one-way catalog-v1 to catalog-v2 door.  It constructs complete
+        nonced shadow generations under the ordinary writer/commit fences, barriers those files
+        before the catalog can name them, and publishes the complete catalog change through the
+        existing WAL-before-data protocol.  Repeating it after every required identity generation
+        is active and fresh performs no durable write.  Read-only handles always refuse the door,
+        including when the current durable state would make it a no-op.
+        """
+
+        with self._public_operation("ensure_identity_indexes"):
+            self._require_open()
+            self._require_writable("ensure identity indexes")
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_identity_index_activation(
+                    transaction._context
+                )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction._context.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return None
+
+    def enable_wal_page_compression(self) -> None:
+        """Persist the compatibility fence before emitting compressed WAL page images.
+
+        Activation is explicit and one way because a database that has retained WAL-v2 records
+        must never be opened by a build that understands only the legacy page-image grammar.
+        The catalog capability is committed in a v1-only transaction; only later commits may
+        select compressed records. Repeating the operation is a zero-write no-op.
+        """
+
+        with self._public_operation("enable_wal_page_compression"):
+            self._require_open()
+            self._require_writable("enable WAL page compression")
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_wal_record_v2_activation(
+                    transaction._context
+                )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction._context.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return None
+
+    def _refresh_index_inventory(self) -> None:
+        """Refresh cached operational names from the committed catalog authority."""
+        manager = self._indexes
+        active_indexes = getattr(manager, "active_indexes", None)
+        if callable(active_indexes):
+            active = tuple(active_indexes(catalog=self._catalog.catalog))
+            self._attached_indexes = tuple(
+                _builtin_text(index.name, field="attached_index", empty=False)
+                for index in active
+            )
+            self._stale_indexes = tuple(
+                _builtin_text(index.name, field="stale_index", empty=False)
+                for index in active
+                if index.stale
+            )
+        refresh_reclaim = getattr(
+            self._transactions,
+            "_refresh_heap_reclaim_capability",
+            None,
+        )
+        if callable(refresh_reclaim):
+            refresh_reclaim()
+        refresh_wal = getattr(
+            self._transactions,
+            "_refresh_wal_record_v2_capability",
+            None,
+        )
+        if callable(refresh_wal):
+            refresh_wal()
+
+    def _committed_index_receipt(self, name: str) -> IndexView:
+        """Return one ACTIVE view with page-zero horizons certified after its commit."""
+        manager = self._require_component(
+            "indexes", self._indexes, "the index framework (C7)"
+        )
+        active_index = getattr(manager, "active_index", None)
+        if not callable(active_index):
+            raise GrafxUnsupportedOperation(
+                "The index framework cannot resolve committed catalog authority.",
+                field="component",
+                value="active_index",
+            )
+        # Establish freshness before capturing the catalog epoch. Doing it inside the loop's
+        # validation section can itself advance that epoch and turn a successful local commit
+        # into an endless optimistic retry.
+        with self._transactions.page_access_section(fresh_read_view=True):
+            pass
+        while True:
+            catalog, epoch = self._catalog_snapshot()
+            authority = self._catalog._catalog
+            tables = catalog.catalog.table_definitions
+            with self._transactions.page_access_section():
+                if (
+                    _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                    != epoch
+                ):
+                    continue
+                selected = active_index(name, catalog=authority)
+                # The freshness boundary above rebased clean frames to current publication;
+                # open now validates digest, visibility and physical generation nonce.
+                header = selected.open()
+                if (
+                    _builtin_int(self._catalog._view_epoch(), field="catalog.epoch")
+                    != epoch
+                ):
+                    continue
+                receipt = _indexes_view(
+                    manager,
+                    tables,
+                    catalog=authority,
+                    certified_headers={name.lower(): header},
+                )
+            return receipt.index(name)
 
     def rebuild_vector_index(self, space: str) -> VectorIndexView:
         """Re-derive one vector index from the heap, and report it only once it is healthy.
@@ -2008,8 +3502,14 @@ class Database:
         # door's own transaction exists, because the retiring half is a checkpoint and a
         # checkpoint taken inside our own open write transaction is refused.
         claim_reason = f"Index {name!r} is being rebuilt."
+        active_index = getattr(manager, "active_index", None)
+        selected_index = (
+            active_index(name, catalog=self._catalog._catalog)
+            if callable(active_index)
+            else manager.index(name)  # type: ignore[attr-defined]
+        )
         claimed = self._transactions.checkpoint_and_claim_index_rebuild(
-            manager.index(name),  # type: ignore[attr-defined]
+            selected_index,
             claim_reason,
         )
         # Everything from here to the barrier runs under one cleanup, because the claim above
@@ -2042,7 +3542,7 @@ class Database:
             # publishes its key partition. Only this table is fenced, so unrelated commits are
             # untouched.
             table_id = _builtin_int(
-                manager.index(name).definition.table_id  # type: ignore[attr-defined]
+                selected_index.definition.table_id  # type: ignore[union-attr]
             )
             for partition in range(self._identity.partitions_per_table):
                 context.note_read(partition_key(table_id, partition))
@@ -2350,7 +3850,12 @@ class Database:
                     # participant after this handle opened. TransactionManager refreshed their
                     # freshness inside the same cross-process commit section as the checkpoint;
                     # only copy that stable local result into the public inventory here.
-                    registered = indexes.indexes()  # type: ignore[attr-defined]
+                    active_indexes = getattr(indexes, "active_indexes", None)
+                    registered = (
+                        active_indexes(catalog=self._catalog._catalog)
+                        if callable(active_indexes)
+                        else indexes.indexes()  # type: ignore[attr-defined]
+                    )
                     self._attached_indexes = tuple(
                         _builtin_text(index.name, field="attached_index", empty=False)
                         for index in registered
@@ -2489,7 +3994,12 @@ class Database:
                 "indexes", self._indexes, "the index framework (C7)"
             )
             with self._transactions.page_access_section():
-                index = indexes.index(wanted)  # type: ignore[attr-defined]
+                active_index = getattr(indexes, "active_index", None)
+                index = (
+                    active_index(wanted, catalog=self._catalog._catalog)
+                    if callable(active_index)
+                    else indexes.index(wanted)  # type: ignore[attr-defined]
+                )
                 return tuple(
                     _index_entry_view(entry)
                     for entry in index.walk()  # type: ignore[attr-defined]

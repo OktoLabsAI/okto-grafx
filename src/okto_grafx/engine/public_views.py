@@ -14,7 +14,8 @@ change bytes or engine bookkeeping are absent rather than hidden behind an ``uns
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
@@ -33,7 +34,13 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.index.definition import (
     IndexDefinition,
+    automatic_index_definitions,
     index_definition_matches_table,
+)
+from okto_grafx.domain.index.catalog import (
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
 )
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
@@ -46,7 +53,7 @@ from okto_grafx.domain.ledger.entry import (
     LedgerReason,
 )
 from okto_grafx.domain.ledger.payload import LedgerPayload, decode_payload
-from okto_grafx.domain.model.catalog import Catalog
+from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
 from okto_grafx.domain.model.value import (
     INT64_MAX,
@@ -61,6 +68,7 @@ from okto_grafx.domain.model.value import (
     VectorValue,
 )
 from okto_grafx.domain.page.layout import MAX_U32, MAX_U64
+from okto_grafx.domain.page.checksum import crc32c_implementation
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import Aggregation
 from okto_grafx.domain.query.ast import (
@@ -84,6 +92,7 @@ from okto_grafx.domain.query.ast import (
     Variable,
 )
 from okto_grafx.domain.query.limits import (
+    DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_EXPRESSION_DEPTH,
     MAX_LIST_ELEMENTS,
     MAX_MAP_ENTRIES,
@@ -98,6 +107,7 @@ from okto_grafx.domain.query.plan import (
     AllNodesScan,
     MAX_PLAN_DEPTH,
     AggregateRows,
+    CreateIndex,
     CreateNodeTable,
     CreatedNode,
     CreatedRelationship,
@@ -117,6 +127,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    RelationshipIncidentSeek,
     RelationshipScan,
     SetProperties,
     SingleRow,
@@ -173,6 +184,7 @@ _PEP604_UNION_TYPE = type(str | None)
 """Runtime origin returned by ``typing.get_origin`` for a PEP 604 union."""
 
 __all__ = [
+    "BloatReport",
     "PUBLIC_DATABASE_VIEW_ALLOWLIST",
     "BufferPoolView",
     "CatalogStoreView",
@@ -194,11 +206,14 @@ __all__ = [
     "QueryEngineView",
     "StorageFileView",
     "StorageView",
+    "TableBloatReport",
+    "TableVacuumReport",
     "TransactionManagerView",
     "VectorEngineView",
     "VectorIndexView",
     "VectorMathView",
     "WalView",
+    "VacuumReport",
 ]
 
 
@@ -223,6 +238,9 @@ class StorageView:
     name: str
     page_size: int
     files: tuple[StorageFileView, ...]
+    descriptor_cache_hits: int | None = None
+    descriptor_cache_misses: int | None = None
+    descriptor_cache_evictions: int | None = None
 
     def list_files(self, prefix: str = "") -> tuple[str, ...]:
         """Return captured file names starting with ``prefix`` in stable order."""
@@ -264,10 +282,12 @@ class ClockView:
 
 @dataclass(frozen=True, slots=True)
 class CodecView:
-    """Immutable public identity of the configured page codec."""
+    """Page codec per instance and the effective process-wide checksum provider."""
 
     format_version: int
     page_size: int
+    implementation: str = "PageCodecV1"
+    process_checksum_implementation: str = "pure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +307,96 @@ class MaintenanceStatus:
     stale_indexes: tuple[str, ...]
     heap_bloat_bytes: int | None
     oldest_reader_age: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class TableBloatReport:
+    """Conservative heap-bloat census for one table at one recyclable horizon.
+
+    Byte counts cover the complete bytes stored in record slots: header plus inline payload, or
+    header plus overflow pointer.  They deliberately exclude slot-directory entries and overflow
+    pages.  ``horizon_eligible`` means only that an ended lifetime falls at or below the
+    WAL-recycling horizon; it is not authorization for physical vacuum.  ``horizon_retained``
+    counts the other ended lifetimes, so eligible plus retained equals ``ended_versions``.  Live
+    and provisional lifetimes remain visible through ``stored_versions - ended_versions`` and are
+    never presented as bloat.
+    """
+
+    table: str
+    table_id: int
+    data_pages: int
+    slot_directory_entries: int
+    free_slots: int
+    stored_versions: int
+    ended_versions: int
+    horizon_eligible_versions: int
+    horizon_retained_versions: int
+    horizon_eligible_slot_bytes: int
+    horizon_retained_slot_bytes: int
+    overflow_versions: int
+    horizon_eligible_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class BloatReport:
+    """Detached aggregate of a read-only, header-only heap-bloat census.
+
+    ``recyclable_horizon_lsn`` is a non-pruning observation of the checkpoint-capped WAL horizon:
+    TTL-stalled reader records remain pins for this diagnostic. A version is horizon-eligible only
+    when it has a committed birth and a committed end at or below that horizon.
+    ``horizon_retained`` counts ended versions that fail that eligibility test; it excludes live
+    and provisional versions. ``vacuum_safety_established`` remains false until reader continuity
+    and the mutating protocol are separately proved; this report never authorizes deletion.
+    """
+
+    recyclable_horizon_lsn: int
+    vacuum_safety_established: bool
+    tables: tuple[TableBloatReport, ...]
+    data_pages: int
+    slot_directory_entries: int
+    free_slots: int
+    stored_versions: int
+    ended_versions: int
+    horizon_eligible_versions: int
+    horizon_retained_versions: int
+    horizon_eligible_slot_bytes: int
+    horizon_retained_slot_bytes: int
+    overflow_versions: int
+    horizon_eligible_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class TableVacuumReport:
+    """Detached physical effects of one quiescent vacuum pass over one table."""
+
+    table: str
+    table_id: int
+    pages_scanned: int
+    eligible_inline_versions: int
+    reclaimed_versions: int
+    reclaimed_slot_bytes: int
+    relinked_versions: int
+    skipped_overflow_versions: int
+
+
+@dataclass(frozen=True, slots=True)
+class VacuumReport:
+    """Outcome of one manual, process-quiescent MVCC vacuum operation."""
+
+    horizon_lsn: int
+    reclaim_floor_before: int
+    reclaim_floor_after: int
+    capability_activated: bool
+    wrote: bool
+    complete: bool
+    tables: tuple[TableVacuumReport, ...]
+    pages_rewritten: int
+    reclaimed_versions: int
+    reclaimed_slot_bytes: int
+    relinked_versions: int
+    skipped_overflow_versions: int
+    indexes_reconciled: int
+    index_entries_removed: int
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -363,10 +473,16 @@ class BufferPoolView:
     capacity_pages: int
     used_bytes_value: int
     db_label: str
+    retained_bytes_estimate_value: int
+    retained_bytes_estimator: str
 
     def used_bytes(self) -> int:
         """Return the resident byte count captured with this view."""
         return self.used_bytes_value
+
+    def retained_bytes_estimate(self) -> int:
+        """Return the versioned retained-memory estimate captured with this view."""
+        return self.retained_bytes_estimate_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,6 +655,36 @@ class IndexView:
     built_through_lsn: int | None
     reconciled_through_lsn: int | None
     missing_targets: int
+    columns: tuple[str, ...] = ()
+    automatic: bool | None = None
+    generation_state: str | None = None
+    active_nonce: int | None = None
+    expected_cardinality: int | None = None
+
+    @property
+    def table_id(self) -> int:
+        """Return the committed table id covered by this index."""
+        return self.definition.table_id
+
+    @property
+    def table_name(self) -> str:
+        """Return the committed table name covered by this index."""
+        return self.definition.table_name
+
+    @property
+    def positions(self) -> tuple[int, ...]:
+        """Return key positions in their declared compound-key order."""
+        return self.definition.positions
+
+    @property
+    def key_derivation(self) -> str:
+        """Return the stable key-derivation contract."""
+        return self.definition.key_derivation
+
+    @property
+    def bucket_count(self) -> int:
+        """Return the active physical generation's bucket count."""
+        return self.definition.bucket_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -1070,6 +1216,9 @@ def _index_definition(value: Any) -> IndexDefinition:
             field="index.key_derivation",
             empty=False,
         ),
+        artifact_nonce=_builtin_int(
+            _domain_field(value, IndexDefinition, "artifact_nonce")
+        ),
     )
 
 
@@ -1124,6 +1273,9 @@ def _commit_state(value: Any) -> CommitState:
         last_csn=_builtin_int(_domain_field(value, CommitState, "last_csn")),
         checkpoint_lsn=_builtin_int(
             _domain_field(value, CommitState, "checkpoint_lsn")
+        ),
+        format_version=_builtin_int(
+            _domain_field(value, CommitState, "format_version")
         ),
     )
 
@@ -1610,6 +1762,8 @@ def _metric_value(value: object, *, field: str, active: set[int]) -> object:
 
 def _query_parameters_snapshot(
     value: Mapping[str, object] | None,
+    *,
+    max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
 ) -> dict[str, Value]:
     """Return one bounded, deeply owned parameter mapping before page access begins.
 
@@ -1656,6 +1810,7 @@ def _query_parameters_snapshot(
             field=f"parameters.{name}",
             depth=0,
             active=active,
+            max_string_characters=max_string_characters,
         )
     return detached
 
@@ -1734,6 +1889,7 @@ def _path_properties_snapshot(
     depth: int,
     active: set[int],
     detached: dict[Value, Value],
+    max_string_characters: int,
 ) -> None:
     """Append exact ordered user properties to one path entity map."""
     pairs = _tuple_items(value, field=field)
@@ -1775,6 +1931,7 @@ def _path_properties_snapshot(
             field=f"{field}.{name}",
             depth=depth,
             active=active,
+            max_string_characters=max_string_characters,
         )
 
 
@@ -1786,6 +1943,7 @@ def _path_node_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Rebuild one node of a projected path in Kuzu-compatible key order."""
     source = _path_exact_value(value, node_type, field=field)
@@ -1805,6 +1963,7 @@ def _path_node_snapshot(
         depth=depth,
         active=active,
         detached=detached,
+        max_string_characters=max_string_characters,
     )
     return detached
 
@@ -1817,6 +1976,7 @@ def _path_relationship_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Rebuild one relationship of a projected path in Kuzu-compatible key order."""
     source = _path_exact_value(value, relationship_type, field=field)
@@ -1847,6 +2007,7 @@ def _path_relationship_snapshot(
         depth=depth,
         active=active,
         detached=detached,
+        max_string_characters=max_string_characters,
     )
     return detached
 
@@ -1857,6 +2018,7 @@ def _query_path_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Detach the engine's nominal one-hop path into maps and immutable sequences."""
     from okto_grafx.engine.query_engine import (
@@ -1907,6 +2069,7 @@ def _query_path_snapshot(
                 field=f"{field}._NODES[{position}]",
                 depth=depth + 3,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             for position, raw_node in enumerate(raw_nodes)
         )
@@ -1918,6 +2081,7 @@ def _query_path_snapshot(
                 field=f"{field}._RELS[{position}]",
                 depth=depth + 3,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             for position, raw_relationship in enumerate(raw_relationships)
         )
@@ -1935,12 +2099,38 @@ def _query_path_snapshot(
         active.remove(marker)
 
 
+def _require_int64(value: int, *, field: str) -> int:
+    """Refuse an integer outside the signed 64-bit range; the one bound every path shares."""
+    if not INT64_MIN <= value <= INT64_MAX:
+        raise GrafxConfigurationError(
+            "A query integer must fit in 64 signed bits.",
+            field=field,
+            value=value,
+            minimum=INT64_MIN,
+            maximum=INT64_MAX,
+        )
+    return value
+
+
+def _require_text_length(value: str, *, field: str, limit: int) -> str:
+    """Refuse a string longer than ``limit``; the one bound every path shares."""
+    if len(value) > limit:
+        raise GrafxConfigurationError(
+            f"A query string may carry at most {limit} characters.",
+            field=field,
+            value=len(value),
+            limit=limit,
+        )
+    return value
+
+
 def _query_value_snapshot(
     value: object,
     *,
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int = MAX_STRING_CHARACTERS,
 ) -> Value:
     """Copy one query value into an exact, bounded and capability-free value graph."""
     if depth > MAX_VALUE_DEPTH:
@@ -1953,29 +2143,24 @@ def _query_value_snapshot(
     value_type = type(value)
     if value is None or value_type is bool:
         return value
+    # An exact built-in is already the object the canonical branches below would return
+    # (``int.__int__``, ``float.__float__`` and ``str.__str__`` hand back the same instance for
+    # an exact one), so only the shared bound remains. A subclass never matches ``is`` and keeps
+    # taking the canonical copy below, unchanged.
+    if value_type is int:
+        return _require_int64(value, field=field)
+    if value_type is float:
+        return value
+    if value_type is str:
+        return _require_text_length(value, field=field, limit=max_string_characters)
     if issubclass(value_type, int):
-        plain_integer = _builtin_int(value, field=field)
-        if not INT64_MIN <= plain_integer <= INT64_MAX:
-            raise GrafxConfigurationError(
-                "A query integer must fit in 64 signed bits.",
-                field=field,
-                value=plain_integer,
-                minimum=INT64_MIN,
-                maximum=INT64_MAX,
-            )
-        return plain_integer
+        return _require_int64(_builtin_int(value, field=field), field=field)
     if issubclass(value_type, float):
         return float.__float__(value)
     if issubclass(value_type, str):
-        plain_text = _builtin_text(value, field=field)
-        if len(plain_text) > MAX_STRING_CHARACTERS:
-            raise GrafxConfigurationError(
-                f"A query string may carry at most {MAX_STRING_CHARACTERS} characters.",
-                field=field,
-                value=len(plain_text),
-                limit=MAX_STRING_CHARACTERS,
-            )
-        return plain_text
+        return _require_text_length(
+            _builtin_text(value, field=field), field=field, limit=max_string_characters
+        )
     if issubclass(value_type, (bytes, bytearray, memoryview)):
         return _builtin_bytes(value, field=field)
     if issubclass(value_type, Timestamp):
@@ -1997,17 +2182,38 @@ def _query_value_snapshot(
         source = _domain_value(value, Uuid, field=field)
         return Uuid(raw=_builtin_bytes(_domain_field(source, Uuid, "raw"), field=field))
     if issubclass(value_type, VectorValue):
-        return _vector_query_snapshot(value)
+        return _vector_query_snapshot(value, reuse_exact_values=True)
+    exact_float_sequence = _exact_float_sequence_snapshot(value, depth=depth)
+    if exact_float_sequence is not None:
+        return exact_float_sequence
     # This is a result-only marker, not a storable Value. It is recognized nominally and
     # rebuilt here, outside page access, before a private engine object can reach the caller.
     from okto_grafx.engine.query_engine import _PathValue
 
     if value_type is _PathValue:
-        return _query_path_snapshot(value, field=field, depth=depth, active=active)
+        return _query_path_snapshot(
+            value,
+            field=field,
+            depth=depth,
+            active=active,
+            max_string_characters=max_string_characters,
+        )
     if isinstance(value, Mapping):
-        return _query_mapping_snapshot(value, field=field, depth=depth, active=active)
+        return _query_mapping_snapshot(
+            value,
+            field=field,
+            depth=depth,
+            active=active,
+            max_string_characters=max_string_characters,
+        )
     if isinstance(value, Sequence):
-        return _query_sequence_snapshot(value, field=field, depth=depth, active=active)
+        return _query_sequence_snapshot(
+            value,
+            field=field,
+            depth=depth,
+            active=active,
+            max_string_characters=max_string_characters,
+        )
     observed = _builtin_type_name(value)
     raise GrafxConfigurationError(
         f"The query value at {field} cannot retain a {observed} capability.",
@@ -2017,12 +2223,45 @@ def _query_value_snapshot(
     )
 
 
+def _exact_float_sequence_snapshot(
+    value: object, *, depth: int
+) -> tuple[Value, ...] | None:
+    """Return a capability-free float sequence, or decline to the recursive copier.
+
+    Exact tuples are already immutable and capability-free, so retaining the caller's exact
+    object is safe. Exact lists are copied once before inspection so the result never retains
+    caller-owned mutable storage. Length is checked on that owned copy as well as before it,
+    preventing a concurrent list growth from crossing the public list bound. Every subclass,
+    non-float component and non-empty sequence at the nesting frontier keeps the established
+    recursive path.
+    """
+    value_type = type(value)
+    if value_type is tuple:
+        if len(value) > MAX_LIST_ELEMENTS:
+            return None
+        detached = value
+    elif value_type is list:
+        if len(value) > MAX_LIST_ELEMENTS:
+            return None
+        detached = tuple(value)
+        if len(detached) > MAX_LIST_ELEMENTS:
+            return None
+    else:
+        return None
+    if detached and depth >= MAX_VALUE_DEPTH:
+        return None
+    if all(type(item) is float for item in detached):
+        return cast(tuple[Value, ...], detached)
+    return None
+
+
 def _query_mapping_snapshot(
     value: Mapping[object, object],
     *,
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> dict[Value, Value]:
     """Copy one bounded map, rejecting cycles and canonical-key collisions."""
     marker = id(value)
@@ -2043,12 +2282,14 @@ def _query_mapping_snapshot(
                 field=f"{field}.key[{position}]",
                 depth=depth + 1,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             item = _query_value_snapshot(
                 raw_value,
                 field=f"{field}[{position}]",
                 depth=depth + 1,
                 active=active,
+                max_string_characters=max_string_characters,
             )
             try:
                 duplicate = key in detached
@@ -2077,6 +2318,7 @@ def _query_sequence_snapshot(
     field: str,
     depth: int,
     active: set[int],
+    max_string_characters: int,
 ) -> tuple[Value, ...]:
     """Copy one bounded sequence without invoking list or tuple subclass overrides."""
     marker = id(value)
@@ -2110,6 +2352,7 @@ def _query_sequence_snapshot(
                     field=f"{field}[{len(detached)}]",
                     depth=depth + 1,
                     active=active,
+                    max_string_characters=max_string_characters,
                 )
             )
         return tuple(detached)
@@ -2145,6 +2388,7 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
     {
         AggregateRows,
         AllNodesScan,
+        CreateIndex,
         CreateNodeTable,
         CreateRelationships,
         CreateRelTable,
@@ -2160,6 +2404,7 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
         OptionalRows,
         ProduceResults,
         ProjectRows,
+        RelationshipIncidentSeek,
         RelationshipScan,
         SetProperties,
         SingleRow,
@@ -2213,32 +2458,198 @@ _QUERY_PLAN_AUXILIARY_TYPES: frozenset[type[object]] = frozenset(
 """Exact frozen dataclasses reachable from operator fields, excluding expressions."""
 
 
-def _query_plan_view(value: object) -> PlanNode:
-    """Rebuild a capability-free plan after checking its exact bounded grammar."""
+_OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES: int = 128
+_OwnedPlanClone = Callable[[], PlanNode]
+_OwnedPlanFieldClone = Callable[[], object]
+_OwnedPlanViewMemo = OrderedDict[int, tuple[PlanNode, _OwnedPlanClone]]
+
+
+def _query_plan_view(
+    value: object,
+    *,
+    internally_owned: bool = False,
+    memo: _OwnedPlanViewMemo | None = None,
+) -> PlanNode:
+    """Rebuild a capability-free plan, memoizing only proven internal immutable roots."""
     try:
-        nodes = _query_plan_nodes(value)
-        detached: dict[int, PlanNode] = {}
-        for node in reversed(nodes):
-            clone = _query_plan_dataclass_snapshot(
-                node,
-                expected=type(node),
-                detached_nodes=detached,
-                active=set(),
-                expression_depth=0,
-            )
-            detached[id(node)] = clone  # type: ignore[assignment]
-        root = detached[id(value)]
-        return validate_plan(root)
+        if internally_owned and memo is not None:
+            return _query_owned_plan_recipe(value, memo)()
+        return _query_plan_rebuild(value)
     except GrafxPlanError:
         raise
     except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
-        observed = _builtin_type_name(failure)
-        raise GrafxPlanError(
-            f"The query collaborator returned a malformed plan field ({observed}).",
-            field="plan",
-            value="malformed",
-            cause=observed,
-        ) from failure
+        raise _malformed_plan_error(failure) from failure
+
+
+def _query_owned_plan_door(value: object, memo: _OwnedPlanViewMemo) -> object:
+    """Seal one proven internal root's clone recipe into a door for exactly one result.
+
+    The door defers the clone until the result's plan is actually read, so a caller that only
+    consumes rows never pays for a tree it never looks at.  Compilation -- the one hostile-shaped
+    rebuild and validation of the root -- still happens here, before the result exists, so a
+    malformed root refuses at execute time exactly as the eager path does.
+    """
+    from okto_grafx.engine.query_engine import _OwnedPlanDoor
+
+    try:
+        return _OwnedPlanDoor(_query_owned_plan_recipe(value, memo))
+    except GrafxPlanError:
+        raise
+    except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
+        raise _malformed_plan_error(failure) from failure
+
+
+def _query_owned_plan_recipe(
+    value: object, memo: _OwnedPlanViewMemo
+) -> _OwnedPlanClone:
+    """Return the compiled clone recipe of one proven internal immutable root, compiling once."""
+    marker = id(value)
+    cached = memo.get(marker)
+    if cached is not None and cached[0] is value:
+        memo.move_to_end(marker)
+        return cached[1]
+    # Compile only this already validated, capability-free graph.  The resulting clone recipe
+    # captures immutable leaves and its own copy of a mutable literal, never any caller's result.
+    # Every later caller therefore avoids repeating dataclass reflection and validation while
+    # still receiving an entirely independent tree from each run of the recipe.
+    clone = _query_owned_plan_clone_factory(_query_plan_rebuild(value))
+    memo[marker] = (value, clone)
+    memo.move_to_end(marker)
+    if len(memo) > _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES:
+        memo.popitem(last=False)
+    return clone
+
+
+def _query_plan_rebuild(value: object) -> PlanNode:
+    """Detach and validate one collaborator plan without trusting any of its doors."""
+    nodes = _query_plan_nodes(value)
+    detached: dict[int, PlanNode] = {}
+    for node in reversed(nodes):
+        clone = _query_plan_dataclass_snapshot(
+            node,
+            expected=type(node),
+            detached_nodes=detached,
+            active=set(),
+            expression_depth=0,
+        )
+        detached[id(node)] = clone  # type: ignore[assignment]
+    return validate_plan(detached[id(value)])
+
+
+def _malformed_plan_error(failure: Exception) -> GrafxPlanError:
+    observed = _builtin_type_name(failure)
+    return GrafxPlanError(
+        f"The query collaborator returned a malformed plan field ({observed}).",
+        field="plan",
+        value="malformed",
+        cause=observed,
+    )
+
+
+def _query_owned_plan_clone_factory(value: PlanNode) -> _OwnedPlanClone:
+    """Compile an independent clone door for one validated, internally owned plan."""
+    clone_field = _query_owned_plan_field_clone_factory(value)
+
+    def clone_plan() -> PlanNode:
+        cloned = clone_field()
+        if (
+            type(cloned) not in _QUERY_PLAN_NODE_TYPES
+        ):  # pragma: no cover - closed helper grammar
+            raise GrafxPlanError(
+                "An internally owned plan template lost its operator root.",
+                field="plan",
+                value="internal_template",
+            )
+        return cast(PlanNode, cloned)
+
+    return clone_plan
+
+
+def _query_owned_plan_field_clone_factory(value: object) -> _OwnedPlanFieldClone:
+    """Compile cloning of exact frozen dataclasses and tuples from a validated plan."""
+    exact = type(value)
+    if (
+        exact in _QUERY_PLAN_NODE_TYPES
+        or exact in _QUERY_PLAN_EXPRESSION_TYPES
+        or exact in _QUERY_PLAN_AUXILIARY_TYPES
+    ):
+        if exact is Literal:
+            private_value = _query_value_snapshot(
+                _domain_field(value, Literal, "value"),
+                field="plan.literal",
+                depth=0,
+                active=set(),
+            )
+
+            def clone_literal(private_value: Value = private_value) -> object:
+                cloned = object.__new__(Literal)
+                object.__setattr__(
+                    cloned,
+                    "value",
+                    _query_value_snapshot(
+                        private_value,
+                        field="plan.literal",
+                        depth=0,
+                        active=set(),
+                    ),
+                )
+                return cloned
+
+            return clone_literal
+        field_names = tuple(declared.name for declared in fields(exact))
+        field_clones = tuple(
+            _query_owned_plan_field_clone_factory(
+                _domain_field(value, exact, field_name)
+            )
+            for field_name in field_names
+        )
+
+        # TableDef and ColumnDef own canonicalising __post_init__ invariants. Resolve that
+        # property while compiling the recipe, including any future inherited hook, rather than
+        # rediscovering it for every public clone.
+        if hasattr(exact, "__post_init__"):
+
+            def clone_canonical_dataclass(
+                exact: type[object] = exact,
+                field_clones: tuple[_OwnedPlanFieldClone, ...] = field_clones,
+            ) -> object:
+                return exact(*(clone() for clone in field_clones))
+
+            return clone_canonical_dataclass
+
+        def clone_plain_dataclass(
+            exact: type[object] = exact,
+            field_names: tuple[str, ...] = field_names,
+            field_clones: tuple[_OwnedPlanFieldClone, ...] = field_clones,
+        ) -> object:
+            cloned = object.__new__(exact)
+            for field_name, clone in zip(field_names, field_clones, strict=True):
+                object.__setattr__(cloned, field_name, clone())
+            return cloned
+
+        return clone_plain_dataclass
+    if exact is tuple:
+        item_clones = tuple(
+            _query_owned_plan_field_clone_factory(item)
+            for item in tuple.__iter__(value)  # type: ignore[arg-type]
+        )
+
+        def clone_tuple(
+            item_clones: tuple[_OwnedPlanFieldClone, ...] = item_clones,
+        ) -> object:
+            return tuple(clone() for clone in item_clones)
+
+        return clone_tuple
+    if exact in (str, bytes, int, float, bool, type(None)):
+        return lambda value=value: value
+    if isinstance(value, Enum):
+        enum_value = value.value
+        return lambda exact=exact, enum_value=enum_value: exact(enum_value)
+    raise GrafxPlanError(
+        "An internally owned plan template contains a field outside the closed grammar.",
+        field="plan",
+        value=_builtin_type_name(value),
+    )
 
 
 def _query_plan_nodes(value: object) -> tuple[PlanNode, ...]:
@@ -2538,10 +2949,21 @@ def _query_plan_field_snapshot(
     )
 
 
-def _query_result_view(value: object) -> QueryResult:
+def _query_result_view(
+    value: object,
+    *,
+    max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    internally_owned_plan: bool = False,
+    plan_memo: _OwnedPlanViewMemo | None = None,
+) -> QueryResult:
     """Rebuild one result and normalize every malformed collaborator shape as a plan error."""
     try:
-        return _query_result_snapshot(value)
+        return _query_result_snapshot(
+            value,
+            max_string_characters=max_string_characters,
+            internally_owned_plan=internally_owned_plan,
+            plan_memo=plan_memo,
+        )
     except GrafxPlanError:
         raise
     except Exception as failure:  # noqa: BLE001 - collaborator output is an untrusted plan
@@ -2554,11 +2976,17 @@ def _query_result_view(value: object) -> QueryResult:
         ) from failure
 
 
-def _query_result_snapshot(value: object) -> QueryResult:
+def _query_result_snapshot(
+    value: object,
+    *,
+    max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
+    internally_owned_plan: bool = False,
+    plan_memo: _OwnedPlanViewMemo | None = None,
+) -> QueryResult:
     """Rebuild one fully materialised query result outside the page-access section."""
     # Local import avoids making the query engine depend on the public-view module that rebuilds
     # its output.  Database calls this only after composition has finished importing both modules.
-    from okto_grafx.engine.query_engine import QueryResult
+    from okto_grafx.engine.query_engine import QueryResult, _owned_query_result
 
     source = _domain_value(value, QueryResult, field="query.result")
     raw_columns = _tuple_items(
@@ -2600,12 +3028,17 @@ def _query_result_snapshot(value: object) -> QueryResult:
     )
     rows: list[tuple[Value, ...]] = []
     active: set[int] = set()
+    # The column suffixes are invariant across rows and the row prefix across columns; their
+    # concatenation is exactly ``f"query.result.rows[{row}][{column}]"``, built once per row
+    # instead of formatting two integers for every published value.
+    column_suffixes = tuple(f"[{position}]" for position in range(len(columns)))
     for row_position, raw_row in enumerate(raw_rows):
-        row_items = _tuple_items(raw_row, field=f"query.result.rows[{row_position}]")
+        row_field = f"query.result.rows[{row_position}]"
+        row_items = _tuple_items(raw_row, field=row_field)
         if len(row_items) != len(columns):
             raise GrafxConfigurationError(
                 "Every query result row must have exactly one value per column.",
-                field=f"query.result.rows[{row_position}]",
+                field=row_field,
                 value=len(row_items),
                 expected=len(columns),
             )
@@ -2613,20 +3046,30 @@ def _query_result_snapshot(value: object) -> QueryResult:
             tuple(
                 _query_value_snapshot(
                     item,
-                    field=f"query.result.rows[{row_position}][{column_position}]",
+                    field=row_field + column_suffixes[column_position],
                     depth=0,
                     active=active,
+                    max_string_characters=max_string_characters,
                 )
                 for column_position, item in enumerate(row_items)
             )
         )
 
     raw_plan = _domain_field(source, QueryResult, "plan")
-    plan = None if raw_plan is None else _query_plan_view(raw_plan)
+    if raw_plan is None:
+        plan: object = None
+    elif internally_owned_plan and plan_memo is not None:
+        # A root the exact engine proved it owns is sealed behind a door: the result carries the
+        # compiled recipe and builds its own independent tree only if someone reads the plan.
+        plan = _query_owned_plan_door(raw_plan, plan_memo)
+    else:
+        # Everything else keeps the eager hostile rebuild: the tree is validated and detached
+        # here, before the result exists, and no collaborator callable is ever kept.
+        plan = _query_plan_view(raw_plan)
     statistics = _query_statistics_snapshot(
         _domain_field(source, QueryResult, "statistics")
     )
-    return QueryResult(
+    return _owned_query_result(
         columns=tuple(columns),
         rows=tuple(rows),
         plan=plan,
@@ -3036,17 +3479,34 @@ def _vector_component(value: object) -> float:
         ) from failure
 
 
-def _vector_query_snapshot(value: object) -> tuple[float, ...] | VectorValue:
-    """Detach a query into an exact tuple or an identity-preserving exact VectorValue."""
+def _vector_query_snapshot(
+    value: object, *, reuse_exact_values: bool = False
+) -> tuple[float, ...] | VectorValue:
+    """Detach a query into an exact tuple or an identity-preserving exact VectorValue.
+
+    Public result projection may set ``reuse_exact_values`` after it has received a VectorValue
+    from the decoder. An exact tuple containing only exact floats is already immutable and
+    capability-free, so returning that tuple avoids revalidating every component in Python.
+    Caller-controlled query input keeps the component path below, including its original refusal
+    and callback order.
+    """
     if issubclass(type(value), VectorValue):
         source = _domain_value(value, VectorValue, field="vector.query")
-        values = tuple(
-            _vector_component(component)
-            for component in _tuple_items(
-                _domain_field(source, VectorValue, "values"),
-                field="vector.query.values",
+        raw_values = _domain_field(source, VectorValue, "values")
+        if (
+            reuse_exact_values
+            and type(raw_values) is tuple
+            and set(map(type, raw_values)) <= {float}
+        ):
+            values = raw_values
+        else:
+            values = tuple(
+                _vector_component(component)
+                for component in _tuple_items(
+                    raw_values,
+                    field="vector.query.values",
+                )
             )
-        )
         space_ref = _builtin_int(
             _domain_field(source, VectorValue, "space_ref"),
             field="vector.query.space_ref",
@@ -3075,7 +3535,10 @@ def _vector_query_snapshot(value: object) -> tuple[float, ...] | VectorValue:
                 reason="dimension_too_large",
                 value=len(values),
             )
-        return VectorValue(values=values, space_ref=space_ref, dtype=dtype)
+        # Every field above is now an exact built-in and has passed the public-query bounds. The
+        # ordinary constructor would map ``float`` across the tuple a second time; the decoded
+        # constructor is the existing no-revalidation door for precisely this trusted shape.
+        return VectorValue._from_decoded(values, space_ref, dtype)
 
     if issubclass(type(value), (str, bytes, bytearray)):
         raise GrafxVectorValidationError(
@@ -3416,10 +3879,29 @@ def _storage_view(storage: Any) -> StorageView:
                 page_size,
             )
         )
+    hits: int | None = None
+    misses: int | None = None
+    evictions: int | None = None
+    descriptor_stats = getattr(storage, "descriptor_cache_stats", None)
+    if callable(descriptor_stats):
+        stats = descriptor_stats()
+        if stats is not None:
+            hits = _builtin_int(
+                getattr(stats, "hits"), field="storage.descriptor_cache_hits"
+            )
+            misses = _builtin_int(
+                getattr(stats, "misses"), field="storage.descriptor_cache_misses"
+            )
+            evictions = _builtin_int(
+                getattr(stats, "evictions"), field="storage.descriptor_cache_evictions"
+            )
     return StorageView(
         _builtin_text(storage.name, field="storage.name", empty=False),
         page_size,
         tuple(files),
+        hits,
+        misses,
+        evictions,
     )
 
 
@@ -3434,7 +3916,16 @@ def _clock_view(clock: Any) -> ClockView:
 
 def _codec_view(codec: Any, page_size: int) -> CodecView:
     """Snapshot codec identity without exposing encode or decode capabilities."""
-    return CodecView(_builtin_int(codec.format_version), _builtin_int(page_size))
+    return CodecView(
+        _builtin_int(codec.format_version),
+        _builtin_int(page_size),
+        _builtin_type_name(codec),
+        _builtin_text(
+            crc32c_implementation(),
+            field="process_checksum_implementation",
+            empty=False,
+        ),
+    )
 
 
 def _component_view(role: str, component: object) -> ComponentView:
@@ -3488,6 +3979,12 @@ def _pool_view(pool: Any) -> BufferPoolView:
         _builtin_int(pool.capacity_pages),
         _builtin_int(pool.used_bytes()),
         _builtin_text(pool.db_label, field="pool.db_label", empty=False),
+        _builtin_int(pool.retained_bytes_estimate()),
+        _builtin_text(
+            pool.retained_bytes_estimator,
+            field="pool.retained_bytes_estimator",
+            empty=False,
+        ),
     )
 
 
@@ -3581,13 +4078,35 @@ def _transactions_view(
     )
 
 
-def _index_view(index: Any, definition: IndexDefinition | None = None) -> IndexView:
-    """Snapshot one registered index without retaining its store or faulting a page in."""
+def _index_view(
+    index: Any,
+    definition: IndexDefinition | None = None,
+    *,
+    table: TableDef | None = None,
+    automatic: bool | None = None,
+    generation_state: str | None = None,
+    expected_cardinality: int | None = None,
+    certified_header: IndexHeader | None = None,
+) -> IndexView:
+    """Snapshot one index, using an optional already-certified header without retaining it."""
     definition = (
         _index_definition(index.definition) if definition is None else definition
     )
     file = _builtin_text(definition.file, field="index.file", empty=False)
-    built_through, reconciled_through = _resident_index_positions(index, file)
+    if certified_header is None:
+        built_through, reconciled_through = _resident_index_positions(index, file)
+    else:
+        header = _domain_value(
+            certified_header, IndexHeader, field="index.certified_header"
+        )
+        built_through = _builtin_int(
+            _domain_field(header, IndexHeader, "built_through_lsn"),
+            field="index.built_through_lsn",
+        )
+        reconciled_through = _builtin_int(
+            _domain_field(header, IndexHeader, "reconciled_through_lsn"),
+            field="index.reconciled_through_lsn",
+        )
     return IndexView(
         _builtin_text(definition.name, field="index.name", empty=False),
         file,
@@ -3598,11 +4117,169 @@ def _index_view(index: Any, definition: IndexDefinition | None = None) -> IndexV
         built_through,
         reconciled_through,
         _builtin_int(index.missing_targets),
+        (
+            ()
+            if table is None
+            else tuple(
+                _builtin_text(
+                    table.columns[position].name,
+                    field="index.columns",
+                    empty=False,
+                )
+                for position in definition.positions
+            )
+        ),
+        None if automatic is None else _builtin_bool(automatic),
+        (
+            None
+            if generation_state is None
+            else _builtin_text(
+                generation_state,
+                field="index.generation_state",
+                empty=False,
+            )
+        ),
+        (
+            None
+            if definition.artifact_nonce == 0
+            else _builtin_int(definition.artifact_nonce)
+        ),
+        (None if expected_cardinality is None else _builtin_int(expected_cardinality)),
     )
 
 
-def _indexes_view(indexes: Any, tables: Sequence[TableDef]) -> IndexRegistryView:
-    """Snapshot registrations whose tables belong to the validated committed catalog."""
+def _index_generation_descriptor(value: Any) -> IndexGenerationDescriptor:
+    """Rebuild one catalog generation without dispatching through a subclass."""
+    value = _domain_value(value, IndexGenerationDescriptor, field="index.generation")
+    return IndexGenerationDescriptor(
+        artifact_nonce=_builtin_int(
+            _domain_field(value, IndexGenerationDescriptor, "artifact_nonce")
+        ),
+        bucket_count=_builtin_int(
+            _domain_field(value, IndexGenerationDescriptor, "bucket_count")
+        ),
+        state=_string_enum(
+            _domain_field(value, IndexGenerationDescriptor, "state"),
+            IndexGenerationState,
+            field="index.generation.state",
+        ),
+    )
+
+
+def _catalog_index_definition(value: Any) -> CatalogIndexDefinition:
+    """Detach one logical catalog index and all of its physical generations."""
+    value = _domain_value(
+        value, CatalogIndexDefinition, field="catalog.index_definition"
+    )
+    raw_expected = _domain_field(value, CatalogIndexDefinition, "expected_cardinality")
+    return CatalogIndexDefinition(
+        name=_builtin_text(
+            _domain_field(value, CatalogIndexDefinition, "name"),
+            field="index.name",
+            empty=False,
+        ),
+        table_id=_builtin_int(_domain_field(value, CatalogIndexDefinition, "table_id")),
+        table_name=_builtin_text(
+            _domain_field(value, CatalogIndexDefinition, "table_name"),
+            field="index.table_name",
+            empty=False,
+        ),
+        positions=tuple(
+            _builtin_int(position)
+            for position in _tuple_items(
+                _domain_field(value, CatalogIndexDefinition, "positions"),
+                field="index.positions",
+            )
+        ),
+        visibility=_string_enum(
+            _domain_field(value, CatalogIndexDefinition, "visibility"),
+            IndexVisibility,
+            field="index.visibility",
+        ),
+        key_derivation=_builtin_text(
+            _domain_field(value, CatalogIndexDefinition, "key_derivation"),
+            field="index.key_derivation",
+            empty=False,
+        ),
+        automatic=_builtin_bool(
+            _domain_field(value, CatalogIndexDefinition, "automatic")
+        ),
+        expected_cardinality=(
+            None
+            if raw_expected is None
+            else _builtin_int(raw_expected, field="index.expected_cardinality")
+        ),
+        generations=tuple(
+            _index_generation_descriptor(generation)
+            for generation in _tuple_items(
+                _domain_field(value, CatalogIndexDefinition, "generations"),
+                field="index.generations",
+            )
+        ),
+    )
+
+
+def _indexes_view(
+    indexes: Any,
+    tables: Sequence[TableDef],
+    *,
+    catalog: Catalog | None = None,
+    certified_headers: dict[str, IndexHeader] | None = None,
+) -> IndexRegistryView:
+    """Snapshot only registrations selected by the committed catalog authority.
+
+    ``tables`` remains the independently canonicalized provenance snapshot.  Catalog v2 decides
+    which physical exact generation is active, so a merely registered building, stale or
+    process-local definition is not public inventory.  Catalog v1 retains its historical
+    registry authority: every valid index registered for a committed table remains observable.
+    Direct internal callers that omit the authority use the same catalog store owned by the
+    concrete index manager.
+    """
+
+    authority = catalog
+    if authority is None:
+        authority = indexes._heap.catalog.catalog
+    if type(authority) is not Catalog:
+        # A public observation never dispatches through a domain subclass.  The catalog store's
+        # persisted image is the independently immutable authority already used by its epoch
+        # protocol; decoding it yields an exact Catalog without retaining or executing the
+        # hostile live object.
+        authority = Catalog.deserialize(
+            _builtin_bytes(indexes._heap.catalog._persisted_image)
+        )
+    catalog_managed = authority.format_version != CATALOG_LEGACY_FORMAT_VERSION
+    # Detach logical definitions before deriving either registry keys or runtime generations.
+    # A CatalogIndexDefinition subclass can override ``registry_key`` or
+    # ``active_generation``; a public observation must never execute those callbacks.  Calling
+    # the base Catalog method alone is insufficient because it delegates back into each stored
+    # definition.  Exact reconstructed values make every derivation below ordinary domain code.
+    logical_definitions = (
+        tuple(
+            _catalog_index_definition(definition)
+            for definition in Catalog.index_definitions(authority)
+        )
+        if catalog_managed
+        else ()
+    )
+    logical_by_key = {
+        definition.name.lower(): definition for definition in logical_definitions
+    }
+    expected_by_key: dict[str, IndexDefinition] = {}
+    for logical in logical_definitions:
+        generation = CatalogIndexDefinition.active_generation(logical)
+        if generation is not None:
+            expected_by_key[logical.name.lower()] = (
+                CatalogIndexDefinition.runtime_definition(logical, generation)
+            )
+    # Catalog v2 persists exact indexes but deliberately leaves proximity/vector definitions
+    # schema-derived.  Preserve that second authority without asking a raw logical definition
+    # to execute anything.
+    for table in tables:
+        for specialized in automatic_index_definitions(table):
+            if specialized.visibility is IndexVisibility.PROXIMITY:
+                expected_by_key[specialized.registry_key] = _index_definition(
+                    specialized
+                )
     by_identity = {(table.table_id, table.name): table for table in tables}
     captured: list[IndexView] = []
     for index in indexes.indexes():
@@ -3615,8 +4292,37 @@ def _indexes_view(indexes: Any, tables: Sequence[TableDef]) -> IndexRegistryView
         table_id = definition.table_id
         table_name = definition.table_name
         table = by_identity.get((table_id, table_name))
-        if table is not None and index_definition_matches_table(definition, table):
-            captured.append(_index_view(index, definition))
+        expected = expected_by_key.get(definition.registry_key)
+        if (
+            (not catalog_managed or expected == definition)
+            and table is not None
+            and index_definition_matches_table(definition, table)
+        ):
+            logical = logical_by_key.get(definition.registry_key)
+            generation = (
+                None
+                if logical is None
+                else CatalogIndexDefinition.active_generation(logical)
+            )
+            captured.append(
+                _index_view(
+                    index,
+                    definition,
+                    table=table,
+                    automatic=None if logical is None else logical.automatic,
+                    generation_state=(
+                        None if generation is None else generation.state.value
+                    ),
+                    expected_cardinality=(
+                        None if logical is None else logical.expected_cardinality
+                    ),
+                    certified_header=(
+                        None
+                        if certified_headers is None
+                        else dict.get(certified_headers, definition.registry_key)
+                    ),
+                )
+            )
     return IndexRegistryView(
         tuple(captured),
         _builtin_int(indexes.published_lsn),

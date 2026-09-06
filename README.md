@@ -8,7 +8,7 @@ processes and several threads read and write it at the same time**. There is no 
 no daemon to keep alive. The core is pure Python and the standard library is its only runtime
 requirement.
 
-**Version 0.0.1 — pre-alpha.** The on-disk format, the public API and the query surface may all
+**Version 0.0.3 — pre-alpha.** The on-disk format, the public API and the query surface may all
 change. Read [Status and limitations](#status-and-limitations) before you rely on it.
 
 ---
@@ -73,6 +73,7 @@ openCypher in the Kùzu dialect, executed by a planner that produces one operato
 | Supported | Notes |
 |---|---|
 | `CREATE NODE TABLE` / `CREATE REL TABLE` | with `PRIMARY KEY`, typed columns, `FROM`/`TO` |
+| `CREATE INDEX` | equality-only exact index over one or more ordered node properties; optional deterministic sizing |
 | `CREATE VECTOR SPACE` | dimension, metric, storage dtype |
 | `CREATE` (nodes and relationships) | patterns with inline properties |
 | `MATCH` … `WHERE` … `RETURN` | equality, comparison, `STARTS WITH`, `ENDS WITH`, boolean operators |
@@ -115,6 +116,15 @@ transactions like any other.
 - **A relationship table gets an index per endpoint** (`ef_`/`et_`), so traversal expands a
   bounded frontier by lookup instead of reading every edge, switching to one grouped scan when
   the frontier grows past the point where the scan is cheaper.
+- **Known bulk loads can size new automatic exact indexes up front.** Pass
+  `automatic_index_expected_cardinality=` to `connect()` before catalog-v2 activation or new DDL.
+  The hint applies per new PK, endpoint and identity index; it never resizes an existing
+  generation. An empty writable catalog is activated to v2 immediately; a non-empty v1 catalog
+  requires the explicit `db.ensure_identity_indexes()` migration before further table DDL, so
+  the hint is never silently ignored. Count artifacts, not tables: a keyed node owns its PK and,
+  when referenced by a relationship, a separate identity index; a relationship owns `ef_` and
+  `et_`. Leave the hint unset when the scale is unknown, because full walks cost
+  `O(bucket_count + entries)` and an oversized eager directory wastes space and scan time.
 - **Dual visibility (CONTRACT §8.7).** An EXACT index returns candidates that are validated against
   the heap under the caller's own snapshot — so the index may be a superset and can never be a wrong
   answer. A PROXIMITY index is versioned with tombstones and a horizon, and its entries are the
@@ -122,6 +132,33 @@ transactions like any other.
 - **A stale index is never used.** A stale index is a *subset* of the heap, which validation cannot
   repair, so both the planner and the uniqueness check fall back to the scan they did before any
   index existed: slower, and right.
+- **Custom exact indexes are durable catalog authority.** Create one transactionally with
+  `CREATE INDEX by_email FOR (p:Person) ON (p.email)` or with
+  `db.create_index("by_email", "Person", ("email",))`. Ordered compound keys are supported.
+  Choose either `bucket_count=` or `expected_cardinality=`; with neither, the default is 64
+  buckets. The Python door owns a dedicated write transaction and returns an immutable
+  `IndexView` only after the shadow generation and catalog commit are durable.
+- **Exact indexes can grow explicitly without replacing a live file.** Call
+  `db.rehash_index("by_email", bucket_count=256)` or supply `expected_cardinality=` instead —
+  exactly one hint is required, and the resolved count must be strictly larger than the current
+  ACTIVE generation. This is foreground maintenance: writers wait during the complete shadow
+  scan/build, while readers with an established snapshot may finish. The immediate predecessor is
+  retained as STALE; older immutable files remain retained orphans until safe reclamation exists.
+  A catalog-v1 automatic index activates v2 and grows in one build, so every process using the
+  directory must satisfy the compatibility fence below.
+- **Unknown growth can be handled by explicit assisted maintenance.**
+  `db.maintenance.rehash_index_if_needed("by_email")` validates the selected physical generation,
+  samples only the bounded eager bucket heads and grows at most one `2x` step when average head
+  occupancy reaches the canonical 64-entry target or retained overflow reaches the configured
+  ratio. It never runs from commit or in a background worker and never walks all entries merely to
+  decide. `None` means only “no assisted growth was selected now” (or the 4,096-bucket ceiling),
+  not that the index is healthy. The eventual foreground shadow build has the same writer-pause,
+  OCC, WAL and durability contract as `rehash_index`; do not call it repeatedly without
+  reassessing a concurrent refusal or data skew.
+- **Catalog-v2 activation is a one-way compatibility fence.** `db.create_index(...)` and the
+  explicit idempotent `db.ensure_identity_indexes()` may activate it. Every process that can open
+  that database must therefore run a Grafx build that understands catalog v2; rollback uses a
+  pre-activation backup or logical export, not an older binary against migrated bytes.
 
 ### Embeddings, first class
 
@@ -133,6 +170,17 @@ transactions like any other.
   `achieved_k`, so a caller can tell an exhaustive answer from an approximate one. The database
   validates that the transaction is active and belongs to it; no raw transaction context or
   mutable vector engine is exposed.
+- A bounded query-language search over one unfiltered node table can use the vector index as a
+  complete access path: after a durable frontier proof over the engine-owned immutable snapshot,
+  and the exact planned table/column pair, the query layer decodes only the returned
+  `VectorHit.ref` rows from the heap (at most `K`, not the table's `N`). The approximate hot path
+  therefore avoids the former heap scan; the exact oracle still performs its intentional
+  exhaustive heap validation once, but no longer pays for an additional `NodeScan`. Filters,
+  joins/traversals, historical/custom snapshots, stale indexes, unbounded searches and uncertain
+  sparse cardinality retain the canonical materialised path; staged owner rows keep the existing
+  fail-closed RYOW refusal.
+  `QueryResult.statistics` reports `vector_direct_accesses` and
+  `vector_rows_materialized` when the direct path is selected.
 
 ### Observability
 
@@ -169,11 +217,11 @@ reads identically in the other. It is worth installing: on Linux the durable-com
 the reference engine falls from ~17× to **~5×** with it, which is inside the ceiling that binding
 decision D5 sets.
 
-**`numpy`** — accelerated vector math. Selected only by `vector_math="numpy"`, never automatically.
-The pure and accelerated adapters agree to a *stated tolerance* rather than exactly, so a selector
-that silently bound whichever adapter happened to be installed would make the ranking of a query
-depend on the machine it ran on. `auto` therefore binds the pure oracle deliberately, and `"numpy"`
-refuses when the extra is absent rather than falling back to something the caller did not ask for.
+**`numpy`** — accelerated vector math and an optional byte-identical page codec. Vector math is
+selected only by `vector_math="numpy"`; it agrees to a stated tolerance, so `auto` deliberately
+binds the pure vector oracle. The page codec is independently selected with `codec="numpy"`; it
+keeps page format v1 byte-for-byte, accelerates dense slot-directory packing/validation and uses
+the pure codec for small directories. Both explicit selectors refuse when the extra is absent.
 
 ### From source
 
@@ -238,8 +286,45 @@ with db.begin("write") as txn:
 # --- operations ---------------------------------------------------------------
 db.verify("all")     # walks pages, records and indexes; a clean database reports nothing
 db.checkpoint()      # puts committed state on the platter and reclaims the log
+db.maintenance.bloat()  # read-only header census; it does not authorize or run vacuum
+# Maintenance window only: stop every other Grafx process first.
+db.ensure_identity_indexes()  # one-way catalog-v2 activation, if not already active
+db.maintenance.vacuum(confirm_quiescent=True, max_versions=10_000)
 db.close()
 ```
+
+### Atomic bulk writes
+
+Use `Transaction.executemany()` when many parameter mappings apply to the same updating query:
+
+```python
+with db.begin("write") as txn:
+    report = txn.executemany(
+        "CREATE (:Person {id: $id, name: $name, city: $city})",
+        (
+            {"id": row.id, "name": row.name, "city": row.city}
+            for row in incoming_rows
+        ),
+    )
+print(report.statements, report.statistics)
+```
+
+The iterable is consumed lazily, canonicalized one mapping at a time and applied in its original
+order. Grafx parses the fixed text once, but replans each item against the transaction's current
+overlay so later items see earlier writes correctly. The report is deliberately small: it carries
+only the executed statement count and summed statistics, never input payloads, plans or
+`QueryResult` objects.
+
+The batch is one savepoint inside the caller-owned transaction. If iteration, parameter binding,
+planning, a write budget or execution fails at any item, every change made by that
+`executemany()` call is discarded. Work staged before it remains intact, and the caller may catch
+the typed error, continue using the transaction and commit that earlier work. A successful call
+does not commit by itself; the surrounding transaction still uses the ordinary WAL, OCC and
+durability path exactly once when it commits.
+
+This door accepts one updating query with no `RETURN`. Reads, DDL, `UNION` and writes that return
+rows use `execute()` instead. It requires a write transaction even for an empty iterable, and all
+existing statement, transaction-byte/row and final WAL-batch budgets continue to apply.
 
 ### Handling a write conflict
 
@@ -328,14 +413,77 @@ separately. `ScanCursorV1` is opaque, non-serializable, single-use and cannot cr
 table or database. This is a physical scan primitive for adapters, not a portable backup format
 or bulk import API.
 
+### Streaming query results
+
+`execute()` remains the convenient materialised result. For a large read result, a query cursor
+keeps one MVCC snapshot and detaches at most one bounded batch at a time:
+
+```python
+query = db.query("MATCH (c:Chunk) RETURN c.id, c.body")
+with query.cursor(batch_size=256) as rows:
+    for chunk_id, body in rows:
+        consume(chunk_id, body)
+```
+
+`Query` copies its text and parameters when it is created and may open independent cursors.
+`QueryCursor` accepts only read plans with `RETURN`; writes continue through `execute()` so early
+cursor close can never commit a prefix. The cursor owns and releases its read transaction on EOF,
+explicit `close()` or context-manager exit. It never retains a page pin or page-access section
+between pulls, is not concurrently consumable, and bounds each iterator refill to `batch_size`
+(default 256, hard maximum 65,536). The internal operators named by the plan can still be blocking;
+streaming the terminal does not by itself make an unbounded sort, distinct or group bounded.
+
 ### Safe observations
 
 Properties such as `db.catalog`, `db.indexes`, `db.wal`, `db.storage` and `db.metrics` are frozen
 snapshots for schema, inventory and diagnostics. They never retain the storage device, page pool,
 WAL, transaction manager or adapter callbacks. Writes go through transactions or explicit gated
-database methods (`checkpoint`, `recover`, `flush`, `publish_metrics`); there is no `unsafe=True`
-escape. `Transaction` exposes `snapshot`, `mode`, `txn_id`, `active` and `report`, but never its
-mutable engine context.
+database methods (`create_index`, `rehash_index`, `rehash_index_if_needed`,
+`ensure_identity_indexes`, `checkpoint`,
+`recover`, `flush`, `publish_metrics`); there is no `unsafe=True` escape. `Transaction` exposes
+`snapshot`, `mode`, `txn_id`, `active` and `report`, but never its mutable engine context.
+
+`db.maintenance.bloat(table=None)` is a conservative, header-only census at a non-pruning
+observation of the checkpoint-capped recyclable horizon; even TTL-stalled reader records remain
+pins. It reports ended versions and record-slot bytes that are eligible or retained by that
+horizon, but deliberately excludes overflow-page bytes and keeps
+`vacuum_safety_established=False`: observing potential bloat neither mutates the database nor
+certifies that physical reclamation is safe.
+
+`db.maintenance.vacuum(table=None, *, confirm_quiescent=False, max_versions=None)` is the
+separate mutating operation. Vacuum v1 is manual and foreground. It refuses catalog v1,
+read-only handles, an open local transaction and every call that does not pass the exact
+`confirm_quiescent=True` assertion. That assertion means the operator has stopped **every other
+Grafx process and handle**, including an older binary, for the whole call; reader TTL is never
+treated as proof of safety. The first call publishes the required `heap_reclaim_v1` capability,
+so older builds fail closed, then one WAL-before-data commit atomically advances a durable global
+snapshot floor, reconciles ACTIVE indexes, relinks retained chains and removes eligible inline
+versions. Use `max_versions` to bound removed heap versions per pass; index reconciliation is not
+part of that quota. A table filter still advances a heap-global floor and is therefore an
+availability choice for the whole database.
+
+The immutable `VacuumReport` distinguishes heap data pages rewritten, tuple-slot bytes removed,
+chain relinks, index entries removed and overflow versions skipped. `complete` means all eligible
+**inline** versions in the selected tables were handled by that pass; overflow history remains.
+Vacuum v1 does not truncate files, reclaim overflow pages or reuse page, slot or `RecordRef`
+identities. Restart application processes after the maintenance window so their first transaction
+adopts the new capability, floor and index authority. See
+[`docs/architecture/MVCC_VACUUM_V1.md`](docs/architecture/MVCC_VACUUM_V1.md).
+
+WAL page-image compression is a separate explicit, one-way activation:
+
+```python
+db.maintenance.ensure_identity_indexes()
+db.maintenance.enable_wal_page_compression()
+```
+
+The first call ensures catalog v2 exists; the second publishes required capability
+`wal_record_v2` in a v1-only transaction. Later commits use bounded zlib level 1 only when the
+complete page image becomes strictly smaller. Incompressible images and batches that roll to a new
+WAL segment retain the exact v1 full-image grammar. `max_wal_batch_bytes` measures the final encoded
+records. Current participants adopt the capability at their next protected boundary; older builds
+fail closed on the catalog capability or retained WAL v2. There is no disable/downgrade door. See
+[`WAL_PAGE_COMPRESSION_V1.md`](docs/architecture/WAL_PAGE_COMPRESSION_V1.md).
 
 ### In memory
 
@@ -455,9 +603,9 @@ invisible to every other process.
 ```
 mydb/
   identity.dat        # what this database is; refuses a mismatched open
-  catalog.dat         # the schema
+  catalog.dat         # schema plus catalog-v2 exact-index authority
   heap.dat            # rows, in slotted pages chained per table
-  index/              # one file per secondary index
+  index/              # immutable index generations; catalog v2 selects each ACTIVE file
   wal/                # segmented write-ahead log
   control/            # lease, commit state, reader registrations
   ledger/             # forensic evidence
@@ -481,7 +629,7 @@ and never degrades into a no-op — opening a database with an incomplete regist
 | `storage` | `StorageDevice` | Files, pages, growth, durability barriers, directory listing | `LocalStorageDevice` — a directory on the real filesystem | `MemoryStorageDevice` (`:memory:`), `FaultInjectingStorageDevice` (tests) |
 | `clock` | `Clock` | Monotonic time for liveness, wall time for human-facing stamps only | `SystemClock` | — |
 | `coordinator` | `ProcessCoordinator` | Leases, epochs, exclusive sections, reader registration, dead-owner takeover | `LocalProcessCoordinator` — lock files under `<db>/control` | same class, `lock_directory=None` for in-memory process-wide sections |
-| `codec` | `PageCodec` | Encoding and decoding a page image, checksum included | `PageCodecV1` | — |
+| `codec` | `PageCodec` | Encoding and decoding a page image, checksum included | `PageCodecV1` | `NumpyPageCodecV1` with `codec="numpy"` (needs `[accel]`) |
 | `metrics` | `MetricsSink` | Counters, gauges, histograms, timers | `NoOpMetricsSink` | `OpenMetricsSink`, `JsonMetricsSink` |
 | `events` | `EventSink` | Structured, sanitised, bounded event records | `LoggingEventSink` — standard-library `logging` | — |
 | `vector_math` | `VectorMath` | Distance and similarity kernels | `PureVectorMath` | `NumpyVectorMath` (needs `[accel]`) |
@@ -495,6 +643,13 @@ installing anything and checks injected callables again on real inputs. The clos
 make the same trust decision explicitly through `NativeCrc32c(..., verify_runtime=False)`.
 Supplying a custom registry replaces the seven ports, but does not disable this process-wide
 `checksum` selection.
+
+`QuerySpillFactory` is a separate, internal composition capability rather than an eighth registry
+slot. It exists only when `query_memory_budget_bytes` selects bounded blocking-query execution:
+the engine owns opaque, versioned record meaning, while the default `LocalQuerySpillFactory` owns
+temporary paths, host I/O and external merging. Keeping it outside `PortRegistry` preserves the
+seven-slot public adapter contract and does not expose a filesystem mechanism to `domain/` or
+`engine/`.
 
 ### Substituting an adapter
 
@@ -548,7 +703,7 @@ refused with the field name the caller actually wrote.
 | `partitions_per_table` | `64` | Conflict granularity — more partitions, fewer false conflicts |
 | `identity_lease_size` | `64` | Burn-only row-id range reserved durably per refill; larger values reduce heap page-0 metadata commits at the cost of wider harmless gaps after close/crash |
 | `buffer_budget_bytes` | `64 MiB` | Per database, never shared; must hold at least two configured pages |
-| `max_open_files` | `128` | Local descriptor-cache budget; tune down for descriptor-constrained hosts |
+| `max_open_files` | `256` | Lazy per-database descriptor-cache ceiling; tune down for descriptor-constrained or multi-database hosts |
 | `descriptor_revalidation` | `"strict"` | `"strict"` proves every cached descriptor hit; `"generation"` amortizes proofs for a closed canonical-file whitelist and requires an exclusively Grafx/Pulse-managed directory |
 | `recovery_policy` | `"replay"` | What the pass at open is allowed to do |
 | `lease_ttl_seconds` | `5.0` | How long a writer's lease stays valid without renewal |
@@ -561,12 +716,19 @@ refused with the field name the caller actually wrote.
 | `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
 | `max_result_rows` | `None` | Optional hard limit on public result rows; row N+1 is refused before it is retained and before any remaining input is consumed |
 | `max_intermediate_rows` | `None` | Optional hard limit per non-terminal physical operator over one execution; it is not a cumulative query-wide count |
+| `query_memory_budget_bytes` | `None` | Optional logical retained-byte ceiling per blocking sort, result-DISTINCT or aggregate operator; enables safe adapter-backed external spill without measuring RSS |
+| `max_traversal_expansions` | `None` | Optional cumulative per-query limit on relationship candidates examined by graph-pattern operators; candidate N+1 is refused before derived landing/filter work |
+| `max_traversal_paths` | `None` | Optional cumulative per-query limit on visible paths admitted by graph-pattern operators; path N+1 is refused before frontier retention or return |
+| `max_query_value_characters` | `65536` | Per-string parameter/result boundary; configurable from 1 through the hard 1,048,576-character guard; query-source literals keep their separate 16,384-character ceiling |
 | `max_transaction_rows` | `None` | Optional hard limit on retained `row_intents` in one transaction |
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
+| `max_index_build_entries` | `None` | Optional hard limit on final exact entries across one detached shadow-build batch; counted to at most N+1 and refused before catalog staging or the first generation file is created |
+| `automatic_index_expected_cardinality` | `None` | Keyword-only expected rows per newly materialized automatic exact index; derives 1..4096 eager buckets at 64 expected entries each, activates an empty writable catalog to v2, is persisted with that generation, and never rehashes an existing index |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
+| `codec` | `"pure"` | `"pure"` binds the byte-contract oracle; `"numpy"` explicitly selects the NumPy-backed, byte-identical dense-directory codec and requires `[accel]` |
 | `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
 | `checksum` | `"auto"` | `"auto"` accelerates when available; `"pure"` pins the reference |
 | `vector_exact_scan_threshold` | `4096` | Below this many candidates, search is exhaustive |
@@ -610,17 +772,63 @@ raises the non-retryable `GrafxTransactionBudgetExceeded`. A refused statement r
 pre-statement staging, and a refused final WAL batch is rejected before append; these refusals do
 not truncate the WAL or persist a partial statement.
 
-The two query row limits are also opt-in positive integers. `max_result_rows` counts the public
+The two query row limits are opt-in positive integers. `max_result_rows` counts the public
 terminal incrementally; it consumes row N+1 only to refuse it, before retaining it or consuming the
 rest of the stream and before `context.release()`. `max_intermediate_rows` counts each non-terminal
 physical operator separately for the whole execution. A public terminal is charged only as result;
 a terminal with no public columns is charged as intermediate. Overrun raises the non-retryable
 `GrafxQueryBudgetExceeded`, without truncating state or releasing a partial write statement.
 
-These are row-admission limits, not a complete query-memory budget. They do not bound cumulative
-work, payload bytes, internal structures, auxiliary scans, RSS, deadlines, traversal work, spill or
-stream results. Sort, aggregate, distinct and eager operators may retain up to the configured rows
-or states before their first yield; the memory of those payloads and structures is not bounded here.
+The two traversal limits are likewise opt-in positive integers, but are cumulative across every
+graph-pattern operator in one query. Variable and untyped traversal charge an expansion for each
+candidate yielded by their selected endpoint source, before repeat-edge and landing checks; a
+fixed relationship scan charges each stored or pending relationship it encounters, before its
+pushed predicate and endpoint checks. A path is charged only after the applicable pushed predicate
+and landing visibility checks, immediately before the path can enter a variable-length frontier or
+be returned by a one-hop scan. The first over-limit unit is refused before it is retained or
+returned. These limits cover Cypher relationship traversal and scans, not the separate internal
+HNSW navigation performed by a vector-search operator. Physical rows read once to construct a
+grouped endpoint fallback are auxiliary scan work and are not charged as candidate expansions.
+When disabled the limits do not add traversal counters to `QueryResult.statistics`; when enabled,
+the corresponding `traversal_expansions` or `traversal_paths` statistic records admitted work on
+successful queries.
+
+`max_query_value_characters` bounds each string parameter and each string copied across the public
+query-result boundary. It defaults to 65,536 characters, while query-source string literals retain
+their independent 16,384-character lexer ceiling. Applications may lower the value or raise it up
+to the hard 1,048,576-character guard; values above the effective ceiling are refused before page
+access. The option is process-local and does not change the on-disk format.
+
+`query_memory_budget_bytes` is a separate opt-in positive integer. `None` preserves the previous
+in-memory sort, top-N, result-DISTINCT and aggregation paths. When configured, each `SortRows`,
+`DistinctRows` and `AggregateRows` gets its own counter and uses adapter-owned external merge runs,
+so input cardinality no longer causes those operators' retained logical bytes to grow without the
+configured ceiling. The counter is deterministic **logical retention, never process RSS**: a
+buffered/run-head record is
+charged `32 + len(versioned_key) + len(versioned_payload)` bytes; one active aggregate group is
+charged 64 bytes plus its versioned detached key and 64 bytes per aggregate slot; each retained
+`COLLECT` or `MIN`/`MAX` value adds 16 bytes plus its versioned detached value; each strongly
+retained NaN identity adds 64 bytes; and a transaction-private held-row identity needed by
+result-DISTINCT adds 128 bytes plus its versioned detached values. Python object headers, allocator
+arenas, encoding/comparison temporaries, OS caches and the final caller-owned result are
+deliberately outside this portable accounting model.
+
+Spill records use purpose- and version-tagged `Value` encodings and a versioned run header; they
+never use pickle. Files live in an isolated adapter temporary directory, outside the database
+namespace; binary merge levels keep their in-memory path metadata O(log N), and all artifacts are
+removed on success, refusal, cancellation and cursor close. Cleanup failure is not silently
+accepted. A single record must fit beside another merge head, so its logical charge must be at most
+half the configured budget. Result `DISTINCT` and aggregate `DISTINCT` values spill too, preserving
+the first occurrence and its order. `COLLECT` still
+has to become one public tuple, so a group whose result itself exceeds the budget is refused rather
+than represented by a disk proxy. Enabling this option also routes `ORDER BY ... LIMIT` through the
+bounded external path instead of the faster O(K) top-N heap.
+
+`max_result_rows` and `max_intermediate_rows` remain independent and authoritative with spill
+enabled. This first byte-budget boundary does not cover `EagerRows`, vector-search candidate
+materialisation, deadlines, RSS or public result retention; use the row limits and cursor API for
+those separate boundaries. It changes no snapshot, transaction, WAL, OCC, durable format,
+multiwriter or multireader rule.
 
 ---
 
@@ -642,7 +850,7 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 | `GrafxRecoveryRefused` | ❌ | Recovery would not be safe; the evidence is preserved |
 | `GrafxBufferBudgetExceeded` | ✅ | The working set exceeded the budget |
 | `GrafxTransactionBudgetExceeded` | ❌ | An enabled statement, transaction or final WAL-batch limit was exceeded before partial persistence |
-| `GrafxQueryBudgetExceeded` | ❌ | An enabled public-result or per-operator intermediate row limit was exceeded before statement release |
+| `GrafxQueryBudgetExceeded` | ❌ | An enabled row, traversal or logical query-memory limit was exceeded before statement release |
 | `GrafxSchemaVersionMismatch` | ❌ | This build cannot read this database |
 | `GrafxPortNotConfigured` | ❌ | An incomplete registry, naming every missing slot |
 | `GrafxTransactionStateError` | ❌ | The transaction is not in a state that allows this |
@@ -656,11 +864,11 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 
 ## Status and limitations
 
-**0.0.1 is pre-alpha.** It is tested hard — 7900+ tests, multi-process smoke tests, crash-and-recover
+**0.0.3 is pre-alpha.** It is tested hard — multi-process smoke tests, crash-and-recover
 tests, a mutation battery with per-mutant verdicts — and it is still young. What that means in
 practice:
 
-- **The on-disk format is not stable.** A database written by 0.0.1 may not open in the next version.
+- **The on-disk format is not stable.** A database written by one pre-alpha version may not open in another.
   There is no migration path yet.
 - **Write throughput is currently platform-bound and serialized** — ~300 ms per durable commit on
   Windows, and all writers intersect on the table directory page, so disjoint writers queue. Reads
@@ -670,10 +878,10 @@ practice:
   reference engine; they are met on POSIX with `[accel]` and missed on Windows, where control-file
   publication costs ~16.5 ms against ~0.13 ms on Linux. The measurements and the analysis are in
   `docs/architecture/COMPONENTS.md`.
-- **Traversal with an unbound target resolves landings by scanning the landing table** (edges
-  store record identities, and identities carry no index yet). Endpoint indexes cover the edges
-  themselves, so the old every-edge-per-node scan is gone, but a hop that lands on a large free
-  table still pays one scan of it per traversal.
+- **Catalog-v1 traversal can still scan an unbound landing table.** Catalog-v2 activation adds an
+  automatic unsigned `RecordId -> RecordRef` exact index for relationship endpoint tables, so
+  eligible landings use one hash-directed lookup plus heap validation. Legacy/unactivated catalogs,
+  absent eligibility and deliberately scan-only collisions retain the canonical scan fallback.
 - **A plain `DELETE` of a node ends the node, not its relationships.** They stay on the pages
   as rows no traversal will follow — a landing whose snapshot cannot see the node is not
   reached — so the absence an ordinary `DELETE` promises is a logical one. `DETACH DELETE` is
@@ -704,6 +912,7 @@ the default `"strict"` mode.
 | `docs/architecture/CONTRACT.md` | The frozen coordination substrate: error taxonomy, on-disk formats, the commit protocol, the metric catalogue, and the Definition of Done every component is reviewed against |
 | `docs/architecture/COMPONENTS.md` | The component register, the sign-off record, and every carried finding with the measurement behind it |
 | [`docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md`](docs/architecture/ST2_DESCRIPTOR_REVALIDATION.md) | The strict/default and generation/opt-in descriptor identity policies, exact whitelist, risks and deployment guidance |
+| [`docs/architecture/P2_IDENTITY_SECONDARY_INDEXES_V1.md`](docs/architecture/P2_IDENTITY_SECONDARY_INDEXES_V1.md) | Catalog-v2 identity/custom exact indexes, immutable generations, sizing, foreground rehash, compatibility and recovery contract |
 | `docs/architecture/LESSONS.md` | What went wrong while building this and what it taught |
 | `docs/architecture/PUNCHLIST.md` | Known gaps, written down rather than hidden |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed, per release |

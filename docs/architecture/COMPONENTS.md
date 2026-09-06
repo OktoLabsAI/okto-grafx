@@ -247,8 +247,10 @@ contract rather than a careless caller. **Routed to C1**, with A66.1 applied: ev
 §6.6 freezes **six** reason codes; C4's `FailureReason` has **seven** verdicts. C6 read the codes as
 naming *why work was discarded*, not the shape of the damage: `CHECKSUM_FAILURE` -> 2, every other
 undecodable range -> `1 truncated_tail` (it **is** the tail being cut), with the exact decoder verdict
-travelling in the payload envelope. `UNSUPPORTED_VERSION` maps to nothing and instead **stops
-recovery** with `schema_version_mismatch`, rather than truncating intact bytes a newer build wrote.
+travelling in the payload envelope. `UNSUPPORTED_VERSION` and
+`UNSUPPORTED_REQUIRED_RECORD` map to nothing and instead **stop recovery** with
+`schema_version_mismatch`, rather than truncating intact bytes or required semantics another build
+wrote.
 That last choice is the important one and it is right: recovery must not destroy data it merely fails
 to understand.
 
@@ -724,7 +726,7 @@ restores the exact staging it received, while a final-batch refusal neither appe
 the WAL; neither path can persist half a statement. This is transaction admission only: it does not
 claim query streaming, query-memory/RSS enforcement or chunked WAL commits.
 
-### F1 query row budgets — per-operator admission (C0/C10; CLOSED)
+### F1 query and traversal budgets — bounded admission (C0/C10; CLOSED)
 
 `max_result_rows` and `max_intermediate_rows` are opt-in positive integers defaulting to `None`.
 The result counter advances while the public terminal is consumed: row N+1 is consumed only far
@@ -734,11 +736,46 @@ for the full execution rather than one cumulative query-wide count. The node fee
 is charged only as result; a terminal with no public columns is charged as intermediate.
 
 Both paths raise non-retryable `GrafxQueryBudgetExceeded` and neither truncates state nor hands a
-partial write statement to its transaction. The scope is deliberately rows, not RSS or total work:
-there is no streaming-result, deadline, traversal, spill or cumulative budget here. Sort, aggregate,
-distinct and eager operators may retain up to the admitted rows or states before their first yield;
-payload bytes, internal structures and auxiliary scans are not charged, so these fields are not a
-complete query-memory budget.
+partial write statement to its transaction.
+
+The additive public terminal stream is `Database.query(...).cursor()`. It owns an independent read
+transaction and fixed snapshot, pulls at most its configured batch, detaches values after page
+access and retains no page pin between pulls. Closing early discards only unread result rows and
+releases the reader; plans that write are refused before execution and remain materialised through
+`execute()`. Blocking operators below this terminal are unchanged.
+
+`max_traversal_expansions` and `max_traversal_paths` add two independent, opt-in cumulative budgets
+for graph-pattern work over the whole query. The first charges each relationship candidate before
+the remaining operator-local landing/repeat or pushed-predicate work; the second charges a visible,
+pushed-predicate-admitted path before frontier retention or return. Limit N refuses unit N+1 before
+that unit is retained. They cover
+typed, untyped and relationship-scan Cypher operators, not HNSW's internal graph. Disabled fields
+preserve the old statistics surface; enabled fields report their admitted counters on success.
+For a grouped endpoint fallback the candidate is what its adjacency map yields, not every physical
+relationship row read once to construct that map; the underlying auxiliary scan remains uncharged.
+
+`query_memory_budget_bytes` adds an independent, opt-in byte boundary for `SortRows`,
+`DistinctRows` and `AggregateRows`. `None` keeps their prior in-memory/top-N paths. A configured
+operator shares one
+deterministic logical-retention counter with an internal `QuerySpillWorkspace`; the local adapter
+uses isolated, versioned external merge runs outside the database namespace. It charges each
+buffered or merge-head record as `32 + versioned key bytes + versioned payload bytes`. Aggregate
+core state additionally charges 64 bytes plus the versioned group key, 64 bytes per aggregate,
+16 bytes plus the versioned value for retained `COLLECT`/extreme state, and 64 bytes for each
+strongly retained NaN identity. Result-DISTINCT additionally charges a transaction-private held-row
+identity as 128 bytes plus its versioned detached values. These strong slots preserve the existing
+identity-sensitive grouping/DISTINCT rules without allowing allocator-address reuse; exhaustion
+fails closed.
+
+This is logical accounting, not RSS estimation: interpreter headers, allocator arenas, transient
+codec/comparator work, OS caches and the materialised public result are excluded. A record larger
+than half the budget is refused because a two-way merge needs two simultaneous heads. Aggregate
+DISTINCT uses external passes; an intrinsically oversized `COLLECT` result is refused because the
+public value remains a tuple, not a disk proxy. Temporary artifacts are removed on success, error,
+cancellation and cursor close, and no pickle or executable serialization is used. The existing row
+and traversal limits still apply independently. `EagerRows`, vector candidate materialisation,
+deadlines and public result retention remain outside this byte boundary. Snapshot,
+write atomicity, WAL/OCC, durable formats and multi-process rules are unchanged.
 
 ### Fase 1.4 / P1.15 — OpenMetrics loopback-by-default bind (C0/C8/C11; CLOSED)
 
@@ -1512,10 +1549,12 @@ The traversal expands a frontier node through them, with two deliberate qualific
 1834 ms before, **221 ms** after; forward hop from one node 29 ms; two hops out and back 56 ms.
 Index-vs-scan equality asserted by test on every shape.
 
-**What remains, recorded not hidden:** the landing of a traversal with a FREE target is resolved by
-one scan of the landing table per traversal (edges store record identities, and no identity index
-exists); and the planner does not reorder a pattern to start from its seekable side, so
-`MATCH (c)-[:M]->(e {id: k})` still walks from `c`. Both in PUNCHLIST as the next levers.
+**What remained at CF-17, recorded not hidden:** the landing of a traversal with a FREE target was
+resolved by one scan of the landing table per traversal because edges store record identities and
+no identity index existed. P2-ID in `0.0.2` closes that first lever for activated catalog-v2
+endpoint tables with an unsigned `RecordId -> RecordRef` exact access path and heap validation;
+legacy/ineligible cases preserve the scan fallback. The planner still does not reorder a pattern to
+start from its seekable side, so `MATCH (c)-[:M]->(e {id: k})` still walks from `c`.
 
 ### CF-18 — round-6 reviews: the schema statement did not hold until complete, and a hostile
 ### metrics sink could turn a durable commit into a reported failure (C10/C5/C8; CLOSED)

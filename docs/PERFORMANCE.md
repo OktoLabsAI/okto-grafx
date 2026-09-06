@@ -26,6 +26,70 @@ taken with the machine otherwise idle, and says so.
 Version 0.0.1, commit `eaad9c2`. Pre-alpha: these are the numbers of a young engine, recorded
 honestly, ceilings included.
 
+### 0.0.2 checkpoint replay dispatch (batch 36)
+
+The 0.0.2 branch retains complete WAL reading, continuity/checksum proof and payload preflight at
+checkpoint, but uses a revocable process-local witness to avoid dispatching page and logical-index
+effects that the same process already applied and flushed. The witness covers only one exact
+checkpoint suffix and is discarded on every foreign, catalog/generation, dirty, recovery, failure
+or custom-collaborator boundary. In the audited 4,000-row/16-transaction run it activated 7 times
+and reduced `CommitRedo.apply` calls from 32 to 18. A seven-round, 250-insert checkpoint-only probe
+measured `0.15056 -> 0.10214 s` median (`1.47x`); an end-to-end 1,000-row sample was noisy and did
+not establish a throughput gain, so this is structural/directional evidence rather than a gate.
+The follow-up batch 37 also removed the shortcut's duplicate logical-index preflight: a focused
+update changed from effect counts `[3, 2, 0]` to `[3, 0]`, retaining the one complete strict proof.
+Batch 38 then reused the decoded RESET fact from that proof and from live staged-record validation,
+removing two remaining logical-record rescans. An A/B 2,000-row/8-commit/8-checkpoint sample moved
+from `11.397` to `11.166 s` median, but overlapping ranges make that temporal delta indistinguishable
+from noise. The claim is the structural removal of the rescans; timings remain informational.
+
+### 0.0.2 fresh index-certificate decode reuse (batch 39)
+
+Every certificate observation still invalidates descriptor identity and performs a fresh physical
+page-zero read. Exact byte equality with the last checksum-, structure- and semantics-validated
+image reuses one immutable pool-witness/certificate pair; any changed byte performs the complete
+canonical decode and validation. Corruptions confined to the last byte and interleaved foreign
+header changes are explicit regressions.
+
+In an instrumented 2,000-CREATE workload, generic decodes changed `1,015→12` and semantic header
+decodes `1,007→4`. Short timing samples were noisy and establish no endpoint or wall-clock claim.
+OCC, WAL, durability and multiwriter/multireader behavior are unchanged.
+
+### 0.0.2 atomic first-extent floor and commit-local append cursor (batch 40)
+
+When one commit creates the first rows of an empty table, its first row now creates the extent
+with the final exclusive identity floor already planned under `COMMIT_SECTION`. Later rows use
+the reserved path and share one opaque, sealed extent proof. The frozen authority contains the
+table, first page and reservation floor; only tail/page-count hints and their revocable epoch move
+within the commit. Every directory rewrite preserves the greater floor already present.
+
+In a 500-row structural probe, ordinary `HeapStore.insert` and
+`_observe_record_id_extent` calls changed `500→0`; one `insert_initial_reserved`, 499
+`insert_reserved`, one proof and three `_find_extent` calls remained. The 62 directory rewrites
+equalled the 62 real page growths (`page_count=63`), rather than repeating per row. Short wall
+timings are not promoted as a gate. Adversarial regressions cover a newer floor, a modified cursor
+floor, a modified first-page hint, an empty-table two-writer race, pre-WAL failure/retry and a
+mixed empty/existing-table commit. WAL/OCC, durability and multiwriter/multireader behavior are
+unchanged.
+
+### 0.0.2 statement- and commit-local index authority (batch 41)
+
+Exact built-in statements whose table footprint is closed now resolve ACTIVE indexes only for
+those tables. The canonical commit path captures the same bounded authority after the first OCC,
+catalog rebase and committed-index synchronization, while already holding the writer lease,
+WAL-tail lock and `COMMIT_SECTION`. It is transient and revoked on success, conflict or exception.
+Untyped/polymorphic/custom statements, custom managers and pre-staged records preserve the global
+fallback.
+
+In the structural probe, growing the catalog from 1 to 80 tables left the work of a Pulse-like
+`CREATE Person` unchanged in catalog v1 and v2: zero `Catalog.tables()`, zero global ACTIVE-index
+enumerations and zero global registry walks. Only `Person` was inspected; the statement performed
+one table-local lookup and commit performed four, while the unregistered-artifact check inspected
+one table and one definition. This removes dependence on unrelated schema size from the canonical
+path. The earlier statement-only probe reduced definition checks from 80 to 2 (`40x` structurally);
+short timings were informational and are not promoted as a gate. WAL, both OCC passes, durability,
+rebuild/retarget validation and multiwriter/multireader behavior are unchanged.
+
 ---
 
 ## 1. Test machine and build
@@ -38,7 +102,7 @@ honestly, ceilings included.
 | OS / filesystem | Windows 11 Home (10.0.26200) / NTFS |
 | Python | 3.13.1 |
 | Build | `[accel]` installed — native CRC-32C (`google-crc32c`), numpy 2.5.1 present |
-| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `max_open_files=128`, `partitions_per_table=64`, `identity_lease_size=64`, `descriptor_revalidation="strict"`, `metrics="noop"`, `checksum="auto"` (→ native) |
+| Configuration | `connect()` defaults: `page_size=8192`, `buffer_budget_bytes=64 MiB`, `max_open_files=256`, `partitions_per_table=64`, `identity_lease_size=64`, `automatic_index_expected_cardinality=None`, `descriptor_revalidation="strict"`, `metrics="noop"`, `checksum="auto"` (→ native) |
 
 Cross-platform rows in §5 additionally used Ubuntu (WSL2, ext4) on the same hardware.
 
@@ -171,10 +235,51 @@ The distinction avoids speculative probes on a scan-shaped plan, which previousl
 `edge_lookups` and `edge_scans`, and the instrument proves **index-vs-scan equality** by staling the
 indexes and comparing answers.
 
-**Known ceiling, recorded:** a traversal whose target is *unbound* resolves landings by one scan of
-the landing table per traversal (edges store record identities; identities carry no index yet) —
-that is most of the 192.9 ms above, and the next structural lever. See PUNCHLIST, *"Traversal after
-CF-17: the two levers left"*.
+For a known bulk load, set `automatic_index_expected_cardinality` on the connection that activates
+catalog v2 or creates later tables. The value is the expected row count of the largest automatic
+exact index, not the sum across the graph. Grafx derives the next power-of-two directory at 64
+expected entries per bucket. Leave it unset when the scale is unknown: every bucket owns an eager
+head page, relationship tables own both `ef_` and `et_`, referenced keyed node tables own both PK
+and identity artifacts, and full index walks still cost
+`O(bucket_count + entries)`. The option affects only new generations; use explicit
+`rehash_index(...)` for an undersized existing index.
+
+When cardinality was not known at creation time,
+`maintenance.rehash_index_if_needed(name, overflow_pages_per_bucket=1)` is a bounded advisory
+door. It validates the catalog-selected physical header and reads only the `B` eager head pages
+(`B <= 4096`), not all entries or overflow chains. It requests one `B -> 2B` foreground rehash
+when occupied head slots reach `64 * B` or retained extra pages reach the configured integer
+ratio. The 4,096-bucket ceiling is identity-checked and returned immediately without the head-page
+pass. This avoids an O(N) assessment, but is not a free health check: a cold filesystem pays O(B),
+retained/unlinked pages can recommend early growth, hot-key skew may not improve after rehash, and
+the selected shadow build still pauses writers. Use it at an operator-selected maintenance point,
+not after every commit or in an unconditional loop.
+
+**Historical ceiling, now structurally addressed in 0.0.2:** the measurements above predate P2-ID,
+when a traversal whose target was *unbound* resolved landings by one scan of the landing table
+because edges store record identities. Activated catalog-v2 endpoint tables now receive an
+unsigned `RecordId -> RecordRef` exact access path and use one hash-directed lookup plus heap
+validation; legacy/ineligible cases keep the canonical scan. No post-P2 wall-time result is claimed
+here. See PUNCHLIST, *"Traversal after CF-17: the two levers left"*.
+
+### Vector top-k as an end-to-end access path (0.0.2)
+
+A bounded similarity query whose candidate child is exactly one unfiltered node-table scan no
+longer has to materialise every heap row before HNSW can run. At the current certified snapshot
+frontier, and only when the registered index names the exact planned table/column pair,
+`VectorSearch` lets the vector index produce hits and revalidates only their physical
+`VectorHit.ref` witnesses. The focused discriminant uses 8 heap rows and `LIMIT 3`: both exact and
+approximate plans report `vector_rows_materialized=3`, while the equivalent forced-canonical plan
+reports `rows_scanned=8` and returns byte/value-identical rows and score order.
+
+This is a complexity claim, not a wall-time benchmark: after the derived HNSW picture and D-12
+cardinality are warm, the query-layer heap materialisation changes from **O(N) payloads to O(K)**.
+An exact vector regime still performs its intentional exhaustive vector scoring, and a cold HNSW
+still performs its intentional rebuild; this change removes the redundant query child scan, not
+those costs. Filters, historical/custom snapshots, stale state, an unbounded search, configured
+intermediate-row admission and uncertain sparse-vector cardinality decline the shortcut; dirty
+owner state keeps its existing fail-closed RYOW refusal. No beam, recall floor, index format, WAL
+or locking protocol changed.
 
 ---
 
@@ -403,6 +508,59 @@ and B `194/194`, with zero conflicts, retries, refusals or reopens; live and col
 generation, source authority and storage identity were stable. Its `4.421593/s` rate and CPU values
 are recorded only as observations.
 
+### Buffer retained-memory and descriptor-cache telemetry (0.0.2 development)
+
+`BufferPool.used_bytes()` remains the compatible nominal admission reading: resident frame count
+times configured page size. The separate `retained_bytes_estimate()` diagnostic uses the
+pointer-width-calibrated `python-v2` formula and covers pool-owned frame/Page objects, page payload
+buffers, slot directories, retired-pinned frames, dirty/modified/abandoned sets, epoch maps,
+metric-label containers, in-flight load reservations and dirty frames detached during eviction.
+The `python-v2` label distinguishes those transient objects from the earlier `python-v1` formula.
+It intentionally excludes allocator arenas, interpreter-specific header variations,
+storage/codec/metrics collaborators, arbitrary read-view tokens and temporary raw/decode values
+owned only by an executing call stack. It is therefore an honest estimate of the pool-owned
+retained Python object graph, not process RSS, and it does not change nominal admission or eviction.
+
+Batch 39 additionally retains one raw page-zero image per accessed `IndexStore`: approximately
+8 KiB at the default page size, or about 1.1 MiB for 141 stores. This memory is owned outside
+`BufferPool` and is therefore intentionally absent from
+`oktografx_buffer_retained_estimate_bytes`.
+
+The same value is exposed as
+`oktografx_buffer_retained_estimate_bytes{db,estimator="python-v2"}` and in the immutable
+`Database.pool` view. The gauge is sampled when the pool reports a residency-topology change;
+reading `Database.pool` recomputes the current diagnostic, including slot-directory changes made
+since that sample. This avoids turning each ordinary page release into a whole-pool telemetry
+walk. Changing the formula requires a new estimator value so historical series do not silently
+change meaning.
+
+The local descriptor cache now exposes cumulative `hits`, `misses` and capacity-driven LRU
+`evictions` through the immutable `Database.storage` view and the three unlabelled
+`oktografx_descriptor_cache_*_total` counters. No logical name, file or path is a label. The
+adapter records integers under its own guard, but sends metric deltas only after the public
+storage door has released that guard. The existing composition-level containment boundary also
+defers a nested storage emission until the enclosing buffer-pool guard is released. A
+disabled/no-op sink receives no registration or emission callback; counters and estimator state
+reset with their owning device/pool lifecycle.
+
+### Buffer cold-miss single-flight (0.0.2 development)
+
+Production assembly now gives each pool one `ConditionGuard`. Resident hits retain the existing
+single guarded dictionary/LRU/pin-count path. A miss reserves capacity atomically, keyed by the
+bounded physical identity `(file, page_index)`, and performs device read plus page decode after
+releasing the global pool guard. A caller finding the same key in flight waits rather than issuing
+duplicate I/O; success publishes exactly one Page object, while failure removes the reservation and
+wakes every waiter without caching the exception. Loads for different keys can overlap.
+
+Resident frames, load reservations and dirty-eviction reservations share the configured page
+capacity. `used_bytes()` deliberately remains the compatible resident-frame metric; `python-v2`
+retained memory includes the transient objects. Invalidation/read-view/structure epochs captured
+before I/O are rechecked at publication, so bytes read from an older view are discarded and loaded
+again. Dirty victims are hidden behind an eviction ticket, encoded and written without the pool
+guard, and only then release their slot. State-sensitive doors wait for such a write, but never for
+a read-only load; same-thread callback re-entry that would wait on its own ticket is typed-refused
+instead of deadlocking. No metric, file path, page key or other open-cardinality label was added.
+
 ### F1, CE-3 and M-PULSE-7 gate chain
 
 The M-PULSE-7 input ratchet is certified at Pulse Community
@@ -434,6 +592,45 @@ contract, F4 multiprocess proof and structural PF5 gate are complete. The former
 an official CE-3 performance matrix and a `7.5/s` entry floor was retired on 2026-09-01. M-PULSE-7
 now proceeds directly under the quality gates stated at the top of this document; a future CE-3
 matrix is optional performance evidence and cannot block it.
+
+### D-26 exclusive-window instrumentation (0.0.2 development)
+
+The 0.0.2 performance round adds bounded-cardinality measurements that locate write-commit cost
+before selecting later optimizations. `oktografx_commit_window_duration_seconds` separates wait and
+hold for the writer lease and `COMMIT_SECTION`; `oktografx_commit_phase_duration_seconds` partitions
+the commit-section hold across `other`, `occ`, `materialize`, `build_records`, `append`, `barrier`,
+`apply`, `flush`, `index` and `publish`. The phase durations reconcile to the section hold for a
+complete timing sample. A typed coordination timeout closes its wait sample at the failure
+boundary, not after participant unwind. An untyped acquisition failure cannot prove that no grant
+occurred and therefore suppresses the whole trace.
+
+`other` deliberately includes completion/application of a durable commit left behind by another
+participant before this attempt starts its first OCC predicate. The separate foreign-commit
+counter reports how many such commits were completed. Classifying that recovery work as `occ`
+would make a foreign gap look like local conflict-validation cost and could select the wrong
+optimization.
+
+The counters report page images logged, physical live-WAL bytes successfully appended (including a
+segment header on rollover), actual buffer-pool flush calls, resident and retired-pinned frames
+traversed by commit-time flush/modified/dirty checks, foreign durable commits completed, and batches
+successfully retargeted. Buffer accounting is a data-only probe: it is attached after participant
+serialization and detached before that section is released, so consecutive local commits cannot
+steal or mix one another's accounting.
+
+Collection is outcome-neutral. The no-op sink constructs no trace object; an enabled trace invokes
+neither the sink nor the host-provided `Clock` while an exclusive window is held. It emits after all
+three coordination layers are proven settled, and a hostile sink cannot alter the commit result.
+Any uncertain acquisition or release suppresses the whole trace rather than invoking host code
+while a boundary may remain held. The exact
+`time.perf_counter_ns` observation used for diagnostics is the sole narrow G2 exception and is never
+an input to liveness, WAL, visibility or durability. If that timer fails, duration samples for the
+attempt are discarded while counters and the transaction continue normally.
+
+The internal `retain_lease=True` policy emits no D-26 per-commit trace. Because its writer lease
+remains live after the operation, there is no safe complete-trace callback boundary; emitting would
+contradict A91. The public/default lease-per-commit policy is fully instrumented. Official probe
+effect and disabled-overhead numbers remain pending P0.4 on an isolated machine; no temporal claim
+is made from development runs while the live Pulse backfill is active.
 
 ---
 

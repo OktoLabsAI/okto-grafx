@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "okto-grafx"
-version = "0.0.1"
+version = "0.0.3"
 description = "Okto Grafx - embedded graph database for Python: multi-process safe, verifiable on disk, recoverable by construction"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -61,10 +61,10 @@ License = "https://github.com/OktoLabsAI/okto-grafx/blob/main/LICENSE"
 #     reference engine falls from ~17x to ~5x with it, which is inside the ceiling
 #     binding decision D5 sets.
 #
-#   numpy - accelerated vector math. Selected only by `vector_math="numpy"`, never
-#     automatically: the pure and accelerated adapters agree to a stated tolerance
-#     rather than exactly, so `auto` binds the pure oracle deliberately and the ranking
-#     of a query does not depend on the machine it ran on.
+#   numpy - accelerated vector math and an independently selected page codec. Vector
+#     math is selected only by `vector_math="numpy"` and agrees to a stated tolerance.
+#     `codec="numpy"` remains byte-identical to page format v1. Neither selector falls
+#     back silently when the optional dependency is absent.
 accel = [
     "numpy>=1.24",
     "google-crc32c>=1.5",

@@ -23,7 +23,7 @@ snapshot of that reader, and the heap never applies that decision on its own.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -64,6 +64,9 @@ NO_PREVIOUS_VERSION: int = 0
 
 _HEADER_STRUCT = struct.Struct("<BBHIQQQQ")
 _POINTER_STRUCT = struct.Struct("<I")
+
+_RecordHeaderFields = tuple[int, int, int, int, int, int, int, int]
+"""Fields unpacked from ``_HEADER_STRUCT``, in the struct's declared order."""
 
 OVERFLOW_POINTER_SIZE: int = _POINTER_STRUCT.size
 """Bytes that follow the header of a record whose payload overflowed: the first chain page."""
@@ -148,6 +151,37 @@ class RecordHeader:
         )
 
     @classmethod
+    def peek(cls, raw: bytes) -> _RecordHeaderFields:
+        """Unpack the fixed fields without constructing a :class:`RecordHeader`.
+
+        The tuple follows ``_HEADER_STRUCT`` exactly.  Heap predicates can therefore inspect
+        ``record_id``, ``xmin`` and ``xmax`` after one struct operation, without duplicating byte
+        offsets outside this format-owning module or paying for a dataclass they will reject.
+        """
+        if len(raw) < RECORD_HEADER_SIZE:
+            raise GrafxCorruptionDetected(
+                f"A record header needs {RECORD_HEADER_SIZE} bytes; got {len(raw)}.",
+                field="record_header",
+                value=len(raw),
+            )
+        return _HEADER_STRUCT.unpack_from(raw, 0)
+
+    @classmethod
+    def _from_peek(cls, fields: _RecordHeaderFields) -> RecordHeader:
+        """Materialize fields already checked and unpacked by :meth:`peek`."""
+        flags, reserved, schema_version, payload_len, record_id, xmin, xmax, prev = fields
+        return cls(
+            record_id=record_id,
+            xmin=xmin,
+            xmax=xmax,
+            prev_version=prev,
+            payload_len=payload_len,
+            schema_version=schema_version,
+            flags=flags,
+            reserved=reserved,
+        )
+
+    @classmethod
     def decode(cls, raw: bytes) -> RecordHeader:
         """Parse the first 40 bytes of a slot payload into a record header."""
         if len(raw) < RECORD_HEADER_SIZE:
@@ -187,6 +221,22 @@ class HeapVersion:
     schema_version: int
     deleted: bool
     table_id: int
+    _stored_payload_bytes: int | None = field(
+        default=None,
+        init=False,
+        compare=False,
+        repr=False,
+    )
+
+    @property
+    def stored_payload_bytes(self) -> int | None:
+        """Return the authenticated stored payload length when this version came from the heap.
+
+        Synthetic and transaction-private versions deliberately answer ``None``.  Callers may
+        use this only as derived accounting evidence; row identity, visibility and contents
+        continue to be decided by the ordinary fields and the owning snapshot.
+        """
+        return self._stored_payload_bytes
 
     @property
     def live(self) -> bool:

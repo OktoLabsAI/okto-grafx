@@ -22,7 +22,10 @@ from collections.abc import Callable
 
 import pytest
 
-from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice, SimulatedCrash
+from okto_grafx.adapters.storage_fault import (
+    FaultInjectingStorageDevice,
+    SimulatedCrash,
+)
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -34,8 +37,10 @@ from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.wal import (
     CHECKSUM_LENGTH,
     MAGIC_BYTES,
+    WAL_FORMAT_VERSION,
     WAL_HEADER_LENGTH,
     WAL_MAGIC,
+    WAL_V2_FLAG_REQUIRED,
     FailureReason,
     WalRecord,
     WalRecordType,
@@ -146,9 +151,13 @@ def test_a_retry_after_a_failed_batch_writes_each_number_once(
     device.clear_trail()
     device.write_partially(30, method="append_log")
     with pytest.raises(GrafxDeviceFull):
-        manager.append_many([make_record(1), make_record(2, record_type=WalRecordType.COMMIT)])
+        manager.append_many(
+            [make_record(1), make_record(2, record_type=WalRecordType.COMMIT)]
+        )
     device.disarm()
-    manager.append_many([make_record(1), make_record(2, record_type=WalRecordType.COMMIT)])
+    manager.append_many(
+        [make_record(1), make_record(2, record_type=WalRecordType.COMMIT)]
+    )
     manager.barrier()
     reopened = make_wal(memory_device)
     lsns = _lsns(reopened)
@@ -168,7 +177,9 @@ def test_a_failed_roll_leaves_no_segment_that_stops_recycling(
     device.clear_trail()
     device.fill_device_on("append_log")
     with pytest.raises(GrafxDeviceFull):
-        manager.append_many([make_record(index, payload=bytes(120)) for index in range(3)])
+        manager.append_many(
+            [make_record(index, payload=bytes(120)) for index in range(3)]
+        )
     device.disarm()
     assert [segment.name for segment in manager.segments()] == before
     # The index would look right either way: re-deriving the tail moves the segment number past
@@ -229,7 +240,11 @@ def test_a_crash_at_the_append_leaves_a_log_that_reads_back_contiguously(
     device.crash_on("append_log", moment=moment)
     with pytest.raises(SimulatedCrash):
         manager.append_many(
-            [make_record(1), make_record(2), make_record(3, record_type=WalRecordType.COMMIT)]
+            [
+                make_record(1),
+                make_record(2),
+                make_record(3, record_type=WalRecordType.COMMIT),
+            ]
         )
     reopened = make_wal(memory_device)
     assert reopened.damage is None
@@ -239,10 +254,14 @@ def test_a_crash_at_the_append_leaves_a_log_that_reads_back_contiguously(
 
 @pytest.mark.parametrize("occurrence", [1, 2, 3])
 def test_a_crash_at_each_write_point_of_a_roll_is_recoverable(
-    make_wal: Callable[..., WalManager], tmp_path_factory: pytest.TempPathFactory, occurrence: int
+    make_wal: Callable[..., WalManager],
+    tmp_path_factory: pytest.TempPathFactory,
+    occurrence: int,
 ) -> None:
     """TS-4 in miniature: crash at each write of a segment roll and reopen every time."""
-    device = FaultInjectingStorageDevice(MemoryStorageDevice(page_size=PAGE_SIZE), seed=17)
+    device = FaultInjectingStorageDevice(
+        MemoryStorageDevice(page_size=PAGE_SIZE), seed=17
+    )
     manager = make_wal(device, segment_bytes=MIN_SEGMENT_BYTES)
     _fill(manager, 2)
     surviving = _lsns(manager)
@@ -337,7 +356,12 @@ def test_the_strict_reader_raises_where_the_tolerant_one_reports(
         list(reopened.read_from(0))
     items = list(reopened.scan_all())
     assert any(item.failure is not None for item in items)
-    assert [item.record.lsn for item in items if item.record is not None] == [1, 2, 3, 4]
+    assert [item.record.lsn for item in items if item.record is not None] == [
+        1,
+        2,
+        3,
+        4,
+    ]
 
 
 def test_a_hole_inside_a_segment_keeps_the_records_after_it_readable(
@@ -354,7 +378,11 @@ def test_a_hole_inside_a_segment_keeps_the_records_after_it_readable(
     name = manager.segments()[0].name
     data = _bytes_of(memory_device, name)
     hole_at = 200
-    _rewrite(memory_device, name, data[:hole_at] + bytes(PAGE_SIZE) + data[hole_at + PAGE_SIZE :])
+    _rewrite(
+        memory_device,
+        name,
+        data[:hole_at] + bytes(PAGE_SIZE) + data[hole_at + PAGE_SIZE :],
+    )
     reopened = make_wal(memory_device)
     assert reopened.damage is not None
     assert reopened.damage.offset <= hole_at
@@ -365,7 +393,9 @@ def test_a_hole_inside_a_segment_keeps_the_records_after_it_readable(
     assert failures[0].length > 0
     assert records, "the records after the hole must still be reachable"
     assert records[-1].lsn == 9
-    assert any(failure.reason is FailureReason.LSN_DISCONTINUITY for failure in failures)
+    assert any(
+        failure.reason is FailureReason.LSN_DISCONTINUITY for failure in failures
+    )
 
 
 def test_a_missing_segment_reads_as_records_lost_rather_than_as_nothing(
@@ -393,7 +423,7 @@ def test_a_record_from_a_later_build_is_a_version_question(
     name = manager.segments()[-1].name
     data = bytearray(_bytes_of(memory_device, name))
     last_record_at = _offset_of_last_record(bytes(data))
-    struct.pack_into("<H", data, last_record_at + 4, 2)
+    struct.pack_into("<H", data, last_record_at + 4, WAL_FORMAT_VERSION + 1)
     body = bytes(data[: len(data) - 4])
     data[-4:] = struct.pack("<I", crc32c(body))
     _rewrite(memory_device, name, bytes(data))
@@ -402,6 +432,54 @@ def test_a_record_from_a_later_build_is_a_version_question(
     assert reopened.damage.reason is FailureReason.UNSUPPORTED_VERSION
     with pytest.raises(GrafxSchemaVersionMismatch):
         list(reopened.read_from(0))
+
+
+@pytest.mark.parametrize("door", ["read_from", "append", "recycle"])
+def test_an_unknown_required_v2_record_refuses_without_changing_the_log(
+    door: str,
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+) -> None:
+    """Required-but-unknown semantics are an upgrade refusal through every mutating door."""
+
+    manager = make_wal(memory_device, segment_bytes=512)
+    _fill(manager, 20)
+    assert len(manager.segments()) >= 2
+    name = manager.segments()[-1].name
+    data = bytearray(_bytes_of(memory_device, name))
+    last_record_at = _offset_of_last_record(bytes(data))
+    struct.pack_into("<H", data, last_record_at + 4, WAL_FORMAT_VERSION)
+    struct.pack_into("<H", data, last_record_at + 6, 250)
+    struct.pack_into("<H", data, last_record_at + 10, WAL_V2_FLAG_REQUIRED)
+    record_length = struct.unpack_from("<I", data, last_record_at + 12)[0]
+    record_end = last_record_at + record_length
+    body_end = record_end - CHECKSUM_LENGTH
+    data[body_end:record_end] = struct.pack(
+        "<I", crc32c(bytes(data[last_record_at:body_end]))
+    )
+    _rewrite(memory_device, name, bytes(data))
+
+    reopened = make_wal(memory_device, segment_bytes=512)
+    assert reopened.damage is not None
+    assert reopened.damage.reason is FailureReason.UNSUPPORTED_REQUIRED_RECORD
+    before = {
+        file: _bytes_of(memory_device, file)
+        for file in memory_device.list_files("wal/")
+    }
+
+    with pytest.raises(GrafxSchemaVersionMismatch) as raised:
+        if door == "read_from":
+            list(reopened.read_from(0))
+        elif door == "append":
+            reopened.append(make_record(999))
+        else:
+            reopened.recycle(reopened.last_lsn + 1_000)
+
+    assert raised.value.details["reason"] == "unsupported_required_record"
+    assert {
+        file: _bytes_of(memory_device, file)
+        for file in memory_device.list_files("wal/")
+    } == before
 
 
 def _offset_of_last_record(data: bytes) -> int:
@@ -515,7 +593,9 @@ def test_a_checksum_failure_is_counted_under_the_record_kind(
     ids=["only-magic", "only-zeros", "only-ones", "every-byte"],
 )
 def test_a_segment_of_rubbish_terminates_and_reports(
-    make_wal: Callable[..., WalManager], memory_device: MemoryStorageDevice, planted: bytes
+    make_wal: Callable[..., WalManager],
+    memory_device: MemoryStorageDevice,
+    planted: bytes,
 ) -> None:
     """A88: a hang is the loudest failure, so a scan over anything at all must stop."""
     manager = make_wal(memory_device)
@@ -525,9 +605,9 @@ def test_a_segment_of_rubbish_terminates_and_reports(
     reopened = make_wal(memory_device)
     items = list(reopened.scan_all())
     assert items, "a scan of rubbish still has to report something"
-    assert all(
-        (item.record is None) != (item.failure is None) for item in items
-    ), "every item carries exactly one of a record and a failure"
+    assert all((item.record is None) != (item.failure is None) for item in items), (
+        "every item carries exactly one of a record and a failure"
+    )
     assert reopened.damage is not None
 
 
@@ -542,10 +622,15 @@ def test_a_scan_never_revisits_an_offset(
     _rewrite(memory_device, name, data[:150] + MAGIC_BYTES * 30 + data[150 + 120 :])
     reopened = make_wal(memory_device)
     positions = [
-        (segment_index(reopened, item.segment), item.offset) for item in reopened.scan_all()
+        (segment_index(reopened, item.segment), item.offset)
+        for item in reopened.scan_all()
     ]
     assert positions == sorted(positions)
-    failures = [position for position, item in zip(positions, reopened.scan_all()) if item.failure]
+    failures = [
+        position
+        for position, item in zip(positions, reopened.scan_all())
+        if item.failure
+    ]
     assert len(set(positions)) >= len(failures)
 
 
@@ -621,20 +706,23 @@ def _planted_record(*, descriptor: bytes, lsn: int, epoch: int = 1) -> bytes:
     plant one.
     """
     total = WAL_HEADER_LENGTH + len(descriptor) + CHECKSUM_LENGTH
-    body = struct.pack(
-        "<IHHHHIQQQII",
-        WAL_MAGIC,
-        1,
-        int(WalRecordType.WRITE_PAGE),
-        WAL_HEADER_LENGTH,
-        0,
-        total,
-        lsn,
-        epoch,
-        1,
-        len(descriptor),
-        0,
-    ) + descriptor
+    body = (
+        struct.pack(
+            "<IHHHHIQQQII",
+            WAL_MAGIC,
+            1,
+            int(WalRecordType.WRITE_PAGE),
+            WAL_HEADER_LENGTH,
+            0,
+            total,
+            lsn,
+            epoch,
+            1,
+            len(descriptor),
+            0,
+        )
+        + descriptor
+    )
     return body + struct.pack("<I", crc32c(body))
 
 
@@ -668,7 +756,9 @@ def test_a_record_this_build_cannot_hold_is_stepped_over_and_the_rest_still_read
     failures = [item.failure for item in items if item.failure is not None]
     records = [item.record for item in items if item.record is not None]
     assert failures[0].reason is FailureReason.UNREPRESENTABLE_RECORD
-    assert failures[0].length == len(planted), "the step must be the record's own length"
+    assert failures[0].length == len(planted), (
+        "the step must be the record's own length"
+    )
     assert [record.lsn for record in records] == [1, 2, 3, 5]
     assert reopened.damage is not None
     report = reopened.truncate_after(3)
@@ -756,7 +846,9 @@ def test_truncating_to_nothing_empties_the_log_and_it_still_reopens(
     assert set(left).isdisjoint(used)
     assert memory_device.log_size(left[0]) == 0
     assert manager.append(make_record(1)) == 2
-    assert set(segment.name for segment in manager.segments()).isdisjoint(used | set(left))
+    assert set(segment.name for segment in manager.segments()).isdisjoint(
+        used | set(left)
+    )
     reopened = make_wal(memory_device)
     assert reopened.damage is None
     assert _lsns(reopened) == [1, 2]
@@ -953,7 +1045,9 @@ def test_a_record_written_by_this_build_is_read_back_identically(
     manager.barrier()
     reopened = make_wal(memory_device)
     read_back = [
-        record for record in reopened.read_from(0) if record.record_type == WalRecordType.COMMIT
+        record
+        for record in reopened.read_from(0)
+        if record.record_type == WalRecordType.COMMIT
     ]
     assert len(read_back) == 1
     assert read_back[0] == written.with_lsn(2)

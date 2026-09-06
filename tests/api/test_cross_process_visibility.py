@@ -247,11 +247,14 @@ def test_a_foreign_persistent_index_missing_after_sync_refuses_before_wal(
             txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
             txn.execute("CREATE (:P {id: 1, name: 'before'})")
 
+        # The ordinary read boundary now also adopts foreign catalog authority.  Disable that
+        # same callback before begin so this test still exercises the commit-time fail-closed
+        # inventory proof rather than succeeding through the earlier safety door.
+        monkeypatch.setattr(old._transactions, "_index_sync", lambda: ())
         pending = old.begin("write")
         pending.execute("MATCH (p:P) WHERE p.id = 1 SET p.name = 'never-published'")
         before_published = old.transactions.published_lsn()
         before_wal = old._wal.last_lsn
-        monkeypatch.setattr(old._transactions, "_index_sync", lambda: ())
 
         with pytest.raises(GrafxTransactionStateError) as refused:
             pending.commit()
@@ -265,6 +268,96 @@ def test_a_foreign_persistent_index_missing_after_sync_refuses_before_wal(
             pending.rollback()
         publisher.close()
         old.close()
+
+
+def test_foreign_row_dml_does_not_rescan_the_index_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A proved heap/index-only WAL delta keeps the read boundary O(changed effects)."""
+
+    root = tmp_path / "foreign-row-no-index-sync"
+    options = {"page_size": 512, "checkpoint_interval_records": 1_000_000}
+    publisher = connect(root, **options)
+    observer = None
+    try:
+        with publisher.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+            txn.execute("CREATE (:P {id: 1})")
+        observer = connect(root, **options)
+        original_sync = observer._transactions._index_sync
+        sync_calls = 0
+
+        def counted_sync() -> object:
+            nonlocal sync_calls
+            sync_calls += 1
+            assert original_sync is not None
+            return original_sync()
+
+        monkeypatch.setattr(observer._transactions, "_index_sync", counted_sync)
+        # The first view remains conservative because a foreign DDL could have landed between
+        # assembly and this statement.  When the persisted catalog image is unchanged, however,
+        # that proof must not repeat the full index inventory/header-open pass from connect().
+        assert observer.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == (
+            (1,),
+        )
+        assert sync_calls == 0
+
+        with publisher.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 2})")
+
+        assert observer.execute("MATCH (p:P) WHERE p.id = 2 RETURN p.id").rows == (
+            (2,),
+        )
+        assert sync_calls == 0
+
+        # Checkpoint movement makes the bounded-WAL proof decline, but catalog bytes did not
+        # change.  The authority-image comparison must avoid a full index inventory/open pass.
+        publisher.checkpoint()
+        assert observer.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == (
+            (1,),
+        )
+        assert sync_calls == 0
+    finally:
+        if observer is not None:
+            observer.close()
+        publisher.close()
+
+
+def test_a_row_commit_with_unchanged_authority_skips_the_registry_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit keeps its final inventory proof without repeating catalog adoption."""
+
+    database = connect(
+        tmp_path / "unchanged-authority-commit",
+        checkpoint_interval_records=1_000_000,
+    )
+    pending = None
+    try:
+        with database.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE P(id INT64, PRIMARY KEY(id))")
+
+        pending = database.begin("write")
+        pending.execute("CREATE (:P {id: 1})")
+        original_sync = database._transactions._index_sync
+        sync_calls = 0
+
+        def counted_sync() -> object:
+            nonlocal sync_calls
+            sync_calls += 1
+            assert original_sync is not None
+            return original_sync()
+
+        monkeypatch.setattr(database._transactions, "_index_sync", counted_sync)
+
+        pending.commit()
+        assert sync_calls == 0
+        assert database.execute("MATCH (p:P) RETURN p.id").rows == ((1,),)
+        assert database.verify("all").clean is True
+    finally:
+        if pending is not None and pending.active:
+            pending.rollback()
+        database.close()
 
 
 def test_a_speculative_index_with_a_reused_table_id_never_indexes_foreign_rows(
@@ -292,17 +385,18 @@ def test_a_speculative_index_with_a_reused_table_id_never_indexes_foreign_rows(
             txn.execute("CREATE (:P {id: 1})")
         assert publisher.catalog.catalog.table("P").table_id == 1
 
-        # A read happens before any old-handle commit has synchronized the foreign index.  Its
-        # registry still contains only speculative pk_Q, which must be withheld from both the
-        # planner and the public committed inventory even though Q and P reuse table id 1.
+        # Before the next statement, the raw registry still contains only speculative pk_Q,
+        # which must be withheld from the public committed inventory even though Q and P reuse
+        # table id 1.  The read boundary then adopts durable pk_P alongside (not over) pk_Q.
         assert tuple(index.name for index in old._indexes.indexes()) == ("pk_Q",)
         assert old.indexes.indexes() == ()
         assert old.execute("MATCH (p:P) WHERE p.id = 1 RETURN p.id").rows == ((1,),)
-        assert tuple(index.name for index in old._indexes.indexes()) == ("pk_Q",)
+        assert tuple(index.name for index in old._indexes.indexes()) == ("pk_P", "pk_Q")
+        assert tuple(index.name for index in old.indexes.indexes()) == ("pk_P",)
         coexistence = old.verify("all")
         assert coexistence.clean is True
         assert coexistence.findings == ()
-        assert tuple(index.name for index in old._indexes.indexes()) == ("pk_Q",)
+        assert tuple(index.name for index in old._indexes.indexes()) == ("pk_P", "pk_Q")
 
         before = publisher.transactions.published_lsn()
         with old.begin("write") as txn:

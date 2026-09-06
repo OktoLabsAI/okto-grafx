@@ -7,7 +7,235 @@ including the on-disk format.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- Added an explicitly selected, per-database `codec="numpy"` page adapter backed by NumPy from
+  `[accel]`. It preserves page format v1 byte-for-byte, uses the pure codec for small directories
+  and as the sole authority for invalid-image refusals, and reports both page-codec and effective
+  CRC-32C implementation through `database.codec`.
+- Added explicit, one-way `db.maintenance.enable_wal_page_compression()` activation. A catalog-v2
+  required capability is published in a v1-only transaction before later commits may store
+  strictly-smaller zlib level-1 full-page images in `WRITE_PAGE` v2. Bounded inflation, closed
+  type/flag semantics, mixed-writer adoption and typed downgrade refusal preserve fail-closed
+  recovery; incompressible images and segment-roll batches retain the v1 grammar.
+- Added manual, foreground `db.maintenance.vacuum(...)` for process-quiescent MVCC reclamation.
+  A one-way catalog-v2 capability guards a durable monotonic snapshot floor; one ordinary
+  WAL-before-data commit relinks retained chains, removes eligible inline version slots and
+  reconciles ACTIVE indexes at the same horizon. The operation requires the exact
+  `confirm_quiescent=True` operator assertion, supports a deterministic `max_versions` bound,
+  rejects stale snapshots with retryable `GrafxSnapshotReclaimed`, and deliberately excludes
+  overflow reclamation, file truncation and durable page/slot/`RecordRef` reuse.
+- Added `db.maintenance.bloat(table=None)`, an immutable, read-only and header-only census of
+  ended heap versions at a non-pruning observation of the checkpoint-capped recyclable horizon.
+  The report distinguishes horizon-eligible from retained ended lifetimes, states its
+  byte-accounting limits and never presents the observation as authorization to vacuum.
+- Added durable equality-only custom indexes through transactional `CREATE INDEX` and
+  `Database.create_index()`. Ordered compound keys, explicit bucket counts and deterministic
+  expected-cardinality sizing share one planner and one catalog-v2 shadow-build protocol. The
+  Python door returns a detached ACTIVE `IndexView` with a certified nonce and freshness
+  horizons only after durable publication.
+- Added explicit growth-only `Database.rehash_index()` and maintenance delegation for exact
+  indexes. A complete immutable shadow becomes ACTIVE only after OCC and its durability barrier;
+  the immediate predecessor becomes STALE, recovery converges to one complete authority, and
+  long-lived/read-only handles adopt foreign generation changes at their next fresh read boundary.
+- Added explicit `Database.rehash_index_if_needed()` and maintenance delegation. Its advisory
+  probe proves physical generation identity, examines only the bounded eager head pages plus the
+  scalar physical page count, and requests at most one `2x` growth step through the existing
+  foreground rehash protocol. It is never automatic/background, never scans all index entries to
+  decide, and does not weaken WAL, OCC or multi-process reader/writer semantics.
+- Added explicit, idempotent `Database.ensure_identity_indexes()` activation for catalog-v2
+  primary-key, relationship-endpoint and unsigned record-identity access paths. Catalog v2 is a
+  one-way mixed-fleet fence; vector/proximity indexes remain schema-derived.
+- Added snapshot-owning, read-only query cursors through `db.query(...).cursor()`. Iteration pulls
+  detached results in bounded batches without materialising the public terminal; early close can
+  never stage a write and always releases the reader transaction.
+- Added `Transaction.executemany()` for streaming parameterized DML batches. It parses one fixed
+  statement once, returns only aggregate counters and preserves the existing transaction/WAL/OCC
+  path. A failure at any item rolls all batch staging back to its initial savepoint even when the
+  caller catches the error and later commits other work.
+- Added the opt-in `query_memory_budget_bytes` limit. Blocking sort, result-DISTINCT and
+  grouping/aggregation use safe, versioned adapter-owned external merge runs under deterministic
+  logical-byte accounting; aggregate DISTINCT, stable mixed-value/NaN ordering, cleanup on every
+  exit and the existing row limits remain intact. The default `None` preserves the previous
+  execution paths.
+
+### Changed
+
+- Bumped the development version to `0.0.3` and started a focused performance round for the
+  user-visible Okto Pulse Knowledge Graph load path. The round may change internals aggressively,
+  but retains multi-reader/multi-writer operation, durability and data consistency as invariants.
+- Exact built-in catalog index definitions now retain one runtime definition for the identity of
+  their selected generation descriptor, and exact in-process index WAL records retain a private
+  decoded proof for their immutable payload. Ownership and record-type checks still run on every
+  access; persisted, reconstructed/deep-copied, foreign, mutable or malformed data takes the full
+  refusing decode.
+  Even a reflectively planted proof is accepted only when its exact `IndexChange` canonically
+  encodes to the record's current bytes, so the optimization cannot override WAL authority.
+- A first or unproved transaction read view no longer discards an unsaved live catalog merely
+  because clean catalog frames were detached. The store rebases that local view only after a
+  non-destructive read proves the complete durable catalog image is byte-identical to its original
+  base; a real foreign catalog publication retains the existing fail-closed refusal.
+- Results produced by the exact built-in engine now defer their independent public plan clone
+  until `QueryResult.plan` is first read. The prepared root is still eagerly rebuilt and
+  validated once into a bounded recipe; results never share plan nodes, concurrent readers of
+  one result receive the same materialized tree, and foreign/unproved roots retain the complete
+  eager hostile-publication path.
+- Exact built-in catalog snapshots now retain their own immutable, checksummed serialized image
+  until the next sanctioned schema, space, index-generation or required-capability mutation.
+  This removes repeated whole-catalog validation and encoding from DDL and prepared-plan keys;
+  every mutation invalidates the image, deserialization starts uncached, and catalog subclasses
+  preserve the former observable serialization protocol.
+- Built-in index verification now captures one catalog image per call, scans each covered heap
+  table once and resolves each repeated physical row reference once across sibling indexes. The
+  table-sized memo is released immediately after that table's final index and never survives the
+  public verification call. Foreign indexes, heaps and catalogs keep the prior per-index
+  observation protocol, and every index still derives and checks its own complete coverage set.
+- Committed logical replay now partitions heterogeneous index batches by physical store. Exact
+  built-in stores retain their single-seed/single-publication batch even when the same replay
+  contains HNSW, RESET, rebuild, replaying or locally stale stores; each excluded store keeps its
+  complete scalar protocol in original WAL order. The common header is still seeded before its
+  first bucket mutation and published only after every scalar effect has finished. A refused
+  common preflight falls back before mutation, and a partial failure marks every touched store
+  stale without changing WAL, recovery, durability or multiwriter/multireader semantics.
+- `Database.transaction()` now retains only the participant section's unlocked file descriptor
+  for its lexical lifetime and revalidates physical identity before every reuse. One-statement
+  scoped transactions therefore replace four Windows lock-file opens with one open plus three
+  identity checks, while manually managed `begin()` transactions keep their existing lifecycle.
+- Relationship seeks now reject the transaction-wide ended-row precheck immediately when neither
+  staged rows nor durable row intents contain a `DELETE`. Insert-only Pulse batches therefore no
+  longer rebuild every dirty table's row view for every endpoint seek; DELETE/read-your-writes
+  semantics and the seek table's pending-reference validation remain on the canonical path.
+- Exact built-in statements with a closed table footprint and their canonical commit path now
+  derive index authority only from the tables actually touched. The commit-local projection is
+  created after OCC/rebase and index synchronization, under the existing writer lease and
+  `COMMIT_SECTION`, and is revoked on every exit. Unknown/polymorphic statements, pre-staged WAL
+  records and custom managers retain the global conservative path. Structural probes with 1 and
+  80 tables produced identical work: zero global catalog/index enumerations and only the `Person`
+  definitions were inspected. Exact artifact, multiset, retarget, rebuild, WAL and apply
+  validations remain unchanged.
+- First materialization of an empty table now installs the transaction's complete planned
+  identity floor with its first row, so the remainder uses the existing reserved-insert path
+  without rewriting heap page zero per row. Reserved inserts share a commit-local, sealed extent
+  authority whose mutable cursor contains only repairable tail hints; table/root/floor are frozen,
+  stale floors are merged monotonically at the directory write door, and epoch movement falls
+  back to canonical lookup. A 500-row structural probe reduced ordinary extent observations
+  `500→0` and directory lookups to `3`; the remaining `62` extent rewrites exactly matched the
+  `62` physical page growths.
+- Completed checkpoints now seed a revocable process-local witness for the exact WAL suffix whose
+  ordinary DML was already applied, flushed and published by that process. Checkpoint still reads
+  and validates the full WAL lineage and payload preflight, replay watermarks and all durability
+  barriers; only redundant structural redo dispatch is skipped. Foreign writers, DDL/generation
+  changes, RESET, dirty pages, recovery/failure/close and custom collaborators retain canonical
+  replay. Local CN-1 identity-floor subcommits extend the witness only after their own durable
+  apply/flush/publication sequence, keeping the optimization reachable for large INSERT batches.
+- Certified checkpoint replay reuses that complete strict preflight instead of decoding the same
+  logical-index subplan a second time. Catalog-writing checkpoints remain on their canonical
+  permissive-then-strict path and cannot enter the shortcut.
+- Mandatory checkpoint and staged-index validation now carry their already-decoded RESET fact
+  across sealed private boundaries. Exact built-in paths avoid a second logical-record scan;
+  missing/incompatible proofs, custom managers and overrides keep the canonical fail-closed path.
+- Fresh index page-zero observations continue to invalidate descriptor identity and physically
+  read the device on every call. When every byte equals a pool-owned witness already validated
+  for checksum, structure and index semantics, the exact built-in `IndexStore` reuses its
+  atomically paired certificate instead of decoding the same image again. Changed images,
+  semantic failures and custom pools retain the complete fail-closed path. Instrumented generic
+  decodes fell `1,015→12` and semantic header decodes `1,007→4`; noisy timings support no
+  wall-clock claim. The lazy memo retains one raw page per accessed store without changing OCC,
+  WAL, durability or multiwriter/multireader behavior.
+- Exact vector searches fed by a small, engine-sealed materialized candidate set now authenticate
+  only the selected heap rows and their index buckets. Any incomplete proof, metadata drift, NULL,
+  deletion, duplicate or wrong reference falls back to the canonical full scan before ranking; a
+  public filter or custom snapshot cannot activate the path. With fixed bucket count the cost is
+  `Θ(U·E/B)`, not `O(K)`; corruption outside visited candidates remains the responsibility of a
+  full scan or `verify`.
+- V2 index-generation nonce allocation now reuses the immutable nonce already certified by each
+  registered definition. Legacy nonce-zero artifacts still open and validate their physical
+  header, and collisions retain the same bounded refusal. A 64-generation component sample moved
+  from roughly `352 ms` to `61 ms`; end-to-end DDL moved from `1,085 ms` to `789 ms`.
+- A local-equality Cartesian pushdown prototype was removed after adversarial tests proved that it
+  could suppress predicate errors, persistent inner-scan failures and query-budget refusals, in
+  the latter case allowing a write that the canonical plan refused. A subsequent bounded replay
+  prototype was also removed: under buffer pressure it could hide corruption introduced before a
+  later physical pass and commit writes that A63 requires to fail closed. Regressions now freeze
+  both refusal surfaces while the canonical nested scans remain in force.
+- Exact index seeks no longer change conjunction semantics by promoting a residual term into a
+  standalone predicate. The planner rechecks the original conjunction over hits and declines a
+  seek when an observable term precedes its equality; safe leading equalities, including a later
+  pattern following total equalities on already-bound rows, keep the indexed path.
+- Empty exact-index generations now use an ephemeral first-fit directory while they are built.
+  The durable index pages remain byte-identical to the canonical allocator, including removes and
+  tombstones, while reset/detached builds avoid repeatedly walking empty buckets and data pages.
+- Recovery port discovery no longer eagerly invokes dynamic attribute fallback for concrete
+  implementations. Native cold recovery therefore performs one authoritative WAL walk; proxy and
+  custom wrappers retain the existing dynamic fallback and typed refusal behavior.
+- Transaction materialization groups immutable MVCC page stamps once per physical page and retargets
+  those groups after publication. This removes repeated page-by-intent inspection without changing
+  row order, WAL effects, OCC validation or conflict semantics.
+- Same-handle content-only heap commits retain extent-directory, tail and endpoint-locator caches.
+  Structural topology changes and foreign read views still invalidate them using an ephemeral
+  structural signature that is never a durability authority.
+- Split and monolithic checkpoints now reuse one exact reader-horizon observation for both reader
+  presence and recycling decisions, avoiding a duplicate coordinator scan without weakening the
+  conservative recycling horizon.
+- Primary-key uniqueness now folds transaction and statement intent suffixes incrementally rather
+  than reducing the complete accumulated list for every row. Public list rewrites and rollbacks
+  force a canonical rebuild; a seeded differential covers numeric equality, NaN, mutable keys,
+  table/transaction isolation and exact refusal parity.
+- Prepared plans now use the immutable serialized catalog image, ACTIVE index picture and dirty
+  table set as their authority key without also requiring Python object identity. Byte-identical
+  catalog adoption across transaction boundaries therefore reuses the same bounded plan entry,
+  while any schema, generation freshness or owner-overlay change still splits it.
+- WAL-only read boundaries retain the resident catalog for a same token, a proven own publication
+  or a complete catalog-free CE-3 interval. Initial views, foreign DDL, checkpoint movement,
+  declined proofs and direct/legacy compositions keep the conservative refresh; the complete
+  ACTIVE index projection is memoized only for the lifetime of that catalog authority.
+- Exact one-hop traversals directly below a streaming `LIMIT` may use fresh endpoint indexes even
+  with a scan frontier, allowing the consumer to stop before grouping the complete relationship
+  table. Blocking operators, ranges, optional/union/write shapes and unavailable or stale indexes
+  retain the canonical grouped scan.
+- Recovery now coalesces repeated full-page effects only for page-only WAL replays whose embedded
+  page LSN sequence is unambiguous. Full preflight still validates every superseded image, mixed
+  page/index effects keep their original order, and recovery establishes per-file data durability
+  after index completion and before publishing `commit.state`.
+- Local two-slot control reads fuse the exact-name existence observation with their bounded read.
+  Warm descriptors are still matched by physical identity, case-only aliases still fail closed,
+  and custom/fault wrappers retain the original two-door behavior unless their concrete type
+  explicitly opts in. The frozen `StorageDevice` port is unchanged.
+- Recovery reuses its passage-bound, content-checked page preflight instead of decoding each page
+  image repeatedly. A proof cannot cross replay objects, modes or recovery passages; a changed
+  record is revalidated before mutation, and a page projection from a mixed replay remains
+  sequential rather than becoming accidentally coalescible.
+- Buffer-pool dirty work is selected from a per-file candidate set and revalidated at use time,
+  avoiding full resident-frame scans in `flush`, `modified_pages`, `has_dirty_pages` and fresh
+  read-view checks. The candidate index covers pinned, doomed, evicted and directly applied pages;
+  it does not change write-back or WAL authority.
+- Heap extent-directory lookups retain a defensive `table_id -> slot` hint. Every hit verifies the
+  current slot's table-id before decode or overwrite, stale hints fall back to the canonical scan,
+  and replay/epoch movement invalidates the memo. Cold scans use zero-copy slot views and decode
+  only the matching extent.
+- Raised the lazy, per-database descriptor-cache default from 128 to 256 (and the direct local
+  adapter default from 64 to 256) to avoid LRU churn for the measured 141-file Pulse working set.
+  `max_open_files` remains configurable per instance and should be lowered when several large
+  databases share a descriptor-constrained process.
+- Bumped the development version to `0.0.2` and started the bounded performance round governed by
+  `GRAFX_PERFORMANCE_ROUND_FINAL.md`.
+- Added a separate, versioned `python-v2` estimate of Python memory retained by the buffer pool
+  without changing its nominal page admission budget. Descriptor-cache hits, misses and
+  capacity-driven evictions are now available as unlabelled metrics and immutable storage-view
+  counters; composed metric callbacks run only after the local storage and enclosing buffer-pool
+  guards are released. The v2 estimator also covers bounded cold-load reservations and dirty
+  frames detached for eviction.
+- Cold buffer misses are single-flight per physical `(file, page)` and run storage read plus codec
+  decode outside the global pool guard. In-flight loads count against capacity, failures wake
+  waiters without being cached, distinct pages can load concurrently, and epoch movement prevents
+  a late stale result from being published. Dirty eviction follows the same callback-free phase
+  boundary without changing on-disk bytes, WAL, nominal LRU admission or concurrency guarantees.
+
+### Fixed
+
+- Made catalog capability/tag lookup tables immutable and restored the pure-core import gate:
+  physical generation-name validation no longer needs `re`, while deterministic bounded `zlib`
+  remains explicitly admitted as part of the durable WRITE_PAGE-v2 grammar.
 
 ## [0.0.1] — 2026-09-01
 

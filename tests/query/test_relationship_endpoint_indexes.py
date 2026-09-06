@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
+from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager, edge_from_index_name, edge_to_index_name
 
 
@@ -95,6 +96,86 @@ def test_seek_frontier_uses_endpoint_lookup_but_scan_frontier_does_not(database)
     assert scan.statistics.get("edge_scans") == 1
 
 
+@pytest.mark.parametrize(
+    ("query", "limit"),
+    (
+        ("MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id", 3),
+        ("MATCH (b:B)<-[:E]-(a:A) RETURN b.id, a.id", 2),
+    ),
+)
+def test_one_hop_limit_preserves_the_canonical_prefix_by_endpoint_index(
+    database, query: str, limit: int
+) -> None:
+    """Forward and reverse LIMIT retain exact scan order while avoiding its eager grouping."""
+    _small_graph(database)
+    complete = database.execute(query)
+    bounded = database.execute(f"{query} LIMIT {limit}")
+
+    assert bounded.rows == complete.rows[:limit]
+    assert bounded.statistics.get("edge_lookups", 0) > 0
+    assert bounded.statistics.get("edge_scans", 0) == 0
+
+
+def test_one_hop_limit_touches_only_the_endpoint_candidates_it_consumes(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first result does not validate all edges merely to build an endpoint map."""
+    _small_graph(database)
+    touched: list[object] = []
+    original = IndexManager.validated
+
+    def recording(self, index, key, snapshot):
+        refs = original(self, index, key, snapshot)
+        if index.name in {edge_from_index_name("E"), edge_to_index_name("E")}:
+            touched.extend(refs)
+        return refs
+
+    monkeypatch.setattr(IndexManager, "validated", recording)
+    result = database.execute(
+        "MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id LIMIT 1"
+    )
+
+    assert result.rows == ((1, 1),)
+    assert 0 < len(touched) < 6
+    assert result.statistics.get("edge_scans", 0) == 0
+
+
+def test_one_hop_limit_keeps_the_grouped_scan_when_endpoint_authority_is_unusable(
+    database,
+) -> None:
+    """A stale accelerator changes only the access path, never the bounded row prefix."""
+    _small_graph(database)
+    database._indexes.index(edge_from_index_name("E")).mark_stale("forced fallback")
+    database._indexes.index(edge_to_index_name("E")).mark_stale("forced fallback")
+    query = "MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id"
+    complete = database.execute(query)
+    bounded = database.execute(f"{query} LIMIT 2")
+
+    assert bounded.rows == complete.rows[:2]
+    assert bounded.statistics.get("edge_lookups", 0) == 0
+    assert bounded.statistics.get("edge_scans") == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "MATCH (a:A)-[:E]->(b:B) RETURN a.id, b.id ORDER BY b.id LIMIT 1",
+        "MATCH (a:A)-[:E]->(b:B) RETURN DISTINCT b.id LIMIT 1",
+    ),
+)
+def test_limit_does_not_enable_short_circuit_below_a_blocking_operator(
+    database, query: str
+) -> None:
+    """ORDER BY and DISTINCT need the complete input and retain the canonical grouped scan."""
+    _small_graph(database)
+
+    result = database.execute(query)
+
+    assert len(result.rows) == 1
+    assert result.statistics.get("edge_lookups", 0) == 0
+    assert result.statistics.get("edge_scans") == 1
+
+
 def test_endpoint_acceleration_crosses_the_central_exact_view_fence(
     database, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -111,6 +192,33 @@ def test_endpoint_acceleration_crosses_the_central_exact_view_fence(
         database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id").rows
     ) == [(1,), (2,)]
     assert edge_from_index_name("E") in crossed
+
+
+def test_endpoint_seek_does_not_retain_every_exact_version_for_a_hub(
+    database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Endpoint hits stay lazy instead of retaining ``degree * payload`` versions."""
+    _small_graph(database)
+    reads: list[object] = []
+    original = HeapStore.read
+    original_versions = IndexManager.lookup_versions
+
+    def recording(self, ref):
+        reads.append(ref)
+        return original(self, ref)
+
+    def guarded_versions(self, name, key, snapshot):
+        if name in {edge_from_index_name("E"), edge_to_index_name("E")}:
+            pytest.fail("endpoint indexes must not retain every validated heap version")
+        return original_versions(self, name, key, snapshot)
+
+    monkeypatch.setattr(HeapStore, "read", recording)
+    monkeypatch.setattr(IndexManager, "lookup_versions", guarded_versions)
+    result = database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id")
+
+    assert sorted(result.rows) == [(1,), (2,)]
+    assert len(reads) == 5
+    assert len(set(reads)) == 3
 
 
 def test_a_whole_table_frontier_scans_without_spending_the_fan_limit_first(

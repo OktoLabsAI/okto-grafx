@@ -12,14 +12,23 @@ rule true on disk.
 
 from __future__ import annotations
 
+from okto_grafx.domain.index.catalog import (
+    IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+    CatalogIndexDefinition,
+    IndexGenerationDescriptor,
+    IndexGenerationState,
+    identity_index_name,
+)
 from okto_grafx.domain.index.contract import SecondaryIndex, StagingTransaction
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
     DEFINITION_DIGEST_SIZE,
     INDEX_DIRECTORY,
     INDEX_FILE_SUFFIX,
+    RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     index_file,
+    index_generation_file,
     require_index_name,
 )
 from okto_grafx.domain.index.entry import (
@@ -37,9 +46,16 @@ from okto_grafx.domain.index.header import (
 from okto_grafx.domain.index.keys import (
     DEFAULT_BUCKET_COUNT,
     MAX_BUCKET_COUNT,
+    MAX_EXPECTED_CARDINALITY,
     MIN_BUCKET_COUNT,
+    RECORD_ID_KEY_FORMAT_VERSION,
+    TARGET_ENTRIES_PER_BUCKET,
     bucket_of,
+    custom_index_sizing,
+    identity_index_sizing,
     index_key,
+    record_id_key,
+    rehash_index_sizing,
     validate_bucket_count,
 )
 from okto_grafx.domain.index.records import (
@@ -74,12 +90,20 @@ __all__ = [
     "INDEX_HEADER_FORMAT_VERSION",
     "INDEX_HEADER_SIZE",
     "INDEX_HEADER_SLOT",
+    "IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY",
     "MAX_BUCKET_COUNT",
+    "MAX_EXPECTED_CARDINALITY",
     "MAX_INDEX_KEY_BYTES",
     "MIN_BUCKET_COUNT",
+    "RECORD_ID_KEY_DERIVATION",
+    "RECORD_ID_KEY_FORMAT_VERSION",
+    "TARGET_ENTRIES_PER_BUCKET",
     "IndexChange",
+    "CatalogIndexDefinition",
     "IndexDefinition",
     "IndexEntry",
+    "IndexGenerationDescriptor",
+    "IndexGenerationState",
     "IndexHeader",
     "IndexOperation",
     "IndexVisibility",
@@ -89,9 +113,15 @@ __all__ = [
     "StagingTransaction",
     "bucket_of",
     "change_of",
+    "custom_index_sizing",
     "entry_visible",
     "index_file",
+    "index_generation_file",
+    "identity_index_name",
+    "identity_index_sizing",
     "index_key",
+    "record_id_key",
+    "rehash_index_sizing",
     "is_reclaimable",
     "lsn_of",
     "require_index_name",

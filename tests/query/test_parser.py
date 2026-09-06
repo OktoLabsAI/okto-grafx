@@ -10,6 +10,7 @@ from okto_grafx.domain.query.ast import (
     BinaryOperation,
     CaseExpression,
     CreateClause,
+    CreateIndexStatement,
     CreateNodeTableStatement,
     CreateRelTableStatement,
     CreateVectorSpaceStatement,
@@ -75,6 +76,72 @@ def test_a_vector_space_statement_keeps_its_options_unresolved() -> None:
     statement = parse("CREATE VECTOR SPACE s {dimension: 4, metric: 'cosine'}")
     assert isinstance(statement, CreateVectorSpaceStatement)
     assert statement.options.keys() == ("dimension", "metric")
+
+
+@pytest.mark.parametrize(
+    ("suffix", "bucket_count", "expected_cardinality"),
+    [
+        ("", None, None),
+        (" OPTIONS bucket_count = 128", 128, None),
+        (" OPTIONS expected_cardinality = 4097", None, 4097),
+    ],
+)
+def test_a_custom_index_statement_preserves_key_order_and_one_sizing_hint(
+    suffix: str,
+    bucket_count: int | None,
+    expected_cardinality: int | None,
+) -> None:
+    statement = parse(
+        "CREATE INDEX by_city_age FOR (p:Person) ON (p.city, p.age)" + suffix
+    )
+    assert isinstance(statement, CreateIndexStatement)
+    assert (statement.name, statement.variable, statement.table) == (
+        "by_city_age",
+        "p",
+        "Person",
+    )
+    assert statement.columns == ("city", "age")
+    assert statement.bucket_count == bucket_count
+    assert statement.expected_cardinality == expected_cardinality
+    assert parse(statement.describe()) == statement
+
+
+@pytest.mark.parametrize(
+    ("text", "field"),
+    [
+        ("CREATE INDEX i FOR (p:Person) ON ()", "columns"),
+        ("CREATE INDEX i FOR (p:Person) ON (q.name)", "variable"),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS nope = 1",
+            "option",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS bucket_count = 0",
+            "bucket_count",
+        ),
+    ],
+)
+def test_a_custom_index_refuses_invalid_shape_before_planning(
+    text: str,
+    field: str,
+) -> None:
+    with pytest.raises(GrafxParseError) as failure:
+        parse(text)
+
+    assert failure.value.details["field"] == field
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "OPTIONS bucket_count = $b",
+        "OPTIONS bucket_count = 64 OPTIONS expected_cardinality = 4096",
+        "OPTIONS bucket_count = 64, expected_cardinality = 4096",
+    ],
+)
+def test_a_custom_index_accepts_at_most_one_literal_sizing_hint(tail: str) -> None:
+    with pytest.raises(GrafxParseError):
+        parse(f"CREATE INDEX i FOR (p:Person) ON (p.name) {tail}")
 
 
 def test_a_trailing_semicolon_is_accepted() -> None:

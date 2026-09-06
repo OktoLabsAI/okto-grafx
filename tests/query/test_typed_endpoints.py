@@ -306,11 +306,12 @@ def test_unwind_before_the_form_is_refused_for_the_clause_it_is(
     assert raised.value.details["field"] == "clause"
 
 
-def test_a_labelled_source_keeps_planning_exactly_as_before(database: object) -> None:
-    assert database.execute("MATCH (a:A)-[r:R]->(b) RETURN r.layer").rows == (
+def test_a_labelled_source_keeps_the_small_frontier_traversal(database: object) -> None:
+    statement = "MATCH (a:A)-[r:R]->(b) RETURN r.layer LIMIT 64"
+    assert database.execute(statement).rows == (
         ("canonical",),
     )
-    assert _scan_table(database.explain("MATCH (a:A)-[r:R]->(b) RETURN r.layer")) == "A"
+    assert _scan_table(database.explain(statement)) == "A"
 
 
 def _frozen_pattern(direction: Direction = Direction.OUTGOING) -> PatternPath:

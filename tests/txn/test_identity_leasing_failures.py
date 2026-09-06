@@ -106,6 +106,53 @@ def test_reservation_append_failure_installs_neither_grant_nor_row(
     assert stack.manager.recovery_required is False
 
 
+def test_first_extent_append_failure_rolls_back_the_atomic_batch_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new table's batch floor is part of the user commit, never prior authority."""
+    stack = build_stack(identity_lease_size=4)
+    table = _table()
+    _register(stack, table)
+    txn = stack.manager.begin("write")
+    for value in ("one", "two", "three"):
+        txn.stage_row_insert(table, (value,))
+        txn.note_write(stack.manager.partition_of(table.table_id, value.encode()))
+    original_append = stack.wal.append_many
+    records_before = stack.wal.records()
+    barriers_before = stack.wal.barriers
+    failure = GrafxDeviceFull("The first user batch append failed.", free_bytes=0)
+
+    def refuse_user_batch(
+        records: Sequence[WalRecordLike],
+        *,
+        expected_terminal_lsn: int | None = None,
+    ) -> int:
+        assert expected_terminal_lsn is not None
+        assert records[-1].record_type == WalRecordType.COMMIT
+        assert records[-1].txn_id == txn.txn_id
+        raise failure
+
+    monkeypatch.setattr(stack.wal, "append_many", refuse_user_batch)
+
+    with pytest.raises(GrafxDeviceFull) as raised:
+        stack.manager.commit(txn)
+
+    assert raised.value is failure
+    assert stack.wal.records() == records_before
+    assert stack.wal.barriers == barriers_before
+    assert stack.heap.next_record_id(table) == 1
+    assert _stored_values(stack, table) == []
+    assert txn.state is TransactionState.ACTIVE
+
+    monkeypatch.setattr(stack.wal, "append_many", original_append)
+    report = stack.manager.commit(txn)
+
+    assert report.durable is True
+    assert len(txn.row_refs) == 3
+    assert stack.heap.next_record_id(table) == 4
+    assert sorted(_stored_values(stack, table)) == [("one",), ("three",), ("two",)]
+
+
 @pytest.mark.parametrize("door", ("apply", "publish"))
 def test_post_barrier_reservation_failure_never_commits_the_user_transaction(
     monkeypatch: pytest.MonkeyPatch,
@@ -149,7 +196,9 @@ def test_post_barrier_reservation_failure_never_commits_the_user_transaction(
             if manager is stack.manager and injected == 0:
                 injected += 1
                 assert committed > previous.last_committed_lsn
-                raise GrafxError("Identity-floor publication failed after its WAL barrier.")
+                raise GrafxError(
+                    "Identity-floor publication failed after its WAL barrier."
+                )
             original_publish(manager, previous, committed)
 
         monkeypatch.setattr(
@@ -171,9 +220,7 @@ def test_post_barrier_reservation_failure_never_commits_the_user_transaction(
     assert isinstance(reservation_csn, int)
     assert stack.wal.barriers == barriers_before + 1
     metadata_commit = next(
-        record
-        for record in stack.wal.records()
-        if record.lsn == reservation_csn
+        record for record in stack.wal.records() if record.lsn == reservation_csn
     )
     assert metadata_commit.record_type == WalRecordType.COMMIT
     assert metadata_commit.txn_id != txn.txn_id

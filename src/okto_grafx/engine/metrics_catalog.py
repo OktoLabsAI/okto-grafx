@@ -128,10 +128,16 @@ _OUTCOME_LEASE = LabelSpec(
     allowed_values=frozenset({"granted", "timeout", "takeover"}),
     max_cardinality=3,
 )
-_MODE = LabelSpec(name="mode", allowed_values=frozenset({"read", "write"}), max_cardinality=2)
-_TARGET = LabelSpec(name="target", allowed_values=frozenset({"wal", "data"}), max_cardinality=2)
+_MODE = LabelSpec(
+    name="mode", allowed_values=frozenset({"read", "write"}), max_cardinality=2
+)
+_TARGET = LabelSpec(
+    name="target", allowed_values=frozenset({"wal", "data"}), max_cardinality=2
+)
 _READER_PRESENT = LabelSpec(
-    name="reader_present", allowed_values=frozenset({"true", "false"}), max_cardinality=2
+    name="reader_present",
+    allowed_values=frozenset({"true", "false"}),
+    max_cardinality=2,
 )
 _CHECKSUM_KIND = LabelSpec(
     name="kind", allowed_values=frozenset({"page", "record"}), max_cardinality=2
@@ -148,10 +154,17 @@ _RECOVERY_OUTCOME = LabelSpec(
 )
 _CEILING = LabelSpec(
     name="ceiling",
-    allowed_values=frozenset({"durable_commit", "point_read", "open_replay", "vector_recall"}),
+    allowed_values=frozenset(
+        {"durable_commit", "point_read", "open_replay", "vector_recall"}
+    ),
     max_cardinality=4,
 )
 _DATABASE = LabelSpec(name="db", allowed_values=None, max_cardinality=64)
+_MEMORY_ESTIMATOR = LabelSpec(
+    name="estimator",
+    allowed_values=frozenset({"python-v2"}),
+    max_cardinality=1,
+)
 _SPACE = LabelSpec(name="space", allowed_values=None, max_cardinality=64)
 _REGIME = LabelSpec(
     name="regime", allowed_values=frozenset({"exact", "approximate"}), max_cardinality=2
@@ -162,10 +175,38 @@ _VECTOR_PHASE = LabelSpec(
     max_cardinality=3,
 )
 _QUERY_PHASE = LabelSpec(
-    name="phase", allowed_values=frozenset({"parse", "plan", "execute"}), max_cardinality=3
+    name="phase",
+    allowed_values=frozenset({"parse", "plan", "execute"}),
+    max_cardinality=3,
 )
 _VIEW_ORIGIN = LabelSpec(
     name="view_origin", allowed_values=frozenset({"own", "foreign"}), max_cardinality=2
+)
+_COMMIT_WINDOW = LabelSpec(
+    name="window",
+    allowed_values=frozenset({"writer_lease", "commit_section"}),
+    max_cardinality=2,
+)
+_COMMIT_INTERVAL = LabelSpec(
+    name="interval", allowed_values=frozenset({"wait", "hold"}), max_cardinality=2
+)
+_COMMIT_PHASE = LabelSpec(
+    name="phase",
+    allowed_values=frozenset(
+        {
+            "other",
+            "occ",
+            "materialize",
+            "build_records",
+            "append",
+            "barrier",
+            "apply",
+            "flush",
+            "index",
+            "publish",
+        }
+    ),
+    max_cardinality=10,
 )
 _ERROR_CODE = LabelSpec(
     name="code",
@@ -240,6 +281,55 @@ METRIC_CATALOG: tuple[MetricDescriptor, ...] = (
         description="Transactions currently open, by mode.",
         unit="transactions",
         labels=(_MODE,),
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_window_duration_seconds",
+        kind=MetricKind.HISTOGRAM,
+        description="Duration of one write-commit coordination interval, by window and interval.",
+        unit="seconds",
+        labels=(_COMMIT_WINDOW, _COMMIT_INTERVAL),
+        buckets=LATENCY_BUCKETS_SECONDS,
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_phase_duration_seconds",
+        kind=MetricKind.HISTOGRAM,
+        description="Duration of one write-commit phase while the commit section is held.",
+        unit="seconds",
+        labels=(_COMMIT_PHASE,),
+        buckets=LATENCY_BUCKETS_SECONDS,
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_pages_logged_total",
+        kind=MetricKind.COUNTER,
+        description="Page images included in write-commit log batches.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_wal_bytes_total",
+        kind=MetricKind.COUNTER,
+        description="Physical bytes added to the live WAL by successful write-commit appends.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_frames_examined_total",
+        kind=MetricKind.COUNTER,
+        description=(
+            "Resident and retired-pinned frames traversed by write-commit flush, modified-page, "
+            "and dirty-page scans."
+        ),
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_flushes_total",
+        kind=MetricKind.COUNTER,
+        description="Buffer-pool flush calls executed by write commits.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_foreign_commits_total",
+        kind=MetricKind.COUNTER,
+        description="Foreign durable commits completed before a local write commit.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_retargets_total",
+        kind=MetricKind.COUNTER,
+        description="Write-commit log batches retargeted after segment planning.",
     ),
     # SPEC-M1 OR-2: durability and write-ahead log
     MetricDescriptor(
@@ -331,6 +421,28 @@ METRIC_CATALOG: tuple[MetricDescriptor, ...] = (
         description="Buffer pool memory currently held, by database.",
         unit="bytes",
         labels=(_DATABASE,),
+    ),
+    MetricDescriptor(
+        name="oktografx_buffer_retained_estimate_bytes",
+        kind=MetricKind.GAUGE,
+        description="Estimated Python memory retained by the buffer pool, by database and estimator.",
+        unit="bytes",
+        labels=(_DATABASE, _MEMORY_ESTIMATOR),
+    ),
+    MetricDescriptor(
+        name="oktografx_descriptor_cache_hits_total",
+        kind=MetricKind.COUNTER,
+        description="Valid cached descriptors returned without reopening a logical file.",
+    ),
+    MetricDescriptor(
+        name="oktografx_descriptor_cache_misses_total",
+        kind=MetricKind.COUNTER,
+        description="Descriptor lookups that found no valid cached handle and required resolution.",
+    ),
+    MetricDescriptor(
+        name="oktografx_descriptor_cache_evictions_total",
+        kind=MetricKind.COUNTER,
+        description="Cached descriptors released by the bounded least-recently-used admission policy.",
     ),
     MetricDescriptor(
         name="oktografx_buffer_budget_exceeded_total",
@@ -459,7 +571,9 @@ _CATALOG_BY_NAME: dict[str, MetricDescriptor] = {
 
 _METRIC_NAMES: frozenset[str] = frozenset(_CATALOG_BY_NAME)
 
-if len(_CATALOG_BY_NAME) != len(METRIC_CATALOG):  # pragma: no cover - a duplicate never ships
+if len(_CATALOG_BY_NAME) != len(
+    METRIC_CATALOG
+):  # pragma: no cover - a duplicate never ships
     raise GrafxConfigurationError(
         "The metric catalog declares the same metric name more than once.",
         field="name",
@@ -526,12 +640,16 @@ class MetricEmitter:
         if self._sink.enabled:
             self._sink.increment(name, value, labels)
 
-    def set_gauge(self, name: str, value: float, labels: Mapping[str, str] | None = None) -> None:
+    def set_gauge(
+        self, name: str, value: float, labels: Mapping[str, str] | None = None
+    ) -> None:
         """Set a gauge when the sink collects anything."""
         if self._sink.enabled:
             self._sink.set_gauge(name, value, labels)
 
-    def observe(self, name: str, value: float, labels: Mapping[str, str] | None = None) -> None:
+    def observe(
+        self, name: str, value: float, labels: Mapping[str, str] | None = None
+    ) -> None:
         """Record one histogram observation when the sink collects anything."""
         if self._sink.enabled:
             self._sink.observe(name, value, labels)

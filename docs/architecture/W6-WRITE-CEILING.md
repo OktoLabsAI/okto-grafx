@@ -1,9 +1,11 @@
 # W6 decision record — the write ceiling and the three-plus-one options
 
-Status: **preferred direction; crash-safe leasing design pending.** Measured premises verified
-2026-08-23 at `903d611`; instruments `tools/measure_concurrency.py` and the D5 harness. This record
-does not authorize implementation until durable-before-use reservation and burn-only cursor
-semantics have an independently reviewed state machine.
+Status: **historical decision record; option 1 and the Windows publication complement are
+delivered.** Measured premises were verified 2026-08-23 at `903d611`; instruments
+`tools/measure_concurrency.py` and the D5 harness. Identity leasing landed in `40b2b43`. The CE-1
+two-slot control protocol landed in `1512199`, `93a3ee3` and `98e52dd`, replacing the hot
+temp-file/rename publication path. The remaining group-commit proposal was subsequently measured
+at approximately `1.002x` and rejected. Options 2 and 3 remain unselected.
 
 ## The system truth that frames every option
 
@@ -19,6 +21,10 @@ and WASTE, and unlock throughput only together with the complements at the end.
 ## The options, under the evolutionary-server lens (resilience first, performance second)
 
 ### Option 1 — identity-range leasing per participant  ← RECOMMENDED FIRST
+
+**Implementation outcome:** delivered in `40b2b43` after the separately reviewed V7 state
+machine. The bullets below preserve the pre-implementation risk analysis that led to that design;
+their words "pending" and "blocked" are historical, not current status.
 
 A participant may allocate a reserved range from memory only after advancing `next_record_id` has
 committed durably **before the first handout**. Its in-memory cursor is burn-only after handout;
@@ -71,16 +77,19 @@ only future durable reservations and chain-growth commits should need to touch p
 
 ## The complements no option works without (server throughput)
 
-1. **The Windows publication fix** (already in W6: 16.5 ms control-file publication vs 0.13 ms on
-   Linux; `CreateFileW` on the source is 11.4 ms of it). This is the denominator: without it the
-   ~10 commits/s ceiling stands whatever else is done.
-2. **Group commit** (batch ready transactions into one barrier + one publication inside the
-   section): the multiplier that turns 1/cost into batch/cost. For a server it buys more than
-   options 2 and 3 combined. Also a §8.5 amendment — recorded here as **option 4, complementary**,
-   to be sequenced after option 1 and the publication fix.
+1. **Windows publication — CLOSED by CE-1.** `commit.state`, writer lease and reader records now
+   publish in place through three-page/two-slot records plus `write_page` and
+   `durable_barrier`. `atomic_replace` remains only on bootstrap/downgrade paths. A 2026-09-05
+   Pulse-shaped profile on the `0.0.2` line observed zero `nt.replace` calls per ordinary commit;
+   commit-state and lease publication together were approximately 1% of commit time. The old
+   16.5 ms rename denominator is therefore not a remaining target.
+2. **Group commit — REJECTED after measurement.** The WAL barrier represented too little of the
+   contemporary commit cost and the measured ceiling was approximately `1.002x`. Batching ready
+   transactions would still amend §8.5 and is not justified by that evidence.
 
 ## Recommended sequence
 
-**1 → measure → Windows publication fix → group commit → (2 only if table-per-tenant
-materializes) → (3 rejected).** Each step is an amendment with the full builder + blind-critic
-cycle, measured before/after with the in-tree instruments.
+The executed sequence is **identity leasing → CE-1 two-slot publication → group commit measured
+and rejected**. Per-table directory pages remain conditional on real table-disjoint contention;
+mergeable directory records remain rejected. This line is closed unless new evidence changes the
+denominator materially; the historical estimates above must not be reintroduced as current work.

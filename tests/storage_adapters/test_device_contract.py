@@ -407,6 +407,63 @@ def test_the_recycled_name_never_stays_in_the_deletion_queue(device: Any) -> Non
 
 # --- names -------------------------------------------------------------------------------
 
+
+def test_exact_logical_name_proofs_are_bounded_and_only_successes_are_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = storage_local._normalize_logical_name_uncached
+    calls = 0
+
+    def counted(file: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original(file)
+
+    cache = storage_local._validate_exact_logical_name
+    cache.cache_clear()
+    monkeypatch.setattr(storage_local, "_normalize_logical_name_uncached", counted)
+    first = "".join(("wal/", "cache-proof.wal"))
+    second = "".join(("wal/cache-", "proof.wal"))
+    assert first == second and first is not second
+    try:
+        assert normalize_logical_name(first) is first
+        assert normalize_logical_name(second) is second
+        assert calls == 1
+        assert cache.cache_info().maxsize == 512
+
+        invalid_failures: list[GrafxUnsupportedOperation] = []
+        for _ in range(2):
+            with pytest.raises(GrafxUnsupportedOperation) as raised:
+                normalize_logical_name("wal/INVALID*.wal")
+            invalid_failures.append(raised.value)
+        assert invalid_failures[0].message == invalid_failures[1].message
+        assert invalid_failures[0].details == invalid_failures[1].details
+        assert calls == 3
+    finally:
+        cache.cache_clear()
+
+
+def test_logical_name_subclasses_keep_the_uncached_hostile_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Text(str):
+        def __hash__(self) -> int:
+            raise AssertionError("a hostile logical name reached the cache key")
+
+    original = storage_local._normalize_logical_name_uncached
+    calls = 0
+
+    def counted(file: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original(file)
+
+    monkeypatch.setattr(storage_local, "_normalize_logical_name_uncached", counted)
+    value = Text("wal/custom-name.wal")
+    assert normalize_logical_name(value) is value
+    assert normalize_logical_name(value) is value
+    assert calls == 2
+
 INADMISSIBLE_NAMES: tuple[tuple[str, object], ...] = (
     ("absolute_name", "/etc/passwd"),
     ("absolute_name", "C:/db/heap.dat"),

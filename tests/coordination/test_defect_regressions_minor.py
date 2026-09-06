@@ -22,6 +22,7 @@ from coordination_support import (
     RecordingMetricsSink,
     sharing_violation,
 )
+from okto_grafx.adapters import coordination_local
 from okto_grafx.adapters.coordination_local import (
     LEASE_WAIT_METRIC,
     LocalProcessCoordinator,
@@ -178,6 +179,78 @@ def test_temporary_files_of_dead_participants_do_not_accumulate(
 
 
 # --- the two identifier doors agree ------------------------------------------------------------
+
+
+def test_exact_identifier_proofs_are_bounded_and_only_successes_are_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = coordination_local._validate_identifier_uncached
+    calls = 0
+
+    def counted(label: str, value: str, *, limit: int = 96) -> str:
+        nonlocal calls
+        calls += 1
+        return original(label, value, limit=limit)
+
+    cache = coordination_local._validate_exact_identifier
+    cache.cache_clear()
+    monkeypatch.setattr(coordination_local, "_validate_identifier_uncached", counted)
+    first = "".join(("cache", "-identifier"))
+    second = "".join(("cache-", "identifier"))
+    assert first == second and first is not second
+    try:
+        assert coordination_local._validate_identifier("section name", first) is first
+        assert coordination_local._validate_identifier("section name", second) is second
+        assert calls == 1
+        assert cache.cache_info().maxsize == 512
+
+        invalid_failures: list[GrafxConfigurationError] = []
+        for _ in range(2):
+            with pytest.raises(GrafxConfigurationError) as raised:
+                coordination_local._validate_identifier("section name", "INVALID")
+            invalid_failures.append(raised.value)
+        assert invalid_failures[0].message == invalid_failures[1].message
+        assert invalid_failures[0].details == invalid_failures[1].details
+
+        with pytest.raises(GrafxConfigurationError) as limited:
+            coordination_local._validate_identifier(
+                "section name", first, limit=len(first) - 1
+            )
+        assert limited.value.details["length"] == len(first)
+        assert calls == 4
+    finally:
+        cache.cache_clear()
+
+
+def test_identifier_subclasses_keep_the_uncached_hostile_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Text(str):
+        pass
+
+    class HostileLabel(str):
+        def __hash__(self) -> int:
+            raise AssertionError("a hostile label reached the cache key")
+
+    original = coordination_local._validate_identifier_uncached
+    calls = 0
+
+    def counted(label: str, value: str, *, limit: int = 96) -> str:
+        nonlocal calls
+        calls += 1
+        return original(label, value, limit=limit)
+
+    monkeypatch.setattr(coordination_local, "_validate_identifier_uncached", counted)
+    value = Text("custom-identifier")
+    assert coordination_local._validate_identifier("section name", value) is value
+    assert coordination_local._validate_identifier("section name", value) is value
+    assert (
+        coordination_local._validate_identifier(
+            HostileLabel("section name"), "safe-identifier"
+        )
+        == "safe-identifier"
+    )
+    assert calls == 3
 
 
 def test_a_snapshot_above_the_record_range_is_refused(

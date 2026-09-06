@@ -16,17 +16,24 @@ answers.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import cast
 
 from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.index.keys import (
     DEFAULT_BUCKET_COUNT,
     index_key,
+    record_id_key,
     validate_bucket_count,
 )
 from okto_grafx.domain.index.visibility import IndexVisibility
-from okto_grafx.domain.model.schema import MAX_IDENTIFIER_LENGTH, TableDef, is_identifier
+from okto_grafx.domain.model.schema import (
+    MAX_IDENTIFIER_LENGTH,
+    TableDef,
+    is_identifier,
+)
 from okto_grafx.domain.model.value import Value
 
 __all__ = [
@@ -34,10 +41,12 @@ __all__ = [
     "index_definition_matches_table",
     "COLUMN_KEY_DERIVATION",
     "DEFINITION_DIGEST_SIZE",
+    "RECORD_ID_KEY_DERIVATION",
     "INDEX_DIRECTORY",
     "INDEX_FILE_SUFFIX",
     "IndexDefinition",
     "index_file",
+    "index_generation_file",
     "require_index_name",
 ]
 
@@ -59,6 +68,9 @@ two derivations over the same columns produce different bytes for the same row a
 under the wrong one answers with nothing while looking perfectly healthy.
 """
 
+RECORD_ID_KEY_DERIVATION: str = "record_id_u64_v1"
+"""The built-in derivation whose key is the row's stable unsigned identity."""
+
 
 def index_file(name: str) -> str:
     """Return the file of an index, as CONTRACT.md section 6.1 names it.
@@ -68,6 +80,22 @@ def index_file(name: str) -> str:
     path looks like on this platform.
     """
     return f"{INDEX_DIRECTORY}/{require_index_name(name)}{INDEX_FILE_SUFFIX}"
+
+
+def index_generation_file(artifact_nonce: object) -> str:
+    """Return the canonical physical path derived from one non-zero generation nonce."""
+
+    if (
+        isinstance(artifact_nonce, bool)
+        or not isinstance(artifact_nonce, int)
+        or not 1 <= artifact_nonce <= 0xFFFFFFFFFFFFFFFF
+    ):
+        raise GrafxIndexError(
+            "An index generation needs a non-zero unsigned 64-bit artifact nonce.",
+            field="artifact_nonce",
+            value=repr(artifact_nonce),
+        )
+    return index_file(f"g_{artifact_nonce:016x}")
 
 
 def require_index_name(name: object) -> str:
@@ -120,6 +148,7 @@ class IndexDefinition:
     visibility: IndexVisibility
     bucket_count: int = DEFAULT_BUCKET_COUNT
     key_derivation: str = COLUMN_KEY_DERIVATION
+    artifact_nonce: int = 0
 
     def __post_init__(self) -> None:
         """Refuse a definition that could not name a file, a table, or a key."""
@@ -142,7 +171,9 @@ class IndexDefinition:
                 field="table_id",
                 value=self.table_id,
             )
-        if not isinstance(self.positions, tuple) or not self.positions:
+        if not isinstance(self.positions, tuple) or (
+            not self.positions and self.key_derivation != RECORD_ID_KEY_DERIVATION
+        ):
             raise GrafxIndexError(
                 f"Index {self.name!r} needs at least one key column, as a tuple of positions.",
                 field="positions",
@@ -150,7 +181,11 @@ class IndexDefinition:
             )
         seen: set[int] = set()
         for position in self.positions:
-            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+            if (
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 0
+            ):
                 raise GrafxIndexError(
                     f"Index {self.name!r} needs every key column position to be a non-negative "
                     f"integer; got {position!r}.",
@@ -164,6 +199,14 @@ class IndexDefinition:
                     value=position,
                 )
             seen.add(position)
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION and self.positions:
+            raise GrafxIndexError(
+                f"Identity index {self.name!r} keys RecordId, not stored columns, so its "
+                "positions tuple must be empty.",
+                field="positions",
+                value=repr(self.positions),
+                index=self.name,
+            )
         if not is_identifier(self.key_derivation):
             raise GrafxIndexError(
                 f"Index {self.name!r} must name its key derivation as an ASCII identifier; got "
@@ -171,8 +214,22 @@ class IndexDefinition:
                 field="key_derivation",
                 value=repr(self.key_derivation),
             )
+        if (
+            isinstance(self.artifact_nonce, bool)
+            or not isinstance(self.artifact_nonce, int)
+            or not 0 <= self.artifact_nonce <= 0xFFFFFFFFFFFFFFFF
+        ):
+            raise GrafxIndexError(
+                f"Index {self.name!r} needs an unsigned 64-bit artifact nonce; got "
+                f"{self.artifact_nonce!r}.",
+                field="artifact_nonce",
+                value=repr(self.artifact_nonce),
+                index=self.name,
+            )
         object.__setattr__(self, "visibility", IndexVisibility.parse(self.visibility))
-        object.__setattr__(self, "bucket_count", validate_bucket_count(self.bucket_count))
+        object.__setattr__(
+            self, "bucket_count", validate_bucket_count(self.bucket_count)
+        )
 
     @classmethod
     def on(
@@ -184,6 +241,7 @@ class IndexDefinition:
         visibility: IndexVisibility | str,
         bucket_count: int = DEFAULT_BUCKET_COUNT,
         key_derivation: str = COLUMN_KEY_DERIVATION,
+        artifact_nonce: int = 0,
     ) -> IndexDefinition:
         """Return the definition of an index over these columns of this table.
 
@@ -224,6 +282,7 @@ class IndexDefinition:
             visibility=IndexVisibility.parse(visibility),
             bucket_count=bucket_count,
             key_derivation=key_derivation,
+            artifact_nonce=artifact_nonce,
         )
 
     @property
@@ -244,7 +303,11 @@ class IndexDefinition:
     @property
     def file(self) -> str:
         """Return the paged file this index is stored in."""
-        return index_file(self.name)
+        return (
+            index_file(self.name)
+            if self.artifact_nonce == 0
+            else index_generation_file(self.artifact_nonce)
+        )
 
     def key_for(self, values: Sequence[Value]) -> bytes:
         """Return the index key of a row of this table.
@@ -267,6 +330,18 @@ class IndexDefinition:
             )
         return index_key(values, self.positions)
 
+    def key_for_record(self, record_id: object, values: Sequence[Value]) -> bytes:
+        """Return this definition's key with the complete heap-version identity available.
+
+        Column definitions retain their established value-only derivation.  The identity
+        derivation deliberately ignores stored values and uses the unsigned logical RecordId,
+        which is not representable by the public signed ``INT64`` value codec.
+        """
+
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION:
+            return record_id_key(record_id)
+        return self.key_for(values)
+
     def entry_key_for(self, values: Sequence[Value]) -> bytes | None:
         """Return the stored key, or ``None`` when this row has no index entry.
 
@@ -277,6 +352,15 @@ class IndexDefinition:
 
         return self.key_for(values)
 
+    def entry_key_for_record(
+        self, record_id: object, values: Sequence[Value]
+    ) -> bytes | None:
+        """Return the stored key with RecordId available to non-column derivations."""
+
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION:
+            return record_id_key(record_id)
+        return self.entry_key_for(values)
+
     def owes_entry(self, values: Sequence[Value]) -> bool:
         """Say whether this row owes an entry without deriving its potentially large key.
 
@@ -286,6 +370,18 @@ class IndexDefinition:
         """
 
         return True
+
+    def owes_entry_for_record(self, record_id: object, values: Sequence[Value]) -> bool:
+        """Say whether the complete heap version owes an entry.
+
+        Validating the identity here keeps WAL pre-counting and staging on the same domain.
+        Sparse value-derived definitions retain their existing predicate.
+        """
+
+        if self.key_derivation == RECORD_ID_KEY_DERIVATION:
+            record_id_key(record_id)
+            return True
+        return self.owes_entry(values)
 
     def digest(self) -> bytes:
         """Return the digest an index file stores to prove which definition wrote it.
@@ -313,61 +409,96 @@ class IndexDefinition:
         ).digest()
 
 
-def automatic_index_definitions(table: TableDef) -> tuple[IndexDefinition, ...]:
-    """Return the exact automatic definitions this table's committed schema declares.
+def _automatic_index_projection(
+    table: TableDef,
+) -> tuple[tuple[IndexDefinition, ...], Mapping[str, IndexDefinition]]:
+    """Normalize one immutable table instance without retaining catalog authority.
 
-    Concurrent speculative catalogs may reuse both a numeric id and a table name.  Positions,
-    visibility and key derivation are therefore part of provenance too; returning value objects
-    here lets planning, DML staging, public inventory and verification share that complete test.
+    DDL validation asks the same question repeatedly while a transaction grows its speculative
+    catalog.  ``TableDef`` is an immutable value and automatic definitions depend only on that
+    complete value, never on a catalog generation, registered store or physical nonce.  The
+    immutable derived projection can therefore live with that table instance without carrying
+    authority across DDL replacements, commits or processes.
     """
-    if not isinstance(table, TableDef):
-        return ()
+    cached = table._automatic_index_projection
+    if cached is not None:
+        return cast(
+            tuple[tuple[IndexDefinition, ...], Mapping[str, IndexDefinition]], cached
+        )
+
     definitions: list[IndexDefinition] = []
     if table.kind == "rel":
-        definitions.extend(
-            (
-                IndexDefinition(
-                    name=f"ef_{table.name}",
-                    table_id=table.table_id,
-                    table_name=table.name,
-                    positions=(0,),
-                    visibility=IndexVisibility.EXACT,
-                ),
-                IndexDefinition(
-                    name=f"et_{table.name}",
-                    table_id=table.table_id,
-                    table_name=table.name,
-                    positions=(1,),
-                    visibility=IndexVisibility.EXACT,
-                ),
-            )
+        candidates = (
+            (f"ef_{table.name}", (0,)),
+            (f"et_{table.name}", (1,)),
         )
+        for name, positions in candidates:
+            try:
+                definitions.append(
+                    IndexDefinition(
+                        name=name,
+                        table_id=table.table_id,
+                        table_name=table.name,
+                        positions=positions,
+                        visibility=IndexVisibility.EXACT,
+                    )
+                )
+            except GrafxIndexError:
+                continue
     elif table.primary_key is not None:
-        definitions.append(
-            IndexDefinition(
-                name=f"pk_{table.name}",
-                table_id=table.table_id,
-                table_name=table.name,
-                positions=(table.column_index(table.primary_key),),
-                visibility=IndexVisibility.EXACT,
+        try:
+            definitions.append(
+                IndexDefinition(
+                    name=f"pk_{table.name}",
+                    table_id=table.table_id,
+                    table_name=table.name,
+                    positions=(table.column_index(table.primary_key),),
+                    visibility=IndexVisibility.EXACT,
+                )
             )
-        )
+        except GrafxIndexError:
+            pass
     # Local import breaks the intentional definition -> vector-definition inheritance cycle.
     from okto_grafx.domain.vector.key import VectorIndexDefinition
 
     for position, column in enumerate(table.columns):
         if column.vector_space is None:
             continue
-        definitions.append(
-            VectorIndexDefinition(
-                name=f"vector_{table.name}_{column.vector_space}",
-                table_id=table.table_id,
-                table_name=table.name,
-                positions=(position,),
-                visibility=IndexVisibility.PROXIMITY,
+        try:
+            definitions.append(
+                VectorIndexDefinition(
+                    name=f"vector_{table.name}_{column.vector_space}",
+                    table_id=table.table_id,
+                    table_name=table.name,
+                    positions=(position,),
+                    visibility=IndexVisibility.PROXIMITY,
+                )
             )
-        )
-    return tuple(definitions)
+        except GrafxIndexError:
+            continue
+    normalized = tuple(definitions)
+    projection: tuple[tuple[IndexDefinition, ...], Mapping[str, IndexDefinition]] = (
+        normalized,
+        MappingProxyType(
+            {definition.registry_key: definition for definition in normalized}
+        ),
+    )
+    object.__setattr__(table, "_automatic_index_projection", projection)
+    return projection
+
+
+def automatic_index_definitions(table: TableDef) -> tuple[IndexDefinition, ...]:
+    """Return the exact automatic definitions this table's committed schema declares.
+
+    Concurrent speculative catalogs may reuse both a numeric id and a table name.  Positions,
+    visibility and key derivation are therefore part of provenance too; returning value objects
+    here lets planning, DML staging, public inventory and verification share that complete test.
+    Each accelerator is optional independently: an inexpressible derived name may decline that
+    one path, but can never hide a valid sibling or make the committed table unusable.
+    """
+    if not isinstance(table, TableDef):
+        return ()
+    return _automatic_index_projection(table)[0]
 
 
 def index_definition_matches_table(
@@ -381,12 +512,22 @@ def index_definition_matches_table(
         or definition.table_name != table.name
     ):
         return False
-    automatic = {
-        candidate.registry_key: candidate
-        for candidate in automatic_index_definitions(table)
-    }
+    automatic = _automatic_index_projection(table)[1]
     expected = automatic.get(definition.registry_key)
     if expected is not None:
-        return definition == expected
+        # Bucket count and artifact nonce describe one physical generation, not the logical
+        # schema provenance. Rehashed automatic exact indexes therefore remain the same access
+        # path. The concrete type is still load-bearing for specialized derivations: accepting
+        # a base IndexDefinition in place of VectorIndexDefinition would preserve the digest but
+        # lose the vector key implementation on reopen.
+        return (
+            type(definition) is type(expected)
+            and definition.name == expected.name
+            and definition.table_id == expected.table_id
+            and definition.table_name == expected.table_name
+            and definition.positions == expected.positions
+            and definition.visibility is expected.visibility
+            and definition.key_derivation == expected.key_derivation
+        )
     stored_arity = len(table.columns) + (2 if table.kind == "rel" else 0)
     return all(position < stored_arity for position in definition.positions)

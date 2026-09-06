@@ -112,6 +112,21 @@ _SLOT_BITS: int = 16
 _MAX_ENCODED: int = (MAX_PAGE_INDEX << _SLOT_BITS) | MAX_SLOT_ID
 
 
+def _require_decodable_ref(raw: object) -> int:
+    """Return a valid encoded record reference without allocating its DTO."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise GrafxCorruptionDetected(
+            f"Encoded record reference must be an integer: {raw!r}.",
+            raw=raw,
+        )
+    if not (0 <= raw <= _MAX_ENCODED):
+        raise GrafxCorruptionDetected(
+            f"Encoded record reference is outside the decodable range: {raw}.",
+            raw=raw,
+        )
+    return raw
+
+
 @dataclass(frozen=True, slots=True)
 class RecordRef:
     """Physical location of one record version: the page that holds it and the slot inside that page."""
@@ -145,16 +160,7 @@ class RecordRef:
     @classmethod
     def decode(cls, raw: int) -> RecordRef:
         """Unpack an integer produced by :meth:`encode` back into a reference."""
-        if isinstance(raw, bool) or not isinstance(raw, int):
-            raise GrafxCorruptionDetected(
-                f"Encoded record reference must be an integer: {raw!r}.",
-                raw=raw,
-            )
-        if not (0 <= raw <= _MAX_ENCODED):
-            raise GrafxCorruptionDetected(
-                f"Encoded record reference is outside the decodable range: {raw}.",
-                raw=raw,
-            )
+        raw = _require_decodable_ref(raw)
         return cls(page=raw >> _SLOT_BITS, slot=raw & MAX_SLOT_ID)
 
 

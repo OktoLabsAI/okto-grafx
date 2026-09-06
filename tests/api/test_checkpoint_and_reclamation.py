@@ -19,10 +19,15 @@ from pathlib import Path
 import pytest
 
 from okto_grafx import connect
-from okto_grafx.domain.errors import GrafxDeviceFull, GrafxError, GrafxUnsupportedOperation
+from okto_grafx.domain.errors import (
+    GrafxDeviceFull,
+    GrafxError,
+    GrafxUnsupportedOperation,
+)
 from okto_grafx.domain.page import PageType
 from okto_grafx.domain.txn.commit_state import CommitState
 from okto_grafx.engine.buffer_pool import BufferPool
+from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.index_manager import IndexManager
 
@@ -31,7 +36,9 @@ SEGMENT_BYTES: int = 64 * 1024
 
 
 def _segments(path: Path) -> list[str]:
-    return sorted(os.path.basename(name) for name in glob.glob(str(path / "wal" / "*.wal")))
+    return sorted(
+        os.path.basename(name) for name in glob.glob(str(path / "wal" / "*.wal"))
+    )
 
 
 def _people(database: object, *, at_least: int = 0) -> int:
@@ -44,7 +51,364 @@ def _schema(database: object) -> None:
         txn.execute("CREATE NODE TABLE P(id INT64, name STRING, PRIMARY KEY(id))")
 
 
-def test_a_checkpoint_reclaims_the_segments_the_database_no_longer_needs(tmp_path: Path) -> None:
+def _seed_local_checkpoint_prefix(database: object) -> None:
+    """Leave one ordinary local update above a checkpoint-based applied-prefix seed."""
+    _schema(database)
+    with database.begin("write") as txn:
+        txn.execute("CREATE (:P {id: 1, name: 'before'})")
+    database.checkpoint()
+    assert database._transactions._local_applied_prefix is not None, type(
+        database._transactions._index_manager
+    )
+    with database.begin("write") as txn:
+        txn.execute("MATCH (p:P {id: 1}) SET p.name = 'after'")
+
+
+def test_checkpoint_validates_but_does_not_reapply_its_exact_local_dml_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkpoint-based local witness removes only redundant physical/logical dispatch."""
+    root = tmp_path / "db"
+    database = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    preflighted: list[int] = []
+    applied: list[int] = []
+    real_preflight = CommitRedo.preflight
+    real_apply = CommitRedo.apply
+    try:
+        _seed_local_checkpoint_prefix(database)
+        prefix = database._transactions._local_applied_prefix
+        assert prefix is not None
+        assert prefix.applied_through_lsn == database.transactions.published_lsn()
+
+        def observe_preflight(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            preflighted.append(len(replay.effects))
+            return real_preflight(redo, replay, *args, **kwargs)
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            applied.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "preflight", observe_preflight)
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+
+        database.checkpoint()
+
+        assert any(count > 0 for count in preflighted), (
+            "the shortcut must retain complete payload preflight"
+        )
+        assert sum(count > 0 for count in preflighted) == 1, (
+            "the complete strict preflight already validates every index effect"
+        )
+        assert not any(count > 0 for count in applied), (
+            "the already-applied local prefix must not be dispatched again"
+        )
+        assert database.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("after",),
+        )
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert reopened.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("after",),
+        )
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "proof_outcome",
+    ("contains-reset", "unverified"),
+)
+def test_reset_or_unverified_preflight_fact_uses_canonical_checkpoint_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    proof_outcome: str,
+) -> None:
+    """RESET and missing private authority decline only the shortcut, never the checkpoint."""
+    database = connect(str(tmp_path / proof_outcome), wal_segment_bytes=SEGMENT_BYTES)
+    nonempty_applies: list[int] = []
+    real_apply = CommitRedo.apply
+    real_reset_fact = CommitRedo._verified_contains_index_reset
+    try:
+        _seed_local_checkpoint_prefix(database)
+        local_redo = database._transactions._commit_redo
+
+        if proof_outcome == "contains-reset":
+
+            def report_reset(redo: CommitRedo, proof: object) -> bool | None:
+                observed = real_reset_fact(redo, proof)
+                assert observed is False
+                return True
+
+            monkeypatch.setattr(
+                CommitRedo,
+                "_verified_contains_index_reset",
+                report_reset,
+            )
+        else:
+            # Leave the genuine full proof in place for canonical page projection, but withhold
+            # the verified private proof consumed only by the shortcut.
+            monkeypatch.setattr(
+                CommitRedo,
+                "_verify_preflight_for",
+                lambda *_args, **_kwargs: None,
+            )
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+
+        database.checkpoint()
+
+        assert nonempty_applies, "declining the shortcut must retain canonical replay"
+        assert database.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("after",),
+        )
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+
+def test_untrusted_staged_record_fact_does_not_extend_the_local_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exact manager with a replaced validator still receives no private proof authority."""
+    database = connect(str(tmp_path / "untrusted-staging"), wal_segment_bytes=SEGMENT_BYTES)
+    nonempty_applies: list[int] = []
+    real_validate = IndexManager.validate_staged_records
+    real_apply = CommitRedo.apply
+    try:
+        _seed_local_checkpoint_prefix(database)
+        assert database._transactions._local_applied_prefix is not None
+
+        def wrapped_validate(
+            manager: IndexManager, txn: object, records: object
+        ) -> bool:
+            return real_validate(manager, txn, records)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(IndexManager, "validate_staged_records", wrapped_validate)
+        with database.begin("write") as txn:
+            txn.execute("MATCH (p:P {id: 1}) SET p.name = 'untrusted-proof'")
+
+        assert database._transactions._local_applied_prefix is None
+        local_redo = database._transactions._commit_redo
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+        database.checkpoint()
+
+        assert nonempty_applies, "an untrusted commit fact must retain canonical replay"
+        assert database.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("untrusted-proof",),
+        )
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+
+def test_identity_refill_extends_the_exact_local_checkpoint_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local CN-1 subcommit remains eligible after its flushed row commit follows it."""
+    root = tmp_path / "db"
+    database = connect(
+        str(root),
+        wal_segment_bytes=SEGMENT_BYTES,
+        checkpoint_interval_records=1_000_000,
+    )
+    nonempty_applies: list[int] = []
+    real_apply = CommitRedo.apply
+    try:
+        _schema(database)
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1, name: 'seed'})")
+        database.checkpoint()
+
+        # More than the default 64-record identity lease forces the private CN-1 floor
+        # reservation before this one public transaction can materialise all rows.
+        with database.begin("write") as txn:
+            txn.executemany(
+                "CREATE (:P {id: $id, name: $name})",
+                (
+                    {"id": identity, "name": f"row-{identity}"}
+                    for identity in range(2, 82)
+                ),
+            )
+
+        prefix = database._transactions._local_applied_prefix
+        assert prefix is not None
+        assert prefix.applied_through_lsn == database.transactions.published_lsn()
+
+        local_redo = database._transactions._commit_redo
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+        database.checkpoint()
+
+        assert nonempty_applies == []
+        assert len(database.execute("MATCH (p:P) RETURN p.id").rows) == 81
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+    reopened = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        assert len(reopened.execute("MATCH (p:P) RETURN p.id").rows) == 81
+        assert reopened.verify("all").findings == ()
+    finally:
+        reopened.close()
+
+
+def test_foreign_commit_revokes_the_local_checkpoint_replay_shortcut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreign suffix takes the unchanged complete replay path."""
+    root = tmp_path / "db"
+    local = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    foreign = None
+    nonempty_applies: list[int] = []
+    real_apply = CommitRedo.apply
+    try:
+        _seed_local_checkpoint_prefix(local)
+        foreign = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+        with foreign.begin("write") as txn:
+            txn.execute("MATCH (p:P {id: 1}) SET p.name = 'foreign'")
+
+        local_redo = local._transactions._commit_redo
+
+        def observe_apply(
+            redo: CommitRedo, replay: object, *args: object, **kwargs: object
+        ) -> object:
+            if redo is local_redo and replay.effects:
+                nonempty_applies.append(len(replay.effects))
+            return real_apply(redo, replay, *args, **kwargs)
+
+        monkeypatch.setattr(CommitRedo, "apply", observe_apply)
+        local.checkpoint()
+
+        assert nonempty_applies
+        assert local.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
+            ("foreign",),
+        )
+        assert local.verify("all").findings == ()
+    finally:
+        if foreign is not None:
+            foreign.close()
+        local.close()
+
+
+def test_catalog_commit_revokes_the_local_checkpoint_replay_shortcut(
+    tmp_path: Path,
+) -> None:
+    """DDL cannot inherit a DML-only physical-application witness."""
+    database = connect(str(tmp_path / "db"), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        _seed_local_checkpoint_prefix(database)
+        assert database._transactions._local_applied_prefix is not None
+
+        with database.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE Q(id INT64, PRIMARY KEY(id))")
+
+        assert database._transactions._local_applied_prefix is None
+        database.checkpoint()
+        assert database.verify("all").findings == ()
+    finally:
+        database.close()
+
+
+def test_failed_data_barrier_revokes_the_local_checkpoint_replay_shortcut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed checkpoint retry always returns to canonical redo."""
+    database = connect(str(tmp_path / "db"), wal_segment_bytes=SEGMENT_BYTES)
+    original_barrier = BufferPool.durability_barrier
+    refused = False
+    try:
+        _seed_local_checkpoint_prefix(database)
+        assert database._transactions._local_applied_prefix is not None
+
+        def fail_first_barrier(pool: BufferPool, file: str | None = None) -> None:
+            nonlocal refused
+            if pool is database._pool and not refused:
+                refused = True
+                raise GrafxDeviceFull("The checkpoint data barrier was refused.", file=file)
+            original_barrier(pool, file)
+
+        monkeypatch.setattr(BufferPool, "durability_barrier", fail_first_barrier)
+        with pytest.raises(GrafxDeviceFull):
+            database.checkpoint()
+
+        assert refused
+        assert database._transactions._local_applied_prefix is None
+    finally:
+        database.close()
+
+
+def test_local_applied_prefix_never_replaces_missing_wal_lineage(tmp_path: Path) -> None:
+    """Even an exact local witness refuses before publishing over a missing segment."""
+    root = tmp_path / "db"
+    database = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
+    try:
+        _schema(database)
+        with database.begin("write") as txn:
+            txn.execute("CREATE (:P {id: 1, name: 'seed'})")
+        database.checkpoint()
+        for revision in range(12):
+            with database.begin("write") as txn:
+                txn.execute(
+                    "MATCH (p:P {id: 1}) SET p.name = $name",
+                    {"name": f"revision-{revision}"},
+                )
+        assert database._transactions._local_applied_prefix is not None
+        segments = _segments(root)
+        assert len(segments) >= 3
+        victim = root / "wal" / segments[1]
+        state_path = root / "control" / "commit.state"
+        state_before = state_path.read_bytes()
+
+        victim.unlink()
+        with pytest.raises(GrafxError):
+            database.checkpoint()
+
+        assert state_path.read_bytes() == state_before
+        assert database.transactions.recovery_required is True
+    finally:
+        database.close()
+
+
+def test_a_checkpoint_reclaims_the_segments_the_database_no_longer_needs(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "db"
     database = connect(str(root), wal_segment_bytes=SEGMENT_BYTES)
     try:
@@ -140,7 +504,9 @@ def test_a_foreign_writer_commits_during_the_checkpoint_data_barrier(
             finally:
                 checkpoint_done.set()
 
-        monkeypatch.setattr(BufferPool, "durability_barrier", pause_first_checkpoint_barrier)
+        monkeypatch.setattr(
+            BufferPool, "durability_barrier", pause_first_checkpoint_barrier
+        )
         checkpoint_thread = threading.Thread(
             target=run_checkpoint, name="concurrent-data-barrier"
         )
@@ -157,7 +523,9 @@ def test_a_foreign_writer_commits_during_the_checkpoint_data_barrier(
         assert writer.execute("MATCH (p:P {id: 1}) RETURN p.name").rows == (
             ("during-barrier",),
         )
-        assert not checkpoint_done.is_set(), "the checkpoint must still be inside phase B"
+        assert not checkpoint_done.is_set(), (
+            "the checkpoint must still be inside phase B"
+        )
 
         release_barrier.set()
         checkpoint_thread.join(timeout=10.0)
@@ -370,15 +738,15 @@ def test_a_checkpoint_with_a_live_local_snapshot_keeps_the_monolithic_fence(
         writer_txn = writer.begin("write")
         writer_txn.execute("CREATE (:P {id: 9, name: 'waited'})")
 
-        def pause_checkpoint_barrier(
-            pool: BufferPool, file: str | None = None
-        ) -> None:
+        def pause_checkpoint_barrier(pool: BufferPool, file: str | None = None) -> None:
             nonlocal paused
             if pool is checkpointer._pool and not paused:
                 paused = True
                 barrier_entered.set()
                 if not release_barrier.wait(timeout=5.0):
-                    raise AssertionError("the test did not release the monolithic checkpoint")
+                    raise AssertionError(
+                        "the test did not release the monolithic checkpoint"
+                    )
             original_barrier(pool, file)
 
         def run_checkpoint() -> None:
@@ -503,7 +871,9 @@ def test_a_long_lived_checkpointer_adopts_foreign_schema_before_logical_redo(
         assert checkpointer.attached_indexes == ()
         checkpointer.checkpoint()
 
-        assert tuple(table.name for table in checkpointer.catalog.catalog.tables()) == ("P",)
+        assert tuple(table.name for table in checkpointer.catalog.catalog.tables()) == (
+            "P",
+        )
         assert checkpointer.indexes.index("pk_P").name == "pk_P"
         assert checkpointer.attached_indexes == ("pk_P",)
         assert checkpointer.execute("MATCH (p:P) RETURN p.id").rows == ((7,),)
@@ -535,14 +905,23 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
         original_open = IndexManager.open
 
         def fail_commit_publication(
-            store: CommitStateStore, state: CommitState
+            store: CommitStateStore,
+            state: CommitState,
+            *,
+            previous: CommitState,
+            previous_was_damaged: bool = False,
         ) -> None:
             if threading.current_thread().name == "latching-commit":
                 raise GrafxDeviceFull(
                     "The test refuses publication after the commit barrier.",
                     file="control/commit.state",
                 )
-            original_publish(store, state)
+            original_publish(
+                store,
+                state,
+                previous=previous,
+                previous_was_damaged=previous_was_damaged,
+            )
 
         def pause_checkpoint_inventory(
             manager: IndexManager,
@@ -550,16 +929,20 @@ def test_checkpoint_index_inventory_is_serialized_with_a_post_barrier_commit(
             *,
             persist_stale: bool = True,
             allow_ahead: bool = False,
+            **kwargs: object,
         ) -> tuple[object, ...]:
             if threading.current_thread().name == "checkpoint-postlude":
                 inventory_entered.set()
                 if not release_inventory.wait(timeout=5.0):
-                    raise AssertionError("the test did not release checkpoint inventory")
+                    raise AssertionError(
+                        "the test did not release checkpoint inventory"
+                    )
             return original_open(
                 manager,
                 published_lsn,
                 persist_stale=persist_stale,
                 allow_ahead=allow_ahead,
+                **kwargs,
             )
 
         def run_checkpoint() -> None:
@@ -650,6 +1033,7 @@ def test_maintenance_index_inventory_fences_a_foreign_commit(
             *,
             persist_stale: bool = True,
             allow_ahead: bool = False,
+            **kwargs: object,
         ) -> tuple[object, ...]:
             if (
                 manager is maintained_indexes
@@ -657,12 +1041,15 @@ def test_maintenance_index_inventory_fences_a_foreign_commit(
             ):
                 inventory_entered.set()
                 if not release_inventory.wait(timeout=5.0):
-                    raise AssertionError("the test did not release maintenance inventory")
+                    raise AssertionError(
+                        "the test did not release maintenance inventory"
+                    )
             return original_open(
                 manager,
                 published_lsn,
                 persist_stale=persist_stale,
                 allow_ahead=allow_ahead,
+                **kwargs,
             )
 
         def run_maintenance() -> None:
@@ -685,7 +1072,9 @@ def test_maintenance_index_inventory_fences_a_foreign_commit(
         maintenance_thread = threading.Thread(
             target=run_maintenance, name="stable-maintenance-inventory"
         )
-        commit_thread = threading.Thread(target=run_commit, name="foreign-inventory-commit")
+        commit_thread = threading.Thread(
+            target=run_commit, name="foreign-inventory-commit"
+        )
         maintenance_thread.start()
         assert inventory_entered.wait(timeout=5.0)
         commit_thread.start()
@@ -779,7 +1168,9 @@ def test_startup_index_inventory_fences_a_foreign_commit(
             commit_done.set()
 
     monkeypatch.setattr(IndexManager, "open", pause_startup_inventory)
-    connect_thread = threading.Thread(target=run_connect, name="stable-startup-inventory")
+    connect_thread = threading.Thread(
+        target=run_connect, name="stable-startup-inventory"
+    )
     commit_thread = threading.Thread(target=run_commit, name="foreign-startup-commit")
     try:
         connect_thread.start()
@@ -816,7 +1207,7 @@ def test_startup_index_inventory_fences_a_foreign_commit(
         reopened.close()
 
 
-_OTHER_PROCESS = r'''
+_OTHER_PROCESS = r"""
 import sys, time
 sys.path.insert(0, sys.argv[2])
 from okto_grafx import connect
@@ -836,10 +1227,10 @@ db._transactions.refresh_due_readers(
 )
 print("COMMITTED", flush=True)
 time.sleep(60)   # hold the pages in memory; the test kills this process before it flushes
-'''
+"""
 
 
-_CHECKPOINT_CRASH_PROCESS = r'''
+_CHECKPOINT_CRASH_PROCESS = r"""
 import os, sys
 sys.path.insert(0, sys.argv[2])
 from okto_grafx import connect
@@ -880,7 +1271,7 @@ else:
 
 db.checkpoint()
 os._exit(99)
-'''
+"""
 
 
 @pytest.mark.parametrize(
@@ -1026,7 +1417,9 @@ def test_a_checkpoint_never_reclaims_a_page_another_process_has_not_flushed(
             }
             assert protected, "the scenario needs WAL newer than the reader snapshot"
             report = checkpointer.checkpoint()
-            assert report.recycled, "the scenario needs the checkpoint to actually reclaim"
+            assert report.recycled, (
+                "the scenario needs the checkpoint to actually reclaim"
+            )
             assert report.reader_present is True
             assert report.horizon_lsn == snapshot
             assert protected <= set(report.retained)

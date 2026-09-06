@@ -22,6 +22,10 @@ reaches outside the pure core. The rules, and why each one exists:
 * **``TYPE_ONLY_MODULES`` may appear only under a trustworthy ``if TYPE_CHECKING:`` guard** --
   one whose name really is ``typing.TYPE_CHECKING`` and is never reassigned in the module.
   Writing ``TYPE_CHECKING = True`` would otherwise turn the escape hatch into an open door.
+* **The one runtime observation exception is exact**: only
+  ``okto_grafx.engine.txn_manager <- time.perf_counter_ns`` is accepted, unaliased and alone in
+  its import. It times diagnostics without invoking a host-supplied Clock while commit locks are
+  held; it never participates in a storage, lease or visibility decision.
 
 The gate also proves it can fail, with synthetic sources for every rule, so a silent regression
 of the checker itself is a failure too.
@@ -58,6 +62,7 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
         "struct",
         "types",
         "typing",
+        "zlib",
     }
 )
 """The only modules the pure core may import. Anything else is mechanism or a dependency.
@@ -70,13 +75,36 @@ exactly the sense ``math`` and ``itertools`` are.
 introducing I/O, time, randomness or a dependency on a mechanism layer.  The module is therefore
 pure under the same criterion as ``dataclasses`` and ``collections``.
 
+``zlib`` is the deterministic algorithm that defines the durable WRITE_PAGE v2 grammar. It has
+no I/O, time, randomness or platform decision, and keeping bounded inflate beside that grammar
+prevents an adapter from acquiring authority over WAL interpretation.
+
 ``uuid`` is deliberately absent: ``uuid4`` is unseeded randomness and ``uuid1`` reads the wall
 clock, both of which G2b and amendment A5 keep out of the domain. The identifier type is still
 reachable through ``TYPE_ONLY_MODULES``.
+
+``time`` is also deliberately absent. Its sole diagnostic observation is enforced separately by
+the exact consumer/origin/symbol triple in ``EXACT_RUNTIME_OBSERVATION_IMPORTS``.
 """
 
 TYPE_ONLY_MODULES: frozenset[str] = frozenset({"uuid"})
 """Modules the pure core may name for typing only, under a trustworthy TYPE_CHECKING guard."""
+
+EXACT_RUNTIME_OBSERVATION_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        (
+            "okto_grafx.engine.txn_manager",
+            "time",
+            "perf_counter_ns",
+        ),
+    }
+)
+"""Single-symbol diagnostic observations that are safe from host callback re-entry.
+
+This is deliberately keyed by consumer, origin and exact unaliased symbol. It does not make
+``time`` an allowed pure-core module and cannot be widened to another file or clock operation by
+adding an import statement alone.
+"""
 
 FORBIDDEN_FOR_EVERY_PURE_MODULE: tuple[str, ...] = (
     "okto_grafx.adapters",
@@ -267,6 +295,14 @@ def scan_source(module_name: str, source: str) -> list[str]:
                 if node.level
                 else (node.module or "")
             )
+            exact_observation = (
+                len(node.names) == 1
+                and node.names[0].asname is None
+                and (module_name, imported, node.names[0].name)
+                in EXACT_RUNTIME_OBSERVATION_IMPORTS
+            )
+            if exact_observation:
+                continue
             if not _is_allowed_import(
                 imported, type_checking=type_checking, forbidden=forbidden
             ):
@@ -373,6 +409,7 @@ def test_every_pure_core_module_postpones_its_annotations() -> None:
 DOMAIN_MODULE: str = "okto_grafx.domain.probe"
 NESTED_MODULE: str = "okto_grafx.domain.ports.storage"
 ENGINE_MODULE: str = "okto_grafx.engine.probe"
+TXN_MANAGER_MODULE: str = "okto_grafx.engine.txn_manager"
 
 VIOLATING_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("import os", DOMAIN_MODULE, "import os\n"),
@@ -381,6 +418,32 @@ VIOLATING_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("import sys", DOMAIN_MODULE, "import sys\n"),
     ("import threading", DOMAIN_MODULE, "import threading\n"),
     ("import time", DOMAIN_MODULE, "import time\n"),
+    ("engine imports time", TXN_MANAGER_MODULE, "import time\n"),
+    (
+        "engine imports another monotonic timer",
+        TXN_MANAGER_MODULE,
+        "from time import monotonic_ns\n",
+    ),
+    (
+        "engine imports wall time",
+        TXN_MANAGER_MODULE,
+        "from time import time\n",
+    ),
+    (
+        "engine aliases the diagnostic timer",
+        TXN_MANAGER_MODULE,
+        "from time import perf_counter_ns as timer\n",
+    ),
+    (
+        "another engine module imports the diagnostic timer",
+        ENGINE_MODULE,
+        "from time import perf_counter_ns\n",
+    ),
+    (
+        "engine broadens the diagnostic timer import",
+        TXN_MANAGER_MODULE,
+        "from time import perf_counter_ns, monotonic\n",
+    ),
     ("import mmap", DOMAIN_MODULE, "import mmap\n"),
     ("import socket", DOMAIN_MODULE, "import socket\n"),
     ("import pathlib", DOMAIN_MODULE, "from pathlib import Path\n"),
@@ -533,8 +596,14 @@ ACCEPTED_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("collections submodule", DOMAIN_MODULE, "from collections import abc\n"),
     ("dataclasses", DOMAIN_MODULE, "from dataclasses import dataclass\n"),
     ("struct", DOMAIN_MODULE, "import struct\n"),
+    ("zlib", DOMAIN_MODULE, "import zlib\n"),
     ("hashlib", DOMAIN_MODULE, "from hashlib import sha256\n"),
     ("math", DOMAIN_MODULE, "from math import isfinite\n"),
+    (
+        "exact commit diagnostic timer",
+        TXN_MANAGER_MODULE,
+        "from time import perf_counter_ns\n",
+    ),
     (
         "sibling domain module",
         DOMAIN_MODULE,

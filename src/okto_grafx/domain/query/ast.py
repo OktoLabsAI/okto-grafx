@@ -31,6 +31,7 @@ __all__ = [
     "CaseExpression",
     "ColumnSpec",
     "CreateClause",
+    "CreateIndexStatement",
     "CreateNodeTableStatement",
     "CreateRelTableStatement",
     "CreateVectorSpaceStatement",
@@ -784,6 +785,34 @@ class ColumnSpec:
         if self.vector_space is not None:
             return f"{self.name} {self.type_name}({self.vector_space})"
         return f"{self.name} {self.type_name}"
+
+
+@dataclass(frozen=True, slots=True)
+class CreateIndexStatement(Statement):
+    """A custom exact-index declaration before catalog resolution."""
+
+    name: str
+    variable: str
+    table: str
+    columns: tuple[str, ...]
+    bucket_count: int | None = None
+    expected_cardinality: int | None = None
+
+    def describe(self) -> str:
+        """Return the statement as it would be written back."""
+        keys = ", ".join(f"{self.variable}.{column}" for column in self.columns)
+        body = (
+            f"CREATE INDEX {self.name} FOR ({self.variable}:{self.table}) "
+            f"ON ({keys})"
+        )
+        if self.bucket_count is not None:
+            return f"{body} OPTIONS bucket_count = {self.bucket_count}"
+        if self.expected_cardinality is not None:
+            return (
+                f"{body} OPTIONS expected_cardinality = "
+                f"{self.expected_cardinality}"
+            )
+        return body
 
 
 @dataclass(frozen=True, slots=True)

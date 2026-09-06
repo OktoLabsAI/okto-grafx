@@ -21,6 +21,7 @@ constant itself (amendments A56 and A68).
 from __future__ import annotations
 
 __all__ = [
+    "DEFAULT_MAX_QUERY_VALUE_CHARACTERS",
     "MAX_CLAUSES",
     "MAX_COLUMN_DEFINITIONS",
     "MAX_EXPRESSION_DEPTH",
@@ -33,6 +34,7 @@ __all__ = [
     "MAX_PATTERNS_PER_CLAUSE",
     "MAX_PROJECTION_ITEMS",
     "MAX_QUERY_CHARACTERS",
+    "MAX_QUERY_VALUE_CHARACTERS",
     "MAX_RENDERED_QUERY_CHARACTERS",
     "MAX_SORT_KEYS",
     "MAX_STRING_CHARACTERS",
@@ -42,6 +44,22 @@ __all__ = [
 
 MAX_QUERY_CHARACTERS: int = 65536
 """Characters one query may carry. Anything longer is refused before a single token is cut."""
+
+DEFAULT_MAX_QUERY_VALUE_CHARACTERS: int = 65536
+"""Default character ceiling for each string entering or leaving the query value boundary.
+
+Unlike :data:`MAX_STRING_CHARACTERS`, this is not a lexer limit: parameter values are data rather
+than query source.  Keeping the default aligned with the complete query-text ceiling admits the
+document-sized values used by Pulse without making the public value graph unbounded.
+"""
+
+MAX_QUERY_VALUE_CHARACTERS: int = 1_048_576
+"""Largest configurable per-string query-value ceiling.
+
+The format can store larger strings, but accepting an arbitrary Python value graph is also a
+memory-admission decision.  One MiB per string is therefore a hard guard above the configurable
+default; applications needing larger payloads should split them or use a bounded blob surface.
+"""
 
 MAX_RENDERED_QUERY_CHARACTERS: int = 1_048_576
 """Characters one query-derived display value may carry in a public plan or result.

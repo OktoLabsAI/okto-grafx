@@ -105,7 +105,9 @@ def _components_of(values: object) -> tuple[float, ...]:
             value=type(values).__name__,
         )
     try:
-        return tuple(float(component) for component in values)  # type: ignore[union-attr]
+        # map() runs the conversion in C for the whole vector (VEC-3); a component that is not
+        # a number raises the same TypeError or ValueError it raised one at a time.
+        return tuple(map(float, values))  # type: ignore[arg-type]
     except (TypeError, ValueError) as failure:
         raise _refuse(
             f"A vector needs a sequence of numbers; got {type(values).__name__}.",
@@ -147,7 +149,35 @@ def validate_components(
             value=dimension,
         )
     single = space.storage_dtype == STORAGE_DTYPE_FLOAT32
-    stored: list[float] = []
+    # The two guards are asked of the whole vector at once (VEC-3): one pass in C decides
+    # whether every component is finite, and two more whether every component of a float32
+    # space is inside the range a slot can hold. Only a vector that fails walks the components
+    # one by one, in the loop below, so that the refusal names the FIRST offending position and
+    # the same reason it always did -- the fast path never decides which component to blame.
+    if not all(map(isfinite, components)) or (
+        single
+        and dimension > 0
+        and not (
+            -FLOAT32_OVERFLOW_THRESHOLD < min(components)
+            and max(components) < FLOAT32_OVERFLOW_THRESHOLD
+        )
+    ):
+        _refuse_first_offending_component(space, components, single)
+    result = _round_block_to_float32(components) if single else tuple(components)
+    if space.normalized:
+        _require_unit_length(space, result)
+    return result
+
+
+def _refuse_first_offending_component(
+    space: EmbeddingSpaceDef, components: tuple[float, ...], single: bool
+) -> None:
+    """Raise the refusal of the first component the block guards of a write rejected.
+
+    This is the per-component walk ``validate_components`` used to do for every vector, kept
+    verbatim so the position, the reason and the message of a refusal are unchanged: the block
+    guards only decide THAT the walk is needed, never which component answers.
+    """
     for position, component in enumerate(components):
         if not isfinite(component):
             raise _refuse(
@@ -159,7 +189,10 @@ def validate_components(
                 position=position,
                 value=repr(component),
             )
-        if single and not -FLOAT32_OVERFLOW_THRESHOLD < component < FLOAT32_OVERFLOW_THRESHOLD:
+        if (
+            single
+            and not -FLOAT32_OVERFLOW_THRESHOLD < component < FLOAT32_OVERFLOW_THRESHOLD
+        ):
             raise _refuse(
                 f"Embedding space {space.name!r} stores float32 components, which hold at most "
                 f"{MAX_FLOAT32!r} in magnitude; component {position} is {component!r} and would "
@@ -171,11 +204,22 @@ def validate_components(
                 value=repr(component),
                 limit=MAX_FLOAT32,
             )
-        stored.append(round_to_storage_dtype(component, space.storage_dtype))
-    result = tuple(stored)
-    if space.normalized:
-        _require_unit_length(space, result)
-    return result
+    raise AssertionError(  # pragma: no cover - the block guards only send offenders here
+        "the block guards refused a vector whose components all pass the per-component walk"
+    )
+
+
+def _round_block_to_float32(components: tuple[float, ...]) -> tuple[float, ...]:
+    """Return the components as float32 slots would read them back, converted as one block.
+
+    One ``struct`` round trip over the whole vector performs exactly the per-component
+    conversion :func:`round_to_storage_dtype` documents -- the same C conversion, the same
+    rounding, the same doubles back -- in one call instead of two per component. A test holds
+    the two to equality component by component, including the values just above the largest
+    float32 that round down to it rather than to an infinity.
+    """
+    layout = f"<{len(components)}f"
+    return struct.unpack(layout, struct.pack(layout, *components))
 
 
 def validate_query_components(
@@ -215,6 +259,15 @@ def validate_query_components(
             expected=space.dimension,
             value=dimension,
         )
+    if not all(map(isfinite, components)):
+        _refuse_first_non_finite_query_component(space, components)
+    return components
+
+
+def _refuse_first_non_finite_query_component(
+    space: EmbeddingSpaceDef, components: tuple[float, ...]
+) -> None:
+    """Raise the refusal of the first query component that is not finite (VEC-3 slow path)."""
     for position, component in enumerate(components):
         if not isfinite(component):
             raise _refuse(
@@ -226,7 +279,9 @@ def validate_query_components(
                 position=position,
                 value=repr(component),
             )
-    return components
+    raise AssertionError(  # pragma: no cover - the block guard only sends offenders here
+        "the block guard refused a query whose components are all finite"
+    )
 
 
 def _require_unit_length(space: EmbeddingSpaceDef, components: tuple[float, ...]) -> None:

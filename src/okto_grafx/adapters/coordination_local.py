@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 import struct
 import threading
 import time
@@ -42,6 +43,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from math import isfinite
 from typing import TypeVar
 
@@ -213,6 +215,9 @@ _MAX_WAIT_ITERATIONS: int = (1 << 63) - 1
 
 _MAX_IDENTIFIER_LENGTH: int = 96
 """Longest accepted identifier of any kind. It has to fit in a file name on every platform."""
+
+_IDENTIFIER_VALIDATION_CACHE_SIZE: int = 512
+"""Maximum successful exact-string identifier proofs retained process-locally."""
 
 _READER_SUFFIX_BUDGET: int = 8
 """Room a reader identifier needs on top of the stored owner identifier, as in ``-r0001``."""
@@ -426,6 +431,22 @@ def _validate_identifier(
     relative traversal is refused for the same family of reasons: a control directory of ``..``
     would put the lease outside the database it is supposed to protect.
     """
+    if type(label) is str and type(value) is str and type(limit) is int:
+        _validate_exact_identifier(label, value, limit)
+        return value
+    return _validate_identifier_uncached(label, value, limit=limit)
+
+
+@lru_cache(maxsize=_IDENTIFIER_VALIDATION_CACHE_SIZE)
+def _validate_exact_identifier(label: str, value: str, limit: int) -> None:
+    """Remember a bounded successful proof for immutable built-in strings only."""
+    _validate_identifier_uncached(label, value, limit=limit)
+
+
+def _validate_identifier_uncached(
+    label: str, value: str, *, limit: int = _MAX_IDENTIFIER_LENGTH
+) -> str:
+    """Apply the canonical identifier grammar without consulting derived state."""
     if not isinstance(value, str) or not value:
         raise _reject(
             f"The {label} must be a non-empty string.", field=label, value=repr(value)
@@ -530,6 +551,41 @@ class ReaderRecord:
     def liveness_key(self) -> tuple[str, int]:
         """Return the pair an observer samples for this reader."""
         return (self.reader_id, self.heartbeat_seq)
+
+
+@dataclass(slots=True)
+class _ReusableDescriptorScope:
+    """One thread-local interval in which an unlocked section descriptor may stay open."""
+
+    depth: int = 1
+    descriptor: int | None = None
+    borrowed: bool = False
+    closing: bool = False
+    # How many nested intervals asked for the revalidated variant. A parked descriptor names
+    # the file it was opened through, never the path: a lock file replaced between two
+    # operations leaves the descriptor on an orphaned inode, and locking an orphan always
+    # succeeds while another process locks the live file. Counting rather than flagging keeps
+    # the guard while ANY long interval is open, including one nested inside a short one.
+    revalidations: int = 0
+    # Once a long interval has touched this scope the guard stays for the rest of its life. A
+    # long interval nested inside a short one has already stretched real time across the short
+    # one, so letting the outer frame reuse that descriptor unproved would restore exactly the
+    # window the guard exists to close.
+    ever_revalidated: bool = False
+
+    @property
+    def revalidated(self) -> bool:
+        """Return whether a parked descriptor must be re-proved before it is locked again."""
+        return self.revalidations > 0 or self.ever_revalidated
+
+
+@dataclass(frozen=True, slots=True)
+class _FileSectionHandle:
+    """A locked descriptor and the exact optional scope from which it was borrowed."""
+
+    descriptor: int
+    scope_key: tuple[int, str] | None = None
+    scope: _ReusableDescriptorScope | None = None
 
 
 def _finish(header: bytes, identifier: str) -> bytes:
@@ -833,6 +889,7 @@ class LocalProcessCoordinator:
 
         self._state_lock = threading.RLock()
         self._sections: dict[tuple[int, str], object] = {}
+        self._descriptor_scopes: dict[tuple[int, str], _ReusableDescriptorScope] = {}
         self._held: Lease | None = None
         self._installed: Lease | None = None
         self._installed_epochs: set[Epoch] = set()
@@ -1360,6 +1417,26 @@ class LocalProcessCoordinator:
                     self._reader_samples.pop(reader_id, None)
         return horizon
 
+    def observe_reader_horizon(self) -> Lsn | None:
+        """Return a conservative reader horizon without pruning or publishing anything.
+
+        This optional capability exists for read-only diagnostics. Unlike
+        :meth:`reader_horizon`, it makes no liveness inference: every decodable active final
+        registration remains a pin even when its heartbeat would be TTL-stalled. Empty,
+        inactive and temporary records are ignored but deliberately left untouched. Corrupt
+        final records still fail closed because their snapshot is unknowable.
+        """
+        horizon: Lsn | None = None
+        for name in self._list_files(self._readers_prefix):
+            if name.endswith(TEMPORARY_SUFFIX) or not name.endswith(READER_FILE_SUFFIX):
+                continue
+            record = self._read_reader_record(name)
+            if record is None or not record.active:
+                continue
+            if horizon is None or record.snapshot_lsn < horizon:
+                horizon = record.snapshot_lsn
+        return horizon
+
     # --- critical sections ---------------------------------------------------------------------
 
     def exclusive(self, name: str, *, timeout: float) -> AbstractContextManager[None]:
@@ -1375,6 +1452,90 @@ class LocalProcessCoordinator:
         return self._section(
             _validate_identifier("section name", name.lower()), timeout
         )
+
+    def reuse_unlocked_section_descriptor(
+        self, name: str
+    ) -> AbstractContextManager[None]:
+        """Keep only an unlocked file descriptor open for a bounded caller-owned interval.
+
+        This optional, private-performance capability never keeps the advisory lock itself:
+        every :meth:`exclusive` entry still acquires the operating-system lock and every exit
+        still releases it. Reuse is restricted to the same thread and normalized section name,
+        and any uncertain acquire or release discards the descriptor instead of caching it.
+        Coordinators without a lock directory use their normal process-local lock unchanged.
+        """
+        if not isinstance(name, str):
+            raise _reject("The section name must be a string.", value=repr(name))
+        normalized = _validate_identifier("section name", name.lower())
+        return self._reuse_unlocked_section_descriptor(normalized)
+
+    def _reuse_revalidated_unlocked_section_descriptor(
+        self, name: str
+    ) -> AbstractContextManager[None] | None:
+        """Keep an unlocked descriptor across an interval whose length the CALLER decides.
+
+        The short variant above lives inside one engine call, so the window in which the lock
+        file could be replaced is bounded by that call. This one may span separate statements of
+        one transaction, and a caller may hold it open for as long as it likes. Over that window
+        the descriptor's file may be unlinked and recreated, and a descriptor kept from before
+        the replacement names an orphaned inode: locking it always succeeds while another
+        process locks the live file, so mutual exclusion would be lost with no error anywhere.
+
+        The longer window is therefore paid for with a proof rather than with trust. Before a
+        parked descriptor is locked again its physical identity is compared with the identity
+        the path names now, and any mismatch or any doubt closes it and opens the file afresh.
+        Every ``exclusive`` still takes and releases the real operating-system lock; only the
+        open descriptor is reused, and only while it is still provably the same file.
+
+        ``None`` means this coordinator has nothing to reuse -- it holds no lock directory, so
+        its sections are process-local. Answering with a live no-op context would make a caller
+        pay a frame per statement to enter an interval that can never park anything.
+        """
+        if not isinstance(name, str):
+            raise _reject("The section name must be a string.", value=repr(name))
+        normalized = _validate_identifier("section name", name.lower())
+        if self._lock_directory is None:
+            return None
+        return self._reuse_unlocked_section_descriptor(normalized, revalidated=True)
+
+    @contextmanager
+    def _reuse_unlocked_section_descriptor(
+        self, name: str, *, revalidated: bool = False
+    ) -> Iterator[None]:
+        """Bound descriptor reuse to one thread and one exact section name."""
+        if self._lock_directory is None:
+            yield
+            return
+
+        key = (threading.get_ident(), name)
+        with self._state_lock:
+            scope = self._descriptor_scopes.get(key)
+            if scope is None or scope.closing:
+                scope = _ReusableDescriptorScope()
+                self._descriptor_scopes[key] = scope
+            else:
+                scope.depth += 1
+            if revalidated:
+                scope.revalidations += 1
+                scope.ever_revalidated = True
+        try:
+            yield
+        finally:
+            descriptor: int | None = None
+            with self._state_lock:
+                current = self._descriptor_scopes.get(key)
+                if current is scope:
+                    if revalidated:
+                        scope.revalidations -= 1
+                    scope.depth -= 1
+                    if scope.depth == 0:
+                        scope.closing = True
+                        if not scope.borrowed:
+                            self._descriptor_scopes.pop(key, None)
+                            descriptor = scope.descriptor
+                            scope.descriptor = None
+            if descriptor is not None:
+                self._close_file_descriptor(descriptor)
 
     @contextmanager
     def _section(self, name: str, timeout: float) -> Iterator[None]:
@@ -1831,18 +1992,54 @@ class LocalProcessCoordinator:
             "" if directory is None else directory, f"{name}{LOCK_FILE_SUFFIX}"
         )
         deadline = self._clock.monotonic() + timeout
-        handle = self._open_lock_file(path, name, deadline)
+        key = (threading.get_ident(), name)
+        scope: _ReusableDescriptorScope | None = None
+        handle: int | None = None
+        revalidate = False
+        with self._state_lock:
+            candidate = self._descriptor_scopes.get(key)
+            if (
+                candidate is not None
+                and not candidate.closing
+                and not candidate.borrowed
+            ):
+                scope = candidate
+                scope.borrowed = True
+                handle = scope.descriptor
+                scope.descriptor = None
+                revalidate = scope.revalidated
         try:
+            if (
+                handle is not None
+                and revalidate
+                and not self._descriptor_names(handle, path)
+            ):
+                # The parked descriptor no longer names what the path names, or the answer could
+                # not be obtained. Either way it is not the file this section is about, and
+                # locking it would report exclusion this coordinator does not have. Closing
+                # before the retake makes the fallback a plain cold open, not a second chance.
+                #
+                # The proof itself is inside this frame because it is fallible like every other
+                # step here: a host interrupt or an injected failure while proving must leave the
+                # borrow released and the descriptor closed, exactly as a failed open would.
+                self._close_file_descriptor(handle)
+                handle = None
+            if handle is None:
+                handle = self._open_lock_file(path, name, deadline)
             self._wait_for_os_lock(handle, name, timeout, deadline)
+            section = _FileSectionHandle(
+                handle, key if scope is not None else None, scope
+            )
         except BaseException:
-            # No path out of here may leak the descriptor: on Windows an open handle is what
-            # keeps a file undeletable, and on both families it is what holds the lock.
-            try:
-                os.close(handle)
-            except OSError:
-                pass
+            # No path out of here -- including construction of the Python handle after the
+            # advisory lock was acquired -- may leak the descriptor. On Windows an open handle
+            # keeps the file undeletable, and on both families it is what holds the lock.
+            if scope is not None:
+                self._finish_descriptor_borrow(key, scope, descriptor=None)
+            if handle is not None:
+                self._close_file_descriptor(handle)
             raise
-        return handle
+        return section
 
     def _wait_for_os_lock(
         self, handle: int, name: str, timeout: float, deadline: float
@@ -1910,21 +2107,105 @@ class LocalProcessCoordinator:
     def _drop_lock(self, handle: object) -> None:
         """Release the advisory lock of a section. It never raises: the caller may be unwinding."""
         if isinstance(handle, int):
+            # Preserve the pre-capability private shape for narrow test doubles and subclasses
+            # that override _take_lock while still delegating cleanup here.
             try:
                 _release_os_lock(handle)
             except OSError:
-                # Closing the handle releases the lock on both families, so a failed explicit
-                # unlock changes nothing that the close below does not already guarantee.
                 pass
             finally:
-                try:
-                    os.close(handle)
-                except OSError:
-                    pass
+                self._close_file_descriptor(handle)
+            return
+        if isinstance(handle, _FileSectionHandle):
+            descriptor = handle.descriptor
+            reusable = False
+            try:
+                _release_os_lock(descriptor)
+            except OSError:
+                # Closing the handle releases the lock on both families, so a failed explicit
+                # unlock invalidates reuse and falls through to the fail-closed close.
+                pass
+            else:
+                reusable = handle.scope is not None
+            finally:
+                if (
+                    reusable
+                    and handle.scope_key is not None
+                    and handle.scope is not None
+                ):
+                    reused = self._finish_descriptor_borrow(
+                        handle.scope_key,
+                        handle.scope,
+                        descriptor=descriptor,
+                    )
+                else:
+                    reused = False
+                    if handle.scope_key is not None and handle.scope is not None:
+                        self._finish_descriptor_borrow(
+                            handle.scope_key,
+                            handle.scope,
+                            descriptor=None,
+                        )
+                if not reused:
+                    self._close_file_descriptor(descriptor)
             return
         release = getattr(handle, "release", None)
         if release is not None:
             release()
+
+    @staticmethod
+    def _descriptor_names(descriptor: int, path: str) -> bool:
+        """Return whether an open descriptor still is the file the path names right now.
+
+        Identity is ``(st_dev, st_ino)`` on both families -- on Windows Python reports the volume
+        serial and the 64-bit file index -- so a lock file unlinked and recreated between two
+        operations answers with a different identity even though the name did not change. The
+        path is inspected WITHOUT being followed: a name that became a link is not the file this
+        descriptor was opened through, whatever it now leads to. Anything that cannot be
+        examined at all is treated the same way, because a descriptor that cannot be proved is
+        exactly as unusable as one that is proved wrong.
+        """
+        try:
+            held = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return False
+        if not (stat.S_ISREG(held.st_mode) and stat.S_ISREG(named.st_mode)):
+            return False
+        return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+
+    def _finish_descriptor_borrow(
+        self,
+        key: tuple[int, str],
+        scope: _ReusableDescriptorScope,
+        *,
+        descriptor: int | None,
+    ) -> bool:
+        """Return a certainly unlocked descriptor to its exact live scope, or evict it."""
+        with self._state_lock:
+            current = self._descriptor_scopes.get(key)
+            if current is not scope:
+                return False
+            scope.borrowed = False
+            if (
+                descriptor is not None
+                and scope.depth > 0
+                and not scope.closing
+                and scope.descriptor is None
+            ):
+                scope.descriptor = descriptor
+                return True
+            if scope.depth == 0 or scope.closing:
+                self._descriptor_scopes.pop(key, None)
+            return False
+
+    @staticmethod
+    def _close_file_descriptor(descriptor: int) -> None:
+        """Close a section descriptor quietly; close is the fail-closed unlock fallback."""
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
     # --- internals: timing and metrics ---------------------------------------------------------
 

@@ -30,6 +30,41 @@ CATALOG: tuple[tuple[str, LabelPlan], ...] = (
     ("oktografx_write_conflicts_total", ()),
     ("oktografx_commit_retries_total", ()),
     ("oktografx_active_transactions", (("mode", frozenset({"read", "write"})),)),
+    (
+        "oktografx_commit_window_duration_seconds",
+        (
+            ("window", frozenset({"writer_lease", "commit_section"})),
+            ("interval", frozenset({"wait", "hold"})),
+        ),
+    ),
+    (
+        "oktografx_commit_phase_duration_seconds",
+        (
+            (
+                "phase",
+                frozenset(
+                    {
+                        "other",
+                        "occ",
+                        "materialize",
+                        "build_records",
+                        "append",
+                        "barrier",
+                        "apply",
+                        "flush",
+                        "index",
+                        "publish",
+                    }
+                ),
+            ),
+        ),
+    ),
+    ("oktografx_commit_pages_logged_total", ()),
+    ("oktografx_commit_wal_bytes_total", ()),
+    ("oktografx_commit_frames_examined_total", ()),
+    ("oktografx_commit_flushes_total", ()),
+    ("oktografx_commit_foreign_commits_total", ()),
+    ("oktografx_commit_retargets_total", ()),
     ("oktografx_fsync_duration_seconds", (("target", frozenset({"wal", "data"})),)),
     ("oktografx_barrier_failures_total", ()),
     ("oktografx_read_view_drops_total", (("view_origin", frozenset({"own", "foreign"})),)),
@@ -98,11 +133,11 @@ def _labels(plan: LabelPlan) -> tuple[LabelSpec, ...]:
 
 
 def test_the_transcription_has_the_size_the_contract_declares() -> None:
-    # A guard on the transcription itself: section 9 lists 36 metrics over 13 label names.
-    assert len(CATALOG) == 36
-    assert len({name for name, _ in CATALOG}) == 36
-    assert len(CATALOG_LABEL_NAMES) == 13
-    assert len(DURATION_METRICS) == 6
+    # A guard on the transcription itself: section 9 lists 44 metrics over 15 label names.
+    assert len(CATALOG) == 44
+    assert len({name for name, _ in CATALOG}) == 44
+    assert len(CATALOG_LABEL_NAMES) == 15
+    assert len(DURATION_METRICS) == 8
 
 
 @pytest.mark.parametrize(("name", "labels"), CATALOG, ids=[row[0] for row in CATALOG])
