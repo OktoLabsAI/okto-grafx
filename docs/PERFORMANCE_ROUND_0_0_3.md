@@ -231,20 +231,27 @@ after all four endpoint stores are adopted, generation, read or corruption failu
 fail-closed. Parallel edges are preserved because deduplication is by physical `RecordRef`, not by
 endpoint pair.
 
-Pulse `523e759` supplies separate endpoint-type ID batches from the node page it has already read
-and does not issue a physical-layout statement when neither endpoint type occurs on that page.
-Untyped provider rows are conservatively included in both arms, preserving the old result. The
-Python membership check remains a final provider boundary defence.
+Pulse `523e759` is the consumer experiment: it supplies separate endpoint-type ID batches from the
+node page it has already read and does not issue a physical-layout statement when neither endpoint
+type occurs on that page. Untyped provider rows are conservatively included in both arms,
+preserving the old result. The Python membership check remains a final provider boundary defence.
 
 The naive first integration, which probed all 500 page IDs against every endpoint table, regressed
-the helper to 5.783 s cold and 4.188–4.744 s warm and was not retained. The typed form on the active
-board reduced queried layouts from 70 to 29 and multi-key calls from 261 to 110. It performed 9,723
-key probes, returned the same 810 incident edges with zero failed layouts, and measured 2.184 s on
-the first one-snapshot run and 1.181 s warm. The prior bounded scan helper measured 1.74–2.08 s.
-The promoted claim is therefore both honest and structural: warm latency improved in this sample,
-while the new path's relationship work is bounded by the typed page keys and incident candidates
-instead of growing with every unrelated edge in the graph; the single cold observation is not
-claimed as a gain.
+a diagnostic unordered page to 5.783 s cold and 4.188–4.744 s warm and was not retained. A second
+measurement then used the exact Pulse node query, including its stable ordering and filters. That
+node phase took 0.960 s and produced the same 500-node/777-edge page as the HTTP baseline. For that
+actual page, the typed incident consumer queried 66 of 70 layouts, made 248 multi-key calls and
+17,116 key probes, and measured 4.392 s on the first edge run and 2.677 s warm. The prior bounded
+scan helper measured 1.74–2.08 s. Direct activation of `523e759` is therefore a measured **NO-GO at
+the current cardinality**: the warm experiment is about 1.29× slower than the top of the prior
+band, even though its relationship work no longer grows with unrelated edges.
+
+The operator and primitive remain valid scale building blocks, but they are not presented as the
+current screen-speed win. Before Pulse promotion, the next implementation must remove the repeated
+node-PK probes across relationship statements (or add a proved cost selection that retains the
+scan for small layouts), then repeat the exact ordered-page comparison. This is a fixed follow-up,
+not a new exploratory gate: the consumer must beat the already measured scan path while retaining
+its `O(page keys + incident edges)` scaling advantage.
 
 Focused validation is 68 Grafx tests plus 10 Pulse consumer tests and Ruff/diff checks. The Grafx
 set includes batch/scalar snapshot parity, page-0 transition retry/refusal, hostile keys, stale and
@@ -275,6 +282,6 @@ the same endpoint visibility and canonical-reference validation as ordinary trav
 | HNSW replay and structural catalog batch | complete | `477fd45`, `36cea9b`; 230 focused tests and Ruff pass |
 | Statement authority memo | complete | `4786496`; identity/catalog/revision/DDL fences, 39 integrated focused tests and Ruff pass |
 | Exact multi-key index validation | complete | `1926fcd`; one durable certificate per index batch, 3.2× for 300 on-disk PK keys |
-| Typed incident-edge operator | implemented; adversarial review in progress | Grafx `bcfa395`, Pulse `523e759`; 68 + 10 focused tests, same 810 edges, 70→29 queried layouts |
+| Typed incident-edge operator | engine building block complete; direct Pulse activation NO-GO pending repeated-PK removal | Grafx `bcfa395`, Pulse experiment `523e759`; actual ordered page preserved 500/777, but edge phase measured 2.677 s warm versus prior 1.74–2.08 s |
 | Pulse critical rendering path | complete on companion branch | `e2b6053`; one-snapshot fanout 1.74–2.08 s; backend/frontend focused tests and production build |
 | Pulse statistics fan-out | complete on companion branch | `880db68`; grouped nodes 0.662 s plus batched relationships 2.178 s; 90 backend tests and Ruff pass |

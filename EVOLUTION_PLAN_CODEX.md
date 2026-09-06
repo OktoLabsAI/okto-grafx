@@ -3638,16 +3638,20 @@ primeiro lote (`4638204`, Pulse `e2b6053`/`880db68`) reduziu o fanout de relaç�
 `3,6–4,1x`, fixou os 70 reads num snapshot, removeu `/stats` da rota crítica visual e eliminou a
 duplicação de requests.
 
-O sublote seguinte fecha a degradação `O(E)` da projeção paginada sem trocar as premissas do banco.
+O sublote seguinte cria o access path que pode fechar a degradação `O(E)` da projeção paginada sem
+trocar as premissas do banco.
 O primitive multi-chave `1926fcd` usa um único certificado durável por índice; o operador fechado
 `bcfa395` faz seek da união incidente pelos PK/endpoint indexes e valida heap, snapshot, geração e
 landings; o consumidor Pulse `523e759` envia IDs por tipo de endpoint e evita layouts impossíveis.
-Na geração ativa, a mesma página de 500 nós retornou as mesmas 810 relações, zero falhas, reduziu
-layouts consultados `70→29`, chamadas multi-chave `261→110` e mediu `2,184 s` no primeiro run e
-`1,181 s` warm. O claim promovido é redução estrutural para trabalho proporcional às chaves da
-página e arestas incidentes, não promessa baseada em um único cold run. Foram aprovados 68 testes
-Grafx e 10 testes Pulse focais; a revisão adversarial Nexus `hof_aecbb8257cb443c198a50634d2d1af2d`
-permanece em andamento antes do fechamento do sublote.
+O primeiro ensaio tipado usou uma página diagnóstica sem a ordenação do Pulse e não podia sustentar
+o claim visual. A repetição com a query exata da tela mediu 0,960 s para obter 500 nós e preservou
+as mesmas 777 relações do baseline; a fase de arestas consultou 66/70 layouts, fez 248 chamadas e
+17.116 probes multi-chave, mas mediu 4,392 s cold e 2,677 s warm contra 1,74–2,08 s do scan bounded.
+Logo a ativação direta do consumidor `523e759` está em **NO-GO no cardinal atual**, embora o access
+path já não cresça com arestas alheias à página. O próximo passo fixo é eliminar a resolução de PK
+repetida entre statements (ou selecionar por custo comprovado o scan em layouts pequenos) e repetir
+essa comparação exata. Foram aprovados 68 testes Grafx e 10 testes Pulse focais; a revisão
+adversarial Nexus `hof_aecbb8257cb443c198a50634d2d1af2d` permanece em andamento.
 
 Esse caminho não altera formato, WAL, recovery, nenhuma das duas OCCs, leases, admissão de writers
 ou snapshots de readers. Tabela/índice ausente, stale ou owner-dirty escolhe o plano canônico antes
