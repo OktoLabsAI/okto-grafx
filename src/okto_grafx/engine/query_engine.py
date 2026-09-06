@@ -354,6 +354,18 @@ same on every platform and run, and it stays above the measured footprint (15.8 
 overcharged that row 2.7 x and starved the cache at 777 landings.
 """
 
+# Repeated relationship layouts in one Pulse page resolve the same endpoint keys under the
+# same transaction snapshot.  Keep only that exact validated result frontier, bounded within
+# the decoded-landing budget.  The value is deliberately not configurable: it changes cost,
+# never answers, and making it a knob would create a second operational contract before the
+# workload has justified one.
+_PRIMARY_KEY_RESOLUTION_MAX_ENTRIES: int = 4_096
+_PRIMARY_KEY_RESOLUTION_ENTRY_BYTES: int = 512
+_NATIVE_VALIDATED_VERSIONS_MANY = IndexManager.validated_versions_many
+_NATIVE_VALIDATED_VERSIONS_MANY_REUSING = (
+    IndexManager.validated_versions_many_reusing
+)
+
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
     for name in (
@@ -1136,6 +1148,26 @@ class _PrimaryKeyTxnMemo:
     row_intents_by_table: dict[int, list[RowIntent]] = field(default_factory=dict)
     row_intent_index_complete: bool = True
     has_delete_intent: bool = False
+    resolutions: dict[tuple[object, ...], _PrimaryKeyResolutionCache] = field(
+        default_factory=dict
+    )
+    resolution_entries: int = 0
+
+
+@dataclass(slots=True)
+class _PrimaryKeyResolutionCache:
+    """Bounded exact-index answers owned by one transaction/snapshot/store generation."""
+
+    store: object
+    snapshot: object
+    registry_revision: int
+    heap_epoch: int
+    generation: object
+    entries: OrderedDict[
+        bytes,
+        tuple[tuple[tuple[RecordRef, HeapVersion], ...], int],
+    ] = field(default_factory=OrderedDict)
+    used_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -4391,7 +4423,7 @@ class QueryEngine:
             self._working.pop(txn_id, None)
             self._settle_owner_memo(txn_id)
             self._settle_endpoint_memo(txn_id)
-            self._primary_key_memos.pop(txn_id, None)
+            self._settle_primary_key_memo(txn_id)
             self._txn_effects.pop(txn_id, None)
             return
         # The transaction's own journal, replayed in reverse -- never a prune against a catalog.
@@ -4405,7 +4437,7 @@ class QueryEngine:
         self._working.pop(txn_id, None)
         self._settle_owner_memo(txn_id)
         self._settle_endpoint_memo(txn_id)
-        self._primary_key_memos.pop(txn_id, None)
+        self._settle_primary_key_memo(txn_id)
         self._txn_effects.pop(txn_id, None)
 
     def _settle_owner_memo(self, txn_id: int) -> None:
@@ -4428,6 +4460,13 @@ class QueryEngine:
         # silently turning settlement into heap I/O under the lock.
         for locator in closers:
             locator.close()
+
+    def _settle_primary_key_memo(self, txn_id: int) -> None:
+        """Release every metered exact-key result on every terminal transaction path."""
+        with self._endpoint_guard:
+            memo = self._primary_key_memos.pop(txn_id, None)
+            if memo is not None:
+                _discard_primary_key_resolution_caches(self, memo)
 
     @property
     def skipped_indexes(self) -> tuple[str, ...]:
@@ -6564,6 +6603,246 @@ def _relationship_scan(
             yield _Row(bindings=bindings)
 
 
+def _primary_key_resolution_charge(
+    table: TableDef,
+    key: bytes,
+    group: tuple[tuple[RecordRef, HeapVersion], ...],
+) -> int | None:
+    """Conservatively meter one retained exact-key answer without affecting its semantics."""
+    charge = _PRIMARY_KEY_RESOLUTION_ENTRY_BYTES + len(key) * 2
+    if not group:
+        miss = _owner_landing_result_bytes(table, None)
+        return None if miss is None else charge + miss
+    for found in group:
+        retained = _owner_landing_result_bytes(table, found)
+        if retained is None:
+            return None
+        charge += retained
+    return charge
+
+
+def _discard_primary_key_resolution_state(
+    engine: QueryEngine,
+    memo: _PrimaryKeyTxnMemo,
+    identity: tuple[object, ...],
+    state: _PrimaryKeyResolutionCache,
+) -> None:
+    """Remove one exact cache and release its complete shared-budget reservation."""
+    if memo.resolutions.get(identity) is state:
+        memo.resolutions.pop(identity)
+    count = len(state.entries)
+    if count:
+        engine._owner_budget.release(bytes_=state.used_bytes, entries=count)
+        memo.resolution_entries -= count
+    state.entries.clear()
+    state.used_bytes = 0
+
+
+def _discard_primary_key_resolution_caches(
+    engine: QueryEngine, memo: _PrimaryKeyTxnMemo
+) -> None:
+    """Release all transaction-owned exact-key results; caller holds the endpoint guard."""
+    for identity, state in tuple(memo.resolutions.items()):
+        _discard_primary_key_resolution_state(engine, memo, identity, state)
+    memo.resolution_entries = 0
+
+
+def _evict_primary_key_resolution_lru(
+    engine: QueryEngine,
+    memo: _PrimaryKeyTxnMemo,
+    state: _PrimaryKeyResolutionCache,
+) -> bool:
+    """Evict this store's oldest answer, returning whether one existed."""
+    if not state.entries:
+        return False
+    _key, (_group, charge) = state.entries.popitem(last=False)
+    state.used_bytes -= charge
+    memo.resolution_entries -= 1
+    engine._owner_budget.release(bytes_=charge, entries=1)
+    return True
+
+
+def _admit_primary_key_resolution(
+    engine: QueryEngine,
+    memo: _PrimaryKeyTxnMemo,
+    state: _PrimaryKeyResolutionCache,
+    key: bytes,
+    group: tuple[tuple[RecordRef, HeapVersion], ...],
+    charge: int,
+) -> bool:
+    """Reserve before retaining, evicting only this exact store's own LRU results."""
+    while True:
+        if memo.resolution_entries >= _PRIMARY_KEY_RESOLUTION_MAX_ENTRIES:
+            if not _evict_primary_key_resolution_lru(engine, memo, state):
+                return False
+            continue
+        try:
+            engine._owner_budget.reserve(bytes_=charge, entries=1)
+        except _OwnerLandingCapacity:
+            if not _evict_primary_key_resolution_lru(engine, memo, state):
+                return False
+        else:
+            try:
+                state.entries[key] = (group, charge)
+            except BaseException:
+                engine._owner_budget.release(bytes_=charge, entries=1)
+                raise
+            state.used_bytes += charge
+            memo.resolution_entries += 1
+            return True
+
+
+def _memoized_primary_key_groups(
+    engine: QueryEngine,
+    context: _Context,
+    manager: object,
+    store: object,
+    keys: tuple[bytes, ...],
+    table: TableDef,
+    position: int,
+    canonical_many: Callable[..., object],
+) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+    """Reuse exact PK answers only under all transaction, registry and storage fences.
+
+    Custom managers and monkey-patched implementations keep the canonical multi-key door.  A
+    native cache hit still opens a fresh page-0 certificate and companion heap view; only the
+    already-proved bucket traversal and heap payload decode are skipped.  Any generation change
+    revalidates the complete request inside IndexManager, while a local heap/registry transition
+    during a cached read triggers one uncached read before the answer is returned.
+    """
+    reuse_many = getattr(manager, "validated_versions_many_reusing", None)
+    if (
+        type(manager) is not IndexManager
+        or not callable(reuse_many)
+        or getattr(reuse_many, "__func__", None)
+        is not _NATIVE_VALIDATED_VERSIONS_MANY_REUSING
+        or getattr(canonical_many, "__func__", None)
+        is not _NATIVE_VALIDATED_VERSIONS_MANY
+    ):
+        return tuple(canonical_many(store, keys, context.snapshot))
+
+    revision = getattr(manager, "_registry_revision", None)
+    if type(revision) is not int:
+        return tuple(canonical_many(store, keys, context.snapshot))
+    identified = _revisioned_txn_memo(engine, context.txn)
+    if identified is None:
+        return tuple(canonical_many(store, keys, context.snapshot))
+    txn_id, memo = identified
+    snapshot = context.snapshot
+    heap_epoch = engine.heap._derived_read_epoch()
+    identity = _primary_key_table_identity(table, position)
+    observed: _PrimaryKeyResolutionCache | None = None
+    generation: object | None = None
+    cached: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
+    with engine._endpoint_guard:
+        if engine._primary_key_memos.get(txn_id) is memo:
+            candidate = memo.resolutions.get(identity)
+            if candidate is not None and (
+                candidate.store is not store
+                or candidate.snapshot is not snapshot
+                or candidate.registry_revision != revision
+                or candidate.heap_epoch != heap_epoch
+            ):
+                _discard_primary_key_resolution_state(
+                    engine, memo, identity, candidate
+                )
+                candidate = None
+            if candidate is not None:
+                observed = candidate
+                generation = candidate.generation
+                cached = {
+                    key: candidate.entries[key][0]
+                    for key in dict.fromkeys(keys)
+                    if key in candidate.entries
+                }
+
+    next_generation, reused, raw_groups = reuse_many(
+        store,
+        keys,
+        snapshot,
+        generation=generation,
+        cached=cached,
+    )
+    groups = tuple(raw_groups)
+    after_revision = getattr(manager, "_registry_revision", None)
+    after_epoch = engine.heap._derived_read_epoch()
+    publish_revision = revision
+    publish_epoch = heap_epoch
+    publishable = after_revision == revision and after_epoch == heap_epoch
+    if reused and not publishable:
+        # The cached values were correctly bracketed by their index certificate, but a local
+        # heap/registry fence moved while the statement was in flight.  Re-read every key rather
+        # than asking callers to reason about which unrelated epoch transition occurred.
+        publish_revision = after_revision
+        publish_epoch = after_epoch
+        next_generation, reused, raw_groups = reuse_many(
+            store,
+            keys,
+            snapshot,
+            generation=None,
+            cached={},
+        )
+        groups = tuple(raw_groups)
+        publishable = (
+            type(publish_revision) is int
+            and getattr(manager, "_registry_revision", None) == publish_revision
+            and engine.heap._derived_read_epoch() == publish_epoch
+        )
+
+    if not publishable or type(publish_revision) is not int:
+        return groups
+
+    # Preserve the caller's established structured refusal for a hostile implementation that
+    # violates the aligned-batch contract; it validates the length immediately after return.
+    if len(groups) != len(keys):
+        return groups
+    unique_groups = dict(zip(keys, groups, strict=True))
+    with engine._endpoint_guard:
+        if engine._primary_key_memos.get(txn_id) is not memo:
+            return groups
+        current = memo.resolutions.get(identity)
+        if current is not observed:
+            # A concurrent resolver or settlement replaced the exact state observed above.  This
+            # answer remains valid under its own certificate, but must not overwrite the newer
+            # cache authority.
+            return groups
+        if current is None:
+            current = _PrimaryKeyResolutionCache(
+                store=store,
+                snapshot=snapshot,
+                registry_revision=publish_revision,
+                heap_epoch=publish_epoch,
+                generation=next_generation,
+            )
+            memo.resolutions[identity] = current
+        elif not reused or current.generation != next_generation:
+            _discard_primary_key_resolution_state(engine, memo, identity, current)
+            current = _PrimaryKeyResolutionCache(
+                store=store,
+                snapshot=snapshot,
+                registry_revision=publish_revision,
+                heap_epoch=publish_epoch,
+                generation=next_generation,
+            )
+            memo.resolutions[identity] = current
+        else:
+            current.registry_revision = publish_revision
+            current.heap_epoch = publish_epoch
+
+        for key, group in unique_groups.items():
+            if key in current.entries:
+                current.entries.move_to_end(key)
+                continue
+            charge = _primary_key_resolution_charge(table, key, group)
+            if charge is not None:
+                _admit_primary_key_resolution(
+                    engine, memo, current, key, group, charge
+                )
+        if not current.entries:
+            memo.resolutions.pop(identity, None)
+    return groups
+
+
 def _relationship_incident_seek(
     engine: QueryEngine, node: RelationshipIncidentSeek, context: _Context
 ) -> Iterator[_Row]:
@@ -6730,7 +7009,25 @@ def _relationship_incident_seek(
         position: int,
     ) -> dict[RecordId, tuple[object, HeapVersion]]:
         keys = tuple(key for key, _value in keyed)
-        groups = aligned_many(store, keys)
+        groups = _memoized_primary_key_groups(
+            engine,
+            context,
+            manager,
+            store,
+            keys,
+            table,
+            position,
+            many,
+        )
+        if len(groups) != len(keys):
+            raise GrafxIndexError(
+                f"Multi-key validation for index {getattr(store, 'name', None)!r} returned "
+                f"{len(groups)} result groups for {len(keys)} keys.",
+                field="index_batch",
+                index=getattr(store, "name", None),
+                expected=len(keys),
+                observed=len(groups),
+            )
         resolved: dict[RecordId, tuple[object, HeapVersion]] = {}
         for (_key, value), hits in zip(keyed, groups, strict=True):
             for ref, version in hits:
@@ -11695,6 +11992,16 @@ def _revisioned_txn_memo(
     memo = engine._primary_key_memos.get(txn_id)
     if memo is not None and memo.txn is txn and memo.intents is raw:
         return txn_id, memo
+    if memo is not None:
+        # A defensive transaction-id reuse/replacement must not strand decoded exact-key
+        # results in the shared owner budget.  Ordinary calls never enter this guarded path.
+        if memo.resolutions:
+            with engine._endpoint_guard:
+                if engine._primary_key_memos.get(txn_id) is memo:
+                    engine._primary_key_memos.pop(txn_id, None)
+                    _discard_primary_key_resolution_caches(engine, memo)
+        elif engine._primary_key_memos.get(txn_id) is memo:
+            engine._primary_key_memos.pop(txn_id, None)
     if isinstance(raw, _RevisionList):
         tracked = raw
     elif isinstance(raw, list):

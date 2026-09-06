@@ -17,7 +17,7 @@ from okto_grafx.domain.query.plan import (
     TraverseRelationship,
 )
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapStore
-from okto_grafx.engine.index_manager import IndexManager
+from okto_grafx.engine.index_manager import HashIndex, IndexManager
 
 
 QUERY = (
@@ -183,21 +183,178 @@ def test_non_list_parameter_preserves_the_public_in_refusal(database: object) ->
 def test_opposite_landings_share_one_identity_certificate(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original = IndexManager.validated_versions_many
+    original = HashIndex.begin_exact_read
     calls: list[tuple[int, ...]] = []
 
-    def observed(manager, index, keys, snapshot):
+    def observed(index, required_lsn):
         calls.append(index.definition.positions)
-        return original(manager, index, keys, snapshot)
+        return original(index, required_lsn)
 
-    monkeypatch.setattr(IndexManager, "validated_versions_many", observed)
+    monkeypatch.setattr(HashIndex, "begin_exact_read", observed)
 
     assert database.execute(QUERY, {"node_ids": ["a1"]}).rows == (
         ("a1", "b1", 0.4),
         ("a1", "b1", 0.5),
     )
     assert calls.count(()) == 1
-    assert len(calls) == 5
+    # The empty incoming edge frontier opens no certificate; the other three index batches and
+    # the one opposite-landing identity lookup each open exactly one.
+    assert len(calls) == 4
+
+
+def test_repeated_incident_pages_reuse_node_pk_decodes_inside_one_transaction(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = IndexManager._validated_version_groups
+    decoded: list[tuple[str, int]] = []
+
+    def observed(manager, index, wanted, distinct, snapshot, certificate):
+        if (
+            index.definition.table_name in {"A", "B"}
+            and index.definition.positions == (0,)
+        ):
+            decoded.append((index.definition.table_name, len(distinct)))
+        return original(manager, index, wanted, distinct, snapshot, certificate)
+
+    monkeypatch.setattr(IndexManager, "_validated_version_groups", observed)
+
+    with database.begin("read") as transaction:
+        first = transaction.execute(QUERY, {"node_ids": ["a1", "b1"]}).rows
+        first_decodes = sum(count for _table, count in decoded)
+        decoded.clear()
+        second = transaction.execute(QUERY, {"node_ids": ["a1", "b1"]}).rows
+        second_decodes = sum(count for _table, count in decoded)
+        assert database._queries._owner_budget._used_entries > 0
+
+    assert sorted(first) == sorted(second)
+    assert first_decodes == 4
+    assert second_decodes == 0
+    assert database._queries._owner_budget._used_entries == 0
+
+
+def test_incident_pk_memo_decodes_only_new_keys_in_the_same_snapshot(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = IndexManager._validated_version_groups
+    decoded: list[tuple[str, int]] = []
+
+    def observed(manager, index, wanted, distinct, snapshot, certificate):
+        if (
+            index.definition.table_name in {"A", "B"}
+            and index.definition.positions == (0,)
+        ):
+            decoded.append((index.definition.table_name, len(distinct)))
+        return original(manager, index, wanted, distinct, snapshot, certificate)
+
+    monkeypatch.setattr(IndexManager, "_validated_version_groups", observed)
+
+    with database.begin("read") as transaction:
+        transaction.execute(QUERY, {"node_ids": ["a1"]})
+        decoded.clear()
+        transaction.execute(QUERY, {"node_ids": ["a1", "a2"]})
+
+    assert sum(count for _table, count in decoded) == 2
+
+
+def test_a_heap_epoch_change_revalidates_every_incident_pk_key(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = IndexManager._validated_version_groups
+    decoded: list[tuple[str, int]] = []
+
+    def observed(manager, index, wanted, distinct, snapshot, certificate):
+        if (
+            index.definition.table_name in {"A", "B"}
+            and index.definition.positions == (0,)
+        ):
+            decoded.append((index.definition.table_name, len(distinct)))
+        return original(manager, index, wanted, distinct, snapshot, certificate)
+
+    monkeypatch.setattr(IndexManager, "_validated_version_groups", observed)
+
+    with database.begin("read") as transaction:
+        expected = transaction.execute(QUERY, {"node_ids": ["a1"]}).rows
+        decoded.clear()
+        heap = database._queries.heap
+        heap._pool.discard_clean_file(heap.file)
+        observed_rows = transaction.execute(QUERY, {"node_ids": ["a1"]}).rows
+
+    assert observed_rows == expected
+    assert sum(count for _table, count in decoded) == 2
+
+
+def test_an_index_registry_revision_change_revalidates_every_incident_pk_key(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = IndexManager._validated_version_groups
+    decoded: list[int] = []
+
+    def observed(manager, index, wanted, distinct, snapshot, certificate):
+        if (
+            index.definition.table_name in {"A", "B"}
+            and index.definition.positions == (0,)
+        ):
+            decoded.append(len(distinct))
+        return original(manager, index, wanted, distinct, snapshot, certificate)
+
+    monkeypatch.setattr(IndexManager, "_validated_version_groups", observed)
+
+    with database.begin("read") as transaction:
+        expected = transaction.execute(QUERY, {"node_ids": ["a1"]}).rows
+        decoded.clear()
+        database._queries._indexes._registry_revision += 1
+        observed_rows = transaction.execute(QUERY, {"node_ids": ["a1"]}).rows
+
+    assert observed_rows == expected
+    assert sum(decoded) == 2
+
+
+def test_a_custom_multi_key_door_never_uses_the_native_pk_memo(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = IndexManager.validated_versions_many
+    node_batches = 0
+
+    def observed(manager, index, keys, snapshot):
+        nonlocal node_batches
+        if (
+            index.definition.table_name in {"A", "B"}
+            and index.definition.positions == (0,)
+        ):
+            node_batches += 1
+        return original(manager, index, keys, snapshot)
+
+    monkeypatch.setattr(IndexManager, "validated_versions_many", observed)
+
+    with database.begin("read") as transaction:
+        first = transaction.execute(QUERY, {"node_ids": ["a1"]}).rows
+        second = transaction.execute(QUERY, {"node_ids": ["a1"]}).rows
+
+    assert first == second
+    assert node_batches == 4
+
+
+def test_pk_memo_capacity_changes_cost_only_and_settlement_releases_it(
+    database: object,
+) -> None:
+    from okto_grafx.engine.query_engine import _OwnerLandingBudget
+
+    expected = database.execute(QUERY, {"node_ids": ["a1", "b1"]}).rows
+    engine = database._queries
+    engine._owner_budget = _OwnerLandingBudget(
+        max_bytes=1_000_000,
+        max_entries=2,
+        guard=engine._endpoint_guard,
+    )
+
+    with database.begin("read") as transaction:
+        first = transaction.execute(QUERY, {"node_ids": ["a1", "b1"]}).rows
+        second = transaction.execute(QUERY, {"node_ids": ["a1", "b1"]}).rows
+        assert engine._owner_budget._used_entries == 2
+
+    assert first == second == expected
+    assert engine._owner_budget._used_entries == 0
+    assert engine._owner_budget._used_bytes == 0
 
 
 def test_tiny_relationship_frontier_uses_edge_first_scan_before_any_certificate(

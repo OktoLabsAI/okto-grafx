@@ -7216,46 +7216,137 @@ class IndexManager:
                 file=index.file,
             )
         read_lsn = index._require_exact_read_lsn(snapshot)
-        definition = index.definition
         wanted_by_position = tuple(index._require_key(key) for key in keys)
         distinct = tuple(dict.fromkeys(wanted_by_position))
         if not distinct:
             return ()
 
+        return index._stable_view(
+            read_lsn,
+            lambda certificate: self._validated_version_groups(
+                index,
+                wanted_by_position,
+                distinct,
+                snapshot,
+                certificate,
+            ),
+        )
+
+    def validated_versions_many_reusing(
+        self,
+        index: IndexStore,
+        keys: Sequence[bytes],
+        snapshot: SnapshotLike,
+        *,
+        generation: object | None,
+        cached: Mapping[bytes, tuple[tuple[RecordRef, HeapVersion], ...]],
+    ) -> tuple[
+        object,
+        bool,
+        tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...],
+    ]:
+        """Reuse transaction-owned key results only inside a newly stable exact view.
+
+        The caller owns and bounds ``cached``; this component owns its authority. A cached group
+        is used only when a fresh pre-certificate is exactly the private generation returned by
+        an earlier successful call. The ordinary post-certificate still brackets the answer. If
+        either certificate changes, ``_stable_view`` retries the whole callback and every key is
+        validated canonically in the new generation before anything leaves this method.
+
+        ``bool`` reports whether the supplied generation authorized cached groups in the final
+        successful attempt. The returned opaque generation has meaning only when handed back to
+        this same method for this exact index; unfamiliar tokens simply miss the cache.
+        """
+        if index.visibility is IndexVisibility.PROXIMITY:
+            raise GrafxIndexError(
+                f"Index {index.name!r} has proximity visibility and does not validate heap "
+                "versions during lookup.",
+                field="visibility",
+                value=index.visibility.value,
+                index=index.name,
+                file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        wanted_by_position = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted_by_position))
+        if not distinct:
+            return generation, True, ()
+
         def confirm(
             certificate: _IndexReadCertificate,
-        ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
-            """Probe every distinct key and validate every candidate inside this certificate."""
-            self._prepare_heap_view(index.file, certificate)
-            answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
-            for wanted in distinct:
-                accepted: list[tuple[RecordRef, HeapVersion]] = []
-                for entry in index._candidates_unchecked(wanted):
-                    version = self._heap.read(entry.ref)
-                    if version.table_id != definition.table_id:
-                        raise GrafxCorruptionDetected(
-                            f"Index {definition.name!r} points at a row of table "
-                            f"{version.table_id} and covers table {definition.table_id}.",
-                            file=index.file,
-                            page=entry.page,
-                            slot=entry.slot,
-                            index=definition.name,
-                            field="table_id",
-                        )
-                    if not snapshot.visible(version.xmin, version.xmax):
-                        continue
-                    if (
-                        definition.entry_key_for_record(
-                            version.record_id, version.values
-                        )
-                        != entry.key
-                    ):
-                        continue
-                    accepted.append((entry.ref, version))
-                answers[wanted] = tuple(accepted)
-            return tuple(answers[wanted] for wanted in wanted_by_position)
+        ) -> tuple[
+            object,
+            bool,
+            tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...],
+        ]:
+            reusable = (
+                type(generation) is _IndexReadCertificate
+                and certificate == generation
+            )
+            missing = tuple(
+                wanted
+                for wanted in distinct
+                if not reusable or wanted not in cached
+            )
+            fresh_groups = self._validated_version_groups(
+                index,
+                missing,
+                missing,
+                snapshot,
+                certificate,
+            )
+            answers = (
+                {wanted: cached[wanted] for wanted in distinct if wanted in cached}
+                if reusable
+                else {}
+            )
+            answers.update(zip(missing, fresh_groups, strict=True))
+            return (
+                certificate,
+                reusable,
+                tuple(answers[wanted] for wanted in wanted_by_position),
+            )
 
         return index._stable_view(read_lsn, confirm)
+
+    def _validated_version_groups(
+        self,
+        index: IndexStore,
+        wanted_by_position: Sequence[bytes],
+        distinct: Sequence[bytes],
+        snapshot: SnapshotLike,
+        certificate: _IndexReadCertificate,
+    ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+        """Validate already-canonical keys inside the caller's exact-read certificate."""
+        # Even an all-cached answer must attach the companion heap view to this exact durable
+        # generation.  The caller may skip payload decodes, never the storage-view fence.
+        self._prepare_heap_view(index.file, certificate)
+        definition = index.definition
+        answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
+        for wanted in distinct:
+            accepted: list[tuple[RecordRef, HeapVersion]] = []
+            for entry in index._candidates_unchecked(wanted):
+                version = self._heap.read(entry.ref)
+                if version.table_id != definition.table_id:
+                    raise GrafxCorruptionDetected(
+                        f"Index {definition.name!r} points at a row of table "
+                        f"{version.table_id} and covers table {definition.table_id}.",
+                        file=index.file,
+                        page=entry.page,
+                        slot=entry.slot,
+                        index=definition.name,
+                        field="table_id",
+                    )
+                if not snapshot.visible(version.xmin, version.xmax):
+                    continue
+                if (
+                    definition.entry_key_for_record(version.record_id, version.values)
+                    != entry.key
+                ):
+                    continue
+                accepted.append((entry.ref, version))
+            answers[wanted] = tuple(accepted)
+        return tuple(answers[wanted] for wanted in wanted_by_position)
 
     def _validated_items(
         self,

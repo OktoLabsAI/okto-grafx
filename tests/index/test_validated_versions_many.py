@@ -323,6 +323,124 @@ def test_no_keys_open_no_view(monkeypatch: pytest.MonkeyPatch) -> None:
     assert counter.begins == 0
 
 
+def test_reusing_skips_only_cached_keys_inside_a_fresh_certificate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, refs = _populated()
+    keys = _keys(database, 4)
+    counter = _ViewCounter(monkeypatch)
+
+    generation, reused, first = database.manager.validated_versions_many_reusing(
+        database.exact,
+        keys[:3],
+        SnapshotDouble(BORN),
+        generation=None,
+        cached={},
+    )
+    assert reused is False
+    assert counter.probes == 3
+
+    cached = dict(zip(keys[:3], first, strict=True))
+    counter.begins = counter.finishes = counter.probes = counter.heap_views = 0
+    next_generation, reused, second = (
+        database.manager.validated_versions_many_reusing(
+            database.exact,
+            [keys[1], keys[3], keys[0]],
+            SnapshotDouble(BORN),
+            generation=generation,
+            cached=cached,
+        )
+    )
+
+    assert reused is True
+    assert next_generation == generation
+    assert counter.begins == counter.finishes == counter.heap_views == 1
+    assert counter.probes == 1
+    assert tuple(_refs(group) for group in second) == (
+        (refs[2],),
+        (refs[4],),
+        (refs[1],),
+    )
+
+
+def test_reusing_a_changed_generation_revalidates_every_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, _refs_by_id = _populated()
+    keys = _keys(database, 3)
+    generation, _reused, first = database.manager.validated_versions_many_reusing(
+        database.exact,
+        keys,
+        SnapshotDouble(BORN),
+        generation=None,
+        cached={},
+    )
+    cached = dict(zip(keys, first, strict=True))
+    _insert(database, 13, "n13", LATER)
+    database.pool.flush(database.heap.file)
+    counter = _ViewCounter(monkeypatch)
+
+    changed, reused, answer = database.manager.validated_versions_many_reusing(
+        database.exact,
+        keys,
+        SnapshotDouble(BORN),
+        generation=generation,
+        cached=cached,
+    )
+
+    assert changed != generation
+    assert reused is False
+    assert counter.probes == len(keys)
+    assert answer == _scalar(database, keys, SnapshotDouble(BORN))
+
+
+def test_reusing_retries_with_no_cached_prefix_after_a_mid_read_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, _refs_by_id = _populated()
+    keys = _keys(database, 4)
+    generation, _reused, first = database.manager.validated_versions_many_reusing(
+        database.exact,
+        keys[:3],
+        SnapshotDouble(BORN),
+        generation=None,
+        cached={},
+    )
+    cached = dict(zip(keys[:3], first, strict=True))
+    original_finish = HashIndex.finish_exact_read
+    outcomes: list[bool] = []
+    counter = _ViewCounter(monkeypatch)
+
+    def changed_once(store: HashIndex, before: object, required_lsn: int) -> bool:
+        stable = original_finish(store, before, required_lsn)
+        if not outcomes:
+            outcomes.append(False)
+            store._carried_certificate = None  # noqa: SLF001 - emulate a foreign publish
+            store._cache_certificate = None  # noqa: SLF001
+            database.pool.discard_clean_file(store.file)
+            return False
+        outcomes.append(stable)
+        return stable
+
+    monkeypatch.setattr(HashIndex, "finish_exact_read", changed_once)
+
+    _new_generation, reused, answer = database.manager.validated_versions_many_reusing(
+        database.exact,
+        keys,
+        SnapshotDouble(BORN),
+        generation=generation,
+        cached=cached,
+    )
+
+    assert outcomes == [False, True]
+    assert reused is True
+    # Both attempts saw the same durable certificate: three groups remained authorized and the
+    # one absent key was reproved in each complete attempt.  Nothing from the losing attempt was
+    # published to the caller.
+    assert counter.probes == 2
+    assert answer == _scalar(database, keys, SnapshotDouble(BORN))
+
+
 def test_a_stale_index_is_refused_exactly_as_the_scalar_read_refuses_it() -> None:
     database, _refs = _populated()
     keys = _keys(database)
