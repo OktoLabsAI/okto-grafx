@@ -19,7 +19,7 @@ No performance number by itself authorizes weakening one of these properties.
 
 ## KG-LOAD-0 — measured Pulse baseline
 
-Status: **diagnosed; implementation selection awaits the joint Claude/Codex review**.
+Status: **diagnosed; first implementation batch integrated**.
 
 The active runtime was Okto Pulse Community 0.3.3 with the board graph bound to Grafx generation
 1 at:
@@ -133,7 +133,8 @@ The implementation order is:
    capability and a once-at-end invalidation/certification hook, with a cross-process generation
    replacement test; R-4 replaces serialize/deserialize DDL working-catalog clones with a
    structural clone of immutable definitions. This is owned by Claude in a separate worktree and
-   will be adversarially reviewed before integration.
+   was implemented by Claude in a separate worktree and accepted only after adversarial review,
+   focused parity/replacement tests and local integration.
 4. **Pulse projection:** execute the 70 relationship reads in one fixed read snapshot, push the
    current-page endpoint restriction down instead of discarding unrelated rows in Python, group
    node statistics in one scan, and batch endpoint-map reads. A native incident-edge access path
@@ -159,6 +160,31 @@ baseline. This is a 3.6–4.1× reduction in that engine-local fanout, before th
 endpoint and frontend changes. Literal `LIMIT 64` remains node-first and `LIMIT 65` becomes
 edge-first, while aggregate input remains edge-first even with `LIMIT 1`.
 
+The companion Pulse branch `perf/v0.3.3-kg-load-grafx` now omits the tautological Code
+Traceability endpoint predicates when the caller is authorized, executes the physical
+relationship fanout in one immutable Grafx read snapshot, and retains table-by-table fallback
+only when the batch fails so partial-failure diagnostics stay exact. A direct run of the actual
+Pulse edge-projection helper against the active generation returned 810 page-incident edges from
+70 relationship layouts with zero failures in 1.74–2.08 s. The historical `/graph` endpoint took
+5.89–6.95 s, of which 4.48 s was the prior engine-local relationship fanout.
+
+The frontend graph request is also independent from health, historical-progress and statistics:
+nodes and edges become renderable as soon as `/graph` completes, permission settlement no longer
+causes a second `/graph` request, explicit refresh still refreshes both projections, and stale
+responses are fenced by per-request generations. This removes the 12.01 s statistics endpoint
+from the critical rendering path without hiding or weakening its diagnostics.
+
+The accepted Claude batch adds two further internal improvements:
+
+- HNSW logical replay can compose WAL records only when the exact store explicitly declares the
+  capability and has no published picture. Publication rechecks the page-0 generation identity,
+  unknown stores and active pictures stay scalar, a mid-batch replacement is refused and the
+  touched store is marked stale through the existing fail-closed path.
+- DDL statements clone the working catalog structurally, sharing only frozen definitions and a
+  previously validated serialized image. Mutation dictionaries remain independent in both
+  directions; subclasses retain the defensive serialize/deserialize round trip. This removes
+  the former O(tables x columns) encode/decode from every DDL statement.
+
 ## Milestone log
 
 | Milestone | State | Evidence |
@@ -167,4 +193,6 @@ edge-first, while aggregate input remains edge-first even with `LIMIT 1`.
 | 0.0.3 branch and version bump | complete | `feature/v0.0.3@1f2172d` |
 | Real Pulse KG load-path baseline | complete | measurements and source mapping above |
 | Claude/Codex final selection | complete | finite selection and rejected guarantee changes above |
-| First implementation batch | in progress | focused correctness tests before grouped regression |
+| First Grafx implementation batch | complete | `4638204`, 3.6–4.1× relationship-fanout reduction |
+| HNSW replay and structural catalog batch | complete | `477fd45`, `36cea9b`; 230 focused tests and Ruff pass |
+| Pulse critical rendering path | implemented, validation in progress | one-snapshot fanout 1.74–2.08 s; backend and frontend focused tests |
