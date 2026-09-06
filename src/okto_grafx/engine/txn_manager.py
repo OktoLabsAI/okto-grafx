@@ -168,7 +168,7 @@ from okto_grafx.engine.commit_state_store import (
 )
 from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapVacuumPlan
-from okto_grafx.engine.index_manager import IndexManager
+from okto_grafx.engine.index_manager import IndexManager, IndexStore
 from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.engine.coordination import (
     COMMIT_SECTION,
@@ -5415,17 +5415,6 @@ class TransactionManager:
         # records, because they are part of that batch: they lengthen it, and the number they
         # carry is the number the lengthened batch gives the COMMIT record. Counting them first
         # is what breaks that circle; `_stage_index_changes` refuses if the count was wrong.
-        index_record_count = self._index_record_count(txn, rows)
-        predicted = (
-            base + len(staged) + len(txn.pending_records) + index_record_count + 1
-        )
-        if predicted >= PROVISIONAL_CSN:
-            raise GrafxTransactionStateError(
-                "The write-ahead log has exhausted its usable commit-number space; the maximum "
-                "unsigned value is reserved for provisional heap versions.",
-                field="last_lsn",
-                value=base,
-            )
         manager = self._index_manager
         uses_canonical_index_staging = (
             type(manager) is IndexManager
@@ -5436,6 +5425,28 @@ class TransactionManager:
             )
             is TransactionManager._stage_index_changes
         )
+        resolved_indexes: list[tuple[IndexStore, ...] | None] | None = (
+            [] if uses_canonical_index_staging else None
+        )
+        index_record_count = (
+            self._index_record_count(
+                txn,
+                rows,
+                _resolved_indexes=resolved_indexes,
+            )
+            if uses_canonical_index_staging
+            else self._index_record_count(txn, rows)
+        )
+        predicted = (
+            base + len(staged) + len(txn.pending_records) + index_record_count + 1
+        )
+        if predicted >= PROVISIONAL_CSN:
+            raise GrafxTransactionStateError(
+                "The write-ahead log has exhausted its usable commit-number space; the maximum "
+                "unsigned value is reserved for provisional heap versions.",
+                field="last_lsn",
+                value=base,
+            )
         if uses_canonical_index_staging:
             # Count and staging run in this same COMMIT_SECTION against the same immutable
             # catalog authority.  Carry that one-shot observation into the verifier instead of
@@ -5447,6 +5458,7 @@ class TransactionManager:
                 rows,
                 predicted,
                 _expected_record_count=index_record_count,
+                _resolved_indexes=resolved_indexes,
             )
         else:
             self._stage_index_changes(txn, rows, predicted)
@@ -5659,7 +5671,11 @@ class TransactionManager:
             return None, ()
 
     def _index_record_count(
-        self, txn: TransactionContext, rows: Sequence[_RowWrite]
+        self,
+        txn: TransactionContext,
+        rows: Sequence[_RowWrite],
+        *,
+        _resolved_indexes: list[tuple[IndexStore, ...] | None] | None = None,
     ) -> int:
         """Return how many log records the index staging of these rows will produce.
 
@@ -5680,28 +5696,68 @@ class TransactionManager:
         for row in rows:
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
+                if _resolved_indexes is not None:
+                    _resolved_indexes.append(None)
                 continue
             table_name = getattr(row.table, "name", None)
             if not isinstance(table_name, str):
                 table_name = None
+            active_indexes = (
+                manager.active_indexes_for(
+                    table_id,
+                    table_name=table_name,
+                    table=row.table,
+                    txn=txn,
+                )
+                if _resolved_indexes is not None
+                else None
+            )
+            if _resolved_indexes is not None:
+                _resolved_indexes.append(active_indexes)
             if row.ended is not None:
-                total += manager.row_entry_count(
-                    table_id,
-                    row.ended_values,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                    txn=txn,
+                count = (
+                    manager.row_entry_count(
+                        table_id,
+                        row.ended_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                    )
+                    if active_indexes is None
+                    else manager.row_entry_count(
+                        table_id,
+                        row.ended_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                        _active_indexes=active_indexes,
+                    )
                 )
+                total += count
             if row.born is not None:
-                total += manager.row_entry_count(
-                    table_id,
-                    row.born_values,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                    txn=txn,
+                count = (
+                    manager.row_entry_count(
+                        table_id,
+                        row.born_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                    )
+                    if active_indexes is None
+                    else manager.row_entry_count(
+                        table_id,
+                        row.born_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                        _active_indexes=active_indexes,
+                    )
                 )
+                total += count
         return total
 
     def _stage_index_changes(
@@ -5711,6 +5767,7 @@ class TransactionManager:
         csn: Csn,
         *,
         _expected_record_count: int | None = None,
+        _resolved_indexes: Sequence[tuple[IndexStore, ...] | None] | None = None,
     ) -> None:
         """Stage, on every index covering each written row, the entries that row owes it.
 
@@ -5730,40 +5787,85 @@ class TransactionManager:
         if manager is None:
             return
         before = len(txn.pending_records)
+        if _resolved_indexes is not None and len(_resolved_indexes) != len(rows):
+            raise GrafxTransactionStateError(
+                "The resolved index plan no longer matches the row batch it was built for.",
+                txn_id=txn.txn_id,
+                expected=len(rows),
+                produced=len(_resolved_indexes),
+            )
         expected = (
             self._index_record_count(txn, rows)
             if _expected_record_count is None
             else _expected_record_count
         )
-        for row in rows:
+        for position, row in enumerate(rows):
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
                 continue
             table_name = getattr(row.table, "name", None)
             if not isinstance(table_name, str):
                 table_name = None
+            active_indexes = (
+                None
+                if _resolved_indexes is None
+                else _resolved_indexes[position]
+            )
+            if _resolved_indexes is not None and active_indexes is None:
+                raise GrafxTransactionStateError(
+                    "The resolved index plan omitted a row with a table identity.",
+                    txn_id=txn.txn_id,
+                    table_id=table_id,
+                    row_position=position,
+                )
             if row.ended is not None:
-                manager.stage_row_delete(
-                    txn,
-                    table_id,
-                    row.ended,
-                    row.ended_values,
-                    csn,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                )
+                if active_indexes is None:
+                    manager.stage_row_delete(
+                        txn,
+                        table_id,
+                        row.ended,
+                        row.ended_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                    )
+                else:
+                    manager.stage_row_delete(
+                        txn,
+                        table_id,
+                        row.ended,
+                        row.ended_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        _active_indexes=active_indexes,
+                    )
             if row.born is not None:
-                manager.stage_row_insert(
-                    txn,
-                    table_id,
-                    row.born,
-                    row.born_values,
-                    csn,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                )
+                if active_indexes is None:
+                    manager.stage_row_insert(
+                        txn,
+                        table_id,
+                        row.born,
+                        row.born_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                    )
+                else:
+                    manager.stage_row_insert(
+                        txn,
+                        table_id,
+                        row.born,
+                        row.born_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        _active_indexes=active_indexes,
+                    )
         produced = len(txn.pending_records) - before
         if produced != expected:
             raise GrafxTransactionStateError(

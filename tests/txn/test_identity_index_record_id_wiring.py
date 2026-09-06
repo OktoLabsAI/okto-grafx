@@ -204,6 +204,51 @@ def test_canonical_manager_counts_index_records_once_per_row_version(
     assert calls == 1, "the first quota count is carried into staging verification"
 
 
+def test_canonical_manager_resolves_active_indexes_once_per_written_row(
+    database_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quota prediction and staging share one immutable table-local index projection."""
+    stack = build_stack(database_root)
+    table = _table()
+    stack.catalog.catalog.add_table(table)
+    stack.catalog.save()
+    stack.pool.flush(stack.catalog.file)
+    stack.pool.flush(stack.heap.file)
+    indexes = IndexManager(stack.pool, stack.heap, stack.metrics)
+    indexes.register(
+        HashIndex(
+            IndexDefinition(
+                name="rid_t_00000001",
+                table_id=table.table_id,
+                table_name=table.name,
+                positions=(),
+                visibility=IndexVisibility.EXACT,
+                key_derivation=RECORD_ID_KEY_DERIVATION,
+            ),
+            stack.pool,
+            stack.metrics,
+        )
+    )
+    stack.manager._index_manager = indexes
+    original = IndexManager.active_indexes_for
+    calls = 0
+
+    def counted(
+        manager: IndexManager, *args: object, **kwargs: object
+    ) -> tuple[object, ...]:
+        nonlocal calls
+        calls += 1
+        return original(manager, *args, **kwargs)
+
+    monkeypatch.setattr(IndexManager, "active_indexes_for", counted)
+
+    _insert(stack, table, (7, "trusted"))
+
+    # Two other commit-protocol validations resolve table authority independently. The row-level
+    # quota/staging pair contributes only one call; before LV-3 the same commit contributed three.
+    assert calls == 3
+
+
 def test_insert_passes_the_resolved_unsigned_identity_to_quota_and_staging(
     database_root: Path,
 ) -> None:

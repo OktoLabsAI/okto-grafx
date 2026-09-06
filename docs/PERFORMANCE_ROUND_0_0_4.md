@@ -105,7 +105,7 @@ parallelism. Process pools or a native accelerator are not selected in Wave 1.
 
 ### Wave 0 — release line and existing transaction-local PK work
 
-Status: **implemented locally; checkpoint pending commit**.
+Status: **implemented and pushed** (`10b7520`).
 
 - keep the existing dirty-table automatic primary-key index overlay;
 - prove insert/update/key-change/delete and pending-reference containment;
@@ -130,7 +130,10 @@ Engine/query lane:
    `row.computed` guard. No `exec` code generation in this wave.
 5. KGRUN-M2(a): stateless pure cosine scorer preparation; no authority-bearing memo.
 6. VECTOR-6: test the identity-index gate before the O(N) proof.
-7. LV-3: resolve active indexes once per row in commit accounting/staging.
+7. LV-3: resolve active indexes once per row in commit accounting/staging. **Implemented
+   locally:** the canonical manager now carries one immutable table-local projection from WAL
+   quota prediction into delete/insert staging, while custom managers and overridden hooks keep
+   the observable legacy path. The produced-versus-expected WAL invariant remains mandatory.
 
 Storage/identity lane:
 
@@ -138,7 +141,9 @@ Storage/identity lane:
    once, preserving exact missing/case/symlink error ordering and types. **Implemented locally:**
    established files now take one page-count proof; only the ambiguous zero/missing boundary of a
    narrow storage collaborator pays `exists`; legacy nonce inventory performs one directory list.
-   The complete index plus storage-device/fault-adapter regression slice passes.
+   The complete index plus storage-device/fault-adapter regression slice passes. Pushed in
+   `cbab991`; `abe068c` additionally preserves adapters that report exact absence as Python's
+   `FileNotFoundError`, without translating permission, case, link or corruption failures.
 
 Pulse Community lane, maintained in the Pulse repository rather than Grafx:
 

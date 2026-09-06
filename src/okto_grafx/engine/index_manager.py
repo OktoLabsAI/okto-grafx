@@ -6322,6 +6322,7 @@ class IndexManager:
         table_name: str | None = None,
         table: object | None = None,
         txn: StagingTransaction | None = None,
+        _active_indexes: Sequence[IndexStore] | None = None,
     ) -> int:
         """Count entries this row owes without deriving or hashing value keys.
 
@@ -6331,14 +6332,19 @@ class IndexManager:
         domain as staging without trying to encode an empty DELETE value tuple.
         """
 
-        return sum(
-            1
-            for index in self.active_indexes_for(
+        indexes = (
+            self.active_indexes_for(
                 table_id,
                 table_name=table_name,
                 table=table,
                 txn=txn,
             )
+            if _active_indexes is None
+            else _active_indexes
+        )
+        return sum(
+            1
+            for index in indexes
             if index.definition.owes_entry_for_record(record_id, values)
         )
 
@@ -6353,12 +6359,18 @@ class IndexManager:
         record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
+        _active_indexes: Sequence[IndexStore] | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the entry this new row version owes it."""
         records: list[WalRecord] = []
-        for index in self.active_indexes_for(
-            table_id, table_name=table_name, table=table, txn=txn
-        ):
+        indexes = (
+            self.active_indexes_for(
+                table_id, table_name=table_name, table=table, txn=txn
+            )
+            if _active_indexes is None
+            else _active_indexes
+        )
+        for index in indexes:
             definition = index.definition
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
@@ -6384,12 +6396,18 @@ class IndexManager:
         record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
+        _active_indexes: Sequence[IndexStore] | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the end of the entry this row version had."""
         records: list[WalRecord] = []
-        for index in self.active_indexes_for(
-            table_id, table_name=table_name, table=table, txn=txn
-        ):
+        indexes = (
+            self.active_indexes_for(
+                table_id, table_name=table_name, table=table, txn=txn
+            )
+            if _active_indexes is None
+            else _active_indexes
+        )
+        for index in indexes:
             definition = index.definition
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
