@@ -11623,7 +11623,12 @@ def _evaluate(expression: Expression, row: _Row, context: _Context) -> object:
     computed = row.computed
     if computed is not None and expression in computed:
         return computed[expression]
-    evaluator = _EXACT_EVALUATORS.get(type(expression))
+    kind = type(expression)
+    if kind is Literal:
+        # The most frequent leaf, and the one node for which one identity test beats both the
+        # table lookup and the first question of the walk; the answer is the walk's.
+        return expression.value
+    evaluator = _EXACT_EVALUATORS.get(kind)
     if evaluator is not None:
         return evaluator(expression, row, context, computed)
     return _evaluate_by_kind(expression, row, context, computed)
