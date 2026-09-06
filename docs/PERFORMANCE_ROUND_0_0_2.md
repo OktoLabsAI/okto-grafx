@@ -2182,6 +2182,11 @@ publication. The residual participant-section/file-lock work is the multiwriter/
 coordination premise, not removable publication overhead. The W6 decision record now states this
 executed outcome so the obsolete 16.5 ms rename denominator does not re-enter the queue.
 
+The final Codex/Claude reconciliation (`msg_b5c7c4731b654deeafeec9b1bfeb1722`) found no remaining
+code item that is both already approved and supported by current evidence. Residual candidates are
+below 3% of the 133.9 s RAW transfer profile or require a new persisted-format/concurrency decision;
+they are not silently promoted into this milestone.
+
 ## Scale-removal batch 53 — transaction intents indexed by table
 
 Status: **implemented in `a0b0508`, adversarially hardened in `eb1c162`; focused, grouped and full

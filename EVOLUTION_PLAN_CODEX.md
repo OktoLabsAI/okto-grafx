@@ -30,6 +30,9 @@
   A antiga correção de publicação Windows também já está entregue pelo CE-1 de dois slots
   (`1512199`, `93a3ee3`, `98e52dd`): perfil Pulse-shaped atual observou zero `nt.replace` por commit
   e cerca de 1% no controle. `W6-WRITE-CEILING.md` foi corrigido para não ressuscitar esse alvo.
+  O consenso final com o Claude (`msg_b5c7c4731b654deeafeec9b1bfeb1722`) confirma que, após
+  `eb1c162`, não resta item de código já aprovado e sustentado por evidência na fila atual; o que
+  sobra mede menos de 3% do transfer RAW ou exige nova decisão sobre formato/concorrência.
 
 - **Paginação do Knowledge Graph e acesso vetorial filtrado Pulse publicados.** A falha de
   `Load more` foi reproduzida no Pulse real: o cursor ISO era comparado com
