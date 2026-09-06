@@ -37,9 +37,11 @@ contract, and this module is not the place that will tell it so.
 from __future__ import annotations
 
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
 from math import isfinite
+from types import MappingProxyType
 from typing import TypeAlias, cast
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxVectorValidationError
@@ -340,25 +342,28 @@ def _utf8(text: str) -> bytes:
         ) from failure
 
 
-_EXACT_VALUE_TYPES: dict[type, ValueType] = {
-    bool: ValueType.BOOL,
-    int: ValueType.INT64,
-    float: ValueType.DOUBLE,
-    str: ValueType.STRING,
-    bytes: ValueType.BYTES,
-    bytearray: ValueType.BYTES,
-    Timestamp: ValueType.TIMESTAMP,
-    Uuid: ValueType.UUID,
-    tuple: ValueType.LIST,
-    list: ValueType.LIST,
-    dict: ValueType.MAP,
-}
+_EXACT_VALUE_TYPES: Mapping[type, ValueType] = MappingProxyType(
+    {
+        bool: ValueType.BOOL,
+        int: ValueType.INT64,
+        float: ValueType.DOUBLE,
+        str: ValueType.STRING,
+        bytes: ValueType.BYTES,
+        bytearray: ValueType.BYTES,
+        Timestamp: ValueType.TIMESTAMP,
+        Uuid: ValueType.UUID,
+        tuple: ValueType.LIST,
+        list: ValueType.LIST,
+        dict: ValueType.MAP,
+    }
+)
 """The value type of each exact built-in or domain class, read before the isinstance walk.
 
 An exact class answers exactly what its isinstance branch below answers, so this table can
 neither admit nor refuse anything the walk does not: a subclass, an unknown object and a vector
 (whose type follows its dtype) still take the walk.  It exists because every stored value
-passes here once per encode, and the walk asked up to eleven questions per value.
+passes here once per encode, and the walk asked up to eleven questions per value.  The proxy
+keeps the table read-only: it is written once at import and never carries database state.
 """
 
 

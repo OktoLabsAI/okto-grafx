@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import namedtuple
 from enum import IntEnum
+from types import MappingProxyType
 
 import pytest
 
@@ -88,28 +89,31 @@ SUBCLASSES = [
 
 def _walk(value: object) -> ValueType:
     """The answer of the isinstance walk alone, with the exact-type table emptied."""
-    saved = dict(value_module._EXACT_VALUE_TYPES)
-    value_module._EXACT_VALUE_TYPES.clear()
+    saved = value_module._EXACT_VALUE_TYPES
+    value_module._EXACT_VALUE_TYPES = MappingProxyType({})
     try:
         return value_type_of(value)  # type: ignore[arg-type]
     finally:
-        value_module._EXACT_VALUE_TYPES.update(saved)
+        value_module._EXACT_VALUE_TYPES = saved
 
 
 @pytest.mark.parametrize("value", EXACT + SUBCLASSES, ids=repr)
 def test_table_and_walk_agree_on_type_and_bytes(value: object) -> None:
     assert value_type_of(value) is _walk(value)  # type: ignore[arg-type]
     expected = encode_value(value)  # type: ignore[arg-type]
-    saved = dict(value_module._EXACT_VALUE_TYPES)
-    value_module._EXACT_VALUE_TYPES.clear()
+    saved = value_module._EXACT_VALUE_TYPES
+    value_module._EXACT_VALUE_TYPES = MappingProxyType({})
     try:
         assert encode_value(value) == expected  # type: ignore[arg-type]
     finally:
-        value_module._EXACT_VALUE_TYPES.update(saved)
+        value_module._EXACT_VALUE_TYPES = saved
 
 
 def test_table_keys_are_exact_classes_the_walk_answers_unconditionally() -> None:
     table = value_module._EXACT_VALUE_TYPES
+    assert isinstance(table, MappingProxyType)
+    with pytest.raises(TypeError):
+        table[Opaque] = ValueType.NULL  # type: ignore[index]
     assert set(table) == {
         bool,
         int,
