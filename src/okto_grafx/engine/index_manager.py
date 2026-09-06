@@ -3058,6 +3058,13 @@ class IndexStore:
         not hidden behind a decline: preparation propagates their typed refusal while the batch
         is still mutation-free.
         """
+        # The directory replaces every physical hook named by ``_LIVE_HOT_HOOK_NAMES``.  The
+        # live-commit caller already makes this check for its whole batch; replay can mix stores
+        # and therefore checks at the individual bucket door.  A subclass or a runtime fault
+        # injector that changes one hook must observe the scalar protocol instead of having its
+        # behavior silently bypassed by the accelerator.
+        if not self._uses_canonical_live_hot_hooks():
+            return None
         if page_limit < 1:
             return None
         pages: list[PageIndex] = []

@@ -664,13 +664,6 @@ def test_every_touched_bucket_bypasses_scalar_apply_whatever_its_run_length(
         )
         for offset, key in enumerate((*long_keys, *short_keys, *single_key))
     )
-    scalar_calls: list[bytes] = []
-    original = IndexStore._apply_change
-
-    def counted(store: IndexStore, change: IndexChange, lsn: int) -> bool:
-        scalar_calls.append(change.key)
-        return original(store, change, lsn)
-
     hot_calls: list[bytes] = []
     original_hot = IndexStore._apply_common_replay_hot_change
 
@@ -683,14 +676,12 @@ def test_every_touched_bucket_bypasses_scalar_apply_whatever_its_run_length(
         hot_calls.append(change.key)
         return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(IndexStore, "_apply_change", counted)
     monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", counted_hot)
 
     CommitRedo(database.pool, database.manager).apply(_replay(records))
 
     # A one-effect bucket and a seven-effect bucket are pre-indexed exactly like the eight-effect
     # run the former floor admitted: the directory walks each touched chain once.
-    assert scalar_calls == []
     assert hot_calls == [*long_keys, *short_keys, *single_key]
     assert len(tuple(database.exact.walk())) == 16
 
@@ -707,26 +698,30 @@ def test_bucket_runs_of_one_to_seven_effects_match_legacy_bytes(
     batched = build_database(name="short-batched", budget_pages=64)
     legacy = build_database(name="short-legacy", budget_pages=64)
     rounds = ({0: 1, 1: 2, 2: 3, 3: 4}, {0: 5, 1: 6, 2: 7})
-    scalar_calls: list[bytes] = []
-    original = IndexStore._apply_change
-
-    def counted(store: IndexStore, change: IndexChange, lsn: int) -> bool:
-        if store is batched.proximity:
-            scalar_calls.append(change.key)
-        return original(store, change, lsn)
-
     prepared_runs: list[int] = []
+    applied_keys: list[bytes] = []
     original_prepare = IndexStore._prepare_common_replay_hot_bucket
+    original_hot = IndexStore._apply_common_replay_hot_change
 
     def counted_prepare(store: IndexStore, bucket: int, targets, **options):  # type: ignore[no-untyped-def]
         if store is batched.proximity:
             prepared_runs.append(len(targets))
         return original_prepare(store, bucket, targets, **options)
 
-    monkeypatch.setattr(IndexStore, "_apply_change", counted)
+    def counted_hot(
+        store: IndexStore,
+        bucket: object,
+        change: IndexChange,
+        lsn: int,
+    ) -> bool:
+        if store is batched.proximity:
+            applied_keys.append(change.key)
+        return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
+
     monkeypatch.setattr(
         IndexStore, "_prepare_common_replay_hot_bucket", counted_prepare
     )
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", counted_hot)
     batched_redo = CommitRedo(batched.pool, batched.manager)
     legacy_redo = CommitRedo(legacy.pool, _LegacyManager(legacy.manager))  # type: ignore[arg-type]
     for round_number, per_bucket in enumerate(rounds):
@@ -758,7 +753,7 @@ def test_bucket_runs_of_one_to_seven_effects_match_legacy_bytes(
 
     # The legacy arm never prepares a directory, so every recorded run is the batched arm's.
     assert sorted(prepared_runs) == [1, 2, 3, 4, 5, 6, 7]
-    assert scalar_calls == []
+    assert len(applied_keys) == sum(range(1, 8))
     assert batched.entries() == legacy.entries()
     assert batched.proximity.header == legacy.proximity.header
     assert batched.proximity.missing_targets == legacy.proximity.missing_targets
@@ -1002,7 +997,6 @@ def test_hot_bucket_partial_failure_marks_stale_without_scalar_fallback(
     )
     original_hot = IndexStore._apply_common_replay_hot_change
     hot_calls = 0
-    scalar_calls = 0
 
     def fail_second(
         store: IndexStore,
@@ -1016,21 +1010,12 @@ def test_hot_bucket_partial_failure_marks_stale_without_scalar_fallback(
             raise GrafxIndexError("injected hot replay failure", field="injected")
         return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
 
-    def unexpected_scalar(
-        _store: IndexStore, _change: IndexChange, _lsn: int
-    ) -> bool:
-        nonlocal scalar_calls
-        scalar_calls += 1
-        return False
-
     monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", fail_second)
-    monkeypatch.setattr(IndexStore, "_apply_change", unexpected_scalar)
 
     with pytest.raises(GrafxIndexError, match="injected hot replay failure"):
         CommitRedo(database.pool, database.manager).apply(_replay(records))
 
     assert hot_calls == 2
-    assert scalar_calls == 0
     assert database.exact.stale is True
 
 
@@ -1093,8 +1078,9 @@ def test_pagefull_remains_authoritative_for_a_hot_first_fit_hint(
     )
     head = database.exact._bucket_head(0)  # noqa: SLF001
     original_insert = Page.insert_slot
+    original_hot = IndexStore._apply_common_replay_hot_change
     refused = False
-    scalar_calls = 0
+    hot_calls = 0
 
     def refuse_first_hint(page: Page, payload: bytes) -> int:
         nonlocal refused
@@ -1103,18 +1089,21 @@ def test_pagefull_remains_authoritative_for_a_hot_first_fit_hint(
             raise PageFullError("injected authoritative page refusal", page=head)
         return original_insert(page, payload)
 
-    def unexpected_scalar(
-        _store: IndexStore, _change: IndexChange, _lsn: int
+    def counted_hot(
+        store: IndexStore,
+        bucket: object,
+        change: IndexChange,
+        lsn: int,
     ) -> bool:
-        nonlocal scalar_calls
-        scalar_calls += 1
-        return False
+        nonlocal hot_calls
+        hot_calls += 1
+        return original_hot(store, bucket, change, lsn)  # type: ignore[arg-type]
 
     monkeypatch.setattr(Page, "insert_slot", refuse_first_hint)
-    monkeypatch.setattr(IndexStore, "_apply_change", unexpected_scalar)
+    monkeypatch.setattr(IndexStore, "_apply_common_replay_hot_change", counted_hot)
 
     CommitRedo(database.pool, database.manager).apply(_replay(records))
 
     assert refused is True
-    assert scalar_calls == 0
+    assert hot_calls == len(records)
     assert len(tuple(database.exact.walk())) == len(records)

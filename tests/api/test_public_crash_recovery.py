@@ -340,7 +340,11 @@ def test_a_late_invalid_effect_preflights_before_stale_or_control_bytes_move() -
             page_lsn=database._wal.last_lsn + 1,
             seq=2,
         )
-        valid_page.insert_slot(b"would-be-prefix")
+        # A HEAP page's slot zero is its four-byte table descriptor.  The replay watermark
+        # preflight now validates that logical structure as well as the page checksum, so keep
+        # this first effect genuinely valid and leave the malformed second image as the late
+        # refusal this test is meant to locate.
+        valid_page.insert_slot(index.definition.table_id.to_bytes(4, "little"))
         valid_image = database._codec.encode_page(valid_page)
         epoch = max(
             (record.epoch for record in database._wal.read_from(1)),
