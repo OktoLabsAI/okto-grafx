@@ -26,6 +26,17 @@ class _IntentIterable:
         return iter(self._values)
 
 
+class _IntentWithHostileOperation:
+    def __init__(self, table: object) -> None:
+        self.table = table
+
+    @property
+    def operation(self) -> object:
+        raise AssertionError(
+            "dirty-table indexing must not inspect an unrelated operation"
+        )
+
+
 def _intent(table: object) -> SimpleNamespace:
     return SimpleNamespace(table=table)
 
@@ -94,3 +105,12 @@ def test_untrackable_intents_keep_the_complete_conservative_scan() -> None:
     assert first == second == frozenset({17})
     assert (valid.reads, boolean.reads, negative.reads) == (2, 2, 2)
     assert engine._primary_key_memos == {}
+
+
+def test_dirty_table_index_does_not_expand_duck_typed_observations() -> None:
+    table = _ObservedTable(23)
+    engine = SimpleNamespace(_primary_key_memos={})
+    txn = SimpleNamespace(txn_id=2, row_intents=[_IntentWithHostileOperation(table)])
+
+    assert _intent_table_ids(engine, txn) == frozenset({23})
+    assert table.reads == 1

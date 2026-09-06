@@ -1079,6 +1079,9 @@ class _PrimaryKeyTxnMemo:
     dirty_rewrite_revision: int = 0
     dirty_table_ids: set[int] = field(default_factory=set)
     dirty_snapshot: frozenset[int] = frozenset()
+    row_intents_by_table: dict[int, list[RowIntent]] = field(default_factory=dict)
+    row_intent_index_complete: bool = True
+    has_delete_intent: bool = False
 
 
 @dataclass(slots=True)
@@ -1430,12 +1433,29 @@ def _intent_table_ids(engine: QueryEngine, txn: object) -> frozenset[int]:
         return frozenset(table_ids)
 
     _txn_id, memo = identified
+    _refresh_revisioned_intent_index(memo)
+    return memo.dirty_snapshot
+
+
+def _refresh_revisioned_intent_index(memo: _PrimaryKeyTxnMemo) -> None:
+    """Index one transaction's append-only intent suffix by table and operation.
+
+    ``_transaction_row_view`` used to rescan every intent in a transaction merely to discover
+    that none belonged to the endpoint table being queried. Pulse relationship ingestion makes
+    that question twice per relationship while the transaction history grows. The same
+    revision-tracking list that protects the primary-key fold lets all consumers share one suffix
+    walk. Structural edits rebuild from zero; unfamiliar entries keep row-view consumers on the
+    canonical scan instead of silently changing their duck-typed behaviour.
+    """
     intents = memo.intents
     if (
         memo.dirty_rewrite_revision != intents.rewrite_revision
         or memo.dirty_cursor > len(intents)
     ):
         memo.dirty_table_ids.clear()
+        memo.row_intents_by_table.clear()
+        memo.row_intent_index_complete = True
+        memo.has_delete_intent = False
         memo.dirty_cursor = 0
         memo.dirty_rewrite_revision = intents.rewrite_revision
         memo.dirty_snapshot = frozenset()
@@ -1450,10 +1470,49 @@ def _intent_table_ids(engine: QueryEngine, txn: object) -> frozenset[int]:
             and table_id > 0
         ):
             table_ids.add(table_id)
+            if type(intent) is RowIntent:
+                memo.row_intents_by_table.setdefault(table_id, []).append(intent)
+            else:
+                memo.row_intent_index_complete = False
+        elif type(intent) is not RowIntent:
+            memo.row_intent_index_complete = False
+        if type(intent) is RowIntent and intent.operation is RowOperation.DELETE:
+            memo.has_delete_intent = True
     memo.dirty_cursor = len(intents)
     if memo.dirty_snapshot != table_ids:
         memo.dirty_snapshot = frozenset(table_ids)
-    return memo.dirty_snapshot
+
+
+def _indexed_row_intents(
+    context: _Context, table: TableDef
+) -> Sequence[RowIntent] | None:
+    """Return the table-local intent slice, or None when canonical filtering is required."""
+    engine = getattr(context, "engine", None)
+    if engine is None or not hasattr(engine, "_primary_key_memos"):
+        return None
+    identified = _revisioned_txn_memo(engine, context.txn)
+    if identified is None:
+        return None
+    _txn_id, memo = identified
+    _refresh_revisioned_intent_index(memo)
+    if not memo.row_intent_index_complete:
+        return None
+    return memo.row_intents_by_table.get(table.table_id, ())
+
+
+def _has_indexed_delete_intent(context: _Context) -> bool | None:
+    """Return the memoized DELETE fact, or None for an untrackable transaction."""
+    engine = getattr(context, "engine", None)
+    if engine is None or not hasattr(engine, "_primary_key_memos"):
+        return None
+    identified = _revisioned_txn_memo(engine, context.txn)
+    if identified is None:
+        return None
+    _txn_id, memo = identified
+    _refresh_revisioned_intent_index(memo)
+    if not memo.row_intent_index_complete:
+        return None
+    return memo.has_delete_intent
 
 
 @dataclass(frozen=True, slots=True)
@@ -2502,8 +2561,8 @@ def _closed_statement_tables(
                     type(clause.targets) is not tuple
                     or type(clause.detach) is not bool
                     or any(
-                    type(target) is not Variable or target.name not in bound
-                    for target in clause.targets
+                        type(target) is not Variable or target.name not in bound
+                        for target in clause.targets
                     )
                 ):
                     return None
@@ -6256,6 +6315,7 @@ def _filtered_vector_search(
         return None
     if type(frontier_count) is not int or frontier_count <= 0:
         return None
+
     def row_of(ref: RecordRef, version: HeapVersion) -> _Row:
         """Bind one vector-index heap witness exactly as the omitted NodeScan would."""
         return _Row(
@@ -9713,12 +9773,16 @@ def _transaction_row_view(
         elif values is not None:
             state[reference] = tuple(values)  # type: ignore[arg-type]
 
-    logical_intents: list[RowIntent] = []
-    for intent in getattr(context.txn, "row_intents", ()):
-        intent_table = getattr(intent, "table", None)
-        if getattr(intent_table, "table_id", None) != table.table_id:
-            continue
-        logical_intents.append(intent)
+    indexed = _indexed_row_intents(context, table)
+    if indexed is None:
+        logical_intents: list[RowIntent] = []
+        for intent in getattr(context.txn, "row_intents", ()):
+            intent_table = getattr(intent, "table", None)
+            if getattr(intent_table, "table_id", None) != table.table_id:
+                continue
+            logical_intents.append(intent)
+    else:
+        logical_intents = list(indexed)
     if include_held:
         for held in context.staged_rows:
             if held.table.table_id != table.table_id:
@@ -10633,9 +10697,19 @@ def _ended_by_this_transaction(context: _Context) -> set[object]:
     row the caller has just said it wants gone.
     """
     row_intents = getattr(context.txn, "row_intents", ())
-    if not any(held.operation == _HELD_DELETE for held in context.staged_rows) and not any(
-        getattr(intent, "operation", None) is RowOperation.DELETE for intent in row_intents
-    ):
+    has_held_delete = any(
+        held.operation == _HELD_DELETE for held in context.staged_rows
+    )
+    if has_held_delete:
+        has_delete = True
+    else:
+        has_delete = _has_indexed_delete_intent(context)
+        if has_delete is None:
+            has_delete = any(
+                getattr(intent, "operation", None) is RowOperation.DELETE
+                for intent in row_intents
+            )
+    if not has_delete:
         # DELETE is the only input that can make _transaction_row_view report an ended row.
         # Most relationship-ingestion transactions only append INSERT intents; avoid rebuilding
         # every dirty table's complete row view for each endpoint seek in that overwhelmingly
