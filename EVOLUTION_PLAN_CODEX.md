@@ -9,6 +9,28 @@
 
 ## Estado de execução — 2026-09-03
 
+- **Lote de escala 53 — histórico de intents indexado por tabela.** `a0b0508`, endurecido em
+  `eb1c162`, reutiliza a lista
+  revisionada já pertencente à transação para indexar uma vez o sufixo append-only por `table_id`
+  e memoizar a existência de `DELETE`. Consultas repetidas a uma tabela sem intents deixam de
+  varrer todo o histórico crescente; rewrite/rollback reconstrói do zero e qualquer entrada não
+  canônica preserva o filtro integral anterior. A prova estrutural de 1.500 intents e 500 views
+  fez 1.500 inspeções de tabela, contra 750 mil no algoritmo anterior; o micro de componente
+  mediu medianas `2,545 ms` e `96,337 ms` no shape sintético, sem extrapolação ponta a ponta. Os
+  testes focais, o grupo de relações/endpoints/read-your-own-writes e toda `tests/query` passaram.
+  A revisão Nexus `hof_5a43ddf253974308ab20ad895d29d7fd` foi verificada PASS após fechar dois
+  casos hostis: ID forjado força fallback integral e walk interrompido invalida o prefixo parcial;
+  o harness diferencial terminou com 31 cenários equivalentes e zero divergências. Formato,
+  WAL/OCC, durabilidade e premissas multiwriter/multireader não mudaram.
+
+- **Reconciliação de backlog após o lote 52.** `VERIFY-2` já era o lote 48 (`4d27162`) e não foi
+  reimplementado. `OPEN-1` foi fechado como NO-GO sem formato: o header do índice atestaria a si
+  mesmo, a foto de checkpoint não é persistida e a META não contém o watermark por tabela; criar
+  sidecar/capability para um teto antigo de aproximadamente 2,4% do transfer ampliaria o escopo.
+  A antiga correção de publicação Windows também já está entregue pelo CE-1 de dois slots
+  (`1512199`, `93a3ee3`, `98e52dd`): perfil Pulse-shaped atual observou zero `nt.replace` por commit
+  e cerca de 1% no controle. `W6-WRITE-CEILING.md` foi corrigido para não ressuscitar esse alvo.
+
 - **Paginação do Knowledge Graph e acesso vetorial filtrado Pulse publicados.** A falha de
   `Load more` foi reproduzida no Pulse real: o cursor ISO era comparado com
   `Timestamp`, produzindo `UNKNOWN`. O Grafx agora ordena/compara timestamps por micros UTC e o
@@ -3638,13 +3660,13 @@ evita split-brain e retrabalho no Core do Pulse.
 
 ### Fase 2 — Performance estrutural
 
-1. identity-range leasing;
+1. identity-range leasing — concluído em `40b2b43`;
 2. reduzir `os.walk`, `stat/fstat` e locks globais;
 3. transformar HNSW em access path real;
 4. corrigir agregadores e top-N;
 5. implementar bulk ingest;
-6. corrigir publicação Windows;
-7. adicionar group commit;
+6. corrigir publicação Windows — concluído pelo CE-1 two-slot em `1512199`/`93a3ee3`/`98e52dd`;
+7. adicionar group commit — rejeitado após teto medido de aproximadamente `1,002x`;
 8. adicionar vacuum, índice de identidade e rehash/rebuild de índices;
 9. decidir P1.16 (parâmetros de construção do HNSW) depois do perfil de recall exigido.
 

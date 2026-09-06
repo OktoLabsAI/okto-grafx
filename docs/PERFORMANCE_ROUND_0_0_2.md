@@ -2163,3 +2163,55 @@ deletes; four predicate selectivities (218, 118, 57 and 0 admitted rows); and `k
 at `T-1`, `T` and `T+1` preserved both result and exact/approximate regime. In the small exact
 DIM384 case, the optimized median was 56.7 ms versus 63.7 ms canonical (about 11% lower), with no
 `rows_scanned`; this is a local small-N measurement, not a large-graph or end-to-end claim.
+
+## Post-batch-52 backlog reconciliation
+
+Three apparent candidates were removed before code. `VERIFY-2` was not pending: batch 48
+(`4d27162`) already captures one catalog picture, scans each table once for all sibling indexes and
+keeps its bounded state inside one verifier call. `OPEN-1` has no non-circular no-format proof:
+an index header cannot certify the heap watermark it is being checked against, checkpoint
+watermarks are not persisted, and heap META stores no per-table commit watermark. Persisting a new
+sidecar/capability or changing `open()` semantics was not justified by the old approximately 2.4%
+transfer ceiling, so the no-format recut is a NO-GO.
+
+The historical Windows publication target was also already closed. CE-1 (`1512199`, `93a3ee3`,
+`98e52dd`) publishes hot control records in place with the three-page/two-slot protocol;
+`atomic_replace` remains on bootstrap/downgrade paths. A current Pulse-shaped profile observed zero
+`nt.replace` calls per ordinary commit and about 1% of commit time across commit-state and lease
+publication. The residual participant-section/file-lock work is the multiwriter/multireader
+coordination premise, not removable publication overhead. The W6 decision record now states this
+executed outcome so the obsolete 16.5 ms rename denominator does not re-enter the queue.
+
+## Scale-removal batch 53 — transaction intents indexed by table
+
+Status: **implemented in `a0b0508`, adversarially hardened in `eb1c162`; focused, grouped and full
+query gates green; independent Nexus review `hof_5a43ddf253974308ab20ad895d29d7fd`
+verified PASS**.
+
+Pulse-shaped relationship ingestion repeatedly asks for endpoint-table overlays while the
+transaction mostly holds intents for other relationship tables. `_transaction_row_view` formerly
+filtered the complete growing `row_intents` list for every such question, and the DELETE precheck
+independently walked the same history. The existing `_RevisionList` authority now maintains one
+table-local index and one DELETE fact. Append-only growth scans only the new suffix; structural
+rewrite, rollback or replacement clears and rebuilds the projection. An unfamiliar, subclassed or
+duck-typed intent makes row-view consumers use the complete canonical filter, preserving hostile
+and extension behaviour.
+
+The adversarial review found two hostile-only gaps before closure. An exact forged `RowIntent`
+whose `table_id` merely compared equal to a valid integer could disappear from the projection, and
+an exception halfway through a suffix walk could leave an append-only prefix partially applied.
+`eb1c162` makes every invalid id force the canonical path and makes an interrupted walk invalidate
+the partial projection before re-raising. The reviewer's differential harness then completed 31
+scenarios with zero divergences, including every `_RevisionList` mutator, rollback, DELETE/MERGE,
+transaction reuse, hostile ids, transient interruption and real-engine commit/rollback.
+
+The structural regression performs 500 empty-table views over 1,500 intents and observes exactly
+1,500 table inspections, rather than the former 750,000. A non-gating component probe on the same
+shape measured three-run medians of 2.545 ms indexed and 96.337 ms canonical (about 37.9x in that
+narrow filtering component). The prior Pulse profile bounded the whole opportunity near 3.4% of
+the relationship phase and 0.7% of transfer, so no end-to-end claim is made. The derived index
+retains one extra reference per standard intent only for the transaction lifetime; transaction
+budgets and the authoritative raw intents remain unchanged. Twenty-four focused cases, 105 grouped
+relationship/endpoint/read-your-own-writes cases and the complete `tests/query` suite passed,
+together with Ruff, format, compileall and diff checks. No stored bytes, API, WAL/OCC, recovery,
+durability or multiwriter/multireader premise changed.
