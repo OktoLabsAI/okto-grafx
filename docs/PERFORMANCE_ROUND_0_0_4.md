@@ -195,7 +195,14 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    `heap.dat` SHA-256. The measured pre-commit memory delta was about 478 KiB for 399 KiB of
    proved payload, and proof authority is revoked at discard, commit and abort. Five initial plus
    one budget-fallback adversarial tests and the 16-file proportional write/transaction/heap
-   slice pass; Ruff, compileall and `git diff --check` are clean.
+   slice pass; Ruff, compileall and `git diff --check` are clean. **NATVER-2 is also implemented
+   and integrated** in `bd02990`: the same canonical encoder now appends scalar and compound
+   values into one private byte buffer, reusing the column's already-classified type and keeping
+   vector validation in the existing oracle. A hostile 10,000-case differential produced the
+   same 5,200 acceptances, 4,800 refusals and digest of bytes plus error details. The measured
+   3,142-byte Pulse-shaped row improved about `1.17x`; the end-to-end post-WRITE-1 write signal
+   was neutral within noise, so no larger claim is made. The full `tests/storage_core` slice plus
+   WRITE-1 tests passes.
 2. NATVER-3 only after a discriminating CRC microbenchmark. **Discriminant completed:** against
    the active `google_crc32c` provider, one collapsed wrapper preserved the full acceptance-corpus
    answers and measured 2.05x–2.54x faster per call for 32 B, 256 B, 4 KiB and 16,380 B inputs
