@@ -285,9 +285,10 @@ _PARSE_CACHE_MAX_ENTRIES: int = 256
 # statements, and this bound keeps the memo from outliving that cache by more than its size.
 _STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES: int = _PARSE_CACHE_MAX_ENTRIES
 # Elements every IN parameter list of one statement may contribute, in total, to hashed
-# membership memos.  Beyond the ceiling the linear comparison stays the answer: the memo is an
-# accelerator over the same _freeze keys, never a second semantics.
-_IN_LIST_MEMO_MAX_TOTAL_ELEMENTS: int = 65_536
+# membership memos: four full facade lists (MAX_LIST_ELEMENTS), where the Pulse graph page
+# carries two of at most 500.  Beyond the ceiling the linear comparison stays the answer: the
+# memo is an accelerator over the same _freeze keys, never a second semantics.
+_IN_LIST_MEMO_MAX_TOTAL_ELEMENTS: int = 4_096
 _PLAN_CACHE_MAX_ENTRIES: int = 128
 _PREPARED_PLAN_VERSION: int = 1
 
@@ -11971,16 +11972,19 @@ def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
 
 
 def _memo_membership(left: object, memo: _InListMemo) -> object:
-    """Answer IN over a hashed list exactly as the linear walk over the same list would."""
+    """Answer IN over a hashed list exactly as the linear walk over the same list would.
+
+    Only an exact ``str`` or ``bytes`` on the left consults the set: against a list of those
+    kinds ``_equal`` is ``_freeze`` key equality and nothing else.  Every other left value --
+    a binding, a list, a map, a number, a boolean -- takes the walk over the same detached
+    list, so the memo never decides a comparison it did not build for.
+    """
     if left is None:
         return None
-    try:
-        found = _freeze(left) in memo.keys
-    except TypeError:
-        # A left value whose frozen form cannot be hashed is compared the long way; the memo
-        # never changes an answer, it only skips comparisons it can prove unnecessary.
+    kind = type(left)
+    if kind is not str and kind is not bytes:
         return _membership(left, memo.values)
-    if found:
+    if _freeze(left) in memo.keys:
         return True
     return None if memo.has_null else False
 

@@ -331,12 +331,13 @@ def test_memo_membership_matches_the_walk(
     assert _memo_membership(left, memo) is _membership(left, values)
 
 
-def test_unhashable_left_falls_back_to_the_walk(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "left",
+    [1, 1.0, True, ["a"], ("a",), {"k": "a"}, bytearray(b"a"), math.nan, object()],
+)
+def test_non_scalar_left_takes_the_walk(
+    left: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class Opaque:
-        __hash__ = None  # type: ignore[assignment]
-
     walks: list[tuple[object, object]] = []
     original = engine_module._membership
 
@@ -348,13 +349,63 @@ def test_unhashable_left_falls_back_to_the_walk(
     values = ("a", None)
     memo = _build_in_list_memo(values, _context())
     assert memo is not None
-    left = Opaque()
     assert _memo_membership(left, memo) is original(left, values) is None
     assert walks == [(left, values)]
     plain = _build_in_list_memo(("a",), _context())
     assert plain is not None
     assert _memo_membership(left, plain) is False
     assert len(walks) == 2
+    assert _memo_membership("a", plain) is True
+    assert len(walks) == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "MATCH (n:T) WHERE n IN $ids RETURN n.id",
+        "MATCH (n:T) WHERE [n.id] IN $ids RETURN n.id",
+        "MATCH (n:T) WHERE {k: n.id} IN $ids RETURN n.id",
+        "MATCH (n:T) WHERE n.n IN $ids RETURN n.id",
+    ],
+)
+def test_binding_list_map_and_number_left_values_walk_the_statement(
+    database: object, text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    walks: list[object] = []
+    original = engine_module._membership
+
+    def counting(left: object, right: object) -> object:
+        walks.append(left)
+        return original(left, right)
+
+    monkeypatch.setattr(engine_module, "_membership", counting)
+    assert _ids(database, text, {"ids": ["t-001", None]}) == []
+    assert len(walks) == ROWS
+
+
+def test_two_full_facade_lists_fit_the_default_ceiling(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from okto_grafx.domain.query.limits import MAX_LIST_ELEMENTS
+
+    builds: list[object] = []
+    original = engine_module._build_in_list_memo
+
+    def counting(value: object, context: object) -> object:
+        memo = original(value, context)
+        builds.append(memo)
+        return memo
+
+    monkeypatch.setattr(engine_module, "_build_in_list_memo", counting)
+    first = [f"x-{position}" for position in range(MAX_LIST_ELEMENTS)]
+    second = [f"y-{position}" for position in range(MAX_LIST_ELEMENTS)]
+    rows = _ids(
+        database,
+        "MATCH (n:T) WHERE n.id IN $first OR n.id IN $second RETURN n.id",
+        {"first": first, "second": second},
+    )
+    assert rows == []
+    assert [memo is not None for memo in builds] == [True, True]
 
 
 def test_walk_stops_at_the_first_match(monkeypatch: pytest.MonkeyPatch) -> None:
