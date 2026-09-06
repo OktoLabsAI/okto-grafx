@@ -1461,6 +1461,24 @@ def _refresh_revisioned_intent_index(memo: _PrimaryKeyTxnMemo) -> None:
         memo.dirty_snapshot = frozenset()
     table_ids = memo.dirty_table_ids
     start = memo.dirty_cursor
+    try:
+        _walk_revisioned_intent_suffix(memo, intents, start, table_ids)
+    except BaseException:
+        # A walk that stops halfway has already appended part of the suffix; make the next
+        # refresh rebuild from zero instead of appending the same intents a second time.
+        memo.dirty_rewrite_revision = -1
+        raise
+    if memo.dirty_snapshot != table_ids:
+        memo.dirty_snapshot = frozenset(table_ids)
+
+
+def _walk_revisioned_intent_suffix(
+    memo: _PrimaryKeyTxnMemo,
+    intents: _RevisionList,
+    start: int,
+    table_ids: set[int],
+) -> None:
+    """Apply one append-only suffix after the caller installed interruption recovery."""
     for position in range(start, len(intents)):
         intent = intents[position]
         table_id = getattr(getattr(intent, "table", None), "table_id", None)
@@ -1474,13 +1492,14 @@ def _refresh_revisioned_intent_index(memo: _PrimaryKeyTxnMemo) -> None:
                 memo.row_intents_by_table.setdefault(table_id, []).append(intent)
             else:
                 memo.row_intent_index_complete = False
-        elif type(intent) is not RowIntent:
+        else:
+            # Engine-built RowIntent objects always carry a validated positive integer id. A
+            # forged id that merely compares equal (True, 1.0, numpy ints) must keep consumers
+            # on the canonical duck-typed scan instead of silently disappearing from the view.
             memo.row_intent_index_complete = False
         if type(intent) is RowIntent and intent.operation is RowOperation.DELETE:
             memo.has_delete_intent = True
     memo.dirty_cursor = len(intents)
-    if memo.dirty_snapshot != table_ids:
-        memo.dirty_snapshot = frozenset(table_ids)
 
 
 def _indexed_row_intents(

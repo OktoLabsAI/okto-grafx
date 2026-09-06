@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from okto_grafx.domain.txn.context import RowIntent, RowOperation
 from okto_grafx.engine.query_engine import (
     _RevisionList,
@@ -115,3 +117,36 @@ def test_delete_precheck_reuses_the_same_append_only_index() -> None:
 
     assert _ended_by_this_transaction(context) == {deleted}
     assert context.engine._primary_key_memos[41].has_delete_intent is True
+
+
+def test_exact_intent_with_forged_table_id_keeps_the_canonical_answer() -> None:
+    forged = SimpleNamespace(table_id=True)
+    context = _context(RowIntent(table=forged, values=(7,)))
+    view = SimpleNamespace(table_id=1)
+
+    assert _transaction_row_view(context, view) == ({}, [(None, (7,))])
+
+
+def test_interrupted_index_walk_does_not_duplicate_intents() -> None:
+    class _FlakyTable:
+        armed = True
+
+        @property
+        def table_id(self) -> int:
+            if self.armed:
+                self.armed = False
+                raise RuntimeError("transient")
+            return 1
+
+    view = SimpleNamespace(table_id=1)
+    context = _context(
+        RowIntent(table=SimpleNamespace(table_id=1), values=(1,)),
+        RowIntent(table=_FlakyTable(), values=(2,)),
+    )
+
+    with pytest.raises(RuntimeError, match="transient"):
+        _transaction_row_view(context, view)
+    assert _transaction_row_view(context, view) == (
+        {},
+        [(None, (1,)), (None, (2,))],
+    )
