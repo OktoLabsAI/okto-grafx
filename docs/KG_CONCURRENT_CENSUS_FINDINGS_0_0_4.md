@@ -158,3 +158,11 @@ snapshot visibility, both endpoint checks, owner overlays, bounded retention,
 vector-data validation, custom-hook fallback, whole-batch retry/refusal and query
 consumer semantics. This is a candidate for the already-open relation-read target,
 not a completed feature or a new acceptance/performance gate.
+
+Follow-up: the bounded COUNT implementation is now integrated in `936515a`,
+validated by the focused regression and loaded in Pulse PID 18528. It reuses
+the existing bounded landing memo with separate presence keys, reducing native
+census certificates from 2960 to 92 with identical counts. Native warm sample
+1.462 -> 0.612–0.642 s; live cold graph/stats 19.352/20.855 s and warm stats
+2.336 s. The cold full-app residual remains, rather than being reclassified as
+complete. See `BATCHED_RELATIONSHIP_COUNT_0_0_4.md` for proofs and limitations.

@@ -4492,3 +4492,12 @@ Fechamento do slice: 24 testes finais do censo agrupado passaram em 18,69 s,
 incluindo fonte ausente, relação vazia e igualdade exata das estatísticas.
 Corrigida antes do aceite a chave `rows_scanned: 0` extra no caso vazio.
 Ruff e verificação de whitespace passaram; testes sobrepostos aos 107 anteriores.
+
+Deploy `936515a`: Pulse PID 18528 carregou a otimização. UI: 500 nós/703 relações,
+censo 2779 nós/4424 relações/69 tabelas/zero falhas. Primeira abertura pós-reinício:
+grafo 19,352 s e censo 20,855 s; fase de contagem de relações 8,397 s. Censo
+isolado aquecido 2,336 s, com contagem de relações em 1,375 s. São observações
+de runtime, não razão controlada de ganho global; a carga fria continua aberta.
+Paginação: +500 IDs únicos/897 relações/zero falhas em 2,015 s, UI 1000/2779.
+As 21 specs e o hash do ledger continuam preservados. Evidências e limitações:
+`docs/BATCHED_RELATIONSHIP_COUNT_0_0_4.md`.

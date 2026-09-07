@@ -80,3 +80,30 @@ whitespace checks passed. No regression run took hours.
 
 No reserved spec was consumed. Initial implementation and tests are in source;
 live deployment evidence is recorded separately after validation.
+
+## Live Pulse validation
+
+Commit `936515a` was pushed to `feature/v0.0.4`. Pulse PID 24624 closed its
+global graph and one board with zero failures; PID 18528 now source-loads this
+Grafx implementation with Pulse 0.3.3. No new wheel installation or PyPI release
+is claimed. Community's default census issues the exact unfiltered COUNT shape;
+the code-traceability-hidden mode retains its filtered canonical path.
+
+An ordinary first KG opening after restart returned Health in 1.186 s, graph
+in 19.352 s, and stats in 20.855 s, all HTTP 200. Stats reported 2779 nodes,
+4424 relationships, 69 physical tables and zero failures. Graph returned 500
+nodes / 703 edges. The edge-count phase took 8.397 s under the concurrent UI
+workload; graph edges took 10.482 s. The earlier cold observation was 41.276 /
+60.643 s for graph/stats, but these independent runtime observations are not
+a controlled end-to-end speedup ratio. Full cold-load latency remains open.
+
+Pagination then returned 500 unique nodes / 897 edges in 2.015 s (click/response
+measurement), with 69 layouts considered / 65 scanned / 4 skipped / zero failed.
+The UI showed 1000 / total 2779 nodes. A separate warm, read-only stats request
+returned the same totals in 2.336 s; its edge-count phase took 1.375 s, node
+counts 0.468 s, nodes 0.442 s and schema 0.036 s. No worker/Health probe was
+disabled to obtain these observations.
+
+Cognitive REST: pending 21 / in progress 0 / consolidated 19. Ledger SHA256:
+`4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
+No spec consolidation, redrive, rebuild or graph reset was initiated.
