@@ -4524,3 +4524,21 @@ resultado mantém aberta a lentidão residual, sem alegar ganho global. Paginaç
 +500 IDs únicos em 2,673 s, tela 1000/2779; Health healthy, camadas 2779/181 e
 backend Grafx corretos. Ledger das 21 specs inalterado. Detalhes e tentativas
 inválidas durante startup/Retry registrados no relatório de censo.
+
+### Resolução agrupada dos layouts físicos do KG
+
+Community `c6a386e`: censo e página do KG resolvem os nomes físicos das relações
+em um único grupo por operação (69 → 1 aquisições de rota no censo). O grupo
+usa uma rota recém-adquirida e a janela de operação existente; não retém
+autoridade entre chamadas. A execução das queries continua adquirindo sua
+própria rota/janela/snapshot. Falha ou grupo incompleto descarta todos os nomes
+e preserva a resolução escalar com diagnóstico por layout; sem adivinhar nomes
+quando a rota está indisponível. Filtros de visibilidade e layouts elegíveis por
+página permanecem iguais. Core, WAL/OCC e multi-reader/writer inalterados.
+
+Passaram 89 testes relacionados em 15,10 s. Comparativo read-only dos mesmos 69
+nomes: escalar 0,324/0,331 s, lote 0,00888/0,01038 s, digest idêntico. O ganho
+é dessa etapa (~0,32 s), não de 30x na UI. Perfil precedente confirmou COUNT
+nativo em uso; Health ainda domina amostras e censo sob carga segue alvo aberto.
+Detalhes: Community `docs/KG_RELATIONSHIP_LAYOUT_BATCHING.md`. Nenhuma spec
+reservada consumida; deploy de fonte separado de publicação/instalação de wheel.

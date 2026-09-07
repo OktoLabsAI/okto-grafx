@@ -69,6 +69,23 @@ No graph reset, recovery job, redrive or spec consolidation was initiated.
 Cognitive ledger hash remained
 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
 
+## Operation-local layout mapping
+
+The subsequent 30-second profile of PID 3944 captured 1306 samples, zero errors:
+764 Health / 109 census / 58 graph / 375 other. Native batched COUNT was active.
+Graph/stats returned HTTP 200 in 4.880/6.614 s during this sample. Repeated layout
+mapping still acquired the board route per table before executing queries.
+
+Community `c6a386e` now groups these pure layout translations under one freshly
+acquired route/window, without retaining authority across operations. Actual
+queries independently reacquire their route and snapshot. Missing/revoked routes
+still fail, and incomplete name batches fall back to per-layout diagnostics.
+Page eligibility, visibility parameters, query text and counts are unchanged.
+89 focused related tests passed in 15.10 s. Read-only 69-name mapping comparison
+preserved its ordered digest: scalar 0.324/0.331 s versus batch 0.00888/0.01038 s.
+This removes repeated route work, not the larger residual Health/native cost.
+See Community `docs/KG_RELATIONSHIP_LAYOUT_BATCHING.md` for exact contracts.
+
 ## Native isolation follow-up and consumer correction
 
 A separate native process opened three explicit read-only participants and
