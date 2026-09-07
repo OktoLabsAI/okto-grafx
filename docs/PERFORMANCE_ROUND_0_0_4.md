@@ -365,8 +365,17 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    chave do cursor — e LIMIT sem materializar a árvore. As duas raízes independentes selecionam
    somente gerações iguais/adjacentes, degradam com uma cópia danificada e recusam split-brain,
    formato futuro ou duas cópias inválidas. O corpus focado de 26 testes cobre árvores multi-nível
-   em páginas de 512/1.024 bytes e shapes com empates. A ligação ao store/certificado/heap continua
-   como OIX-1B; nenhuma query seleciona este caminho ainda.
+   em páginas de 512/1.024 bytes e shapes com empates.
+10. **OIX-1B implementado:** o store dedicado cria somente artefatos ordenados com nonce físico
+   não zero e publica em três fases duráveis (`tree -> raízes A/B -> header estático`). A abertura
+   faz verificação estrutural integral; cada leitura de statement fica entre certificados frescos
+   de page 0 e das duas raízes, carrega somente as páginas visitadas e repete toda a tentativa se
+   a raiz mudar. A raiz pode estar à frente do snapshot apenas porque cada candidato exato é
+   relido no heap, reavaliado pela visibilidade do snapshot e tem sua chave rederivada; candidatos
+   invisíveis ou antigos não consomem o LIMIT. Uma raiz danificada degrada para a cópia íntegra e
+   duas inválidas recusam fail-closed. O corpus focado acumulado de OIX-0/1 passa 32 testes nesta
+   etapa, com Ruff, compileall e diff-check verdes. Nenhuma query seleciona o caminho antes de
+   OIX-2 manter o índice no protocolo transacional.
 
 ## Explicit decision queue
 

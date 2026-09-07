@@ -203,11 +203,13 @@ prefix.
    capability/layout encoding, index-header/page/root-descriptor codecs, old-reader refusal tests;
    no planner selection. The established hash digest and catalog metadata bytes remain frozen,
    and `HashIndex` refuses an ordered definition until the dedicated store is attached.
-2. **OIX-1 — bulk build and read:** immutable page builder, complete structural verifier, reverse
-   bounded walk, heap revalidation and generation certificates. **The domain half is
-   implemented:** the order-preserving key, internal/leaf codecs, bulk builder, dual-root
-   selection, complete structural verifier and bounded descending walk are present; engine
-   storage, heap revalidation and statement certificates remain in this milestone.
+2. **OIX-1 — bulk build and read (implemented):** immutable page builder, complete structural
+   verifier, reverse bounded walk, heap revalidation and generation certificates. The engine
+   publishes a new nonced artifact in three durable phases — tree, both roots, then static page
+   0 — and reopens it through fresh header/root observations. Statement reads use lazy page
+   loading, retry the complete attempt on certified root drift and re-read every candidate from
+   the heap under the snapshot before returning it. The planner still cannot select this path;
+   that waits for transactional maintenance in OIX-2.
 3. **OIX-2 — transactional maintenance:** batch COW planning, grouped publication barriers,
    logical redo watermark, failure injection at every publication boundary, compacting rebuild.
 4. **OIX-3 — query path:** exact planner matcher, `OrderedNodeMerge`, lazy merge, keyset bound and
