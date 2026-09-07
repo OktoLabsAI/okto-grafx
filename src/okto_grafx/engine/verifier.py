@@ -67,6 +67,8 @@ from okto_grafx.domain.ids import (
 )
 from okto_grafx.domain.index.definition import index_definition_matches_table
 from okto_grafx.domain.index.keys import index_key
+from okto_grafx.domain.index.layout import IndexLayout
+from okto_grafx.domain.index.ordered_root import ORDERED_ROOT_PAGE_B
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, HeapVersion, RecordHeader
 from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
 from okto_grafx.domain.model.schema import TableDef
@@ -267,8 +269,11 @@ class Verifier:
         # finding on a later run of the same verifier.
         reported: set[tuple[str, PageIndex]] = set()
         if scope_covers(scope, SCOPE_PAGES):
+            reachable_by_file = self._ordered_reachable_pages()
             for file in self._paged_files():
-                seen, found = self._verify_pages(file, reported)
+                seen, found = self._verify_pages(
+                    file, reported, reachable=reachable_by_file.get(file)
+                )
                 pages_checked += seen
                 findings.extend(found)
                 if seen:
@@ -301,8 +306,35 @@ class Verifier:
                 names.append(name)
         return tuple(name for name in names if self._pool.storage.exists(name))
 
+    def _ordered_reachable_pages(self) -> dict[str, frozenset[PageIndex]]:
+        """Return, per ORDERED artifact file, the tree pages its selected root reaches.
+
+        The layout comes from the store's own definition, the same authority the catalog
+        resolved it through, and the reachable set from a fresh, complete proof: the store
+        reads its certificate and traverses the whole tree.  A file no store names, a store
+        without the door, and a store whose proof is absent or failed anywhere are absent
+        from the mapping: every page of such a file keeps every verdict.
+        """
+        reachable: dict[str, frozenset[PageIndex]] = {}
+        for index in self._indexes:
+            definition = getattr(index, "definition", None)
+            if getattr(definition, "layout", None) is not IndexLayout.ORDERED:
+                continue
+            name = _index_file(index)
+            door = getattr(index, "reachable_pages", None)
+            if not name or not callable(door):
+                continue
+            pages = door()
+            if pages is not None:
+                reachable[name] = frozenset(pages)
+        return reachable
+
     def _verify_pages(
-        self, file: str, reported: set[tuple[str, PageIndex]]
+        self,
+        file: str,
+        reported: set[tuple[str, PageIndex]],
+        *,
+        reachable: frozenset[PageIndex] | None = None,
     ) -> tuple[int, list[VerificationFinding]]:
         """Verify every page of one file, straight off the device.
 
@@ -324,7 +356,7 @@ class Verifier:
                 )
             ]
         for index in range(total):
-            page = self._decode_page(file, index, findings, reported)
+            page = self._decode_page(file, index, findings, reported, reachable=reachable)
             checked += 1
             if page is None:
                 continue
@@ -360,6 +392,8 @@ class Verifier:
         index: PageIndex,
         findings: list[VerificationFinding],
         reported: set[tuple[str, PageIndex]],
+        *,
+        reachable: frozenset[PageIndex] | None = None,
     ) -> Page | None:
         """Read and decode one page, counting the checksum and reporting a failure as a finding.
 
@@ -407,6 +441,22 @@ class Verifier:
                     "this file was grown before its header was written. No replay repairs a "
                     "file header, because a header is written when the file is created.",
                 )
+                return None
+            if (
+                reachable is not None
+                and index > ORDERED_ROOT_PAGE_B
+                and index not in reachable
+            ):
+                # OIX-2B/O2.  An ORDERED artifact is append-only copy-on-write: a publication
+                # allocates its new pages, writes them, barriers them, and only then writes a
+                # root that references them.  A page allocated but never written and reached
+                # by no valid root is the orphan of a publication interrupted between the
+                # allocation and the write; no replay will ever fill it, because a COW page
+                # carries no log image, and only a compacting rebuild reclaims it.  It is not
+                # a loss and not a finding.  A page the selected root does reach keeps this
+                # verdict whatever the scope -- zeroed under a live handle it is damage, and
+                # the page walk names it before the tree walk refuses it.  The two root pages
+                # and a file whose certificate cannot be read keep every verdict.
                 return None
             self._report_page(
                 findings,

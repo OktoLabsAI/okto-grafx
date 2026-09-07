@@ -18,6 +18,7 @@ from typing import TypeVar
 
 from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
+    GrafxError,
     GrafxIndexError,
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
@@ -53,6 +54,7 @@ from okto_grafx.domain.index import (
     make_ordered_root_page,
     mutate_ordered_tree,
     seek_ordered_exact,
+    decode_ordered_root_page,
     select_ordered_root,
     verify_ordered_tree,
     walk_ordered_desc,
@@ -176,6 +178,11 @@ class _OrderedPageLoader(Mapping[PageIndex, Page]):
                 page = resident.copy()
         self._seen[page_index] = page
         return page
+
+    @property
+    def visited(self) -> frozenset[PageIndex]:
+        """Return every page this loader has read so far, decodable or not."""
+        return frozenset(self._seen)
 
     def __iter__(self) -> Iterator[PageIndex]:
         return iter(range(3, self._page_count))
@@ -728,6 +735,55 @@ class OrderedIndex(IndexStore):
             _OrderedPageLoader(self._pool, self.file, fresh=False),
             wanted,
         )
+
+    def reachable_pages(self) -> frozenset[PageIndex] | None:
+        """Return the pages both root copies reach, or ``None`` without a complete proof.
+
+        A door for the verifier, read fresh from the device and never from a resident frame.
+        The proof is complete or it is nothing: the dual-root certificate must decode with no
+        damaged root page; the selected tree and, when the alternate root page decodes, the
+        alternate tree are structurally verified in full (shape, order, height, entry count);
+        and the certificate must be unchanged afterwards.  Any refusal anywhere returns
+        ``None`` and the caller keeps every verdict for every page of the file -- a partial
+        set would let a page an aborted traversal never reached pass for an orphan.  Nothing
+        is cached and nothing is repaired.
+        """
+        try:
+            before = self._read_certificate()
+        except GrafxError:
+            return None
+        if before.selection.damaged_pages:
+            return None
+        descriptors = [before.selection.descriptor]
+        alternate_page = self._read_root_fresh(before.selection.publication_page)
+        if alternate_page is not None:
+            try:
+                alternate = decode_ordered_root_page(alternate_page)
+            except GrafxError:
+                alternate = None
+            if (
+                alternate is not None
+                and alternate.artifact_nonce == self._definition.artifact_nonce
+                and alternate.root_page != NO_PAGE
+            ):
+                descriptors.append(alternate)
+        loader = _OrderedPageLoader(self._pool, self._file, fresh=True)
+        try:
+            for descriptor in descriptors:
+                if descriptor.root_page == NO_PAGE:
+                    continue
+                verify_ordered_tree(
+                    descriptor.root_page,
+                    descriptor.height,
+                    loader,
+                    expected_entry_count=descriptor.entry_count,
+                )
+            after = self._read_certificate()
+        except (GrafxError, KeyError):
+            return None
+        if after != before:
+            return None
+        return loader.visited
 
     def walk(self) -> tuple[IndexEntry, ...]:
         """Return every reachable entry in deterministic ascending physical identity order."""

@@ -490,9 +490,10 @@ def test_committed_batch_crash_points_recover_through_the_root_watermark(
             root_before = _selected_root(observer)
         _crash_run(memory, fault, _insert_d, point, moment=moment)
         with _connect(fault, namespace=memory) as recovered:
-            orphans = _assert_only_orphan_pages(recovered, (label, moment))
-            if label in ("wal", "heap"):
-                assert orphans == 0, (label, moment)
+            assert _assert_only_orphan_pages(recovered, (label, moment)) == 0, (
+                label,
+                moment,
+            )
             durable = _heap_has(recovered, "d", 40)
             if _certainly_durable(point, moment, wal):
                 assert durable, (label, moment)
@@ -883,3 +884,228 @@ def test_cold_reopen_after_vacuum_keeps_ordered_answers_and_a_single_generation(
         logical = reopened._catalog.catalog.index_definition(INDEX_NAME)
         assert [g.state for g in logical.generations] == [IndexGenerationState.ACTIVE]
     memory.close()
+
+
+# --- orphan COW pages (OIX-2B / O2) ---------------------------------------------------------
+
+
+def test_an_orphan_cow_page_of_an_interrupted_publication_is_not_a_finding(
+    batch_points: tuple[str, tuple[tuple[str, WritePoint], ...]],
+) -> None:
+    """Cut between the allocation and the write of the COW page: the page stays allocated,
+    never written and unreachable; verification is clean and the answers are complete."""
+    _file, points = batch_points
+    cow_page = dict(points)["cow_page"]
+    memory, fault, database, _nonce, file = _prepared_ordered_database()
+    database.close()
+    pages_before = fault.page_count(file)
+    _crash_run(memory, fault, _insert_d, cow_page, moment="before")
+    assert fault.page_count(file) == pages_before + 1
+    orphan = pages_before  # the page the interrupted publication allocated
+    with _connect(fault, namespace=memory) as recovered:
+        report = recovered.verify("all")
+        assert report.clean is True
+        assert report.findings == ()
+        assert file in report.files_checked
+        _expect_rows(recovered, "d", 40, "D")
+        root = _selected_root(recovered)
+        assert root.root_page != orphan
+    # The orphan is still all zeros: nothing repaired it, and nothing will but a rebuild.
+    assert memory.read_page(file, orphan) == bytes(PAGE_SIZE)
+    memory.close()
+
+
+def test_an_unwritten_page_of_a_hash_artifact_is_still_reported() -> None:
+    """The exemption is scoped to append-only ordered trees, never to hash directories."""
+    memory, fault, database, _nonce, _file = _prepared_ordered_database()
+    with database.begin("write") as schema:
+        schema.execute(
+            "CREATE NODE TABLE Person(id INT64, email STRING, PRIMARY KEY(id))"
+        )
+    with database.begin("write") as rows:
+        rows.execute("CREATE (:Person {id: 1, email: 'ada@example.test'})")
+    hashed = database.create_index("by_email", "Person", ("email",), bucket_count=8)
+    database.close()
+    memory.allocate(hashed.file, 1)
+    with _connect(fault, namespace=memory) as reopened:
+        findings = reopened.verify("all").findings
+        assert [(f.kind, str(f.location.file)) for f in findings] == [
+            ("page_unwritten", hashed.file)
+        ]
+    memory.close()
+
+
+def test_a_zeroed_ordered_root_copy_is_still_named_by_verification() -> None:
+    memory, fault, database, _nonce, file = _prepared_ordered_database()
+    _insert_d(database)()
+    database.checkpoint()
+    database.close()
+    memory.write_page(file, ORDERED_ROOT_PAGE_A, bytes(PAGE_SIZE))
+    with _connect(fault, namespace=memory) as reopened:
+        kinds = {(f.kind, f.location.page) for f in reopened.verify("all").findings}
+        assert ("page_unwritten", ORDERED_ROOT_PAGE_A) in kinds
+        _expect_rows(reopened, "d", 40, "D")
+    memory.close()
+
+
+def test_a_reachable_page_zeroed_under_a_live_handle_is_named_in_every_scope() -> None:
+    """The verdict does not depend on the tree walk: the page scope alone names it."""
+    memory, fault, database, _nonce, file = _prepared_ordered_database()
+    try:
+        reachable = _selected_root(database).root_page
+        assert reachable > ORDERED_ROOT_PAGE_B
+        memory.write_page(file, reachable, bytes(PAGE_SIZE))
+        pages = database.verify("pages")
+        assert pages.clean is not True
+        assert [
+            (f.kind, str(f.location.file), f.location.page) for f in pages.findings
+        ] == [("page_unwritten", file, reachable)]
+        everything = database.verify("all")
+        assert ("page_unwritten", reachable) in {
+            (f.kind, f.location.page) for f in everything.findings
+        }
+        assert any(f.location.index for f in everything.findings), (
+            "the tree walk names the index unreadable as well"
+        )
+    finally:
+        database.close()
+        memory.close()
+
+
+def test_an_orphan_next_to_an_unreadable_certificate_keeps_its_verdict(
+    batch_points: tuple[str, tuple[tuple[str, WritePoint], ...]],
+) -> None:
+    """Without a readable root certificate nothing is exempt: every page keeps its verdict."""
+    _file, points = batch_points
+    cow_page = dict(points)["cow_page"]
+    memory, fault, database, _nonce, file = _prepared_ordered_database()
+    database.close()
+    orphan = fault.page_count(file)
+    _crash_run(memory, fault, _insert_d, cow_page, moment="before")
+    with _connect(fault, namespace=memory) as recovered:
+        assert recovered.verify("all").findings == ()
+        store = _ordered_store(recovered)
+        assert orphan not in store.reachable_pages()
+        # Damage both root copies under the live handle: the certificate is gone, the
+        # exemption with it, and the orphan is reported again next to the roots.
+        _damage_page(memory, file, ORDERED_ROOT_PAGE_A)
+        _damage_page(memory, file, ORDERED_ROOT_PAGE_B)
+        assert store.reachable_pages() is None
+        kinds = {(f.kind, f.location.page) for f in recovered.verify("pages").findings}
+        assert ("page_unwritten", orphan) in kinds
+    memory.close()
+
+
+def test_a_zeroed_reachable_tree_page_fails_closed_through_the_walk() -> None:
+    """Damage a page a root reaches: the exemption never hides it."""
+    memory, fault, database, _nonce, file = _prepared_ordered_database()
+    reachable = _selected_root(database).root_page
+    database.checkpoint()
+    database.close()
+    memory.write_page(file, reachable, bytes(PAGE_SIZE))
+    # Observed at 7db89d2: the store verifies its whole tree while the index is adopted at
+    # open, so the damage is refused before any verification runs (fail closed at open, the
+    # same availability shape D1 had for a damaged root).  Should a later base open instead,
+    # verification must name the damage and the read must still refuse.
+    try:
+        reopened = _connect(fault, namespace=memory)
+    except GrafxCorruptionDetected:
+        memory.close()
+        return
+    try:
+        report = reopened.verify("all")
+        assert report.clean is not True
+        assert any(
+            finding.location.index or finding.location.file == file
+            for finding in report.findings
+        )
+        with pytest.raises(GrafxError):
+            _tree_rows(reopened, "c", 20)
+    finally:
+        reopened.close()
+    memory.close()
+
+
+def test_a_failed_proof_exempts_nothing_even_pages_the_traversal_never_reached() -> (
+    None
+):
+    """Two leaves zeroed: the traversal fails at the first, the second is still named."""
+    memory, fault = _fresh_pair()
+    database = _connect(fault, namespace=memory)
+    try:
+        with database.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE Event("
+                "id STRING, created_at TIMESTAMP, payload STRING, PRIMARY KEY(id))"
+            )
+        with database.begin("write") as rows:
+            for number in range(80):
+                rows.execute(
+                    "CREATE (:Event {id: $id, created_at: $t, payload: $p})",
+                    {"id": f"e{number:03d}", "t": Timestamp(number), "p": "x" * 40},
+                )
+        created = database.create_index(
+            INDEX_NAME, "Event", ("created_at", "id"), layout="ordered"
+        )
+        file = created.file
+        store = _ordered_store(database)
+        reachable = store.reachable_pages()
+        assert reachable is not None
+        root = _selected_root(database)
+        leaves = sorted(page for page in reachable if page != root.root_page)
+        assert len(leaves) >= 2, "the tree must have at least two leaves for this proof"
+        first, last = leaves[0], leaves[-1]
+        memory.write_page(file, first, bytes(PAGE_SIZE))
+        memory.write_page(file, last, bytes(PAGE_SIZE))
+        assert store.reachable_pages() is None
+        named = {
+            (f.kind, f.location.page)
+            for f in database.verify("pages").findings
+            if str(f.location.file) == file
+        }
+        assert ("page_unwritten", first) in named
+        assert ("page_unwritten", last) in named
+    finally:
+        database.close()
+        memory.close()
+
+
+def test_a_reachable_page_zeroed_behind_a_warm_frame_is_still_named() -> None:
+    """The reviewer's repro on c20fa85: a resident frame must not launder device damage."""
+    memory, fault, database, _nonce, file = _prepared_ordered_database()
+    try:
+        reachable = _selected_root(database).root_page
+        database.checkpoint()
+        assert _tree_rows(database, "c", 20) == ("C",)  # warms the resident frame
+        memory.write_page(file, reachable, bytes(PAGE_SIZE))
+        for scope in ("pages", "all"):
+            report = database.verify(scope)
+            assert report.clean is not True, scope
+            assert ("page_unwritten", reachable) in {
+                (f.kind, f.location.page)
+                for f in report.findings
+                if str(f.location.file) == file
+            }, scope
+        assert _ordered_store(database).reachable_pages() is None
+    finally:
+        database.close()
+        memory.close()
+
+
+def test_the_proof_covers_the_alternate_root_and_refuses_a_damaged_one() -> None:
+    """Pages of the older root's tree are never orphans; a damaged root copy voids the proof."""
+    memory, fault, database, _nonce, file = _prepared_ordered_database()
+    try:
+        older = _selected_root(database)
+        _insert_d(database)()
+        newer = _selected_root(database)
+        assert newer.generation == older.generation + 1
+        store = _ordered_store(database)
+        reachable = store.reachable_pages()
+        assert reachable is not None
+        assert older.root_page in reachable and newer.root_page in reachable
+        _damage_page(memory, file, ORDERED_ROOT_PAGE_A)
+        assert store.reachable_pages() is None
+    finally:
+        database.close()
+        memory.close()
