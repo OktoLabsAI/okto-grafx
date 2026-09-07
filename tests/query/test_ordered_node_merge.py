@@ -118,6 +118,51 @@ def test_ordered_merge_is_not_selected_until_every_table_has_the_capability(
         ).rows
 
 
+def test_ordered_merge_prunes_only_tables_proved_rejected_by_missing_properties(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "database", page_size=512) as database:
+        _seed(database)
+        with database.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE BoardMeta(board_id STRING, PRIMARY KEY(board_id))"
+            )
+        with database.begin("write") as rows:
+            rows.execute("CREATE (:BoardMeta {board_id: 'board-1'})")
+        _create_ordered(database, "Decision", "Evidence")
+        parameters = {"minimum": 0.5, "maximum": 5}
+
+        plan = database.explain(PAGE)
+        ordered_node = next(
+            node for node in plan.walk() if node.label == "OrderedNodeMerge"
+        )
+        ordered = database.execute(PAGE, parameters)
+        canonical = database.execute(_canonical(PAGE), parameters)
+
+        assert ordered_node.details()["tables"] == "Decision, Evidence"
+        assert ordered.rows == canonical.rows
+
+
+def test_ordered_merge_does_not_prune_a_missing_property_below_unsafe_or(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "database", page_size=512) as database:
+        _seed(database)
+        with database.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE BoardMeta(board_id STRING, PRIMARY KEY(board_id))"
+            )
+        _create_ordered(database, "Decision", "Evidence")
+        text = PAGE.replace(
+            "n.relevance_score >= $minimum",
+            "n.relevance_score >= $minimum OR n.id IS NULL",
+        )
+
+        assert all(
+            node.label != "OrderedNodeMerge" for node in database.explain(text).walk()
+        )
+
+
 def test_potentially_refusing_projection_and_row_timestamp_conversion_keep_the_scan(
     tmp_path: Path,
 ) -> None:

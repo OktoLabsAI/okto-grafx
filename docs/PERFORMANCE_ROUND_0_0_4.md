@@ -421,6 +421,12 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    Os 18 casos focados de store/query e a regressão combinada de 440 testes de planner,
    polimorfismo, projeção e executor passaram. Não há alteração em WAL, OCC, writer fence,
    snapshot, durabilidade ou participação multi-reader/multi-writer.
+16. **Poda polimórfica necessária ao Pulse implementada:** uma tabela sem as colunas de ordenação
+   só deixa de participar quando a análise ternária prova que seu predicado completo nunca pode
+   ser verdadeiro por causa de propriedade ausente. Isso remove `BoardMeta` do merge real do
+   Pulse sem modificar o Core nem relaxar a exigência de índice em qualquer tabela que possa
+   produzir uma linha. Conjunções admitem a prova por um ramo; `OR` exige prova nos dois ramos.
+   Dois casos focados cobrem a poda válida e o `OR` inseguro que conserva o scan canônico.
 
 ## Explicit decision queue
 

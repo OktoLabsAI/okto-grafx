@@ -4053,3 +4053,10 @@ corpus focado passou 18 casos e o slice combinado passou 440 testes. O handoff i
 `hof_4fe5ef3390c148c4ba668a83f6b3ac58` cobre agora crash/replay e concorrência real antes do
 checkpoint OIX-4/Pulse; nenhum invariante de WAL, OCC, snapshot, durabilidade ou multiwriter foi
 alterado.
+
+O teste do shape real revelou que o `AllNodesScan` também inclui a tabela interna `BoardMeta`,
+sem `created_at/id`. O planner agora a remove somente quando uma prova conservadora de lógica
+ternária demonstra que propriedades ausentes tornam o WHERE completo não verdadeiro; um `OR`
+que ainda possa admitir a tabela mantém todo o pipeline canônico. Assim o caminho ordenado pode
+atender o Pulse sem especializar o Core e sem aceitar capability parcial para tabelas capazes de
+retornar linhas.

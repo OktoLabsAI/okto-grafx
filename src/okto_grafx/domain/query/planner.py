@@ -3696,11 +3696,16 @@ class _Planner:
 
         timestamp_column = first.expression.key
         string_column = second.expression.key
+        ordered_tables: list[TableDef] = []
         index_names: list[str] = []
         for table in scan.tables:
             timestamp_definition = self._column_of(table, timestamp_column)
             string_definition = self._column_of(table, string_column)
             if timestamp_definition is None or string_definition is None:
+                if predicate is not None and self._ordered_filter_excludes_table(
+                    predicate, scan.variable, table
+                ):
+                    continue
                 return None
             timestamp_position = table.column_index(timestamp_column)
             string_position = table.column_index(string_column)
@@ -3725,7 +3730,11 @@ class _Planner:
             )
             if not candidates:
                 return None
+            ordered_tables.append(table)
             index_names.append(candidates[0])
+
+        if not ordered_tables:
+            return None
 
         upper_timestamp: Expression | None = None
         upper_string: Expression | None = None
@@ -3742,7 +3751,7 @@ class _Planner:
         return OrderedNodeMerge(
             fallback=pipeline,
             variable=scan.variable,
-            tables=scan.tables,
+            tables=tuple(ordered_tables),
             indexes=tuple(index_names),
             timestamp_column=timestamp_column,
             string_column=string_column,
@@ -3750,6 +3759,55 @@ class _Planner:
             predicate=predicate,
             upper_timestamp=upper_timestamp,
             upper_string=upper_string,
+        )
+
+    @classmethod
+    def _ordered_filter_excludes_table(
+        cls, expression: Expression, variable: str, table: TableDef
+    ) -> bool:
+        """Prove that a polymorphic table can never make the WHERE predicate true.
+
+        A missing property reads as ``NULL``.  SQL/Cypher comparisons involving that value are
+        therefore unknown and a filter rejects the row.  This deliberately small proof lets an
+        internal metadata table that lacks the ordered columns stay out of a polymorphic merge,
+        but only when the complete predicate proves that every one of its rows is rejected.
+        """
+
+        if isinstance(expression, BinaryOperation):
+            if expression.operator == "AND":
+                return cls._ordered_filter_excludes_table(
+                    expression.left, variable, table
+                ) or cls._ordered_filter_excludes_table(
+                    expression.right, variable, table
+                )
+            if expression.operator == "OR":
+                return cls._ordered_filter_excludes_table(
+                    expression.left, variable, table
+                ) and cls._ordered_filter_excludes_table(
+                    expression.right, variable, table
+                )
+            if expression.operator in ("=", "<>", "<", "<=", ">", ">="):
+                return cls._ordered_operand_is_missing_property(
+                    expression.left, variable, table
+                ) or cls._ordered_operand_is_missing_property(
+                    expression.right, variable, table
+                )
+            return False
+        if isinstance(expression, NullCheck) and expression.negated:
+            return cls._ordered_operand_is_missing_property(
+                expression.operand, variable, table
+            )
+        return False
+
+    @staticmethod
+    def _ordered_operand_is_missing_property(
+        expression: Expression, variable: str, table: TableDef
+    ) -> bool:
+        return (
+            isinstance(expression, Property)
+            and isinstance(expression.subject, Variable)
+            and expression.subject.name == variable
+            and all(column.name != expression.key for column in table.columns)
         )
 
     @staticmethod

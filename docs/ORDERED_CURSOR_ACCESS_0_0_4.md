@@ -177,8 +177,10 @@ and analyzed plan, never from query text:
 3. a terminal `LIMIT` has already passed the ordinary parameter/type/range validation;
 4. an optional keyset bound is the exact strict Pulse predicate and its timestamp conversion and
    string parameter retain their established eager refusals;
-5. every participating table has one ACTIVE ordered definition on the corresponding positions,
-   with a valid generation certificate and sufficient freshness;
+5. every table that can satisfy the residual predicate has one ACTIVE ordered definition on the
+   corresponding positions, with a valid generation certificate and sufficient freshness; a
+   polymorphic table may be omitted only when three-valued predicate analysis proves that a
+   missing property makes its complete WHERE result never true;
 6. no relevant table is dirty in the transaction and no custom collaborator lacks the ordered
    range capability;
 7. projection and residual filters are in the existing proved-total subset, so stopping after
@@ -238,7 +240,10 @@ prefix.
    starts. Dirty owner tables and every near miss retain the complete canonical pipeline. The
    focused corpus proves first-page/cursor equivalence, partial-capability fallback, owner RYOW,
    reduced scan counts, Unicode/tied values through the seeded data, and early-close root drift.
-   The broader crash/multiprocess and mutation/reopen matrix remains the checkpoint condition.
+   It also proves conservative polymorphic pruning: Pulse's internal `BoardMeta` table may be
+   omitted because its missing filtered properties make the whole conjunction non-true, while a
+   missing property below an unsafe `OR` retains the canonical scan. The broader crash/multiprocess
+   and mutation/reopen matrix remains the checkpoint condition.
 6. **OIX-4 — Pulse Community:** idempotent per-table index creation/migration, Community-only
    capability use, installed API/UI test and board benchmark.
 
