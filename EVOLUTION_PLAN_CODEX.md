@@ -55,6 +55,13 @@
   174 testes e toda `tests/index` passou. O seek de múltiplas PKs `NODE-IN-SEEK` segue em paralelo
   no handoff `hof_f05eb759297a4598845a9d312d9c339c`.
 
+  OIX-1A também está implementado no domínio: codec de chave equivalente à ordenação canônica,
+  bulk builder de páginas imutáveis, seleção das duas raízes, verificador estrutural completo e
+  walk descendente com upper bound exclusivo/LIMIT. O corpus focado cobre extremos temporais,
+  NULL, NUL, Unicode, empates físicos, árvores multi-nível, separator drift, ciclos/filhos ausentes
+  e split-brain de raízes. Store, certificado por statement e revalidação no heap permanecem no
+  OIX-1B; portanto o planner ainda não pode selecionar esse acesso incompleto.
+
 - **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
   estão publicados até `ed3ce95`; o memo transacional de resolução de PK entrou em `04aa244` com
   cercas de transação/snapshot/store/revisão/época/geração, LRU de 4.096 entradas dentro da quota

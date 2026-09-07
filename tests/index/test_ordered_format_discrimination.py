@@ -35,13 +35,16 @@ from okto_grafx.domain.index.ordered_root import (
     ORDERED_ROOT_PAGE_A,
     ORDERED_ROOT_PAGE_B,
     OrderedRootDescriptor,
+    decode_ordered_root_page,
+    make_ordered_root_page,
+    select_ordered_root,
 )
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model import catalog as catalog_module
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
-from okto_grafx.domain.page import crc32c
+from okto_grafx.domain.page import Page, PageType, crc32c
 from okto_grafx.engine.index_manager import HashIndex
 
 
@@ -293,3 +296,77 @@ def test_root_descriptor_requires_coherent_empty_and_nonempty_shapes() -> None:
         _root(root_page=NO_PAGE, height=1, entry_count=0)
     with pytest.raises(GrafxIndexError):
         _root(root_page=ORDERED_ROOT_PAGE_A, height=1, entry_count=1)
+
+
+def test_independent_root_pages_select_the_newest_and_alternate_publication() -> None:
+    first = _root(generation=3)
+    page_a = make_ordered_root_page(first, ORDERED_ROOT_PAGE_A, page_size=512)
+    page_b = make_ordered_root_page(first, ORDERED_ROOT_PAGE_B, page_size=512)
+
+    equal = select_ordered_root(page_a, page_b)
+    assert equal.descriptor == first
+    assert equal.page_index == ORDERED_ROOT_PAGE_A
+    assert equal.publication_page == ORDERED_ROOT_PAGE_B
+
+    second = _root(generation=4, root_page=29, entry_count=131)
+    page_b = make_ordered_root_page(second, ORDERED_ROOT_PAGE_B, page_size=512)
+    newer = select_ordered_root(page_a, page_b)
+    assert newer.descriptor == second
+    assert newer.page_index == ORDERED_ROOT_PAGE_B
+    assert newer.publication_page == ORDERED_ROOT_PAGE_A
+
+
+def test_one_damaged_root_degrades_but_two_or_split_brain_refuse() -> None:
+    descriptor = _root()
+    healthy = make_ordered_root_page(descriptor, ORDERED_ROOT_PAGE_B, page_size=512)
+    damaged = Page(
+        int(PageType.INDEX_ORDERED_LEAF),
+        page_size=512,
+        page_index=ORDERED_ROOT_PAGE_A,
+    )
+    damaged.insert_slot(b"not-a-root")
+
+    selected = select_ordered_root(damaged, healthy)
+    assert selected.descriptor == descriptor
+    assert selected.damaged_pages == (ORDERED_ROOT_PAGE_A,)
+    assert selected.publication_page == ORDERED_ROOT_PAGE_A
+
+    with pytest.raises(GrafxCorruptionDetected) as both:
+        select_ordered_root(damaged, None)
+    assert both.value.details["damaged_pages"] == (
+        ORDERED_ROOT_PAGE_A,
+        ORDERED_ROOT_PAGE_B,
+    )
+
+    disagreement = make_ordered_root_page(
+        _root(root_page=31), ORDERED_ROOT_PAGE_A, page_size=512
+    )
+    with pytest.raises(GrafxCorruptionDetected) as split_brain:
+        select_ordered_root(disagreement, healthy)
+    assert split_brain.value.details["field"] == "generation"
+
+
+def test_root_page_watermark_and_future_format_remain_fail_closed() -> None:
+    descriptor = _root()
+    page = make_ordered_root_page(descriptor, ORDERED_ROOT_PAGE_A, page_size=512)
+    page.page_lsn = descriptor.applied_through_lsn + 1
+    with pytest.raises(GrafxCorruptionDetected) as mismatch:
+        decode_ordered_root_page(page)
+    assert mismatch.value.details["field"] == "page_lsn"
+
+    future = bytearray(descriptor.encode())
+    struct.pack_into(
+        "<H",
+        future,
+        _ROOT_FORMAT_OFFSET,
+        ORDERED_ROOT_DESCRIPTOR_FORMAT_VERSION + 1,
+    )
+    future_page = Page(
+        int(PageType.INDEX_ORDERED_ROOT),
+        page_size=512,
+        page_index=ORDERED_ROOT_PAGE_A,
+        page_lsn=descriptor.applied_through_lsn,
+    )
+    future_page.insert_slot(_with_root_checksum(future))
+    with pytest.raises(GrafxSchemaVersionMismatch):
+        select_ordered_root(future_page, None)

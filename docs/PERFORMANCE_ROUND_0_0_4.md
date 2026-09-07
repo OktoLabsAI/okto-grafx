@@ -357,6 +357,16 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    corpus focado passou 174 testes e a regressão completa de `tests/index` passou a 100%; Ruff,
    compileall e diff-check estão verdes. O handoff `NODE-IN-SEEK`
    `hof_f05eb759297a4598845a9d312d9c339c` segue independente em worktree isolado.
+9. **OIX-1A implementado:** a chave `(TIMESTAMP, STRING)` preserva a ordem canônica inclusive nos
+   extremos assinados, empates, prefixos, NUL, Unicode e NULL. O bulk builder produz páginas
+   leaf/internal imutáveis e contíguas; o verificador prova tipo, ordem estrita, separadores,
+   ranges disjuntos, ausência de ciclos/shared children, altura e contagem. A caminhada
+   descendente aplica upper bound lógico exclusivo — removendo todos os `RecordRef` históricos da
+   chave do cursor — e LIMIT sem materializar a árvore. As duas raízes independentes selecionam
+   somente gerações iguais/adjacentes, degradam com uma cópia danificada e recusam split-brain,
+   formato futuro ou duas cópias inválidas. O corpus focado de 26 testes cobre árvores multi-nível
+   em páginas de 512/1.024 bytes e shapes com empates. A ligação ao store/certificado/heap continua
+   como OIX-1B; nenhuma query seleciona este caminho ainda.
 
 ## Explicit decision queue
 

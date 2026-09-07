@@ -12,6 +12,7 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.ids import NO_LSN, NO_PAGE, PROVISIONAL_CSN, Lsn, PageIndex
 from okto_grafx.domain.index.definition import DEFINITION_DIGEST_SIZE
+from okto_grafx.domain.page import DEFAULT_PAGE_SIZE, Page, PageType
 from okto_grafx.domain.page.checksum import crc32c
 
 __all__ = [
@@ -22,6 +23,10 @@ __all__ = [
     "ORDERED_ROOT_PAGE_A",
     "ORDERED_ROOT_PAGE_B",
     "OrderedRootDescriptor",
+    "OrderedRootSelection",
+    "decode_ordered_root_page",
+    "make_ordered_root_page",
+    "select_ordered_root",
 ]
 
 ORDERED_ROOT_DESCRIPTOR_MAGIC: bytes = b"GRFXORDR"
@@ -273,3 +278,186 @@ class OrderedRootDescriptor:
                 field=str(failure.details.get("field", "ordered_root")),
                 value=failure.details.get("value"),
             ) from failure
+
+
+@dataclass(frozen=True, slots=True)
+class OrderedRootSelection:
+    """The newest valid root and the older page its successor must replace."""
+
+    descriptor: OrderedRootDescriptor
+    page_index: PageIndex
+    publication_page: PageIndex
+    damaged_pages: tuple[PageIndex, ...] = ()
+
+
+def make_ordered_root_page(
+    descriptor: OrderedRootDescriptor,
+    page_index: PageIndex,
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> Page:
+    """Build one complete independent root page for a durable publication."""
+
+    if page_index not in (ORDERED_ROOT_PAGE_A, ORDERED_ROOT_PAGE_B):
+        raise GrafxIndexError(
+            "An ordered root descriptor belongs only on physical page 1 or 2.",
+            field="page_index",
+            value=page_index,
+        )
+    if not isinstance(descriptor, OrderedRootDescriptor):
+        raise GrafxIndexError(
+            "An ordered root page requires an OrderedRootDescriptor.",
+            field="descriptor",
+            value=type(descriptor).__name__,
+        )
+    page = Page(
+        int(PageType.INDEX_ORDERED_ROOT),
+        page_size=page_size,
+        page_index=page_index,
+        page_lsn=descriptor.applied_through_lsn,
+    )
+    page.insert_slot(descriptor.encode())
+    return page
+
+
+def decode_ordered_root_page(page: Page) -> OrderedRootDescriptor:
+    """Validate and decode one of the two independent root pages."""
+
+    if not isinstance(page, Page):
+        raise GrafxCorruptionDetected(
+            "An ordered root page must be a Page value.",
+            field="page",
+            value=type(page).__name__,
+        )
+    if page.page_index not in (ORDERED_ROOT_PAGE_A, ORDERED_ROOT_PAGE_B):
+        raise GrafxCorruptionDetected(
+            "An ordered root was read from a physical page other than 1 or 2.",
+            field="page_index",
+            value=page.page_index,
+        )
+    if page.page_type != int(PageType.INDEX_ORDERED_ROOT):
+        raise GrafxCorruptionDetected(
+            f"Ordered root page {page.page_index} has the wrong page type.",
+            field="page_type",
+            value=page.page_type,
+            page=page.page_index,
+        )
+    header = page.header()
+    if page.flags != 0 or page.next_page != NO_PAGE or header.reserved != 0:
+        raise GrafxCorruptionDetected(
+            f"Ordered root page {page.page_index} carries unsupported header metadata.",
+            field="page_header",
+            page=page.page_index,
+            flags=page.flags,
+            next_page=page.next_page,
+            reserved=header.reserved,
+        )
+    if page.seq & 1:
+        raise GrafxCorruptionDetected(
+            f"Ordered root page {page.page_index} carries an in-progress sequence.",
+            field="seq",
+            value=page.seq,
+            page=page.page_index,
+        )
+    if page.slot_count != 1:
+        raise GrafxCorruptionDetected(
+            f"Ordered root page {page.page_index} must carry exactly one descriptor.",
+            field="slot_count",
+            value=page.slot_count,
+            page=page.page_index,
+        )
+    descriptor = OrderedRootDescriptor.decode(page.read_slot(0))
+    if page.page_lsn != descriptor.applied_through_lsn:
+        raise GrafxCorruptionDetected(
+            "An ordered root page LSN disagrees with the descriptor watermark.",
+            field="page_lsn",
+            value=page.page_lsn,
+            applied_through_lsn=descriptor.applied_through_lsn,
+            page=page.page_index,
+        )
+    return descriptor
+
+
+def select_ordered_root(
+    page_a: Page | None,
+    page_b: Page | None,
+) -> OrderedRootSelection:
+    """Select the newest valid descriptor and name the older publication target."""
+
+    candidates = (
+        (ORDERED_ROOT_PAGE_A, page_a),
+        (ORDERED_ROOT_PAGE_B, page_b),
+    )
+    valid: list[tuple[PageIndex, OrderedRootDescriptor]] = []
+    damaged: list[PageIndex] = []
+    for expected_page, page in candidates:
+        if page is None:
+            damaged.append(expected_page)
+            continue
+        if page.page_index != expected_page:
+            raise GrafxCorruptionDetected(
+                "Ordered root page arguments do not match their physical slots.",
+                field="page_index",
+                value=page.page_index,
+                expected=expected_page,
+            )
+        try:
+            valid.append((expected_page, decode_ordered_root_page(page)))
+        except GrafxSchemaVersionMismatch:
+            # A future descriptor may be the newest authority. Falling back would let this build
+            # overwrite a format it cannot interpret.
+            raise
+        except GrafxCorruptionDetected:
+            damaged.append(expected_page)
+    if not valid:
+        raise GrafxCorruptionDetected(
+            "Both independent ordered-root descriptors are missing or invalid.",
+            field="ordered_root",
+            damaged_pages=tuple(damaged),
+        )
+    if len(valid) == 1:
+        page_index, descriptor = valid[0]
+        publication_page = (
+            ORDERED_ROOT_PAGE_B
+            if page_index == ORDERED_ROOT_PAGE_A
+            else ORDERED_ROOT_PAGE_A
+        )
+        return OrderedRootSelection(
+            descriptor,
+            page_index,
+            publication_page,
+            tuple(damaged),
+        )
+
+    first_page, first = valid[0]
+    second_page, second = valid[1]
+    if first.artifact_nonce != second.artifact_nonce:
+        raise GrafxCorruptionDetected(
+            "The two ordered roots claim different physical artifact nonces.",
+            field="artifact_nonce",
+            first=first.artifact_nonce,
+            second=second.artifact_nonce,
+        )
+    if first.definition_digest != second.definition_digest:
+        raise GrafxCorruptionDetected(
+            "The two ordered roots claim different index definitions.",
+            field="definition_digest",
+        )
+    if first.generation == second.generation:
+        if first != second:
+            raise GrafxCorruptionDetected(
+                "Equal ordered-root generations disagree on their publication state.",
+                field="generation",
+                value=first.generation,
+            )
+        return OrderedRootSelection(first, first_page, second_page)
+    if abs(first.generation - second.generation) != 1:
+        raise GrafxCorruptionDetected(
+            "Valid ordered-root generations must be identical or adjacent.",
+            field="generation",
+            first=first.generation,
+            second=second.generation,
+        )
+    if first.generation > second.generation:
+        return OrderedRootSelection(first, first_page, second_page)
+    return OrderedRootSelection(second, second_page, first_page)

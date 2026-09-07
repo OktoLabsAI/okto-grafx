@@ -29,6 +29,7 @@ from okto_grafx.domain.index.keys import (
     validate_bucket_count,
 )
 from okto_grafx.domain.index.layout import IndexLayout
+from okto_grafx.domain.index.ordered_keys import ordered_index_key
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import (
     MAX_IDENTIFIER_LENGTH,
@@ -371,6 +372,8 @@ class IndexDefinition:
         rule would come back empty while the structure looked perfectly healthy. Refusing is the
         only answer that cannot be mistaken for a working index.
         """
+        if self.key_derivation == ORDERED_KEY_DERIVATION:
+            return ordered_index_key(values, self.positions)
         if self.key_derivation != COLUMN_KEY_DERIVATION:
             raise GrafxIndexError(
                 f"Index {self.name!r} declares the {self.key_derivation!r} key derivation, which "
