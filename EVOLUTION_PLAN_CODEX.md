@@ -82,6 +82,14 @@
   passou neste checkpoint. DDL/ativação, rebuild compactante e a matriz crash/multiprocesso ainda
   precisam fechar antes do OIX-2B ser considerado concluído.
 
+  O trabalho paralelo NODE-IN-SEEK também foi concluído e validado adversarialmente. Somente o
+  shape standalone rotulado com `n.<primary-key> IN $parameter` usa o lookup exato multi-key;
+  predicado integral, revalidação do heap, fallback canônico, RYOW e recusas foram preservados.
+  O seletor determinístico usa o high-water de identidades para evitar o seek quando o número de
+  probes torna o scan mais barato, sem calibração por máquina. O handoff Nexus
+  `hof_f05eb759297a4598845a9d312d9c339c` passou 57 casos focados, matou 18/18 mutantes, passou
+  2.248 testes de query no worktree e mais 178 testes combinados após o cherry-pick.
+
 - **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
   estão publicados até `ed3ce95`; o memo transacional de resolução de PK entrou em `04aa244` com
   cercas de transação/snapshot/store/revisão/época/geração, LRU de 4.096 entradas dentro da quota

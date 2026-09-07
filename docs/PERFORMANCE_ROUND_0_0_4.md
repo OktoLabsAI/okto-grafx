@@ -393,6 +393,15 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    bulk sem alterar autoridade do catálogo. O checkpoint completo de `tests/index` passou a
    100%. DDL/ativação de catálogo, rebuild compactante e crash/multiprocesso permanecem antes do
    fechamento do OIX-2B.
+13. **NODE-IN-SEEK implementado e validado:** o shape estrito `MATCH (n:Label) WHERE
+   n.<primary-key> IN $parameter` usa a porta exata multi-key sem scan no caso elegível, mantendo
+   o predicado acima do operador e revalidando cada candidato no heap. Tabela suja, store
+   ausente/stale/custom sem a capacidade, tipo/encoding incompleto e todos os near misses mantêm
+   o scan canônico. Um seletor pelo high-water durável escolhe scan quando a tabela alocou no
+   máximo metade das chaves distintas; ele evita a regressão medida das listas maiores sem
+   constante dependente de hardware. Revisão independente: 57/57 casos focados, 18/18 mutantes,
+   2.248/2.248 testes de query no branch isolado e 178 testes combinados após integração. Handoff
+   Nexus `hof_f05eb759297a4598845a9d312d9c339c` concluído e verificado por Codex.
 
 ## Explicit decision queue
 

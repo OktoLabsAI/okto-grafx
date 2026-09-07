@@ -232,7 +232,9 @@ prefix.
    capability use, installed API/UI test and board benchmark.
 
 `NODE-IN-SEEK` is an independent low-risk optimization and useful primitive, but it is not
-reported as CURSOR-1. It can land before OIX-0 without changing disk format.
+reported as CURSOR-1. It is implemented without changing disk format: only the exact standalone
+`n.<primary-key> IN $parameter` shape can use the multi-key exact-index door; all near misses,
+dirty-table reads and incomplete key encodings retain the canonical scan.
 
 ## Acceptance and crash matrix
 
