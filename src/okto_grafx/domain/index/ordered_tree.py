@@ -19,14 +19,17 @@ from okto_grafx.domain.ids import (
 from okto_grafx.domain.index.entry import MAX_INDEX_KEY_BYTES, IndexEntry
 from okto_grafx.domain.index.ordered_keys import ordered_entry_identity
 from okto_grafx.domain.index.ordered_root import FIRST_ORDERED_TREE_PAGE
+from okto_grafx.domain.index.records import IndexChange, IndexOperation
 from okto_grafx.domain.page import DEFAULT_PAGE_SIZE, Page, PageType, validate_page_size
 
 __all__ = [
     "ORDERED_INTERNAL_ENTRY_SIZE",
     "OrderedChildPointer",
     "OrderedTreeBuild",
+    "OrderedTreeMutation",
     "OrderedTreeVerification",
     "build_ordered_tree",
+    "mutate_ordered_tree",
     "decode_ordered_internal",
     "decode_ordered_leaf",
     "verify_ordered_tree",
@@ -166,6 +169,23 @@ class OrderedTreeVerification:
     internal_pages: int
     minimum: tuple[bytes, int] | None
     maximum: tuple[bytes, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class OrderedTreeMutation:
+    """The reachable copy-on-write pages and root produced by one logical batch."""
+
+    root_page: PageIndex
+    height: int
+    entry_count: int
+    pages: tuple[Page, ...]
+    changed: bool
+    missing_targets: int = 0
+
+    def page_map(self) -> Mapping[PageIndex, Page]:
+        """Return only the newly allocated pages keyed by their physical identities."""
+
+        return {page.page_index: page for page in self.pages}
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,6 +517,345 @@ def build_ordered_tree(
         level = rebuilt
         height += 1
     return OrderedTreeBuild(level[0].page, height, len(ordered), tuple(pages))
+
+
+@dataclass(frozen=True, slots=True)
+class _CowNode:
+    page: PageIndex
+    maximum: tuple[bytes, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _CowResult:
+    nodes: tuple[_CowNode, ...]
+    changed: bool
+    entry_delta: int
+    missing_targets: int
+
+
+def mutate_ordered_tree(
+    root_page: PageIndex,
+    height: int,
+    entry_count: int,
+    pages: Mapping[PageIndex, Page],
+    changes: Iterable[IndexChange],
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    start_page: PageIndex,
+    page_lsn: Lsn,
+) -> OrderedTreeMutation:
+    """Apply one exact-index batch by copying each affected tree page at most once.
+
+    Changes are partitioned through the existing inclusive high keys, then applied together at
+    each leaf.  A changed leaf is repacked once; changed ancestors are repacked once on the way
+    back up.  Untouched children remain referenced by their immutable old page numbers.  The
+    resulting work is proportional to affected pages and tree height, never to all entries.
+    """
+
+    validate_page_size(page_size)
+    if (
+        isinstance(start_page, bool)
+        or not isinstance(start_page, int)
+        or not FIRST_ORDERED_TREE_PAGE <= start_page < NO_PAGE
+    ):
+        raise GrafxIndexError(
+            "An ordered COW batch must start at an append-only tree page.",
+            field="start_page",
+            value=repr(start_page),
+        )
+    if (
+        isinstance(page_lsn, bool)
+        or not isinstance(page_lsn, int)
+        or not NO_LSN <= page_lsn < PROVISIONAL_CSN
+    ):
+        raise GrafxIndexError(
+            "An ordered COW batch needs a non-provisional page LSN.",
+            field="page_lsn",
+            value=repr(page_lsn),
+        )
+    if (
+        isinstance(entry_count, bool)
+        or not isinstance(entry_count, int)
+        or entry_count < 0
+    ):
+        raise GrafxIndexError(
+            "An ordered COW root needs a non-negative entry count.",
+            field="entry_count",
+            value=repr(entry_count),
+        )
+    try:
+        materialized = tuple(changes)
+    except TypeError as failure:
+        raise GrafxIndexError(
+            "An ordered COW batch needs an iterable of IndexChange values.",
+            field="changes",
+            value=type(changes).__name__,
+        ) from failure
+    for change in materialized:
+        if not isinstance(change, IndexChange):
+            raise GrafxIndexError(
+                "An ordered COW batch accepts only IndexChange values.",
+                field="changes",
+                value=type(change).__name__,
+            )
+        if change.versioned:
+            raise GrafxIndexError(
+                "An ordered exact batch cannot apply a versioned index change.",
+                field="versioned",
+                value=True,
+                index=change.index,
+            )
+        if change.operation is IndexOperation.RESET:
+            raise GrafxIndexError(
+                "RESET builds a fresh ordered artifact and is not a COW tree mutation.",
+                field="operation",
+                value=change.operation.name,
+                index=change.index,
+            )
+        _key_bytes(change.key, stored=False)
+    if not materialized:
+        return OrderedTreeMutation(root_page, height, entry_count, (), False)
+
+    ordered_changes = tuple(
+        sorted(
+            enumerate(materialized),
+            key=lambda item: (
+                ordered_entry_identity(item[1].key, item[1].ref),
+                item[0],
+            ),
+        )
+    )
+    new_pages: list[Page] = []
+
+    def allocate(page_type: PageType) -> Page:
+        page_index = start_page + len(new_pages)
+        if page_index >= NO_PAGE:
+            raise GrafxIndexError(
+                "An ordered COW batch exhausted the encodable page-index space.",
+                field="page_index",
+                value=page_index,
+            )
+        page = _new_page(page_type, page_size, page_index, page_lsn)
+        new_pages.append(page)
+        return page
+
+    def pack_leaf(entries: Iterable[IndexEntry]) -> tuple[_CowNode, ...]:
+        result: list[_CowNode] = []
+        current: Page | None = None
+        maximum: tuple[bytes, int] | None = None
+        for entry in entries:
+            payload = entry.encode()
+            identity = ordered_entry_identity(entry.key, entry.ref)
+            if current is None or not current.can_fit(len(payload)):
+                if current is not None and maximum is not None:
+                    result.append(_CowNode(current.page_index, maximum))
+                current = allocate(PageType.INDEX_ORDERED_LEAF)
+                if not current.can_fit(len(payload)):
+                    raise GrafxIndexError(
+                        "One ordered leaf entry does not fit in an empty page.",
+                        field="page_size",
+                        value=page_size,
+                        record_size=len(payload),
+                    )
+            current.insert_slot(payload)
+            maximum = identity
+        if current is not None and maximum is not None:
+            result.append(_CowNode(current.page_index, maximum))
+        return tuple(result)
+
+    def pack_internal(nodes: Iterable[_CowNode]) -> tuple[_CowNode, ...]:
+        result: list[_CowNode] = []
+        current: Page | None = None
+        maximum: tuple[bytes, int] | None = None
+        for node in nodes:
+            pointer = OrderedChildPointer(
+                high_key=node.maximum[0],
+                high_ref=RecordRef.decode(node.maximum[1]),
+                child_page=node.page,
+            )
+            payload = pointer.encode()
+            if current is None or not current.can_fit(len(payload)):
+                if current is not None and maximum is not None:
+                    result.append(_CowNode(current.page_index, maximum))
+                current = allocate(PageType.INDEX_ORDERED_INTERNAL)
+                if not current.can_fit(len(payload)):
+                    raise GrafxIndexError(
+                        "One ordered internal pointer does not fit in an empty page.",
+                        field="page_size",
+                        value=page_size,
+                        record_size=len(payload),
+                    )
+            current.insert_slot(payload)
+            maximum = node.maximum
+        if current is not None and maximum is not None:
+            result.append(_CowNode(current.page_index, maximum))
+        return tuple(result)
+
+    def apply_leaf(
+        page_index: PageIndex,
+        batch: tuple[tuple[int, IndexChange], ...],
+    ) -> _CowResult:
+        try:
+            current = decode_ordered_leaf(pages[page_index])
+        except KeyError as failure:
+            raise GrafxCorruptionDetected(
+                "An ordered COW path references an absent leaf page.",
+                field="child_page",
+                value=page_index,
+            ) from failure
+        by_identity = {
+            ordered_entry_identity(entry.key, entry.ref): entry for entry in current
+        }
+        changed = False
+        delta = 0
+        missing = 0
+        for _position, change in batch:
+            identity = ordered_entry_identity(change.key, change.ref)
+            existing = by_identity.get(identity)
+            if change.operation is IndexOperation.INSERT:
+                if existing is None:
+                    by_identity[identity] = IndexEntry(
+                        key=change.key,
+                        ref=change.ref,
+                        versioned=False,
+                    )
+                    changed = True
+                    delta += 1
+                continue
+            if existing is None:
+                missing += 1
+                continue
+            if change.operation is IndexOperation.TOMBSTONE:
+                if existing.live:
+                    by_identity[identity] = existing.ended_at(change.csn)
+                    changed = True
+                continue
+            del by_identity[identity]
+            changed = True
+            delta -= 1
+        if not changed:
+            return _CowResult(
+                (_CowNode(page_index, ordered_entry_identity(current[-1].key, current[-1].ref)),),
+                False,
+                0,
+                missing,
+            )
+        ordered_entries = (
+            by_identity[identity] for identity in sorted(by_identity)
+        )
+        return _CowResult(pack_leaf(ordered_entries), True, delta, missing)
+
+    def visit(
+        page_index: PageIndex,
+        depth: int,
+        batch: tuple[tuple[int, IndexChange], ...],
+    ) -> _CowResult:
+        if depth == 1:
+            return apply_leaf(page_index, batch)
+        try:
+            pointers = decode_ordered_internal(pages[page_index])
+        except KeyError as failure:
+            raise GrafxCorruptionDetected(
+                "An ordered COW path references an absent internal page.",
+                field="child_page",
+                value=page_index,
+            ) from failure
+        highs = [pointer.high_identity for pointer in pointers]
+        groups: list[list[tuple[int, IndexChange]]] = [
+            [] for _pointer in pointers
+        ]
+        for item in batch:
+            identity = ordered_entry_identity(item[1].key, item[1].ref)
+            position = min(bisect_left(highs, identity), len(pointers) - 1)
+            groups[position].append(item)
+
+        output: list[_CowNode] = []
+        changed = False
+        delta = 0
+        missing = 0
+        for pointer, group in zip(pointers, groups, strict=True):
+            if not group:
+                output.append(_CowNode(pointer.child_page, pointer.high_identity))
+                continue
+            child = visit(pointer.child_page, depth - 1, tuple(group))
+            output.extend(child.nodes)
+            changed = changed or child.changed
+            delta += child.entry_delta
+            missing += child.missing_targets
+        if not changed:
+            return _CowResult(
+                (_CowNode(page_index, pointers[-1].high_identity),),
+                False,
+                0,
+                missing,
+            )
+        return _CowResult(pack_internal(output), True, delta, missing)
+
+    if root_page == NO_PAGE:
+        if height != 0 or entry_count != 0:
+            raise GrafxCorruptionDetected(
+                "An empty ordered COW root disagrees with its height or entry count.",
+                field="root_page",
+                value=root_page,
+                height=height,
+                entry_count=entry_count,
+            )
+        # A synthetic empty leaf lets the same sequential identity semantics handle INSERT,
+        # TOMBSTONE and REMOVE without manufacturing a stored empty page.
+        by_identity: dict[tuple[bytes, int], IndexEntry] = {}
+        delta = 0
+        missing = 0
+        for _position, change in ordered_changes:
+            identity = ordered_entry_identity(change.key, change.ref)
+            existing = by_identity.get(identity)
+            if change.operation is IndexOperation.INSERT:
+                if existing is None:
+                    by_identity[identity] = IndexEntry(
+                        key=change.key, ref=change.ref, versioned=False
+                    )
+                    delta += 1
+            elif existing is None:
+                missing += 1
+            elif change.operation is IndexOperation.TOMBSTONE:
+                if existing.live:
+                    by_identity[identity] = existing.ended_at(change.csn)
+            else:
+                del by_identity[identity]
+                delta -= 1
+        nodes = pack_leaf(by_identity[key] for key in sorted(by_identity))
+        changed = bool(nodes)
+        result = _CowResult(nodes, changed, delta, missing)
+        result_height = 1 if nodes else 0
+    else:
+        if height <= 0:
+            raise GrafxCorruptionDetected(
+                "A non-empty ordered COW root needs a positive height.",
+                field="height",
+                value=height,
+            )
+        result = visit(root_page, height, ordered_changes)
+        result_height = height if result.nodes else 0
+
+    nodes = result.nodes
+    while len(nodes) > 1:
+        nodes = pack_internal(nodes)
+        result_height += 1
+    new_count = entry_count + result.entry_delta
+    if new_count < 0 or bool(nodes) != bool(new_count):
+        raise GrafxCorruptionDetected(
+            "An ordered COW mutation produced an inconsistent root entry count.",
+            field="entry_count",
+            value=new_count,
+            root_count=len(nodes),
+        )
+    return OrderedTreeMutation(
+        root_page=NO_PAGE if not nodes else nodes[0].page,
+        height=result_height,
+        entry_count=new_count,
+        pages=tuple(new_pages),
+        changed=result.changed,
+        missing_targets=result.missing_targets,
+    )
 
 
 def verify_ordered_tree(

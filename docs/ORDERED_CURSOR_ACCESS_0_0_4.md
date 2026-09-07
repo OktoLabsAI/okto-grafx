@@ -210,11 +210,20 @@ prefix.
    loading, retry the complete attempt on certified root drift and re-read every candidate from
    the heap under the snapshot before returning it. The planner still cannot select this path;
    that waits for transactional maintenance in OIX-2.
-3. **OIX-2 — transactional maintenance:** batch COW planning, grouped publication barriers,
-   logical redo watermark, failure injection at every publication boundary, compacting rebuild.
-4. **OIX-3 — query path:** exact planner matcher, `OrderedNodeMerge`, lazy merge, keyset bound and
+3. **OIX-2A — COW batch and physical publication (implemented):** a complete logical batch is
+   partitioned down the immutable tree, copies/re-packs each affected leaf and ancestor at most
+   once, shares untouched children and allocates the reachable replacement pages contiguously.
+   After the caller's WAL barrier, the store publishes `COW pages -> grouped data barrier ->
+   alternate root -> grouped root barrier`; the selected root watermark makes replay idempotent
+   without repeated allocation.  Root-write refusal leaves the former root authoritative, while
+   a write-that-landed-then-raised is recovered by the fresh certificate and watermark.  The
+   focused differential/failure corpus passes 16 tests.  Index-manager registration, commit/replay
+   batching, compacting rebuild and the accumulated crash/multiprocess matrix remain in OIX-2B.
+4. **OIX-2B — transactional integration:** registry/DDL attachment, grouped commit and recovery
+   replay, catalog generation lifecycle, compacting rebuild and the crash/multiprocess matrix.
+5. **OIX-3 — query path:** exact planner matcher, `OrderedNodeMerge`, lazy merge, keyset bound and
    differential query corpus.
-5. **OIX-4 — Pulse Community:** idempotent per-table index creation/migration, Community-only
+6. **OIX-4 — Pulse Community:** idempotent per-table index creation/migration, Community-only
    capability use, installed API/UI test and board benchmark.
 
 `NODE-IN-SEEK` is an independent low-risk optimization and useful primitive, but it is not

@@ -65,6 +65,15 @@
   de chave antiga não consome o LIMIT. O planner continua sem selecionar esse caminho até OIX-2
   fornecer manutenção transacional copy-on-write.
 
+  OIX-2A está implementado e testado de forma focada: o lote COW copia/reempacota cada folha e
+  ancestral afetados uma única vez, compartilha os ramos imutáveis e aloca somente a nova árvore
+  alcançável. A publicação física ocorre, após o WAL durável do chamador, em `páginas COW ->
+  barrier de dados -> raiz alternada -> barrier de raiz`; o watermark selecionado evita alocação
+  repetida no replay. Falha antes da raiz preserva a autoridade anterior e a incerteza de uma
+  escrita de raiz que pousou antes da exceção é resolvida por certificado fresco. Os 16 testes
+  focados passam. Registry/DDL, commit/replay agrupado, rebuild compactante e a matriz acumulada
+  de crash/multiprocesso permanecem no OIX-2B e serão fechados antes de o planner usar o índice.
+
 - **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
   estão publicados até `ed3ce95`; o memo transacional de resolução de PK entrou em `04aa244` com
   cercas de transação/snapshot/store/revisão/época/geração, LRU de 4.096 entradas dentro da quota

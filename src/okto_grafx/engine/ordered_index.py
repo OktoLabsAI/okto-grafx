@@ -29,9 +29,11 @@ from okto_grafx.domain.index import (
     ORDERED_ROOT_PAGE_A,
     ORDERED_ROOT_PAGE_B,
     IndexDefinition,
+    IndexChange,
     IndexEntry,
     IndexHeader,
     IndexLayout,
+    IndexOperation,
     IndexVisibility,
     OrderedRootDescriptor,
     OrderedRootSelection,
@@ -39,6 +41,7 @@ from okto_grafx.domain.index import (
     SnapshotLike,
     build_ordered_tree,
     make_ordered_root_page,
+    mutate_ordered_tree,
     select_ordered_root,
     verify_ordered_tree,
     walk_ordered_desc,
@@ -59,6 +62,7 @@ from okto_grafx.engine.heap_store import HeapStore
 __all__ = [
     "ORDERED_READ_RETRY_BUDGET",
     "OrderedIndex",
+    "OrderedBatchPublication",
     "OrderedIndexReadCertificate",
 ]
 
@@ -113,6 +117,17 @@ class OrderedIndexReadCertificate:
     root_a_seq: int | None
     root_b_seq: int | None
     selection: OrderedRootSelection
+
+
+@dataclass(frozen=True, slots=True)
+class OrderedBatchPublication:
+    """The durable ordered-root transition produced by one committed logical batch."""
+
+    descriptor: OrderedRootDescriptor
+    changes: int
+    pages_written: int
+    missing_targets: int
+    replay_skipped: bool = False
 
 
 class _OrderedPageLoader(Mapping[PageIndex, Page]):
@@ -371,6 +386,171 @@ class OrderedIndex:
             _OrderedPageLoader(self._pool, self._file, fresh=True),
             expected_entry_count=descriptor.entry_count,
         )
+
+    def publish_committed_batch(
+        self,
+        changes: Iterable[IndexChange],
+        *,
+        applied_through_lsn: Lsn,
+    ) -> OrderedBatchPublication:
+        """Publish one already-WAL-durable exact batch through append-only COW pages.
+
+        Every conforming ordered writer enters the same page-0 write section.  Within it, the
+        current dual-root certificate is read once, the batch is planned against immutable
+        pages, one contiguous run is allocated, and the new tree pages cross a grouped data
+        barrier before the alternate root page crosses its grouped root barrier.  Commit-state
+        publication remains the transaction manager's next step; this door never performs it.
+
+        Recovery may call this again.  A selected root already at or beyond the batch LSN is the
+        idempotence proof; the file is barriered again before the skip is acknowledged so an
+        earlier write-that-landed-then-raised cannot turn an uncertain root into false success.
+        """
+
+        try:
+            materialized = tuple(changes)
+        except TypeError as failure:
+            raise GrafxIndexError(
+                "An ordered publication needs an iterable of IndexChange values.",
+                field="changes",
+                value=type(changes).__name__,
+                index=self.name,
+            ) from failure
+        for change in materialized:
+            if not isinstance(change, IndexChange):
+                raise GrafxIndexError(
+                    "An ordered publication accepts only IndexChange values.",
+                    field="changes",
+                    value=type(change).__name__,
+                    index=self.name,
+                )
+            if change.index.casefold() != self.name.casefold():
+                raise GrafxIndexError(
+                    "An ordered publication received a change for another index.",
+                    field="index",
+                    value=change.index,
+                    index=self.name,
+                )
+
+        # OrderedRootDescriptor owns the exact position-domain validation.  Constructing a
+        # provisional descriptor before any file mutation keeps malformed positions pre-write.
+        self._root_descriptor(
+            generation=1,
+            root_page=NO_PAGE,
+            height=0,
+            entry_count=0,
+            applied_through_lsn=applied_through_lsn,
+            reconciled_through_lsn=NO_LSN,
+        )
+        publication_page: PageIndex | None = None
+        allocated_pages: tuple[PageIndex, ...] = ()
+        with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
+            before = self._read_certificate()
+            current = before.selection.descriptor
+            if current.applied_through_lsn >= applied_through_lsn:
+                self._pool.storage.durable_barrier(self.file)
+                return OrderedBatchPublication(
+                    current,
+                    len(materialized),
+                    0,
+                    0,
+                    replay_skipped=True,
+                )
+            start_page = self._pool.storage.page_count(self.file)
+            mutation = mutate_ordered_tree(
+                current.root_page,
+                current.height,
+                current.entry_count,
+                _OrderedPageLoader(self._pool, self.file, fresh=False),
+                materialized,
+                page_size=self._pool.page_size,
+                start_page=start_page,
+                page_lsn=applied_through_lsn,
+            )
+            reconciled = current.reconciled_through_lsn
+            for change in materialized:
+                if change.operation is IndexOperation.REMOVE:
+                    reconciled = max(reconciled, change.csn)
+            descriptor = self._root_descriptor(
+                generation=current.generation + 1,
+                root_page=mutation.root_page,
+                height=mutation.height,
+                entry_count=mutation.entry_count,
+                applied_through_lsn=applied_through_lsn,
+                reconciled_through_lsn=reconciled,
+            )
+            publication_page = before.selection.publication_page
+            try:
+                if mutation.pages:
+                    first = self._pool.storage.allocate(
+                        self.file, len(mutation.pages)
+                    )
+                    if first != start_page:
+                        raise GrafxCorruptionDetected(
+                            "Ordered COW allocation did not begin at the planned append point.",
+                            field="page_index",
+                            value=first,
+                            expected=start_page,
+                            file=self.file,
+                        )
+                    allocated_pages = tuple(
+                        range(first, first + len(mutation.pages))
+                    )
+                    for image in mutation.pages:
+                        self._replace_page(image.page_index, image)
+                    self._pool.flush(self.file)
+                    self._pool.storage.durable_barrier(self.file)
+
+                # A clean resident root may predate the fresh certificate.  Drop it without
+                # write-back before installing the alternate complete descriptor.
+                self._pool.discard_clean_page(self.file, publication_page)
+                self._replace_page(
+                    publication_page,
+                    make_ordered_root_page(
+                        descriptor,
+                        publication_page,
+                        page_size=self._pool.page_size,
+                    ),
+                )
+                self._pool.flush(self.file)
+                self._pool.storage.durable_barrier(self.file)
+                after = self._read_certificate()
+                if (
+                    after.selection.descriptor != descriptor
+                    or after.selection.page_index != publication_page
+                ):
+                    raise GrafxCorruptionDetected(
+                        "The ordered root publication did not become the selected generation.",
+                        field="ordered_root",
+                        file=self.file,
+                        expected_generation=descriptor.generation,
+                        observed_generation=after.selection.descriptor.generation,
+                    )
+            except BaseException as failure:
+                # No published root reaches a failed data prefix.  Dirty frames must not be
+                # allowed to escape and write themselves during an unrelated later flush.
+                for page_index in allocated_pages:
+                    try:
+                        self._pool.discard(self.file, page_index)
+                    except BaseException as cleanup_failure:  # pragma: no cover - note only
+                        failure.add_note(
+                            f"Discarding failed ordered COW page {page_index} also failed: "
+                            f"{cleanup_failure!r}"
+                        )
+                if publication_page is not None:
+                    try:
+                        self._pool.discard(self.file, publication_page)
+                    except BaseException as cleanup_failure:  # pragma: no cover - note only
+                        failure.add_note(
+                            "Discarding the failed ordered root frame also failed: "
+                            f"{cleanup_failure!r}"
+                        )
+                raise
+            return OrderedBatchPublication(
+                descriptor=descriptor,
+                changes=len(materialized),
+                pages_written=len(mutation.pages),
+                missing_targets=mutation.missing_targets,
+            )
 
     def candidates_desc(
         self,

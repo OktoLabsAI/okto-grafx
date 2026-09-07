@@ -11,9 +11,11 @@ from okto_grafx.domain.index import (
     ORDERED_KEY_DERIVATION,
     ORDERED_ROOT_PAGE_A,
     ORDERED_ROOT_PAGE_B,
+    IndexChange,
     IndexDefinition,
     IndexEntry,
     IndexLayout,
+    IndexOperation,
     IndexVisibility,
     OrderedRootDescriptor,
     decode_ordered_root_page,
@@ -237,3 +239,160 @@ def test_root_page_payload_round_trip_used_by_store_is_self_contained() -> None:
     page = make_ordered_root_page(descriptor, ORDERED_ROOT_PAGE_A, page_size=512)
     decoded = Page.from_bytes(page.to_bytes(), page_size=512, page_index=ORDERED_ROOT_PAGE_A)
     assert decode_ordered_root_page(decoded) == descriptor
+
+
+def _change(
+    definition: IndexDefinition,
+    operation: IndexOperation,
+    entry: IndexEntry,
+    *,
+    csn: int = 0,
+) -> IndexChange:
+    return IndexChange(
+        index=definition.name,
+        operation=operation,
+        key=entry.key,
+        ref=entry.ref,
+        csn=csn,
+    )
+
+
+def test_committed_batch_publishes_cow_pages_then_alternate_root() -> None:
+    device, pool, _catalog, heap, table, definition = _stack()
+    entries: list[IndexEntry] = []
+    for number in range(100):
+        values = (Timestamp(number), f"id-{number:04d}")
+        ref = heap.insert(table, number + 1, values, xmin=10)
+        entries.append(_entry(definition, ref, values))
+    index = OrderedIndex(definition, pool)
+    initial = index.create(entries, applied_through_lsn=10)
+    old_page_count = device.page_count(index.file)
+    added_values = (Timestamp(200), "new")
+    added_ref = heap.insert(table, 1001, added_values, xmin=20)
+    added = _entry(definition, added_ref, added_values)
+    barriers_before = len(device.barriers)
+
+    report = index.publish_committed_batch(
+        (_change(definition, IndexOperation.INSERT, added),),
+        applied_through_lsn=20,
+    )
+
+    assert report.descriptor.generation == initial.generation + 1
+    assert report.descriptor.applied_through_lsn == 20
+    assert report.descriptor.entry_count == 101
+    assert 0 < report.pages_written < old_page_count
+    assert device.page_count(index.file) == old_page_count + report.pages_written
+    assert len(device.barriers) - barriers_before == 2
+    assert index.visible_desc(heap, table, Snapshot(20), limit=1)[0][0] == added_ref
+
+
+def test_noop_watermark_and_replay_skip_do_not_allocate_tree_pages() -> None:
+    device, pool, _catalog, heap, table, definition = _stack()
+    values = (Timestamp(1), "one")
+    ref = heap.insert(table, 1, values, xmin=5)
+    entry = _entry(definition, ref, values)
+    index = OrderedIndex(definition, pool)
+    initial = index.create((entry,), applied_through_lsn=5)
+    before_pages = device.page_count(index.file)
+
+    advanced = index.publish_committed_batch((), applied_through_lsn=8)
+    skipped = index.publish_committed_batch(
+        (_change(definition, IndexOperation.INSERT, entry),),
+        applied_through_lsn=8,
+    )
+
+    assert advanced.descriptor.generation == initial.generation + 1
+    assert advanced.pages_written == 0
+    assert skipped.replay_skipped
+    assert skipped.pages_written == 0
+    assert device.page_count(index.file) == before_pages
+
+
+def test_tombstone_and_remove_update_reconciliation_without_rebuilding_tree() -> None:
+    _device, pool, _catalog, heap, table, definition = _stack()
+    values = (Timestamp(1), "one")
+    ref = heap.insert(table, 1, values, xmin=5)
+    entry = _entry(definition, ref, values)
+    index = OrderedIndex(definition, pool)
+    index.create((entry,), applied_through_lsn=5)
+
+    tombstone = index.publish_committed_batch(
+        (_change(definition, IndexOperation.TOMBSTONE, entry, csn=9),),
+        applied_through_lsn=9,
+    )
+    assert tombstone.descriptor.entry_count == 1
+    assert index.candidates_desc(Snapshot(9), limit=1)[0].dead_csn == 9
+
+    removed = index.publish_committed_batch(
+        (_change(definition, IndexOperation.REMOVE, entry, csn=9),),
+        applied_through_lsn=12,
+    )
+    assert removed.descriptor.entry_count == 0
+    assert removed.descriptor.reconciled_through_lsn == 9
+    assert index.candidates_desc(Snapshot(12), limit=1) == ()
+
+
+def test_failed_root_write_leaves_old_root_readable_and_retry_is_idempotent() -> None:
+    device, pool, _catalog, heap, table, definition = _stack()
+    values = (Timestamp(1), "one")
+    ref = heap.insert(table, 1, values, xmin=5)
+    entry = _entry(definition, ref, values)
+    index = OrderedIndex(definition, pool)
+    initial = index.create((entry,), applied_through_lsn=5)
+    added_values = (Timestamp(2), "two")
+    added_ref = heap.insert(table, 2, added_values, xmin=7)
+    added = _entry(definition, added_ref, added_values)
+    change = _change(definition, IndexOperation.INSERT, added)
+    device.refuse_write_number(2, GrafxIndexError("root refused", retryable=True))
+
+    with pytest.raises(GrafxIndexError):
+        index.publish_committed_batch((change,), applied_through_lsn=7)
+
+    assert index.open() == initial
+    device.disarm()
+    completed = index.publish_committed_batch((change,), applied_through_lsn=7)
+    assert completed.descriptor.generation == initial.generation + 1
+    assert [
+        version.record_id
+        for _ref, version in index.visible_desc(heap, table, Snapshot(7), limit=5)
+    ] == [2, 1]
+
+
+def test_root_write_that_lands_then_raises_is_recovered_by_watermark_skip() -> None:
+    class WriteThenRaiseDevice(MemoryDevice):
+        fail_file: str | None = None
+        fail_page: int | None = None
+
+        def write_page(self, file: str, page_index: int, data: bytes) -> None:
+            super().write_page(file, page_index, data)
+            if file == self.fail_file and page_index == self.fail_page:
+                self.fail_file = None
+                self.fail_page = None
+                raise GrafxIndexError("write landed before interruption", retryable=True)
+
+    device = WriteThenRaiseDevice()
+    _device, pool, _catalog, heap, table, definition = _stack(device)
+    values = (Timestamp(1), "one")
+    ref = heap.insert(table, 1, values, xmin=5)
+    entry = _entry(definition, ref, values)
+    index = OrderedIndex(definition, pool)
+    index.create((entry,), applied_through_lsn=5)
+    added_values = (Timestamp(2), "two")
+    added_ref = heap.insert(table, 2, added_values, xmin=7)
+    added = _entry(definition, added_ref, added_values)
+    change = _change(definition, IndexOperation.INSERT, added)
+    pages_before = device.page_count(index.file)
+    device.fail_file = index.file
+    device.fail_page = ORDERED_ROOT_PAGE_B
+
+    with pytest.raises(GrafxIndexError):
+        index.publish_committed_batch((change,), applied_through_lsn=7)
+
+    landed = index.open()
+    pages_after_failure = device.page_count(index.file)
+    assert landed.applied_through_lsn == 7
+    retry = index.publish_committed_batch((change,), applied_through_lsn=7)
+    assert retry.replay_skipped
+    assert retry.descriptor == landed
+    assert device.page_count(index.file) == pages_after_failure
+    assert pages_after_failure > pages_before

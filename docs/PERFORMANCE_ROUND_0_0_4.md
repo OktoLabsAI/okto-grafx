@@ -376,6 +376,15 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    duas inválidas recusam fail-closed. O corpus focado acumulado de OIX-0/1 passa 32 testes nesta
    etapa, com Ruff, compileall e diff-check verdes. Nenhuma query seleciona o caminho antes de
    OIX-2 manter o índice no protocolo transacional.
+11. **OIX-2A implementado:** o mutador COW aplica o lote lógico completo copiando cada folha e
+   ancestral afetados no máximo uma vez, compartilha filhos imutáveis não afetados e grava apenas
+   as páginas alcançáveis da nova geração. O publicador exige WAL já durável, serializa pela seção
+   de escrita da page 0 e respeita `páginas COW -> barrier de dados -> raiz alternada -> barrier de
+   raiz`; o watermark da raiz torna o replay idempotente sem novo crescimento. Testes cobrem lote
+   diferencial aleatório, coalescência na mesma folha, árvore vazia, tombstone/remove, recusa da
+   raiz e escrita que pousa antes de lançar exceção. O corpus focado passa 16/16. A conexão com
+   registry/DDL, commit/replay em lote, rebuild compactante e a matriz crash/multiprocesso ficam
+   explicitamente em OIX-2B antes de qualquer seleção pelo planner.
 
 ## Explicit decision queue
 
