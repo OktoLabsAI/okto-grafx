@@ -60,6 +60,7 @@ from okto_grafx.domain.query.analysis import (
     named_path,
     named_path_refusal,
     optional_match_refusal,
+    correlated_optional_hop,
     untyped_one_hop_source,
     union_refusal,
     polymorphic_node_refusal,
@@ -494,6 +495,7 @@ class _Planner:
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
     polymorphic_variables: set[str] = field(default_factory=set)
+    polymorphic_tables: dict[str, tuple[TableDef, ...]] = field(default_factory=dict)
     typed_endpoint_form: bool = False
     path_projection: PatternPath | None = None
     untyped_one_hop_label: str | None = None
@@ -1400,12 +1402,16 @@ class _Planner:
                 expression=statement.unwind_clause.expression,
             )
         similarity_terms: list[Expression] = []
+        correlated = correlated_optional_hop(statement)
         for clause in statement.match_clauses:
+            if clause.optional and correlated is not None:
+                pipeline = self._correlated_optional(pipeline, clause)
+                continue
             pipeline, deferred = self._match_clause(pipeline, clause)
             similarity_terms.extend(deferred)
         pipeline = self._similarity(pipeline, statement, similarity_terms)
         optional = [clause for clause in statement.match_clauses if clause.optional]
-        if optional:
+        if optional and correlated is None:
             # Above every filter of the clause, residual and deferred alike: the WHERE belongs
             # to the OPTIONAL, so "no rows" has to mean no rows AFTER all of it. The gate above
             # has already proved the shape, which is why one node of one pattern can be read
@@ -1440,6 +1446,58 @@ class _Planner:
             ProduceResults(child=pipeline, columns=columns),
             columns=columns,
             writes=statement.writes,
+        )
+
+    def _correlated_optional(self, pipeline: PlanNode, clause: MatchClause) -> PlanNode:
+        """Plan an optional incident expansion over snapshot-visible relationship tables."""
+        pattern = clause.patterns[0]
+        source, target = pattern.nodes
+        edge = pattern.relationships[0]
+        anchor = self.tables[source.variable]
+        if edge.types:
+            candidates = (self._relationship_table(edge),)
+        else:
+            candidates = tuple(t for t in self.catalog.tables() if t.kind == "rel")
+        selected = []
+        for table in sorted(candidates, key=lambda t: t.table_id):
+            self._table_named(table.from_table, "from")
+            self._table_named(table.to_table, "to")
+            outgoing = edge.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
+            incoming = edge.direction in (Direction.INCOMING, Direction.UNDIRECTED)
+            if ((outgoing and table.from_table == anchor.name)
+                    or (incoming and table.to_table == anchor.name)):
+                selected.append(table)
+        target_name = target.variable or self._anonymous()
+        if target.labels:
+            target_definition = self._table_named(target.labels[0], "label")
+            if target_definition.kind != "node":
+                raise GrafxPlanError("An optional hop target must name a node table.")
+            self.tables[target_name] = target_definition
+        elif target.variable:
+            self.polymorphic_variables.add(target.variable)
+            landing_names = set()
+            for table in selected:
+                if edge.direction in (Direction.OUTGOING, Direction.UNDIRECTED) and table.from_table == anchor.name:
+                    landing_names.add(table.to_table)
+                if edge.direction in (Direction.INCOMING, Direction.UNDIRECTED) and table.to_table == anchor.name:
+                    landing_names.add(table.from_table)
+            self.polymorphic_tables[target.variable] = tuple(
+                table for table in self._node_tables() if table.name in landing_names
+            )
+        if edge.variable and edge.types:
+            self.tables[edge.variable] = candidates[0]
+        elif edge.variable:
+            self.polymorphic_variables.add(edge.variable)
+            self.polymorphic_tables[edge.variable] = tuple(selected)
+        if clause.predicate is not None and self._reads_similarity(clause.predicate):
+            raise GrafxPlanError("An optional hop predicate cannot perform vector search.")
+        return TraverseAnyRelationship(
+            child=pipeline, source=source.variable, target=target_name,
+            relationship=edge.variable or self._anonymous(), tables=tuple(selected),
+            direction=edge.direction, optional=True, source_table=anchor.name,
+            target_table=target.labels[0] if target.labels else None,
+            relationship_polymorphic=not edge.types,
+            predicate=clause.predicate,
         )
 
     def _with_clause(self, pipeline: PlanNode, clause: WithClause) -> PlanNode:
@@ -1794,7 +1852,7 @@ class _Planner:
                 if expression.subject.name == self.unwind_alias:
                     return self._unwind_static_postfix_type(expression, owner=owner)
                 if expression.subject.name in self.polymorphic_variables:
-                    return self._polymorphic_property_type(expression.key, owner)
+                    return self._polymorphic_property_type(expression.key, owner, expression.subject.name)
                 table = self.tables.get(expression.subject.name)
                 if table is None:
                     message = f"{owner} reads {expression.describe()}, whose variable has no table."
@@ -2115,7 +2173,7 @@ class _Planner:
             if argument.subject.name in self.polymorphic_variables:
                 # A node matched without a label: the family is whatever the tables that
                 # declare the column agree on, and null when none of them declares it.
-                return self._polymorphic_property_type(argument.key, call.name)
+                return self._polymorphic_property_type(argument.key, call.name, argument.subject.name)
             table = self.tables.get(argument.subject.name)
             if table is None:
                 message = (
@@ -2466,7 +2524,7 @@ class _Planner:
         """Return True when this variable names a matched row, table or no table."""
         return name in self.tables or name in self.polymorphic_variables
 
-    def _polymorphic_property_type(self, key: str, owner: str) -> ValueType | None:
+    def _polymorphic_property_type(self, key: str, owner: str, variable: str) -> ValueType | None:
         """Return the one type a property has across the tables that declare it.
 
         A polymorphic match reads one name across many tables, so the property is typed only
@@ -2481,7 +2539,7 @@ class _Planner:
 
         declared = [
             (table.name, column.type)
-            for table in self._node_tables()
+            for table in self.polymorphic_tables.get(variable, self._node_tables())
             for column in (self._column_of(table, key),)
             if column is not None
         ]
@@ -2496,7 +2554,7 @@ class _Planner:
             f"{name}.{key} is {value_type.name}" for name, value_type in declared
         )
         raise GrafxPlanError(
-            f"{owner} reads {key!r} on a node that names no label, and the tables do not agree "
+            f"{owner} reads {key!r} on a polymorphic binding, and the tables do not agree "
             f"on what it is: {listing}.",
             field="property",
             value=key,
@@ -2513,7 +2571,7 @@ class _Planner:
                     continue
                 if subject.name not in self.polymorphic_variables:
                     continue
-                self._polymorphic_property_type(node.key, node.describe())
+                self._polymorphic_property_type(node.key, node.describe(), subject.name)
 
     def _typed_endpoint_source(self, pattern: PatternPath) -> TableDef | None:
         """Return the table a label-free source reads, when the query is the one shape for it.
@@ -3816,12 +3874,23 @@ class _Planner:
 
         if isinstance(expression, NullCheck):
             return _Planner._ordered_filter_operand(expression.operand, variable)
+        if isinstance(expression, UnaryOperation):
+            return expression.operator == "NOT" and _Planner._ordered_filter_is_total(
+                expression.operand, variable
+            )
         if not isinstance(expression, BinaryOperation):
             return False
         if expression.operator in ("AND", "OR"):
             return _Planner._ordered_filter_is_total(
                 expression.left, variable
             ) and _Planner._ordered_filter_is_total(expression.right, variable)
+        if expression.operator == "IN":
+            return _Planner._ordered_filter_operand(
+                expression.left, variable
+            ) and isinstance(expression.right, ListExpression) and all(
+                _Planner._ordered_scalar_is_total(element, variable)
+                for element in expression.right.elements
+            )
         if expression.operator not in ("=", "<>", "<", "<=", ">", ">="):
             return False
         return _Planner._ordered_filter_operand(

@@ -1228,10 +1228,31 @@ term, runs before `OptionalRows`: if the complete match produces no row, that op
 row binding `v` to null; if it produces rows, it forwards only those rows and adds nothing.
 Consequently `v.property` and `label(v)` answer null, `count(v)` is zero and `count(*)` is one on
 the extension. The scan remains the ordinary owner-only snapshot view, and the synthetic row is
-subject to the ordinary result and intermediate-row budgets. A chained optional, one following
-`MATCH`, `WITH` or `UNWIND`, any write, an anonymous/unlabelled/multi-labelled/map node, a path,
-relationship or multiple pattern is refused before streaming. Parser, analysis and planner each
-repeat the structural gate so supplied trees or supplied analysis cannot widen the form.
+subject to the ordinary result and intermediate-row budgets. This root-only form does not admit
+an anonymous/unlabelled/multi-labelled/map node or multiple patterns. Parser, analysis and planner
+each repeat the structural gate so supplied trees or supplied analysis cannot widen the form.
+
+Since 0.0.4 a second form admits `MATCH (a:Label) [WHERE ...] OPTIONAL MATCH (a)-[r]-(b)
+[WHERE ...] RETURN ...`. The root is one named node with exactly one label (an inline root map
+is allowed). The optional clause is one correlated single hop, outgoing, incoming or undirected,
+with zero or one relationship type and zero or one target label. Target and relationship names
+are optional; supplied aliases must be distinct. The optional source may repeat the root label.
+Optional inline maps, ranges, named paths, additional MATCH clauses, WITH, UNWIND, writes and
+vector-search predicates in the optional clause remain refused. This is not arbitrary optional
+join support.
+
+All matching edges retain multiplicity. Each anchor with no edge satisfying the target label
+and complete optional WHERE produces one row with null target/relationship: `count(r)=0`,
+`count(*)=1`. An empty mandatory root produces no such row. An undirected self-loop has two
+directional matches (`count(r)=2`, `count(DISTINCT r)=1`), as in typed traversal. Existing scalar,
+aggregate, ordering and window rules apply; unsupported expression/type combinations still fail.
+Label-free targets and untyped relationships read missing properties as null. Property families
+are checked across eligible tables before streaming; incompatible families are refused and
+integer/double families promote under the existing polymorphic rules.
+`TraverseAnyRelationship` expands only incident tables in catalog table-id order, using the
+existing indexed/batched traversal access paths, owner overlay and one statement snapshot.
+Existing traversal, result and intermediate budgets remain enforced. No storage format, WAL,
+OCC, durability or reader/writer admission protocol changes are involved.
 
 `left UNION right` is admitted in one deliberately closed form: exactly two top-level, read-only
 queries, each ending in `RETURN`, followed by one global duplicate elimination. Column positions
@@ -1254,8 +1275,8 @@ supplied analysis. The same bounded expression-depth and parameter-count limits 
 combined statement; alias expansion used only for type proof is memoized and never rewrites the
 executable branch AST.
 
-`MATCH (a:Decision)-[r]->(b) RETURN a.id` is admitted literally, and it is the only untyped hop
-this engine reads. Those names and that label are part of the form: a relationship that names no
+`MATCH (a:Decision)-[r]->(b) RETURN a.id` is admitted literally as the standalone mandatory
+untyped-hop form. Those names and that label are part of that form: a relationship that names no
 type names no table, so the answer is defined only where the tables it could live in are, and
 they are the relationship tables whose `from_table` is `Decision`. They are enumerated in
 table_id order, and multiplicity is preserved in both directions -- two parallel edges between
@@ -1270,7 +1291,7 @@ fan-out. A candidate whose `to_table` the catalog does not hold fails before str
 the same door a typed hop uses; it is not filtered out, because filtering would answer with the
 sound tables and give no sign the answer was partial.
 
-Every other untyped spelling keeps the refusal and the message it already had: an incoming or
+Outside the correlated optional form described above, every other untyped spelling keeps its refusal: an incoming or
 undirected hop, an anonymous relationship, a written or implicit range, an inline map, a
 different source or target name, another label or none, a target carrying a label, a `WHERE`, a
 second pattern or `MATCH`, a named path, and any `RETURN` other than the single unaliased

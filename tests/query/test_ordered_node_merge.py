@@ -105,6 +105,43 @@ def test_ordered_merge_pushes_the_exact_pulse_cursor_and_matches_the_scan(
         assert ordered.statistics["rows_scanned"] < canonical.statistics["rows_scanned"]
 
 
+def test_ordered_merge_accepts_pulse_not_in_filter_without_changing_rows(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "database", page_size=512) as database:
+        _seed(database)
+        _create_ordered(database, "Decision", "Evidence")
+        text = PAGE.replace(
+            "coalesce(n.revocation_reason, '') <> 'source_deleted'",
+            "NOT (coalesce(n.revocation_reason, '') IN "
+            "['source_deleted', 'source_projection_removed'])",
+        )
+        parameters = {"minimum": 0.5, "maximum": 5}
+
+        assert any(
+            node.label == "OrderedNodeMerge" for node in database.explain(text).walk()
+        )
+        assert database.execute(text, parameters).rows == database.execute(
+            _canonical(text), parameters
+        ).rows
+
+
+def test_ordered_merge_rejects_not_in_with_a_potentially_refusing_operand(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "database", page_size=512) as database:
+        _seed(database)
+        _create_ordered(database, "Decision", "Evidence")
+        text = PAGE.replace(
+            "n.relevance_score >= $minimum",
+            "NOT ((10.0 / n.relevance_score) IN [1.0, 2.0])",
+        )
+
+        assert all(
+            node.label != "OrderedNodeMerge" for node in database.explain(text).walk()
+        )
+
+
 def test_ordered_merge_is_not_selected_until_every_table_has_the_capability(
     tmp_path: Path,
 ) -> None:

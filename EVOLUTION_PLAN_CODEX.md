@@ -4058,6 +4058,24 @@ sobrevivente danificada além do high-water quando seu WAL já foi reciclado. O 
 canônico permanecem disponíveis para rebuild; o índice não pode omitir dados silenciosamente.
 Nenhum invariante de WAL, OCC, snapshot, durabilidade ou multiwriter foi alterado.
 
+### Compatibilidade Discovery: OPTIONAL MATCH correlacionado (2026-09-07)
+
+Implementado no Grafx 0.0.4 o padrão genérico de nó obrigatório rotulado seguido de um hop
+opcional correlacionado, sem reconhecer nomes de consultas ou entidades do Pulse. Suporta
+direção incoming/outgoing/undirected, relação tipada ou não, filtro opcional, alvo rotulado ou
+polimórfico, agregação e janela. Preserva nós isolados, multiplicidade, snapshot e overlay do
+writer, além dos budgets existentes. Propriedades ausentes em bindings polimórficos são NULL;
+tipos incompatíveis entre tabelas são recusados antes de executar. Formas mais amplas continuam
+explicitamente recusadas; contrato completo em `docs/architecture/CONTRACT.md`.
+
+O adapter Community executa a consulta original de Key Decisions; não contém uma implementação
+especializada do ranking ou da consulta. A integração de teste prova graus e ranking exatos.
+A regressão agrupada do Grafx passou 421 testes (parser/planner, optional, polymorphic, untyped e
+ordered merge). Na API e na UI do Pulse 0.3.3, o board Okto Pulse retornou as 100 decisões do
+limite do card, sem warning, com graus de conectividade (máximo observado: 8). A auditoria dos
+demais 13 cards segue como pré-condição ao próximo lote de performance, separando lacunas
+genéricas do motor de defeitos de regra/projeção do Pulse.
+
 O teste do shape real revelou que o `AllNodesScan` também inclui a tabela interna `BoardMeta`,
 sem `created_at/id`. O planner agora a remove somente quando uma prova conservadora de lógica
 ternária demonstra que propriedades ausentes tornam o WHERE completo não verdadeiro; um `OR`

@@ -582,20 +582,16 @@ class _Parser:
                 unwind_clause = self._unwind_clause()
                 continue
             if (
-                clauses == 1
-                and self._at_keyword("OPTIONAL")
+                self._at_keyword("OPTIONAL")
                 and self._at_keyword("MATCH", ahead=1)
             ):
-                # Deliberately the NARROWEST recognition that can read the admitted form: the
-                # word is only a keyword as the FIRST clause and only immediately before MATCH.
-                # Anything else -- OPTIONAL after a MATCH, a second OPTIONAL MATCH, OPTIONAL
-                # before some other word -- falls through to the clause dispatch below and earns
-                # exactly the refusal it earned before this milestone, down to the message. That
-                # matters beyond taste: the corpus records the error text of every refused probe,
-                # so a refusal reworded here would move objects this milestone must not touch.
+                # Root optional nodes and correlated one-hop optional expansions have
+                # distinct shape checks. Validate the latter once RETURN is available.
+                if with_clauses or updating_clauses or return_clause is not None or unwind_clause is not None:
+                    raise self._refuse("OPTIONAL MATCH must precede projection and writes", field="clause")
                 self._advance()
                 clause = self._match_clause(optional=True)
-                defect = optional_clause_defect(clause)
+                defect = optional_clause_defect(clause) if clauses == 1 else None
                 if defect is not None:
                     message, value = defect
                     raise self._refuse(message, field="pattern", value=value)
@@ -659,13 +655,24 @@ class _Parser:
                 field="clause",
                 value="RETURN",
             )
-        return Query(
+        query = Query(
             unwind_clause=unwind_clause,
             match_clauses=tuple(match_clauses),
             with_clauses=tuple(with_clauses),
             updating_clauses=tuple(updating_clauses),
             return_clause=return_clause,
         )
+        if any(c.optional for c in match_clauses) and len(match_clauses) > 1:
+            from okto_grafx.domain.query.analysis import correlated_optional_hop
+
+            if correlated_optional_hop(query) is None:
+                raise self._refuse(
+                    "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop",
+                    field="clause", value="OPTIONAL MATCH",
+                )
+        elif optional_root and (unwind_clause is not None or with_clauses):
+            raise self._refuse("An OPTIONAL MATCH cannot follow UNWIND or WITH", field="clause")
+        return query
 
     def _unwind_clause(self) -> UnwindClause:
         """Parse ``UNWIND <expression> AS <alias>``."""

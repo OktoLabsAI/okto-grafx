@@ -391,11 +391,12 @@ class TraverseRelationship(PlanNode):
 
 @dataclass(frozen=True, slots=True)
 class TraverseAnyRelationship(PlanNode):
-    """One outgoing hop that names no type, walked across every table it could live in.
+    """One incident hop across eligible tables, optionally null-extending each anchor.
 
     A typed hop names its table and :class:`TraverseRelationship` walks it. An untyped hop names
-    none, and the honest answer is not to pick one: it is every relationship table that leaves
-    the source's label, walked in a fixed order so the same query answers the same way twice.
+    none, and the honest answer is not to pick one: it is every eligible relationship table.
+    Correlated optional hops additionally support incoming/undirected or typed expansion,
+    a target label and a predicate evaluated before per-anchor null extension.
 
     The tables are ordered by ``table_id``, which is the order the catalog assigned them and the
     only order that does not depend on how a name happens to sort. Multiplicity is preserved
@@ -411,6 +412,12 @@ class TraverseAnyRelationship(PlanNode):
     target: str
     relationship: str
     tables: tuple[TableDef, ...]
+    direction: Direction = Direction.OUTGOING
+    optional: bool = False
+    source_table: str | None = None
+    target_table: str | None = None
+    relationship_polymorphic: bool = False
+    predicate: Expression | None = None
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -418,11 +425,17 @@ class TraverseAnyRelationship(PlanNode):
 
     def details(self) -> Mapping[str, object]:
         """Return the endpoints and the tables this hop may live in, in walk order."""
-        return {
+        details = {
             "source": self.source,
             "target": self.target,
             "tables": ", ".join(table.name for table in self.tables),
         }
+        if self.optional:
+            details["optional"] = "true"
+            details["direction"] = self.direction.value
+            if self.predicate is not None:
+                details["predicate"] = self.predicate.describe()
+        return details
 
 
 @dataclass(frozen=True, slots=True)

@@ -6435,8 +6435,10 @@ def _traverse_any(
                     table,
                     catalog.table(table.from_table),
                     catalog.table(table.to_table),
-                    True,
-                    False,
+                    node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
+                    and (node.source_table is None or table.from_table == node.source_table),
+                    node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
+                    and (node.source_table is None or table.to_table == node.source_table),
                     ended,
                     changes,
                     pending,
@@ -6454,10 +6456,13 @@ def _traverse_any(
                 value=node.source,
             )
         identity = _overlay_identity(start)
+        matched = False
         for table, steps in walkers:
             for ref, version, next_table, next_id in steps(identity):
                 if charge_expansions:
                     context.admit_traversal_expansion()
+                if node.target_table is not None and next_table.name != node.target_table:
+                    continue
                 landing = node_at(next_table, next_id)
                 if landing is None:
                     continue
@@ -6470,17 +6475,28 @@ def _traverse_any(
                     table=next_table,
                     ref=landing_ref,
                     version=landing_version,
+                    polymorphic=node.optional and node.target_table is None,
                 )
                 bindings[node.relationship] = RowBinding(
                     variable=node.relationship,
                     table=table,
                     ref=ref,
                     version=version,
+                    polymorphic=node.relationship_polymorphic,
                 )
                 context.count("rows_scanned")
-                yield _Row(
+                candidate = _Row(
                     bindings=bindings, computed=row.computed, columns=row.columns
                 )
+                if node.predicate is not None and not _predicate_admits(node.predicate, candidate, context):
+                    continue
+                matched = True
+                yield candidate
+        if node.optional and not matched:
+            bindings = dict(row.bindings)
+            bindings[node.target] = None
+            bindings[node.relationship] = None
+            yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
 
 def _relationship_scan(

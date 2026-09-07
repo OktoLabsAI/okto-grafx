@@ -729,14 +729,47 @@ def exact_path_projection(query: Query) -> PatternPath | None:
     return pattern
 
 
-def optional_match_refusal(query: Query) -> tuple[str, str] | None:
-    """Return the refusal an OPTIONAL MATCH earns outside the one admitted shape, or None.
+def correlated_optional_hop(query: Query) -> PatternPath | None:
+    """Recognize a labelled node followed by a correlated, single optional hop.
 
-    The admitted shape is narrow on purpose: the first and only clause of a read-only query,
-    one pattern, one named node, one label, no inline map. Everything a wider OPTIONAL MATCH
-    would need -- a null-extended traversal, a second clause deciding what "no match" means for
-    names bound above it -- is a different milestone, and answering those forms half-way would
-    be worse than refusing them.
+    Names, labels, direction, projection and row windows are caller-defined.
+    Wider optional joins remain refused until they have execution semantics.
+    """
+    if (len(query.match_clauses) != 2 or query.unwind_clause is not None
+            or query.with_clauses or query.updating_clauses or query.return_clause is None):
+        return None
+    root, optional = query.match_clauses
+    if root.optional is not False or optional.optional is not True:
+        return None
+    if len(root.patterns) != 1 or len(optional.patterns) != 1:
+        return None
+    base, hop = root.patterns[0], optional.patterns[0]
+    if (base.variable is not None or base.relationships or len(base.nodes) != 1
+            or hop.variable is not None or len(hop.nodes) != 2 or len(hop.relationships) != 1):
+        return None
+    anchor = base.nodes[0]
+    source, target = hop.nodes
+    edge = hop.relationships[0]
+    if (not anchor.variable or len(anchor.labels) != 1
+            or source.variable != anchor.variable
+            or source.labels not in ((), anchor.labels)
+            or source.properties is not None or target.properties is not None
+            or len(target.labels) > 1 or len(edge.types) > 1
+            or edge.properties is not None or edge.hop_range_written
+            or edge.min_hops != 1 or edge.max_hops != 1
+            or type(edge.direction) is not Direction):
+        return None
+    names = [name for name in (anchor.variable, target.variable, edge.variable) if name]
+    if len(names) != len(set(names)):
+        return None
+    return hop
+
+
+def optional_match_refusal(query: Query) -> tuple[str, str] | None:
+    """Refuse OPTIONAL MATCH outside the root-node and correlated single-hop forms.
+
+    Root-node optional queries extend an empty scan once. Correlated optional hops extend each
+    unmatched anchor separately, after the optional predicate. Wider joins remain refused.
 
     Asked at both doors, and for EVERY query rather than only the ones the parser marked. A tree
     built by hand reaches ``analyze`` and a caller's own analysis reaches ``build_plan``, and the
@@ -756,10 +789,11 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
     optional = [clause for clause in query.match_clauses if clause.optional]
     if not optional:
         return None
+    if correlated_optional_hop(query) is not None:
+        return None
     if len(query.match_clauses) != 1:
         return (
-            "An OPTIONAL MATCH is the only pattern clause of a query in this subset; it may "
-            "not be chained with another MATCH.",
+            "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop.",
             "clause",
         )
     if query.unwind_clause is not None or query.with_clauses or query.updating_clauses:
