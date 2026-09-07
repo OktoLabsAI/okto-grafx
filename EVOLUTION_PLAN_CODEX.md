@@ -4395,3 +4395,18 @@ teste específico de DDL estrangeiro; Ruff passou. Documento e fronteiras:
 Implementação validada em fonte e em novas conexões diagnósticas; ainda não
 carregada pelo Pulse PID 15796, reservada ao próximo deploy acumulado. Nenhuma
 spec consumida. A carga fria completa continua pendente, sem novo gate de timing.
+
+### Censo concorrente — hipótese testada e rejeitada
+
+No Pulse PID 15796, grafo/censo isolados responderam em 0,884/3,770 s; juntos
+com Health, em 1,610/10,995 s, com os mesmos totais e HTTP 200. A fase de contagem
+de relações subiu de 2,659 para 10,328 s mesmo com páginas de nós em cache.
+Isso confirma custo dependente do workload, ainda sem atribuição causal a lock,
+GIL ou storage. Nenhum worker foi desligado nem se restringiu a concorrência.
+
+Uma extensão experimental de projeção para agregações passou 66 testes, mas
+não mostrou ganho consistente no censo real: medianas full/projetada
+0,287/0,307 s. A tentativa foi retirada; não faz parte do produto nem do deploy.
+Não haverá rodada longa buscando ganho marginal nessa hipótese. Evidências,
+limitações e decisão: `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
+O foco continua no custo concorrente dominante; nenhuma spec reservada consumida.

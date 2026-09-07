@@ -619,3 +619,12 @@ The real-board sample reduced 366 adoptions to 183 with opening medians
 slices passed (15 and 57, overlapping), plus a targeted foreign-DDL test.
 See `docs/READ_ONLY_SINGLE_ADOPTION_0_0_4.md`. Queue this change for accumulated
 Pulse deployment; PID 15796 is not claimed to have loaded it yet.
+
+Concurrent workload check: isolated graph/stats took 0.884/3.770 s; alongside
+Health they took 1.610/10.995 s with identical counts and HTTP 200. The residual
+is not yet attributed to a specific lock/GIL/storage cause. A native aggregate
+projection candidate passed 66 focused tests but showed no consistent real-board
+timing gain (warm medians full/projected 0.287/0.307 s), so it was withdrawn,
+not integrated. No separate spill feature or prolonged marginal gate was added.
+See `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`; the existing concurrent-read
+investigation remains the next target. Reserved specs and durability are untouched.
