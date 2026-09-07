@@ -34,6 +34,7 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.index.catalog import (
     IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+    ORDERED_SECONDARY_INDEXES_V1_CAPABILITY,
     CatalogIndexDefinition,
     IndexGenerationDescriptor,
     IndexGenerationState,
@@ -41,10 +42,12 @@ from okto_grafx.domain.index.catalog import (
 )
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
+    ORDERED_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import (
     SPACE_STATE_ACTIVE,
@@ -61,6 +64,7 @@ __all__ = [
     "CATALOG_MAGIC",
     "CATALOG_FORMAT_VERSION",
     "HEAP_RECLAIM_V1_CAPABILITY",
+    "ORDERED_SECONDARY_INDEXES_V1_CAPABILITY",
     "WAL_RECORD_V2_CAPABILITY",
     "Catalog",
 ]
@@ -95,14 +99,21 @@ _MAX_TEXT = 0xFFFF
 _IDENTITY_SECONDARY_INDEXES_V1_BIT = 1 << 0
 _HEAP_RECLAIM_V1_BIT = 1 << 1
 _WAL_RECORD_V2_BIT = 1 << 2
+_ORDERED_SECONDARY_INDEXES_V1_BIT = 1 << 3
 _KNOWN_CAPABILITY_BITS = (
-    _IDENTITY_SECONDARY_INDEXES_V1_BIT | _HEAP_RECLAIM_V1_BIT | _WAL_RECORD_V2_BIT
+    _IDENTITY_SECONDARY_INDEXES_V1_BIT
+    | _HEAP_RECLAIM_V1_BIT
+    | _WAL_RECORD_V2_BIT
+    | _ORDERED_SECONDARY_INDEXES_V1_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
         IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT,
         HEAP_RECLAIM_V1_CAPABILITY: _HEAP_RECLAIM_V1_BIT,
         WAL_RECORD_V2_CAPABILITY: _WAL_RECORD_V2_BIT,
+        ORDERED_SECONDARY_INDEXES_V1_CAPABILITY: (
+            _ORDERED_SECONDARY_INDEXES_V1_BIT
+        ),
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -110,7 +121,11 @@ _TAG_TO_VISIBILITY = MappingProxyType(
     {value: key for key, value in _VISIBILITY_TO_TAG.items()}
 )
 _DERIVATION_TO_TAG = MappingProxyType(
-    {COLUMN_KEY_DERIVATION: 1, RECORD_ID_KEY_DERIVATION: 2}
+    {
+        COLUMN_KEY_DERIVATION: 1,
+        RECORD_ID_KEY_DERIVATION: 2,
+        ORDERED_KEY_DERIVATION: 3,
+    }
 )
 _TAG_TO_DERIVATION = MappingProxyType(
     {value: key for key, value in _DERIVATION_TO_TAG.items()}
@@ -123,6 +138,12 @@ _STATE_TO_TAG = MappingProxyType(
     }
 )
 _TAG_TO_STATE = MappingProxyType({value: key for key, value in _STATE_TO_TAG.items()})
+_LAYOUT_TO_TAG = MappingProxyType(
+    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1}
+)
+_TAG_TO_LAYOUT = MappingProxyType(
+    {value: key for key, value in _LAYOUT_TO_TAG.items()}
+)
 
 
 class Catalog:
@@ -404,9 +425,13 @@ class Catalog:
                 supported=CATALOG_FORMAT_VERSION,
             )
         self._format_version = CATALOG_FORMAT_VERSION
-        self._required_capabilities = frozenset(
-            (IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,)
-        )
+        capabilities = {IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY}
+        if any(
+            definition.layout is IndexLayout.ORDERED
+            for definition in validated.values()
+        ):
+            capabilities.add(ORDERED_SECONDARY_INDEXES_V1_CAPABILITY)
+        self._required_capabilities = frozenset(capabilities)
         self._install_indexes(validated)
         return self
 
@@ -418,6 +443,13 @@ class Catalog:
         self._require_index_catalog()
         proposed = (*self.index_definitions(), definition)
         validated = self._validated_index_authority(proposed, stored=False)
+        if definition.layout is IndexLayout.ORDERED:
+            self._required_capabilities = frozenset(
+                (
+                    *self._required_capabilities,
+                    ORDERED_SECONDARY_INDEXES_V1_CAPABILITY,
+                )
+            )
         self._install_indexes(validated)
         return definition
 
@@ -621,6 +653,13 @@ class Catalog:
                     "Catalog format 2 requires identity_secondary_indexes_v1.",
                     field="required_capabilities",
                 )
+            if any(
+                definition.layout is IndexLayout.ORDERED for definition in indexes
+            ) and not capability_bits & _ORDERED_SECONDARY_INDEXES_V1_BIT:
+                raise GrafxConfigurationError(
+                    "An ordered index requires ordered_secondary_indexes_v1.",
+                    field="required_capabilities",
+                )
         parts: list[bytes] = [
             _PREAMBLE.pack(
                 CATALOG_MAGIC,
@@ -786,6 +825,17 @@ class Catalog:
             _require_canonical_order(tables, spaces, indexes)
         catalog._install_loaded(tables, spaces)
         if format_version == CATALOG_FORMAT_VERSION:
+            if any(
+                definition.layout is IndexLayout.ORDERED for definition in indexes
+            ) and (
+                ORDERED_SECONDARY_INDEXES_V1_CAPABILITY
+                not in required_capabilities
+            ):
+                raise GrafxCorruptionDetected(
+                    "The catalog carries an ordered index without its required capability.",
+                    field="required_capabilities",
+                    value=ORDERED_SECONDARY_INDEXES_V1_CAPABILITY,
+                )
             validated = catalog._validated_index_authority(
                 indexes,
                 stored=True,
@@ -931,6 +981,25 @@ class Catalog:
                         f"{table.name!r}, whose stored arity is {stored_arity}.",
                         field="positions",
                         value=position,
+                        index=definition.name,
+                    )
+            if definition.layout is IndexLayout.ORDERED:
+                if table.kind != "node":
+                    refuse(
+                        f"Ordered index {definition.name!r} belongs to a node table.",
+                        field="table_id",
+                        value=definition.table_id,
+                        index=definition.name,
+                    )
+                first, second = (
+                    table.columns[position] for position in definition.positions
+                )
+                if first.type is not ValueType.TIMESTAMP or second.type is not ValueType.STRING:
+                    refuse(
+                        f"Ordered index {definition.name!r} requires TIMESTAMP then STRING; "
+                        f"got {first.type.name} then {second.type.name}.",
+                        field="positions",
+                        value=definition.positions,
                         index=definition.name,
                     )
 
@@ -1094,6 +1163,7 @@ def _logical_index_identity(definition: CatalogIndexDefinition) -> tuple[object,
         definition.positions,
         definition.visibility,
         definition.key_derivation,
+        definition.layout,
         definition.automatic,
     )
 
@@ -1113,6 +1183,7 @@ def _matches_automatic_exact(
         and definition.positions == candidate.positions
         and definition.visibility is candidate.visibility
         and definition.key_derivation == candidate.key_derivation
+        and definition.layout is candidate.layout
     )
 
 
@@ -1168,6 +1239,7 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
     try:
         visibility_tag = _VISIBILITY_TO_TAG[definition.visibility]
         derivation_tag = _DERIVATION_TO_TAG[definition.key_derivation]
+        layout_tag = _LAYOUT_TO_TAG[definition.layout]
     except KeyError as failure:
         raise GrafxConfigurationError(
             f"Index {definition.name!r} uses a contract catalog format 2 cannot encode.",
@@ -1182,7 +1254,7 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
             visibility_tag,
             derivation_tag,
             1 if definition.automatic else 0,
-            0,
+            layout_tag,
             len(definition.positions),
             len(definition.generations),
             definition.expected_cardinality or 0,
@@ -1215,17 +1287,18 @@ def _decode_catalog_index(
         visibility_tag,
         derivation_tag,
         automatic,
-        reserved,
+        layout_tag,
         position_count,
         generation_count,
         expected_cardinality,
     ) = _INDEX_META.unpack_from(raw, offset)
     offset += _INDEX_META.size
-    if reserved != 0:
+    layout = _TAG_TO_LAYOUT.get(layout_tag)
+    if layout is None:
         raise GrafxCorruptionDetected(
-            f"Index {name!r} has a non-zero reserved metadata byte.",
-            field="reserved",
-            value=reserved,
+            f"Index {name!r} declares unknown layout tag {layout_tag}.",
+            field="layout",
+            value=layout_tag,
             index=name,
         )
     visibility = _TAG_TO_VISIBILITY.get(visibility_tag)
@@ -1295,6 +1368,7 @@ def _decode_catalog_index(
             positions=tuple(positions),
             visibility=visibility,
             key_derivation=key_derivation,
+            layout=layout,
             automatic=automatic == 1,
             expected_cardinality=expected_cardinality or None,
             generations=tuple(generations),

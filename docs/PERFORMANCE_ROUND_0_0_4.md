@@ -342,10 +342,21 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    avança com uma materialização destacada e limitada ou um acesso ordenado persistido que prove
    a geração/snapshot, preserve as recusas fail-closed e não retenha leitores durante o tempo de
    interação do usuário; o atalho ingênuo foi encerrado como **NO-GO**.
-7. **Próximo alvo:** CURSOR-1 permanece estrutural porque o custo observado continua `O(P*N)`.
-   Sua solução exige uma cerca explícita de geração/snapshot ou um access path persistido com
-   migração e recovery; nenhuma das duas alternativas será introduzida como efeito colateral de
-   um ajuste local de planner.
+7. **CURSOR-1 selecionado após revisão adversarial:** a materialização destacada foi rejeitada
+   porque torna a primeira página estritamente mais cara e é invalidada pelas escritas frequentes
+   do Pulse, restaurando `O(P*N)`. O consenso Claude/Codex selecionou um índice exato ordenado,
+   persistente e copy-on-write em `(TIMESTAMP, STRING)`, com revalidação obrigatória no heap.
+   `docs/ORDERED_CURSOR_ACCESS_0_0_4.md` congela o desenho, incluindo duas páginas físicas de
+   descritor de raiz, watermark de redo no mesmo descritor, páginas imutáveis append-only,
+   publicação `WAL -> COW -> raiz -> commit-state`, rebuild compactante e fallback canônico.
+8. **OIX-0 implementado:** o catálogo continua em formato 2 e ganhou a capability obrigatória
+   `ordered_secondary_indexes_v1`; o byte reservado de metadados passou a discriminar layout sem
+   alterar os bytes de índices hash. O header ordenado usa formato 3, as páginas têm tipos próprios
+   e as duas raízes físicas têm payload checksummed. Uma versão 0.0.3 recusa a capability antes de
+   interpretar o record; `HashIndex` recusa o layout ordenado até o store dedicado existir. O
+   corpus focado passou 174 testes e a regressão completa de `tests/index` passou a 100%; Ruff,
+   compileall e diff-check estão verdes. O handoff `NODE-IN-SEEK`
+   `hof_f05eb759297a4598845a9d312d9c339c` segue independente em worktree isolado.
 
 ## Explicit decision queue
 
@@ -411,3 +422,10 @@ adversarial review narrowed the proof from an allocation counter to the exclusiv
 extent, and the real board confirmed 43 fewer relationship scans with identical results, though
 without a material wall-time gain. No item in this wave changes writer/reader
 participation, snapshot visibility, either OCC validation or durability semantics.
+
+CURSOR-1 was then resolved through Nexus trace
+`trc_c2b021d3d44c4ec69ab96cdbbf8fc818`. Claude's detached-spine proposal was rejected after both
+agents agreed that it adds work to the first page and loses its benefit whenever Pulse advances
+the node frontier. The accepted persistent ordered design and F1--F7 safety conditions are frozen
+in `docs/ORDERED_CURSOR_ACCESS_0_0_4.md`; OIX-0 is implemented, while Claude owns the independent
+`NODE-IN-SEEK` handoff `hof_f05eb759297a4598845a9d312d9c339c`.

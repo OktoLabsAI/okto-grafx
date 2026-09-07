@@ -43,6 +43,18 @@
   geração/snapshot e sem relaxar recusas fail-closed. Rastreabilidade e medições estão em
   `docs/PERFORMANCE_ROUND_0_0_4.md`.
 
+  A revisão adversarial posterior encerrou a alternativa de materialização destacada: ela
+  adicionava o scan/sort integral à primeira página e seria invalidada pelas escritas frequentes
+  do Pulse, restaurando `O(P*N)`. Claude e Codex acordaram o índice exato ordenado persistente
+  copy-on-write descrito em `docs/ORDERED_CURSOR_ACCESS_0_0_4.md`. O primeiro checkpoint OIX-0 já
+  está implementado: capability de catálogo fail-closed sem elevar o formato do catálogo,
+  discriminação de layout sem mudar bytes hash legados, header ordenado formato 3, tipos de página
+  próprios e dois descritores físicos de raiz com checksum e watermark de redo. O digest hash
+  legado ficou byte-exato; uma versão 0.0.3 recusa o bit desconhecido antes de interpretar o
+  índice; e o `HashIndex` não pode abrir acidentalmente um layout ordenado. O corpus focado passou
+  174 testes e toda `tests/index` passou. O seek de múltiplas PKs `NODE-IN-SEEK` segue em paralelo
+  no handoff `hof_f05eb759297a4598845a9d312d9c339c`.
+
 - **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
   estão publicados até `ed3ce95`; o memo transacional de resolução de PK entrou em `04aa244` com
   cercas de transação/snapshot/store/revisão/época/geração, LRU de 4.096 entradas dentro da quota

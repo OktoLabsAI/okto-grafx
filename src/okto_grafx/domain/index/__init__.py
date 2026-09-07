@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from okto_grafx.domain.index.catalog import (
     IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+    ORDERED_SECONDARY_INDEXES_V1_CAPABILITY,
     CatalogIndexDefinition,
     IndexGenerationDescriptor,
     IndexGenerationState,
@@ -25,12 +26,14 @@ from okto_grafx.domain.index.definition import (
     DEFINITION_DIGEST_SIZE,
     INDEX_DIRECTORY,
     INDEX_FILE_SUFFIX,
+    ORDERED_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     index_file,
     index_generation_file,
     require_index_name,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.entry import (
     ENTRY_FLAG_VERSIONED,
     INDEX_ENTRY_HEADER_SIZE,
@@ -41,6 +44,8 @@ from okto_grafx.domain.index.header import (
     INDEX_HEADER_FORMAT_VERSION,
     INDEX_HEADER_SIZE,
     INDEX_HEADER_SLOT,
+    ORDERED_INDEX_HEADER_FORMAT_VERSION,
+    ORDERED_INDEX_HEADER_SIZE,
     IndexHeader,
 )
 from okto_grafx.domain.index.keys import (
@@ -57,6 +62,15 @@ from okto_grafx.domain.index.keys import (
     record_id_key,
     rehash_index_sizing,
     validate_bucket_count,
+)
+from okto_grafx.domain.index.ordered_root import (
+    FIRST_ORDERED_TREE_PAGE,
+    ORDERED_ROOT_DESCRIPTOR_FORMAT_VERSION,
+    ORDERED_ROOT_DESCRIPTOR_MAGIC,
+    ORDERED_ROOT_DESCRIPTOR_SIZE,
+    ORDERED_ROOT_PAGE_A,
+    ORDERED_ROOT_PAGE_B,
+    OrderedRootDescriptor,
 )
 from okto_grafx.domain.index.records import (
     CHANGE_FLAG_VERSIONED,
@@ -82,6 +96,7 @@ __all__ = [
     "DEFAULT_BUCKET_COUNT",
     "DEFINITION_DIGEST_SIZE",
     "ENTRY_FLAG_VERSIONED",
+    "FIRST_ORDERED_TREE_PAGE",
     "INDEX_CHANGE_FORMAT_VERSION",
     "INDEX_CHANGE_HEADER_SIZE",
     "INDEX_DIRECTORY",
@@ -91,6 +106,15 @@ __all__ = [
     "INDEX_HEADER_SIZE",
     "INDEX_HEADER_SLOT",
     "IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY",
+    "ORDERED_KEY_DERIVATION",
+    "ORDERED_INDEX_HEADER_FORMAT_VERSION",
+    "ORDERED_INDEX_HEADER_SIZE",
+    "ORDERED_ROOT_DESCRIPTOR_FORMAT_VERSION",
+    "ORDERED_ROOT_DESCRIPTOR_MAGIC",
+    "ORDERED_ROOT_DESCRIPTOR_SIZE",
+    "ORDERED_ROOT_PAGE_A",
+    "ORDERED_ROOT_PAGE_B",
+    "ORDERED_SECONDARY_INDEXES_V1_CAPABILITY",
     "MAX_BUCKET_COUNT",
     "MAX_EXPECTED_CARDINALITY",
     "MAX_INDEX_KEY_BYTES",
@@ -105,8 +129,10 @@ __all__ = [
     "IndexGenerationDescriptor",
     "IndexGenerationState",
     "IndexHeader",
+    "IndexLayout",
     "IndexOperation",
     "IndexVisibility",
+    "OrderedRootDescriptor",
     "ReconcileReport",
     "SecondaryIndex",
     "SnapshotLike",

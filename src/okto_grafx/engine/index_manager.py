@@ -101,6 +101,7 @@ from okto_grafx.domain.index.header import (
     INDEX_HEADER_SLOT,
     IndexHeader,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.records import (
     IndexChange,
@@ -3907,6 +3908,14 @@ class HashIndex(IndexStore):
                 f"declares {definition.visibility.value}.",
                 field="visibility",
                 value=definition.visibility.value,
+                index=definition.name,
+            )
+        if definition.layout is not IndexLayout.HASH:
+            raise GrafxIndexError(
+                f"A HashIndex cannot open the {definition.layout.value!r} layout declared by "
+                f"definition {definition.name!r}.",
+                field="layout",
+                value=definition.layout.value,
                 index=definition.name,
             )
         super().__init__(definition, pool, metrics)
