@@ -60,6 +60,7 @@ __all__ = [
     "IndexSeek",
     "LimitRows",
     "MergePattern",
+    "NodeMultiKeySeek",
     "NodeScan",
     "OptionalRows",
     "PlanNode",
@@ -415,6 +416,42 @@ class RelationshipScan(PlanNode):
         if self.predicate is not None:
             details["predicate"] = self.predicate.describe()
         return details
+
+
+@dataclass(frozen=True, slots=True)
+class NodeMultiKeySeek(PlanNode):
+    """Resolve a closed primary-key list of one node table through its exact multi-key index.
+
+    The operator is admitted only for a standalone labelled node whose first local term is
+    ``n.<primary key> IN $parameter``.  ``fallback`` is the canonical scan of the same table for
+    the same statement, and the predicate itself stays above this operator, replayed over every
+    row either path produces: a missing/stale capability, a probe that is not a list or that the
+    durable key cannot represent, or a table this transaction has already written change only
+    the access path, never the answer or the refusal.  The runtime still validates every
+    exact-index candidate against the heap under the transaction snapshot before yielding it.
+    """
+
+    fallback: PlanNode
+    variable: str
+    table: TableDef
+    keys: Expression
+    key_position: int
+    index: str
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the exact canonical fallback retained by this access path."""
+        return (self.fallback,)
+
+    def details(self) -> Mapping[str, object]:
+        """Describe the closed predicate and the exact index it needs."""
+        return {
+            "variable": self.variable,
+            "table": self.table.name,
+            "index": self.index,
+            "predicate": (
+                f"{self.variable}.{self.table.primary_key} IN {self.keys.describe()}"
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)

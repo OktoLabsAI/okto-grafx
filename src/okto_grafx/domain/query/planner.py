@@ -118,6 +118,7 @@ from okto_grafx.domain.query.plan import (
     IndexSeek,
     LimitRows,
     MergePattern,
+    NodeMultiKeySeek,
     NodeScan,
     OptionalRows,
     PlanNode,
@@ -2325,7 +2326,71 @@ class _Planner:
         seek, remaining = self._index_seek(pipeline, variable, table, terms)
         if seek is not None:
             return seek, remaining, variable
+        if standalone:
+            keyed = self._node_multi_key_seek(pipeline, variable, table, terms)
+            if keyed is not None:
+                return keyed, terms, variable
         return NodeScan(child=pipeline, variable=variable, table=table), terms, variable
+
+    def _node_multi_key_seek(
+        self,
+        pipeline: PlanNode,
+        variable: str,
+        table: TableDef,
+        terms: Sequence[Expression],
+    ) -> PlanNode | None:
+        """Return the multi-key seek for ``n.pk IN $keys`` leading a standalone labelled node.
+
+        NODE-IN-SEEK.  The term must be the first local term of the conjunction: seeking on a
+        later conjunct would evaluate it before the terms written ahead of it and could suppress
+        a refusal the scan path raises on every row the seek eliminates.  Only a parameter list
+        is admitted; a literal list, a non-primary-key column, a polymorphic node, a nested
+        pattern and a table without its automatic exact primary-key index keep the scan.  No
+        term is consumed: the whole conjunction stays above the seek exactly as it stays above
+        the scan, so both paths judge, refuse and count the predicate the same way.
+        """
+        if type(pipeline) is not SingleRow or not terms or table.primary_key is None:
+            return None
+        term = terms[0]
+        if (
+            not isinstance(term, BinaryOperation)
+            or term.operator != "IN"
+            or not isinstance(term.left, Property)
+            or not isinstance(term.left.subject, Variable)
+            or term.left.subject.name != variable
+            or term.left.key != table.primary_key
+            or not isinstance(term.right, Parameter)
+        ):
+            return None
+        position = table.column_index(table.primary_key)
+        automatic = {
+            definition.name
+            for definition in automatic_index_definitions(table)
+            if definition.positions == (position,)
+            and definition.visibility is IndexVisibility.EXACT
+            and definition.key_derivation == COLUMN_KEY_DERIVATION
+        }
+        chosen: IndexDefinition | None = None
+        for definition in self.indexes:
+            if (
+                definition.name in automatic
+                and index_definition_matches_table(definition, table)
+                and definition.visibility is IndexVisibility.EXACT
+                and definition.key_derivation == COLUMN_KEY_DERIVATION
+                and definition.positions == (position,)
+            ):
+                chosen = definition
+                break
+        if chosen is None:
+            return None
+        return NodeMultiKeySeek(
+            fallback=NodeScan(child=pipeline, variable=variable, table=table),
+            variable=variable,
+            table=table,
+            keys=term.right,
+            key_position=position,
+            index=chosen.name,
+        )
 
     def _match_every_node(
         self,

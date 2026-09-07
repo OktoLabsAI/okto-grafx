@@ -108,6 +108,7 @@ from okto_grafx.engine.index_manager import (
 )
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID
 from okto_grafx.engine.vector_engine import VectorEngine
+from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import (
     ENDPOINT_COLUMNS,
@@ -204,6 +205,7 @@ from okto_grafx.domain.query.plan import (
     IndexSeek,
     LimitRows,
     MergePattern,
+    NodeMultiKeySeek,
     NodeScan,
     OptionalRows,
     PlanNode,
@@ -6853,6 +6855,127 @@ def _memoized_primary_key_groups(
     return groups
 
 
+def _node_multi_key_seek(
+    engine: QueryEngine, node: NodeMultiKeySeek, context: _Context
+) -> Iterator[_Row]:
+    """Read a closed primary-key list of one node table through its exact multi-key index.
+
+    NODE-IN-SEEK.  Capability selection happens before the first lookup: a missing/stale store,
+    an engine without the multi-key door, a table this transaction has written, a probe that is
+    not a list or a probe the durable key cannot represent completely all execute the retained
+    canonical scan, which sits under the very same predicate as this operator, so the scan
+    judges, refuses and counts exactly what it judged before.  Every later refusal propagates:
+    falling back after a partial certified read could hide a generation replacement or a corrupt
+    heap candidate.  Hits are validated against the heap under the snapshot and yielded in heap
+    order, the order the scan yields them, so LIMIT and every operator above observe the same
+    sequence either way.
+    """
+
+    manager = engine._indexes
+    many = getattr(manager, "validated_versions_many", None)
+    authority = context.index_authority
+    if manager is None or not callable(many) or authority is None:
+        yield from engine._rows(node.fallback, context)
+        return
+
+    position = node.key_position
+    store = authority.named(node.index)
+    definition = getattr(store, "definition", None)
+    if (
+        store is None
+        or not isinstance(definition, IndexDefinition)
+        or definition.name != node.index
+        or definition.table_id != node.table.table_id
+        or definition.table_name != node.table.name
+        or definition.positions != (position,)
+        or definition.key_derivation != COLUMN_KEY_DERIVATION
+        or definition.visibility is not IndexVisibility.EXACT
+        or getattr(store, "stale", True) is not False
+    ):
+        yield from engine._rows(node.fallback, context)
+        return
+
+    if node.table.table_id in _intent_table_ids(engine, context.txn):
+        # An exact index describes only durable heap versions: the owner's pending rows and
+        # pending keys are visible only to the scan's logical overlay.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    raw = _evaluate(node.keys, _Row(bindings={}), context)
+    if raw is None:
+        # ``x IN NULL`` is UNKNOWN for every row, exactly as the incident seek treats it.
+        return
+    if type(raw) not in (list, tuple):
+        # Preserve the canonical IN refusal (and custom Sequence behaviour) in the fallback.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    # Freeze a caller-owned list before encoding so one execution never observes a moving
+    # parameter frontier while it is opening durable index certificates.
+    unique: dict[bytes, Value] = {}
+    for value in tuple(raw):
+        if value is None:
+            continue
+        if not _exact_probe_is_encoding_complete(node.table, (position,), (value,)):
+            yield from engine._rows(node.fallback, context)
+            return
+        template: list[Value] = [None] * node.table.arity
+        template[position] = cast(Value, value)
+        try:
+            key = index_key(template, (position,))
+        except (GrafxIndexError, SchemaMismatchError):
+            # The encoder refuses only the probe's own shape (a lone surrogate, a form the key
+            # cannot carry); the scan compares that probe by value and raises nothing, so the
+            # scan keeps the answer.  No certificate has been opened yet.
+            yield from engine._rows(node.fallback, context)
+            return
+        unique.setdefault(key, cast(Value, value))
+
+    keys = tuple(unique)
+    groups = _memoized_primary_key_groups(
+        engine, context, manager, store, keys, node.table, position, many
+    )
+    if len(groups) != len(keys):
+        raise GrafxIndexError(
+            f"Multi-key validation for index {node.index!r} returned {len(groups)} result "
+            f"groups for {len(keys)} keys.",
+            field="index_batch",
+            index=node.index,
+            expected=len(keys),
+            observed=len(groups),
+        )
+    resolved: dict[RecordId, tuple[object, HeapVersion]] = {}
+    for (_key, value), hits in zip(unique.items(), groups, strict=True):
+        for ref, version in hits:
+            if not _equal(version.values[position], value):
+                continue
+            previous = resolved.setdefault(version.record_id, (ref, version))
+            if previous[0] != ref:
+                raise GrafxCorruptionDetected(
+                    f"Primary-key index {node.index!r} resolved one snapshot-visible key to "
+                    f"multiple rows of {node.table.name!r}.",
+                    table=node.table.name,
+                    table_id=node.table.table_id,
+                    field="primary_key",
+                    index=node.index,
+                )
+    ordered = sorted(
+        resolved.values(), key=lambda item: cast(RecordRef, item[0]).encode()
+    )
+    for ref, version in ordered:
+        context.count("rows_seeked")
+        yield _Row(
+            bindings={
+                node.variable: RowBinding(
+                    variable=node.variable,
+                    table=node.table,
+                    ref=ref,
+                    version=version,
+                )
+            }
+        )
+
+
 def _relationship_incident_seek(
     engine: QueryEngine, node: RelationshipIncidentSeek, context: _Context
 ) -> Iterator[_Row]:
@@ -13167,6 +13290,7 @@ _HANDLERS: dict[type, _Handler] = {
     WithRows: _with_rows,  # type: ignore[dict-item]
     AllNodesScan: _all_nodes_scan,  # type: ignore[dict-item]
     NodeScan: _node_scan,  # type: ignore[dict-item]
+    NodeMultiKeySeek: _node_multi_key_seek,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
