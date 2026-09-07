@@ -6864,11 +6864,16 @@ def _node_multi_key_seek(
     an engine without the multi-key door, a table this transaction has written, a probe that is
     not a list or a probe the durable key cannot represent completely all execute the retained
     canonical scan, which sits under the very same predicate as this operator, so the scan
-    judges, refuses and counts exactly what it judged before.  Every later refusal propagates:
-    falling back after a partial certified read could hide a generation replacement or a corrupt
-    heap candidate.  Hits are validated against the heap under the snapshot and yielded in heap
-    order, the order the scan yields them, so LIMIT and every operator above observe the same
-    sequence either way.
+    judges, refuses and counts exactly what it judged before.  The durable allocation frontier
+    then selects the scan for a small table before any index certificate is opened, by the
+    rule the incident seek measured: every probe is a validated bucket read and a landing,
+    every scanned row one decode, so a table whose ids ever allocated are at most half the
+    distinct probes is cheaper to walk (measured on a 182-row table: 40 probes seek in 21-28 ms
+    against a 33-69 ms scan, 500 probes seek in 103-181 ms against a 63-105 ms scan).  Every
+    later refusal propagates: falling back after a partial certified read could hide a
+    generation replacement or a corrupt heap candidate.  Hits are validated against the heap
+    under the snapshot and yielded in heap order, the order the scan yields them, so LIMIT and
+    every operator above observe the same sequence either way.
     """
 
     manager = engine._indexes
@@ -6912,8 +6917,31 @@ def _node_multi_key_seek(
 
     # Freeze a caller-owned list before encoding so one execution never observes a moving
     # parameter frontier while it is opening durable index certificates.
+    values = tuple(raw)
+
+    # next_record_id is the durable O(1) upper bound strictly beyond every identity ever
+    # allocated for this table; deletions can only overestimate its live cardinality, which
+    # conservatively favours the seek.  A table without an extent never allocated a page and
+    # holds no stored row (its pending rows were excluded above), so it answers empty without
+    # a scan or a certificate; a table whose pages exist keeps the canonical scan, which walks
+    # and validates that physical chain.  The comparison uses integers so the boundary is
+    # exact and deterministic on every platform.
+    extent = engine.heap.extent_of(node.table)
+    allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
+
+    def small_table() -> Iterator[_Row]:
+        if extent is not None:
+            yield from engine._rows(node.fallback, context)
+
+    # KGRUN-M3: exact ASCII strings count their distinct keys without encoding; any other
+    # probe shape takes the encoding route below, which remains the single oracle.
+    exact_frontier = _string_probe_frontier(node.table, position, values)
+    if exact_frontier is not None and allocated_upper * 2 <= exact_frontier:
+        yield from small_table()
+        return
+
     unique: dict[bytes, Value] = {}
-    for value in tuple(raw):
+    for value in values:
         if value is None:
             continue
         if not _exact_probe_is_encoding_complete(node.table, (position,), (value,)):
@@ -6930,6 +6958,10 @@ def _node_multi_key_seek(
             yield from engine._rows(node.fallback, context)
             return
         unique.setdefault(key, cast(Value, value))
+
+    if allocated_upper * 2 <= len(unique):
+        yield from small_table()
+        return
 
     keys = tuple(unique)
     groups = _memoized_primary_key_groups(

@@ -28,6 +28,7 @@ def _seed_database(path: Path, *, identity_indexes: bool) -> object:
         transaction.execute("CREATE NODE TABLE A(id STRING, v INT64, PRIMARY KEY(id))")
         transaction.execute("CREATE NODE TABLE B(id STRING, PRIMARY KEY(id))")
         transaction.execute("CREATE NODE TABLE C(k INT64, name STRING, PRIMARY KEY(k))")
+        transaction.execute("CREATE NODE TABLE D(id STRING, PRIMARY KEY(id))")
         transaction.execute("CREATE REL TABLE R(FROM A TO B, confidence DOUBLE)")
     with handle.begin("write") as transaction:
         for number in range(1, 6):
@@ -404,3 +405,119 @@ def test_repeated_statements_in_one_transaction_reuse_the_primary_key_memo(
         second = transaction.execute(QUERY, {"ids": ["a2", "a1"]})
 
     assert first.rows == second.rows == (("a1", 1), ("a2", 2))
+
+
+# --- the durable-frontier selector ---------------------------------------------------------
+
+
+def test_a_frontier_of_at_least_twice_the_allocated_ids_keeps_the_scan(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Five ids were ever allocated in A: ten distinct probes walk the table, nine seek."""
+    counts = _doors(monkeypatch)
+    ten = [f"a{number}" for number in range(1, 11)]
+    assert database.execute(QUERY, {"ids": ten}).rows == tuple(  # type: ignore[attr-defined]
+        (f"a{number}", number) for number in range(1, 6)
+    )
+    assert counts["scans"] == 1 and counts["many"] == 0 and counts["certificates"] == 0
+
+    nine = ten[:9]
+    assert database.execute(QUERY, {"ids": nine}).rows == tuple(  # type: ignore[attr-defined]
+        (f"a{number}", number) for number in range(1, 6)
+    )
+    assert counts["scans"] == 1 and counts["many"] == 1
+
+
+def test_the_selector_counts_distinct_probes_only(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts = _doors(monkeypatch)
+    repeated = ["a1"] * 10 + [None] * 5
+    assert database.execute(QUERY, {"ids": repeated}).rows == (("a1", 1),)  # type: ignore[attr-defined]
+    assert counts["scans"] == 0 and counts["many"] == 1 and counts["probes"] == 1
+
+
+def test_the_selector_is_decided_before_any_exact_string_is_encoded(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts = _doors(monkeypatch)
+    ten = [f"a{number}" for number in range(1, 11)]
+    database.execute(QUERY, {"ids": ten})  # type: ignore[attr-defined]
+    assert counts["encoded"] == 0 and counts["scans"] == 1
+
+
+def test_a_non_ascii_frontier_takes_the_encoding_route_before_the_selector(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts = _doors(monkeypatch)
+    ten = [f"a{number}" for number in range(1, 10)] + ["ação"]
+    assert database.execute(QUERY, {"ids": ten}).rows == tuple(  # type: ignore[attr-defined]
+        (f"a{number}", number) for number in range(1, 6)
+    )
+    assert counts["encoded"] == 10 and counts["scans"] == 1 and counts["many"] == 0
+
+
+def test_a_table_that_never_allocated_a_row_answers_empty_without_opening_anything(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts = _doors(monkeypatch, table_name="D")
+    text = "MATCH (d:D) WHERE d.id IN $ids RETURN d.id"
+    result = database.execute(text, {"ids": ["x", "y", "z"]})  # type: ignore[attr-defined]
+
+    assert result.rows == ()
+    assert counts == {
+        "many": 0,
+        "probes": 0,
+        "encoded": 0,
+        "scans": 0,
+        "certificates": 0,
+    }
+
+
+@pytest.mark.parametrize("ids", ([], [None], ["x"], "x", 7, ["\ud800"], [1.5]))
+def test_the_empty_answer_is_differentially_equal_to_the_scan_of_the_empty_table(
+    database: object, monkeypatch: pytest.MonkeyPatch, ids: object
+) -> None:
+    text = "MATCH (d:D) WHERE d.id IN $ids RETURN d.id"
+    accelerated = _outcome(database, text, {"ids": ids})
+    with monkeypatch.context() as scoped:
+        scoped.setattr(IndexManager, "validated_versions_many", None, raising=False)
+        canonical = _outcome(database, text, {"ids": ids})
+    assert accelerated == canonical
+
+
+def test_a_materialised_extent_at_the_first_id_keeps_the_canonical_scan(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pages that exist are walked and validated even when no id was ever allocated."""
+    from dataclasses import replace
+
+    from okto_grafx.engine.heap_store import FIRST_RECORD_ID
+
+    original_extent = HeapStore.extent_of
+
+    def at_first_id(heap, table):  # type: ignore[no-untyped-def]
+        extent = original_extent(heap, table)
+        if extent is not None and table.name == "A":
+            return replace(extent, next_record_id=FIRST_RECORD_ID)
+        return extent
+
+    monkeypatch.setattr(HeapStore, "extent_of", at_first_id)
+    counts = _doors(monkeypatch)
+    rows = database.execute(QUERY, {"ids": ["a1", "a2"]}).rows  # type: ignore[attr-defined]
+
+    assert rows == (("a1", 1), ("a2", 2))
+    assert counts["scans"] == 1 and counts["many"] == 0
+
+
+def test_a_table_whose_rows_were_all_deleted_keeps_the_selector(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ids once allocated are not the empty proof: the rule and its scan still run."""
+    with database.begin("write") as transaction:  # type: ignore[attr-defined]
+        transaction.execute("MATCH (n:A) DELETE n")
+    counts = _doors(monkeypatch)
+    assert database.execute(QUERY, {"ids": ["a1"]}).rows == ()  # type: ignore[attr-defined]
+    assert counts["many"] == 1 and counts["scans"] == 0
+    assert database.execute(QUERY, {"ids": [f"a{n}" for n in range(1, 11)]}).rows == ()  # type: ignore[attr-defined]
+    assert counts["scans"] == 1
