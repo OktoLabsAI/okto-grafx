@@ -83,6 +83,10 @@ def _stack(
     return actual, pool, catalog, heap, table, _definition(table)
 
 
+def _ordered(definition: IndexDefinition, pool: BufferPool) -> OrderedIndex:
+    return OrderedIndex(definition, pool, RecordingMetrics())
+
+
 def test_bulk_artifact_publishes_tree_roots_then_static_header_and_reopens() -> None:
     device, pool, _catalog, heap, table, definition = _stack()
     entries: list[IndexEntry] = []
@@ -91,12 +95,12 @@ def test_bulk_artifact_publishes_tree_roots_then_static_header_and_reopens() -> 
         ref = heap.insert(table, number + 1, values, xmin=10)
         entries.append(_entry(definition, ref, values))
 
-    index = OrderedIndex(definition, pool)
-    descriptor = index.create(reversed(entries), applied_through_lsn=10)
+    index = _ordered(definition, pool)
+    descriptor = index.create_bulk(reversed(entries), applied_through_lsn=10)
 
     assert descriptor.entry_count == 90
     assert index.is_created()
-    assert index.open() == descriptor
+    assert index.open_root() == descriptor
     assert index.verify().entry_count == 90
     assert device.barriers[-3:] == [index.file, index.file, index.file]
     assert device.write_calls[-1] == (index.file, 0)
@@ -104,6 +108,7 @@ def test_bulk_artifact_publishes_tree_roots_then_static_header_and_reopens() -> 
     cold = OrderedIndex(
         definition,
         make_pool(device, RecordingMetrics(), budget_pages=4),
+        RecordingMetrics(),
     )
     candidates = cold.candidates_desc(Snapshot(10), limit=4)
     assert [entry.key for entry in candidates] == sorted(
@@ -128,8 +133,8 @@ def test_visible_read_skips_invisible_and_stale_exact_candidates_before_limit() 
         _entry(definition, visible_ref, visible_values),
         _entry(definition, future_ref, future_values),
     )
-    index = OrderedIndex(definition, pool)
-    index.create(entries, applied_through_lsn=30)
+    index = _ordered(definition, pool)
+    index.create_bulk(entries, applied_through_lsn=30)
 
     selected = index.visible_desc(heap, table, Snapshot(20), limit=2)
 
@@ -149,18 +154,18 @@ def test_one_damaged_root_degrades_and_two_damaged_roots_refuse() -> None:
     device, pool, _catalog, heap, table, definition = _stack()
     values = (Timestamp(1), "one")
     ref = heap.insert(table, 1, values, xmin=4)
-    index = OrderedIndex(definition, pool)
-    expected = index.create((_entry(definition, ref, values),), applied_through_lsn=4)
+    index = _ordered(definition, pool)
+    expected = index.create_bulk((_entry(definition, ref, values),), applied_through_lsn=4)
 
     for root_page in (ORDERED_ROOT_PAGE_A, ORDERED_ROOT_PAGE_B):
         raw = bytearray(device.raw_page(index.file, root_page))
         raw[-1] ^= 0x5A
         device.poke_page(index.file, root_page, bytes(raw))
         if root_page == ORDERED_ROOT_PAGE_A:
-            assert index.open() == expected
+            assert index.open_root() == expected
 
     with pytest.raises(GrafxCorruptionDetected) as both:
-        index.open()
+        index.open_root()
     assert both.value.details["field"] == "ordered_root"
 
 
@@ -173,8 +178,8 @@ def test_root_drift_retries_the_complete_candidate_walk(
         values = (Timestamp(number), str(number))
         ref = heap.insert(table, number + 1, values, xmin=7)
         entries.append(_entry(definition, ref, values))
-    index = OrderedIndex(definition, pool)
-    initial = index.create(entries, applied_through_lsn=7)
+    index = _ordered(definition, pool)
+    initial = index.create_bulk(entries, applied_through_lsn=7)
     original = OrderedIndex._read_certificate
     calls = 0
 
@@ -202,8 +207,8 @@ def test_stable_root_behind_snapshot_refuses_and_wrong_table_reference_is_corrup
     _device, pool, catalog, heap, table, definition = _stack()
     values = (Timestamp(1), "one")
     ref = heap.insert(table, 1, values, xmin=4)
-    index = OrderedIndex(definition, pool)
-    index.create((_entry(definition, ref, values),), applied_through_lsn=4)
+    index = _ordered(definition, pool)
+    index.create_bulk((_entry(definition, ref, values),), applied_through_lsn=4)
 
     with pytest.raises(GrafxIndexError) as stale:
         index.candidates_desc(Snapshot(5), limit=1)
@@ -214,8 +219,8 @@ def test_stable_root_behind_snapshot_refuses_and_wrong_table_reference_is_corrup
     other_values = (Timestamp(2), "other")
     other_ref = heap.insert(other, 1, other_values, xmin=4)
     foreign_definition = _definition(table, nonce=92)
-    foreign = OrderedIndex(foreign_definition, pool)
-    foreign.create(
+    foreign = _ordered(foreign_definition, pool)
+    foreign.create_bulk(
         (_entry(foreign_definition, other_ref, other_values),),
         applied_through_lsn=4,
     )
@@ -264,8 +269,8 @@ def test_committed_batch_publishes_cow_pages_then_alternate_root() -> None:
         values = (Timestamp(number), f"id-{number:04d}")
         ref = heap.insert(table, number + 1, values, xmin=10)
         entries.append(_entry(definition, ref, values))
-    index = OrderedIndex(definition, pool)
-    initial = index.create(entries, applied_through_lsn=10)
+    index = _ordered(definition, pool)
+    initial = index.create_bulk(entries, applied_through_lsn=10)
     old_page_count = device.page_count(index.file)
     added_values = (Timestamp(200), "new")
     added_ref = heap.insert(table, 1001, added_values, xmin=20)
@@ -291,8 +296,8 @@ def test_noop_watermark_and_replay_skip_do_not_allocate_tree_pages() -> None:
     values = (Timestamp(1), "one")
     ref = heap.insert(table, 1, values, xmin=5)
     entry = _entry(definition, ref, values)
-    index = OrderedIndex(definition, pool)
-    initial = index.create((entry,), applied_through_lsn=5)
+    index = _ordered(definition, pool)
+    initial = index.create_bulk((entry,), applied_through_lsn=5)
     before_pages = device.page_count(index.file)
 
     advanced = index.publish_committed_batch((), applied_through_lsn=8)
@@ -313,8 +318,8 @@ def test_tombstone_and_remove_update_reconciliation_without_rebuilding_tree() ->
     values = (Timestamp(1), "one")
     ref = heap.insert(table, 1, values, xmin=5)
     entry = _entry(definition, ref, values)
-    index = OrderedIndex(definition, pool)
-    index.create((entry,), applied_through_lsn=5)
+    index = _ordered(definition, pool)
+    index.create_bulk((entry,), applied_through_lsn=5)
 
     tombstone = index.publish_committed_batch(
         (_change(definition, IndexOperation.TOMBSTONE, entry, csn=9),),
@@ -337,8 +342,8 @@ def test_failed_root_write_leaves_old_root_readable_and_retry_is_idempotent() ->
     values = (Timestamp(1), "one")
     ref = heap.insert(table, 1, values, xmin=5)
     entry = _entry(definition, ref, values)
-    index = OrderedIndex(definition, pool)
-    initial = index.create((entry,), applied_through_lsn=5)
+    index = _ordered(definition, pool)
+    initial = index.create_bulk((entry,), applied_through_lsn=5)
     added_values = (Timestamp(2), "two")
     added_ref = heap.insert(table, 2, added_values, xmin=7)
     added = _entry(definition, added_ref, added_values)
@@ -348,7 +353,7 @@ def test_failed_root_write_leaves_old_root_readable_and_retry_is_idempotent() ->
     with pytest.raises(GrafxIndexError):
         index.publish_committed_batch((change,), applied_through_lsn=7)
 
-    assert index.open() == initial
+    assert index.open_root() == initial
     device.disarm()
     completed = index.publish_committed_batch((change,), applied_through_lsn=7)
     assert completed.descriptor.generation == initial.generation + 1
@@ -375,8 +380,8 @@ def test_root_write_that_lands_then_raises_is_recovered_by_watermark_skip() -> N
     values = (Timestamp(1), "one")
     ref = heap.insert(table, 1, values, xmin=5)
     entry = _entry(definition, ref, values)
-    index = OrderedIndex(definition, pool)
-    index.create((entry,), applied_through_lsn=5)
+    index = _ordered(definition, pool)
+    index.create_bulk((entry,), applied_through_lsn=5)
     added_values = (Timestamp(2), "two")
     added_ref = heap.insert(table, 2, added_values, xmin=7)
     added = _entry(definition, added_ref, added_values)
@@ -388,7 +393,7 @@ def test_root_write_that_lands_then_raises_is_recovered_by_watermark_skip() -> N
     with pytest.raises(GrafxIndexError):
         index.publish_committed_batch((change,), applied_through_lsn=7)
 
-    landed = index.open()
+    landed = index.open_root()
     pages_after_failure = device.page_count(index.file)
     assert landed.applied_through_lsn == 7
     retry = index.publish_committed_batch((change,), applied_through_lsn=7)

@@ -91,6 +91,7 @@ from okto_grafx.domain.index.ordered_tree import (
     decode_ordered_internal,
     decode_ordered_leaf,
     mutate_ordered_tree,
+    seek_ordered_exact,
     verify_ordered_tree,
     walk_ordered_desc,
 )
@@ -172,6 +173,7 @@ __all__ = [
     "decode_ordered_internal",
     "decode_ordered_leaf",
     "mutate_ordered_tree",
+    "seek_ordered_exact",
     "decode_ordered_root_page",
     "entry_visible",
     "index_file",

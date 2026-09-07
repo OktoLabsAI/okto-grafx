@@ -63,6 +63,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION
 from okto_grafx.domain.page.checksum import crc32c
@@ -87,6 +88,7 @@ from okto_grafx.engine.index_manager import (
     index_file,
     primary_key_index_name,
 )
+from okto_grafx.engine.ordered_index import OrderedIndex
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
 from okto_grafx.engine.quarantine import QuarantineStore
@@ -725,7 +727,11 @@ def _attach_primary_key_indexes(
         if definition.visibility is not IndexVisibility.EXACT:
             continue
         try:
-            index = HashIndex(definition, pool, metrics)
+            index = (
+                OrderedIndex(definition, pool, metrics)
+                if definition.layout is IndexLayout.ORDERED
+                else HashIndex(definition, pool, metrics)
+            )
             try:
                 current = indexes.index(index.name)
             except GrafxIndexError as failure:

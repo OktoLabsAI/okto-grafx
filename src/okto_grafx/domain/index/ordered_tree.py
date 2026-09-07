@@ -32,6 +32,7 @@ __all__ = [
     "mutate_ordered_tree",
     "decode_ordered_internal",
     "decode_ordered_leaf",
+    "seek_ordered_exact",
     "verify_ordered_tree",
     "walk_ordered_desc",
 ]
@@ -1069,3 +1070,79 @@ def walk_ordered_desc(
             visiting.remove(page_index)
 
     yield from descend(root_page, height, bound)
+
+
+def seek_ordered_exact(
+    root_page: PageIndex,
+    height: int,
+    pages: Mapping[PageIndex, Page],
+    key: bytes,
+) -> tuple[IndexEntry, ...]:
+    """Return every physical candidate for one logical key without scanning the tree.
+
+    Parent separators are inclusive high ``(key, RecordRef)`` identities.  A logical key may
+    therefore span adjacent children; the seek starts at the first child whose high identity can
+    contain the key and continues only while a child can still end on that same key.  Every page
+    reached is decoded through the ordinary fail-closed codecs.
+    """
+
+    wanted = _key_bytes(key, stored=False)
+    if root_page == NO_PAGE:
+        if height != 0:
+            raise GrafxCorruptionDetected(
+                "An empty ordered root declares a non-zero height.",
+                field="height",
+                value=height,
+            )
+        return ()
+    if height <= 0:
+        raise GrafxCorruptionDetected(
+            "A non-empty ordered seek requires a positive height.",
+            field="height",
+            value=height,
+        )
+
+    visiting: set[PageIndex] = set()
+
+    def descend(page_index: PageIndex, depth: int) -> tuple[IndexEntry, ...]:
+        if page_index in visiting:
+            raise GrafxCorruptionDetected(
+                "An ordered seek encountered a child cycle.",
+                field="child_page",
+                value=page_index,
+            )
+        page = pages.get(page_index)
+        if page is None or page.page_index != page_index:
+            raise GrafxCorruptionDetected(
+                "An ordered seek could not resolve the requested page identity.",
+                field="page_index",
+                value=page_index,
+            )
+        visiting.add(page_index)
+        try:
+            if depth == 1:
+                entries = decode_ordered_leaf(page)
+                keys = [entry.key for entry in entries]
+                start = bisect_left(keys, wanted)
+                found: list[IndexEntry] = []
+                for entry in entries[start:]:
+                    if entry.key != wanted:
+                        break
+                    found.append(entry)
+                return tuple(found)
+
+            pointers = decode_ordered_internal(page)
+            highs = [pointer.high_identity for pointer in pointers]
+            position = bisect_left(highs, (wanted, -1))
+            found = []
+            while position < len(pointers):
+                pointer = pointers[position]
+                found.extend(descend(pointer.child_page, depth - 1))
+                if pointer.high_key > wanted:
+                    break
+                position += 1
+            return tuple(found)
+        finally:
+            visiting.remove(page_index)
+
+    return descend(root_page, height)

@@ -17,6 +17,7 @@ from okto_grafx.domain.index.ordered_tree import (
     OrderedChildPointer,
     build_ordered_tree,
     decode_ordered_internal,
+    seek_ordered_exact,
     verify_ordered_tree,
     walk_ordered_desc,
 )
@@ -141,6 +142,34 @@ def test_exclusive_logical_bound_removes_every_physical_tie_and_limit_is_lazy() 
     assert tuple(ordered_entry_identity(entry.key, entry.ref) for entry in limited) == tuple(
         ordered_entry_identity(entry.key, entry.ref) for entry in expected[:2]
     )
+
+
+def test_exact_seek_crosses_only_adjacent_children_that_can_share_the_key() -> None:
+    shared_key = ordered_timestamp_string_key(Timestamp(5), "shared")
+    tied = tuple(
+        _entry(number, timestamp=5, text="shared", ref=RecordRef(1000 + number, 0))
+        for number in range(90)
+    )
+    entries = (
+        *tuple(_entry(number, timestamp=4, text=f"lower-{number}") for number in range(20)),
+        *tied,
+        *tuple(_entry(number + 200, timestamp=6, text=f"upper-{number}") for number in range(20)),
+    )
+    build = build_ordered_tree(entries, page_size=_PAGE_SIZE)
+
+    found = seek_ordered_exact(
+        build.root_page, build.height, build.page_map(), shared_key
+    )
+
+    assert tuple(ordered_entry_identity(entry.key, entry.ref) for entry in found) == tuple(
+        ordered_entry_identity(entry.key, entry.ref) for entry in tied
+    )
+    assert seek_ordered_exact(
+        build.root_page,
+        build.height,
+        build.page_map(),
+        ordered_timestamp_string_key(Timestamp(5), "missing"),
+    ) == ()
 
 
 def test_empty_tree_has_no_pages_and_a_zero_height_walk() -> None:

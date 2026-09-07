@@ -5,15 +5,15 @@ identifies one nonced artifact, and pages 1/2 alternate complete root publicatio
 only an exact-index candidate authority: every result is read again from the heap under the
 caller's snapshot before it can leave this module.
 
-Transactional copy-on-write maintenance is intentionally a later layer.  Keeping the bulk
-artifact and its read protocol here means the query planner cannot accidentally select the
-ordered format merely because its domain codecs exist.
+Transactional copy-on-write maintenance shares the ordinary secondary-index staging/WAL
+contract, while this module retains the layout-specific publication and read certificates.  The
+query planner still cannot select the ordered format merely because its domain codecs exist.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeVar
 
 from okto_grafx.domain.errors import (
@@ -22,7 +22,15 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.ids import NO_LSN, NO_PAGE, PROVISIONAL_CSN, Lsn, PageIndex, RecordRef
+from okto_grafx.domain.ids import (
+    NO_LSN,
+    NO_PAGE,
+    PROVISIONAL_CSN,
+    Csn,
+    Lsn,
+    PageIndex,
+    RecordRef,
+)
 from okto_grafx.domain.index import (
     INDEX_HEADER_SLOT,
     ORDERED_INDEX_HEADER_FORMAT_VERSION,
@@ -38,16 +46,22 @@ from okto_grafx.domain.index import (
     OrderedRootDescriptor,
     OrderedRootSelection,
     OrderedTreeVerification,
+    ReconcileReport,
     SnapshotLike,
+    StagingTransaction,
     build_ordered_tree,
     make_ordered_root_page,
     mutate_ordered_tree,
+    seek_ordered_exact,
     select_ordered_root,
     verify_ordered_tree,
     walk_ordered_desc,
 )
+from okto_grafx.domain.index.records import change_of, lsn_of
+from okto_grafx.domain.index.visibility import is_reclaimable
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import TableDef
+from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.page import (
     HEADER_PAGE_INDEX,
     FileHeader,
@@ -56,8 +70,10 @@ from okto_grafx.domain.page import (
     Page,
     PageType,
 )
+from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.heap_store import HeapStore
+from okto_grafx.engine.index_manager import IndexStore, _IndexReadCertificate
 
 __all__ = [
     "ORDERED_READ_RETRY_BUDGET",
@@ -168,17 +184,23 @@ class _OrderedPageLoader(Mapping[PageIndex, Page]):
         return max(0, self._page_count - 3)
 
 
-class OrderedIndex:
+class OrderedIndex(IndexStore):
     """One persistent append-only exact ordered artifact.
 
     Reads are useful independently of query planning: callers can bulk-create an unreachable
     nonced generation, verify it, and obtain reverse candidates or heap-validated rows.  The
-    normal registry and commit path start using this type only once OIX-2 can maintain it.
+    normal registry and commit path use the shared staging contract, while all physical mutation
+    remains a single root-certified COW batch.
     """
 
-    __slots__ = ("_definition", "_digest", "_file", "_pool")
+    __slots__ = ()
 
-    def __init__(self, definition: IndexDefinition, pool: BufferPool) -> None:
+    def __init__(
+        self,
+        definition: IndexDefinition,
+        pool: BufferPool,
+        metrics: MetricsSink,
+    ) -> None:
         if not isinstance(definition, IndexDefinition):
             raise GrafxIndexError(
                 "An OrderedIndex needs an IndexDefinition.",
@@ -213,30 +235,23 @@ class OrderedIndex:
                 value=type(pool).__name__,
                 index=definition.name,
             )
-        self._definition = definition
-        self._digest = definition.digest()
-        self._file = definition.file
-        self._pool = pool
+        if not isinstance(metrics, MetricsSink):
+            raise GrafxIndexError(
+                "An OrderedIndex needs the metrics port used by the index framework.",
+                field="metrics",
+                value=type(metrics).__name__,
+                index=definition.name,
+            )
+        super().__init__(definition, pool, metrics)
+        self._page_type = int(PageType.INDEX_ORDERED_LEAF)
 
-    @property
-    def definition(self) -> IndexDefinition:
-        return self._definition
-
-    @property
-    def file(self) -> str:
-        return self._file
-
-    @property
-    def name(self) -> str:
-        return self._definition.name
-
-    def exists(self) -> bool:
-        return self._pool.storage.exists(self._file)
-
-    def is_created(self) -> bool:
+    def is_created(self, *, proved_present: bool = False) -> bool:
         """Say whether page 0 is a complete header for this exact artifact."""
 
-        if not self.exists() or self._pool.storage.page_count(self._file) == 0:
+        if (
+            (not proved_present and not self.exists())
+            or self._pool.storage.page_count(self._file) == 0
+        ):
             return False
         try:
             self._read_header_fresh()
@@ -246,12 +261,13 @@ class OrderedIndex:
             raise
         return True
 
-    def create(
+    def create_bulk(
         self,
         entries: Iterable[IndexEntry],
         *,
         applied_through_lsn: Lsn,
         reconciled_through_lsn: Lsn = NO_LSN,
+        _precreated: bool = False,
     ) -> OrderedRootDescriptor:
         """Exclusively create and durably publish one verified bulk generation.
 
@@ -282,36 +298,37 @@ class OrderedIndex:
             reconciled_through_lsn=reconciled_through_lsn,
         )
         storage = self._pool.storage
-        try:
-            storage.create(self._file)
-        except GrafxUnsupportedOperation as failure:
-            # Narrow test/storage collaborators predating the normalized reason still expose
-            # the decisive postcondition: the exact logical name now exists.  Never reinterpret
-            # another refusal as a create race when the name remains absent.
-            if (
-                failure.details.get("reason") != "file_exists"
-                and not storage.exists(self._file)
-            ):
-                raise
-            if self.is_created():
-                current = self.open()
-                if current != descriptor:
-                    raise GrafxIndexError(
-                        "The ordered artifact already exists with a different root.",
-                        field="artifact_generation",
-                        index=self.name,
-                        file=self.file,
-                        expected=descriptor.generation,
-                        observed=current.generation,
-                        retryable=True,
-                    )
-                return current
-            raise GrafxCorruptionDetected(
-                "The ordered artifact name exists but its publication header is incomplete.",
-                field="ordered_artifact_incomplete",
-                index=self.name,
-                file=self.file,
-            ) from failure
+        if not _precreated:
+            try:
+                storage.create(self._file)
+            except GrafxUnsupportedOperation as failure:
+                # Narrow test/storage collaborators predating the normalized reason still expose
+                # the decisive postcondition: the exact logical name now exists.  Never
+                # reinterpret another refusal as a create race when the name remains absent.
+                if (
+                    failure.details.get("reason") != "file_exists"
+                    and not storage.exists(self._file)
+                ):
+                    raise
+                if self.is_created():
+                    current = self.open_root()
+                    if current != descriptor:
+                        raise GrafxIndexError(
+                            "The ordered artifact already exists with a different root.",
+                            field="artifact_generation",
+                            index=self.name,
+                            file=self.file,
+                            expected=descriptor.generation,
+                            observed=current.generation,
+                            retryable=True,
+                        )
+                    return current
+                raise GrafxCorruptionDetected(
+                    "The ordered artifact name exists but its publication header is incomplete.",
+                    field="ordered_artifact_incomplete",
+                    index=self.name,
+                    file=self.file,
+                ) from failure
 
         total_pages = 3 + len(build.pages)
         first = storage.allocate(self._file, total_pages)
@@ -352,7 +369,7 @@ class OrderedIndex:
         self._pool.flush(self._file)
         storage.durable_barrier(self._file)
 
-        selected = self.open()
+        selected = self.open_root()
         if selected != descriptor:
             raise GrafxCorruptionDetected(
                 "The ordered artifact did not reopen at the root it published.",
@@ -361,7 +378,49 @@ class OrderedIndex:
             )
         return selected
 
-    def open(self) -> OrderedRootDescriptor:
+    def create(self, *, proved_present: bool = False) -> IndexHeader:
+        """Create an empty ordered artifact or open the existing complete generation."""
+
+        header, _created = self._create_with_provenance(
+            proved_present=proved_present
+        )
+        return header
+
+    def _create_with_provenance(
+        self, *, proved_present: bool = False
+    ) -> tuple[IndexHeader, bool]:
+        if self.is_created(proved_present=proved_present):
+            return self.open(proved_present=proved_present), False
+        if proved_present or self.exists():
+            raise GrafxCorruptionDetected(
+                "The ordered artifact name exists but its publication header is incomplete.",
+                field="ordered_artifact_incomplete",
+                index=self.name,
+                file=self.file,
+            )
+        try:
+            self._pool.storage.create(self.file)
+        except GrafxUnsupportedOperation as failure:
+            if (
+                failure.details.get("reason") != "file_exists"
+                and not self.exists()
+            ):
+                raise
+            if self.is_created():
+                return self.open(), False
+            raise GrafxCorruptionDetected(
+                "The ordered artifact name was concurrently reserved but is incomplete.",
+                field="ordered_artifact_incomplete",
+                index=self.name,
+                file=self.file,
+                retryable=True,
+            ) from failure
+        self.create_bulk(
+            (), applied_through_lsn=NO_LSN, _precreated=True
+        )
+        return self.open(), True
+
+    def open_root(self) -> OrderedRootDescriptor:
         """Open, identify and completely verify the currently selected tree."""
 
         certificate = self._read_certificate()
@@ -375,6 +434,19 @@ class OrderedIndex:
         )
         return descriptor
 
+    def open(self, *, proved_present: bool = False) -> IndexHeader:
+        """Open and fully verify the artifact, returning its current logical header."""
+
+        if proved_present and self._pool.storage.page_count(self.file) == 0:
+            raise GrafxIndexError(
+                "The proved ordered artifact is empty.",
+                field="file",
+                index=self.name,
+                file=self.file,
+            )
+        descriptor = self.open_root()
+        return self._header_at(self._read_header_fresh()[1], descriptor)
+
     def verify(self) -> OrderedTreeVerification:
         """Return the complete structural verification report for the selected root."""
 
@@ -387,11 +459,309 @@ class OrderedIndex:
             expected_entry_count=descriptor.entry_count,
         )
 
+    @staticmethod
+    def _header_at(
+        header: IndexHeader, descriptor: OrderedRootDescriptor
+    ) -> IndexHeader:
+        """Project mutable root watermarks onto the immutable artifact identity header."""
+
+        return replace(
+            header,
+            built_through_lsn=descriptor.applied_through_lsn,
+            reconciled_through_lsn=descriptor.reconciled_through_lsn,
+        )
+
+    def _fresh_certificate(self) -> _IndexReadCertificate:
+        """Return the manager certificate shape, backed by one fresh dual-root proof."""
+
+        certificate = self._read_certificate()
+        descriptor = certificate.selection.descriptor
+        return _IndexReadCertificate(
+            seq=descriptor.generation,
+            header=self._header_at(certificate.header, descriptor),
+        )
+
+    def _remember_local_certificate(self) -> _IndexReadCertificate:
+        """Bind manager cache state to the root generation this pool just published."""
+
+        certificate = self._fresh_certificate()
+        self._carried_certificate = None
+        self._cache_certificate = certificate
+        self._local_certificate = certificate
+        return certificate
+
+    @property
+    def built_through_lsn(self) -> Lsn:
+        return self._read_certificate().selection.descriptor.applied_through_lsn
+
+    @property
+    def reconciled_through_lsn(self) -> Lsn:
+        return self._read_certificate().selection.descriptor.reconciled_through_lsn
+
+    def check_freshness(
+        self,
+        published_lsn: Lsn,
+        *,
+        required_lsn: Lsn | None = None,
+        persist: bool = True,
+        allow_ahead: bool = False,
+    ) -> bool:
+        """Compare the selected root with the table floor; an exact root may be ahead safely."""
+
+        del persist  # Every read proves the root watermark again; no mutable stale bit is needed.
+        for field, value in (("published_lsn", published_lsn), ("required_lsn", required_lsn)):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < NO_LSN
+            ):
+                raise GrafxIndexError(
+                    f"An ordered index needs a non-negative integer {field}.",
+                    field=field,
+                    value=repr(value),
+                    index=self.name,
+                )
+        required = published_lsn if required_lsn is None else required_lsn
+        if required > published_lsn and not allow_ahead:
+            raise GrafxIndexError(
+                "The ordered index table floor is ahead of the published database position.",
+                field="required_lsn",
+                value=required,
+                published_lsn=published_lsn,
+                index=self.name,
+            )
+        certificate = self._fresh_certificate()
+        if certificate.header.built_through_lsn < required:
+            self._stale_reason = (
+                f"Ordered index {self.name!r} covers position "
+                f"{certificate.header.built_through_lsn}, before its table floor {required}."
+            )
+            self._stale_device_seq = certificate.seq
+            return True
+        if (
+            self._stale_reason is not None
+            and self._stale_device_seq is not None
+            and certificate.seq != self._stale_device_seq
+        ):
+            self._stale_reason = None
+            self._stale_device_seq = None
+        return self._stale_reason is not None
+
+    def mark_stale(self, reason: str, *, persist: bool = True) -> None:
+        """Refuse this handle; root freshness makes the same omission fail closed elsewhere."""
+
+        del persist
+        if not isinstance(reason, str) or not reason:
+            raise GrafxIndexError(
+                "Marking an ordered index stale needs a reason.",
+                field="reason",
+                value=repr(reason),
+                index=self.name,
+            )
+        self._stale_reason = reason
+        self._stale_device_seq = self._fresh_certificate().seq
+        self._carried_certificate = None
+
+    def advance_built_through(self, lsn: Lsn) -> None:
+        """Publish a completed-replay/empty-observation watermark without rebuilding entries."""
+
+        current = self._read_certificate().selection.descriptor
+        if current.applied_through_lsn < lsn:
+            self.publish_committed_batch((), applied_through_lsn=lsn)
+        self._stale_reason = None
+        self._stale_device_seq = None
+        self._remember_local_certificate()
+
+    def stage_reset(
+        self,
+        txn: StagingTransaction,
+        built_through: Lsn,
+        *,
+        rebuild_token: int = 0,
+        defer_clear: bool = False,
+    ) -> WalRecord:
+        """Refuse in-place RESET; ordered compaction publishes a fresh nonced generation."""
+
+        del txn, built_through, rebuild_token, defer_clear
+        raise GrafxUnsupportedOperation(
+            "An ordered index is rebuilt by publishing a fresh compact generation.",
+            field="ordered_rebuild_generation",
+            index=self.name,
+            file=self.file,
+        )
+
+    def commit(self, txn: StagingTransaction, csn: Csn) -> int:
+        """Publish this transaction's complete staged set as one COW root generation."""
+
+        txn_id = self._require_txn(txn)
+        stamp = self._require_csn("csn", csn)
+        staged = self._staged.get(txn_id)
+        if staged is None:
+            return 0
+        if any(change.operation is IndexOperation.RESET for change in staged.changes):
+            raise GrafxUnsupportedOperation(
+                "An ordered commit cannot apply an in-place RESET.",
+                field="ordered_rebuild_generation",
+                index=self.name,
+                file=self.file,
+            )
+        report = self.publish_committed_batch(
+            staged.changes, applied_through_lsn=stamp
+        )
+        self._missing_targets += report.missing_targets
+        self._staged.pop(txn_id, None)
+        self._stale_reason = None
+        self._stale_device_seq = None
+        self._remember_local_certificate()
+        return len(staged.changes)
+
+    def apply(self, record: WalRecord) -> None:
+        """Replay one logical record idempotently through the ordered root watermark."""
+
+        change = change_of(record)
+        if change.index != self.name:
+            raise GrafxIndexError(
+                "A WAL record was offered to a different ordered index.",
+                field="index",
+                value=change.index,
+                index=self.name,
+            )
+        if change.versioned or change.operation is IndexOperation.RESET:
+            raise GrafxCorruptionDetected(
+                "An ordered exact artifact cannot replay this index-record shape.",
+                field=(
+                    "versioned"
+                    if change.versioned
+                    else "ordered_rebuild_generation"
+                ),
+                index=self.name,
+                operation=change.operation.name,
+            )
+        self.apply_replay_batch((change,), through_lsn=lsn_of(record))
+
+    def apply_replay_batch(
+        self, changes: Iterable[IndexChange], *, through_lsn: Lsn
+    ) -> OrderedBatchPublication:
+        """Replay one prevalidated WAL subsequence as a single idempotent COW publication."""
+
+        materialized = tuple(changes)
+        if any(
+            change.index != self.name
+            or change.versioned
+            or change.operation is IndexOperation.RESET
+            for change in materialized
+        ):
+            raise GrafxCorruptionDetected(
+                "An ordered replay batch contains an incompatible logical change.",
+                field="ordered_replay_batch",
+                index=self.name,
+            )
+        report = self.publish_committed_batch(
+            materialized, applied_through_lsn=through_lsn
+        )
+        self._missing_targets += report.missing_targets
+        self._stale_reason = None
+        self._stale_device_seq = None
+        self._remember_local_certificate()
+        return report
+
+    def lookup(self, key: bytes, snapshot: SnapshotLike) -> tuple[RecordRef, ...]:
+        """Return exact candidates; IndexManager performs the mandatory heap validation."""
+
+        self._require_readable()
+        read_lsn = self._require_exact_read_lsn(snapshot)
+        wanted = self._require_key(key)
+        return tuple(
+            entry.ref for entry in self._stable_candidates(wanted, read_lsn)
+        )
+
+    def _candidates_unchecked(self, wanted: bytes) -> tuple[IndexEntry, ...]:
+        descriptor = self._read_certificate().selection.descriptor
+        return seek_ordered_exact(
+            descriptor.root_page,
+            descriptor.height,
+            _OrderedPageLoader(self._pool, self.file, fresh=False),
+            wanted,
+        )
+
+    def walk(self) -> tuple[IndexEntry, ...]:
+        """Return every reachable entry in deterministic ascending physical identity order."""
+
+        def materialize(descriptor: OrderedRootDescriptor) -> tuple[IndexEntry, ...]:
+            return tuple(
+                reversed(
+                    tuple(
+                        walk_ordered_desc(
+                            descriptor.root_page,
+                            descriptor.height,
+                            _OrderedPageLoader(self._pool, self.file, fresh=False),
+                        )
+                    )
+                )
+            )
+
+        return self._stable_read(NO_LSN, materialize)
+
+    def reconcile(
+        self, horizon: Lsn, txn: StagingTransaction | None = None
+    ) -> ReconcileReport:
+        """Measure or stage reclaimable ordered tombstones through logical WAL records."""
+
+        if txn is not None:
+            self._require_txn(txn)
+        scanned = reclaimable = removed = retained = 0
+        pages: set[PageIndex] = set()
+        for entry in self.walk():
+            scanned += 1
+            if entry.live:
+                continue
+            if not is_reclaimable(entry, horizon):
+                retained += 1
+                continue
+            reclaimable += 1
+            pages.add(entry.page)
+            if txn is None:
+                continue
+            self._stage(
+                txn,
+                IndexChange(
+                    index=self.name,
+                    operation=IndexOperation.REMOVE,
+                    key=entry.key,
+                    ref=entry.ref,
+                    csn=horizon,
+                ),
+            )
+            removed += 1
+        return ReconcileReport(
+            index=self.name,
+            horizon=horizon,
+            scanned=scanned,
+            reclaimable=reclaimable,
+            removed=removed,
+            retained=retained,
+            pages_touched=len(pages),
+        )
+
+    def note_reconciled(self, horizon: Lsn) -> None:
+        """Advance an empty reconciliation horizon through the same root publication."""
+
+        current = self._read_certificate().selection.descriptor
+        if current.reconciled_through_lsn >= horizon:
+            return
+        self.publish_committed_batch(
+            (),
+            applied_through_lsn=current.applied_through_lsn,
+            reconciled_through_lsn=horizon,
+        )
+        self._remember_local_certificate()
+
     def publish_committed_batch(
         self,
         changes: Iterable[IndexChange],
         *,
         applied_through_lsn: Lsn,
+        reconciled_through_lsn: Lsn | None = None,
     ) -> OrderedBatchPublication:
         """Publish one already-WAL-durable exact batch through append-only COW pages.
 
@@ -441,12 +811,29 @@ class OrderedIndex:
             applied_through_lsn=applied_through_lsn,
             reconciled_through_lsn=NO_LSN,
         )
+        if reconciled_through_lsn is not None:
+            self._root_descriptor(
+                generation=1,
+                root_page=NO_PAGE,
+                height=0,
+                entry_count=0,
+                applied_through_lsn=applied_through_lsn,
+                reconciled_through_lsn=reconciled_through_lsn,
+            )
         publication_page: PageIndex | None = None
         allocated_pages: tuple[PageIndex, ...] = ()
         with self._pool.page_write_fence(self.file, HEADER_PAGE_INDEX):
             before = self._read_certificate()
             current = before.selection.descriptor
-            if current.applied_through_lsn >= applied_through_lsn:
+            requested_reconciled = (
+                current.reconciled_through_lsn
+                if reconciled_through_lsn is None
+                else reconciled_through_lsn
+            )
+            if (
+                current.applied_through_lsn >= applied_through_lsn
+                and current.reconciled_through_lsn >= requested_reconciled
+            ):
                 self._pool.storage.durable_barrier(self.file)
                 return OrderedBatchPublication(
                     current,
@@ -466,7 +853,9 @@ class OrderedIndex:
                 start_page=start_page,
                 page_lsn=applied_through_lsn,
             )
-            reconciled = current.reconciled_through_lsn
+            reconciled = max(
+                current.reconciled_through_lsn, requested_reconciled
+            )
             for change in materialized:
                 if change.operation is IndexOperation.REMOVE:
                     reconciled = max(reconciled, change.csn)
@@ -475,7 +864,9 @@ class OrderedIndex:
                 root_page=mutation.root_page,
                 height=mutation.height,
                 entry_count=mutation.entry_count,
-                applied_through_lsn=applied_through_lsn,
+                applied_through_lsn=max(
+                    current.applied_through_lsn, applied_through_lsn
+                ),
                 reconciled_through_lsn=reconciled,
             )
             publication_page = before.selection.publication_page
@@ -561,6 +952,7 @@ class OrderedIndex:
     ) -> tuple[IndexEntry, ...]:
         """Return a stable descending candidate prefix below an exclusive logical key."""
 
+        self._require_readable()
         wanted = _required_limit(limit)
         read_lsn = _required_read_lsn(snapshot)
 
@@ -593,6 +985,7 @@ class OrderedIndex:
         valid row that follows them.
         """
 
+        self._require_readable()
         wanted = _required_limit(limit)
         read_lsn = _required_read_lsn(snapshot)
         self._require_table(table)
@@ -655,18 +1048,19 @@ class OrderedIndex:
         operation: Callable[[OrderedRootDescriptor], _ReadResult],
     ) -> _ReadResult:
         """Run one complete read between equal fresh header/root certificates."""
+        required_lsn = self._required_table_position(read_lsn)
         last: OrderedIndexReadCertificate | None = None
         for attempt in range(ORDERED_READ_RETRY_BUDGET + 1):
             before = self._read_certificate()
             descriptor = before.selection.descriptor
-            if descriptor.applied_through_lsn < read_lsn:
+            if descriptor.applied_through_lsn < required_lsn:
                 raise GrafxIndexError(
                     "The ordered index does not cover the requested snapshot.",
                     field="index_view_unavailable",
                     index=self.name,
                     file=self.file,
                     applied_through_lsn=descriptor.applied_through_lsn,
-                    required_lsn=read_lsn,
+                    required_lsn=required_lsn,
                     retryable=True,
                 )
             try:
@@ -712,7 +1106,7 @@ class OrderedIndex:
                 expected=self._definition.artifact_nonce,
                 observed=descriptor.artifact_nonce,
             )
-        if descriptor.definition_digest != self._digest:
+        if descriptor.definition_digest != self._definition_digest:
             raise GrafxCorruptionDetected(
                 "The selected ordered root belongs to a different index definition.",
                 field="definition_digest",
@@ -795,7 +1189,7 @@ class OrderedIndex:
             or header.visibility is not IndexVisibility.EXACT
             or header.table_id != self._definition.table_id
             or header.bucket_count != 1
-            or header.digest != self._digest
+            or header.digest != self._definition_digest
             or header.artifact_nonce != self._definition.artifact_nonce
             or header.flags != 0
         ):
@@ -841,7 +1235,7 @@ class OrderedIndex:
                 visibility=IndexVisibility.EXACT,
                 table_id=self._definition.table_id,
                 bucket_count=1,
-                digest=self._digest,
+                digest=self._definition_digest,
                 built_through_lsn=descriptor.applied_through_lsn,
                 reconciled_through_lsn=descriptor.reconciled_through_lsn,
                 artifact_nonce=self._definition.artifact_nonce,
@@ -869,7 +1263,7 @@ class OrderedIndex:
             entry_count=entry_count,
             applied_through_lsn=applied_through_lsn,
             reconciled_through_lsn=reconciled_through_lsn,
-            definition_digest=self._digest,
+            definition_digest=self._definition_digest,
         )
 
     def _require_table(self, table: object) -> None:

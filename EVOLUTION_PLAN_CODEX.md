@@ -74,6 +74,14 @@
   focados passam. Registry/DDL, commit/replay agrupado, rebuild compactante e a matriz acumulada
   de crash/multiprocesso permanecem no OIX-2B e serão fechados antes de o planner usar o índice.
 
+  OIX-2B já integrou o store ordenado ao contrato comum de staging/registry: um commit vivo gera
+  uma única publicação COW e o recovery agrupa todos os records do mesmo store sob um watermark
+  idempotente. A igualdade exata ganhou seek limitado aos ramos compatíveis e segue cercada pelo
+  certificado e pela revalidação do heap feita pelo `IndexManager`; o construtor de geração
+  destacada usa bulk build direto e não antecipa autoridade de catálogo. Toda `tests/index`
+  passou neste checkpoint. DDL/ativação, rebuild compactante e a matriz crash/multiprocesso ainda
+  precisam fechar antes do OIX-2B ser considerado concluído.
+
 - **Rodada 0.0.4, Wave 2 concluída até STO-M1.** O caminho de scans fechados e o top-k adiado
   estão publicados até `ed3ce95`; o memo transacional de resolução de PK entrou em `04aa244` com
   cercas de transação/snapshot/store/revisão/época/geração, LRU de 4.096 entradas dentro da quota

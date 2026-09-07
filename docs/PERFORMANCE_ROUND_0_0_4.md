@@ -385,6 +385,14 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    raiz e escrita que pousa antes de lançar exceção. O corpus focado passa 16/16. A conexão com
    registry/DDL, commit/replay em lote, rebuild compactante e a matriz crash/multiprocesso ficam
    explicitamente em OIX-2B antes de qualquer seleção pelo planner.
+12. **OIX-2B parcialmente implementado — registry/commit/replay:** `OrderedIndex` participa do
+   contrato comum de staging e do registry, publica o conjunto completo de uma transação em uma
+   raiz COW e o recovery coalesce toda a subsequência WAL do mesmo store em uma única publicação
+   idempotente. Lookup exato navega somente os ramos capazes de conter a chave e continua dentro
+   do certificado com revalidação obrigatória no heap; gerações destacadas são construídas em
+   bulk sem alterar autoridade do catálogo. O checkpoint completo de `tests/index` passou a
+   100%. DDL/ativação de catálogo, rebuild compactante e crash/multiprocesso permanecem antes do
+   fechamento do OIX-2B.
 
 ## Explicit decision queue
 

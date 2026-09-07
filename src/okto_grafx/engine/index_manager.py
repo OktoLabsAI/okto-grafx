@@ -6942,6 +6942,7 @@ class IndexManager:
 
         resolved: list[tuple[WalRecord, IndexStore, IndexChange]] = []
         excluded: set[IndexStore] = set()
+        ordered: set[IndexStore] = set()
         resolution_memo: dict[str, IndexStore] | None = (
             {} if type(self).active_index is IndexManager.active_index else None
         )
@@ -6995,6 +6996,15 @@ class IndexManager:
                 )
             resolved.append((record, store, change))
             if (
+                store.definition.layout is IndexLayout.ORDERED
+                and change.operation is not IndexOperation.RESET
+                and store._rebuild_authority is None
+                and not store._replaying
+                and store._stale_reason is None
+                and callable(getattr(store, "apply_replay_batch", None))
+            ):
+                ordered.add(store)
+            elif (
                 change.operation is IndexOperation.RESET
                 or not self._batch_replay_compatible(store)
                 or store._rebuild_authority is not None
@@ -7006,12 +7016,18 @@ class IndexManager:
                 # authority even if the two records are far apart in WAL order.
                 excluded.add(store)
 
+        # Eligibility is store-wide. A later RESET or specialised state revokes an earlier
+        # ordered observation from this same WAL subsequence.
+        ordered.difference_update(excluded)
+
         common_records = tuple(
-            record for record, store, _change in resolved if store not in excluded
+            record
+            for record, store, _change in resolved
+            if store not in excluded and store not in ordered
         )
-        if not common_records:
+        if not common_records and not ordered:
             return None
-        if not excluded:
+        if not excluded and not ordered:
             # Preserve an override's observable preparation door. The built-in path can consume
             # the exact passage-local decode/resolution above; a custom override keeps receiving
             # the original single positional sequence and retains its complete protocol.
@@ -7030,23 +7046,39 @@ class IndexManager:
             return self.apply_common_replay_batch(records)
 
         common_resolved = tuple(
-            item for item in resolved if item[1] not in excluded
+            item
+            for item in resolved
+            if item[1] not in excluded and item[1] not in ordered
         )
-        prepared = (
-            self._prepare_common_replay_batch(
-                common_records,
-                _resolved=common_resolved,
+        prepared = None
+        if common_records:
+            prepared = (
+                self._prepare_common_replay_batch(
+                    common_records,
+                    _resolved=common_resolved,
+                )
+                if can_reuse_resolved
+                else self._prepare_common_replay_batch(common_records)
             )
-            if can_reuse_resolved
-            else self._prepare_common_replay_batch(common_records)
-        )
-        if prepared is None:
-            return None
+            if prepared is None:
+                return None
 
         moved_by_store: dict[IndexStore, bool] = {
-            state.store: False for state in prepared.stores
+            state.store: False for state in (() if prepared is None else prepared.stores)
         }
-        common_items = iter(prepared.items)
+        common_items = iter(() if prepared is None else prepared.items)
+        ordered_batches: dict[IndexStore, tuple[tuple[IndexChange, ...], Lsn]] = {}
+        for store in ordered:
+            items = tuple(
+                (change, lsn_of(record))
+                for record, candidate, change in resolved
+                if candidate is store
+            )
+            ordered_batches[store] = (
+                tuple(change for change, _position in items),
+                max(position for _change, position in items),
+            )
+        ordered_applied: set[IndexStore] = set()
         touched: list[IndexStore] = []
         touched_set: set[IndexStore] = set()
         try:
@@ -7054,6 +7086,14 @@ class IndexManager:
                 if store not in touched_set:
                     touched_set.add(store)
                     touched.append(store)
+                if store in ordered:
+                    if store in ordered_applied:
+                        continue
+                    changes, through_lsn = ordered_batches[store]
+                    apply_ordered = getattr(store, "apply_replay_batch")
+                    apply_ordered(changes, through_lsn=through_lsn)
+                    ordered_applied.add(store)
+                    continue
                 if store in excluded:
                     if not self.apply(record):
                         raise GrafxIndexError(
@@ -7079,7 +7119,8 @@ class IndexManager:
                     store._replaying = False
                 moved_by_store[store] = moved_by_store[store] or moved
 
-            self._publish_common_replay_headers(prepared, moved_by_store)
+            if prepared is not None:
+                self._publish_common_replay_headers(prepared, moved_by_store)
             return tuple(store.file for store in touched)
         except Exception as failure:
             for store in touched:
@@ -7754,7 +7795,15 @@ class IndexManager:
             definition, through_lsn
         )
 
-        index = HashIndex(definition, self._pool, self._metrics)
+        ordered = definition.layout is IndexLayout.ORDERED
+        if ordered:
+            from okto_grafx.engine.ordered_index import OrderedIndex
+
+            index: IndexStore = OrderedIndex(
+                definition, self._pool, self._metrics
+            )
+        else:
+            index = HashIndex(definition, self._pool, self._metrics)
         index._set_creation_nonce(definition.artifact_nonce)
         collision = next(
             (
@@ -7780,40 +7829,67 @@ class IndexManager:
             # distinguishes our new orphan-safe generation from another participant's bytes.
             self._pool.storage.create(index.file, exclusive=True)
             created = True
-            index.create(proved_present=True)
-
-            empty_build = _EmptyIndexBuild()
-            for ref, key, ended_at in self._detached_exact_generation_entries(
-                definition, position, table
-            ):
-                insert = IndexChange(
-                    index=definition.name,
-                    operation=IndexOperation.INSERT,
-                    key=key,
-                    ref=ref,
-                )
-                accelerated = index._apply_empty_build_change(
-                    empty_build, insert, position
-                )
-                if accelerated is None:
-                    index._apply_change(insert, position)
-                if ended_at is not None:
-                    tombstone = IndexChange(
+            if ordered:
+                create_bulk = getattr(index, "create_bulk", None)
+                if not callable(create_bulk):
+                    raise GrafxUnsupportedOperation(
+                        "The ordered index store has no detached bulk-build door.",
+                        field="ordered_bulk_build",
                         index=definition.name,
-                        operation=IndexOperation.TOMBSTONE,
+                    )
+                create_bulk(
+                    (
+                        IndexEntry(
+                            key=key,
+                            ref=ref,
+                            versioned=False,
+                            dead_csn=(
+                                NO_CSN if ended_at is None else ended_at
+                            ),
+                        )
+                        for ref, key, ended_at in self._detached_exact_generation_entries(
+                            definition, position, table
+                        )
+                    ),
+                    applied_through_lsn=position,
+                    _precreated=True,
+                )
+            else:
+                index.create(proved_present=True)
+
+                empty_build = _EmptyIndexBuild()
+                for ref, key, ended_at in self._detached_exact_generation_entries(
+                    definition, position, table
+                ):
+                    insert = IndexChange(
+                        index=definition.name,
+                        operation=IndexOperation.INSERT,
                         key=key,
                         ref=ref,
-                        csn=ended_at,
                     )
                     accelerated = index._apply_empty_build_change(
-                        empty_build, tombstone, position
+                        empty_build, insert, position
                     )
                     if accelerated is None:
-                        index._apply_change(tombstone, position)
+                        index._apply_change(insert, position)
+                    if ended_at is not None:
+                        tombstone = IndexChange(
+                            index=definition.name,
+                            operation=IndexOperation.TOMBSTONE,
+                            key=key,
+                            ref=ref,
+                            csn=ended_at,
+                        )
+                        accelerated = index._apply_empty_build_change(
+                            empty_build, tombstone, position
+                        )
+                        if accelerated is None:
+                            index._apply_change(tombstone, position)
 
             # The header claim is flushed before verification, and the final checkpoint below
             # then barriers the complete verified generation as one unreachable shadow.
-            index.advance_built_through(position)
+            if not ordered:
+                index.advance_built_through(position)
             entry_findings = self._verify_entries(index)
             coverage_findings = self._verify_coverage(index)
             findings = (*entry_findings, *coverage_findings)

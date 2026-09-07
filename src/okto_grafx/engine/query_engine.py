@@ -95,6 +95,7 @@ from okto_grafx.domain.index.keys import (
     index_key,
     record_id_key,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.engine.index_manager import (
     HashIndex,
@@ -4656,7 +4657,16 @@ class QueryEngine:
     ) -> None:
         """Create and observe one v2 generation without granting committed authority early."""
         if committed_table is None:
-            candidate = HashIndex(definition, self._pool, self._metrics.sink)
+            if definition.layout is IndexLayout.ORDERED:
+                from okto_grafx.engine.ordered_index import OrderedIndex
+
+                candidate = OrderedIndex(
+                    definition, self._pool, self._metrics.sink
+                )
+            else:
+                candidate = HashIndex(
+                    definition, self._pool, self._metrics.sink
+                )
         else:
             # `_schema` already owns COMMIT_SECTION through schema_artifact_section.  Grafx
             # materialises heap rows only inside that same section, so the durable heap cannot
