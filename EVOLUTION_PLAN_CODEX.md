@@ -4297,3 +4297,18 @@ Slice integrado 156 testes; slice final de guards/PK/predicados/budgets 53 teste
 com sobreposição entre os conjuntos; Ruff/diff-check passaram. Evidência em
 `docs/SCALAR_PRIMARY_KEY_MEMO_0_0_4.md`. As 21 specs continuam intactas e o Pulse
 não foi reiniciado para este patch. O fan-out por layout ainda não está eliminado.
+
+### Compatibilidade do consumidor — filtros de contexto por artefato
+
+A integração de `9420b49` revelou que a fachada roteada e o adapter Grafx não
+expunham `find_by_artifact_filtered`, embora o serviço do Core já oferecesse
+direção, tipos de relação e profundidade. O fallback ignorava essas opções.
+Corrigido no Community `440070b`: seleção de layouts/direção apenas no primeiro
+salto, profundidade 1 sem executar hop2, filtros de visibilidade mantidos e
+capacidade ausente recusada explicitamente. O limite passou a incidir nas linhas
+expandidas, não nos centros candidatos: um centro isolado anterior não pode
+ocultar outro com vizinhos válidos. Core e protocolo nativo não foram alterados.
+53 testes finais de integração real Community/Grafx, 8 do contrato Core e 75 no
+slice anterior de filtros/fachadas passaram (conjuntos com sobreposição).
+Documentação: Community `docs/GRAFX_RELATED_CONTEXT_FILTERS.md`. Nenhuma spec
+reservada consumida; correção versionada, ainda não carregada pelo Pulse ativo.

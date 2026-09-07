@@ -208,6 +208,13 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
     index view per statement, identical 105-neighbour results and a 150.12 → 131.10 ms warm
     median on the isolated real-board restore. Evidence and exact fallback boundaries:
     `docs/SCALAR_PRIMARY_KEY_MEMO_0_0_4.md`. This is not CONCUR-2 or query fan-out collapse.
+    **Consumer correctness follow-up (`Community@440070b`):** the routed facade and Grafx
+    store now expose the existing Core filtered-context capability. Hop1 direction/type filters
+    select only their layouts and depth 1 performs no hop2 queries, rather than silently using
+    the default two-hop path. The result limit no longer truncates candidate centers before
+    expansion. Final real-Grafx/Community slice: 53 tests; existing Core contract: 8 tests.
+    Details in Community `docs/GRAFX_RELATED_CONTEXT_FILTERS.md`. This removes unrequested work
+    from filtered calls but does not claim the unrestricted layout fan-out is collapsed.
     Eager cross-node batching is not accepted yet: it can visit a center that
     the existing `max_rows` frontier never reaches, changing error/admission behavior. Keep the
     current exact result order, parallel-edge multiplicity, visibility filters and null hop2
