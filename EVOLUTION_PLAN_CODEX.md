@@ -4605,3 +4605,43 @@ merge na main ou publicação PyPI. O ledger das 21 specs reservadas permanece c
 SHA256 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
 A abertura fria e o custo de escrita continuam pendentes: este fechamento não
 declara a performance global resolvida nem consome novas specs de benchmark.
+
+### Fechamento de escrita e entrega Global — 2026-09-07
+
+Core `c4a01bf` e Community `31b8439` registram as correções de entrega já
+validadas no runtime: índice nativo exato de `DecisionDigest(board_id,
+original_node_id)`, probes de links a partir do digest, visibilidade em lotes
+de 512 IDs sem reescrita de valores corretos e exclusão segura de links inválidos.
+O conjunto esperado dessa exclusão continua completo: nunca fragmentar NOT IN.
+Inventário e todos os DELETEs permanecem no mesmo snapshot/transação, com rollback
+integral se um lote falhar. Visibilidade, diferentemente, usa chamadas idempotentes
+separadas e retry convergente, sem ACK em caso de erro. Certificação vetorial
+mantém verify(all), correlação com header durável e publicação estável.
+
+Revisão adversarial corrigiu uma regressão do worktree antes do aceite:
+`edge_exists` com endpoints inline e `WHERE r.rule_id` fazia scan antes do filtro
+de identidade. Restauradas as igualdades de endpoint à frente do predicado de
+regra. Fixture com 8 nós/1 edge passou de 9 linhas examinadas para no máximo 1;
+teste também cobre 32 nós. É restauração da forma já commitada anteriormente,
+não ganho sobre HEAD. Criação de pares: as formas antiga e nova já fazem 2 seeks
+e zero scans no motor atual; não há ganho de sintaxe a alegar nesse caso.
+
+Candidatos exatos de ambos os indexes Git foram exportados sem as mudanças de
+UI/settings/reparo ainda não incluídas: 198 testes Community passaram em 502,66 s,
+19 Core em 26,71 s; Ruff e whitespace verdes. Sem novas consolidações, redrive,
+limpeza de dívida ou benchmark que consuma as 21 specs. Detalhes: Community
+`docs/GRAFX_WRITE_PATH_MILESTONE.md`, `docs/GRAFX_GLOBAL_DIGEST_SOURCE_INDEX.md`
+e Core `docs/GLOBAL_DIGEST_VISIBILITY_BATCHING.md`. Sem nova publicação PyPI,
+wheel global ou merge na main; custo de abertura fria/escrita ponta a ponta
+continua aberto, sem criar novo gate temporal.
+
+Deploy de fonte validado no Pulse PID 9544, após término confirmado do PID 35808
+e fechamento dos grafos com zero falhas. A correção de `edge_exists` e a sanitização
+de log do lote anterior estão carregadas. Censo: HTTP 200, 2779/4424, 41,316 s.
+O grafo ultrapassou a observação de 55 s, mas terminou HTTP 200 sem Retry/reinício;
+fases nodes/edges somaram aproximadamente 59,3 s, UI 500/2779. Não é aceite de
+performance fria: essa lentidão continua explicitamente pendente.
+
+Pela UI, +500 retornou em 861 ms com 500 IDs únicos, 897 relações, zero tabelas
+com falha; tela 1000/2779. O ledger das 21 specs segue byte-idêntico ao hash
+registrado acima. Sem novo benchmark de escrita real ou consumo dessas specs.

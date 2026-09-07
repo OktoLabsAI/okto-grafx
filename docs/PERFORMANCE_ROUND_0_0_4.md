@@ -628,3 +628,22 @@ timing gain (warm medians full/projected 0.287/0.307 s), so it was withdrawn,
 not integrated. No separate spill feature or prolonged marginal gate was added.
 See `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`; the existing concurrent-read
 investigation remains the next target. Reserved specs and durability are untouched.
+
+### Write-path source consolidation — 2026-09-07
+
+Community `31b8439` and Core `c4a01bf` consolidate the Global identity index,
+digest-anchored link probes and bounded reconciliation corrections described in
+`PULSE_COGNITIVE_WRITE_AUDIT_2026_09_07.md`. No delivery was replayed or cognitive
+spec consumed to record these source milestones. The exact isolated candidates
+passed 198 Community tests (502.66 s) and 19 Core tests (26.71 s).
+
+Review caught an uncommitted adapter regression: inline endpoint maps with a
+leading relationship-rule WHERE predicate lost the endpoint seek in edge_exists.
+Restore the earlier committed endpoint-first equality form; the 8-node fixture
+drops from 9 examined rows to at most one edge. Both 8/32-node fixtures pass.
+Pair creation itself already used two native seeks in its previous WHERE form,
+so the explicit PK syntax is equivalent, not an additional performance gain.
+No planner refusal semantics, OCC, WAL or multi-reader/writer guarantees changed.
+See Community `docs/GRAFX_WRITE_PATH_MILESTONE.md` for scope and deployment
+boundaries. Cold UI admission and full write latency remain unresolved; this
+checkpoint does not add a new exploratory target or timing gate.
