@@ -69,6 +69,50 @@ No graph reset, recovery job, redrive or spec consolidation was initiated.
 Cognitive ledger hash remained
 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
 
+## Attribution follow-up after suffix-verification deployment
+
+The browser's retained resource timing supplied the missing concurrent stats
+observation for PID 36660 without replaying any request: graph started at page
+time 57.370 s and took 28.756 s; Health started at 57.371 s and returned after
+2.257 s; stats started at 57.372 s and took 18.472 s. The Health response does
+not mean all its background probes had completed. The events request was a
+long-lived SSE subscription, not a 212-second finite graph query. The later
+cursor page took 1.396 s. See the deployment evidence in
+`VERIFICATION_VERSION_SUFFIXES_0_0_4.md`.
+
+Re-examining the existing PID 24152 sample also narrows, rather than proves, the
+CPU attribution: of 76 `json.raw_decode` leaf samples, 67 belonged to SQLAlchemy
+ORM row hydration with no application frame visible above the greenlet boundary.
+Only five were clearly attributed to canonical source hashing. It would be
+incorrect to label all JSON decoding as the Core source-history hash or to
+optimize the latter on that basis. The sample does not identify the ORM table
+or establish that its cost remains dominant in PID 36660.
+
+Two finite, read-only diagnostics against the current data then checked simpler
+suspects. No worker action, graph mutation or writable Grafx admission was used:
+
+- `CommunityBoardSourceReader.fetch` produced a complete snapshot of 980 rows in
+  0.588 s **with cProfile enabled**. Of that, content hashing consumed 0.281 s
+  inclusive and quality-context preparation 0.073 s. This measures current board
+  sources, not the complete independent cognitive-revision/rebuild audit. No
+  lexical JSON shortcut or audit suppression was implemented for this small cost.
+- The ordinary routed schema read took 1.969 s instrumented, including 1.809 s
+  in read-only admission. A following routed 500-node read took 2.287 s, including
+  a different read lane's 1.369 s admission and 0.821 s in native Database.execute.
+  Both newly admitted readers adopted 183 indexes once; the previous duplicate
+  adoption has not returned. Table high-water discovery still visits 81 tables
+  (0.701/0.419 s inclusive), matching the already recorded persisted-high-water
+  decision queue. No physical freshness proof was removed to reduce that cost.
+
+These isolated, instrumented reads are not equivalent to concurrent first-load
+HTTP requests and cannot prove their cause. They rule out treating the isolated
+source reader or single native admission as sufficient explanations of 28.756 s.
+The existing CONC-CPU-1 target remains attribution of overlapping first-load
+queries and background work, including the ORM hydration boundary; no new
+acceptance threshold, source feature, permission expansion or restart was added.
+Diagnostic artifacts are local `.grafx-tmp/current_board_sources.prof`,
+`profile_current_board_sources.py` and the existing `routed_cold_profile.py`.
+
 ## Scoped metadata follow-up — 2026-09-07
 
 Community `9617912` adds schema current_version/validate to the existing scoped

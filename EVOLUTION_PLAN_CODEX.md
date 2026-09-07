@@ -4883,3 +4883,22 @@ API cognitiva confirmou 21 pendentes, zero em progresso, 19 consolidados e zero
 falhos; ledger byte-idêntico após restart e leituras. Não foi disparado redrive,
 consolidação, rebuild, replay ou reset. Modal fechada após inspeção visual.
 Detalhes: `docs/VERIFICATION_VERSION_SUFFIXES_0_0_4.md`.
+
+### Carga inicial: descarte de hipóteses pequenas sem novo gate — 2026-09-07
+
+Os timings já retidos no browser confirmam que a primeira carga do grafo
+(28,756 s) se sobrepôs a stats (18,472 s) e Health (resposta em 2,257 s, sem
+provar término dos probes assíncronos). Não foi necessário repetir a carga.
+A reanálise do perfil anterior separou 67 amostras de decode JSON em hidratação
+ORM, sem caller de aplicação visível, das poucas atribuídas ao hash de fontes;
+não foi assumido que todo esse CPU pertence ao auditador de fontes.
+
+Diagnósticos somente leitura: snapshot atual de fontes completo, 980 linhas em
+0,588 s instrumentado; admissão de dois leitores novos em 1,809/1,369 s e
+consulta nativa de 500 nós em 0,821 s. A adoção permanece única, 183 índices
+por leitor. Essas medições não reproduzem toda a concorrência da primeira carga;
+evitam otimizar hipóteses pequenas como se explicassem o atraso completo.
+Nenhuma validação foi removida, nenhum knob de concorrência alterado, nenhum
+restart/replay ou consolidação adicional disparado. Continua o alvo existente
+CONC-CPU-1, sem novo critério de aceitação. Evidências e limites em
+`docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
