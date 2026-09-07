@@ -53,6 +53,7 @@ from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType, value_type_o
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import (
     QueryAnalysis,
+    Aggregation,
     SimilarityUse,
     analyze,
     exact_path_projection,
@@ -60,7 +61,8 @@ from okto_grafx.domain.query.analysis import (
     named_path,
     named_path_refusal,
     optional_match_refusal,
-    correlated_optional_hop,
+    correlated_optional_pipeline,
+    is_aggregate,
     untyped_one_hop_source,
     union_refusal,
     polymorphic_node_refusal,
@@ -186,8 +188,6 @@ It carries spaces on purpose. A user variable is an ASCII identifier and can nev
 so an anonymous binding can never be shadowed by, or shadow, something the caller wrote.
 """
 
-_PATH_PROJECTION_NODE_TABLE: str = "Decision"
-_PATH_PROJECTION_RELATIONSHIP_TABLE: str = "supersedes"
 _PATH_PROJECTION_NODE_KEYS = frozenset({"_ID", "_LABEL"})
 _PATH_PROJECTION_RELATIONSHIP_KEYS = frozenset({"_SRC", "_DST", "_LABEL", "_ID"})
 """The catalog declaration required by the one projected path."""
@@ -1372,7 +1372,8 @@ class _Planner:
         self.untyped_one_hop_label = (
             None if untyped_source is None else untyped_source.labels[0]
         )
-        if untyped_source is not None or projected_path is not None:
+        if (untyped_source is not None or projected_path is not None
+                or statement.with_clauses or correlated_optional_pipeline(statement)):
             # Each literal recogniser judged the STATEMENT, while the pipeline below also reads
             # the analysis -- which a caller may have supplied. A supplied summary that claims
             # an aggregation gets one: _result inserts AggregateRows over a statement that
@@ -1402,16 +1403,20 @@ class _Planner:
                 expression=statement.unwind_clause.expression,
             )
         similarity_terms: list[Expression] = []
-        correlated = correlated_optional_hop(statement)
-        for clause in statement.match_clauses:
-            if clause.optional and correlated is not None:
+        correlated = correlated_optional_pipeline(statement)
+        reading_clauses = statement.ordered_read_clauses() if correlated else statement.match_clauses
+        for clause in reading_clauses:
+            if isinstance(clause, WithClause):
+                pipeline = self._with_clause(pipeline, clause)
+                continue
+            if clause.optional and correlated:
                 pipeline = self._correlated_optional(pipeline, clause)
                 continue
             pipeline, deferred = self._match_clause(pipeline, clause)
             similarity_terms.extend(deferred)
         pipeline = self._similarity(pipeline, statement, similarity_terms)
         optional = [clause for clause in statement.match_clauses if clause.optional]
-        if optional and correlated is None:
+        if optional and not correlated:
             # Above every filter of the clause, residual and deferred alike: the WHERE belongs
             # to the OPTIONAL, so "no rows" has to mean no rows AFTER all of it. The gate above
             # has already proved the shape, which is why one node of one pattern can be read
@@ -1420,8 +1425,9 @@ class _Planner:
                 child=pipeline,
                 alias=optional[0].patterns[0].nodes[0].variable,
             )
-        for clause in statement.with_clauses:
-            pipeline = self._with_clause(pipeline, clause)
+        if not correlated:
+            for clause in statement.with_clauses:
+                pipeline = self._with_clause(pipeline, clause)
         for clause in statement.updating_clauses:
             pipeline = self._updating_clause(pipeline, clause)
         self._record_polymorphic_properties(statement)
@@ -1511,6 +1517,20 @@ class _Planner:
             # provable for every use of the name below it: parts[1] is a STRING because parts
             # is the string_split() this stage projected.
             self.alias_definitions[item.alias] = item.expression
+        aggregations = tuple(
+            Aggregation(position=position, call=call)
+            for position, item in enumerate(clause.items)
+            for call in walk(item.expression) if is_aggregate(call)
+        )
+        if aggregations:
+            grouped_positions = {aggregate.position for aggregate in aggregations}
+            pipeline = AggregateRows(
+                child=pipeline,
+                grouping=tuple(item for position, item in enumerate(clause.items)
+                               if position not in grouped_positions),
+                aggregations=aggregations,
+                preserve_group_bindings=True,
+            )
         pipeline = WithRows(child=pipeline, items=clause.items)
         if clause.predicate is not None:
             # The predicate belongs to THIS stage, so it filters what the projection produced
@@ -3287,30 +3307,34 @@ class _Planner:
         return found if found.keys() == expected.keys() else None
 
     def _require_path_projection_schema(self, table: TableDef) -> None:
-        """Require the exact relationship declaration the projected path was frozen against.
+        """Require the relationship declaration to match both written path endpoints.
 
         The ordinary traversal checks the table at its starting end. Its labelled target is
         otherwise resolved from the label the query wrote, without proving that label is the
         relationship's declared ``to_table``. That is insufficient for a path value: publishing
-        ``b:Decision`` while the edge actually lands in another table would encode a path the
-        query did not match. The literal form therefore closes both ends before any row streams.
+        a target label while the edge actually lands in another table would encode a path the
+        query did not match. Close both ends before any row streams.
         """
+        pattern = self.path_projection
+        assert pattern is not None  # Only the exact typed shape can publish a path value.
+        source_label, target_label = (node.labels[0] for node in pattern.nodes)
         if not (
-            table.name == _PATH_PROJECTION_RELATIONSHIP_TABLE
-            and table.from_table == _PATH_PROJECTION_NODE_TABLE
-            and table.to_table == _PATH_PROJECTION_NODE_TABLE
+            table.name == pattern.relationships[0].types[0]
+            and table.from_table == source_label
+            and table.to_table == target_label
         ):
             raise GrafxPlanError(
-                "The projected path reads a 'supersedes' relationship declared from Decision "
-                "to Decision; the catalog declaration does not match that frozen endpoint pair.",
+                "The projected path endpoint labels do not match the relationship's "
+                "catalog declaration.",
                 field="endpoint",
                 value=table.name,
                 from_table=table.from_table,
                 to_table=table.to_table,
             )
 
-        node_table = self._table_named(_PATH_PROJECTION_NODE_TABLE, "label")
-        self._require_path_property_keys(node_table, _PATH_PROJECTION_NODE_KEYS)
+        for label in (source_label, target_label):
+            node_table = self._table_named(label, "label")
+            self._require_path_property_keys(node_table, _PATH_PROJECTION_NODE_KEYS)
         self._require_path_property_keys(table, _PATH_PROJECTION_RELATIONSHIP_KEYS)
 
     @staticmethod
@@ -3504,6 +3528,7 @@ class _Planner:
         if (
             clause is None
             or statement.updating_clauses
+            or statement.with_clauses
             or residual
             or clause.distinct
             or self.analysis.aggregated

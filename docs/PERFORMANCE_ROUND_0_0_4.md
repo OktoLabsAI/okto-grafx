@@ -199,7 +199,11 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
     logical sink commits one recoverable batch (default maximum 500), checkpoints the exclusively
     owned unbound candidate at completion and cold-verifies its fingerprint before publication.
     **Remaining:** `find_by_artifact` memoizes adjacency per node, but still queries each incident
-    layout/direction. Eager cross-node batching is not accepted yet: it can visit a center that
+    layout/direction. The September 7 native vector-free landing candidate removes unused
+    vector materialization from its existing closed scalar single-hop queries, without changing
+    the frontier. Focused evidence and the accumulated checkpoint status are recorded in
+    `docs/VECTOR_FREE_TRAVERSAL_0_0_4.md`; this does not claim that layout fan-out is eliminated.
+    Eager cross-node batching is not accepted yet: it can visit a center that
     the existing `max_rows` frontier never reaches, changing error/admission behavior. Keep the
     current exact result order, parallel-edge multiplicity, visibility filters and null hop2
     extension as the oracle for this already selected residual, not as a new feature target.

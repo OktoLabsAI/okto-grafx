@@ -3,6 +3,11 @@
 This specification freezes the finite compatibility target for M-PULSE-2O. It does not widen
 the Grafx Cypher subset beyond the single statement below.
 
+The historical oracle below remains unchanged. Grafx 0.0.4 subsequently generalized the
+same directed one-hop value to caller-defined aliases and catalog labels/types, including
+physical relationship names; see [the current query contract](../architecture/CONTRACT.md).
+This extension changes neither the public structural keys nor endpoint identity correlations.
+
 ```cypher
 MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path
 ```

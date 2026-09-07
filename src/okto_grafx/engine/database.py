@@ -4026,6 +4026,17 @@ class Database:
         self._require_open()
         self._publish_metrics()
 
+    def read_index_status(self, name: str) -> IndexView:
+        """Read an active index's validated durable header into an immutable DTO.
+
+        Unlike ``indexes``, this explicit I/O operation faults in a cold header.
+        It validates catalog/physical generation identity, but does not rebuild,
+        clear staleness, certify heap coverage, or advance a watermark.
+        """
+        with self._public_operation("read_index_status"):
+            self._require_open()
+            return self._committed_index_receipt(_require_text("index", name))
+
     def inspect_index(self, name: str) -> tuple[IndexEntry, ...]:
         """Return immutable entry DTOs from one secondary index.
 

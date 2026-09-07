@@ -1146,7 +1146,7 @@ class QueryEngine:
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`, and `-[:R*]->`
 for the default bound), the narrow root `OPTIONAL MATCH (v:Label)`, `WHERE`, `RETURN`
-(`DISTINCT`, aliases), one leading `UNWIND`, non-aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
+(`DISTINCT`, aliases), one leading `UNWIND`, scalar or aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
 aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
 `string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
 evaluates every argument from left to right and returns the first non-null one, or null when all
@@ -1216,8 +1216,13 @@ stage projects each name once. A carried matched variable keeps its binding, so 
 still read its properties and still write it, while a computed item is a value and never a `SET`
 or `DELETE` target. The `WHERE` belongs to the stage it was written under and therefore filters
 what that projection produced, which is what lets a guard such as `size(parts) >= 2` protect the
-stage after it. Aggregation, `DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` inside a `WITH`, a `MATCH`
-after one, a `WITH` after a clause that writes, and `UNWIND` combined with `WITH` are all refused.
+stage after it. Since 0.0.4 aggregate WITH items use the same native `AggregateRows` operator as
+RETURN; all non-aggregate items are grouping keys. An empty input with no grouping key still
+produces the global aggregate (e.g. count zero); grouping by a node over an empty input produces
+no row. Aggregate nesting is refused. Grouped entity bindings survive byte-budget spill using
+the private operator-row codec, preserving their original snapshot and owner-overlay identity.
+`DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` inside a `WITH`, a mandatory `MATCH`
+after one, a `WITH` after a clause that writes, and `UNWIND` combined with `WITH` remain refused.
 `WithRows` is streaming -- one row in, one row out -- and participates once, through the common
 operator wrapper, in `max_intermediate_rows`.
 
@@ -1237,9 +1242,16 @@ Since 0.0.4 a second form admits `MATCH (a:Label) [WHERE ...] OPTIONAL MATCH (a)
 is allowed). The optional clause is one correlated single hop, outgoing, incoming or undirected,
 with zero or one relationship type and zero or one target label. Target and relationship names
 are optional; supplied aliases must be distinct. The optional source may repeat the root label.
-Optional inline maps, ranges, named paths, additional MATCH clauses, WITH, UNWIND, writes and
+This form also admits additional incident OPTIONAL hops from the same anchor, interleaved with
+WITH projections/aggregations. The AST retains their written order. For example, count outgoing
+edges in a WITH before expanding incoming edges to avoid multiplying the two degrees. Each hop
+introduces fresh target/relationship aliases; the anchor must remain in scope. An incompatible
+typed relationship endpoint produces a null optional extension, not an invented relationship.
+Optional inline maps, ranges, named paths, additional mandatory MATCH clauses, UNWIND, writes and
 vector-search predicates in the optional clause remain refused. This is not arbitrary optional
-join support.
+join support; vector search also cannot cross the new interleaved projection barriers.
+No Pulse schema or scoring formula is encoded in the engine. LIMIT-to-vector-top-k fusion
+remains disabled across WITH stages, which may filter or aggregate candidate rows.
 
 All matching edges retain multiplicity. Each anchor with no edge satisfying the target label
 and complete optional WHERE produces one row with null target/relationship: `count(r)=0`,
@@ -1334,13 +1346,19 @@ and the pattern records that a `*` was typed rather than inferring it from the h
 
 A path may also be NAMED, in `MATCH path = (a:A)-[r:T]->(b:B) [WHERE ...] RETURN ...`. Ordinarily
 the name is decorative: it is written and checked but not read, and the plan is the plan of the
-same query without the name. There is one closed Pulse compatibility exception that reads it:
+same query without the name. A closed typed one-hop form reads it:
 
 ```
-MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path
+MATCH journey = (source:Person)-[edge:Knows]->(target:Person) RETURN journey
 ```
 
-That exact AST returns one one-hop path value for every matching relationship, preserving
+Since 0.0.4 the path, endpoint and relationship aliases and schema names are caller-defined
+bare identifiers; the four aliases must be distinct. The two endpoint labels may differ,
+provided the named relationship's catalog declaration matches them exactly. A literal
+non-negative terminal LIMIT is optional. This also admits storage-owned relationship names
+without encoding a client application's physical naming convention in Grafx.
+
+That shape returns one one-hop path value for every matching relationship, preserving
 parallel-edge multiplicity. The map carries `_NODES` and `_RELS`; nodes carry `_ID`, `_LABEL`
 and every catalog property, while the relationship carries `_SRC`, `_DST`, `_LABEL`, `_ID` and
 every user property. Endpoint identities equal the corresponding node identities. The numbers
@@ -1350,13 +1368,13 @@ list values remain tuples; the Pulse provider performs its narrow tuple-to-list 
 [`PULSE-PATH-VALUE-1.0.md`](../specs/PULSE-PATH-VALUE-1.0.md) freezes the differential oracle,
 key order, identity correlations and public Pulse layer rewrites.
 
-Because those maps have structural keys, this projection refuses a `Decision` property named
-`_ID` or `_LABEL`, or a `supersedes` property named `_SRC`, `_DST`, `_LABEL` or `_ID`, during
+Because those maps have structural keys, this projection refuses a property on either endpoint
+named `_ID` or `_LABEL`, or a relationship property named `_SRC`, `_DST`, `_LABEL` or `_ID`, during
 planning and before any row streams. The names remain legal for schemas outside this projection;
 the physical relationship endpoint columns `_from` and `_to` are not user properties and remain
 accepted and omitted from the public map.
 
-Every other read of a path name -- another name, label, relationship type or direction, a
+Every wider read of a path name -- an incoming or undirected hop, a
 property/function, `WHERE`, `ORDER BY`, alias, additional item or clause, map, written range,
 multiple hop, write, or `UNION` branch -- is refused before streaming. Decorative paths keep
 their existing exact form: one `MATCH` of one pattern, one named outgoing hop of one type with no
@@ -2828,3 +2846,24 @@ A component gets **two** correction rounds per rejection. A blocking defect surv
 recorded as a carried finding and the component ships with it stated. The bar is a database that does
 not lose, duplicate or corrupt data, does not return wrong results, and does not lie about what it did
 -- proven by tests that exist, with the remaining gaps written down.
+
+## Explicit durable index status (2026-09-07)
+
+`Database.read_index_status(name) -> IndexView` is an explicit read-I/O operation.
+It reads and validates the active generation's durable header under the existing
+catalog/freshness protocol and returns detached immutable metadata. Unlike the
+cheap `database.indexes` and `database.vectors` observations, its watermark does
+not depend on page-zero cache residency. It does not rebuild an index, advance
+its watermark, clear staleness or prove full heap/index coverage. Consumers that
+certify coverage must still use verification and publication fencing. Cheap
+observations retain their no-page-fault contract; `None` means unobserved, not zero.
+
+## Closed scalar traversal materialization (0.0.4)
+
+A proved single-hop scalar query may omit allocation of unused destination vector
+components, never their durable validation. Full-entity/vector reads and unproved
+plans retain full materialization. Partial landing rows are internal, guarded and
+separately keyed in the existing bounded transaction-local cache; they cannot
+answer a later full read. Traversal order, multiplicity, frontier, budgets and
+index/heap certificates are unchanged. See `docs/VECTOR_FREE_TRAVERSAL_0_0_4.md`
+for the proof boundary, fallback, adversarial evidence and measured limitations.

@@ -550,6 +550,8 @@ class _Parser:
         return_clause: ReturnClause | None = None
         clauses = 0
         optional_root = False
+        read_order: list[str] = []
+        interleaved = False
         while (
             self._current.kind is not TokenKind.END
             and not self._at_symbol(";")
@@ -562,7 +564,7 @@ class _Parser:
                     field="clauses",
                     value=MAX_CLAUSES,
                 )
-            if optional_root and not self._at_keyword("RETURN"):
+            if optional_root and len(match_clauses) == 1 and not self._at_keyword("RETURN"):
                 # WHERE was already taken by the clause itself, so RETURN is the only word that
                 # may follow an OPTIONAL MATCH here. One guard answers every trailing clause at
                 # once -- a second MATCH, a WITH, an UNWIND, anything that writes -- and answers
@@ -587,7 +589,7 @@ class _Parser:
             ):
                 # Root optional nodes and correlated one-hop optional expansions have
                 # distinct shape checks. Validate the latter once RETURN is available.
-                if with_clauses or updating_clauses or return_clause is not None or unwind_clause is not None:
+                if updating_clauses or return_clause is not None or unwind_clause is not None:
                     raise self._refuse("OPTIONAL MATCH must precede projection and writes", field="clause")
                 self._advance()
                 clause = self._match_clause(optional=True)
@@ -597,6 +599,8 @@ class _Parser:
                     raise self._refuse(message, field="pattern", value=value)
                 optional_root = True
                 match_clauses.append(clause)
+                read_order.append("match")
+                interleaved = interleaved or bool(with_clauses)
                 continue
             if self._at_keyword("MATCH"):
                 if with_clauses:
@@ -613,6 +617,7 @@ class _Parser:
                         value="MATCH",
                     )
                 match_clauses.append(self._match_clause())
+                read_order.append("match")
                 continue
             if return_clause is not None:
                 raise self._refuse(
@@ -639,6 +644,7 @@ class _Parser:
                         value="WITH",
                     )
                 with_clauses.append(self._with_clause())
+                read_order.append("with")
                 continue
             updating_clauses.append(self._updating_clause())
         if (
@@ -661,11 +667,12 @@ class _Parser:
             with_clauses=tuple(with_clauses),
             updating_clauses=tuple(updating_clauses),
             return_clause=return_clause,
+            read_clause_order=tuple(read_order) if interleaved else (),
         )
         if any(c.optional for c in match_clauses) and len(match_clauses) > 1:
-            from okto_grafx.domain.query.analysis import correlated_optional_hop
+            from okto_grafx.domain.query.analysis import correlated_optional_pipeline
 
-            if correlated_optional_hop(query) is None:
+            if not correlated_optional_pipeline(query):
                 raise self._refuse(
                     "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop",
                     field="clause", value="OPTIONAL MATCH",

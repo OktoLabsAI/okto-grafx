@@ -349,6 +349,9 @@ _OWNER_LANDING_BYTES_BASE_BYTES: int = 40
 _OWNER_LANDING_OBJECT_BYTES: int = 96
 _OWNER_LANDING_VECTOR_BASE_BYTES: int = 128
 _OWNER_LANDING_VECTOR_COMPONENT_BYTES: int = 32
+_VECTOR_FREE_CANONICAL_READ = HeapStore.read
+_VECTOR_FREE_CANONICAL_DECODE = HeapStore._decode_version
+_VECTOR_FREE_CANONICAL_VALIDATED = IndexManager.validated_versions
 """Shape tariff of one retained landing (KGRUN-M4).
 
 Each constant dominates the CPython footprint of the object it meters: a scalar cell is one
@@ -1260,6 +1263,9 @@ class _Context:
     node_scan_projections: dict[int, dict[int, frozenset[int]]] = field(
         default_factory=dict
     )
+    # A closed one-hop read may validate landing vectors without allocating them.
+    # This is a per-operator proof, never a change to an index's authority.
+    vector_free_landings: frozenset[int] = frozenset()
     # Hashed IN parameter lists keyed by parameter name.  ``None`` records a declined build, so
     # the linear walk is chosen once for that parameter rather than re-examined on every row.
     in_list_memos: dict[str, _InListMemo | None] = field(default_factory=dict)
@@ -2134,6 +2140,9 @@ def _owner_landing_result_bytes(
     )
     compound = False
     for column, value in zip(table.columns, values):
+        if _is_unmaterialized_column(value):
+            charge += _OWNER_LANDING_TUPLE_SLOT_BYTES
+            continue
         if value is None:
             charge += _OWNER_LANDING_TUPLE_SLOT_BYTES
             continue
@@ -2144,10 +2153,15 @@ def _owner_landing_result_bytes(
                 + _OWNER_LANDING_STRING_CHAR_BYTES * len(cast(str, value))
             )
         elif kind in VECTOR_VALUE_TYPES:
+            # Pending SET can carry a not-yet-encoded value of the wrong type.
+            # Optional retention must not replace the canonical schema refusal
+            # with an AttributeError while estimating the cache charge.
+            if type(value) is not VectorValue:
+                return None
             charge += (
                 _OWNER_LANDING_VECTOR_BASE_BYTES
                 + _OWNER_LANDING_VECTOR_COMPONENT_BYTES
-                * len(cast(VectorValue, value).values)
+                * len(value.values)
             )
         elif kind is ValueType.BYTES:
             charge += _OWNER_LANDING_BYTES_BASE_BYTES + len(cast(bytes, value))
@@ -2336,9 +2350,12 @@ class _OwnerLandingView:
         )
 
     def get(
-        self, identity: object, context: _Context
+        self, identity: object, context: _Context, *, materialize_vectors: bool = True
     ) -> tuple[object, HeapVersion] | None:
         """Return one owner-visible identity, memoizing only after successful admission."""
+        # Partial rows never answer a later full-entity/vector read in this transaction.
+        # Physical identities are integers or PendingRowRef, never this private tuple key.
+        cache_key = identity if materialize_vectors else (identity, "vector_free")
         with self._guard:
             if self._retired:
                 raise GrafxTransactionStateError(
@@ -2347,33 +2364,39 @@ class _OwnerLandingView:
                     table=self._table.name,
                     table_id=self._table.table_id,
                 )
-            cached = self._cache.get(identity)
+            cached = self._cache.get(cache_key)
             if cached is not None:
                 # A hit becomes the most recently used entry (dict order is the LRU order).
-                del self._cache[identity]
-                self._cache[identity] = cached
+                del self._cache[cache_key]
+                self._cache[cache_key] = cached
                 return cached[0]
             self._active += 1
         lease_open = True
         try:
             # The identity door can walk and decode heap pages.  It is deliberately outside the
             # injected registry guard; only the immutable overlay references above are leased.
-            found = self._resolve(identity, context)
+            found = (
+                self._resolve(identity, context)
+                if materialize_vectors
+                else self._resolve(identity, context, materialize_vectors=False)
+            )
             charge = _owner_landing_result_bytes(self._table, found)
+            if charge is not None and not materialize_vectors:
+                charge += 128  # conservative retention tariff for the private key tuple
             with self._guard:
                 try:
                     if (
                         not self._retired
                         and self._cache_enabled
                         and charge is not None
-                        and identity not in self._cache
+                        and cache_key not in self._cache
                     ):
                         budget = self._budget
                         if budget is not None and self._reserve_evicting_locked(
                             budget, charge
                         ):
                             try:
-                                self._cache[identity] = (found, charge)
+                                self._cache[cache_key] = (found, charge)
                             except BaseException:
                                 budget.release(bytes_=charge, entries=1)
                                 raise
@@ -2408,7 +2431,7 @@ class _OwnerLandingView:
             self._budget = None
 
     def _resolve(
-        self, identity: object, context: _Context
+        self, identity: object, context: _Context, *, materialize_vectors: bool = True
     ) -> tuple[object, HeapVersion] | None:
         """Apply the former full-map overlay to one physical or pending identity."""
         if isinstance(identity, PendingRowRef):
@@ -2429,15 +2452,26 @@ class _OwnerLandingView:
                 ),
             )
 
-        physical = _visible_identity_with_ref(
-            self._engine,
-            context,
-            self._table,
-            cast(RecordId, identity),
+        physical = (
+            _visible_identity_with_ref(
+                self._engine, context, self._table, cast(RecordId, identity)
+            )
+            if materialize_vectors
+            else _visible_identity_with_ref(
+                self._engine, context, self._table, cast(RecordId, identity), landing=True
+            )
         )
         if physical is None:
             return None
         ref, version = physical
+        if not materialize_vectors:
+            # The identity-only decoder's proof values must not become row values.
+            # Convert every vector position to the projected decoder's guarded marker;
+            # owner updates below replace this with their complete, validated tuple.
+            version = replace(version, values=tuple(
+                _UNMATERIALIZED_COLUMN if column.type in VECTOR_VALUE_TYPES else value
+                for column, value in zip(self._table.columns, version.values)
+            ))
         if ref in self._ended:
             return None
         if ref in self._changed:
@@ -3487,6 +3521,7 @@ class QueryEngine:
                 union_coercions=_bound_union_columns(plan, bound),
                 index_authority=authority,
                 node_scan_projections=_closed_node_scan_projections(root.child),
+                vector_free_landings=_closed_vector_free_landings(root.child),
             )
             _bind_timestamp_values(plan, context)
             _validate_bound_subscript_types(plan, bound)
@@ -3887,6 +3922,7 @@ class QueryEngine:
             index_authority=index_authority,
             short_circuit_traversals=_short_circuit_traversals(root.child),
             node_scan_projections=_closed_node_scan_projections(root.child),
+            vector_free_landings=_closed_vector_free_landings(root.child),
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
@@ -5849,6 +5885,84 @@ NodeScan and AllNodesScan frontiers bypass this limit and scan immediately becau
 already promises a whole-table walk. Unknown producers retain the conservative hybrid fallback."""
 
 
+def _closed_vector_free_landings(root: PlanNode) -> frozenset[int]:
+    """Prove one typed, single-hop read cannot inspect any landing vector.
+
+    Keep the same traversal, row order, frontier, physical checks and admission.
+    Only scalar projections/filters/aggregates over a single node source qualify.
+    WITH, UNION, optional/range/path traversal, writes and unknown operators keep
+    full rows. A bare target or a target vector anywhere in the pipeline declines.
+    """
+    expressions: list[Expression] = []
+    planned = root
+    while True:
+        kind = type(planned)
+        if kind is FilterRows:
+            expressions.append(planned.predicate)
+        elif kind is ProjectRows:
+            expressions.extend(item.expression for item in planned.items)
+        elif kind is AggregateRows:
+            if planned.preserve_group_bindings:
+                return frozenset()
+            expressions.extend(item.expression for item in planned.grouping)
+            expressions.extend(item.call for item in planned.aggregations)
+        elif kind is SortRows:
+            expressions.extend(item.expression for item in planned.keys)
+            expressions.extend(value for value in (
+                planned.retained_limit, planned.retained_skip,
+            ) if value is not None)
+        elif kind in (LimitRows, SkipRows):
+            expressions.append(planned.count)
+        elif kind is not DistinctRows:
+            break
+        planned = planned.child
+    if type(planned) is not TraverseRelationship:
+        return frozenset()
+    hop = planned
+    if (
+        hop.min_hops != 1 or hop.max_hops != 1 or hop.path_variable is not None
+        or hop.target_bound or hop.target_table is None or hop.target == hop.source
+        or hop.direction is Direction.UNDIRECTED
+    ):
+        return frozenset()
+    vector_names = {
+        column.name for column in hop.target_table.columns
+        if column.type in VECTOR_VALUE_TYPES
+    }
+    if not vector_names:
+        return frozenset()
+    source = hop.child
+    while type(source) is FilterRows:
+        expressions.append(source.predicate)
+        source = source.child
+    if (
+        type(source) not in (NodeScan, IndexSeek)
+        or type(source.child) is not SingleRow or source.variable != hop.source
+    ):
+        return frozenset()
+    if type(source) is IndexSeek:
+        expressions.extend(source.key_values)
+    pending = list(expressions)
+    while pending:
+        expression = pending.pop()
+        if (
+            type(expression) is FunctionCall and expression.name.upper() == LABEL_FUNCTION
+            and len(expression.arguments) == 1
+            and type(expression.arguments[0]) is Variable
+            and expression.arguments[0].name == hop.target
+            and not expression.named_arguments and not expression.distinct and not expression.star
+        ):
+            continue
+        if type(expression) is Property and type(expression.subject) is Variable:
+            if expression.subject.name == hop.target and expression.key in vector_names:
+                return frozenset()
+            continue
+        if type(expression) is Variable and expression.name == hop.target:
+            return frozenset()
+        pending.extend(expression.children())
+    return frozenset((id(hop),))
+
+
 def _closed_node_scan_projections(
     root: PlanNode,
 ) -> dict[int, dict[int, frozenset[int]]]:
@@ -6279,6 +6393,14 @@ def _traverse(
     landing_views: dict[int, _OwnerLandingView] = {}
 
     ended = _ended_by_this_transaction(context)
+    vector_free = (
+        id(node) in context.vector_free_landings
+        and type(engine.heap) is HeapStore
+        and type(engine._indexes) is IndexManager
+        and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
+        and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
+        and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
+    )
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
         """Return one owner-visible node through a single lazy view per landing table."""
@@ -6286,7 +6408,10 @@ def _traverse(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity, context)
+        return (
+            view.get(identity, context, materialize_vectors=False)
+            if vector_free else view.get(identity, context)
+        )
 
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
@@ -9859,10 +9984,15 @@ def _aggregate_input_payload(
     row: _Row,
     context: _Context,
     nan_identities: _NaNIdentityRegistry,
+    group_codec: _SpillRowCodec | None = None,
 ) -> tuple[bytes, bytes, tuple[Value, ...]]:
     """Evaluate and safely encode one aggregate input row before releasing it."""
     raw_keys = tuple(_evaluate(item.expression, row, context) for item in node.grouping)
-    keys = tuple(_spill_detach_value(value) for value in raw_keys)
+    # A grouping key can be a carried entity for a subsequent WITH/traversal.
+    # Public value detachment loses RowBinding identity/capability; use the same
+    # budgeted private codec as other blocking operators, never a heap reread.
+    keys = tuple((group_codec._detach(value) if group_codec is not None
+                  else _spill_detach_value(value)) for value in raw_keys)
     signature = _spill_encode(
         _spill_pack_internal(
             tuple(_freeze(value) for value in raw_keys),
@@ -9897,6 +10027,7 @@ def _aggregate_input_payload(
 
 def _decode_aggregate_input(
     payload: bytes,
+    *, encoded_group_keys: bool = False,
 ) -> tuple[tuple[Value, ...], tuple[Value, ...]]:
     value = _spill_decode(payload, key=False)
     if (
@@ -9911,7 +10042,8 @@ def _decode_aggregate_input(
             field="query_spill.record",
             value="aggregate_input",
         )
-    return tuple(_spill_restore_value(item) for item in value[1]), value[2]
+    keys = value[1] if encoded_group_keys else tuple(_spill_restore_value(item) for item in value[1])
+    return keys, value[2]
 
 
 def _decode_aggregate_entry(
@@ -10190,7 +10322,8 @@ class _SpilledAggregateState:
         accumulator.add_value(value, sort_key=sort_key, apply_distinct=False)
 
 
-def _decode_aggregate_output(payload: bytes, node: AggregateRows) -> _Row:
+def _decode_aggregate_output(payload: bytes, node: AggregateRows,
+                             group_codec: _SpillRowCodec | None = None) -> _Row:
     value = _spill_decode(payload, key=False)
     if (
         not isinstance(value, tuple)
@@ -10218,7 +10351,8 @@ def _decode_aggregate_output(payload: bytes, node: AggregateRows) -> _Row:
             value="aggregate_results",
         )
     computed: dict[Expression, object] = {
-        item.expression: item_value for item, item_value in zip(node.grouping, keys)
+        item.expression: (group_codec._restore(item_value) if group_codec is not None else item_value)
+        for item, item_value in zip(node.grouping, keys)
     }
     computed.update(
         {
@@ -10235,6 +10369,7 @@ def _spilled_aggregate_rows(
     """Group through bounded external passes, retaining only one aggregate state in core."""
     workspace, _budget = engine._spill_workspace(node.label)
     nan_identities = _NaNIdentityRegistry(workspace)
+    group_codec = _SpillRowCodec(context, workspace) if node.preserve_group_bindings else None
     source = workspace.sorter(_compare_group_spill_keys)
     output = workspace.sorter(_compare_ordinal_spill_keys)
     current: _SpilledAggregateState | None = None
@@ -10253,7 +10388,7 @@ def _spilled_aggregate_rows(
                     observed=ordinal,
                 )
             signature, payload, _keys = _aggregate_input_payload(
-                node, row, context, nan_identities
+                node, row, context, nan_identities, group_codec
             )
             source.append(
                 _spill_encode(("group", signature, ordinal), key=True), payload
@@ -10272,7 +10407,7 @@ def _spilled_aggregate_rows(
         current_signature: bytes | None = None
         for key, payload in source_records:
             signature, ordinal = _spill_pair_key(key, kind="group")
-            keys, entries = _decode_aggregate_input(payload)
+            keys, entries = _decode_aggregate_input(payload, encoded_group_keys=group_codec is not None)
             if current_signature != signature:
                 if current is not None:
                     output.append(
@@ -10290,7 +10425,7 @@ def _spilled_aggregate_rows(
 
         output_records = output.records()
         for _key, payload in output_records:
-            yield _decode_aggregate_output(payload, node)
+            yield _decode_aggregate_output(payload, node, group_codec)
     except BaseException as caught:
         failure = caught
         raise
@@ -10318,6 +10453,14 @@ def _spilled_aggregate_rows(
                         "A query spill iterator also failed to close with "
                         f"{type(close_failure).__name__}: {close_failure}"
                     )
+        try:
+            if group_codec is not None:
+                group_codec.close()
+        except BaseException as close_failure:
+            if cleanup_failure is None:
+                cleanup_failure = close_failure
+            else:
+                cleanup_failure.add_note(f"Aggregate group codec cleanup also failed: {close_failure}")
         try:
             nan_identities.close()
         except BaseException as close_failure:

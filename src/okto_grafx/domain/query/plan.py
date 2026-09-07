@@ -653,6 +653,9 @@ class AggregateRows(PlanNode):
     child: PlanNode
     grouping: tuple[ReturnItem, ...]
     aggregations: tuple[Aggregation, ...]
+    # WITH carries matched entities to downstream graph operators; RETURN can
+    # detach them to public values and retain its compact spill representation.
+    preserve_group_bindings: bool = False
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are grouped."""

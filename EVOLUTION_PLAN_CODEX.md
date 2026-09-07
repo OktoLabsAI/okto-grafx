@@ -4121,3 +4121,132 @@ integrada passou 152 testes de crash/verifier/recovery/chain-relink; páginas al
 zeradas continuam diagnosticadas com cache quente em `pages`/`all`. O1 foi encerrado como
 custo marginal e O3 como comportamento documentado de visão capturada, sem alteração de
 protocolo. O escopo `indexes` sozinho não substitui a verificação física `pages`/`all`.
+
+### Configurações Grafx no Menu > Settings do Pulse (2026-09-07)
+
+A tela, que expunha somente página e revalidação de descritores, passou a inventariar
+os 36 campos públicos de `DatabaseConfig`, com teste de cobertura contra o dataclass
+nativo. São 30 controles editáveis (incluindo orçamento por handle, timeouts,
+WAL/checkpoint, budgets e busca vetorial) e 6 campos explicitamente gerenciados pela
+composição: path, read_only, partitions_per_table e os 3 campos de telemetria.
+Todos têm ajuda por mouse, foco de teclado e clique. Nenhum default foi elevado.
+
+As opções avançadas são persistidas em `kg_grafx_options`, validadas pelo Grafx antes
+do save e encaminhadas aos pools Community. A composição é refeita após hidratar
+as configurações salvas no boot, antes de seed/workers; valores efetivos e desejados
+continuam separados. Não há hot-reload de handles, rebuild ou mudança no Core.
+Evidência: 66 casos Python distintos, 19 testes UI, build e validação pela API/tela
+da instância reiniciada. Detalhes e políticas dos campos gerenciados constam em
+`okto-pulse-v003-kg-load-codex/docs/GRAFX_RUNTIME_SETTINGS_UI.md`.
+
+### Consolidação cognitiva real e custo de escrita (2026-09-07)
+
+Auditoria em `docs/PULSE_COGNITIVE_WRITE_AUDIT_2026_09_07.md`: 1 das 22 specs
+pendentes consolidada (4 nós/8 relações; 26,960 s na chamada completa), com leitura
+posterior confirmada. Permanecem 21 pendentes: 7 sem raiz determinística e 14 com
+base disponível. O lote foi contido após nova entrega ao Global Discovery cair
+em DLQ com configuration_error. A tentativa anterior sem raiz foi recusada antes
+de gravar, em 40,373 s. Não confundir esses tempos com latência física do Grafx.
+Prioridades identificadas: corrigir entrega Global/consultas lógicas/scoring,
+restaurar projeções determinísticas faltantes, reduzir enumeração/fingerprints
+de health no caminho de escrita, agrupar consultas de proveniência e instrumentar
+as fases nativas. São achados/propostas, não implementações nem fechamento do lote.
+
+#### Correção dos bloqueios e reserva dos benchmarks (2026-09-07)
+
+Por orientação explícita do usuário, **não consolidar as 21 specs restantes**:
+elas são o corpus para comparar futuras melhorias de escrita. O escopo atual
+é corrigir bloqueios e reparar projeções determinísticas, sem fechar seu ledger
+cognitivo, executar rebuild amplo ou alterar as garantias multi-reader/writer.
+
+Implementados e testados: OPTIONAL MATCH intercalado com WITH agregado nativo
+(incluindo bindings preservados no spill), tradução Community das relações
+lógicas, projeção genérica de paths de um hop e correções de listas acima de
+1.024 IDs na reconciliação Global. A visibilidade usa lotes de 512 e evita
+reescrever valores já corretos; a limpeza de vínculos compara o conjunto esperado
+completo e publica somente deleções comprovadas em uma transação, com rollback
+integral. Nunca fragmentar NOT IN como deleções independentes.
+
+O Pulse ganhou repair autorizado de projeção determinística por IDs explícitos,
+com auditoria e preservação de claims/tombstones. As consultas lógicas, de scoring
+e de paths já foram confirmadas no Pulse em execução. A entrega Global existente
+foi redriven de forma isolada; a verificação terminal e a admissão das sete raízes
+determinísticas continuam pendentes neste checkpoint. Não criar sessões cognitivas
+para testar esses caminhos. Evidências, testes e atualização do estado estão em
+`docs/PULSE_COGNITIVE_WRITE_AUDIT_2026_09_07.md`.
+
+Oportunidade adicional identificada: a verificação
+de identidade `(board_id, original_node_id)` antes de cada upsert de digest faz
+node scan; investigar índice secundário/composite ou resolução transacional em
+lote, mantendo detecção de colisões. O índice composto nativo existente foi
+antecipado para desbloquear a recomposição real: na cópia isolada com 853 digests,
+a consulta caiu de mediana 3.411,89 ms/853 linhas examinadas para 6,97 ms/1 linha
+buscada, sem diferença de resultado (5 amostras por variante). Não extrapolar
+esse ~490× para o commit completo. Construção inicial do índice: 57,48 s.
+Avaliar também o custo da convergência global
+completa por evento e da sessão relacional retida durante esse processamento.
+
+Também corrigidas as consultas exatas de vínculo Global para partir do PK do
+digest e percorrer suas relações incoming, em vez de varrer o hub do board.
+Teste nativo adversarial: mesmo COUNT com duplicatas/vínculo estrangeiro,
+33 relações examinadas antes versus 3 depois; normalização e guardas preservadas.
+Dois testes focados passaram em 18,54 s. Não confundir redução de trabalho com
+speedup medido do commit completo. O ledger das 21 specs segue inalterado.
+
+Reparo determinístico das sete specs admitido via REST auditado (HTTP 202,
+correlação `665ff221-7d3f-4a76-8d76-a3401daa7db2`), sem consolidação cognitiva.
+A execução revelou starvation na fila: o dependente `b4df3d30` precedia os
+pré-requisitos `eed9e13f` e `d9381a62` e bloqueava o board durante seus retries.
+Corrigido no seletor agnóstico do Core: somente espera tipada por endpoint cede
+aos demais; claims, erros ordinários e rebuild mantêm suas barreiras. Quinze
+testes focados passaram (5,42 s), incluindo cadeia com retry já vencido e
+rotação quando todos aguardam endpoints. Recibos terminais ainda devem ser
+confirmados após carregar essa correção; HTTP 202 não comprova reparo concluído.
+
+Recusa adicional isolada no pós-flush: views públicas baratas retornavam
+`built_through_lsn=None` para cabeçalhos frios, apesar de `verify(all)` limpo.
+Adicionado `Database.read_index_status(name)`, leitura explícita do cabeçalho
+durável com DTO imutável, sem rebuild nem mudança de watermark. A certificação
+Community usa essa prova, verifica identidade/staleness/limites e mantém
+verificação integral e publicação estável. 91 testes nativos e 24 de integração
+passaram. Na mesma cópia quiescente de 102 MB/LSN 140805, a certificação antes
+recusada passou para os quatro índices (80,23 s). Isso corrige disponibilidade,
+não reduz nem disfarça o custo da verificação integral. Processo Pulse atualizado
+iniciado com ambas as correções; validação terminal dos jobs em acompanhamento.
+
+**Reparo determinístico concluído:** sete commits com recibos e sete raízes
+canonical confirmadas pela API, fila exata drenada. Ledger cognitivo com o mesmo
+SHA256 e REST confirmando 21 pending/19 consolidated/zero in_progress: nenhum
+benchmark cognitivo adicional consumido. Tempos persistidos das sessões: 59,967
+a 120,295 s para volumes diferentes (não representam latência nativa isolada).
+Tabela completa no relatório da auditoria. A entrega Global original ainda
+aguarda ACK após retry por inventário alterado durante os reparos; não confundir
+conclusão das sete projeções com fechamento de toda a entrega downstream.
+
+**Checkpoint terminal — 07/09/2026 11:09:24 (UTC−3):** a entrega Global
+`evt_4b636627858d434a` recebeu ACK durável, `last_error=None`; as outras seis
+entregas do lote também foram confirmadas após a verificação pós-flush normal.
+Zero entregas Global não terminais e zero itens ativos de consolidação. REST
+confirma 21 specs cognitivas pending/19 consolidated/zero in_progress e SHA256
+do ledger inalterado. Nenhuma outra spec foi consolidada para obter o resultado.
+KG Health: board e discovery healthy/queryable, sem recovery necessário; o
+overall permanece at_risk por passivos anteriores (224 Global DLQ, 439 policy
+DLQ, uma canonical debt), não tratados neste escopo. Amostra curta de escrita
+e limitações de interpretação registradas no relatório: traversal/identidade/
+decodificação e convergência repetida ainda merecem medição; não atribuir todo
+o tempo da sessão ao commit/WAL. Execução segue sem Claude, conforme solicitado.
+
+### Continuação 0.0.4 — materialização de destinos sem vetores não utilizados
+
+Candidato nativo para as consultas escalares de adjacência/link já selecionadas:
+prova fechada de um salto permite validar integralmente o vetor sem construir
+seus componentes. Cache parcial separado do completo, limitado e invalidado pelo
+mesmo protocolo; nenhuma mudança de WAL/OCC/multi-reader/writer ou formato físico.
+55 testes focados passaram; regressão acumulada: 2.324 testes de query passaram
+em 357,63 s e 37 testes de integração Community em 46,64 s. Ruff/diff-check limpos.
+Comparativo isolado: mesmas 480 linhas, retenção tarifada no cache
+2.114.960 → 150.160 bytes; mediana 165,67 → 149,84 ms, sinal temporal ruidoso, não
+prometido como speedup da UI. Documentação/prova/limitações em
+`docs/VECTOR_FREE_TRAVERSAL_0_0_4.md`. Nenhuma spec de benchmark consumida; o Pulse
+ativo ainda usa o código carregado antes deste candidato. O fan-out por layout
+continua explicitamente pendente, sem declarar sua eliminação por esta melhoria.
