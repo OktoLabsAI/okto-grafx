@@ -150,6 +150,61 @@ def test_visible_read_skips_invisible_and_stale_exact_candidates_before_limit() 
     assert [version.record_id for _ref, version in bounded] == [2]
 
 
+def test_lazy_visible_read_matches_the_materialized_door_and_checks_early_close() -> None:
+    _device, pool, _catalog, heap, table, definition = _stack()
+    entries: list[IndexEntry] = []
+    for number in range(8):
+        values = (Timestamp(number), f"id-{number}")
+        ref = heap.insert(table, number + 1, values, xmin=6)
+        entries.append(_entry(definition, ref, values))
+    index = _ordered(definition, pool)
+    index.create_bulk(entries, applied_through_lsn=6)
+
+    lazy = index.iter_visible_desc(heap, table, Snapshot(6))
+    first = next(lazy)
+    lazy.close()
+    materialized = index.visible_desc(heap, table, Snapshot(6), limit=8)
+
+    assert first[0] == definition.key_for((Timestamp(7), "id-7"))
+    assert (first[1], first[2]) == materialized[0]
+    assert [version.record_id for _ref, version in materialized] == list(
+        range(8, 0, -1)
+    )
+
+
+def test_lazy_visible_read_refuses_root_drift_when_the_consumer_closes_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device, pool, _catalog, heap, table, definition = _stack()
+    values = (Timestamp(1), "one")
+    ref = heap.insert(table, 1, values, xmin=4)
+    index = _ordered(definition, pool)
+    initial = index.create_bulk((_entry(definition, ref, values),), applied_through_lsn=4)
+    original = OrderedIndex._read_certificate
+    calls = 0
+
+    def racing(candidate: OrderedIndex):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            newer = replace(initial, generation=2)
+            page = make_ordered_root_page(
+                newer, ORDERED_ROOT_PAGE_B, page_size=pool.page_size
+            )
+            device.poke_page(index.file, ORDERED_ROOT_PAGE_B, page.to_bytes())
+        return original(candidate)
+
+    monkeypatch.setattr(OrderedIndex, "_read_certificate", racing)
+    lazy = index.iter_visible_desc(heap, table, Snapshot(4))
+    assert next(lazy)[2].record_id == 1
+
+    with pytest.raises(GrafxIndexError) as drift:
+        lazy.close()
+
+    assert drift.value.details["field"] == "index_view_changed"
+    assert drift.value.retryable is True
+
+
 def test_one_damaged_root_degrades_and_two_damaged_roots_refuse() -> None:
     device, pool, _catalog, heap, table, definition = _stack()
     values = (Timestamp(1), "one")

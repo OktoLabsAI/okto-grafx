@@ -227,8 +227,18 @@ prefix.
    TIMESTAMP+STRING contract and refuse hash sizing. `rebuild_index()` bulk-builds and verifies a
    compact fresh nonce before catalog rotation, retaining the former generation as `STALE`.
    The ordered-specific accumulated crash/multiprocess matrix remains before OIX-2B is closed.
-5. **OIX-3 — query path:** exact planner matcher, `OrderedNodeMerge`, lazy merge, keyset bound and
-   differential query corpus.
+5. **OIX-3 — query path (implemented; accumulated matrix pending):** the planner recognizes only
+   a polymorphic all-node scan ordered by the table primary key after one TIMESTAMP column, with
+   both keys descending, a bounded LIMIT, no SKIP/DISTINCT/aggregation and a proved-total
+   residual predicate. Every participating table must expose a catalog-authorized ACTIVE exact
+   ordered generation on those positions. The executor validates every capability and cursor
+   value before opening a certificate, then holds one heap-revalidated candidate per table in a
+   best-first heap. It stops without prefetching beyond K, closes and rechecks every root/header
+   certificate before publishing the private result prefix, and never falls back after a stream
+   starts. Dirty owner tables and every near miss retain the complete canonical pipeline. The
+   focused corpus proves first-page/cursor equivalence, partial-capability fallback, owner RYOW,
+   reduced scan counts, Unicode/tied values through the seeded data, and early-close root drift.
+   The broader crash/multiprocess and mutation/reopen matrix remains the checkpoint condition.
 6. **OIX-4 — Pulse Community:** idempotent per-table index creation/migration, Community-only
    capability use, installed API/UI test and board benchmark.
 

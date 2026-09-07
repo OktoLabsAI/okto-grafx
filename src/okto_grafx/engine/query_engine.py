@@ -55,6 +55,7 @@ from __future__ import annotations
 from _thread import LockType
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from heapq import heappop, heappush
 from types import MappingProxyType
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -84,6 +85,7 @@ from okto_grafx.domain.index.catalog import (
 )
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
+    ORDERED_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
@@ -207,6 +209,7 @@ from okto_grafx.domain.query.plan import (
     MergePattern,
     NodeMultiKeySeek,
     NodeScan,
+    OrderedNodeMerge,
     OptionalRows,
     PlanNode,
     ProduceResults,
@@ -7013,6 +7016,196 @@ def _node_multi_key_seek(
         )
 
 
+@dataclass(slots=True)
+class _OrderedMergeCandidate:
+    """One current table head ordered best-first for Python's minimum heap."""
+
+    key: bytes
+    ordinal: int
+    ref: RecordRef
+    version: HeapVersion
+
+    def __lt__(self, other: _OrderedMergeCandidate) -> bool:
+        """Expose larger ordered keys first and retain catalog table order for exact ties."""
+        if self.key != other.key:
+            return self.key > other.key
+        if self.ordinal != other.ordinal:
+            return self.ordinal < other.ordinal
+        return self.ref.encode() < other.ref.encode()
+
+
+def _ordered_node_merge(
+    engine: QueryEngine, node: OrderedNodeMerge, context: _Context
+) -> Iterator[_Row]:
+    """Merge the certified descending head of each node table in ``O(K log T)``.
+
+    Every capability and bound is validated before the first ordered iterator is advanced. A
+    failure there retains the complete canonical scan. Once a certificate has been opened no
+    fallback is legal: all selected rows remain private until every iterator has closed under
+    the same certificate, and drift, corruption or an incomplete generation propagates.
+    """
+
+    authority = context.index_authority
+    if authority is None or type(engine.heap) is not HeapStore:
+        yield from engine._rows(node.fallback, context)
+        return
+    if len(node.tables) != len(node.indexes):
+        yield from engine._rows(node.fallback, context)
+        return
+    if {table.table_id for table in node.tables} & _intent_table_ids(
+        engine, context.txn
+    ):
+        # Ordered artifacts describe durable heap versions only. The owner-visible overlay is
+        # implemented by the fallback scan and must remain the single authority for dirty rows.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    stores: list[object] = []
+    definitions: list[IndexDefinition] = []
+    for table, name in zip(node.tables, node.indexes, strict=True):
+        store = authority.named(name)
+        definition = getattr(store, "definition", None)
+        timestamp_position = table.column_positions.get(node.timestamp_column)
+        string_position = table.column_positions.get(node.string_column)
+        if (
+            store is None
+            or not isinstance(definition, IndexDefinition)
+            or timestamp_position is None
+            or string_position is None
+            or definition.name != name
+            or definition.table_id != table.table_id
+            or definition.table_name != table.name
+            or definition.positions != (timestamp_position, string_position)
+            or definition.layout is not IndexLayout.ORDERED
+            or definition.key_derivation != ORDERED_KEY_DERIVATION
+            or definition.visibility is not IndexVisibility.EXACT
+            or getattr(store, "stale", True) is not False
+            or not callable(getattr(store, "iter_visible_desc", None))
+        ):
+            yield from engine._rows(node.fallback, context)
+            return
+        stores.append(store)
+        definitions.append(definition)
+
+    wanted = _window(node.limit, context, "LIMIT")
+    if wanted == 0:
+        # The canonical path is the authority for eager expression validation at a zero window.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    upper_keys: list[bytes | None] = [None] * len(stores)
+    if node.upper_timestamp is not None and node.upper_string is not None:
+        empty = _Row(bindings={})
+        upper_timestamp = _evaluate(node.upper_timestamp, empty, context)
+        upper_string = _evaluate(node.upper_string, empty, context)
+        if not isinstance(upper_timestamp, Timestamp) or type(upper_string) is not str:
+            yield from engine._rows(node.fallback, context)
+            return
+        for ordinal, (table, definition) in enumerate(
+            zip(node.tables, definitions, strict=True)
+        ):
+            values: list[Value] = [None] * table.arity
+            values[table.column_index(node.timestamp_column)] = upper_timestamp
+            values[table.column_index(node.string_column)] = upper_string
+            try:
+                upper_keys[ordinal] = definition.key_for(values)
+            except (GrafxIndexError, SchemaMismatchError):
+                yield from engine._rows(node.fallback, context)
+                return
+
+    admits = (
+        None
+        if node.predicate is None
+        else _predicate_admitter(node.predicate, context)
+    )
+    iterators: list[Iterator[tuple[bytes, RecordRef, HeapVersion]]] = []
+    selected: list[_Row] = []
+    failure: BaseException | None = None
+
+    def next_admitted(ordinal: int) -> _OrderedMergeCandidate | None:
+        iterator = iterators[ordinal]
+        table = node.tables[ordinal]
+        for key, ref, version in iterator:
+            row = _Row(
+                bindings={
+                    node.variable: RowBinding(
+                        variable=node.variable,
+                        table=table,
+                        ref=ref,
+                        version=version,
+                        polymorphic=True,
+                    )
+                }
+            )
+            context.count("ordered_candidates_examined")
+            context.count("rows_scanned")
+            if admits is None or admits(row):
+                return _OrderedMergeCandidate(key, ordinal, ref, version)
+        return None
+
+    try:
+        for table, store, upper_key in zip(
+            node.tables, stores, upper_keys, strict=True
+        ):
+            iterator = store.iter_visible_desc(  # type: ignore[attr-defined]
+                engine.heap,
+                table,
+                context.snapshot,
+                upper_key=upper_key,
+            )
+            iterators.append(iter(iterator))
+
+        queue: list[_OrderedMergeCandidate] = []
+        for ordinal in range(len(iterators)):
+            candidate = next_admitted(ordinal)
+            if candidate is not None:
+                heappush(queue, candidate)
+
+        while queue and len(selected) < wanted:
+            candidate = heappop(queue)
+            table = node.tables[candidate.ordinal]
+            selected.append(
+                _Row(
+                    bindings={
+                        node.variable: RowBinding(
+                            variable=node.variable,
+                            table=table,
+                            ref=candidate.ref,
+                            version=candidate.version,
+                            polymorphic=True,
+                        )
+                    }
+                )
+            )
+            if len(selected) == wanted:
+                break
+            following = next_admitted(candidate.ordinal)
+            if following is not None:
+                heappush(queue, following)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        cleanup_failure: BaseException | None = failure
+        for iterator in iterators:
+            try:
+                _close_iterator(iterator)
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        "An ordered table iterator also failed to close with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
+
+    context.count("ordered_merge_tables", len(stores))
+    context.count("ordered_merge_rows", len(selected))
+    yield from selected
+
+
 def _relationship_incident_seek(
     engine: QueryEngine, node: RelationshipIncidentSeek, context: _Context
 ) -> Iterator[_Row]:
@@ -13328,6 +13521,7 @@ _HANDLERS: dict[type, _Handler] = {
     AllNodesScan: _all_nodes_scan,  # type: ignore[dict-item]
     NodeScan: _node_scan,  # type: ignore[dict-item]
     NodeMultiKeySeek: _node_multi_key_seek,  # type: ignore[dict-item]
+    OrderedNodeMerge: _ordered_node_merge,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]

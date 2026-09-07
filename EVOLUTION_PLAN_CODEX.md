@@ -4034,3 +4034,22 @@ bootstrap durável
 ```
 
 Depois que essa cadeia estiver provada por crash matrices públicas, o restante do roadmap — budgets, vacuum, backup, índices e performance — pode evoluir sobre uma fundação confiável.
+
+## 14. Execução da rodada 0.0.4
+
+O plano finito e a rastreabilidade desta rodada vivem em `docs/PERFORMANCE_ROUND_0_0_4.md`; o
+contrato do acesso ordenado está congelado em `docs/ORDERED_CURSOR_ACCESS_0_0_4.md`. O consenso
+Claude/Codex rejeitou o spine destacado e selecionou um índice persistente exato, COW e
+heap-revalidated para retirar a paginação do Pulse da complexidade `O(P*N)`.
+
+OIX-2B avançou em `28d76ea`: DDL textual/Python ativa gerações ordenadas somente para a shape
+TIMESTAMP+STRING aceita, e `rebuild_index()` publica uma geração compacta nonced antes de tornar a
+anterior STALE. OIX-3 está implementado no checkpoint seguinte: o planner escolhe
+`OrderedNodeMerge` exclusivamente para o page shape fechado do Pulse, e o executor faz merge lazy
+com uma cabeça por tabela, revalidação obrigatória no heap, cursor exclusivo e fechamento de
+todos os certificados antes de expor resultados. Capability incompleta, tabela suja e near misses
+mantêm o scan canônico; depois de abrir uma stream, erro ou drift propaga sem fallback parcial. O
+corpus focado passou 18 casos e o slice combinado passou 440 testes. O handoff independente
+`hof_4fe5ef3390c148c4ba668a83f6b3ac58` cobre agora crash/replay e concorrência real antes do
+checkpoint OIX-4/Pulse; nenhum invariante de WAL, OCC, snapshot, durabilidade ou multiwriter foi
+alterado.

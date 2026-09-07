@@ -122,6 +122,7 @@ from okto_grafx.domain.query.plan import (
     MergePattern,
     NodeMultiKeySeek,
     NodeScan,
+    OrderedNodeMerge,
     OptionalRows,
     PlanNode,
     ProduceResults,
@@ -3623,6 +3624,9 @@ class _Planner:
                 ),
                 aggregations=self.analysis.aggregations,
             )
+        ordered = self._ordered_node_merge(pipeline, clause)
+        if ordered is not None:
+            pipeline = ordered
         pipeline = ProjectRows(child=pipeline, items=self._projected(clause))
         if clause.distinct:
             pipeline = DistinctRows(child=pipeline)
@@ -3638,6 +3642,226 @@ class _Planner:
         if clause.limit is not None:
             pipeline = LimitRows(child=pipeline, count=clause.limit)
         return pipeline
+
+    def _ordered_node_merge(
+        self, pipeline: PlanNode, clause: ReturnClause
+    ) -> OrderedNodeMerge | None:
+        """Select the closed Pulse keyset path or retain the complete canonical pipeline."""
+
+        if (
+            self.analysis.aggregated
+            or clause.distinct
+            or clause.skip is not None
+            or clause.limit is None
+            or len(clause.sort_items) != 2
+        ):
+            return None
+        first, second = clause.sort_items
+        if not first.descending or not second.descending:
+            return None
+        if not isinstance(first.expression, Property) or not isinstance(
+            second.expression, Property
+        ):
+            return None
+        first_subject = first.expression.subject
+        second_subject = second.expression.subject
+        if (
+            not isinstance(first_subject, Variable)
+            or not isinstance(second_subject, Variable)
+            or first_subject.name != second_subject.name
+        ):
+            return None
+
+        predicate: Expression | None = None
+        scan = pipeline
+        if isinstance(scan, FilterRows):
+            predicate = scan.predicate
+            scan = scan.child
+        if (
+            not isinstance(scan, AllNodesScan)
+            or not isinstance(scan.child, SingleRow)
+            or scan.variable != first_subject.name
+            or not scan.tables
+        ):
+            return None
+        if predicate is not None and not self._ordered_filter_is_total(
+            predicate, scan.variable
+        ):
+            return None
+        if any(
+            not self._ordered_scalar_is_total(item.expression, scan.variable)
+            for item in clause.items
+        ):
+            return None
+
+        timestamp_column = first.expression.key
+        string_column = second.expression.key
+        index_names: list[str] = []
+        for table in scan.tables:
+            timestamp_definition = self._column_of(table, timestamp_column)
+            string_definition = self._column_of(table, string_column)
+            if timestamp_definition is None or string_definition is None:
+                return None
+            timestamp_position = table.column_index(timestamp_column)
+            string_position = table.column_index(string_column)
+            if (
+                timestamp_definition.type is not ValueType.TIMESTAMP
+                or string_definition.type is not ValueType.STRING
+                or table.primary_key != string_column
+            ):
+                return None
+            candidates = sorted(
+                (
+                    definition.name
+                    for definition in self.indexes
+                    if index_definition_matches_table(definition, table)
+                    and definition.layout is IndexLayout.ORDERED
+                    and definition.visibility is IndexVisibility.EXACT
+                    and definition.key_derivation == ORDERED_KEY_DERIVATION
+                    and definition.positions
+                    == (timestamp_position, string_position)
+                ),
+                key=str.casefold,
+            )
+            if not candidates:
+                return None
+            index_names.append(candidates[0])
+
+        upper_timestamp: Expression | None = None
+        upper_string: Expression | None = None
+        if predicate is not None:
+            bound = self._ordered_keyset_bound(
+                predicate,
+                variable=scan.variable,
+                timestamp_column=timestamp_column,
+                string_column=string_column,
+            )
+            if bound is not None:
+                upper_timestamp, upper_string = bound
+
+        return OrderedNodeMerge(
+            fallback=pipeline,
+            variable=scan.variable,
+            tables=scan.tables,
+            indexes=tuple(index_names),
+            timestamp_column=timestamp_column,
+            string_column=string_column,
+            limit=clause.limit,
+            predicate=predicate,
+            upper_timestamp=upper_timestamp,
+            upper_string=upper_string,
+        )
+
+    @staticmethod
+    def _ordered_filter_is_total(expression: Expression, variable: str) -> bool:
+        """Admit only the scalar predicate subset that cannot hide a late refusal."""
+
+        if isinstance(expression, NullCheck):
+            return _Planner._ordered_filter_operand(expression.operand, variable)
+        if not isinstance(expression, BinaryOperation):
+            return False
+        if expression.operator in ("AND", "OR"):
+            return _Planner._ordered_filter_is_total(
+                expression.left, variable
+            ) and _Planner._ordered_filter_is_total(expression.right, variable)
+        if expression.operator not in ("=", "<>", "<", "<=", ">", ">="):
+            return False
+        return _Planner._ordered_filter_operand(
+            expression.left, variable
+        ) and _Planner._ordered_filter_operand(expression.right, variable)
+
+    @staticmethod
+    def _ordered_filter_operand(expression: Expression, variable: str) -> bool:
+        """Recognize total leaves used by the Pulse page filters and keyset predicate."""
+
+        return _Planner._ordered_scalar_is_total(expression, variable)
+
+    @staticmethod
+    def _ordered_scalar_is_total(expression: Expression, variable: str) -> bool:
+        """Recognize scalar expressions that cannot hide a refusal below the ordered K."""
+
+        if isinstance(expression, (Literal, Parameter)):
+            return True
+        if isinstance(expression, Property):
+            return isinstance(expression.subject, Variable) and (
+                expression.subject.name == variable
+            )
+        if not isinstance(expression, FunctionCall):
+            return False
+        if expression.named_arguments or expression.distinct or expression.star:
+            return False
+        name = expression.name.upper()
+        if name == LABEL_FUNCTION:
+            return len(expression.arguments) == 1 and isinstance(
+                expression.arguments[0], Variable
+            ) and expression.arguments[0].name == variable
+        if name == TIMESTAMP_FUNCTION:
+            # Literal/parameter conversions are bound before the first row. A property conversion
+            # can refuse only on a later row, which an early LIMIT must never conceal.
+            return len(expression.arguments) == 1 and isinstance(
+                expression.arguments[0], (Literal, Parameter)
+            )
+        if name == COALESCE_FUNCTION:
+            return bool(expression.arguments) and all(
+                _Planner._ordered_scalar_is_total(argument, variable)
+                for argument in expression.arguments
+            )
+        return False
+
+    @staticmethod
+    def _ordered_keyset_bound(
+        predicate: Expression,
+        *,
+        variable: str,
+        timestamp_column: str,
+        string_column: str,
+    ) -> tuple[Expression, Expression] | None:
+        """Extract only ``ts < bound OR (ts = bound AND id < bound)`` from conjunctions."""
+
+        terms: list[Expression] = []
+        pending = [predicate]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, BinaryOperation) and current.operator == "AND":
+                pending.extend((current.right, current.left))
+            else:
+                terms.append(current)
+
+        def property_is(expression: Expression, column: str) -> bool:
+            return (
+                isinstance(expression, Property)
+                and isinstance(expression.subject, Variable)
+                and expression.subject.name == variable
+                and expression.key == column
+            )
+
+        for term in terms:
+            if not isinstance(term, BinaryOperation) or term.operator != "OR":
+                continue
+            earlier = term.left
+            tied = term.right
+            if (
+                not isinstance(earlier, BinaryOperation)
+                or earlier.operator != "<"
+                or not property_is(earlier.left, timestamp_column)
+                or not isinstance(tied, BinaryOperation)
+                or tied.operator != "AND"
+            ):
+                continue
+            same_time = tied.left
+            earlier_id = tied.right
+            if (
+                not isinstance(same_time, BinaryOperation)
+                or same_time.operator != "="
+                or not property_is(same_time.left, timestamp_column)
+                or same_time.right != earlier.right
+                or not isinstance(earlier_id, BinaryOperation)
+                or earlier_id.operator != "<"
+                or not property_is(earlier_id.left, string_column)
+            ):
+                continue
+            return earlier.right, earlier_id.right
+        return None
 
     def _projected(self, clause: ReturnClause) -> tuple[ReturnItem, ...]:
         """Return the projected items, giving every one of them the name it is read under."""

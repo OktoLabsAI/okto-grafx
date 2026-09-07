@@ -63,6 +63,7 @@ __all__ = [
     "MergePattern",
     "NodeMultiKeySeek",
     "NodeScan",
+    "OrderedNodeMerge",
     "OptionalRows",
     "PlanNode",
     "ProduceResults",
@@ -242,6 +243,50 @@ class AllNodesScan(PlanNode):
         return {
             "variable": self.variable,
             "tables": ", ".join(table.name for table in self.tables) or "none",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OrderedNodeMerge(PlanNode):
+    """Bounded descending merge of one exact ordered generation per node table.
+
+    ``fallback`` is the complete canonical scan/filter pipeline. It is used only before an
+    ordered certificate is opened when the runtime collaborator cannot discharge the planned
+    capability. Once iteration starts, any drift or damage propagates rather than mixing a
+    partially produced ordered prefix with a scan.
+    """
+
+    fallback: PlanNode
+    variable: str
+    tables: tuple[TableDef, ...]
+    indexes: tuple[str, ...]
+    timestamp_column: str
+    string_column: str
+    limit: Expression
+    predicate: Expression | None = None
+    upper_timestamp: Expression | None = None
+    upper_string: Expression | None = None
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the canonical fallback as the operator's proof-preserving child."""
+        return (self.fallback,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the exact order, participating generations and optional bound."""
+        return {
+            "variable": self.variable,
+            "tables": ", ".join(table.name for table in self.tables) or "none",
+            "indexes": ", ".join(self.indexes) or "none",
+            "order": f"{self.timestamp_column} DESC, {self.string_column} DESC",
+            "upper_bound": (
+                "none"
+                if self.upper_timestamp is None or self.upper_string is None
+                else (
+                    f"({self.upper_timestamp.describe()}, "
+                    f"{self.upper_string.describe()})"
+                )
+            ),
+            "limit": self.limit.describe(),
         }
 
 

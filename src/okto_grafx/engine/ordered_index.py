@@ -1042,6 +1042,113 @@ class OrderedIndex(IndexStore):
 
         return self._stable_read(read_lsn, materialize)
 
+    def iter_visible_desc(
+        self,
+        heap: HeapStore,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        *,
+        upper_key: bytes | None = None,
+    ) -> Iterator[tuple[bytes, RecordRef, HeapVersion]]:
+        """Yield heap-validated rows lazily below one certified descending root.
+
+        Unlike :meth:`visible_desc`, this door does not retain a candidate prefix per table.
+        It is intended for a bounded k-way query merge: the caller holds at most one current
+        row from each table and closes every iterator before exposing any result.  Closing is a
+        semantic part of the read.  A fresh certificate is compared even when the caller stops
+        early, so a root replacement can never bless a mixed or partially certified prefix.
+
+        The immutable pages selected by ``before`` remain safe to traverse while another writer
+        publishes a new root.  Drift still produces a retryable refusal because the query layer
+        deliberately has no permission to replay after consuming part of this stream.
+        """
+
+        self._require_readable()
+        read_lsn = _required_read_lsn(snapshot)
+        self._require_table(table)
+        if not isinstance(heap, HeapStore):
+            raise GrafxIndexError(
+                "An ordered exact read needs the canonical HeapStore for revalidation.",
+                field="heap",
+                value=type(heap).__name__,
+                index=self.name,
+            )
+
+        required_lsn = self._required_table_position(read_lsn)
+        before = self._read_certificate()
+        descriptor = before.selection.descriptor
+        if descriptor.applied_through_lsn < required_lsn:
+            raise GrafxIndexError(
+                "The ordered index does not cover the requested snapshot.",
+                field="index_view_unavailable",
+                index=self.name,
+                file=self.file,
+                applied_through_lsn=descriptor.applied_through_lsn,
+                required_lsn=required_lsn,
+                retryable=True,
+            )
+
+        failure: BaseException | None = None
+        try:
+            candidates = walk_ordered_desc(
+                descriptor.root_page,
+                descriptor.height,
+                _OrderedPageLoader(self._pool, self._file, fresh=False),
+                upper_key=upper_key,
+            )
+            for entry in candidates:
+                version = heap.read_if(
+                    entry.ref,
+                    lambda _record_id, xmin, xmax: snapshot.visible(xmin, xmax),
+                )
+                if version is None:
+                    continue
+                if version.table_id != table.table_id:
+                    raise GrafxCorruptionDetected(
+                        "An ordered index candidate points into a different heap table.",
+                        field="table_id",
+                        index=self.name,
+                        file=self.file,
+                        page=entry.ref.page,
+                        slot=entry.ref.slot,
+                        expected_table_id=table.table_id,
+                        observed_table_id=version.table_id,
+                    )
+                if (
+                    self._definition.entry_key_for_record(
+                        version.record_id, version.values
+                    )
+                    != entry.key
+                ):
+                    continue
+                yield entry.key, entry.ref, version
+        except GeneratorExit:
+            # ``close()`` is an early but successful consumption boundary.  Let the certificate
+            # check below replace GeneratorExit when the root drifted so callers observe it.
+            raise
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            try:
+                after = self._read_certificate()
+                if after != before:
+                    raise GrafxIndexError(
+                        "The ordered index changed during a lazy certified read.",
+                        field="index_view_changed",
+                        index=self.name,
+                        file=self.file,
+                        generation=after.selection.descriptor.generation,
+                        retryable=True,
+                    )
+            except BaseException as certificate_failure:
+                if failure is None:
+                    raise
+                failure.add_note(
+                    "Closing the ordered read certificate also failed with "
+                    f"{type(certificate_failure).__name__}: {certificate_failure}"
+                )
+
     def _stable_read(
         self,
         read_lsn: Lsn,
