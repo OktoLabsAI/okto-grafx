@@ -4763,3 +4763,50 @@ versionada fica agrupada com o lote pendente de DLQ. A validação estrita nova 
 manifesto serão carregados no próximo restart acumulado, não estão hot-loaded.
 Ledger das 21 specs permanece byte-idêntico. Referências: Community
 `docs/GRAFX_RUNTIME_SETTINGS_UI.md`, Core `docs/PUBLIC_GRAPH_INTEGRATION_CONTRACTS.md`.
+
+### Fechamento da UI de redrive e bundle acumulado — 2026-09-07
+
+Community `b666a0f`, enviado à branch de trabalho, fecha Redrive individual e
+Redrive all no inspector da DLQ de consolidação do board. O REST reutiliza os
+casos de uso neutros do Core, permissões, separação de escopos Code Traceability,
+idempotência e commits por lote. A verificação de board escritor precede qualquer
+operação: inexistente, sem acesso e viewer-only preservam a resposta 404 das
+demais rotas de escrita, sem vazamento de existência.
+
+Correção encontrada na revisão: Redrive all não pode perseguir novas falhas
+indefinidamente. Cada requisição tenta cada ID no máximo uma vez, admite até a
+quantidade visível inicial e usa transações de até 200 IDs. Trata-se de limite de
+cardinalidade, não snapshot imutável dos IDs. A resposta informa restantes e
+motivo da parada; lotes já confirmados não são revertidos por falha posterior.
+UI atualiza a lista também após erro HTTP e não anuncia sucesso em recusa parcial.
+Nenhuma destas ações significa que a consolidação cognitiva terminou.
+
+Validação isolada: 133 testes Community em 42,30 s; após o último ajuste de
+resposta parcial, 14 testes REST em 16,99 s (há sobreposição, não somar).
+80 testes Core existentes em 7,18 s e 31 UI em 5,79 s. Ruff, whitespace,
+TypeScript e build de produção passaram. Fixtures incluem 451 itens em
+200/200/51, reposição contínua, IDs repetidos, recusa, permissões e wake do worker.
+
+Sincronizados e versionados os 78 assets acumulados de Settings/DLQ, com igualdade
+SHA256 entre build e pacote: árvore
+`373c5fe492565aa1e7769354072da7eb7977414b16a94e6078579b04fd15461c`.
+O processo anterior PID 18920 encerrou de forma terminal, grafos sem falha de
+fechamento e portas livres antes da substituição. Validação do novo runtime será
+registrada abaixo; não há publicação de wheel ou alteração da instalação global.
+
+Não foi feito redrive em produção, nova consolidação, rebuild ou limpeza de DLQ.
+As 21 specs reservadas permanecem com ledger byte-idêntico, SHA256
+`4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
+Este é um fechamento de segurança/usabilidade da integração; não é alegado ganho
+temporal do motor nem encerramento da investigação de escrita/carga fria.
+Referência detalhada: Community `docs/DLQ_REDRIVE_UI.md`.
+
+Deploy por fonte confirmado no PID 24152, API 8100/MCP 8101, startup completo
+e `/health` HTTP 200 (`healthy`, Pulse 0.3.3). A UI recebeu
+`index-igFxIQ1X.js`, com a correção final de recusa parcial. Settings HTTP 200,
+backend Grafx e page_size 8192 sem restart pendente. KG exibiu 500/2779 nós;
+inspector mostrou DLQ de consolidação vazia deste board e Redrive all desabilitado.
+Nenhum botão de processamento foi acionado; modais fechadas sem salvar. Isso não
+declara vazias as outras DLQs nem as pendências cognitivas. Ledger byte-idêntico
+após o smoke. O restart também carregou a validação estrita de Settings e os
+contratos públicos registrados no checkpoint anterior.
