@@ -4337,3 +4337,22 @@ censo, UI com 1000 nós e total 2779, segunda página HTTP 200 com 500 IDs únic
 45,340 s e o censo 53,187 s: duplicação eliminada, custo frio **ainda não resolvido**,
 sem alegação de speedup causal. Build TypeScript/produção passou; 21 pendentes,
 0 em andamento e 19 consolidadas confirmados novamente. Não houve nova consolidação.
+
+### Diagnóstico por fase no consumidor — 2026-09-07
+
+Community `270d84a` versiona o despacho de subgrafo/censo fora do loop da API
+pelo port genérico existente e medições de fases sem conteúdo das consultas.
+51 testes focados passaram (15,46 s), incluindo autorização, visibilidade,
+relações, execução em thread e fronteira de erro de cursor; Ruff passou.
+Detalhes e limitações: Community `docs/KG_READ_PHASE_PROFILE.md`.
+
+Na navegação fria instrumentada: subgrafo 27,751 s e censo 34,351 s. Autorização
+e despacho ficaram abaixo de 3 ms por fase; nós/admissão e relações/censo
+concentraram o tempo. Duas conexões nativas read-only independentes contra o
+mesmo grafo abriram e leram 500 nós cada em 2,886 s no total, em processo separado.
+Uma amostra curta do Pulse mostrou leituras, censo e Health sobrepostos, mas não
+prova uma causa única nem um ganho causal. A carga fria continua **pendente**.
+Não se aprovou cache de autoridade, enfraquecimento de validações nem mudança
+de isolamento. O próximo alvo permanece o custo de admissão/censo sob o workload
+real, sem novos gates de performance. Nenhuma spec reservada foi consumida;
+hash do ledger cognitivo inalterado. Codex segue sozinho, sem Claude/Nexus.

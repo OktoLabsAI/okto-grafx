@@ -582,3 +582,19 @@ agents agreed that it adds work to the first page and loses its benefit whenever
 the node frontier. The accepted persistent ordered design and F1--F7 safety conditions are frozen
 in `docs/ORDERED_CURSOR_ACCESS_0_0_4.md`; OIX-0 is implemented, while Claude owns the independent
 `NODE-IN-SEEK` handoff `hof_f05eb759297a4598845a9d312d9c339c`.
+
+### Current execution checkpoint — 2026-09-07
+
+Codex now proceeds alone; earlier Claude ownership above is historical, not an
+active dependency. Community `270d84a` records subgraph/census phase timing and
+off-loop dispatch through the existing generic Core port. The cold live load
+remains unresolved (27.751 s graph, 34.351 s census in the instrumented run).
+Authorization/dispatch were below 3 ms per phase; separate-process native and
+routed probes were much faster but are not an equivalent full-app benchmark.
+The 15-second stack sample shows concurrent graph, census and Health work,
+not proof of a single bottleneck. See Community `docs/KG_READ_PHASE_PROFILE.md`
+for measurements, limitations and the 51-test focused checkpoint.
+
+No native protocol change, further consolidation or new performance gate was
+introduced. Preserve the 21 pending specs for write benchmarks. Continue the
+existing cold admission/census investigation without expanding acceptance scope.
