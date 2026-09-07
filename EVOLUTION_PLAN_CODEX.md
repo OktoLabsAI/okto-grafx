@@ -4833,3 +4833,33 @@ Fonte nativa pronta para deploy acumulado; PID 24152 ainda não carrega esta
 alteração. Sem wheel, consolidação, redrive, rebuild ou reset. Ledger das 21 specs
 permanece byte-idêntico. Detalhes, limites e evidência do perfil:
 `docs/OPTIONAL_DEGREE_VECTOR_LANDINGS_0_0_4.md`.
+
+### Verificação pós-escrita: históricos MVCC sem repetição quadrática — 2026-09-07
+
+Trabalho conduzido sozinho, sem Claude/Nexus. O perfil da cópia privada do Global
+identificou 1,81 milhão de leituras de slots ao verificar 27.240 versões: cada
+versão repetia a caminhada por todo o histórico anterior. O verificador agora
+reutiliza somente sufixos comprovadamente válidos, dentro da passagem da mesma
+tabela e chamada. Históricos saudáveis passam a ter trabalho linear nessa etapa.
+
+Não há cache persistente de autoridade, mudança de OCC, WAL, snapshot ou locks.
+Páginas do dispositivo, registros históricos, índices e cobertura continuam sendo
+verificados integralmente. Falhas não alimentam o reaproveitamento; ciclos e
+referências corrompidas mantêm achados equivalentes ao caminho integral. API
+pública e Core do Pulse permanecem inalterados.
+
+A/B somente leitura na cópia privada: `verify("all")` caiu de 64,36 s para 16,08 s
+(aproximadamente 4× nesta etapa), com relatório completo idêntico: 15.003 páginas,
+27.240 versões, 102.763 entradas e zero achados; LSN 140805 inalterado. Amostra
+única, baseline primeiro; não equivale a ganho end-to-end nem gate temporal.
+353 testes afetados passaram em 4,14 s; 16 focais finais/visibilidade estrangeira
+em 3,94 s, com sobreposição. Fonte preparada para deploy acumulado, ainda não
+carregada no PID 24152. Nenhuma spec, entrega ou DLQ de produção foi processada.
+Detalhes e limites: `docs/VERIFICATION_VERSION_SUFFIXES_0_0_4.md`.
+
+Fechamento desta fatia: 24 testes Community Global passaram em 135,46 s, com
+data home isolado, incluindo certificação fria, cobertura, publicação e reabertura.
+15 testes nativos focais finais passaram em 3,45 s (sobreposição), acrescentando
+atualização do histórico por outro participante e verificação somente leitura no
+mesmo handle. Ruff/whitespace verdes. Pulse `/health` saudável 0.3.3 e ledger
+das 21 specs byte-idêntico; nenhum processamento de produção foi disparado.

@@ -479,3 +479,20 @@ authorization. Ruff and staged whitespace checks passed. No additional repair,
 cognitive consolidation or DLQ redrive was requested during this validation;
 the 21-spec ledger hash still matches the baseline. This closes the source
 milestone, not the outstanding cold-load/write performance investigation.
+
+### Full post-flush verification: quadratic history walk removed
+
+The read-only preserved Global copy localized a separate avoidable cost:
+`Verifier._verify_record` called the complete `HeapStore.version_chain` for each
+stored version. The native verifier now shares successful suffix lengths only
+within one table pass/call; all physical and logical verification remains.
+No Pulse adapter certification requirement or Core contract was weakened.
+
+One uninstrumented private A/B measured full verification at 64.359 s before and
+16.075 s after, with equal complete reports (15,003 pages, 27,240 records,
+102,763 entries, no findings), unchanged publication 140805, and no live writes.
+This approximately 4x result is for verification, not native commit, embedding
+preparation or whole cognitive consolidation; baseline-first cache effects are
+not controlled. Complexity and corruption parity have focused deterministic tests.
+See `VERIFICATION_VERSION_SUFFIXES_0_0_4.md` for evidence and deployment boundary.
+The 21 pending specs remain reserved; none of the seven repaired specs was replayed.

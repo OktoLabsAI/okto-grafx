@@ -138,6 +138,9 @@ DEFAULT_VERIFIED_FILES: tuple[str, ...] = ("heap.dat", "catalog.dat")
 _HEAP_DESCRIPTOR_SLOT: int = 0
 _FIRST_RECORD_SLOT: int = 1
 
+_CANONICAL_VERSION_CHAIN = HeapStore.version_chain
+_CANONICAL_READ_SLOT = HeapStore._read_slot
+
 _CANONICAL_INDEX_TYPES: tuple[type[object], ...] = (
     HashIndex,
     ProximityIndex,
@@ -1044,6 +1047,17 @@ class Verifier:
         """
         findings: list[VerificationFinding] = []
         checked = 0
+        # A long history used to rewalk every older suffix for every stored version:
+        # quadratic work despite checking the same stable physical graph. Keep only
+        # successful suffix lengths, local to this table/call, never across admission.
+        # Custom heap collaborators retain their observable per-record protocol.
+        verified_chains: dict[int, int] | None = (
+            {}
+            if type(self._heap) is HeapStore
+            and HeapStore.version_chain is _CANONICAL_VERSION_CHAIN
+            and HeapStore._read_slot is _CANONICAL_READ_SLOT
+            else None
+        )
         for page_index in chain:
             page = self._decode_page(heap_file, page_index, findings, reported)
             if page is None:
@@ -1057,7 +1071,14 @@ class Verifier:
                     continue
                 checked += 1
                 findings.extend(
-                    self._verify_record(table, heap_file, page, page_index, slot)
+                    self._verify_record(
+                        table,
+                        heap_file,
+                        page,
+                        page_index,
+                        slot,
+                        verified_chains=verified_chains,
+                    )
                 )
         return checked, findings
 
@@ -1068,6 +1089,8 @@ class Verifier:
         page: Page,
         page_index: PageIndex,
         slot: int,
+        *,
+        verified_chains: dict[int, int] | None = None,
     ) -> list[VerificationFinding]:
         """Check one stored version against the slot that holds it.
 
@@ -1130,7 +1153,11 @@ class Verifier:
                 )
         if header.previous is not None and self._heap is not None:
             try:
-                self._heap.version_chain(RecordRef(page_index, slot))
+                ref = RecordRef(page_index, slot)
+                if verified_chains is None:
+                    self._heap.version_chain(ref)
+                else:
+                    self._heap._walk_version_chain(ref, verified_chains)
             except GrafxError as failure:
                 findings.append(
                     VerificationFinding(

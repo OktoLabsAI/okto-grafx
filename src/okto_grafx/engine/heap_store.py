@@ -2222,6 +2222,18 @@ class HeapStore:
 
         A chain that returns to a version it already visited is corruption, not a loop to walk.
         """
+        return self._walk_version_chain(ref)
+
+    def _walk_version_chain(
+        self, ref: RecordRef, verified: dict[int, int] | None = None
+    ) -> tuple[RecordRef, ...]:
+        """Walk with the canonical checks, optionally stopping at a proven clean suffix.
+
+        Only the verifier supplies ``verified``: it owns this memo for one table in one
+        stable verification call. Values are complete suffix lengths, not visibility or
+        durability certificates. Failures never populate it. With a memo the returned
+        tuple is only the newly walked prefix; the public API always walks the full chain.
+        """
         chain: list[RecordRef] = []
         seen: set[int] = visited_pages()
         # A version chain visits distinct slots, so the pages of the file times the slots a page
@@ -2232,6 +2244,7 @@ class HeapStore:
             + 1
         )
         current: RecordRef | None = ref
+        suffix_length = 0
         while current is not None:
             refuse_endless_chain(self._file, len(chain) + 1, limit)
             encoded = current.encode()
@@ -2244,10 +2257,19 @@ class HeapStore:
                     slot=current.slot,
                     field="cycle",
                 )
+            if verified is not None and encoded in verified:
+                suffix_length = verified[encoded]
+                # Reusing a suffix must not weaken the independent finite-walk bound.
+                refuse_endless_chain(self._file, len(chain) + suffix_length, limit)
+                break
             seen.add(encoded)
             chain.append(current)
             _table_id, content = self._read_slot(current)
             current = RecordHeader.decode(content).previous
+        if verified is not None:
+            for visited in reversed(chain):
+                suffix_length += 1
+                verified[visited.encode()] = suffix_length
         return tuple(chain)
 
     def extent_of(self, table: TableDef) -> TableExtent | None:

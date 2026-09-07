@@ -657,3 +657,15 @@ No planner refusal semantics, OCC, WAL or multi-reader/writer guarantees changed
 See Community `docs/GRAFX_WRITE_PATH_MILESTONE.md` for scope and deployment
 boundaries. Cold UI admission and full write latency remain unresolved; this
 checkpoint does not add a new exploratory target or timing gate.
+
+### Full verification history cost — 2026-09-07
+
+The recorded post-flush write-cost investigation identified quadratic traversal
+of MVCC suffixes. Native verification now reuses only fully checked suffix lengths
+within one table/call, retaining all page, record and index validation and custom
+collaborator fallbacks. A single read-only private Global comparison returned
+identical complete reports in 64.359 s versus 16.075 s. This is a stage-specific
+observation, not end-to-end write acceleration or a new timing gate. Tests prove
+linear healthy-history visits and identical corruption findings. Details, safety,
+test counts and deployment status: `VERIFICATION_VERSION_SUFFIXES_0_0_4.md`.
+No live consolidation or backlog processing was used; the 21 reserved specs remain.
