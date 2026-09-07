@@ -4734,3 +4734,32 @@ complexidade adicional nem abrir um gate prolongado para ganho marginal.
 Fonte nativa restaurada ao estado anterior, sem deploy ou consumo das 21 specs.
 Não foi executada nem alegada a matriz de qualidade do candidato rejeitado.
 Evidências e limites em `docs/ENDPOINT_VERSION_REUSE_EVALUATION_0_0_4.md`.
+
+### Configurações Grafx e contratos públicos — 2026-09-07
+
+Community `c547cc5` fecha o lote de fontes da UI/persistência: catálogo dos 36
+campos de DatabaseConfig, 30 editáveis (3 básicos/27 avançados), 6 explicitamente
+geridos pelo Pulse, tooltips em portal fixo acima da modal. Valores desejados
+ficam separados dos efetivos; recomposição após hidratação precede seed/workers.
+Nenhum ajuste de Settings redefine geometria de uma geração existente.
+Corrigida coerção indevida de tamanho de página: API exige JSON inteiro e o
+serviço não trunca valores fracionários; texto inteiro persistido continua válido.
+
+A auditoria encontrou omissões anteriores nos contratos de integração.
+Core `6245114` declara o pacote neutro `kg.logical_transfer` (M-PULSE-5) e somente
+o símbolo `kg.blocking_io.run_blocking_graph_io`; Community atualiza sua expectativa.
+Mantidos manifesto pareado, auditoria de imports e baseline zero de acesso privado,
+sem liberar todo o módulo de implementação nem introduzir Grafx no Core.
+
+Candidatos isolados: 166 testes Community em 51,79 s, 39 Core em 4,55 s e 19 UI
+em 5,55 s, Ruff/whitespace verdes. Rodada Core anterior de 69 testes se sobrepõe
+ao conjunto final e não é somada. Pela UI servida no PID 18920: 36 ajudas, tooltip
+em BODY/fixed/z-index 100 e bounds da modal idênticos antes/depois; Escape fecha
+somente a ajuda. API HTTP 200, defaults efetivos preservados. Sem Save ou jobs.
+
+Commits enviados às branches de trabalho. Sem publicação de wheel ou novo build
+de assets neste checkpoint: o bundle ativo já possui essa UI; sua sincronização
+versionada fica agrupada com o lote pendente de DLQ. A validação estrita nova e o
+manifesto serão carregados no próximo restart acumulado, não estão hot-loaded.
+Ledger das 21 specs permanece byte-idêntico. Referências: Community
+`docs/GRAFX_RUNTIME_SETTINGS_UI.md`, Core `docs/PUBLIC_GRAPH_INTEGRATION_CONTRACTS.md`.
