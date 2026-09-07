@@ -4250,3 +4250,36 @@ prometido como speedup da UI. Documentação/prova/limitações em
 `docs/VECTOR_FREE_TRAVERSAL_0_0_4.md`. Nenhuma spec de benchmark consumida; o Pulse
 ativo ainda usa o código carregado antes deste candidato. O fan-out por layout
 continua explicitamente pendente, sem declarar sua eliminação por esta melhoria.
+
+**Integração no runtime de desenvolvimento:** Pulse 0.3.3 reiniciado com Grafx
+`1b53f57` (PID 35824; portas 8100/8101). Consulta escalar incoming real retornou
+HTTP 200/20 linhas. O teste pela API revelou recusa nativa de consulta inválida
+virando HTTP 500 não estruturado; corrigido com erro agnóstico no Core e mapping/
+resposta RFC 7807 no Community. A mesma consulta passou a HTTP 400; 97 testes de
+autorização/REST/transaction passaram em 34,38 s. Sem recovery/redrive implícito,
+sem publicação de pacote, sem tocar as 21 specs reservadas (ledger idêntico).
+Detalhes e limitações em `docs/VECTOR_FREE_TRAVERSAL_0_0_4.md` e no Community
+`docs/GRAFX_READ_QUERY_ERRORS.md`. Os passivos anteriores de DLQ e sondagens Health
+com orçamento expirado permanecem explicitamente visíveis.
+
+### Checkpoint complementar 0.0.4 — vetores, transferência e concorrência
+
+Executado sem Claude e sem consumir as 21 specs reservadas. Caso isolado: buscas
+vetoriais estáveis, backup/restore idênticos, dois readers com snapshots mantidos
+e dois writers com 16 inserts confirmados, sem perda/duplicação após recovery e
+checkpoint. Três testes existentes de concorrência vetorial/read-your-own-writes
+passaram. O backup completo do board real (2.961 nodes/4.424 relações/2.960 vetores)
+foi restaurado fora do runtime; reconciliação independente somente leitura provou
+`verify("all")` limpo e igualdade de contagens, schema e fingerprint. O status
+terminal e o tempo total da restauração original não foram observados, portanto
+não são declarados. Ledger cognitivo permanece com o mesmo SHA256. Evidências,
+tempos e limitações em `docs/V004_VECTOR_TRANSFER_CONCURRENCY_CHECKPOINT.md`.
+Fecha o complemento da Wave 3 item 4, não toda a versão: fan-out por layout,
+decision queue e passivos históricos permanecem explícitos, sem novos gates.
+
+**Milestone de integração rastreável:** erro de consulta agnóstico versionado no
+Core `6ea25e9`; mapping/REST e matriz de erros no Community `54b2a90`; utilitários
+reproduzíveis de checkpoint no Community `6e369c5`. O slice de autorização/erros
+passou novamente 13 testes em 14,77 s. Foram selecionados apenas os hunks desta
+correção, preservando fora desses commits as demais alterações locais de UI,
+recovery e event loop. Nenhum backup com conteúdo do board foi versionado.

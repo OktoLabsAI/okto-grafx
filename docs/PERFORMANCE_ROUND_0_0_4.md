@@ -344,8 +344,11 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    scan, com mesmo digest, 73 chamadas multi-key e 4.808 probes. Open mediu `1,210 s`, autocommit
    relacional `2,260 s` e o mesmo batch sob um snapshot `0,890 s` para 3.256 rows. O checkpoint
    combinado pós-WAL/recovery passou 411 testes de WAL, protocolo de commit, integração WAL e
-   crash recovery. Vector, transfer e concorrência serão medidos uma única vez no fechamento da
-   Wave 3, não após cada patch.
+   crash recovery. O complemento delimitado de vector, transfer e concorrência foi executado
+   em 07/09/2026, sem consumir specs pendentes: caso sintético com dois leitores/dois writers,
+   mais restauração isolada do backup completo do board real. Evidência, medidas e limites em
+   `docs/V004_VECTOR_TRANSFER_CONCURRENCY_CHECKPOINT.md`. Isso fecha esse complemento de
+   checkpoint, não declara eliminados o fan-out residual nem os itens da decision queue.
 5. **Decisão material:** BATCH-REL-1 foi executado antes de CURSOR-1; não foram adicionados
    residuais menores. A solução integrada em `567a6a3` é deliberadamente estreita: somente a
    ausência do extent — prova durável de que nenhuma página relacional foi alocada — responde

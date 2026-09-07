@@ -77,6 +77,30 @@ tariff, not process RSS or a measured native allocation peak.
 
 Local reproducer: `.grafx-tmp/vector_free_traversal_bench.py`; its databases are
 isolated under `.grafx-tmp/vector-free-*`. It never opens Pulse data. No cognitive
-spec was consumed. The live Pulse process has not been restarted onto this patch.
+spec was consumed. The initial checkpoint did not restart Pulse; the deployment
+validation below records the subsequent source-runtime restart.
 The residual incident-layout fan-out in `find_by_artifact` is **not** claimed
 eliminated; this change reduces decoding/retention within its existing queries.
+
+## Source-runtime integration checkpoint
+
+Pulse 0.3.3 was restarted onto native commit `1b53f57`, with explicit default
+DATA_DIR and source roots for Community/Core/Grafx. PID 35824 serves ports 8100
+and 8101. The previous process exceeded the 15-second HTTP shutdown window, but
+logged successful Global/board graph closure and was confirmed exited before
+the new process started; no OS force-kill or overlapping writer was used.
+
+An authenticated typed incoming Constraint-to-Entity query through Pulse REST
+returned HTTP 200 and 20 rows (1,264 ms executor-reported, cold observation, not a
+paired speedup). A diagnostic unsupported-function query exposed a separate REST
+error-handling gap: native planning correctly refused, but an uncaught neutral
+error became plain HTTP 500. Core now defines only a backend-neutral invalid-query
+failure; Community maps the native types and returns structured HTTP 400. The
+exact original request was retested after restart. Authorization/error integration
+passed 97 tests; details are in Community `docs/GRAFX_READ_QUERY_ERRORS.md`.
+
+REST still reports 21 pending cognitive specs, zero in progress, 19 consolidated
+and an unchanged ledger hash. The graph is queryable with no required recovery,
+and active queue depth is zero. Historical DLQ/debt and bounded Health probe
+timeouts are not claimed resolved. This is source-runtime validation, not a
+new package publication or proof that the entire 0.0.4 plan is complete.
