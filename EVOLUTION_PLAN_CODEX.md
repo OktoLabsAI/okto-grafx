@@ -4703,3 +4703,20 @@ Agora carregados tanto o escalonamento de schema `9617912` quanto a admissão
 restritiva deste lote. Startup completo, API 8100 e MCP 8101 no mesmo PID,
 `GET /health` HTTP 200 (`healthy`, versão Pulse 0.3.3). Este é um smoke de
 disponibilidade, não nova auditoria integral do KG. Ledger permanece byte-idêntico.
+
+### Leituras REST restantes fora do event loop — 2026-09-07
+
+Community `47a6f09` fecha `list_nodes`, `get_node_detail`, `find_similar`,
+`get_supersedence`, `find_contradictions` e `cypher_query` com o bridge genérico
+existente do Core. Autorizações/visibilidade são resolvidas antes do despacho;
+o UoW relacional não entra nas closures síncronas. Contexto, filtros, budgets,
+resultados e mapeamento de erros preservados. Cancelamento repetido drena a
+operação nativa antes de liberar o chamador, sem abandonar recursos em uso.
+
+62 testes Community em 37,31 s e 13 Core em 7,55 s passaram em fontes isoladas;
+Ruff e whitespace verdes. Verificadas as seis rotas, argumentos/contexto,
+callback concorrente no loop, permissões e cleanup após cancelamento duplo.
+Sem promessa de paralelismo CPU/GIL ou redução de complexidade da consulta.
+O código já estava no worktree usado pelo PID 18920: não houve novo restart.
+Nenhuma spec consumida; ledger byte-idêntico. Documentação Community:
+`docs/KG_REST_READ_DISPATCH.md`. O restante do plano permanece aberto.
