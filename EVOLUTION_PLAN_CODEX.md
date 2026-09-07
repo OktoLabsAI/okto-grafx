@@ -4283,3 +4283,17 @@ reproduzíveis de checkpoint no Community `6e369c5`. O slice de autorização/er
 passou novamente 13 testes em 14,77 s. Foram selecionados apenas os hunks desta
 correção, preservando fora desses commits as demais alterações locais de UI,
 recovery e event loop. Nenhum backup com conteúdo do board foi versionado.
+
+### Continuação 0.0.4 — reutilização do anchor PK escalar
+
+O perfil da adjacência real identificou 36 buscas repetidas do mesmo nó central.
+A busca escalar em transações nativas de leitura agora usa o cache PK bounded já
+existente para listas, mantendo uma visão validada independente por statement.
+Writers e colaboradores especializados continuam no caminho escalar canônico;
+nenhuma mudança de OCC/WAL/multi-reader/writer, formato ou política de certificados.
+No board restaurado e isolado: probes centrais 36 → 1, mesmas 105 linhas e digest,
+mediana quente 150,12 → 131,10 ms (~12,7% menor nessa operação, não na UI inteira).
+Slice integrado 156 testes; slice final de guards/PK/predicados/budgets 53 testes,
+com sobreposição entre os conjuntos; Ruff/diff-check passaram. Evidência em
+`docs/SCALAR_PRIMARY_KEY_MEMO_0_0_4.md`. As 21 specs continuam intactas e o Pulse
+não foi reiniciado para este patch. O fan-out por layout ainda não está eliminado.

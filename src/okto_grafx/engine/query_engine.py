@@ -148,6 +148,8 @@ from okto_grafx.domain.txn.context import (
     PendingRowRef,
     RowIntent,
     RowOperation,
+    TransactionContext,
+    TransactionMode,
 )
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.txn.snapshot import Snapshot
@@ -374,6 +376,8 @@ _NATIVE_VALIDATED_VERSIONS_MANY = IndexManager.validated_versions_many
 _NATIVE_VALIDATED_VERSIONS_MANY_REUSING = (
     IndexManager.validated_versions_many_reusing
 )
+_SCALAR_PK_CANONICAL_READ_SLOT = HeapStore._read_slot
+_SCALAR_PK_CANONICAL_VALIDATED_ITEMS = IndexManager._validated_items
 
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -5817,7 +5821,7 @@ def _index_seek(
                 continue
             overlay_candidates = selected
         yielded: set[object] = set()
-        for ref, version in _index_lookup_versions(
+        versions = _index_lookup_versions(
             engine,
             manager,
             node.index,
@@ -5826,7 +5830,15 @@ def _index_seek(
             reuse_validated_version=reuse_validated_version,
             ended=ended,
             selected_index=selected_index,
-        ):
+        )
+        if reuse_validated_version and primary_position is not None:
+            cached_group = _scalar_primary_key_group(
+                engine, context, manager, selected_index, key, node.table,
+                primary_position,
+            )
+            if cached_group is not None:
+                versions = iter(cached_group)
+        for ref, version in versions:
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
             if primary_state is not None and statement_primary is not None:
@@ -5883,6 +5895,54 @@ Chosen from the shape of the two costs, not tuned to a machine: a lookup costs a
 reads however large the edge table is, and the grouped scan costs the whole edge table once.
 NodeScan and AllNodesScan frontiers bypass this limit and scan immediately because their plan
 already promises a whole-table walk. Unknown producers retain the conservative hybrid fallback."""
+
+
+def _scalar_primary_key_group(
+    engine: QueryEngine,
+    context: _Context,
+    manager: object,
+    store: object,
+    key: bytes,
+    table: TableDef,
+    position: int,
+) -> tuple[tuple[RecordRef, HeapVersion], ...] | None:
+    """Share the bounded PK memo with scalar read seeks, never its certificates.
+
+    A one-key batch validates the same candidate sequence as the scalar exact
+    door. Reuse still opens a fresh stable index/heap view on every statement;
+    only bucket traversal and payload materialization may be reused. Writer
+    statements and specialized scalar collaborators keep their existing door.
+    """
+    if type(context.txn) is not TransactionContext or context.txn.mode is not TransactionMode.READ:
+        return None
+    many = getattr(manager, "validated_versions_many", None)
+    definition = getattr(store, "definition", None)
+    if (
+        type(manager) is not IndexManager
+        or type(engine.heap) is not HeapStore
+        or getattr(engine.heap.read, "__func__", None) is not _VECTOR_FREE_CANONICAL_READ
+        or getattr(engine.heap._decode_version, "__func__", None) is not _VECTOR_FREE_CANONICAL_DECODE
+        or getattr(engine.heap._read_slot, "__func__", None) is not _SCALAR_PK_CANONICAL_READ_SLOT
+        or getattr(manager.validated_versions, "__func__", None) is not _VECTOR_FREE_CANONICAL_VALIDATED
+        or getattr(manager._validated_items, "__func__", None) is not _SCALAR_PK_CANONICAL_VALIDATED_ITEMS
+        or getattr(many, "__func__", None) is not _NATIVE_VALIDATED_VERSIONS_MANY
+        or not isinstance(definition, IndexDefinition)
+        or definition.table_id != table.table_id
+        or definition.table_name != table.name
+        or definition.positions != (position,)
+        or definition.key_derivation != COLUMN_KEY_DERIVATION
+        or definition.visibility is not IndexVisibility.EXACT
+    ):
+        return None
+    groups = _memoized_primary_key_groups(
+        engine, context, manager, store, (key,), table, position, many,
+    )
+    if len(groups) != 1:
+        raise GrafxIndexError(
+            "Scalar primary-key validation returned an invalid result group count.",
+            field="index_batch", index=definition.name, expected=1, observed=len(groups),
+        )
+    return groups[0]
 
 
 def _closed_vector_free_landings(root: PlanNode) -> frozenset[int]:

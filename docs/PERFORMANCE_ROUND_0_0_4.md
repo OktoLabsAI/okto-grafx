@@ -203,6 +203,11 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
     vector materialization from its existing closed scalar single-hop queries, without changing
     the frontier. Focused evidence and the accumulated checkpoint status are recorded in
     `docs/VECTOR_FREE_TRAVERSAL_0_0_4.md`; this does not claim that layout fan-out is eliminated.
+    The subsequent scalar-anchor extension reuses the existing bounded PK memo in native read
+    transactions: 36 repeated central-node bucket probes become 1, with an independent stable
+    index view per statement, identical 105-neighbour results and a 150.12 → 131.10 ms warm
+    median on the isolated real-board restore. Evidence and exact fallback boundaries:
+    `docs/SCALAR_PRIMARY_KEY_MEMO_0_0_4.md`. This is not CONCUR-2 or query fan-out collapse.
     Eager cross-node batching is not accepted yet: it can visit a center that
     the existing `max_rows` frontier never reaches, changing error/admission behavior. Keep the
     current exact result order, parallel-edge multiplicity, visibility filters and null hop2
