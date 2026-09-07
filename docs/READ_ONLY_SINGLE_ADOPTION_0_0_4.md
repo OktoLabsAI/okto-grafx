@@ -82,3 +82,9 @@ job was started. The reserved cognitive ledger remains unchanged:
 
 The full cold UI load remains pending. See also
 [relationship scan optimization](RELATIONSHIP_SCAN_VECTOR_FREE_0_0_4.md).
+
+Deployment follow-up: Pulse PID 7896 loaded this change at the accumulated
+Community `9c9ef1a` checkpoint. Graph, census and pagination succeeded; the
+21 reserved specs remain untouched. See
+`KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md` for current measurements and the still
+unresolved cost of the full UI workload.

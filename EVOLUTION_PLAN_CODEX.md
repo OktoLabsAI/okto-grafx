@@ -4410,3 +4410,22 @@ não mostrou ganho consistente no censo real: medianas full/projetada
 Não haverá rodada longa buscando ganho marginal nessa hipótese. Evidências,
 limitações e decisão: `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
 O foco continua no custo concorrente dominante; nenhuma spec reservada consumida.
+
+### Correção de censo e deploy acumulado — 2026-09-07
+
+A comparação nativa revelou 69 layouts físicos únicos, enquanto o Pulse
+enumerava 70: `supersedes(Decision,Decision)` estava presente em duas listas.
+Community `9c9ef1a` deduplica as triplas exatas, mantendo ordem, direção e tipos
+distintos. Corrige os totais de censo/verificação e elimina uma leitura repetida.
+55 testes focados passaram. Detalhes no Community
+`docs/KG_UNIQUE_RELATIONSHIP_LAYOUTS.md`.
+
+Pulse PID 7896 carregou essa correção e o Grafx `eaa7c65`, antes pendente de
+deploy. API: 2779 nós, 4424 relações, 69 layouts, nenhuma falha; UI com 500 →
+1000 nós e paginação sem falhas. As 21 specs continuam reservadas.
+
+Três leitores nativos concluíram o censo em paralelo em 4,866 s contra 7,751 s
+somados em sequência. Três transações no mesmo handle terminaram em 6,196 s:
+compartilhar handle isoladamente não reproduziu o residual de ~23 s observado
+nas relações da UI. Carga completa permanece pendente, sem atribuição prematura
+da causa. Evidências: `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
