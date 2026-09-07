@@ -7238,6 +7238,58 @@ class IndexManager:
             landing=True,
         )
 
+    def validated_identity_counts_many(
+        self,
+        index: IndexStore,
+        keys: Sequence[bytes],
+        snapshot: SnapshotLike,
+    ) -> tuple[int, ...]:
+        """Count visible identity witnesses under one exact pre/post certificate.
+
+        Like scalar identity landings, every candidate is decoded and checked,
+        including vector bodies. Only cardinalities survive the callback, so a
+        bounded frontier need not retain all endpoint payloads. Counts above one
+        remain observable to the query's canonical duplicate-identity refusal.
+        No answer escapes until the whole batch's post-certificate succeeds.
+        """
+        definition = index.definition
+        if definition.key_derivation != RECORD_ID_KEY_DERIVATION:
+            raise GrafxIndexError(
+                f"Index {definition.name!r} derives its key from columns and cannot validate "
+                "identity landings.",
+                field="key_derivation", value=definition.key_derivation,
+                index=definition.name, file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        wanted_by_position = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted_by_position))
+        if not distinct:
+            return ()
+
+        def confirm(certificate: _IndexReadCertificate) -> tuple[int, ...]:
+            self._prepare_heap_view(index.file, certificate)
+            answers: dict[bytes, int] = {}
+            for wanted in distinct:
+                count = 0
+                for entry in index._candidates_unchecked(wanted):
+                    version = self._heap.read_landing(entry.ref)
+                    if version.table_id != definition.table_id:
+                        raise GrafxCorruptionDetected(
+                            f"Index {definition.name!r} points at a row of table "
+                            f"{version.table_id} and covers table {definition.table_id}.",
+                            file=index.file, page=entry.page, slot=entry.slot,
+                            index=definition.name, field="table_id",
+                        )
+                    if not snapshot.visible(version.xmin, version.xmax):
+                        continue
+                    if definition.entry_key_for_record(version.record_id, version.values) != entry.key:
+                        continue
+                    count += 1
+                answers[wanted] = count
+            return tuple(answers[wanted] for wanted in wanted_by_position)
+
+        return index._stable_view(read_lsn, confirm)
+
     def validated_versions_many(
         self,
         index: IndexStore,

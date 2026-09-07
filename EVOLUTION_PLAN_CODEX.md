@@ -4469,3 +4469,26 @@ existente: agrupamento limitado dessas validações pelo mecanismo certificado
 já existente, preservando todos os contratos. Não é cache/bundle de autoridade
 entre operações, nem autorização para suprimir verificações. Evidências e
 ressalvas do script diagnóstico em `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
+
+### Censo nativo com validação agrupada de endpoints
+
+Implementado caminho exato para `COUNT(r)`/`COUNT(*)` sem filtros/agrupamento,
+com até 64 pares de endpoints por lote. Cada candidato continua validado no heap
+e sob o certificado exato pre/post existente. O memo transacional de landings
+ganhou uma chave separada de presença (0/1), com tarifa conservadora, LRU,
+invalidação por snapshot/catálogo/epoch e liberação no encerramento já existentes.
+Presença não pode responder propriedades nem vetores. Escritas, hooks especiais
+e limites operacionais mantêm o caminho canônico. Nenhuma mudança em WAL/OCC,
+formatos ou premissas multi-reader/writer.
+
+Comparação read-only no board: 69 layouts, 4424 relações e fingerprint idêntico.
+Certificados: 2960 → 92 (~96,9% menos). Amostra aquecida: escalar 1,462 s contra
+lote 0,612–0,642 s (aproximadamente 2,3–2,4x nessa operação, não na UI inteira).
+Regressão relacionada passou 107 testes em 55,80 s; casos extras de fronteira
+continuam em validação antes do deploy. Detalhes: `docs/BATCHED_RELATIONSHIP_COUNT_0_0_4.md`.
+Nenhuma spec reservada consumida e nenhum novo gate de timing.
+
+Fechamento do slice: 24 testes finais do censo agrupado passaram em 18,69 s,
+incluindo fonte ausente, relação vazia e igualdade exata das estatísticas.
+Corrigida antes do aceite a chave `rows_scanned: 0` extra no caso vazio.
+Ruff e verificação de whitespace passaram; testes sobrepostos aos 107 anteriores.

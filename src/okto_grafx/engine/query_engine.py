@@ -2319,7 +2319,7 @@ class _OwnerLandingView:
             self._base_bytes = base_bytes if budget is not None else 0
             self._base_entries = base_entries if budget is not None else 0
             self._cache: dict[
-                object, tuple[tuple[object, HeapVersion] | None, int]
+                object, tuple[tuple[object, HeapVersion] | None | int, int]
             ] = {}
             self._cache_bytes = 0
             self._cache_entries = 0
@@ -2373,7 +2373,7 @@ class _OwnerLandingView:
                 # A hit becomes the most recently used entry (dict order is the LRU order).
                 del self._cache[cache_key]
                 self._cache[cache_key] = cached
-                return cached[0]
+                return cast(tuple[object, HeapVersion] | None, cached[0])
             self._active += 1
         lease_open = True
         try:
@@ -2414,6 +2414,66 @@ class _OwnerLandingView:
             if lease_open:
                 with self._guard:
                     self._leave_locked()
+
+    def counts_many(
+        self, identities: Sequence[int], context: _Context, index: object,
+    ) -> tuple[int, ...]:
+        """Retain bounded READ-only presence proofs, separate from all row values.
+
+        This shares the existing snapshot/owner/heap-epoch view, LRU budget and
+        retirement lifecycle. Presence never satisfies full or vector-free row
+        reads. The native caller has already excluded writes and custom hooks.
+        """
+        with self._guard:
+            if self._retired:
+                raise GrafxTransactionStateError(
+                    "A transaction-local landing view was retired before its query finished.",
+                    field="owner_landing_view", table=self._table.name,
+                    table_id=self._table.table_id,
+                )
+            answers: dict[int, int] = {}
+            for identity in identities:
+                key = (identity, "presence")
+                cached = self._cache.get(key)
+                if cached is not None:
+                    answers[identity] = cast(int, cached[0])
+                    del self._cache[key]
+                    self._cache[key] = cached
+            self._active += 1
+        try:
+            missing = tuple(identity for identity in dict.fromkeys(identities)
+                            if identity not in answers)
+            if missing:
+                counts = self._engine._indexes.validated_identity_counts_many(
+                    index, tuple(record_id_key(identity) for identity in missing), context.snapshot,
+                )
+                if len(counts) != len(missing):
+                    raise GrafxIndexError(
+                        "Identity count validation returned an invalid result group count.",
+                        field="index_batch", index=index.name,
+                        expected=len(missing), observed=len(counts),
+                    )
+                answers.update(zip(missing, counts))
+                with self._guard:
+                    if not self._retired and self._cache_enabled and self._budget is not None:
+                        for identity, count in zip(missing, counts):
+                            key = (identity, "presence")
+                            # Never retain an invalid duplicate witness as a successful proof.
+                            if count not in (0, 1) or key in self._cache:
+                                continue
+                            charge = 512  # tuple key, bounded id/count, dict and LRU overhead
+                            if self._reserve_evicting_locked(self._budget, charge):
+                                try:
+                                    self._cache[key] = (count, charge)
+                                except BaseException:
+                                    self._budget.release(bytes_=charge, entries=1)
+                                    raise
+                                self._cache_bytes += charge
+                                self._cache_entries += 1
+            return tuple(answers[identity] for identity in identities)
+        finally:
+            with self._guard:
+                self._leave_locked()
 
     def close(self) -> None:
         """Drop payloads, overlays and their exact charges at transaction settlement."""
@@ -9960,12 +10020,112 @@ def _compare_sort_spill_keys(left: bytes, right: bytes) -> int:
     return _spill_compare(left_ordinal, right_ordinal)
 
 
+def _batched_relationship_count(
+    engine: QueryEngine, node: AggregateRows, context: _Context,
+) -> int | None:
+    """Count a closed relationship scan with bounded, fully validated endpoints.
+
+    No entity, vector or property escapes this exact COUNT-only shape. The
+    frontier holds at most 64 integer endpoint pairs, not heap payloads or an
+    unbounded table map. Owner writes, hooks and operational row/spill/traversal
+    quotas retain the canonical path and its refusal/admission order.
+    """
+    scan = node.child
+    manager = engine._indexes
+    if (
+        type(scan) is not RelationshipScan or type(scan.child) is not SingleRow
+        or scan.predicate is not None or node.grouping or node.preserve_group_bindings
+        or len(node.aggregations) != 1
+        or type(context.txn) is not TransactionContext
+        or context.txn.mode is not TransactionMode.READ
+        or engine._max_intermediate_rows is not None
+        or engine._max_traversal_expansions is not None
+        or engine._max_traversal_paths is not None
+        or engine._query_memory_budget_bytes is not None
+        or type(engine.heap) is not HeapStore or type(manager) is not IndexManager
+        or getattr(engine.heap.read, "__func__", None) is not _VECTOR_FREE_CANONICAL_READ
+        or getattr(engine.heap._decode_version, "__func__", None) is not _VECTOR_FREE_CANONICAL_DECODE
+        or getattr(manager.validated_versions, "__func__", None) is not _VECTOR_FREE_CANONICAL_VALIDATED
+        or getattr(getattr(manager, "validated_identity_landings", None), "__func__", None)
+        is not _COUNT_CANONICAL_LANDINGS
+        or getattr(getattr(manager, "validated_identity_counts_many", None), "__func__", None)
+        is not _COUNT_CANONICAL_MANY
+    ):
+        return None
+    call = node.aggregations[0].call
+    if (
+        call.name.upper() != "COUNT" or call.distinct or call.named_arguments
+        or not (call.star or (
+            len(call.arguments) == 1 and type(call.arguments[0]) is Variable
+            and call.arguments[0].name == scan.relationship
+        ))
+        or scan.from_variable == scan.to_variable
+        or scan.relationship in (scan.from_variable, scan.to_variable)
+    ):
+        return None
+    from_index = _endpoint_identity_index(engine, context, scan.from_table)
+    to_index = _endpoint_identity_index(engine, context, scan.to_table)
+    if from_index is None or to_index is None:
+        return None
+    ended = _ended_by_this_transaction(context)
+    views = {
+        table.table_id: _owner_landing_view(engine, context, table, ended)
+        for table in (scan.from_table, scan.to_table)
+    }
+
+    def visible(table: TableDef, index: object, identities: Sequence[int]) -> tuple[bool, ...]:
+        counts = views[table.table_id].counts_many(identities, context, index)
+        if len(counts) != len(identities):
+            raise GrafxIndexError(
+                "Identity count validation returned an invalid result group count.",
+                field="index_batch", index=index.name,
+                expected=len(identities), observed=len(counts),
+            )
+        for identity, count in zip(identities, counts):
+            if count > 1:
+                raise GrafxCorruptionDetected(
+                    f"Identity index {index.name!r} resolved record {identity} of "
+                    f"table {table.name!r} to {count} snapshot-visible versions.",
+                    file=index.file, table=table.name, table_id=table.table_id,
+                    record_id=identity, field="record_id", index=index.name, count=count,
+                )
+        return tuple(count == 1 for count in counts)
+
+    def count_frontier(frontier: list[tuple[int, int]]) -> int:
+        from_visible = visible(scan.from_table, from_index, [pair[0] for pair in frontier])
+        # Preserve the scalar short circuit: a missing source never probes its target.
+        targets = [pair[1] for pair, present in zip(frontier, from_visible) if present]
+        return sum(visible(scan.to_table, to_index, targets)) if targets else 0
+
+    context.count("edge_scans")
+    total = 0
+    frontier: list[tuple[int, int]] = []
+    for _ref, version in engine.heap.scan(scan.table, context.snapshot):
+        frontier.append((version.values[0], version.values[1]))
+        if len(frontier) == 64:
+            total += count_frontier(frontier)
+            frontier.clear()
+    if frontier:
+        total += count_frontier(frontier)
+    if total:
+        context.count("rows_scanned", total)
+    return total
+
+
+_COUNT_CANONICAL_LANDINGS = IndexManager.validated_identity_landings
+_COUNT_CANONICAL_MANY = IndexManager.validated_identity_counts_many
+
+
 def _aggregate_rows(
     engine: QueryEngine, node: AggregateRows, context: _Context
 ) -> Iterator[_Row]:
     """Produce one row per group, carrying the grouping keys and the aggregates."""
     if getattr(engine, "_query_memory_budget_bytes", None) is not None:
         yield from _spilled_aggregate_rows(engine, node, context)
+        return
+    count = _batched_relationship_count(engine, node, context)
+    if count is not None:
+        yield _Row(bindings={}, computed={node.aggregations[0].call: count})
         return
     groups: dict[object, tuple[list[object], dict[Expression, _Accumulator]]] = {}
     order: list[object] = []

@@ -37,6 +37,11 @@ PREFIX = "MATCH (a:A)-[r:E]->(b:B) WHERE a.id='a' "
 SCAN_PREFIX = "MATCH (a:A)-[r:E]->(b:B) "
 
 
+def _full_decode_oracle(monkeypatch):
+    monkeypatch.setattr(qe, "_batched_relationship_count", lambda *_args: None)
+    monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
+
+
 @pytest.mark.parametrize("suffix,enabled", [
     ("RETURN b.id, b.title, r.rank", True),
     ("RETURN b.id, label(b) ORDER BY b.id DESC LIMIT 4", True),
@@ -60,7 +65,7 @@ def test_native_results_equal_full_decode_and_proof_is_exact(graph, monkeypatch,
     query = prefix + suffix
     candidate = graph.execute(query)
     assert bool(counts["landing"]) is enabled
-    monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
+    _full_decode_oracle(monkeypatch)
     oracle = graph.execute(query)
     assert candidate.rows == oracle.rows
     assert candidate.columns == oracle.columns
@@ -201,7 +206,7 @@ def test_relationship_scan_proves_both_vector_endpoints(graph, monkeypatch, suff
     assert any(type(node) is qe.RelationshipScan for node in graph.explain(query).walk())
     candidate = graph.execute(query)
     assert len(set(calls)) == (2 if enabled else 0)
-    monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
+    _full_decode_oracle(monkeypatch)
     assert candidate.rows == graph.execute(query).rows
     assert graph._queries._owner_budget._used_bytes == 0
 
@@ -211,9 +216,9 @@ def test_relationship_count_retains_less_without_changing_budget_or_answer(graph
     with graph.begin("read") as reader:
         candidate = reader.execute(query).rows
         candidate_bytes = graph._queries._owner_budget._used_bytes
-        assert candidate_bytes > 0
+        assert candidate_bytes > 0  # COUNT retains metered presence, never endpoint payloads.
     assert graph._queries._owner_budget._used_bytes == 0
-    monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
+    _full_decode_oracle(monkeypatch)
     with graph.begin("read") as reader:
         assert reader.execute(query).rows == candidate
         canonical_bytes = graph._queries._owner_budget._used_bytes
