@@ -224,13 +224,52 @@ def test_missing_multi_key_door_executes_the_retained_scan(
 def test_a_stale_store_executes_the_retained_scan(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A store the statement authority still names but reports stale is never probed."""
+    import okto_grafx.engine.query_engine as query_engine_module
+
+    original_named = query_engine_module._IndexAuthorityProjection.named
+
+    class _Stale:
+        stale = True
+
+        def __init__(self, store: object) -> None:
+            self._store = store
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._store, name)
+
+    def named(self, name):  # type: ignore[no-untyped-def]
+        store = original_named(self, name)
+        return None if store is None else _Stale(store)
+
+    monkeypatch.setattr(query_engine_module._IndexAuthorityProjection, "named", named)
     counts = _doors(monkeypatch)
-    monkeypatch.setattr(HashIndex, "stale", property(lambda self: True))
     result = database.execute(QUERY, {"ids": ["a4"]})  # type: ignore[attr-defined]
 
     assert result.rows == (("a4", 4),)
     assert counts["many"] == 0
     assert counts["scans"] == 1
+
+
+def test_a_custom_door_candidate_is_still_judged_against_the_probe(
+    database: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duck-typed multi-key door may hand back candidates under the wrong key; the seek
+    keeps only the rows whose stored key equals the probe, exactly as the scan would."""
+    from okto_grafx.domain.index.keys import index_key
+
+    original = IndexManager.validated_versions_many
+
+    def loose(manager, index, keys, snapshot):  # type: ignore[no-untyped-def]
+        extra = index_key(("a5", None), (0,))
+        groups = original(manager, index, tuple(keys) + (extra,), snapshot)
+        everything = tuple(hit for group in groups for hit in group)
+        return tuple(everything for _ in keys)
+
+    monkeypatch.setattr(IndexManager, "validated_versions_many", loose)
+    rows = database.execute(QUERY, {"ids": ["a1", "a3"]}).rows  # type: ignore[attr-defined]
+
+    assert rows == (("a1", 1), ("a3", 3))
 
 
 def test_catalog_v1_keeps_its_automatic_primary_key_seek(
