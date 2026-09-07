@@ -4050,9 +4050,13 @@ com uma cabeça por tabela, revalidação obrigatória no heap, cursor exclusivo
 todos os certificados antes de expor resultados. Capability incompleta, tabela suja e near misses
 mantêm o scan canônico; depois de abrir uma stream, erro ou drift propaga sem fallback parcial. O
 corpus focado passou 18 casos e o slice combinado passou 440 testes. O handoff independente
-`hof_4fe5ef3390c148c4ba668a83f6b3ac58` cobre agora crash/replay e concorrência real antes do
-checkpoint OIX-4/Pulse; nenhum invariante de WAL, OCC, snapshot, durabilidade ou multiwriter foi
-alterado.
+`hof_4fe5ef3390c148c4ba668a83f6b3ac58` entregou a matriz de crash/replay e concorrência real:
+17 casos de crash e 8 de processos passam. O defeito adversarial encontrado — raiz mais nova
+danificada bloqueava o open ao ser lida antes da substituição — foi corrigido por overwrite
+serializado da cópia não-header descartável, sem leitura prévia, e por recusa de promover a raiz
+sobrevivente danificada além do high-water quando seu WAL já foi reciclado. O banco e o heap
+canônico permanecem disponíveis para rebuild; o índice não pode omitir dados silenciosamente.
+Nenhum invariante de WAL, OCC, snapshot, durabilidade ou multiwriter foi alterado.
 
 O teste do shape real revelou que o `AllNodesScan` também inclui a tabela interna `BoardMeta`,
 sem `created_at/id`. O planner agora a remove somente quando uma prova conservadora de lógica

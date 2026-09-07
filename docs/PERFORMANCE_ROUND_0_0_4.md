@@ -402,13 +402,18 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    constante dependente de hardware. Revisão independente: 57/57 casos focados, 18/18 mutantes,
    2.248/2.248 testes de query no branch isolado e 178 testes combinados após integração. Handoff
    Nexus `hof_f05eb759297a4598845a9d312d9c339c` concluído e verificado por Codex.
-14. **OIX-2B DDL/ativação e compactação concluídos:** `28d76ea` expõe
+14. **OIX-2B DDL/ativação, compactação e matriz concluídos:** `28d76ea` expõe
    `OPTIONS layout = ordered`, `create_index(..., layout="ordered")` e
    `rebuild_index()`. A ativação usa geração nonced `BUILDING -> ACTIVE`, o rebuild constrói e
    verifica uma geração compacta nova antes da rotação `ACTIVE -> STALE`, e `rehash_index()`
    recusa explicitamente o layout ordenado. Tipos, posições, derivação, sizing e reopen foram
-   provados no corpus focado; a matriz independente de crash/replay/multiprocesso está delegada
-   no handoff Nexus `hof_4fe5ef3390c148c4ba668a83f6b3ac58`.
+   provados no corpus focado. O handoff Nexus `hof_4fe5ef3390c148c4ba668a83f6b3ac58`
+   entregou 17 casos de crash/recovery e 8 de processos reais. A matriz revelou que uma raiz mais
+   nova danificada podia impedir o open quando a publicação seguinte tentava decodificar a cópia
+   descartável antes de substituí-la. A correção escreve a raiz não-header completa pela porta
+   serializada do pool sem ler o alvo, e não promove uma raiz sobrevivente danificada além do
+   high-water da tabela quando o WAL correspondente já não permite reconstrução. Todos os 25
+   casos passam sem xfail; dois writers e readers pinados preservam as garantias originais.
 15. **OIX-3 implementado; checkpoint acumulado pendente:** o novo `OrderedNodeMerge` reconhece
    somente a página polimórfica fechada `ORDER BY TIMESTAMP DESC, primary-key STRING DESC LIMIT K`.
    Ele empurra o cursor estrito `(timestamp,id)` ao índice, mantém uma cabeça certificada por

@@ -220,7 +220,7 @@ prefix.
    without repeated allocation.  Root-write refusal leaves the former root authoritative, while
    a write-that-landed-then-raised is recovered by the fresh certificate and watermark.  The
    focused differential/failure corpus passes 16 tests.
-4. **OIX-2B — transactional integration (implementation complete; final matrix pending):** the ordered store
+4. **OIX-2B — transactional integration (implemented and matrix-verified):** the ordered store
    now implements the ordinary secondary-index staging contract, participates in registry/table
    watermarks, publishes one COW generation per live transaction and coalesces each store's WAL
    subsequence into one recovery publication. Exact equality uses a bounded tree seek and remains
@@ -228,7 +228,10 @@ prefix.
    `OPTIONS layout = ordered` and Python `layout="ordered"` activate only the narrow
    TIMESTAMP+STRING contract and refuse hash sizing. `rebuild_index()` bulk-builds and verifies a
    compact fresh nonce before catalog rotation, retaining the former generation as `STALE`.
-   The ordered-specific accumulated crash/multiprocess matrix remains before OIX-2B is closed.
+   The ordered-specific matrix now passes 17 crash/recovery and 8 real-process cases. It exposed
+   and pinned a damaged-newest-root defect: replacement now installs a complete non-header root
+   without first decoding the disposable target, while recovery refuses to advance a surviving
+   damaged root past its table high-water after the corresponding WAL has been recycled.
 5. **OIX-3 — query path (implemented; accumulated matrix pending):** the planner recognizes only
    a polymorphic all-node scan ordered by the table primary key after one TIMESTAMP column, with
    both keys descending, a bounded LIMIT, no SKIP/DISTINCT/aggregation and a proved-total

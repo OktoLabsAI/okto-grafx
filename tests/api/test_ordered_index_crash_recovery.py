@@ -756,21 +756,7 @@ def test_a_damaged_older_root_copy_is_ignored(checkpointed: bool) -> None:
     memory.close()
 
 
-_NEWEST_ROOT_DAMAGE_DEFECT = (
-    "Observed at 28d76ea: when the damaged copy is the NEWEST root, the older copy is "
-    "selected and the next publication -- the replay of the pending batch, or the empty "
-    "watermark bump advance_built_through performs on every open -- targets the damaged "
-    "alternate page, pins it through the buffer pool, fails its checksum and recovery "
-    "refuses the whole database. The design says one damaged copy is ignored and root "
-    "damage fails closed at the index, not at open: the publication path must overwrite the "
-    "alternate page without reading it. Reported to the integrator, not patched."
-)
-
-
 @pytest.mark.parametrize("checkpointed", [True, False])
-@pytest.mark.xfail(
-    strict=True, raises=GrafxCorruptionDetected, reason=_NEWEST_ROOT_DAMAGE_DEFECT
-)
 def test_a_damaged_newest_root_copy_keeps_the_database_open(checkpointed: bool) -> None:
     """Designed behaviour: the open succeeds; the tree either recovers the batch (replay
     pending) or refuses reads beyond the surviving older root; the heap still answers."""

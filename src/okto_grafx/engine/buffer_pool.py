@@ -2232,6 +2232,55 @@ class BufferPool:
         return True
 
     @_guarded
+    def replace_clean_page_without_read(
+        self, file: str, page_index: PageIndex, image: Page
+    ) -> None:
+        """Publish a complete non-header replacement without decoding the target first.
+
+        Dual-copy authority pages deliberately replace the older or damaged copy after the
+        other copy has selected the publication target.  Requiring a pin here would first decode
+        that disposable target and let one bad checksum prevent its repair.  This door keeps the
+        normal pool/page-write serialization, refuses local dirty authority, discards clean or
+        pinned-stale frames, and then uses the ordinary checksum/sequence publication path.
+
+        Page zero is excluded because its cross-process compare-and-swap requires the device
+        sequence carried by an owning frame.  Callers must already hold whatever higher-level
+        dual-authority fence proves that overwriting this non-header page is safe.
+        """
+
+        _require_page_index("page_index", page_index)
+        if not isinstance(image, Page):
+            raise GrafxCorruptionDetected(
+                "A blind page replacement needs a complete Page image.",
+                field="page",
+                value=type(image).__name__,
+                file=file,
+                page=page_index,
+            )
+        if page_index == HEADER_PAGE_INDEX:
+            raise GrafxUnsupportedOperation(
+                "Page 0 requires an owning frame for its sequence compare-and-swap.",
+                field="page_sequence_base",
+                file=file,
+                page=page_index,
+            )
+        if image.page_index != page_index:
+            raise GrafxCorruptionDetected(
+                "A blind page replacement was offered at a different physical index.",
+                field="page_index",
+                value=image.page_index,
+                expected=page_index,
+                file=file,
+                page=page_index,
+            )
+
+        self._wait_for_evictions(file, page_index)
+        self._wait_for_loads()
+        self.discard_clean_page(file, page_index)
+        self._publish_page(file, page_index, image, frame=None)
+        self._remember_write_back(file, page_index)
+
+    @_guarded
     def discard_clean_file(self, file: str) -> int:
         """Forget every clean frame of ``file`` without writing a byte.
 

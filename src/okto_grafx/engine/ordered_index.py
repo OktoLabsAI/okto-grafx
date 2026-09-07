@@ -572,6 +572,51 @@ class OrderedIndex(IndexStore):
         self._stale_device_seq = None
         self._remember_local_certificate()
 
+    def complete_built_through(self, lsn: Lsn, table_high_water: Lsn | None) -> None:
+        """Refuse to certify a damaged surviving root past data it may have lost.
+
+        A hash header can safely advance after complete logical replay.  An ordered watermark is
+        the root authority itself: advancing an older surviving root after the newer copy was
+        damaged would certify a tree that omits committed rows once the corresponding WAL was
+        checkpointed away.  A root that is merely behind because intervening commits did not
+        touch this index retains the established completed-replay advance.  Recovery therefore
+        leaves only an actually damaged-and-behind generation stale and available for rebuild,
+        while the database and canonical heap remain usable.
+        """
+
+        if isinstance(lsn, bool) or not isinstance(lsn, int) or lsn < NO_LSN:
+            raise GrafxIndexError(
+                "An ordered replay completion needs a non-negative integer position.",
+                field="lsn",
+                value=repr(lsn),
+                index=self.name,
+            )
+        if table_high_water is not None and (
+            isinstance(table_high_water, bool)
+            or not isinstance(table_high_water, int)
+            or table_high_water < NO_LSN
+        ):
+            raise GrafxIndexError(
+                "An ordered replay completion needs a non-negative table high-water.",
+                field="table_high_water",
+                value=repr(table_high_water),
+                index=self.name,
+            )
+        certificate = self._read_certificate()
+        covered = certificate.selection.descriptor.applied_through_lsn
+        if certificate.selection.damaged_pages and (
+            table_high_water is None or covered < table_high_water
+        ):
+            self._stale_reason = (
+                f"Ordered index {self.name!r} survived recovery through {covered}, before "
+                f"its table high-water {table_high_water!r}; a root copy was damaged and "
+                "an explicit rebuild is required."
+            )
+            self._stale_device_seq = certificate.selection.descriptor.generation
+            self._carried_certificate = None
+            return
+        super().complete_built_through(lsn, table_high_water)
+
     def stage_reset(
         self,
         txn: StagingTransaction,
@@ -1325,6 +1370,11 @@ class OrderedIndex(IndexStore):
                 expected=page_index,
                 file=self.file,
             )
+        if page_index in (ORDERED_ROOT_PAGE_A, ORDERED_ROOT_PAGE_B):
+            self._pool.replace_clean_page_without_read(
+                self._file, page_index, image
+            )
+            return
         with self._pool.pinned(self._file, page_index) as resident:
             resident.replace_with(image)
 
