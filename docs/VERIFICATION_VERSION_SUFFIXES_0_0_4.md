@@ -106,3 +106,28 @@ No live consolidation, delivery replay, redrive, rebuild, graph reset or debt/DL
 cleanup was performed. The 21 pending specs remain reserved for future write
 benchmarks. This closes the quadratic verification subtask, not all write latency
 or the complete 0.0.4 performance plan.
+
+### Accumulated runtime deployment
+
+Grafx source commits `c0cc3e1` (unused optional endpoint vectors) and `0fee5b4`
+(history suffix verification) were loaded into Pulse 0.3.3 PID 36660 on the same
+default data home. PID 24152 closed both graphs with zero board failures and
+reached terminal exit before replacement; both listener ports were absent.
+Startup explicitly reported the Grafx source path and both new capabilities.
+This is source-runtime integration, not a globally installed wheel or PyPI release.
+
+The browser rendered 1000 / 2779 canonical nodes after one `Load more` action.
+Observed real UI graph responses: 500 nodes/703 edges in 28.756 s after restart,
+then 500 nodes/897 edges in 1.396 s, both HTTP 200, `edge_read_status=ok` and zero
+failed tables. These are two different pages and cold/warm conditions, **not**
+an A/B comparison. An authenticated stats GET returned HTTP 200 in 2.579 s,
+2779 nodes and 4424 edges across 69 relationship layouts with zero failures.
+The first-load latency remains open; no further load/restart was repeated to
+chase a marginal timing result. Initial browser observer setup needed a local
+compatibility correction; requests were not replayed because of that observer error.
+
+Visual evidence: local `.grafx-tmp/grafx-0fee5b4-runtime-1000-nodes-20260907.png`.
+The overlay was closed after the check. `/health` reports healthy 0.3.3, and the
+cognitive API confirms 21 pending, zero in progress, 19 consolidated, zero failed,
+40 total. The ledger SHA256 above is unchanged after restart and UI/API reads.
+No consolidation, redrive, rebuild, delivery replay or reset was initiated.

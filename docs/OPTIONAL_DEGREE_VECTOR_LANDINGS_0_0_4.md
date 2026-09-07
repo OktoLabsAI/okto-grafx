@@ -81,3 +81,10 @@ was performed. The 21-spec cognitive ledger remains byte-identical, SHA256
 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
 Cold UI load and full write latency remain open; this closes only the selected
 unused-vector work inside the existing optional degree query.
+
+Deployment follow-up: accumulated restart loaded this change and `0fee5b4` into
+Pulse 0.3.3 PID 36660. The previous participant terminated before replacement.
+UI pagination reached 1000 / 2779 nodes with zero failed edge tables, and the
+reserved cognitive ledger remained byte-identical. See the runtime evidence in
+`VERIFICATION_VERSION_SUFFIXES_0_0_4.md`; this smoke is not an isolated degree-query
+speedup measurement and does not close first-load latency.

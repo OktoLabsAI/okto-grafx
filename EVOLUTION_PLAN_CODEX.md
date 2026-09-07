@@ -4863,3 +4863,23 @@ data home isolado, incluindo certificação fria, cobertura, publicação e reab
 atualização do histórico por outro participante e verificação somente leitura no
 mesmo handle. Ruff/whitespace verdes. Pulse `/health` saudável 0.3.3 e ledger
 das 21 specs byte-idêntico; nenhum processamento de produção foi disparado.
+
+### Deploy acumulado e smoke UI/API — 2026-09-07
+
+`c0cc3e1` e `0fee5b4` carregados por fonte no Pulse 0.3.3, PID 36660,
+API 8100/MCP 8101 e data home padrão preservado. PID 24152 encerrou
+terminalmente antes da substituição, com grafos fechados sem falhas e portas
+livres. Startup confirmou as duas capacidades nativas; `/health` saudável.
+Não há instalação global de wheel ou publicação PyPI neste checkpoint.
+
+UI mostrou 1.000 / 2.779 nós canônicos após um clique em +500. As duas respostas
+do grafo tiveram HTTP 200 e zero tabelas de arestas com falha: 500/703 nós/arestas
+na primeira e 500/897 na seguinte. Tempos de requisição observados: 28,76 s na
+primeira carga pós-restart e 1,40 s na seguinte; condições/páginas diferentes,
+sem alegação de A/B. Stats autenticado: 2,58 s, 2.779 nós e 4.424 arestas,
+69 layouts sem falha. A latência da primeira abertura continua pendente.
+
+API cognitiva confirmou 21 pendentes, zero em progresso, 19 consolidados e zero
+falhos; ledger byte-idêntico após restart e leituras. Não foi disparado redrive,
+consolidação, rebuild, replay ou reset. Modal fechada após inspeção visual.
+Detalhes: `docs/VERIFICATION_VERSION_SUFFIXES_0_0_4.md`.
