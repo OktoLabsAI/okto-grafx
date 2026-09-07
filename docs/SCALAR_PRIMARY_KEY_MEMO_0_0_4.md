@@ -17,8 +17,12 @@ authority checks. This is **not CONCUR-2**, certificate caching across statement
 a new batch API, or removal of the layout query fan-out.
 
 No Community/Core code or public configuration changes are needed to consume it.
-Core remains backend-agnostic. The current Pulse process was not restarted for
-this change; source checkout changes do not hot-reload its already loaded engine.
+Core remains backend-agnostic. Source checkout changes do not hot-reload an
+already loaded engine. The subsequent controlled deployment on 2026-09-07 loaded
+this optimization into Pulse 0.3.3 (PID 18604), with the module path and scalar
+helper source SHA256 printed by the same server process at startup:
+`276ba5d4a745f22835acb96d664ceecad02cd069bed1076eebd9498dbd29110e`.
+This was a local source runtime, not a published 0.0.4 package.
 
 ## Equivalence and fallback
 

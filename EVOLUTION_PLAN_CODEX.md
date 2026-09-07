@@ -4312,3 +4312,21 @@ ocultar outro com vizinhos válidos. Core e protocolo nativo não foram alterado
 slice anterior de filtros/fachadas passaram (conjuntos com sobreposição).
 Documentação: Community `docs/GRAFX_RELATED_CONTEXT_FILTERS.md`. Nenhuma spec
 reservada consumida; correção versionada, ainda não carregada pelo Pulse ativo.
+
+### Checkpoint de runtime e censo da UI — 2026-09-07
+
+O restart controlado carregou o PK escalar `9420b49` e os filtros Community
+`440070b` no Pulse 0.3.3 (primeira validação PID 18604). API quente: 500 nós,
+703 relações, nenhuma tabela de relação com falha, 1,486 s. A UI avançou de 500
+para 1000 nós em 1,945 s e mostrou o total de 2779 nós canônicos. A primeira carga
+fria ainda levou 42,464 s; não foi declarada resolvida nem comparada diretamente
+com o resultado quente como ganho do patch.
+
+A observação no browser encontrou dois censos sobrepostos quando as permissões
+de Health eram carregadas. Community `5ee613d` separa o censo por board/camada,
+publica Health e histórico independentemente e elimina a corrida de onboarding
+enquanto o histórico está pendente. Refresh explícito continua atualizando tudo;
+respostas antigas são invalidadas. 26 testes focados passaram. Detalhes no
+Community `docs/KG_CENSUS_REQUEST_ISOLATION.md`. As 21 specs seguem reservadas,
+sem consolidação, rebuild ou redrive novos. Trabalho conduzido somente por Codex,
+conforme a indisponibilidade do Claude informada pelo usuário.

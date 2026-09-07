@@ -520,6 +520,15 @@ snapshot, OCC or consistency.
 
 ## Test cadence and acceptance
 
+Runtime follow-up (2026-09-07): scalar PK `9420b49` and Community filtered context
+`440070b` were loaded into Pulse 0.3.3. Real UI pagination reached 1000 nodes;
+warm graph REST returned 500 nodes/703 edges with no failed relationship tables.
+The cold 42.464 s request remains distinct from warm observations. Community
+`5ee613d` removes duplicate census requests caused by permission hydration and
+decouples historical completion from Health latency (26 focused UI tests).
+See Community `docs/KG_CENSUS_REQUEST_ISOLATION.md`. This is integration follow-up,
+not a new performance gate or closure of the remaining layout fan-out work.
+
 - Each item gets focused correctness, hostile-boundary and component A/B tests.
 - Several low-risk items are accumulated before the related regression slice.
 - Long crash, recovery, multi-process and full-suite runs occur at coherent wave checkpoints,
