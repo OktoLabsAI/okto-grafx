@@ -166,3 +166,46 @@ census certificates from 2960 to 92 with identical counts. Native warm sample
 1.462 -> 0.612–0.642 s; live cold graph/stats 19.352/20.855 s and warm stats
 2.336 s. The cold full-app residual remains, rather than being reclassified as
 complete. See `BATCHED_RELATIONSHIP_COUNT_0_0_4.md` for proofs and limitations.
+
+## Health query groups after the native COUNT improvement
+
+A 35-second stack-only profile of PID 18528 captured 1553 samples, zero errors:
+1079 Health, 101 census, 95 graph, 278 other stacks. Health still included 230
+JSON encoding leaves and 505 result-collection stacks. These classifications
+are not wall-time/CPU percentages. A UI Refresh completed graph/stats in 8.206 s;
+the source-history audit and other Health graph work remain material.
+
+Core commit `2a45364` groups the 11 existing relevance queries and 11 layer/maturity
+queries into two optional backend-neutral read batches. Query text, parameters,
+limits, arithmetic and degradation policy are preserved. Failed/incomplete
+batches contribute no prefix and retry the authorized scalar reads. The adapter
+owns the engine transaction; Core acquires no Grafx-specific configuration.
+
+Read-only routed scalar/batch/batch/scalar comparison: 22 calls become 2 groups;
+all answers identical (2960 nodes, 2555 default scores, mean 0.4939, 2779 canonical
+/ 181 working, zero failed node types). Cold scalar 5.532 s, batches 1.012/0.985 s,
+warm scalar 1.243 s: approximately 19–21% for these two warm families, not a
+fivefold UI improvement. Core's `docs/KG_HEALTH_QUERY_BATCHING.md` records digest,
+contract and fallback costs. Tests: 61 Core + 3 Community schema checks passed.
+No health probe/history check disabled, no spec consumed, no authority cache.
+
+### Live deployment of Health batching
+
+Pulse 0.3.3 PID 3944 (source runtime, not a rebuilt global wheel) loads Core
+`2a45364` plus whitespace-only `7396dbb` and Grafx's native COUNT improvement.
+The first Refresh ran before API startup completed and failed to fetch; it is
+excluded from timing comparisons. Retry subsequently loaded the graph, but did
+not issue a stats request, so a diagnostic waiting for both timed out. A normal
+Refresh then returned both HTTP 200: graph 3.981 s (500 nodes / 703 edges), stats
+21.527 s (2779 nodes / 4424 edges / 69 tables / zero failures). Stats phases:
+schema 90.8 ms, nodes 1007.1 ms, node counts 4281.5 ms, edge counts 16069.5 ms.
+This observation does not establish a global latency win; census under the live
+workload remains slow despite the isolated improvements.
+
+UI pagination added 500 unique node IDs and 897 edges in 2.673 s, zero failed
+edge tables; UI showed 1000 / total 2779. A subsequent read-only Health request
+returned HTTP 200 in 0.745 s, graph healthy and layer counts correct (2779/181,
+no failed types). This endpoint timing is not proof that all background Health
+work completed in 0.745 s. Board/global storage identity correctly reports Grafx.
+Pending ledger SHA256 remains
+`4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.

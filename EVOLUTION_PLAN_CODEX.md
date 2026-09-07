@@ -4501,3 +4501,26 @@ de runtime, não razão controlada de ganho global; a carga fria continua aberta
 Paginação: +500 IDs únicos/897 relações/zero falhas em 2,015 s, UI 1000/2779.
 As 21 specs e o hash do ledger continuam preservados. Evidências e limitações:
 `docs/BATCHED_RELATIONSHIP_COUNT_0_0_4.md`.
+
+### Health: agrupamento opcional de leituras sem acoplar o Core
+
+Core `2a45364`: métricas de relevância e censo de camada/maturidade passam de
+22 chamadas escalares para 2 grupos, usando a capacidade opcional já disponível
+nos adaptadores. Mantidos queries, parâmetros, limites, ordem e degradação por
+tipo; falha/prefixo incompleto descarta o lote e tenta as leituras escalares
+autorizadas. Nenhuma especificidade Grafx no Core ou verificação desabilitada.
+
+Comparativo routed read-only preservou todos os resultados: amostras aquecidas
+1,243 s escalar contra 0,985–1,012 s em lote (~19–21% nessas duas famílias,
+não na UI inteira). Passaram 61 testes Core e 3 de contrato Community.
+Histórico de fingerprints e demais probes continuam integrais; 21 specs
+reservadas para benchmark de escrita, sem novas consolidações. Detalhes em
+`docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md` e, no Core,
+`docs/KG_HEALTH_QUERY_BATCHING.md`. O custo residual da carga fria continua aberto.
+
+Validação no Pulse PID 3944: grafo HTTP 200 com 500 nós/703 relações em 3,981 s;
+censo 2779 nós/4424 relações/69 tabelas/zero falhas em 21,527 s. Este último
+resultado mantém aberta a lentidão residual, sem alegar ganho global. Paginação
++500 IDs únicos em 2,673 s, tela 1000/2779; Health healthy, camadas 2779/181 e
+backend Grafx corretos. Ledger das 21 specs inalterado. Detalhes e tentativas
+inválidas durante startup/Retry registrados no relatório de censo.
