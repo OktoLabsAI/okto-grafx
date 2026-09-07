@@ -4330,3 +4330,10 @@ respostas antigas são invalidadas. 26 testes focados passaram. Detalhes no
 Community `docs/KG_CENSUS_REQUEST_ISOLATION.md`. As 21 specs seguem reservadas,
 sem consolidação, rebuild ou redrive novos. Trabalho conduzido somente por Codex,
 conforme a indisponibilidade do Claude informada pelo usuário.
+
+Validação final do frontend carregado (Pulse PID 26560): uma única chamada de
+censo, UI com 1000 nós e total 2779, segunda página HTTP 200 com 500 IDs únicos,
+897 relações e zero falhas de tabelas em 2,292 s. A primeira página fria levou
+45,340 s e o censo 53,187 s: duplicação eliminada, custo frio **ainda não resolvido**,
+sem alegação de speedup causal. Build TypeScript/produção passou; 21 pendentes,
+0 em andamento e 19 consolidadas confirmados novamente. Não houve nova consolidação.
