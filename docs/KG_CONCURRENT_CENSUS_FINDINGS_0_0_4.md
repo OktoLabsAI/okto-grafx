@@ -69,6 +69,32 @@ No graph reset, recovery job, redrive or spec consolidation was initiated.
 Cognitive ledger hash remained
 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
 
+## Scoped metadata follow-up — 2026-09-07
+
+Community `9617912` adds schema current_version/validate to the existing scoped
+reader scheduler. Admission and all metadata reads remain charged until cleanup;
+legacy resolvers, writer bootstrap/migration and original validation semantics
+are preserved. The adapter does not claim a new atomic metadata snapshot.
+96 focused/surrounding tests passed in 9.04 s, including failure cleanup and
+composition wiring. The patch awaits accumulated source deployment, not loaded
+in the observed PID 9544.
+
+A 25-second aligned 30-Hz idle-inclusive profile on that PID captured 17469
+samples without errors: 132 graph, 174 stats, 783 Health, 16341 other, 39 empty.
+Graph/stats returned HTTP 200 in 4.224/5.796 s, with 500 nodes / 703 edges and
+zero failed edge tables. Of the graph stacks, 27 entered participant sections
+and 15 ended in coordination sleep; for stats those counts were 9 and 4.
+These are inclusive sampled stacks, not additive seconds or CPU percentages.
+Two earlier short captures missed the actual Refresh and are not attribution
+evidence. Private artifact: `.grafx-tmp/pulse9544-refresh-aligned-20260907.json`.
+
+The settings API confirmed generation descriptor revalidation, 8192-byte pages,
+64 MiB per handle, no advanced overrides and no pending configuration restart.
+The cold/warm gap therefore is not explained by a demonstrated strict-versus-
+generation configuration mismatch. No configuration changed and no spec was
+consumed. This warm observation neither explains the 59-second cold load nor
+proves an end-to-end benefit from the not-yet-deployed metadata patch.
+
 ## Operation-local layout mapping
 
 The subsequent 30-second profile of PID 3944 captured 1306 samples, zero errors:

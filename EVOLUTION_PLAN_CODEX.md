@@ -4645,3 +4645,28 @@ performance fria: essa lentidão continua explicitamente pendente.
 Pela UI, +500 retornou em 861 ms com 500 IDs únicos, 897 relações, zero tabelas
 com falha; tela 1000/2779. O ledger das 21 specs segue byte-idêntico ao hash
 registrado acima. Sem novo benchmark de escrita real ou consumo dessas specs.
+
+### Leituras de schema incluídas no escalonamento — 2026-09-07
+
+Community `9617912`: `current_version` e `validate` do adaptador de schema passam
+a reservar o mesmo escalonador de leitores até concluir admissão e leitura de
+metadados. Antes eram chamadas sem contabilização de ocupação, inclusive pelo
+Health. Mantidos resolver legado, verificações de geometria/rota e semântica de
+validação; bootstrap/migração continuam no writer. Não há cache de metadados,
+novo snapshot ou alteração nativa. Falhas de open/admissão/leitura/validação/
+cleanup e KeyboardInterrupt liberam a reserva sem liberar o leitor concorrente.
+96 testes passaram em 9,04 s e Ruff passou. Mudança enfileirada para deploy
+acumulado: ainda não carregada no Pulse PID 9544.
+
+Controle aquecido anterior ao novo patch: Refresh HTTP 200 em 4,224 s (grafo,
+500 nós/703 relações/zero tabelas com falha) e 5,796 s (censo). Perfil alinhado de
+25 s, 30 Hz, incluindo stacks ociosas: 17469 amostras/zero erros, sendo 132 grafo,
+174 censo, 783 Health, 16341 outras e 39 vazias. Esses números não são percentuais
+de CPU nem tempos aditivos. Capturas precedentes sem sobreposição ao clique
+foram descartadas como evidência de atribuição. Configuração efetiva via API:
+descriptor_revalidation=generation, página=8192, pool=64 MiB/handle, sem overrides
+avançados ou restart pendente; nenhuma configuração foi alterada.
+
+A lacuna de ocupação está corrigida, mas não há prova de ganho global desse
+patch nem resolução da lentidão fria. As 21 specs permanecem preservadas,
+ledger byte-idêntico. Detalhes: Community `docs/GRAFX_READ_LANE_SCHEDULING.md`.
