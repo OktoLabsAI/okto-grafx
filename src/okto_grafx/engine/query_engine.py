@@ -5976,6 +5976,49 @@ def _closed_vector_free_landings(root: PlanNode) -> frozenset[int]:
         elif kind is not DistinctRows:
             break
         planned = planned.child
+    if type(planned) is RelationshipScan:
+        # Edge-first scans resolve BOTH endpoints. Decline the whole optimization
+        # if either can expose a vector, or if bindings could come from another
+        # source. This changes decoding only, never edge/endpoint visibility.
+        if (
+            type(planned.child) is not SingleRow
+            or planned.from_variable == planned.to_variable
+            or planned.relationship in (planned.from_variable, planned.to_variable)
+        ):
+            return frozenset()
+        vectors_by_variable = {
+            variable: {column.name for column in table.columns
+                       if column.type in VECTOR_VALUE_TYPES}
+            for variable, table in (
+                (planned.from_variable, planned.from_table),
+                (planned.to_variable, planned.to_table),
+            )
+        }
+        if not any(vectors_by_variable.values()):
+            return frozenset()
+        if planned.predicate is not None:
+            expressions.append(planned.predicate)
+        pending = list(expressions)
+        while pending:
+            expression = pending.pop()
+            if (
+                type(expression) is FunctionCall
+                and expression.name.upper() == LABEL_FUNCTION
+                and len(expression.arguments) == 1
+                and type(expression.arguments[0]) is Variable
+                and expression.arguments[0].name in vectors_by_variable
+                and not expression.named_arguments
+                and not expression.distinct and not expression.star
+            ):
+                continue
+            if type(expression) is Property and type(expression.subject) is Variable:
+                if expression.key in vectors_by_variable.get(expression.subject.name, ()):
+                    return frozenset()
+                continue
+            if type(expression) is Variable and expression.name in vectors_by_variable:
+                return frozenset()
+            pending.extend(expression.children())
+        return frozenset((id(planned),))
     if type(planned) is not TraverseRelationship:
         return frozenset()
     hop = planned
@@ -6706,6 +6749,14 @@ def _relationship_scan(
         changed, pending = _owner_edges(context, relationship)
     ended = _ended_by_this_transaction(context)
     landing_views: dict[int, _OwnerLandingView] = {}
+    vector_free = (
+        id(node) in context.vector_free_landings
+        and type(engine.heap) is HeapStore
+        and type(engine._indexes) is IndexManager
+        and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
+        and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
+        and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
+    )
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
         """Resolve one endpoint against the transaction-private landing view."""
@@ -6713,7 +6764,10 @@ def _relationship_scan(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity, context)
+        return (
+            view.get(identity, context, materialize_vectors=False)
+            if vector_free else view.get(identity, context)
+        )
 
     def judged(version: HeapVersion, ref: object) -> RowBinding | None:
         """Return the edge binding when the predicate keeps this edge, refusing non-booleans."""

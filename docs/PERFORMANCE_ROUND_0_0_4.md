@@ -598,3 +598,14 @@ for measurements, limitations and the 51-test focused checkpoint.
 No native protocol change, further consolidation or new performance gate was
 introduced. Preserve the 21 pending specs for write benchmarks. Continue the
 existing cold admission/census investigation without expanding acceptance scope.
+
+The census investigation then identified the native RelationshipScan gap in the
+existing scalar vector-free landing proof. Its extension validates both endpoints
+without retaining vector components, keeping the full path for any vector/entity
+consumer and specialized hooks. The final 64-test slice passed, with a separate
+48-test initial slice (overlap). Real routed count batches preserved all 70 table
+answers; the short median change was only 2.837 → 2.698 s, not a new timing gate.
+The native change was loaded in Pulse PID 15796 and pagination reached 1500 nodes
+with zero failed edge tables; total cold UI latency remains unresolved.
+See `docs/RELATIONSHIP_SCAN_VECTOR_FREE_0_0_4.md` for safety, limitations and live
+evidence. No spec was consolidated and no authority-cache initiative was added.

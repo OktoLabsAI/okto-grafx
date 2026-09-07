@@ -34,6 +34,7 @@ def graph(tmp_path):
 
 
 PREFIX = "MATCH (a:A)-[r:E]->(b:B) WHERE a.id='a' "
+SCAN_PREFIX = "MATCH (a:A)-[r:E]->(b:B) "
 
 
 @pytest.mark.parametrize("suffix,enabled", [
@@ -46,7 +47,8 @@ PREFIX = "MATCH (a:A)-[r:E]->(b:B) WHERE a.id='a' "
     ("WITH b RETURN b.id", False),
     ("RETURN b.id ORDER BY b.v IS NULL", False),
 ])
-def test_native_results_equal_full_decode_and_proof_is_exact(graph, monkeypatch, suffix, enabled):
+@pytest.mark.parametrize("prefix", [PREFIX, SCAN_PREFIX])
+def test_native_results_equal_full_decode_and_proof_is_exact(graph, monkeypatch, suffix, enabled, prefix):
     counts = Counter()
     original = HeapStore.read_landing
 
@@ -55,7 +57,7 @@ def test_native_results_equal_full_decode_and_proof_is_exact(graph, monkeypatch,
         return original(heap, ref)
 
     monkeypatch.setattr(HeapStore, "read_landing", counted)
-    query = PREFIX + suffix
+    query = prefix + suffix
     candidate = graph.execute(query)
     assert bool(counts["landing"]) is enabled
     monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
@@ -64,16 +66,17 @@ def test_native_results_equal_full_decode_and_proof_is_exact(graph, monkeypatch,
     assert candidate.columns == oracle.columns
 
 
-def test_partial_then_full_then_owner_update_cannot_reuse_partial_values(graph):
+@pytest.mark.parametrize("prefix", [PREFIX, SCAN_PREFIX])
+def test_partial_then_full_then_owner_update_cannot_reuse_partial_values(graph, prefix):
     with graph.begin("write") as tx:
-        assert len(tx.execute(PREFIX + "RETURN b.id").rows) == 6
-        full = tx.execute(PREFIX + "RETURN b.id,b.v").rows
+        assert len(tx.execute(prefix + "RETURN b.id").rows) == 6
+        full = tx.execute(prefix + "RETURN b.id,b.v").rows
         assert all(len(row[1].values) == 384 for row in full)
         tx.execute("MATCH (b:B {id:'b1'}) SET b.title='changed', b.v=$v",
                    {"v": okto_grafx.VectorValue((9.0,) * 384, 1, "float32")})
-        rows = tx.execute(PREFIX + "RETURN b.id,b.title").rows
+        rows = tx.execute(prefix + "RETURN b.id,b.title").rows
         assert [row[1] for row in rows if row[0] == "b1"] == ["changed", "changed"]
-        full = tx.execute(PREFIX + "RETURN b.id,b.v").rows
+        full = tx.execute(prefix + "RETURN b.id,b.v").rows
         assert all(row[1].values == (9.0,) * 384 for row in full if row[0] == "b1")
     budget = graph._queries._owner_budget
     assert budget._used_bytes == budget._used_entries == 0
@@ -91,15 +94,17 @@ def test_pending_vector_parameter_tuple_is_not_a_quota_attribute_error(graph, mo
     assert rows[0][0].values == (2.0,) * 384
 
 
-def test_capability_absence_keeps_full_validation_and_same_rows(graph, monkeypatch):
-    expected = graph.execute(PREFIX + "RETURN b.id,b.title").rows
+@pytest.mark.parametrize("prefix", [PREFIX, SCAN_PREFIX])
+def test_capability_absence_keeps_full_validation_and_same_rows(graph, monkeypatch, prefix):
+    expected = graph.execute(prefix + "RETURN b.id,b.title").rows
     monkeypatch.delattr(IndexManager, "validated_identity_landings")
-    assert graph.execute(PREFIX + "RETURN b.id,b.title").rows == expected
+    assert graph.execute(prefix + "RETURN b.id,b.title").rows == expected
 
 
 @pytest.mark.parametrize("owner,method", [(HeapStore, "read"), (HeapStore, "_decode_version"),
                                          (IndexManager, "validated_versions")])
-def test_specialized_full_read_hook_is_not_bypassed(graph, monkeypatch, owner, method):
+@pytest.mark.parametrize("prefix", [PREFIX, SCAN_PREFIX])
+def test_specialized_full_read_hook_is_not_bypassed(graph, monkeypatch, owner, method, prefix):
     original = getattr(owner, method)
     calls = []
 
@@ -112,7 +117,7 @@ def test_specialized_full_read_hook_is_not_bypassed(graph, monkeypatch, owner, m
 
     monkeypatch.setattr(owner, method, observed)
     monkeypatch.setattr(HeapStore, "read_landing", forbidden)
-    assert len(graph.execute(PREFIX + "RETURN b.id").rows) == 6
+    assert len(graph.execute(prefix + "RETURN b.id").rows) == 6
     assert calls
 
 
@@ -125,16 +130,17 @@ def test_wrong_projection_proof_refuses_instead_of_exposing_a_marker(graph, monk
     assert caught.value.details["field"] == "projection"
 
 
-def test_independent_writer_does_not_change_reader_snapshot_or_leak_partial_cache(graph):
+@pytest.mark.parametrize("prefix", [PREFIX, SCAN_PREFIX])
+def test_independent_writer_does_not_change_reader_snapshot_or_leak_partial_cache(graph, prefix):
     with okto_grafx.connect(graph.path, page_size=8192) as writer:
         with graph.begin("read") as reader:
-            before = reader.execute(PREFIX + "RETURN b.id,b.title").rows
+            before = reader.execute(prefix + "RETURN b.id,b.title").rows
             with writer.begin("write") as tx:
                 tx.execute("MATCH (b:B {id:'b1'}) SET b.title='new generation'")
-            assert reader.execute(PREFIX + "RETURN b.id,b.title").rows == before
-            vectors = reader.execute(PREFIX + "RETURN b.id,b.v").rows
+            assert reader.execute(prefix + "RETURN b.id,b.title").rows == before
+            vectors = reader.execute(prefix + "RETURN b.id,b.v").rows
             assert all(len(row[1].values) == 384 for row in vectors)
-        assert [row for row in graph.execute(PREFIX + "RETURN b.id,b.title").rows
+        assert [row for row in graph.execute(prefix + "RETURN b.id,b.title").rows
                 if row[0] == "b1"] == [("b1", "new generation")] * 2
 
 
@@ -146,7 +152,8 @@ def test_cursor_keeps_scalar_projection_and_releases_its_reader(graph):
     assert graph._queries._owner_budget._used_bytes == 0
 
 
-def test_omitted_vector_corruption_still_refuses_with_oracle_error(graph, monkeypatch):
+@pytest.mark.parametrize("prefix", [PREFIX, SCAN_PREFIX])
+def test_omitted_vector_corruption_still_refuses_with_oracle_error(graph, monkeypatch, prefix):
     original = HeapStore._read_slot
     table_id = graph._queries.catalog.catalog.table("B").table_id
 
@@ -161,8 +168,54 @@ def test_omitted_vector_corruption_still_refuses_with_oracle_error(graph, monkey
 
     monkeypatch.setattr(HeapStore, "_read_slot", corrupt)
     with pytest.raises(GrafxCorruptionDetected) as candidate:
-        graph.execute(PREFIX + "RETURN b.id")
+        graph.execute(prefix + "RETURN b.id")
     monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
     with pytest.raises(GrafxCorruptionDetected) as oracle:
-        graph.execute(PREFIX + "RETURN b.id")
+        graph.execute(prefix + "RETURN b.id")
     assert candidate.value.to_dict() == oracle.value.to_dict()
+
+
+@pytest.mark.parametrize("suffix,enabled", [
+    ("RETURN count(r)", True),
+    ("RETURN a.id,b.id,label(a),label(b)", True),
+    ("WHERE r IS NOT NULL RETURN count(r)", True),
+    ("RETURN a.v,b.id", False),
+    ("RETURN a.id,b.v", False),
+    ("RETURN a,b.id", False),
+    ("RETURN count(r), a.v IS NOT NULL", False),
+])
+def test_relationship_scan_proves_both_vector_endpoints(graph, monkeypatch, suffix, enabled):
+    with graph.begin("write") as tx:
+        tx.execute("CREATE REL TABLE BB(FROM B TO B)")
+        tx.execute("MATCH (a:B {id:'b0'}),(b:B {id:'b1'}) CREATE (a)-[:BB]->(b)")
+    calls = []
+    original = HeapStore.read_landing
+
+    def counted(heap, ref):
+        found = original(heap, ref)
+        calls.append(found.record_id)
+        return found
+
+    monkeypatch.setattr(HeapStore, "read_landing", counted)
+    query = "MATCH (a:B)-[r:BB]->(b:B) " + suffix
+    assert any(type(node) is qe.RelationshipScan for node in graph.explain(query).walk())
+    candidate = graph.execute(query)
+    assert len(set(calls)) == (2 if enabled else 0)
+    monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
+    assert candidate.rows == graph.execute(query).rows
+    assert graph._queries._owner_budget._used_bytes == 0
+
+
+def test_relationship_count_retains_less_without_changing_budget_or_answer(graph, monkeypatch):
+    query = SCAN_PREFIX + "RETURN count(r)"
+    with graph.begin("read") as reader:
+        candidate = reader.execute(query).rows
+        candidate_bytes = graph._queries._owner_budget._used_bytes
+        assert candidate_bytes > 0
+    assert graph._queries._owner_budget._used_bytes == 0
+    monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
+    with graph.begin("read") as reader:
+        assert reader.execute(query).rows == candidate
+        canonical_bytes = graph._queries._owner_budget._used_bytes
+    assert 0 < candidate_bytes < canonical_bytes
+    assert graph._queries._owner_budget._used_bytes == 0

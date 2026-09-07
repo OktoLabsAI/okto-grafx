@@ -4356,3 +4356,24 @@ Não se aprovou cache de autoridade, enfraquecimento de validações nem mudanç
 de isolamento. O próximo alvo permanece o custo de admissão/censo sob o workload
 real, sem novos gates de performance. Nenhuma spec reservada foi consumida;
 hash do ledger cognitivo inalterado. Codex segue sozinho, sem Claude/Nexus.
+
+### Censo de relações — endpoints sem materialização vetorial
+
+Implementada no Grafx a extensão da prova de projeção escalar para
+`RelationshipScan`, antes restrita a travessias. O censo do Pulse já agrupava 70
+consultas num snapshot, mas cada scan ainda decodificava vetores completos dos
+endpoints. Agora ambos os endpoints usam a validação vetorial sem materialização
+quando nenhuma expressão pode ler esses vetores; queries de vetor/entidade e
+hooks especializados mantêm o caminho completo. Visibilidade, ordem, limites,
+orçamento, corrupção, OCC e WAL não foram relaxados. Core Pulse sem alterações.
+
+64 testes finais passaram (53,60 s), além do slice inicial de 48 com sobreposição.
+Pares curtos pelo adapter real mantiveram as contagens idênticas em 70 tabelas;
+medianas 2,837/2,698 s, ganho pequeno, sem criar gate adicional. A redução de
+memória retida foi comprovada em teste com o mesmo orçamento.
+Documento: `docs/RELATIONSHIP_SCAN_VECTOR_FREE_0_0_4.md`.
+
+Carregado no Pulse PID 15796 e testado via browser: 500 → 1000 → 1500 nós,
+total 2779; terceira página com 500 IDs únicos, 753 relações, zero falhas, 1,591 s.
+Carga fria 30,930 s e censo 43,558 s: continuam pendentes, sem alegação de ganho
+global. 21 specs reservadas, nenhuma em andamento e ledger inalterado.
