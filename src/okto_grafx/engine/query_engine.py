@@ -6006,13 +6006,17 @@ def _scalar_primary_key_group(
 
 
 def _closed_vector_free_landings(root: PlanNode) -> frozenset[int]:
-    """Prove one typed, single-hop read cannot inspect any landing vector.
+    """Prove a closed read cannot inspect the selected landing vectors.
 
     Keep the same traversal, row order, frontier, physical checks and admission.
-    Only scalar projections/filters/aggregates over a single node source qualify.
-    WITH, UNION, optional/range/path traversal, writes and unknown operators keep
-    full rows. A bare target or a target vector anywhere in the pipeline declines.
+    Typed single hops qualify for scalar projections/filters/aggregates. Optional
+    hops with unconsumed targets also qualify across a closed WITH pipeline.
+    UNION, range/path traversal, writes and unknown operators keep full rows.
+    A bare target or a target vector anywhere in the pipeline declines.
     """
+    unused = _unused_optional_landings(root)
+    if unused:
+        return unused
     expressions: list[Expression] = []
     planned = root
     while True:
@@ -6124,6 +6128,62 @@ def _closed_vector_free_landings(root: PlanNode) -> frozenset[int]:
             return frozenset()
         pending.extend(expression.children())
     return frozenset((id(hop),))
+
+
+def _unused_optional_landings(root: PlanNode) -> frozenset[int]:
+    """Prove optional degree pipelines never consume their landing bindings.
+
+    Only the anchor survives grouping/WITH. No landing is projected, renamed,
+    tested or used as another hop's source. Full anchor/edge values and every
+    landing's validation remain; only unused vector components may be omitted.
+    Unknown operators and binding aliases decline the entire proof.
+    """
+    expressions: list[Expression] = []
+    aliases: set[str] = set()
+    hops: list[TraverseAnyRelationship] = []
+    planned = root
+    while True:
+        kind = type(planned)
+        if kind in (ProjectRows, WithRows):
+            expressions.extend(item.expression for item in planned.items)
+            aliases.update(item.alias for item in planned.items if item.alias is not None)
+        elif kind is AggregateRows:
+            expressions.extend(item.expression for item in planned.grouping)
+            expressions.extend(item.call for item in planned.aggregations)
+        elif kind is FilterRows:
+            expressions.append(planned.predicate)
+        elif kind in (LimitRows, SkipRows):
+            expressions.append(planned.count)
+        elif kind is TraverseAnyRelationship:
+            if not planned.optional:
+                return frozenset()
+            hops.append(planned)
+            if planned.predicate is not None:
+                expressions.append(planned.predicate)
+        elif kind is not DistinctRows:
+            break
+        planned = planned.child
+    if (
+        not hops or type(planned) not in (NodeScan, IndexSeek)
+        or type(planned.child) is not SingleRow
+        or any(hop.source != planned.variable for hop in hops)
+    ):
+        return frozenset()
+    targets = {hop.target for hop in hops}
+    if (
+        len(targets) != len(hops) or planned.variable in targets
+        or aliases & targets or any(hop.relationship in targets for hop in hops)
+    ):
+        return frozenset()
+    if type(planned) is IndexSeek:
+        expressions.extend(planned.key_values)
+    pending = list(expressions)
+    while pending:
+        expression = pending.pop()
+        if type(expression) is Variable and expression.name in targets:
+            return frozenset()
+        pending.extend(expression.children())
+    return frozenset(id(hop) for hop in hops)
 
 
 def _closed_node_scan_projections(
@@ -6706,8 +6766,19 @@ def _traverse_any(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity, context)
+        return (
+            view.get(identity, context, materialize_vectors=False)
+            if vector_free else view.get(identity, context)
+        )
 
+    vector_free = (
+        id(node) in context.vector_free_landings
+        and type(engine.heap) is HeapStore
+        and type(engine._indexes) is IndexManager
+        and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
+        and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
+        and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
+    )
     walkers = []
     for table in node.tables:
         changes: Mapping[object, tuple[Value, ...] | None] = {}

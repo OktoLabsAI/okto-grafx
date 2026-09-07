@@ -1,5 +1,15 @@
 # Performance round 0.0.4 — finite execution plan
 
+Latest native read-path follow-up (2026-09-07): the existing unused-vector
+opportunity now covers the orphan audit's OPTIONAL degree pipeline when no
+expression consumes its target bindings. Full validation/certificates remain.
+The isolated 953-row query preserved its ordered digest; samples were
+2.40–2.54 s full versus 2.22–2.30 s candidate, not a whole-UI speedup claim.
+Affected/adjacent slices passed 107 and 87 tests; the final overlapping 14-test
+slice also proves lower metered retention. Details and deployment boundary:
+`docs/OPTIONAL_DEGREE_VECTOR_LANDINGS_0_0_4.md`. This does not reopen the rejected
+aggregate node projection, remove Health checks or add an authority cache.
+
 This document is the execution authority for the Grafx 0.0.4 performance round. It consolidates
 Claude's measured surveys, Codex's adversarial review, and direct measurements of the current
 Okto Pulse workload. It is deliberately finite: later profiling may reorder or reject an item,

@@ -4810,3 +4810,26 @@ Nenhum botão de processamento foi acionado; modais fechadas sem salvar. Isso n�
 declara vazias as outras DLQs nem as pendências cognitivas. Ledger byte-idêntico
 após o smoke. O restart também carregou a validação estrita de Settings e os
 contratos públicos registrados no checkpoint anterior.
+
+### Vetores não consumidos na consulta OPTIONAL de graus — 2026-09-07
+
+O perfil curto do Pulse atual localizou trabalho relevante do Health na auditoria
+de órfãos (`_connected_node_ids`). O Grafx agora prova um pipeline fechado em que
+os targets opcionais não aparecem em expressões, aliases ou próximos saltos e
+reutiliza a leitura de landing existente sem reter seus componentes vetoriais.
+As verificações completas, certificados, snapshot, overlay do escritor, budgets,
+ordem/multiplicidade e null extension permanecem; consumidores do target e hooks
+especializados mantêm o caminho integral. Nenhuma especificidade entrou no Core.
+
+Cópia isolada: 953 linhas e digest ordenado idênticos em quatro execuções;
+2,40–2,54 s no caminho integral e 2,22–2,30 s no candidato. Ganho moderado neste
+componente, não alegação de viabilidade ou ganho global da UI. Foram 107 testes
+afetados em 57,16 s e 87 adjacentes em 11,10 s; os 14 focais finais em 7,29 s
+se sobrepõem ao primeiro conjunto. Provadas menor retenção contabilizada, liberação
+das quotas, corrupção de vetor omitido, recusas tipadas e leitor independente sob
+escrita. Ruff/whitespace verdes. Sem gate temporal prolongado.
+
+Fonte nativa pronta para deploy acumulado; PID 24152 ainda não carrega esta
+alteração. Sem wheel, consolidação, redrive, rebuild ou reset. Ledger das 21 specs
+permanece byte-idêntico. Detalhes, limites e evidência do perfil:
+`docs/OPTIONAL_DEGREE_VECTOR_LANDINGS_0_0_4.md`.
