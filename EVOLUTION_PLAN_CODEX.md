@@ -4583,3 +4583,25 @@ Paginação +500 IDs únicos/897 relações em 1,258 s, UI 1000/2779. Não é ra
 A/B controlada frente ao run anterior; abertura fria continua pendente.
 Integração está no worktree/runtime de fonte, não em novo wheel global ou release;
 consolidar dependências pré-existentes de leitores antes de publicar o milestone.
+
+### Fechamento do milestone de leitores Community — 2026-09-07
+
+Community `f582b1d`, branch `fix/v0.3.3-grafx-transparent-recovery`: consolidado
+o conjunto de dependências dos leitores independentes, seleção por ocupação,
+budget por handle e integração com lifecycle/recovery. Mantidos os protocolos
+nativos de admissão, snapshots, WAL e OCC; Core sem especificidades Grafx.
+O commit não inclui UI/settings persistidos, reparo determinístico ou otimizações
+de escrita/indexação Global ainda presentes no worktree.
+
+A cópia isolada do candidato exato do index Git passou 294 testes em 51,26 s,
+sem depender dessas alterações não incluídas. Após retirar mensagens brutas de
+exceção do log de recusa de checkpoint e delimitar os campos diagnósticos,
+27 testes de provedores operacionais passaram em 7,82 s (sobrepostos à regressão).
+Ruff de todos os arquivos Python do lote e whitespace passaram.
+
+Pulse PID 35808 segue ativo com leitores/escalonamento já validados; o ajuste
+final apenas de log ainda não foi carregado nesse processo. Nenhum novo wheel,
+merge na main ou publicação PyPI. O ledger das 21 specs reservadas permanece com
+SHA256 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
+A abertura fria e o custo de escrita continuam pendentes: este fechamento não
+declara a performance global resolvida nem consome novas specs de benchmark.
