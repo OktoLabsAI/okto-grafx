@@ -4092,3 +4092,25 @@ ternária demonstra que propriedades ausentes tornam o WHERE completo não verda
 que ainda possa admitir a tabela mantém todo o pipeline canônico. Assim o caminho ordenado pode
 atender o Pulse sem especializar o Core e sem aceitar capability parcial para tabelas capazes de
 retornar linhas.
+
+### Retomada de performance após a auditoria dos 14 cards (2026-09-07)
+
+O checkpoint acumulado de índice/ordenação, crash e multiprocessos passou 96 testes. No mesmo
+snapshot do board real, as duas páginas de 500 produziram linhas e digests idênticos ao scan
+canônico, examinando 657 e 512 candidatos em vez de 2.411 por página. A redução de trabalho é
+72,7%/78,8%; os tempos de um par não são apresentados como benchmark controlado nem gate.
+
+Community recebeu `KG_GRAFX_BUFFER_POOL_MB`, com padrão de 64 MiB inalterado e orçamento por
+handle documentado em `docs/GRAFX_BUFFER_POOL_BUDGET.md` do Pulse. Passaram 129 casos distintos
+de settings, pools e composição, incluindo abertura nativa em 64/128/256 MiB e compartilhamento
+Board/Global. O teste não demonstrou vantagem que justifique impor 256 MiB; nenhum orçamento da
+instância ativa foi elevado. O Core continua agnóstico ao backend.
+
+A reconciliação dos itens 9–11, com o two-hop ainda pendente e sem repetir trabalho já entregue
+no sink/IN/vetores, está no plano finito. O handoff `hof_4bb4dae3f00d45c792b6ab8fe807bd17` trata
+somente três observações anteriores do índice ordenado: custo marginal de publicação, páginas
+COW órfãs pós-crash e atualização da visão capturada do registry. A primeira proposta para
+órfãs (`c20fa85`) foi rejeitada antes da integração: o teste com cache quente mostrou que a
+isenção por layout poderia ocultar uma página alcançável zerada em `verify("pages")` e
+`verify("all")`. A correção precisa provar inalcançabilidade por leitura física fresca e
+completa; falha ou prova parcial mantém a recusa original. Não se reabrem otimizações NO-GO.

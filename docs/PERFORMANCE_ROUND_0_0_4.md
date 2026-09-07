@@ -176,10 +176,33 @@ Storage/identity lane:
 
 Pulse Community lane, maintained in the Pulse repository rather than Grafx:
 
-9. set the Grafx handle/pool budget to 256 MiB for the Pulse schema after measuring 128/256 MiB;
-10. deliver vector components through the Community sink so Grafx remains the validator;
+9. make the Grafx handle/pool budget configurable after measuring 128/256 MiB. **Decision
+   revised by the real-board checkpoint on 2026-09-07:** retain 64 MiB by default. All three
+   budgets produced identical ordered/canonical digests for two 500-row pages. Single-pair
+   observations at 128 MiB were 0.261/0.255 s and at 256 MiB 0.315/0.283 s; these noisy samples
+   establish no benefit from automatically allocating 256 MiB. Community configuration is
+   implemented as `KG_GRAFX_BUFFER_POOL_MB` / `kg_grafx_buffer_pool_mb` (Community only), with
+   exact positive-integer validation and rejection of mismatched shared pools. The accumulated
+   settings/pool/composition checkpoints passed 129 distinct tests, including effective native budgets
+   and durable reads at 64/128/256 MiB. The option is startup-only, documented in Community
+   `docs/GRAFX_BUFFER_POOL_BUDGET.md`; no live budget was raised. Remember that one writer plus
+   two reader lanes multiplies the
+   nominal buffer envelope by three (192/384/768 MiB per fully opened board, excluding other
+   engine/process memory). This does not change the native default;
+10. deliver vector components through the Community sink so Grafx remains the validator.
+    **Already implemented:** `grafx_logical_sink.py` delivers `LogicalVector.components`,
+    `space_id` and `dtype` directly to native `VectorValue`, without a second normalization;
 11. batch safe `IN` lookups, reduce sink commits only across explicitly recoverable units, and
     collapse the Grafx-specific two-hop fan-out without changing Core abstractions.
+    **Partially implemented:** endpoint projection groups typed `IN` lists and executes the
+    validated read batch under one snapshot (`kg_routes.py`, `grafx_cypher_executor.py`). The
+    logical sink commits one recoverable batch (default maximum 500), checkpoints the exclusively
+    owned unbound candidate at completion and cold-verifies its fingerprint before publication.
+    **Remaining:** `find_by_artifact` memoizes adjacency per node, but still queries each incident
+    layout/direction. Eager cross-node batching is not accepted yet: it can visit a center that
+    the existing `max_rows` frontier never reaches, changing error/admission behavior. Keep the
+    current exact result order, parallel-edge multiplicity, visibility filters and null hop2
+    extension as the oracle for this already selected residual, not as a new feature target.
 
 ### Wave 2 — medium changes after Wave 1 re-profile
 
@@ -414,7 +437,7 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    serializada do pool sem ler o alvo, e não promove uma raiz sobrevivente danificada além do
    high-water da tabela quando o WAL correspondente já não permite reconstrução. Todos os 25
    casos passam sem xfail; dois writers e readers pinados preservam as garantias originais.
-15. **OIX-3 implementado; checkpoint acumulado pendente:** o novo `OrderedNodeMerge` reconhece
+15. **OIX-3 implementado; checkpoint acumulado executado em 2026-09-07:** o novo `OrderedNodeMerge` reconhece
    somente a página polimórfica fechada `ORDER BY TIMESTAMP DESC, primary-key STRING DESC LIMIT K`.
    Ele empurra o cursor estrito `(timestamp,id)` ao índice, mantém uma cabeça certificada por
    tabela e faz merge `O((K+S) log T)` com memória `O(T)`, revalidando candidatos no heap. O
@@ -432,6 +455,19 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    Pulse sem modificar o Core nem relaxar a exigência de índice em qualquer tabela que possa
    produzir uma linha. Conjunções admitem a prova por um ramo; `OR` exige prova nos dois ramos.
    Dois casos focados cobrem a poda válida e o `OR` inseguro que conserva o scan canônico.
+17. **Retomada pós-Discovery (2026-09-07):** os 14 cards do Pulse foram validados via API e UI
+   após a implementação nativa do OPTIONAL correlacionado (`6b0b66e`), sem mascarar warnings.
+   O checkpoint OIX acumulado passou 96 casos de chaves/árvore/store/manager/formato, crash,
+   multiprocesso, ordered merge e optional. Uma comparação read-only no mesmo snapshot do board
+   real, com as consultas Core atuais e `SKIP 0` como oráculo canônico, obteve linhas/digests
+   idênticos nas duas páginas de 500: 657/512 candidatos examinados pelo merge contra 2.411/2.411
+   linhas no scan (redução estrutural de 72,7%/78,8%). Tempos observados no par único foram
+   0,376/0,338 s contra 0,729/0,515 s; sem alegação de benchmark controlado nem gate temporal.
+   A integração idempotente OIX-4 está em Community `40ed1a3` e passou 62 testes no checkpoint
+   anterior; o Core continua independente da tecnologia. Claude recebeu o handoff delimitado
+   `hof_4bb4dae3f00d45c792b6ab8fe807bd17` para reconciliar exclusivamente O1–O3 da sua revisão
+   anterior e corrigir bloqueios concretos, se ainda existirem. Custos marginais não reabrem a
+   rodada. Nenhuma nova lista exploratória foi acrescentada.
 
 ## Explicit decision queue
 

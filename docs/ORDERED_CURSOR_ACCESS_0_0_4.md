@@ -232,7 +232,7 @@ prefix.
    and pinned a damaged-newest-root defect: replacement now installs a complete non-header root
    without first decoding the disposable target, while recovery refuses to advance a surviving
    damaged root past its table high-water after the corresponding WAL has been recycled.
-5. **OIX-3 — query path (implemented; accumulated matrix pending):** the planner recognizes only
+5. **OIX-3 — query path (implemented; accumulated checkpoint executed):** the planner recognizes only
    a polymorphic all-node scan ordered by the table primary key after one TIMESTAMP column, with
    both keys descending, a bounded LIMIT, no SKIP/DISTINCT/aggregation and a proved-total
    residual predicate. Every participating table must expose a catalog-authorized ACTIVE exact
@@ -246,9 +246,14 @@ prefix.
    It also proves conservative polymorphic pruning: Pulse's internal `BoardMeta` table may be
    omitted because its missing filtered properties make the whole conjunction non-true, while a
    missing property below an unsafe `OR` retains the canonical scan. The broader crash/multiprocess
-   and mutation/reopen matrix remains the checkpoint condition.
-6. **OIX-4 — Pulse Community:** idempotent per-table index creation/migration, Community-only
-   capability use, installed API/UI test and board benchmark.
+   matrix passed with the integrated ordered/index/query checkpoint: 96 cases on 2026-09-07.
+   The same-snapshot real-board comparison returned identical first/second 500-node pages with
+   657/512 examined candidates instead of 2,411 each in the canonical scan. Residual observations
+   O1–O3 from the prior review are being reconciled in a bounded handoff, not silently dismissed.
+6. **OIX-4 — Pulse Community (implemented):** idempotent per-table index creation/migration,
+   Community-only capability use (`40ed1a3`), 62 integration tests, and real API/UI validation.
+   The 14 Discovery cards were also exercised after the native optional-hop addition. No live
+   query, index or generation required a destructive migration during this checkpoint.
 
 `NODE-IN-SEEK` is an independent low-risk optimization and useful primitive, but it is not
 reported as CURSOR-1. It is implemented without changing disk format: only the exact standalone
