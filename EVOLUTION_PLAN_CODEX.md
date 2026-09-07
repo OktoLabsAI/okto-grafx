@@ -4076,6 +4076,16 @@ limite do card, sem warning, com graus de conectividade (máximo observado: 8). 
 demais 13 cards segue como pré-condição ao próximo lote de performance, separando lacunas
 genéricas do motor de defeitos de regra/projeção do Pulse.
 
+Checkpoint funcional concluído após o restart do Pulse: os 14 cards passaram pela API e por
+cliques/submissão na UI real, sem HTTP 500 ou warnings, com contagens renderizadas iguais às
+respostas. Core `1a21b9c` corrige cobertura FR, arquivados, cadeias spec-local e confiança nula;
+o adapter corrige área ausente de Learning e a UI deixa de mascarar warnings. Evidências e
+limitações preexistentes dos limites 500 candidatos/100 decisões e 200 learnings estão em
+`okto-pulse-v003-kg-load-codex/docs/GRAFX_DISCOVERY_AUDIT_0_0_4.md`. Além do slice nativo, passaram
+53 testes Core, 61 testes agrupados Community, 3 casos de ranking nativo, 1 SQL e 13 de UI.
+A retomada de performance pode seguir o plano finito existente; não depende de ampliar a
+semântica dos cards além desses contratos.
+
 O teste do shape real revelou que o `AllNodesScan` também inclui a tabela interna `BoardMeta`,
 sem `created_at/id`. O planner agora a remove somente quando uma prova conservadora de lógica
 ternária demonstra que propriedades ausentes tornam o WHERE completo não verdadeiro; um `OR`
