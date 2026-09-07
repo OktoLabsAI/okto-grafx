@@ -267,9 +267,12 @@ def test_a_custom_door_candidate_is_still_judged_against_the_probe(
         return tuple(everything for _ in keys)
 
     monkeypatch.setattr(IndexManager, "validated_versions_many", loose)
-    rows = database.execute(QUERY, {"ids": ["a1", "a3"]}).rows  # type: ignore[attr-defined]
+    result = database.execute(QUERY, {"ids": ["a1", "a3"]})  # type: ignore[attr-defined]
 
-    assert rows == (("a1", 1), ("a3", 3))
+    assert result.rows == (("a1", 1), ("a3", 3))
+    # The predicate above the seek would drop the stray row anyway; the seek itself must not
+    # have offered it, which its own counter shows.
+    assert result.statistics.get("rows_seeked") == 2
 
 
 def test_catalog_v1_keeps_its_automatic_primary_key_seek(
