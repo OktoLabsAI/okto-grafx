@@ -4670,3 +4670,36 @@ avançados ou restart pendente; nenhuma configuração foi alterada.
 A lacuna de ocupação está corrigida, mas não há prova de ganho global desse
 patch nem resolução da lentidão fria. As 21 specs permanecem preservadas,
 ledger byte-idêntico. Detalhes: Community `docs/GRAFX_READ_LANE_SCHEDULING.md`.
+
+### Reparo determinístico e dependências — checkpoint 2026-09-07
+
+Core `2092ee9` e Community `0c55b39`, publicados somente nas branches de trabalho,
+fecham o lote de reparo seletivo já utilizado nas sete fontes documentadas na
+auditoria. Endpoint limitado a 1–25 specs explícitas, autorização editor/admin
+mais queue-reprocess, elegibilidade de todas as fontes antes de qualquer enqueue,
+fila e auditoria na mesma transação. Claims, pausas, tombstones e membership de
+rebuild não são tomados pelo reparo. HTTP 202 significa admissão, não conclusão.
+
+A revisão corrigiu admissão permissiva de estados gerais ausentes/desconhecidos:
+agora exige `graph_state=healthy` e `overall_state` explicitamente `healthy` ou
+`at_risk`. Autoridade é novamente validada pelo worker antes de escrever.
+Somente o prefixo tipado de espera por endpoint pode ceder a outras dependências
+do board; barreiras de erro ordinário, backoff, claims e rebuild permanecem.
+Core continua independente do backend.
+
+Validação em exports dos candidatos exatos do index Git, sem as alterações
+paralelas de UI/settings/DLQ: 39 testes Core em 10,95 s e 158 Community em 58,48 s.
+Inclui rollback real SQLite de insert e reativação quando a auditoria falha,
+coalescência/fences, autorização operacional e contratos REST. Ruff dos arquivos
+novos e whitespace passaram. Os testes REST do endpoint usam override do ator;
+as regras reais do dependency writer são cobertas pela suíte operacional.
+Não foi repetido o reparo em produção. As 21 specs continuam reservadas, com
+SHA256 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
+Sem novo ganho temporal alegado, merge na main ou publicação/instalação de wheel.
+
+Deploy acumulado por fonte concluído no Pulse PID 18920: encerramento terminal
+do PID 9544 confirmado antes da substituição, grafos fechados com zero falhas.
+Agora carregados tanto o escalonamento de schema `9617912` quanto a admissão
+restritiva deste lote. Startup completo, API 8100 e MCP 8101 no mesmo PID,
+`GET /health` HTTP 200 (`healthy`, versão Pulse 0.3.3). Este é um smoke de
+disponibilidade, não nova auditoria integral do KG. Ledger permanece byte-idêntico.

@@ -463,3 +463,19 @@ parity; some auxiliary snapshots were stale and refreshing on this request.
 These unrelated diagnostics were not silently purged or redriven. This checkpoint
 closes the selected deterministic repair and its downstream delivery, not every
 historical board issue or the entire 0.0.4 performance plan.
+
+### Source milestone validation — targeted repair, no production replay
+
+Core `2092ee9` and Community `0c55b39` commit the bounded repair and prerequisite
+fairness used above. A final review tightened health admission: healthy graph
+plus an explicit healthy/at_risk overall state, not merely absence of known
+negative states. Unknown/malformed states fail closed; worker authority remains
+independent. An isolated SQLite test verifies that failed audit persistence
+rolls back both a new queue row and reactivation of a terminal row.
+
+Exact staged-source exports passed 39 Core tests (10.95 s) and 158 Community
+tests (58.48 s), including queue claim/deletion fences and operational writer
+authorization. Ruff and staged whitespace checks passed. No additional repair,
+cognitive consolidation or DLQ redrive was requested during this validation;
+the 21-spec ledger hash still matches the baseline. This closes the source
+milestone, not the outstanding cold-load/write performance investigation.
