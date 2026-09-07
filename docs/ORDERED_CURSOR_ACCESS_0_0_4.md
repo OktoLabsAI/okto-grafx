@@ -217,15 +217,16 @@ prefix.
    alternate root -> grouped root barrier`; the selected root watermark makes replay idempotent
    without repeated allocation.  Root-write refusal leaves the former root authoritative, while
    a write-that-landed-then-raised is recovered by the fresh certificate and watermark.  The
-   focused differential/failure corpus passes 16 tests.  Index-manager registration, commit/replay
-   batching, compacting rebuild and the accumulated crash/multiprocess matrix remain in OIX-2B.
-4. **OIX-2B — transactional integration (registry/commit/replay implemented):** the ordered store
+   focused differential/failure corpus passes 16 tests.
+4. **OIX-2B — transactional integration (implementation complete; final matrix pending):** the ordered store
    now implements the ordinary secondary-index staging contract, participates in registry/table
    watermarks, publishes one COW generation per live transaction and coalesces each store's WAL
    subsequence into one recovery publication. Exact equality uses a bounded tree seek and remains
-   heap-validated by `IndexManager`; detached catalog generations bulk-build directly. Catalog
-   DDL surface/activation, compacting rebuild and the crash/multiprocess matrix remain before
-   OIX-2B is closed.
+   heap-validated by `IndexManager`; detached catalog generations bulk-build directly. Textual
+   `OPTIONS layout = ordered` and Python `layout="ordered"` activate only the narrow
+   TIMESTAMP+STRING contract and refuse hash sizing. `rebuild_index()` bulk-builds and verifies a
+   compact fresh nonce before catalog rotation, retaining the former generation as `STALE`.
+   The ordered-specific accumulated crash/multiprocess matrix remains before OIX-2B is closed.
 5. **OIX-3 — query path:** exact planner matcher, `OrderedNodeMerge`, lazy merge, keyset bound and
    differential query corpus.
 6. **OIX-4 — Pulse Community:** idempotent per-table index creation/migration, Community-only

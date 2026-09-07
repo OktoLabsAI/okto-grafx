@@ -3348,6 +3348,7 @@ class QueryEngine:
         columns: tuple[str, ...],
         bucket_count: int | None,
         expected_cardinality: int | None,
+        layout: str | None,
         txn: object,
     ) -> QueryResult:
         """Run the Python index door through the same analysis and plan as textual DDL."""
@@ -3359,6 +3360,7 @@ class QueryEngine:
                 columns=columns,
                 bucket_count=bucket_count,
                 expected_cardinality=expected_cardinality,
+                layout=layout,
             ),
             txn,
         )
@@ -4033,6 +4035,8 @@ class QueryEngine:
                 positions=node.positions,
                 bucket_count=node.bucket_count,
                 expected_cardinality=node.expected_cardinality,
+                layout=node.layout,
+                key_derivation=node.key_derivation,
             )
             after = set(staged_pages()) if callable(staged_pages) else set()
             statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
@@ -4623,6 +4627,7 @@ class QueryEngine:
                 positions=definition.positions,
                 visibility=definition.visibility,
                 key_derivation=definition.key_derivation,
+                layout=definition.layout,
                 automatic=True,
                 expected_cardinality=expected_cardinality,
                 generations=(generation,),

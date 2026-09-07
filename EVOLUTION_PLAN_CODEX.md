@@ -71,16 +71,20 @@
   barrier de dados -> raiz alternada -> barrier de raiz`; o watermark selecionado evita alocação
   repetida no replay. Falha antes da raiz preserva a autoridade anterior e a incerteza de uma
   escrita de raiz que pousou antes da exceção é resolvida por certificado fresco. Os 16 testes
-  focados passam. Registry/DDL, commit/replay agrupado, rebuild compactante e a matriz acumulada
-  de crash/multiprocesso permanecem no OIX-2B e serão fechados antes de o planner usar o índice.
+  focados passam. Registry, commit/replay agrupado, DDL e rebuild compactante pertencem ao
+  OIX-2B; a matriz acumulada de crash/multiprocesso fecha o checkpoint antes do uso pelo planner.
 
   OIX-2B já integrou o store ordenado ao contrato comum de staging/registry: um commit vivo gera
   uma única publicação COW e o recovery agrupa todos os records do mesmo store sob um watermark
   idempotente. A igualdade exata ganhou seek limitado aos ramos compatíveis e segue cercada pelo
   certificado e pela revalidação do heap feita pelo `IndexManager`; o construtor de geração
-  destacada usa bulk build direto e não antecipa autoridade de catálogo. Toda `tests/index`
-  passou neste checkpoint. DDL/ativação, rebuild compactante e a matriz crash/multiprocesso ainda
-  precisam fechar antes do OIX-2B ser considerado concluído.
+  destacada usa bulk build direto e não antecipa autoridade de catálogo. O DDL textual
+  `OPTIONS layout = ordered` e a API `layout="ordered"` agora persistem o contrato exato
+  TIMESTAMP+STRING, recusam sizing hash e constroem a geração ativa do heap. O novo
+  `rebuild_index()` compacta tanto hash quanto ordered em uma geração nonced completa antes da
+  rotação `ACTIVE -> STALE`, sem reset in-place. Reopen frio, mutação, igualdade, rebuild e os
+  fluxos de rehash/recovery passaram no checkpoint combinado. Resta a matriz
+  ordered específica de crash/multiprocesso para fechar o OIX-2B.
 
   O trabalho paralelo NODE-IN-SEEK também foi concluído e validado adversarialmente. Somente o
   shape standalone rotulado com `n.<primary-key> IN $parameter` usa o lookup exato multi-key;

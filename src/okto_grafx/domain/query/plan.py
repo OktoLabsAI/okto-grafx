@@ -28,6 +28,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 from okto_grafx.domain.errors import GrafxPlanError
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.ports.vectormath import DistanceMetric
@@ -961,6 +962,8 @@ class CreateIndex(PlanNode):
     positions: tuple[int, ...]
     bucket_count: int
     expected_cardinality: int | None
+    layout: IndexLayout
+    key_derivation: str
 
     def details(self) -> Mapping[str, object]:
         """Return the fully resolved logical definition and sizing intent."""
@@ -970,6 +973,8 @@ class CreateIndex(PlanNode):
             "positions": ", ".join(str(position) for position in self.positions),
             "bucket_count": self.bucket_count,
             "expected_cardinality": self.expected_cardinality or "none",
+            "layout": self.layout.value,
+            "key_derivation": self.key_derivation,
         }
 
 

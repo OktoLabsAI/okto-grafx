@@ -44,6 +44,7 @@ from okto_grafx.domain.index.catalog import (
 )
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.ids import MAX_PAGE_INDEX, MAX_SLOT_ID, NULL_REF, RecordRef
 from okto_grafx.domain.ledger.entry import (
@@ -687,6 +688,11 @@ class IndexView:
         """Return the active physical generation's bucket count."""
         return self.definition.bucket_count
 
+    @property
+    def layout(self) -> IndexLayout:
+        """Return the durable physical organization selected by the catalog."""
+        return self.definition.layout
+
 
 @dataclass(frozen=True, slots=True)
 class IndexRegistryView:
@@ -1219,6 +1225,11 @@ def _index_definition(value: Any) -> IndexDefinition:
         ),
         artifact_nonce=_builtin_int(
             _domain_field(value, IndexDefinition, "artifact_nonce")
+        ),
+        layout=_string_enum(
+            _domain_field(value, IndexDefinition, "layout"),
+            IndexLayout,
+            field="index.layout",
         ),
     )
 
@@ -4232,6 +4243,11 @@ def _catalog_index_definition(value: Any) -> CatalogIndexDefinition:
             _domain_field(value, CatalogIndexDefinition, "key_derivation"),
             field="index.key_derivation",
             empty=False,
+        ),
+        layout=_string_enum(
+            _domain_field(value, CatalogIndexDefinition, "layout"),
+            IndexLayout,
+            field="index.layout",
         ),
         automatic=_builtin_bool(
             _domain_field(value, CatalogIndexDefinition, "automatic")

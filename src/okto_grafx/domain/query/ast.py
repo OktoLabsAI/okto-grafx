@@ -797,6 +797,7 @@ class CreateIndexStatement(Statement):
     columns: tuple[str, ...]
     bucket_count: int | None = None
     expected_cardinality: int | None = None
+    layout: str | None = None
 
     def describe(self) -> str:
         """Return the statement as it would be written back."""
@@ -812,6 +813,8 @@ class CreateIndexStatement(Statement):
                 f"{body} OPTIONS expected_cardinality = "
                 f"{self.expected_cardinality}"
             )
+        if self.layout is not None:
+            return f"{body} OPTIONS layout = {self.layout}"
         return body
 
 

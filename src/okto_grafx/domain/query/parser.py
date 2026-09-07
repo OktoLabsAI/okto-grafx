@@ -383,36 +383,49 @@ class _Parser:
 
         bucket_count: int | None = None
         expected_cardinality: int | None = None
+        layout: str | None = None
         if self._match_keyword("OPTIONS"):
             option_token = self._current
-            option = self._take_name("bucket_count or expected_cardinality")
+            option = self._take_name("bucket_count, expected_cardinality or layout")
             folded = option.lower()
             if option_token.quoted or folded not in {
                 "bucket_count",
                 "expected_cardinality",
+                "layout",
             }:
                 raise self._refuse(
-                    "An index sizing option is bucket_count or expected_cardinality; "
+                    "An index option is bucket_count, expected_cardinality or layout; "
                     f"got {option!r}",
                     field="option",
                     value=option,
                 )
             self._take_symbol("=")
-            token = self._current
-            if token.kind is not TokenKind.INTEGER:
-                raise self._unexpected("a positive integer sizing value")
-            self._advance()
-            value = int(token.value)
-            if value <= 0:
-                raise self._refuse(
-                    f"The {folded} option must be positive; got {value}",
-                    field=folded,
-                    value=value,
-                )
-            if folded == "bucket_count":
-                bucket_count = value
+            if folded == "layout":
+                value_token = self._current
+                if value_token.kind is not TokenKind.NAME or value_token.quoted:
+                    raise self._refuse(
+                        "An index layout is an unquoted layout name.",
+                        field="layout",
+                        value=value_token.text,
+                    )
+                value = self._take_name("the index layout")
+                layout = value
             else:
-                expected_cardinality = value
+                token = self._current
+                if token.kind is not TokenKind.INTEGER:
+                    raise self._unexpected("a positive integer sizing value")
+                self._advance()
+                value = int(token.value)
+                if value <= 0:
+                    raise self._refuse(
+                        f"The {folded} option must be positive; got {value}",
+                        field=folded,
+                        value=value,
+                    )
+                if folded == "bucket_count":
+                    bucket_count = value
+                else:
+                    expected_cardinality = value
 
         return CreateIndexStatement(
             name=name,
@@ -421,6 +434,7 @@ class _Parser:
             columns=tuple(columns),
             bucket_count=bucket_count,
             expected_cardinality=expected_cardinality,
+            layout=layout,
         )
 
     def _create_node_table(self) -> CreateNodeTableStatement:

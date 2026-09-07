@@ -1448,6 +1448,7 @@ class Maintenance:
         *,
         bucket_count: int | None = None,
         expected_cardinality: int | None = None,
+        layout: str = "hash",
     ) -> IndexView:
         """Delegate custom exact-index creation to the database."""
         return self._database.create_index(
@@ -1456,6 +1457,7 @@ class Maintenance:
             columns,
             bucket_count=bucket_count,
             expected_cardinality=expected_cardinality,
+            layout=layout,
         )
 
     def rehash_index(
@@ -1471,6 +1473,10 @@ class Maintenance:
             bucket_count=bucket_count,
             expected_cardinality=expected_cardinality,
         )
+
+    def rebuild_index(self, name: str) -> IndexView:
+        """Delegate immutable exact-index reconstruction to the database."""
+        return self._database.rebuild_index(name)
 
     def rehash_index_if_needed(
         self,
@@ -2830,12 +2836,15 @@ class Database:
         *,
         bucket_count: int | None = None,
         expected_cardinality: int | None = None,
+        layout: str = "hash",
     ) -> IndexView:
         """Create and atomically publish one custom exact index.
 
         The operation owns a fresh, dedicated write transaction. ``bucket_count`` selects the
         physical directory directly; ``expected_cardinality`` lets Grafx derive it. Supplying
-        both is refused by the same planner used by textual ``CREATE INDEX``.
+        both is refused by the same planner used by textual ``CREATE INDEX``. The ordered
+        layout is selected explicitly with ``layout='ordered'`` and accepts only a
+        TIMESTAMP+STRING key, without hash sizing hints.
         """
         with self._public_operation("create_index"):
             self._require_open()
@@ -2869,6 +2878,7 @@ class Database:
                     "expected_cardinality", expected_cardinality
                 )
             )
+            wanted_layout = _require_text("layout", layout)
 
             transaction = self.begin("write")
             try:
@@ -2884,6 +2894,7 @@ class Database:
                         columns=wanted_columns,
                         bucket_count=wanted_bucket_count,
                         expected_cardinality=wanted_expected_cardinality,
+                        layout=wanted_layout,
                         txn=transaction._context,
                     )
                 transaction.commit()
@@ -2940,6 +2951,41 @@ class Database:
                     name=wanted_name,
                     bucket_count=wanted_bucket_count,
                     expected_cardinality=wanted_expected_cardinality,
+                )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return self._committed_index_receipt(wanted_name)
+
+    def rebuild_index(self, name: str) -> IndexView:
+        """Rebuild one exact index into a compact, immutable fresh generation.
+
+        The active generation remains authoritative until the complete replacement and its WAL
+        publication are durable. The former generation is retained as ``STALE`` for rollback and
+        audit provenance; no in-place reset can expose a partially rebuilt tree.
+        """
+
+        with self._public_operation("rebuild_index"):
+            self._require_open()
+            self._require_writable("rebuild an exact index")
+            self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            wanted_name = _require_text("name", name)
+
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_index_rehash(
+                    transaction._context,
+                    name=wanted_name,
+                    rebuild=True,
                 )
                 transaction.commit()
             except BaseException as failure:

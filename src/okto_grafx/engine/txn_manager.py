@@ -109,6 +109,7 @@ from okto_grafx.domain.index.catalog import (
     identity_index_name,
 )
 from okto_grafx.domain.index.definition import (
+    COLUMN_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
@@ -118,6 +119,7 @@ from okto_grafx.domain.index.keys import (
     identity_index_sizing,
     rehash_index_sizing,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.index.visibility import ReconcileReport
 from okto_grafx.domain.ports.clock import Clock
@@ -132,6 +134,7 @@ from okto_grafx.domain.model.schema import (
     _encode_tuple_with_proof,
     _proved_tuple_payload,
 )
+from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
@@ -1453,6 +1456,8 @@ class TransactionManager:
         positions: tuple[int, ...],
         bucket_count: int,
         expected_cardinality: int | None,
+        layout: IndexLayout = IndexLayout.HASH,
+        key_derivation: str = COLUMN_KEY_DERIVATION,
     ) -> CatalogIndexDefinition:
         """Seal a full custom exact-index build into one fresh write transaction.
 
@@ -1507,6 +1512,8 @@ class TransactionManager:
                     positions=positions,
                     bucket_count=bucket_count,
                     expected_cardinality=expected_cardinality,
+                    layout=layout,
+                    key_derivation=key_derivation,
                     operation=operation,
                 )
                 published = self._published_state_in_section().last_committed_lsn
@@ -1553,21 +1560,24 @@ class TransactionManager:
         name: str,
         bucket_count: int | None = None,
         expected_cardinality: int | None = None,
+        rebuild: bool = False,
     ) -> CatalogIndexDefinition:
-        """Seal one growth-only foreground rehash into a dedicated transaction.
+        """Seal one immutable foreground replacement into a dedicated transaction.
 
-        The detached generation is built later by the ordinary commit path, after the first
-        OCC pass and while the writer lease plus ``COMMIT_SECTION`` are held.  Catalog v2 keeps
-        the former ACTIVE generation as STALE.  A v1 automatic exact index is coactivated with
-        catalog v2 in the same commit, replacing its not-yet-built migration generation so the
-        target is scanned exactly once.
+        Rehash grows a hash directory. Rebuild retains the current physical sizing and works for
+        both hash and ordered layouts, making the ordered path's append-only pages compact again.
+        In both modes the detached generation is built later by the ordinary commit path, after
+        the first OCC pass and while the writer lease plus ``COMMIT_SECTION`` are held. Catalog
+        v2 keeps the former ACTIVE generation as STALE.
         """
 
-        operation = "prepare exact-index rehash"
+        operation = (
+            "prepare exact-index rebuild" if rebuild else "prepare exact-index rehash"
+        )
         self._require_fresh_index_catalog_transaction(
             txn,
             operation=operation,
-            purpose="Exact-index rehash",
+            purpose="Exact-index rebuild" if rebuild else "Exact-index rehash",
         )
 
         with self._participant_section():
@@ -1593,6 +1603,13 @@ class TransactionManager:
 
                 published = self._published_state_in_section().last_committed_lsn
                 if source.format_version == CATALOG_LEGACY_FORMAT_VERSION:
+                    if rebuild:
+                        raise GrafxUnsupportedOperation(
+                            "Exact-index rebuild requires catalog v2 generation authority.",
+                            operation=operation,
+                            field="format_version",
+                            value=source.format_version,
+                        )
                     return self._prepare_legacy_index_rehash(
                         txn,
                         source,
@@ -1626,11 +1643,33 @@ class TransactionManager:
                 # freshness flag is deliberately repairable by the full shadow build.
                 selected = manager.active_index(logical.name, catalog=source)
                 selected.open()
-                resolved_count, resolved_expected = rehash_index_sizing(
-                    active.bucket_count,
-                    bucket_count=bucket_count,
-                    expected_cardinality=expected_cardinality,
-                )
+                if rebuild:
+                    if bucket_count is not None or expected_cardinality is not None:
+                        raise GrafxConfigurationError(
+                            "An exact-index rebuild retains physical sizing; use rehash for "
+                            "a hash-directory growth request.",
+                            operation=operation,
+                            field="sizing",
+                            bucket_count=repr(bucket_count),
+                            expected_cardinality=repr(expected_cardinality),
+                        )
+                    resolved_count = active.bucket_count
+                    resolved_expected = logical.expected_cardinality
+                else:
+                    if logical.layout is IndexLayout.ORDERED:
+                        raise GrafxUnsupportedOperation(
+                            "An ordered index has no hash directory to rehash; rebuild it into "
+                            "a compact fresh generation instead.",
+                            operation=operation,
+                            field="layout",
+                            value=logical.layout.value,
+                            index=logical.name,
+                        )
+                    resolved_count, resolved_expected = rehash_index_sizing(
+                        active.bucket_count,
+                        bucket_count=bucket_count,
+                        expected_cardinality=expected_cardinality,
+                    )
 
                 candidate = Catalog.deserialize(source.serialize())
                 candidate_logical = candidate.index_definition(logical.name)
@@ -1786,6 +1825,8 @@ class TransactionManager:
         positions: tuple[int, ...],
         bucket_count: int,
         expected_cardinality: int | None,
+        layout: IndexLayout,
+        key_derivation: str,
         operation: str,
     ) -> tuple[TableDef, CatalogIndexDefinition]:
         """Validate one custom definition without changing catalog, txn or nonce state."""
@@ -1822,6 +1863,8 @@ class TransactionManager:
             table_name=table.name,
             positions=positions,
             visibility=IndexVisibility.EXACT,
+            key_derivation=key_derivation,
+            layout=layout,
             automatic=False,
             expected_cardinality=expected_cardinality,
             generations=(placeholder,),
@@ -1836,6 +1879,17 @@ class TransactionManager:
                     value=position,
                     index=provisional.name,
                     table=table.name,
+                )
+        if provisional.layout is IndexLayout.ORDERED:
+            first, second = (table.columns[position] for position in provisional.positions)
+            if first.type is not ValueType.TIMESTAMP or second.type is not ValueType.STRING:
+                raise GrafxConfigurationError(
+                    f"Ordered index {provisional.name!r} requires TIMESTAMP then STRING; "
+                    f"got {first.type.name} then {second.type.name}.",
+                    operation=operation,
+                    field="positions",
+                    value=provisional.positions,
+                    index=provisional.name,
                 )
         if source.has_index_definition(provisional.name):
             raise GrafxConfigurationError(

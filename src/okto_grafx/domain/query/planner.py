@@ -39,11 +39,13 @@ from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
 from okto_grafx.domain.index.catalog import CatalogIndexDefinition
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
+    ORDERED_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
     index_definition_matches_table,
 )
 from okto_grafx.domain.index.keys import custom_index_sizing
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
@@ -1029,23 +1031,53 @@ class _Planner:
                 field="table",
                 value=table.name,
             )
-        bucket_count, expected_cardinality = custom_index_sizing(
-            bucket_count=statement.bucket_count,
-            expected_cardinality=statement.expected_cardinality,
-        )
+        layout = IndexLayout.parse(statement.layout or IndexLayout.HASH.value)
+        if layout is IndexLayout.ORDERED:
+            if (
+                statement.bucket_count is not None
+                or statement.expected_cardinality is not None
+            ):
+                raise GrafxPlanError(
+                    "An ordered index has no hash-directory sizing options.",
+                    field="layout",
+                    value=layout.value,
+                )
+            bucket_count = 1
+            expected_cardinality = None
+            key_derivation = ORDERED_KEY_DERIVATION
+        else:
+            bucket_count, expected_cardinality = custom_index_sizing(
+                bucket_count=statement.bucket_count,
+                expected_cardinality=statement.expected_cardinality,
+            )
+            key_derivation = COLUMN_KEY_DERIVATION
         definition = IndexDefinition.on(
             table,
             name=statement.name,
             columns=statement.columns,
             visibility=IndexVisibility.EXACT,
             bucket_count=bucket_count,
+            key_derivation=key_derivation,
+            layout=layout,
         )
+        if layout is IndexLayout.ORDERED:
+            first, second = (table.columns[position] for position in definition.positions)
+            if first.type is not ValueType.TIMESTAMP or second.type is not ValueType.STRING:
+                raise GrafxPlanError(
+                    "An ordered index requires TIMESTAMP then STRING key columns; "
+                    f"got {first.type.name} then {second.type.name}.",
+                    field="columns",
+                    value=statement.columns,
+                    table=table.name,
+                )
         logical = CatalogIndexDefinition(
             name=definition.name,
             table_id=definition.table_id,
             table_name=definition.table_name,
             positions=definition.positions,
             visibility=definition.visibility,
+            key_derivation=definition.key_derivation,
+            layout=definition.layout,
             expected_cardinality=expected_cardinality,
         )
         self._require_new_index_name(logical.name)
@@ -1055,6 +1087,8 @@ class _Planner:
             positions=logical.positions,
             bucket_count=definition.bucket_count,
             expected_cardinality=logical.expected_cardinality,
+            layout=logical.layout,
+            key_derivation=logical.key_derivation,
         )
 
     def _require_new_index_name(self, name: str) -> None:

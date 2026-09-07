@@ -10,9 +10,12 @@ from okto_grafx import connect
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxIndexError,
+    GrafxPlanError,
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.index.layout import IndexLayout
+from okto_grafx.domain.model.value import Timestamp
 from okto_grafx.domain.query.plan import IndexSeek, plan_nodes
 
 
@@ -97,6 +100,138 @@ def test_textual_ddl_and_maintenance_delegate_share_the_public_contract(
         )
         assert delegated.name == "by_email"
         assert delegated.bucket_count == 8
+
+
+def test_ordered_ddl_builds_maintains_and_cold_reopens_one_catalog_generation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "database"
+    with connect(root, page_size=512) as database:
+        with database.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE Event("
+                "id STRING, created_at TIMESTAMP, payload STRING, PRIMARY KEY(id))"
+            )
+        for event_id, micros in (("a", 30), ("b", 10), ("c", 20)):
+            with database.begin("write") as rows:
+                rows.execute(
+                    "CREATE (:Event {id: $id, created_at: $created_at, payload: $payload})",
+                    {
+                        "id": event_id,
+                        "created_at": Timestamp(micros),
+                        "payload": event_id.upper(),
+                    },
+                )
+
+        with database.begin("write") as schema:
+            result = schema.execute(
+                "CREATE INDEX by_event_time FOR (e:Event) "
+                "ON (e.created_at, e.id) OPTIONS layout = ordered"
+            )
+
+        created = database.indexes.index("by_event_time")
+        assert result.statistics["indexes_created"] == 1
+        assert created.layout is IndexLayout.ORDERED
+        assert created.key_derivation == "ordered_timestamp_string_v1"
+        assert created.bucket_count == 1
+        assert created.automatic is False
+        assert created.expected_cardinality is None
+        nonce = created.active_nonce
+        file = created.file
+
+        plan = database.explain(
+            "MATCH (e:Event) WHERE e.created_at = $created_at AND e.id = $id "
+            "RETURN e.payload"
+        )
+        assert any(isinstance(node, IndexSeek) for node in plan_nodes(plan))
+        assert database.execute(
+            "MATCH (e:Event) WHERE e.created_at = $created_at AND e.id = $id "
+            "RETURN e.payload",
+            {"created_at": Timestamp(20), "id": "c"},
+        ).rows == (("C",),)
+
+        with database.begin("write") as rows:
+            rows.execute(
+                "MATCH (e:Event) WHERE e.id = 'c' SET e.created_at = $created_at",
+                {"created_at": Timestamp(40)},
+            )
+        assert database.execute(
+            "MATCH (e:Event) WHERE e.created_at = $created_at AND e.id = 'c' RETURN e.id",
+            {"created_at": Timestamp(20)},
+        ).rows == ()
+        assert database.execute(
+            "MATCH (e:Event) WHERE e.created_at = $created_at AND e.id = 'c' RETURN e.id",
+            {"created_at": Timestamp(40)},
+        ).rows == (("c",),)
+
+        rebuilt = database.rebuild_index("by_event_time")
+        assert rebuilt.layout is IndexLayout.ORDERED
+        assert rebuilt.active_nonce is not None
+        assert rebuilt.active_nonce != nonce
+        logical = database._catalog.catalog.index_definition("by_event_time")
+        assert sorted(generation.state.value for generation in logical.generations) == [
+            "active",
+            "stale",
+        ]
+        nonce = rebuilt.active_nonce
+        file = rebuilt.file
+        assert database.verify("all").findings == ()
+
+    with connect(root, page_size=512) as reopened:
+        restored = reopened.indexes.index("by_event_time")
+        assert restored.layout is IndexLayout.ORDERED
+        assert restored.active_nonce == nonce
+        assert restored.file == file
+        assert reopened.execute(
+            "MATCH (e:Event) WHERE e.created_at = $created_at AND e.id = 'c' RETURN e.id",
+            {"created_at": Timestamp(40)},
+        ).rows == (("c",),)
+        assert reopened.verify("all").findings == ()
+
+
+def test_python_ordered_door_refuses_hash_sizing_before_publication(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "database", page_size=512) as database:
+        with database.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE Event(id STRING, created_at TIMESTAMP, PRIMARY KEY(id))"
+            )
+        before = database.wal.last_lsn
+
+        with pytest.raises(GrafxPlanError) as failure:
+            database.create_index(
+                "by_event_time",
+                "Event",
+                ("created_at", "id"),
+                layout="ordered",
+                bucket_count=8,
+            )
+
+        assert failure.value.details["field"] == "layout"
+        assert database.wal.last_lsn == before
+
+
+def test_ordered_index_refuses_hash_rehash_and_names_the_compacting_door(
+    tmp_path: Path,
+) -> None:
+    with connect(tmp_path / "database", page_size=512) as database:
+        with database.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE Event(id STRING, created_at TIMESTAMP, PRIMARY KEY(id))"
+            )
+        database.create_index(
+            "by_event_time",
+            "Event",
+            ("created_at", "id"),
+            layout="ordered",
+        )
+
+        with pytest.raises(GrafxUnsupportedOperation) as failure:
+            database.rehash_index("by_event_time", bucket_count=8)
+
+        assert failure.value.details["field"] == "layout"
+        assert "rebuild" in str(failure.value).lower()
 
 
 def test_custom_seek_preserves_query_numeric_and_null_equality_semantics(
