@@ -4720,3 +4720,17 @@ Sem promessa de paralelismo CPU/GIL ou redução de complexidade da consulta.
 O código já estava no worktree usado pelo PID 18920: não houve novo restart.
 Nenhuma spec consumida; ledger byte-idêntico. Documentação Community:
 `docs/KG_REST_READ_DISPATCH.md`. O restante do plano permanece aberto.
+
+### Decisão sobre releitura de endpoints — 2026-09-07
+
+Reperfil do fan-out selecionado: 36 statements, 105 vizinhos e 210 chamadas
+`HeapStore.read`. Testado protótipo de retenção limitada dos registros que a
+validação exata já leu, preservando certificados por tentativa e fallback de
+capacidade. Seis pares alternados na restauração isolada mantiveram o mesmo
+digest, mas não mostraram ganho consistente: medianas quentes de 112,37 ms no
+canônico e 113,93 ms no protótipo. Decisão: retirar o protótipo, sem promover
+complexidade adicional nem abrir um gate prolongado para ganho marginal.
+
+Fonte nativa restaurada ao estado anterior, sem deploy ou consumo das 21 specs.
+Não foi executada nem alegada a matriz de qualidade do candidato rejeitado.
+Evidências e limites em `docs/ENDPOINT_VERSION_REUSE_EVALUATION_0_0_4.md`.
