@@ -4549,3 +4549,37 @@ A carga inicial ainda levou 41,543 s (grafo) / 28,770 s (censo), com 11,262 s j�
 na fase de schema e 24,142 s na leitura inicial de nós do grafo. Portanto, não há
 alegação de ganho end-to-end: permanece aberta a investigação da admissão/leitura
 fria e da concorrência com Health. Evidências completas no relatório de censo.
+
+### Leitores: diagnóstico da admissão fria e seleção por ocupação
+
+Diagnóstico read-only separou abertura nativa do tempo com profiler: sem
+instrumentação, 0,928/0,949 s por participante; os 2,192/2,247 s anteriores
+incluíam overhead de cProfile. Duas aberturas em threads progrediram, com grupo
+de 1,648 s; processos incluindo startup levaram 2,006 s, sem justificar mudança
+de arquitetura. As seis leituras de schema retornaram digest idêntico.
+
+Perfil live incluindo esperas: 56/105 amostras do censo estavam entrando na seção
+do participante, 43 terminavam na espera do lock. Implementada no worktree
+Community seleção por ocupação dos dois leitores existentes, cobrindo a leitura
+completa e liberando reserva em erro/retry/interrupção. Caso discriminante: se
+o leitor 0 continua ocupado e o leitor 1 já terminou, a próxima leitura usa o 1
+em vez de seguir round-robin para o 0. Não aumenta handles, não cria fila/espera
+no escalonador nem transforma contadores em autoridade. Core, WAL/OCC e janela
+nativa preservados. Metadados/vetores ainda não enquadrados no scope mantêm o
+resolver original; contadores são hints de scheduling, não prova de idleness.
+
+84 testes relacionados passaram em 14,52 s; suíte focada final com 22 testes
+em 7,00 s após duas fronteiras adicionais (sobreposição explícita). Integração
+ainda não é milestone de pacote publicado: depende das alterações pré-existentes
+de leitores independentes no worktree Community, preservadas sem staging amplo.
+Detalhes: Community `docs/GRAFX_READ_LANE_SCHEDULING.md`. `OPEN-1` não foi
+reaberto por prova circular: a conferência do heap continua integral. As 21
+specs permanecem reservadas, ledger inalterado.
+
+Deploy de fonte no Pulse PID 35808 validado: primeira atualização pós-readiness
+retornou grafo em 14,704 s e censo em 14,348 s, HTTP 200, 500/703 e 2779/4424,
+zero falhas. Schema ainda consumiu 10,924 s; contagem de relações 1,876 s.
+Paginação +500 IDs únicos/897 relações em 1,258 s, UI 1000/2779. Não é razão
+A/B controlada frente ao run anterior; abertura fria continua pendente.
+Integração está no worktree/runtime de fonte, não em novo wheel global ou release;
+consolidar dependências pré-existentes de leitores antes de publicar o milestone.
