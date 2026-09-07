@@ -98,3 +98,28 @@ requests still took 24.758/24.555 seconds even after an isolated census warmed
 the instance. The relation phases were 23.717/23.603 seconds. The full Pulse
 workload remains the target, not another admission-only or marginal query gate.
 No reserved spec was consumed (21 pending / 0 in progress / 19 consolidated).
+
+## Live profile: Health history work overlaps census
+
+A 40-second stack-only profile on PID 7896 captured 1992 samples, zero errors.
+The ordinary UI Refresh returned graph in 5.768 s and census in 24.944 s.
+Health returned in 2.532 s but its background work continued. Classification:
+1257 Health stacks, 244 census stacks, 58 graph-edge stacks, 433 other stacks;
+these are not additive wall-time/CPU percentages. Health included 466 JSON
+encoding leaf samples and 590 stacks through source enumeration. Census still
+spent substantial native work resolving relationship endpoints and validating
+storage paths; this profile does not excuse remaining Grafx costs.
+
+The relational cognitive history contains 290 base records plus 5134 revisions,
+approximately 53 MB of JSON payload characters. Community's revision decoder
+serialized every revision twice consecutively for identical fingerprint
+validation. It now uses the freshly computed DTO fingerprint for the storage
+comparison, eliminating 5134 redundant hashes without trusting stored digests
+or skipping superseded history. Core remains backend-agnostic and unchanged.
+Read-only comparison preserved all 5424 records and the final 290-record digest.
+Details, timing caveats and test evidence belong to Community
+`docs/KG_HEALTH_COGNITIVE_ENUMERATION_COST.md`.
+
+No health probe was disabled, no read participant was serialized, no authority
+cache introduced, and no reserved spec consumed. This is an integration cost
+reduction, not a claim that Grafx concurrency or the full UI workload is solved.

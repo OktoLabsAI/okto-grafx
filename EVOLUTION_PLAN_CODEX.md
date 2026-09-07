@@ -4429,3 +4429,28 @@ somados em sequência. Três transações no mesmo handle terminaram em 6,196 s:
 compartilhar handle isoladamente não reproduziu o residual de ~23 s observado
 nas relações da UI. Carga completa permanece pendente, sem atribuição prematura
 da causa. Evidências: `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
+
+### Perfil real: trabalho de Health sobreposto ao censo
+
+Captura curta do Refresh real: grafo 5,768 s, censo 24,944 s; sondagens de Health
+continuam após sua resposta. Das 1992 amostras, 1257 estavam em Health, incluindo
+466 folhas de codificação JSON. A enumeração cognitiva lê 290 bases e 5134
+revisões (~53 MB de payload), validando também o histórico substituído.
+
+No adaptador Community, eliminada uma serialização/hash redundante por revisão:
+o fingerprint recém-calculado pelo DTO é comparado com o persistido antes do
+retorno. Não há confiança no digest armazenado, cache, salto de histórico ou
+mudança no Core. Paridade read-only: 5424 registros e digest final idêntico.
+Documento Community: `docs/KG_HEALTH_COGNITIVE_ENUMERATION_COST.md`.
+
+O custo nativo restante de leitura de relações continua em escopo. A melhoria
+não demonstra resolução da carga completa e não cria gate marginal de timing.
+As specs reservadas não foram consolidadas; ledger cognitivo permanece intacto.
+
+Validação acumulada: 47 testes Community (adaptador/schema), 104 testes Core
+(port/rebuild sources) passaram, além do slice inicial sobreposto. Community
+`3e95746` foi enviado à branch e carregado no Pulse PID 2816 após fechamento
+gracioso do PID 7896. UI mostrou 500 → 1000 de 2779 nós; nova página com 500 IDs
+únicos, 897 relações e zero tabelas com falha. REST: 21 pendentes, zero em curso.
+Primeira carga pós-reinício ainda 41,276 s (grafo) / 60,643 s (censo), HTTP 200:
+não há alegação de ganho global ou conclusão do problema de carga fria.
