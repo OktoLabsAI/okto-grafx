@@ -123,3 +123,38 @@ Details, timing caveats and test evidence belong to Community
 No health probe was disabled, no read participant was serialized, no authority
 cache introduced, and no reserved spec consumed. This is an integration cost
 reduction, not a claim that Grafx concurrency or the full UI workload is solved.
+
+## Host restart and restored diagnostic baseline
+
+Windows reported `LastBootUpTime=2026-09-07 15:17:45` (local time). The running
+Pulse PID 2816 and its exec handle were gone, with neither service port listening.
+Two loose Git refs (`heads/feature/v0.0.4` and its origin tracking ref) contained
+41 zero bytes. The commit object and reflog were intact; `git ls-remote` confirmed
+`b117db7576db1b461d497caef3e017df32fea059`, and the worktree diff against that
+explicit object was empty. No claim is made about the cause of the host restart.
+
+The two malformed refs were preserved in the ignored private directory
+`.grafx-tmp/git-ref-recovery-20260907-151745/` and restored with `git update-ref`
+to the exact remote/reflog-confirmed commit. No checkout/reset, source replacement,
+graph reset or database repair was used. Pulse PID 24624 subsequently started
+with the same source paths. A read-only API check returned 50 nodes / 73 edges,
+69 layouts considered / 60 scanned / 9 skipped / zero failures. Both ports are
+listening; pending specs remain 21 / in progress 0 and the ledger hash is unchanged.
+
+A separate routed cProfile after restart localized the remaining native census
+cost: 8850 landing-view lookups reduced to 2960 identity resolutions through the
+existing memo. Those 2960 scalar exact-index views accounted for 5.061 s inside
+the 8.313 s profiled first batch (4.860 of 8.359 s in the second). These cumulative
+times include callees and cProfile overhead and must not be compared directly
+to uninstrumented UI timings. The private script still included the old duplicate
+layout during this capture (70 statements, sum 4425); it was corrected to 69
+unique layouts afterward. The production consumer remains corrected throughout.
+
+The next native candidate is bounded grouping of these endpoint validations
+inside the existing exact pre/post certificate mechanism, not retained authority
+across operations. Existing `validated_versions_many` provides full rows, whereas
+the vector-free identity landing path remains scalar. Any integration must retain
+snapshot visibility, both endpoint checks, owner overlays, bounded retention,
+vector-data validation, custom-hook fallback, whole-batch retry/refusal and query
+consumer semantics. This is a candidate for the already-open relation-read target,
+not a completed feature or a new acceptance/performance gate.

@@ -4454,3 +4454,18 @@ gracioso do PID 7896. UI mostrou 500 → 1000 de 2779 nós; nova página com 500
 únicos, 897 relações e zero tabelas com falha. REST: 21 pendentes, zero em curso.
 Primeira carga pós-reinício ainda 41,276 s (grafo) / 60,643 s (censo), HTTP 200:
 não há alegação de ganho global ou conclusão do problema de carga fria.
+
+### Retomada após reinício do host — 2026-09-07 15:17:45
+
+O reinício encerrou o Pulse e deixou duas refs Git preenchidas com zeros. Refs
+originais preservadas; restauração estrita ao commit `b117db7`, confirmado pelo
+remoto, reflog e objeto local, sem reset/checkout ou alteração do código/dados.
+Pulse retomado no PID 24624: API com 50 nós/73 relações e zero falhas; portas
+8100/8101 ativas, 21 specs pendentes e ledger inalterado.
+
+O perfil nativo/routed localizou 2960 validações escalares de identidade no
+censo, mesmo após hits do memo de endpoints. Próxima candidata dentro do alvo
+existente: agrupamento limitado dessas validações pelo mecanismo certificado
+já existente, preservando todos os contratos. Não é cache/bundle de autoridade
+entre operações, nem autorização para suprimir verificações. Evidências e
+ressalvas do script diagnóstico em `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
