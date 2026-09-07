@@ -4542,3 +4542,10 @@ nomes: escalar 0,324/0,331 s, lote 0,00888/0,01038 s, digest idêntico. O ganho
 nativo em uso; Health ainda domina amostras e censo sob carga segue alvo aberto.
 Detalhes: Community `docs/KG_RELATIONSHIP_LAYOUT_BATCHING.md`. Nenhuma spec
 reservada consumida; deploy de fonte separado de publicação/instalação de wheel.
+
+Deploy validado no PID 13084: HTTP 200, 500 nós/703 relações, censo 2779/4424 e
+zero falhas; paginação +500 IDs únicos/897 relações em 3,101 s, UI 1000/2779.
+A carga inicial ainda levou 41,543 s (grafo) / 28,770 s (censo), com 11,262 s já
+na fase de schema e 24,142 s na leitura inicial de nós do grafo. Portanto, não há
+alegação de ganho end-to-end: permanece aberta a investigação da admissão/leitura
+fria e da concorrência com Health. Evidências completas no relatório de censo.

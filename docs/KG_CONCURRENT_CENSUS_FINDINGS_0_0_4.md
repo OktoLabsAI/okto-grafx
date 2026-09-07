@@ -86,6 +86,25 @@ preserved its ordered digest: scalar 0.324/0.331 s versus batch 0.00888/0.01038 
 This removes repeated route work, not the larger residual Health/native cost.
 See Community `docs/KG_RELATIONSHIP_LAYOUT_BATCHING.md` for exact contracts.
 
+### Runtime validation of layout grouping
+
+Pulse PID 13084 now loads Community `c6a386e`. Previous PID 3944 closed its board
+and global graphs with zero failures. A launch attempted during shutdown exited
+before serving; the replacement was started only after confirmed terminal state.
+The measurement below began after the API reported startup complete.
+
+First Refresh: graph HTTP 200 in 41.543 s (500 nodes / 703 edges / zero failed
+layouts), stats HTTP 200 in 28.770 s (2779 nodes / 4424 edges / zero failed tables).
+Stats phases: schema 11.262 s, node sample 6.004 s, node counts 6.874 s, edge counts
+4.496 s. Graph phases: nodes 24.142 s, edges 16.973 s. The substantial cold cost
+already precedes layout mapping; these samples do not establish end-to-end gain.
+No timing gate was added and this residual remains open for diagnosis.
+
+Pagination added 500 unique IDs and 897 edges in 3.101 s, zero failures, UI
+1000 / total 2779. Specs ledger hash remains unchanged. The next investigation
+must isolate first-reader/schema/node admission and concurrent Health work,
+rather than extrapolate the isolated mapping improvement to the whole UI.
+
 ## Native isolation follow-up and consumer correction
 
 A separate native process opened three explicit read-only participants and
