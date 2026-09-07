@@ -468,6 +468,20 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
    `hof_4bb4dae3f00d45c792b6ab8fe807bd17` para reconciliar exclusivamente O1–O3 da sua revisão
    anterior e corrigir bloqueios concretos, se ainda existirem. Custos marginais não reabrem a
    rodada. Nenhuma nova lista exploratória foi acrescentada.
+18. **OIX residual fechado (`a52940d`):** O1 (segunda publicação do watermark no replay) é
+   custo marginal, sem correção selecionada; O3 é a semântica de visão capturada do registry,
+   atualizada após `execute`, `begin("read")` ou `verify`, não por `status()` isolado. O2 era
+   um bloqueio real para consumidores que exigem verificação limpa após crash: páginas COW
+   alocadas e nunca publicadas permaneciam como `page_unwritten`. A proposta inicial
+   `c20fa85` foi rejeitada porque escondia página alcançável zerada com cache quente. A revisão
+   `0d441f0`, integrada junto com a correção em um único commit, exige certificado fresco e
+   estável e verificação estrutural completa das árvores das duas raízes. Só a página não
+   escrita fora desse conjunto é isenta; qualquer falha de prova conserva todos os findings.
+   Header, raízes e artefatos hash não recebem a isenção. A regressão integrada de crash
+   ordenado, verifier, recovery público e chain-relink passou 152 testes; Ruff passou. A
+   verificação física deve usar `pages` ou `all`: o escopo `indexes` continua sendo o walk
+   lógico e não substitui a inspeção física com cache quente. Nenhum patch foi aplicado aos
+   dados do board; nenhuma operação de WAL, OCC, snapshot ou participação foi alterada.
 
 ## Explicit decision queue
 

@@ -249,7 +249,11 @@ prefix.
    matrix passed with the integrated ordered/index/query checkpoint: 96 cases on 2026-09-07.
    The same-snapshot real-board comparison returned identical first/second 500-node pages with
    657/512 examined candidates instead of 2,411 each in the canonical scan. Residual observations
-   O1–O3 from the prior review are being reconciled in a bounded handoff, not silently dismissed.
+   O1–O3 from the prior review were reconciled in the bounded handoff: O1 is a marginal replay
+   publication cost and O3 is the captured-registry contract. O2 is fixed in `a52940d`: unwritten
+   COW pages are exempt only behind a fresh, complete, stable proof of both recoverable trees;
+   missing/failed proof preserves all original findings. The integrated verifier/crash/recovery
+   slice passed 152 tests, including reachable damage under a warm handle.
 6. **OIX-4 — Pulse Community (implemented):** idempotent per-table index creation/migration,
    Community-only capability use (`40ed1a3`), 62 integration tests, and real API/UI validation.
    The 14 Discovery cards were also exercised after the native optional-hop addition. No live

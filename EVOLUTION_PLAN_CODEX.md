@@ -4114,3 +4114,10 @@ COW órfãs pós-crash e atualização da visão capturada do registry. A primei
 isenção por layout poderia ocultar uma página alcançável zerada em `verify("pages")` e
 `verify("all")`. A correção precisa provar inalcançabilidade por leitura física fresca e
 completa; falha ou prova parcial mantém a recusa original. Não se reabrem otimizações NO-GO.
+
+Fechamento do handoff: a revisão `0d441f0` foi aceita e integrada como `a52940d`, verificando
+as árvores de ambas as raízes recuperáveis e a estabilidade do certificado. A regressão
+integrada passou 152 testes de crash/verifier/recovery/chain-relink; páginas alcançáveis
+zeradas continuam diagnosticadas com cache quente em `pages`/`all`. O1 foi encerrado como
+custo marginal e O3 como comportamento documentado de visão capturada, sem alteração de
+protocolo. O escopo `indexes` sozinho não substitui a verificação física `pages`/`all`.
