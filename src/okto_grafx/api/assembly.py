@@ -438,11 +438,11 @@ def assemble_database(
                     attached_names.append(name)
             return newly_attached
 
-        def load_catalog_and_sync_existing_indexes() -> tuple[str, ...]:
-            """Interpret catalog bytes only after recovery has replayed their page images."""
+        def load_catalog() -> bool:
+            """Interpret proved catalog bytes before constructing catalog-dependent services."""
             nonlocal catalog_loaded
             if not catalog.is_bootstrapped():
-                return ()
+                return False
             if not catalog_loaded:
                 # Re-derive then adopt, the same non-destructive route recovery itself uses.
                 # When catalog pages were replayed this is an idempotent second reading; when
@@ -451,6 +451,12 @@ def assemble_database(
                 # unsaved changes must never be discarded by a later callback.
                 catalog.adopt(catalog.read_from_pages())
                 catalog_loaded = True
+            return True
+
+        def load_catalog_and_sync_existing_indexes() -> tuple[str, ...]:
+            """Load then adopt the existing baseline required by writable recovery."""
+            if not load_catalog():
+                return ()
             # Existing files form the only baseline recovery may certify. Creating an empty
             # index from a retained WAL suffix would turn absence into a silently short path.
             return sync_indexes(existing_only=True)
@@ -478,7 +484,12 @@ def assemble_database(
         if config.read_only:
             recovery.require_read_only_consistent()
             _require_published_stores(catalog, heap)
-            load_catalog_and_sync_existing_indexes()
+            # No redo runs on this path. The manager constructor needs the catalog
+            # capability flags but does not consume index artifacts. Adopt those
+            # once at the existing final read-only sync below, not twice around a
+            # constructor that only wires transaction state. Recovery's callback
+            # and all later transaction-level synchronization remain unchanged.
+            load_catalog()
             report = None
         else:
             report = recovery.run()

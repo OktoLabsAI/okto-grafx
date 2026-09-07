@@ -4377,3 +4377,21 @@ Carregado no Pulse PID 15796 e testado via browser: 500 → 1000 → 1500 nós,
 total 2779; terceira página com 500 IDs únicos, 753 relações, zero falhas, 1,591 s.
 Carga fria 30,930 s e censo 43,558 s: continuam pendentes, sem alegação de ganho
 global. 21 specs reservadas, nenhuma em andamento e ledger inalterado.
+
+### Abertura read-only — adoção única dos índices
+
+Removida a adoção duplicada dos índices durante `connect(read_only=True)`.
+O catálogo continua carregado antes da construção do gerenciador transacional;
+todos os índices continuam validados no ponto final de admissão. Recovery
+writable, criação cercada por lock, sincronizações posteriores, snapshots,
+OCC/WAL e recusa de corrupção permanecem. Sem cache de autoridade ou nova opção.
+
+Na amostra real read-only, 366 adoções passaram a 183 (mesmos 183 índices).
+Medianas de abertura 1,479 → 1,242 s (~16% nessa amostra, não no carregamento
+completo do KG). Slices de 15 e 57 testes passaram, com sobreposição, mais um
+teste específico de DDL estrangeiro; Ruff passou. Documento e fronteiras:
+`docs/READ_ONLY_SINGLE_ADOPTION_0_0_4.md`.
+
+Implementação validada em fonte e em novas conexões diagnósticas; ainda não
+carregada pelo Pulse PID 15796, reservada ao próximo deploy acumulado. Nenhuma
+spec consumida. A carga fria completa continua pendente, sem novo gate de timing.

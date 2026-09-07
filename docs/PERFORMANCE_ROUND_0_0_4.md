@@ -609,3 +609,13 @@ The native change was loaded in Pulse PID 15796 and pagination reached 1500 node
 with zero failed edge tables; total cold UI latency remains unresolved.
 See `docs/RELATIONSHIP_SCAN_VECTOR_FREE_0_0_4.md` for safety, limitations and live
 evidence. No spec was consolidated and no authority-cache initiative was added.
+
+Cold admission then exposed a duplicate exact-index adoption around the
+TransactionManager constructor. Read-only assembly now loads the catalog first
+and performs one full adoption at the existing final admission point. Writable
+recovery and later foreign-DDL synchronization retain their existing callbacks.
+The real-board sample reduced 366 adoptions to 183 with opening medians
+1.479 → 1.242 s; this is not an end-to-end UI speedup claim. Startup/read-only
+slices passed (15 and 57, overlapping), plus a targeted foreign-DDL test.
+See `docs/READ_ONLY_SINGLE_ADOPTION_0_0_4.md`. Queue this change for accumulated
+Pulse deployment; PID 15796 is not claimed to have loaded it yet.
