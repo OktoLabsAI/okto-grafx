@@ -24,6 +24,7 @@ Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 | Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a5a5c3c`; carregados no Pulse PID 23228, 500/2779 nós pela UI e ledger cognitivo preservado. |
 | Two-hop: montagem limitada ao resultado | Community `7559ba7`, 25 testes; deploy acumulado concluído. Consultas por layout continuam residuais, não foram declaradas eliminadas. |
 | Identidade/proveniência por source ref | Bootstrap e certificação estrita integrados em Community `a5a5c3c`; 11 índices ativos. No board, Entity: 953 scans → 1 candidato; Decision: 203 → 1, resultados idênticos. |
+| Preparação local de proveniência | Core elimina varreduras repetidas da lista de arestas por candidato, mantendo fallback correto para colisão de ID; 24 testes passaram. Aguarda deploy acumulado, sem consolidação ao vivo. |
 | Latência completa fria / custo completo de escrita | Não encerrados por medições isoladas. O acesso por source ref está entregue; o custo integral de escrita e manutenção dos índices ainda requer benchmark reservado, sem consumir specs nesta etapa. |
 | Corpus reservado | 21 specs pendentes, zero em progresso; não consolidar, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
 | Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |
@@ -39,6 +40,14 @@ fontes, não uma nova instalação global/publicação. Detalhes, testes, limite
 medições e recuperação automática de admissão no Community:
 `docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`. Permanecem as frentes já registradas de
 latência fria/custo integral de escrita e os planos globais, sem criar novos gates.
+
+Medição isolada posterior: lotes nativos sintéticos de 4 nós/8 arestas em cópias
+quiescentes mantiveram commits em 49–57 ms; acesso por origem caiu de 106–109 ms
+para 2–4 ms, enquanto checkpoint explícito custou 653–763 ms. Verificação integral
+e reabertura passaram, com pares de arestas idênticos. A instrumentação revelou
+um custo quadrático do estimador de memória quando métricas estão habilitadas;
+não foi atribuído ao runtime do Pulse nem corrigido mediante omissão de checks.
+Evidência e limites em `docs/SOURCE_REFERENCE_WRITE_COST_0_0_4.md`.
 
 ## Histórico de execução — checkpoint iniciado em 2026-09-06
 

@@ -36,6 +36,18 @@ consolidation or repair replay was triggered. Details and timing limitations:
 Community `docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`. Full cold latency/write cost
 remain the previously recorded residual scope, not new exploratory gates.
 
+Isolated write-attribution follow-up: source seeks also improve a native write
+transaction (106–109 ms to 2–4 ms); four-node/eight-edge durable commits remain
+49–57 ms in the small noop-metrics samples, with explicit checkpoints 653–763 ms.
+Both private copies pass full verification and cold exact edge-pair parity. This
+does not certify full Pulse consolidation latency. The instrumented variant
+exposed quadratic aggregate retained-memory telemetry work; retain this finding
+in the existing attribution scope, without a new timing gate or weakening the
+diagnostic/authority contract. Core provenance batch membership now avoids its
+own repeated O(C*E+C²) edge scans on ordinary batches, preserving re-indexing on
+generated-ID collisions; 24 tests passed. Awaiting accumulated deployment.
+See `docs/SOURCE_REFERENCE_WRITE_COST_0_0_4.md` for all boundaries and evidence.
+
 Base: `ea4b5ff` (`0.0.3`)
 
 Package version: `0.0.4`
