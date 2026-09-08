@@ -21,6 +21,14 @@ provas pré/pós-flush. 73 testes passaram; inventário privado de 2.253 víncul
 Implementação ainda não carregada no Pulse ativo; não houve nova consolidação.
 Detalhes no Core: `docs/GLOBAL_DELIVERY_EDGE_INVENTORY.md`.
 
+Atribuição posterior em cópias privadas: inventários/metadados do Board abaixo de
+1 s por fase; inventários de arestas Global em 4,778/4,698 s. O perfil encontrou
+repetição de buckets nas resoluções de destino. As APIs nativas em lote passaram
+a percorrer cada bucket solicitado uma vez, mantendo provas de heap/certificado;
+256 identidades: 512 → 128 pins de buckets, respostas idênticas. Integrar o lote
+ao destino escalar da consulta Global continua pendente, sem declarar os 131 s
+resolvidos. Fonte apenas, sem nova spec: `docs/GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md`.
+
 Este resumo prevalece sobre os checkpoints cronológicos abaixo; eles ficam
 preservados como evidência, não como novas filas ou dependências ativas do Claude.
 Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.

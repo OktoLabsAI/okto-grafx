@@ -2684,6 +2684,38 @@ class IndexStore:
         )
         return found
 
+    def _candidate_groups_unchecked(
+        self, keys: Sequence[bytes],
+    ) -> Iterator[tuple[bytes, tuple[IndexEntry, ...]]]:
+        """Walk each requested hash bucket once within the caller's stable view.
+
+        Only candidate work is shared, never a visibility answer or certificate.
+        Each key retains chain/slot order. Groups may be visited in bucket order;
+        callers restore input order only after all heap proofs and the post-fence.
+        Specialized stores and scalar hooks retain their original access path.
+        """
+        if (
+            type(self) is not HashIndex
+            or getattr(self._candidates_unchecked, "__func__", None) is not _BATCH_CANONICAL_CANDIDATES
+            or getattr(self._scan_bucket, "__func__", None) is not _BATCH_CANONICAL_BUCKET_SCAN
+        ):
+            for key in keys:
+                yield key, self._candidates_unchecked(key)
+            return
+        buckets: dict[int, list[bytes]] = {}
+        for key in keys:
+            buckets.setdefault(bucket_of(key, self._definition.bucket_count), []).append(key)
+        for bucket, wanted in buckets.items():
+            if len(wanted) == 1:
+                yield wanted[0], self._candidates_unchecked(wanted[0])
+                continue
+            _pages, entries = self._scan_bucket(bucket, keys=frozenset(wanted))
+            groups: dict[bytes, list[IndexEntry]] = {key: [] for key in wanted}
+            for entry in entries:
+                groups[entry.key].append(entry)
+            for key in wanted:
+                yield key, tuple(groups.pop(key))
+
     def walk(self) -> tuple[IndexEntry, ...]:
         """Return every stored entry of this index, bucket by bucket.
 
@@ -3696,6 +3728,7 @@ class IndexStore:
         ref: RecordRef | None = None,
         *,
         first_matching_page: bool = False,
+        keys: frozenset[bytes] | None = None,
     ) -> tuple[tuple[PageIndex, ...], tuple[IndexEntry, ...]]:
         """Validate one chain and optionally collect matches during that same page pass.
 
@@ -3760,6 +3793,16 @@ class IndexStore:
                         # with a match, while its preceding chain walk still validated every
                         # page type/link. Preserve that bounded work and error surface exactly.
                         matching_complete = True
+                elif keys is not None:
+                    for slot, image in page.iter_slot_views():
+                        raw, encoded_ref, born, dead, versioned = _validated_image(image)
+                        stored_key = bytes(raw[INDEX_ENTRY_HEADER_SIZE:])
+                        if stored_key in keys:
+                            matches.append(IndexEntry(
+                                key=stored_key, ref=RecordRef.decode(encoded_ref),
+                                versioned=versioned, born_csn=born, dead_csn=dead,
+                                page=index, slot=slot,
+                            ))
                 following = page.next_page
             pages.append(index)
             index = following
@@ -3884,6 +3927,10 @@ class IndexStore:
                 index=self.name,
             )
         return txn_id
+
+
+_BATCH_CANONICAL_CANDIDATES = IndexStore._candidates_unchecked
+_BATCH_CANONICAL_BUCKET_SCAN = IndexStore._scan_bucket
 
 
 class HashIndex(IndexStore):
@@ -7269,9 +7316,9 @@ class IndexManager:
         def confirm(certificate: _IndexReadCertificate) -> tuple[int, ...]:
             self._prepare_heap_view(index.file, certificate)
             answers: dict[bytes, int] = {}
-            for wanted in distinct:
+            for wanted, candidates in index._candidate_groups_unchecked(distinct):
                 count = 0
-                for entry in index._candidates_unchecked(wanted):
+                for entry in candidates:
                     version = self._heap.read_landing(entry.ref)
                     if version.table_id != definition.table_id:
                         raise GrafxCorruptionDetected(
@@ -7432,9 +7479,9 @@ class IndexManager:
         self._prepare_heap_view(index.file, certificate)
         definition = index.definition
         answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
-        for wanted in distinct:
+        for wanted, candidates in index._candidate_groups_unchecked(distinct):
             accepted: list[tuple[RecordRef, HeapVersion]] = []
-            for entry in index._candidates_unchecked(wanted):
+            for entry in candidates:
                 version = self._heap.read(entry.ref)
                 if version.table_id != definition.table_id:
                     raise GrafxCorruptionDetected(

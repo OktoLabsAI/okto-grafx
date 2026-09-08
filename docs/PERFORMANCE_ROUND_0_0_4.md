@@ -745,3 +745,17 @@ verification reports remained identical. Combined tests: 701 passed in 34.57 s.
 No wall-time gain is claimed (13.327/15.163 s with concurrent tests), and no
 marginal gate was repeated. Source-only, queued for accumulated deployment;
 20 reserved specs untouched. See `VERIFICATION_RETAINED_HISTORY_0_0_4.md`.
+
+### Global batch bucket traversal — 2026-09-08
+
+Core 9e91ea9 replaces per-digest O(S*E) edge counting with a fresh call-local
+O(S+E) projection (73 tests). Private attribution then found Global outgoing and
+inbound inventories at 4.778/4.698 s, while Board read phases stayed below 1 s.
+The native profile identifies repeated bucket work during scalar identity landings.
+Existing native many-key APIs now share each requested bucket walk within their
+unchanged stable view; all candidate heap checks and full-batch retries remain.
+A private 256-key count batch preserved answers with 512 -> 128 bucket pins.
+This primitive also serves existing PK batches and relationship counts, but the
+profiled scalar-destination Global query still needs bounded batch integration.
+No total-delivery speedup, live deployment or extra consolidation is claimed.
+Details: `GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md`.
