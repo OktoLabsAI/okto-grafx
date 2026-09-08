@@ -167,3 +167,67 @@ def test_valid_catalog_horizon_survives_later_schema_change(include_legacy: bool
     redo.apply(replay, _preflighted=proof)
     assert store.read_from_pages().serialize() == value.serialize()
     assert redo.apply(replay).page_images_applied == 0
+
+
+@pytest.mark.parametrize("floor", [0, 1000, 1999])
+@pytest.mark.parametrize("door", ["preflight", "apply"])
+def test_post_checkpoint_activation_needs_its_own_schema_snapshot(floor: int, door: str) -> None:
+    pool, _store, images = staged(catalog(2000), 3000)
+    # A COMMIT envelope at the alleged activation is insufficient without its
+    # schema images; a later snapshot must not retroactively supply those effects.
+    replay = committed_replay((*records((), 2000), *records(images, 3000)))
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        getattr(CommitRedo(pool), door)(replay, _checkpoint_lsn=floor)
+    assert failure.value.details["field"] == "commit_catalog_activation"
+
+
+@pytest.mark.parametrize("floor", [2000, 2500])
+def test_checkpointed_activation_does_not_require_recycled_activation_wal(floor: int) -> None:
+    value = catalog(2000)
+    pool, store, images = staged(value, 3000)
+    replay = committed_replay(records(images, 3000))
+    redo = CommitRedo(pool)
+    passage = object()
+    proof = redo.preflight(replay, _checkpoint_lsn=floor, _passage=passage)
+    projected = redo._project_page_preflight(replay, replay, proof,
+        allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=floor)
+    assert projected is not None
+    redo.apply(replay, _preflighted=projected, _passage=passage, _checkpoint_lsn=floor)
+    assert store.read_from_pages().serialize() == value.serialize()
+
+
+@pytest.mark.parametrize("floor", [True, -1, 1.5, 3000, 4000])
+def test_invalid_or_overlapping_checkpoint_refuses_before_page_decoding(floor: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    pool, _store, images = staged(catalog(None), 3000)
+    replay = committed_replay(records(images, 3000))
+
+    def forbidden_decode(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Checkpoint admission must precede page decoding.")
+
+    monkeypatch.setattr("okto_grafx.engine.commit_redo.decode_page_write", forbidden_decode)
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        CommitRedo(pool).preflight(replay, _checkpoint_lsn=floor)  # type: ignore[arg-type]
+    assert failure.value.details["field"] == "checkpoint_lsn"
+
+
+@pytest.mark.parametrize("door", ["verify", "ensure", "project", "apply"])
+def test_preflight_cannot_be_reused_under_a_different_checkpoint(door: str) -> None:
+    pool, _store, images = staged(catalog(2000), 3000)
+    replay = committed_replay(records(images, 3000))
+    redo = CommitRedo(pool)
+    passage = object()
+    proof = redo.preflight(replay, _checkpoint_lsn=2000, _passage=passage)
+    if door == "verify":
+        assert redo._verify_preflight_for(replay, proof,
+            allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=0) is None
+    elif door == "project":
+        assert redo._project_page_preflight(replay, replay, proof,
+            allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=0) is None
+    else:
+        with pytest.raises(GrafxRecoveryRefused) as failure:
+            if door == "ensure":
+                redo._ensure_preflight(replay, proof,
+                    allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=0)
+            else:
+                redo.apply(replay, _preflighted=proof, _passage=passage, _checkpoint_lsn=0)
+        assert failure.value.details["field"] == "commit_catalog_activation"

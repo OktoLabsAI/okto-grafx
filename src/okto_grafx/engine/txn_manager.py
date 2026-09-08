@@ -4291,12 +4291,14 @@ class TransactionManager:
             replay,
             allow_unregistered_indexes=touched_catalog,
             _passage=redo_passage,
+            _checkpoint_lsn=checkpoint,
         )
         verified_full_preflight = self._commit_redo._verify_preflight_for(
             replay,
             full_preflight,
             allow_unregistered_indexes=touched_catalog,
             passage=redo_passage,
+            checkpoint_lsn=checkpoint,
         )
         if verified_full_preflight is not None:
             full_preflight = verified_full_preflight
@@ -4320,6 +4322,7 @@ class TransactionManager:
                 full_preflight,
                 allow_unregistered_indexes=touched_catalog,
                 passage=redo_passage,
+                checkpoint_lsn=checkpoint,
             )
             if page_preflight is None:
                 raise GrafxRecoveryRefused(
@@ -4330,6 +4333,7 @@ class TransactionManager:
                 page_replay,
                 _preflighted=page_preflight,
                 _passage=redo_passage,
+                _checkpoint_lsn=checkpoint,
             )
         if touched_catalog:
             self._catalog.adopt(self._catalog.read_from_pages())
@@ -4353,7 +4357,7 @@ class TransactionManager:
             manager.check_replay_floor(checkpoint, watermarks=watermarks)
         index_result = None
         if not skip_reapply:
-            index_result = self._commit_redo.apply(index_replay)
+            index_result = self._commit_redo.apply(index_replay, _checkpoint_lsn=checkpoint)
             assert page_result is not None
             for result in (page_result, index_result):
                 self._commit_redo.flush(result)

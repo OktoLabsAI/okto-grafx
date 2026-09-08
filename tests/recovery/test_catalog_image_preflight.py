@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
-from okto_grafx.domain.errors import GrafxCorruptionDetected
+from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxRecoveryRefused
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.page import Page
 from okto_grafx.domain.txn.commit_record import CommitPayload
@@ -15,10 +15,11 @@ from okto_grafx.engine.commit_state_store import CommitStateStore
 from .conftest import CATALOG_FILE, DESCRIPTOR, Stack, build_stack
 
 
-def append_activation(stack: Stack, *, omit: int | None = None) -> tuple[Catalog, tuple[tuple[int, bytes], ...], int]:
+def append_activation(stack: Stack, *, omit: int | None = None, horizon_override: int | None = None) -> tuple[Catalog, tuple[tuple[int, bytes], ...], int]:
     """Emit a durable real batch, optionally missing one otherwise valid image."""
     def batch(sequence: int) -> tuple[Catalog, tuple[tuple[int, bytes], ...], list[WalRecord]]:
-        value = stack.catalog.read_from_pages().upgrade_index_catalog().enable_commit_catalog(sequence)
+        horizon = sequence if horizon_override is None else horizon_override
+        value = stack.catalog.read_from_pages().upgrade_index_catalog().enable_commit_catalog(horizon)
         images = []
         records = []
         for index, raw in stack.catalog.stage(value):
@@ -68,6 +69,23 @@ def test_native_activation_recovery_across_every_two_page_apply_cut(stack: Stack
     again = build_stack(storage, bootstrap=False)
     again.recovery().run()
     assert again.catalog.read_from_pages().serialize() == value.serialize()
+    assert stored_bytes(storage) == before
+
+
+@pytest.mark.parametrize("already_applied", [False, True])
+def test_native_recovery_rejects_activation_invented_after_checkpoint(stack: Stack, already_applied: bool) -> None:
+    _value, images, terminal = append_activation(stack, horizon_override=2)
+    assert terminal > 2  # 2 is a page effect, not a historical activation COMMIT.
+    storage = stack.storage
+    assert isinstance(storage, MemoryStorageDevice)
+    if already_applied:
+        for index, raw in images:
+            storage.write_page(CATALOG_FILE, index, raw)
+    reopened = build_stack(storage, bootstrap=False)
+    before = stored_bytes(storage)
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        reopened.recovery().run()
+    assert failure.value.details["field"] == "commit_catalog_activation"
     assert stored_bytes(storage) == before
 
 

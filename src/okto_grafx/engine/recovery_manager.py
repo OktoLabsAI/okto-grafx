@@ -736,7 +736,7 @@ class RecoveryManager:
         # must not leave either an applied page prefix or unrelated control/index publication
         # behind merely because static validation used to live inside the later redo step.
         preflighted, preflight_touched_catalog = self._preflight_committed_replay(
-            replay, permit
+            replay, permit, checkpoint_lsn=state.checkpoint_lsn
         )
         replay_floor_watermarks = None
         if manager is not None and not state_was_damaged:
@@ -1409,7 +1409,7 @@ class RecoveryManager:
             )
 
     def _preflight_committed_replay(
-        self, replay: CommittedReplay, permit: _RecoveryPermit
+        self, replay: CommittedReplay, permit: _RecoveryPermit, *, checkpoint_lsn: Lsn
     ) -> tuple[object, bool]:
         """Validate every committed effect before recovery performs its first mutation.
 
@@ -1431,6 +1431,7 @@ class RecoveryManager:
             replay,
             allow_unregistered_indexes=touched_catalog,
             _passage=permit,
+            _checkpoint_lsn=checkpoint_lsn,
         )
         return proof, touched_catalog
 
@@ -1498,6 +1499,7 @@ class RecoveryManager:
             preflighted,
             allow_unregistered_indexes=preflight_touched_catalog,
             passage=permit,
+            checkpoint_lsn=state.checkpoint_lsn,
         )
         touched_catalog = preflight_touched_catalog
         page_preflight = self._redo_engine._project_page_preflight(
@@ -1506,6 +1508,7 @@ class RecoveryManager:
             full_preflight,
             allow_unregistered_indexes=touched_catalog,
             passage=permit,
+            checkpoint_lsn=state.checkpoint_lsn,
         )
         if page_preflight is None:
             raise GrafxRecoveryRefused(
@@ -1525,6 +1528,7 @@ class RecoveryManager:
             page_replay,
             _preflighted=page_preflight,
             _passage=permit,
+            _checkpoint_lsn=state.checkpoint_lsn,
         )
         if touched_catalog:
             self._adopt_catalog(findings)
@@ -1544,7 +1548,7 @@ class RecoveryManager:
                 persist_stale=self._policy != POLICY_REFUSE,
                 watermarks=watermarks,
             )
-        index_result = self._redo_engine.apply(index_replay)
+        index_result = self._redo_engine.apply(index_replay, _checkpoint_lsn=state.checkpoint_lsn)
 
         # Make every replayed heap/catalog/index effect visible to the device before certifying
         # derived indexes. If a data flush fails, no fresh header may get ahead of the data it

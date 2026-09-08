@@ -17,7 +17,7 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxRecoveryRefused,
 )
-from okto_grafx.domain.ids import Lsn, NO_LSN
+from okto_grafx.domain.ids import Lsn, NO_LSN, PROVISIONAL_CSN
 from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
@@ -97,6 +97,7 @@ class _PreflightedReplay:
     commit_records: tuple[WalRecord, ...]
     commit_signature: tuple[tuple[object, ...], ...]
     last_committed_lsn: Lsn
+    checkpoint_lsn: Lsn | None
     allow_unregistered_indexes: bool
     allow_page_coalescing: bool
     record_signature: tuple[tuple[object, ...], ...]
@@ -130,6 +131,7 @@ class CommitRedo:
         *,
         _preflighted: object | None = None,
         _passage: object | None = None,
+        _checkpoint_lsn: Lsn | None = None,
     ) -> CommitRedoResult:
         """Apply ``replay.effects`` in order, leaving durability publication to the caller.
 
@@ -150,18 +152,20 @@ class CommitRedo:
             _preflighted,
             allow_unregistered_indexes=False,
             passage=_passage,
+            checkpoint_lsn=_checkpoint_lsn,
         )
         if proof is not None:
             prepared_pages = proof.prepared_pages
         else:
             validate_commit_boundaries(replay)
+            self._validate_replay_floor(replay, _checkpoint_lsn)
             commit_records = replay.commit_records
             commit_signature = self._record_signature(commit_records)
             prepared_pages, _signature, _contains_index_reset = self._preflight(
                 replay.effects,
                 allow_unregistered_indexes=False,
             )
-            self._validate_catalog_transitions(replay, prepared_pages)
+            self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
             self._require_unchanged_commit_records(replay, commit_records, commit_signature)
 
         pages_applied = 0
@@ -278,6 +282,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool = False,
         _passage: object | None = None,
+        _checkpoint_lsn: Lsn | None = None,
     ) -> object:
         """Validate a complete dispatch plan without applying any of its effects.
 
@@ -300,13 +305,14 @@ class CommitRedo:
                 value=type(allow_unregistered_indexes).__name__,
             )
         validate_commit_boundaries(replay)
+        self._validate_replay_floor(replay, _checkpoint_lsn)
         commit_records = replay.commit_records
         commit_signature = self._record_signature(commit_records)
         prepared_pages, signature, contains_index_reset = self._preflight(
             replay.effects,
             allow_unregistered_indexes=allow_unregistered_indexes,
         )
-        self._validate_catalog_transitions(replay, prepared_pages)
+        self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
         self._require_unchanged_commit_records(replay, commit_records, commit_signature)
         return _PreflightedReplay(
             seal=_PREFLIGHT_SEAL,
@@ -318,6 +324,7 @@ class CommitRedo:
             commit_records=commit_records,
             commit_signature=commit_signature,
             last_committed_lsn=replay.last_committed_lsn,
+            checkpoint_lsn=_checkpoint_lsn,
             allow_unregistered_indexes=allow_unregistered_indexes,
             allow_page_coalescing=len(prepared_pages) == len(replay.effects),
             record_signature=signature,
@@ -326,16 +333,36 @@ class CommitRedo:
             prepared_pages=prepared_pages,
         )
 
+    @staticmethod
+    def _validate_replay_floor(replay: CommittedReplay, checkpoint_lsn: Lsn | None) -> None:
+        """Bind native replay to its caller-proved checkpoint, before decoding or I/O."""
+        if checkpoint_lsn is None:
+            return
+        if type(checkpoint_lsn) is not int or not 0 <= checkpoint_lsn < PROVISIONAL_CSN:
+            raise GrafxRecoveryRefused("Invalid replay checkpoint.", field="checkpoint_lsn")
+        if (
+            replay.commit_records and replay.commit_records[0].lsn <= checkpoint_lsn
+            or not replay.commit_records and (
+                replay.effects or replay.last_committed_lsn not in {0, checkpoint_lsn}
+            )
+        ):
+            raise GrafxRecoveryRefused(
+                "Replay COMMIT boundaries do not start strictly after the checkpoint.",
+                field="checkpoint_lsn", checkpoint_lsn=checkpoint_lsn,
+            )
+
     def _validate_catalog_transitions(
         self, replay: CommittedReplay,
         prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
+        *, checkpoint_lsn: Lsn | None = None,
     ) -> None:
         """Prove complete schema-catalog snapshots before native replay can mutate.
 
         Legacy hand-composed effect-only plans retain the dispatcher contract;
         actual WAL selectors provide terminal records. Missing physical tails
         cannot supply a missing catalog image. This does not authorize journal
-        pages or establish activation relative to the prior durable control.
+        pages. With a caller-proved checkpoint, an activation after that floor
+        must be introduced by its own complete schema snapshot in this range.
         """
         if not replay.commit_records:
             return
@@ -356,6 +383,8 @@ class CommitRedo:
             horizon = catalog.commit_catalog_activation
             if (
                 horizon is not None and horizon > terminal.lsn
+                or not seen and checkpoint_lsn is not None and horizon is not None
+                and checkpoint_lsn < horizon != terminal.lsn
                 or seen and previous_horizon is not None and horizon != previous_horizon
                 or seen and previous_horizon is None and horizon is not None and horizon != terminal.lsn
             ):
@@ -373,6 +402,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object,
+        checkpoint_lsn: Lsn | None = None,
     ) -> object | None:
         """Consume one exact proof once so later private facts need no second decode.
 
@@ -385,6 +415,7 @@ class CommitRedo:
             preflighted,
             allow_unregistered_indexes=allow_unregistered_indexes,
             passage=passage,
+            checkpoint_lsn=checkpoint_lsn,
         )
         return None if compatible is None else self._verified_preflight(compatible)
 
@@ -466,6 +497,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object,
+        checkpoint_lsn: Lsn | None = None,
     ) -> object:
         """Return a compatible proof, performing the full preflight when necessary."""
         compatible = self._compatible_preflight(
@@ -473,6 +505,7 @@ class CommitRedo:
             preflighted,
             allow_unregistered_indexes=allow_unregistered_indexes,
             passage=passage,
+            checkpoint_lsn=checkpoint_lsn,
         )
         if compatible is not None:
             return self._verified_preflight(compatible)
@@ -480,6 +513,7 @@ class CommitRedo:
             replay,
             allow_unregistered_indexes=allow_unregistered_indexes,
             _passage=passage,
+            _checkpoint_lsn=checkpoint_lsn,
         )
         assert isinstance(fresh, _PreflightedReplay)
         return self._verified_preflight(fresh)
@@ -492,6 +526,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object,
+        checkpoint_lsn: Lsn | None = None,
     ) -> object | None:
         """Project a valid full proof onto its exact all-page subplan without decoding again."""
         source = self._compatible_preflight(
@@ -499,6 +534,7 @@ class CommitRedo:
             preflighted,
             allow_unregistered_indexes=allow_unregistered_indexes,
             passage=passage,
+            checkpoint_lsn=checkpoint_lsn,
         )
         if source is None:
             return None
@@ -526,6 +562,7 @@ class CommitRedo:
             commit_records=page_replay.commit_records,
             commit_signature=source.commit_signature,
             last_committed_lsn=page_replay.last_committed_lsn,
+            checkpoint_lsn=source.checkpoint_lsn,
             allow_unregistered_indexes=False,
             allow_page_coalescing=source.allow_page_coalescing,
             record_signature=tuple(
@@ -544,6 +581,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object | None,
+        checkpoint_lsn: Lsn | None = None,
     ) -> _PreflightedReplay | None:
         """Return a genuine exact proof or None so the caller revalidates normally."""
         if (
@@ -559,6 +597,8 @@ class CommitRedo:
             or preflighted.incomplete_effects is not replay.incomplete_effects
             or preflighted.commit_records is not replay.commit_records
             or preflighted.last_committed_lsn != replay.last_committed_lsn
+            or preflighted.checkpoint_lsn != checkpoint_lsn
+            or checkpoint_lsn is not None and type(checkpoint_lsn) is not int
         ):
             return None
         if (
@@ -587,6 +627,7 @@ class CommitRedo:
             commit_records=proof.commit_records,
             commit_signature=proof.commit_signature,
             last_committed_lsn=proof.last_committed_lsn,
+            checkpoint_lsn=proof.checkpoint_lsn,
             allow_unregistered_indexes=proof.allow_unregistered_indexes,
             allow_page_coalescing=proof.allow_page_coalescing,
             record_signature=proof.record_signature,

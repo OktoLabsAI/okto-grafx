@@ -16,8 +16,10 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import PROVISIONAL_CSN
 from okto_grafx.domain.model.catalog import Catalog, COMMIT_CATALOG_V1_CAPABILITY
 from okto_grafx.domain.page.checksum import crc32c
+from okto_grafx.domain.recovery.decision import CommittedReplay
 from okto_grafx.domain.wal.record import WalRecordType
 from okto_grafx.engine.database import Database
+from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.wal_manager import WalManager
 
@@ -235,3 +237,32 @@ def test_pre_append_failure_can_rebind_the_same_uncommitted_activation(tmp_path:
         txn.commit()
         assert database._catalog.catalog.commit_catalog_activation == txn._context.commit_csn
         assert database._transactions._commit_catalog_activation_plans == {}
+
+
+def test_public_checkpoint_anchors_activation_and_reopens_at_new_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "db"
+    with connect(root, page_size=512, wal_segment_bytes=512) as database:
+        database.ensure_identity_indexes()
+        database.checkpoint()
+        floor = database._transactions._commit_state_store.read().checkpoint_lsn
+        assert floor > 0
+        horizon = activate(database)
+        assert horizon > floor
+        observed: list[tuple[object, int]] = []
+        original = CommitRedo.preflight
+
+        def observe(redo: CommitRedo, replay: CommittedReplay, **kwargs: object) -> object:
+            observed.append((kwargs.get("_checkpoint_lsn"), len(replay.effects)))
+            return original(redo, replay, **kwargs)  # type: ignore[arg-type]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(CommitRedo, "preflight", observe)
+            database.checkpoint()
+        assert observed and observed[0][0] == floor
+        assert any(count for _value, count in observed)
+        assert all(value == floor for value, count in observed if count)
+        assert all(value in {floor, horizon} for value, _count in observed)
+        assert database._transactions._commit_state_store.read().checkpoint_lsn == horizon
+    with connect(root, page_size=512, wal_segment_bytes=512) as database:
+        assert database._catalog.catalog.commit_catalog_activation == horizon
+        assert database._transactions._commit_state_store.read().checkpoint_lsn == horizon
