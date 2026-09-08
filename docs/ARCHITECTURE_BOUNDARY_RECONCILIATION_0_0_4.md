@@ -334,3 +334,39 @@ the remaining mechanism import prohibitions were not relaxed. This is not proof
 that every evolution requirement is complete, nor a new real-spec latency result.
 Source-only until accumulated deployment: Pulse remains on installed a82d3bf,
 with no restart, graph mutation, recovery/redrive or consumption of reserved specs.
+
+## Accumulated installed-wheel deployment — 2026-09-08
+
+The source-only checkpoint above is now deployed: **Grafx 0.0.4@9b41f36**,
+wheel SHA-256 `93DE9672912947DD933BB603634368603B25D5248CBDAC394EC30BB479129EAF`.
+Before replacing the package, an isolated wheel installation passed **79 tests in
+1.35 s** (encoding proofs/composition, both index contexts, two-slot controls and
+WAL port shape), importing from that installed target rather than source. Strict
+markers and the 60-second thread timeout remained enabled.
+
+Pulse PID 34048 shut down gracefully; its owning execution handle reached terminal
+exit 1, the PID disappeared and both listening ports were free before replacement.
+The wheel was installed into Python 3.13's user environment, with NumPy 2.5.2 and
+google-crc32c 1.8.0 retained. Twelve installed module hashes match source exactly.
+Pulse **0.3.3 PID 28232** now serves 8100/8101, using unchanged Core code `9e91ea9`
+and Community checkout `7158383`; Grafx is imported from the installed package,
+not injected from its source tree. HTTP root returned 200.
+
+Authenticated MCP schema inspection and canonical readback succeeded: the five
+Alternative/Decision rows are exactly equal before/after. The readback took
+0.144 s MCP / 54.2 ms executor; this is a readiness sample, not a speedup claim.
+All 20 pending projections and the entire 40-item ledger are unchanged (20
+consolidated, zero in progress/failed/skipped). No new spec was consolidated,
+and no graph reset, rebuild or DLQ redrive was issued.
+
+The initial cold health probe explicitly returned unavailable metrics while its
+refresh was running. The follow-up returned Board/Discovery healthy, metrics
+available, 2,965 nodes and queue depth zero. Overall remains at_risk due to the
+historical policy projection DLQ; historical Global DLQ and canonical debt were
+not repaired or hidden by this deployment. This is not an all-green health claim
+or a new full-write benchmark: the previous real-spec measurements remain
+22.981 s commit and 131.489 s downstream delivery on their documented source.
+
+Sanitized local evidence: `.grafx-tmp/deploy-9b41f36-live-evidence.json`, SHA-256
+`429B591127ECAB897E7B2FCC55155588BAC7E2BE1980D755C5886394EA82ACC6`.
+No PyPI publication or main merge was performed.

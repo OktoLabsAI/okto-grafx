@@ -846,3 +846,12 @@ txn, heap, index contexts/hot batches, public boundaries and full import gate:
 are closed without new waivers. This closes that gate, not the overall evolution
 or full-write performance objective. Source-only, no new spec consumed or deployment.
 Final checkpoint: `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.
+
+Accumulated deployment completed afterward: installed wheel **0.0.4@9b41f36**,
+79 isolated-package tests passed, 12 installed module hashes matched. Pulse 0.3.3
+PID 28232 serves both ports after verified graceful shutdown of PID 34048.
+Canonical five-row readback and all 40 ledger items are unchanged; 20 pending specs
+remain reserved. Follow-up health: Board/Discovery healthy, metrics available,
+2,965 nodes, queue zero; historical policy DLQ keeps overall at_risk. No new
+consolidation, reset/rebuild/redrive or full-write timing claim. Deployment evidence
+and wheel hash are in `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.

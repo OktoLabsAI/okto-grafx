@@ -29,14 +29,16 @@ a percorrer cada bucket solicitado uma vez, mantendo provas de heap/certificado;
 posterior ao destino escalar mantém lotes de até 64 passos e o memo já limitado:
 consulta de saída 4,771 → 4,464 s, entrada 5,627 → 3,231 s em cópia privada, com
 2.253 resultados idênticos. Não declara os 131 s resolvidos nem um novo run vivo.
-Deploy acumulado concluído: Grafx **0.0.4@a82d3bf** instalado com accel, Pulse
-0.3.3 PID **34048** nas portas 8100/8101, Core `9e91ea9`, Community `7158383`.
-214 testes na regressão da integração; hashes instalados conferidos e leitura MCP
+Deploy acumulado atualizado: Grafx **0.0.4@9b41f36** instalado com accel, Pulse
+0.3.3 PID **28232** nas portas 8100/8101, Core `9e91ea9`, Community `7158383`.
+958 testes agrupados de arquitetura/composição e 79 do wheel isolado passaram;
+hashes de 12 módulos instalados conferidos e leitura MCP
 dos cinco nós/vínculos concluída. Board/Global healthy; overall at_risk pela DLQ
 histórica de políticas, sem ocultar snapshots stale/runtime budget incompleto.
 20 itens pendentes idênticos antes/depois. Sem nova spec, rebuild ou redrive.
 Rastreabilidade: `docs/GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md` e
-`docs/GLOBAL_DESTINATION_BATCHING_0_0_4.md`.
+`docs/GLOBAL_DESTINATION_BATCHING_0_0_4.md`; deploy atual em
+`docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.
 
 Este resumo prevalece sobre os checkpoints cronológicos abaixo; eles ficam
 preservados como evidência, não como novas filas ou dependências ativas do Claude.
