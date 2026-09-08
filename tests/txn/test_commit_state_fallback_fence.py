@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from okto_grafx.runtime.capability_probe import port_has_attribute
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -213,6 +215,7 @@ def _recovery(
         quarantine,
         pool,
         metrics,
+        attribute_probe=port_has_attribute,
         catalog=catalog,
         commit_state_store=state_store,
         coordinator=_Coordinator(),

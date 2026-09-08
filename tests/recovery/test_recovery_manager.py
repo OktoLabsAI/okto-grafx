@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from okto_grafx.runtime.capability_probe import port_has_attribute
+
 import struct
 from dataclasses import dataclass
 
@@ -1553,6 +1555,7 @@ def test_a_collaborator_of_the_wrong_type_is_refused_at_construction(
             stack.quarantine,
             stack.pool,
             metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
     with pytest.raises(GrafxConfigurationError):
         RecoveryManager(
@@ -1562,6 +1565,7 @@ def test_a_collaborator_of_the_wrong_type_is_refused_at_construction(
             "not a quarantine",  # type: ignore[arg-type]
             stack.pool,
             metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
     with pytest.raises(GrafxConfigurationError):
         RecoveryManager(
@@ -1571,6 +1575,7 @@ def test_a_collaborator_of_the_wrong_type_is_refused_at_construction(
             stack.quarantine,
             "not a pool",  # type: ignore[arg-type]
             metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
 
 
@@ -1594,6 +1599,7 @@ def test_a_log_that_cannot_answer_the_doors_recovery_opens_is_refused(
             stack.quarantine,
             stack.pool,
             stack.metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
     assert caught.value.details["slot"] == "wal"
 

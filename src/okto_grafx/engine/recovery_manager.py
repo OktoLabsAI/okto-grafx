@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Sequence
-from inspect import getattr_static
 from typing import Protocol, cast, runtime_checkable
 
 from okto_grafx.domain.errors import (
@@ -402,6 +401,7 @@ class RecoveryManager:
         pool: BufferPool,
         metrics: MetricsSink,
         *,
+        attribute_probe: Callable[[object, str], bool],
         catalog: object = None,
         index_manager: object = None,
         index_sync: Callable[[], object] | None = None,
@@ -418,6 +418,11 @@ class RecoveryManager:
     ) -> None:
         """Build the manager over the stores and ports one recovery pass needs.
 
+        ``attribute_probe`` is supplied by the composition root: it observes
+        declared members without evaluating descriptors, with dynamic lookup
+        only for absent declarations. Host introspection is not an engine
+        dependency. The engine still owns the required shape and refusal.
+
         ``catalog`` and ``control_probe`` are optional because a database can be recovered
         without them: a catalog store is needed only to complete the CF-4 route, and a probe
         only to retire a damaged control record. Each absent one disables exactly its own step
@@ -433,7 +438,13 @@ class RecoveryManager:
         Naming the same setting twice with two different values has no correct reading, so it is
         refused rather than resolved by an ordering rule nobody can see from the call site.
         """
-        _require_port("storage", storage, STORAGE_PORT_METHODS)
+        if not callable(attribute_probe):
+            raise GrafxConfigurationError(
+                "Recovery attribute_probe must be callable.",
+                field="attribute_probe",
+                value=type(attribute_probe).__name__,
+            )
+        _require_port("storage", storage, STORAGE_PORT_METHODS, attribute_probe)
         _require_port(
             "wal",
             wal,
@@ -446,8 +457,11 @@ class RecoveryManager:
                 "barrier",
                 "force_barrier_range",
             ),
+            attribute_probe,
         )
-        _require_port("metrics", metrics, ("enabled", "register", "increment"))
+        _require_port(
+            "metrics", metrics, ("enabled", "register", "increment"), attribute_probe
+        )
         if not isinstance(ledger, LedgerStore):
             raise GrafxConfigurationError(
                 f"Recovery needs a LedgerStore; got {type(ledger).__name__}.",
@@ -1984,7 +1998,12 @@ def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str
     )
 
 
-def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
+def _require_port(
+    slot: str,
+    instance: object,
+    methods: Sequence[str],
+    attribute_probe: Callable[[object, str], bool],
+) -> None:
     """Refuse a port or collaborator that cannot answer the doors recovery opens (G5).
 
     Inspect declared attributes without invoking descriptors.  In particular, ``damage`` is
@@ -1993,25 +2012,25 @@ def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
     keeps transparent ``__getattr__`` wrappers compatible; as with ``hasattr``, only
     ``AttributeError`` means that a door is absent and every other exception remains visible.
     """
-    missing = [name for name in methods if not _port_has_attribute(instance, name)]
+    missing: list[str] = []
+    for name in methods:
+        present = attribute_probe(instance, name)
+        if type(present) is not bool:
+            raise GrafxConfigurationError(
+                "Recovery attribute_probe must return an exact bool.",
+                field="attribute_probe",
+                slot=slot,
+                member=name,
+                value=type(present).__name__,
+            )
+        if not present:
+            missing.append(name)
     if missing:
         raise GrafxPortNotConfigured(
             f"The {slot} port of recovery is missing {', '.join(missing)}.",
             slot=slot,
             missing=tuple(missing),
         )
-
-
-def _port_has_attribute(instance: object, name: str) -> bool:
-    """Return whether ``instance`` declares or dynamically supplies ``name`` without eager IO."""
-    try:
-        getattr_static(instance, name)
-    except AttributeError:
-        try:
-            getattr(instance, name)
-        except AttributeError:
-            return False
-    return True
 
 
 def _one_policy(recovery_policy: object, policy: object) -> object:

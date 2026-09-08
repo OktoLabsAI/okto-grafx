@@ -16,6 +16,8 @@ contract's, step for step.
 
 from __future__ import annotations
 
+from okto_grafx.runtime.capability_probe import port_has_attribute
+
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -227,6 +229,7 @@ class Stack:
         """Return a recovery manager over this stack, with anything the test wants changed."""
         settings: dict[str, object] = {
             "catalog": self.catalog,
+            "attribute_probe": port_has_attribute,
             "coordinator": StackCoordinator(),
         }
         settings.update(overrides)

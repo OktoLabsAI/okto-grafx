@@ -107,6 +107,7 @@ from okto_grafx.runtime.config import (
     _openmetrics_host_port,
 )
 from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
+from okto_grafx.runtime.capability_probe import port_has_attribute
 
 __all__ = [
     "LABEL_DIGEST_BYTES",
@@ -468,6 +469,7 @@ def assemble_database(
             quarantine,
             pool,
             metrics,
+            attribute_probe=port_has_attribute,
             catalog=catalog,
             index_manager=indexes,
             index_sync=load_catalog_and_sync_existing_indexes,

@@ -2,7 +2,8 @@
 
 2026-09-08, `feature/v0.0.4`. This addresses the nine findings already recorded
 in `RETAINED_METRIC_SAMPLING_0_0_4.md`; it is not a new performance acceptance gate.
-The complete architecture gate remains **failing**, with five occurrences below.
+The complete architecture gate remains **failing**. The first checkpoint left five
+occurrences; the recovery checkpoint below reduces this to four in three modules.
 
 ## Corrected engine synchronization placement
 
@@ -65,7 +66,7 @@ same spelling is still rejected; the rule was not widened to arbitrary enums.
 - Ruff and `git diff --check` passed. These runs preserve strict markers and the
   existing 60-second per-test thread timeout; no hang guard was removed.
 
-## Remaining existing architecture debt
+## Remaining existing architecture debt after query checkpoint
 
 | Module | Occurrences | Mechanism still to separate |
 | --- | ---: | --- |
@@ -83,3 +84,49 @@ correction checkpoint, not completion of the architecture/evolution objective.
 Source-only; accumulate with the remaining corrections before the next deployment.
 Pulse PID 34048 remains on installed a82d3bf, with Core 9e91ea9 code. No additional
 spec consolidation, recovery, redrive, reset, live graph write or restart was done.
+
+## Recovery composition checkpoint — 2026-09-08
+
+Moved static descriptor inspection from `engine.recovery_manager` to
+`runtime.capability_probe.port_has_attribute`, supplied explicitly by API assembly.
+The runtime helper preserves the former algorithm exactly: a declared member is
+observed without evaluating its descriptor; only absent declarations use dynamic
+lookup, only AttributeError means absence, and all other errors propagate. No
+observation is cached, and this shape check grants no transaction/storage authority.
+
+The engine still owns the complete mandatory member lists, aggregate missing-member
+refusal, and all recovery/WAL/fencing policy. It additionally refuses non-callable
+probes and non-exact-bool answers instead of admitting them by truthiness. The
+recovery algorithm and frozen architecture contract are unchanged. The native
+cold-WAL regression still proves only one walk rather than an eager shape scan.
+
+Public `connect`/configuration/Pulse contracts are unchanged. **Internal manual
+compositions constructing RecoveryManager now must provide the keyword-only
+`attribute_probe`**, normally `port_has_attribute` imported in their outer layer.
+All repository compositions and capturing subclasses were updated. There is no
+default `hasattr` fallback that would reintroduce descriptor I/O; no public setting
+or new required PortRegistry slot was added. The helper is not substituted for
+PortRegistry's stricter static-only member validation, which has different semantics.
+
+New tests cover inherited descriptors and slots without evaluation, instance
+members, dynamic absence, malformed probes/results, preserved exception identity,
+and engine-owned missing-WAL-member policy. Existing dynamic-wrapper, one-WAL-walk,
+fence lifetime, control retirement, recovery and public crash tests remain intact.
+The initial run identified two capturing test subclasses missing the explicit
+injection; their compositions were fixed, not their assertions.
+
+Grouped run (recovery WAL shape/manager/fence/retirement/commit-section tests,
+transaction commit-state fallback, API startup/public crash recovery, entire import
+gate): **366 passed, 4 failed in 13.10 s**. The four failures are exactly the three
+remaining modules below and the aggregate zero-budget assertion. Strict markers
+and 60-second thread timeouts remain enabled. Ruff and diff whitespace checks pass.
+
+| Remaining module | Occurrences | Mechanism still to separate |
+| --- | ---: | --- |
+| domain/control_record.py | 1 | explicit concrete fused-read capability selection |
+| domain/model/schema.py | 2 | synchronized weak-lifetime tuple-encoding proof registry |
+| engine/index_manager.py | 1 | context-local live-commit authority/projection state |
+
+No gate waiver and no all-plan completion claim. This checkpoint is source-only:
+the running Pulse remains on installed Grafx a82d3bf; no pending spec was consumed,
+no live graph was opened by tests, and no restart/deployment/rebuild/redrive occurred.

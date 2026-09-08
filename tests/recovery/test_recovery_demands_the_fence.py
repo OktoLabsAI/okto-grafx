@@ -19,6 +19,8 @@ documents as the boundary.
 
 from __future__ import annotations
 
+from okto_grafx.runtime.capability_probe import port_has_attribute
+
 import subprocess
 import sys
 import time
@@ -130,6 +132,7 @@ def _manager(
         stack.quarantine,
         stack.pool,
         stack.metrics,  # type: ignore[arg-type]
+        attribute_probe=port_has_attribute,
         **settings,  # type: ignore[arg-type]
     )
 
@@ -278,6 +281,7 @@ def test_a_permit_dies_with_its_section_and_cannot_be_replayed(stack: Stack) -> 
         stack.quarantine,
         stack.pool,
         stack.metrics,  # type: ignore[arg-type]
+        attribute_probe=port_has_attribute,
         catalog=stack.catalog,
         coordinator=coordinator,
     )
@@ -305,6 +309,7 @@ def test_a_base_exception_inside_the_section_still_revokes_the_permit(
         stack.quarantine,
         stack.pool,
         stack.metrics,  # type: ignore[arg-type]
+        attribute_probe=port_has_attribute,
         catalog=stack.catalog,
         coordinator=coordinator,
     )

@@ -789,3 +789,13 @@ Combined slice: 610 passed, 5 failed, all failures in the remaining architecture
 debt (five occurrences across four modules plus the aggregate assertion). No skipped
 gate, performance threshold, live consolidation or deployment was introduced.
 Details: `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.
+
+Follow-up: recovery's static descriptor probe now comes from runtime/API composition,
+without evaluating declared properties or swallowing dynamic-wrapper failures.
+Manual internal RecoveryManager compositions require explicit `attribute_probe`;
+public connect/configuration and the frozen recovery algorithm do not change.
+Grouped recovery/fencing/control-retirement/transaction-fallback/public-crash/import
+slice: **366 passed, 4 failed in 13.10 s**. Remaining architecture debt is four
+occurrences across three modules (plus the aggregate assertion), not a waived gate.
+This is source-only; no new spec consumption or deployment. See the recovery
+checkpoint in the same report for constructor migration and exact evidence.
