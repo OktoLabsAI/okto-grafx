@@ -582,3 +582,52 @@ metrics/verify, transfer/restore/fork and complete concurrency/crash regression.
 No journal-target allowlist or writer guard was removed. Both OCCs, multi-reader/
 writer semantics and durability remain unchanged. Pulse was not restarted or
 modified; **19 pending specs remain reserved**. Full CAP-1 is not complete.
+
+### CAP-1B native checkpoint anchor — 2026-09-08
+
+Immutable implementation checkpoint: `1932d3519518854921ac0a8b62ec9a9f3c12d6d9`.
+
+Recovery/checkpoint now carry their validated checkpoint into `CommitRedo` and
+its private full/projected proofs. First schema activation after that checkpoint
+must be established by its own COMMIT snapshot, not retrospectively claimed by
+a later snapshot. A checkpoint mismatch invalidates proof reuse and any fallback
+revalidates against the current caller's floor. Admission precedes page decoding.
+No new physical I/O, authority cache, WAL/OCC ordering or publication was added.
+See [native checkpoint anchoring](../architecture/COMMIT_CATALOG_V1.md).
+
+Added 20 tests: six missing-activation-snapshot cases across standalone doors,
+two checkpointed-activation cases without old WAL, five invalid/overlapping floor
+admissions before decoding, four mismatched-proof entry points, two real native
+recovery refusals (old/fully applied disk, all bytes preserved), and a public
+checkpoint/reopen test after actual internal activation. The public test observes
+the old floor for nonempty replay and the new floor for the subsequent empty
+preflight. Initial fixture mistakes (state-store attribute, assuming only one
+preflight) were corrected without changing production checks.
+
+Grouped command:
+
+```text
+python -m pytest tests/recovery tests/storage_core/test_catalog_replay_images.py
+  tests/txn/test_commit_catalog_activation.py tests/txn/test_commit_catalog_transition.py
+  tests/api/test_checkpoint_and_reclamation.py tests/api/test_checkpoint_watermark_scope.py
+  tests/api/test_checkpoint_meta_root_proof.py tests/api/test_m0b_checkpoint_lineage.py
+  tests/api/test_m0b_catalog_repair_from_log.py tests/api/test_auto_checkpoint.py
+  tests/api/test_recovery_floor_photo_reuse.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**1,012 passed in 57.18 s**. After the final apply-path admission placement and
+public-checkpoint test, activation/catalog-image/native-catalog/CommitRedo suites:
+**144 passed in 2.54 s**, overlapping the group. Ruff/diff-check pass. Expanded
+strict mypy on CommitRedo/RecoveryManager/TransactionManager reports **69 errors**;
+`--shadow-file` comparison with HEAD `79641ec` yields the identical 69 diagnostics
+after line-number normalization. No newly introduced errors; no type-clean claim.
+The three changed test modules have only eight imported existing Catalog/Store
+diagnostics, with none in the tests themselves.
+
+Next integration obligations remain finite and unchanged: independently current
+catalog for no-schema ranges, journal physical/UUID/coverage checks, guarded native
+application and automatic staging/publication, then public APIs and the remaining
+verify/metrics/transfer/restore/fork/concurrency/crash requirements. The journal
+allowlist and writer guards remain closed. Pulse and 19 reserved specs untouched.

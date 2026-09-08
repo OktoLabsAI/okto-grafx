@@ -3,6 +3,14 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / vínculo ao checkpoint / 2026-09-08:** recovery e checkpoint passam
+seu limite durável ao preflight; ativação posterior exige snapshot no seu próprio
+COMMIT. Provas não podem ser reutilizadas sob outro limite, inclusive nas portas
+de projeção/revalidação/aplicação. 1.012 testes agrupados e 144 focados finais;
+API pública de checkpoint/reabertura incluída. Cobertura física do journal,
+staging/publicação e APIs continuam pendentes. [Evidência](docs/specs/SPEC-GX-CAP-1.md).
+Pulse e 19 specs preservados. Checkpoint: `1932d3519518854921ac0a8b62ec9a9f3c12d6d9`.
+
 **GX-CAP-1B / catálogo no preflight nativo / 2026-09-08:** snapshots completos de
 `catalog.dat` validados por COMMIT antes da aplicação; horizonte observado não
 pode desaparecer nem mudar. WAL/recovery reais exercitados com aplicação parcial,

@@ -26,6 +26,17 @@ ledger permaneceram idênticos. Dívidas históricas continuam explícitas.
 [Recibo, limites e identidade do runtime](docs/PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md).
 Este teste não altera o estado incompleto dos slices GX-CAP-1 abaixo.
 
+GX-CAP-1 vinculou o replay nativo ao checkpoint fornecido pelo controle durável:
+ativação posterior ao checkpoint exige seu próprio snapshot/COMMIT no intervalo;
+um snapshot posterior não pode inventá-la. A prova privada conserva esse limite
+nas projeções, revalidação e aplicação de recovery/checkpoint. **1.012 testes em
+57,18 s**, mais 144 focados finais (sobrepostos). Teste pela API pública confirma
+checkpoint/reabertura. Ruff verde; comparação estrita dos três módulos maiores
+reproduziu os mesmos 69 erros anteriores, sem novos diagnósticos. Não habilita
+o journal: cobertura física, staging/publicação e APIs permanecem obrigatórios.
+[Contrato e evidência](docs/specs/SPEC-GX-CAP-1.md). Pulse/19 specs intocados.
+Checkpoint imutável: `1932d3519518854921ac0a8b62ec9a9f3c12d6d9`.
+
 GX-CAP-1 agora valida snapshots completos de `catalog.dat` no preflight nativo,
 antes de qualquer aplicação de página: cadeia/cabeçalho, COMMIT e continuidade
 do horizonte de ativação. Recovery real testado com todas as combinações de

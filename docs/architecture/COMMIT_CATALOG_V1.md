@@ -527,3 +527,33 @@ application subsets, normal/torn covered pages, repeat recovery and exact durabl
 control publication. Missing header/chain refuses byte-identically even after full
 physical application. This is schema-activation recovery evidence, not the still
 required automatic journal-publication crash matrix or a full-capability release.
+
+### Native checkpoint anchoring
+
+Implementation checkpoint: `1932d3519518854921ac0a8b62ec9a9f3c12d6d9`.
+
+Recovery now supplies the checkpoint from its validated control-state observation;
+TransactionManager supplies the checkpoint used to select/prove the retained WAL
+range. `CommitRedo` admits that exact nonnegative, non-provisional integer before
+page decoding. Selected COMMITs must begin strictly after it. Empty ranges remain
+valid; hand-composed effect-only plans cannot claim checkpoint-qualified proof.
+
+For the first schema snapshot, an active horizon after this floor must equal its
+own COMMIT LSN. A later snapshot cannot substitute for absent activation effects,
+even if an effect-free COMMIT envelope exists at the claimed earlier horizon.
+Horizons at/before the checkpoint do not demand recycled activation WAL. Later
+snapshots retain the previously implemented one-way continuity checks.
+
+The private replay proof carries this checkpoint. Exact compatibility includes
+the checkpoint in verification, projection and application; fallback preflight
+uses the caller's current value, never the discarded proof's value. Recovery and
+checkpoint pass it through full/page/index replay. No extra physical reads or
+full-history traversal are introduced. Existing WAL lineage and barrier checks
+still independently establish the range and its durability; passing an integer
+to the standalone dispatcher does not itself prove physical authority.
+
+This closes the post-checkpoint activation-snapshot obligation, not the entire
+journal integration. No-schema intervals still need the independently current
+catalog, journal coverage/UUID and physical-target validation before native journal
+replay can be enabled. Automatic staging/publication and public capability APIs
+remain disabled. Complete required acceptance matrix above remains in scope.
