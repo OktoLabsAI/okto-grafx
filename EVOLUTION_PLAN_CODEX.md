@@ -14,6 +14,18 @@
 
 ## Resumo vigente — 2026-09-08
 
+Novo teste vivo, autorizado pelo operador: confirmado o Grafx instalado
+**0.0.4@fa8f188** (145 arquivos conferidos) no Pulse 0.3.3; não foi necessário
+reinstalar/reiniciar nem instalar a branch GX-CAP-1 ainda incompleta. Uma única
+spec consolidada: **11 nós / 22 arestas**, commit MCP **10,726 s**, entrega Global
+**54,952 s**, sem retry/erro. Caso anterior: 5/10, 22,981 s e 131,489 s;
+comparação observacional entre workloads distintos, não speedup isolado do motor.
+Leituras exatas e auditoria durável verificadas. Agora são **19 specs pendentes
+reservadas**, 21 consolidadas e zero em andamento/falhas; os outros 39 itens do
+ledger permaneceram idênticos. Dívidas históricas continuam explícitas.
+[Recibo, limites e identidade do runtime](docs/PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md).
+Este teste não altera o estado incompleto dos slices GX-CAP-1 abaixo.
+
 GX-CAP-1 ganhou validação de uma transição completa de append do histórico contra
 uma visão anterior íntegra: diretório/stream, COMMIT/UUID/tempo, páginas exatas e
 preservação de prefixos, inclusive reescritas com CRC válido. 691 testes agrupados

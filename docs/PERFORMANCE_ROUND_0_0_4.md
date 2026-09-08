@@ -918,3 +918,13 @@ PID 15940. Five canonical rows and the complete 40-item ledger remain identical;
 20 pending specs reserved. Follow-up Health: Board/Global healthy, metrics
 available, 2,965 nodes, queue zero; historical debt still visible. No further
 consolidation, main merge, PyPI publication or full-delivery timing claim.
+
+Subsequent operator-authorized single-Spec run (2026-09-08): confirmed all 145
+installed package files against the latest performance branch, without installing
+unfinished CAP work or restarting an already-current process. One commit added
+11 Alternatives / 22 edges in **10.726 s**; Global durable ACK **54.952 s**, no
+retry/error. Earlier sample was 5/10, 22.981/131.489 s; differing workload/runtime
+prevents an isolated engine-speedup claim. Exact body/edge/audit readback passed.
+One ledger item closed; the other 39 are identical. **19 pending Specs remain
+reserved**. Historical health debt stays visible; native phase attribution was
+not captured. Evidence: `PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md`.
