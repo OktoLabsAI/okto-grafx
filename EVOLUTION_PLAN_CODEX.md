@@ -14,6 +14,13 @@
 
 ## Resumo vigente — 2026-09-07
 
+Adendo 2026-09-08: a investigação do ACK Global encontrou uma contagem de arestas
+O(S*E) no Core, substituída por projeção local O(S+E), sem dispensar leituras ou
+provas pré/pós-flush. 73 testes passaram; inventário privado de 2.253 vínculos:
+1,219 s → 0,0034 s na contagem isolada, sem alegação de ganho total nos 131,489 s.
+Implementação ainda não carregada no Pulse ativo; não houve nova consolidação.
+Detalhes no Core: `docs/GLOBAL_DELIVERY_EDGE_INVENTORY.md`.
+
 Este resumo prevalece sobre os checkpoints cronológicos abaixo; eles ficam
 preservados como evidência, não como novas filas ou dependências ativas do Claude.
 Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
