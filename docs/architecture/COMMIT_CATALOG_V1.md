@@ -629,3 +629,48 @@ applies no new pages and does not manufacture publication authority from the inp
 UUID or integer. Required journal WAL effects remain refused until full native
 crash-cut/physical-target integration. Automatic emission and public APIs remain
 disabled; schema-changing interval coverage and full verify integration remain.
+
+### Native journal effects and target validation
+
+Implementation checkpoint: `6b5163ea8f1dec57411920880731602e439ef539`.
+This supersedes the earlier refusal of all journal effects in qualified native
+replay, not the guard against automatic writer emission or public activation.
+
+CommitRedo admits journal pages only with a native checkpoint and composition
+UUID. Before any effect applies, it decodes complete schema snapshots, establishes
+activation, invokes `validate_redo` for the complete COMMIT range, and invokes
+`validate_redo_targets` for physical and resident targets and final extents.
+Ordinary effects retain complete preflight. Exact passage-bound page/index
+subplans inherit the full proof; index registry checks still run after schema
+adoption. Standalone unqualified journal dispatch remains refused.
+
+Each current target must be missing, exactly unwritten/empty FREE, or an intact
+journal page with matching UUID, file role and logical address. Existing stamped
+pages lie strictly after activation and no later than the selected final COMMIT.
+Above the checkpoint, their location/LSN/content must match an image in the
+validated WAL range, not just a numerical high-water mark. Canonical comparison
+normalizes only the page sequence/derived checksum, since physical publication
+advances the seqlock. A current foreign page or future LSN can never be hidden by
+the generic C1 already-applied rule. Dirty resident targets receive the same
+validation through a detached, non-evicting pool snapshot; dirty doomed authority
+refuses. No persistent authority cache or host access enters the store.
+
+The final WAL image at each location overlays storage for bounded head/end-record
+validation. Projected sizes include both actual file lengths and growth implied
+by the selected images; misalignment, missing immutable coverage and extra trailing
+pages refuse. Costs are proportional to selected WAL effects/targets plus bounded
+history-tail reads, not a scan of retained commit history. Journal effects prove
+an empty heap-watermark table scope, avoiding an unrelated all-table scan.
+
+After full preflight, native callers retain the WAL barrier before C1 application.
+Touched journals flush with other pages, and recovery barriers them before control
+publication. Concurrent checkpoint's explicit barrier inventory includes both
+journals even when every replay image was an idempotent no-op. Native interruption
+and barrier-failure tests prove no premature ACK and successful retry without
+duplicate entries; local-storage public checkpoint/reopen is also covered.
+
+**Limits:** arbitrary CRC-invalid/torn or odd-sequence targets refuse before
+mutation; this change does not bypass page-zero CAS or add a blind repair door.
+Full historical verification remains distinct from final-head validation. Native
+replay of existing durable journal effects is enabled, but automatic creation of
+those effects in ordinary writes and the public CAP-1 surface remain disabled.

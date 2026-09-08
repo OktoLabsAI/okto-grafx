@@ -14,6 +14,22 @@
 
 ## Resumo vigente — 2026-09-08
 
+**Checkpoint encerrado — replay nativo do journal:** a validação completa do
+intervalo WAL está conectada à aplicação das páginas e ao checkpoint. UUID,
+ativação, cobertura de cada COMMIT, conteúdo/LSN dos alvos físicos e residentes,
+extensões dos arquivos e barreiras de durabilidade são verificados. Recuperação
+de aplicações parciais válidas/zero-filled e repetição sem duplicação comprovadas;
+UUID estrangeiro, LSN futuro e divergência no mesmo LSN recusam antes de alterar
+dados. **2.433 testes em 77,27 s**, Ruff verde, nenhum novo diagnóstico de tipagem
+na comparação isolada com a base. Commit `6b5163ea8f1dec57411920880731602e439ef539`.
+[Escopo e evidências](docs/specs/SPEC-GX-CAP-1.md#cap-1b-native-journal-replay-checkpoint--2026-09-08).
+CRC inválido continua fail-closed, sem sobrescrita cega. Emissão automática/API
+pública de histórico e o restante de GX-CAP-1 **não estão concluídos**. As notas
+históricas abaixo sobre replay desabilitado foram superadas apenas neste escopo.
+Por orientação do operador, parar neste checkpoint e preparar a publicação
+**0.0.4 no PyPI em conjunto**, sem abrir nova frente ou fazer upload automático.
+Pulse instalado e 19 specs reservadas não foram alterados nesta etapa.
+
 Novo teste vivo, autorizado pelo operador: confirmado o Grafx instalado
 **0.0.4@fa8f188** (145 arquivos conferidos) no Pulse 0.3.3; não foi necessário
 reinstalar/reiniciar nem instalar a branch GX-CAP-1 ainda incompleta. Uma única

@@ -734,3 +734,69 @@ automatic staging/publication, full verify/metrics and public APIs, then existin
 transfer/restore/fork/concurrency/crash acceptance. This bounded head verifier is
 not a substitute for the full historical scan. All original multi-reader/writer,
 OCC and durability premises remain. Pulse and 19 pending specs were untouched.
+
+### CAP-1B native journal replay checkpoint — 2026-09-08
+
+Implementation: `6b5163ea8f1dec57411920880731602e439ef539`.
+
+The finite native-journal integration step is closed: qualified RecoveryManager
+and TransactionManager replay now connect complete semantic journal validation
+to the existing page-apply, flush and control-publication protocol. This supersedes
+earlier journal-effect integration guards, **not** automatic writer activation or
+the remaining CAP-1 requirements. [Protocol details](../architecture/COMMIT_CATALOG_V1.md#native-journal-effects-and-target-validation).
+
+Implemented:
+
+- Per-transaction image cardinality admission before any image decompression.
+- Schema activation and every post-activation COMMIT's complete journal coverage,
+  including maintenance and epoch-qualified reuse of transaction IDs.
+- Physical and resident target UUID/role/address validation; future page LSNs and
+  differing content at a WAL-covered LSN refuse before any ordinary effect applies.
+  Seqlock-only publication changes do not create false content mismatches.
+- Final WAL overlay plus exact projected file sizes checked against final head.
+  Missing/zero-filled targets are replayable, not inferred historical records.
+- Same-pool dirty replay, fresh-pool partial replay, native WAL/data barriers and
+  checkpoint inventory containing both journals even without a modified-page ledger.
+- Journal pages have a known empty heap-watermark scope, avoiding a whole-table
+  watermark scan caused solely by appending audit history.
+
+New native suite: **109 cases**, including 64 combinations of four-page physical
+subsets, raw/compressed WAL and valid/unwritten materialization; 24 physical-target
+faults; dirty-pool repetition; three invalid resident targets; missing middle
+coverage; checkpointed suffixes; eight before/after native write interruptions;
+three barrier failures with successful recovery retry; cardinality admission;
+unqualified refusal; and public Database checkpoint/reopen on local storage.
+These tests use actual WalManager and RecoveryManager paths. They do not claim
+automatic normal-transaction journal staging or arbitrary damaged-page repair.
+
+An expanded regression exposed the pre-existing mutable two-entry CRC argument
+convention table. It is now a MappingProxyType with a dedicated exact-content
+test; the structural isolation gate was not waived. Six schema-only fixture cases
+were updated: schema-horizon validity is no longer presented as sufficient native
+journal coverage, and checkpoint-proof reuse remains tested independently.
+
+Final grouped run:
+
+```text
+python -m pytest tests/txn/test_commit_catalog_store.py
+  tests/txn/test_commit_catalog_transition.py tests/txn/test_commit_catalog_physical.py
+  tests/txn/test_commit_catalog_activation.py tests/recovery tests/storage_core
+  tests/api/test_checkpoint_and_reclamation.py tests/api/test_m0b_catalog_repair_from_log.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**2,433 passed in 77.27 s**. Focused runs overlap this result. Ruff and diff-check
+pass. Strict mypy, using explicit repository MYPYPATH, nonincremental isolated
+caches and four HEAD shadow sources, reports the same **78** existing production
+diagnostics before/after; none added. Earlier mixed installed-package/cache
+observations were discarded. Changed tests report only three existing errors in
+test_no_shared_state; none in the new replay suite. This is not global type-clean.
+
+CRC-invalid or odd-sequence targets remain fail-closed, with no blind replacement.
+Full historical verification, normal writer staging/retarget/OCC, public metadata
+and history APIs, metrics, transfer/restore/fork and full CAP-1 acceptance remain
+separate unfinished requirements. No original multi-reader/writer, WAL, OCC or
+durability premise changed. The user requested stopping at this checkpoint before
+joint preparation/publication of version 0.0.4. No PyPI upload, main merge, runtime
+deployment or additional spec consolidation was performed.

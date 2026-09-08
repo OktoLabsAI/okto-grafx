@@ -3,6 +3,17 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / replay nativo do journal / 2026-09-08:** etapa de conexão entre
+validação e aplicação encerrada em `6b5163ea8f1dec57411920880731602e439ef539`.
+Recovery/checkpoint validam identidade, todos os COMMITs do intervalo, alvos
+físicos/residentes e extensões; aplicações parciais e repetição foram testadas.
+Falhas de barreira não publicam; UUID estrangeiro, LSN futuro e mesmo LSN com
+conteúdo divergente recusam antes de aplicar. 2.433 testes verdes em 77,27 s.
+CRC inválido ainda recusa; emissão automática e API pública permanecem fechadas.
+GX-CAP-1 completo não foi declarado entregue. [Evidências](docs/specs/SPEC-GX-CAP-1.md#cap-1b-native-journal-replay-checkpoint--2026-09-08).
+Próximo passo acordado: preparar/publicar 0.0.4 junto com o operador, sem upload
+automático. Pulse/19 specs preservados; entradas abaixo são checkpoints históricos.
+
 **GX-CAP-1B / histórico físico checkpointado / 2026-09-08:** validação limitada
 de identidade, tamanhos físicos, limites do diretório, stamps e registro final.
 Replay nativo vazio pode reconhecer histórico publicado com UUID correto; sem
