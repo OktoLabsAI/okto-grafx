@@ -421,3 +421,49 @@ memory/validation is linear in the already selected replay range, with no new ho
 I/O or full commit-history scan. Both OCCs, durability and multi-reader/writer
 premises remain intact. Automatic journal publication/replay, public APIs and all
 remaining CAP-1 deliverables are still required. Pulse and reserved specs untouched.
+
+### CAP-1B append transition validator — 2026-09-08
+
+Added `CommitCatalogStore.validate_append_images`: bounded/read-only validation
+of an exact stamped image set against an independently supplied predecessor view.
+It verifies previous/current/activation coordinates, one-entry advancement,
+directory/stream extents and exact affected locations, reconstructed record/UUID/
+sequence/time, and unchanged historical prefixes through canonical re-planning.
+Duplicate, missing, extra, foreign-target or incorrectly stamped images refuse.
+It does not return an apply permit, activate files or reconstruct a crash-cut view.
+
+The first executable test failed because the method was absent. The suite also
+reproduced acceptance of a monotonic but incorrectly large logical-clock jump;
+the validator now enforces the exact assigned-clock rule, with tie/regression
+and maintenance cases. CRC-valid old-prefix rewrites are refused even if the new
+record itself is valid. The exact 65,596-byte record is exercised after a split
+tail and after another maximum record. Existing internal file-name reexports are
+now explicit for strict type consumers; the strings/format did not change.
+
+Focused suite: **42 passed in 3.94 s**. Final group:
+
+```text
+python -m pytest tests/txn/test_commit_catalog_transition.py
+  tests/txn/test_commit_catalog_store.py tests/txn/test_commit_catalog_record.py
+  tests/txn/test_commit_provenance_values.py tests/txn/test_commit_catalog_activation.py
+  tests/wal/test_commit_catalog_wal_grammar.py tests/wal/test_commit_catalog_batch_sizing.py
+  tests/recovery/test_commit_redo.py tests/recovery/test_replay_decision.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**691 passed in 21.47 s**; overlap is not an additional test total. Ruff/diff-check
+pass. Strict mypy on the store and new tests reports only the four existing
+imported diagnostics (Catalog and CommitRedo); the store-only comparison against
+HEAD `1cf6d29` shadow source has identical diagnostics. No claim of a type-clean
+whole engine. Read bounds and precise validator contract are in
+[COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md).
+
+This validator requires an intact predecessor view. It explicitly refuses to
+reinterpret an already applied head as that predecessor. Full startup/gap replay
+still needs safe predecessor reconstruction or an equivalent fully specified
+cross-cut protocol, plus initialization/missing-history classification and normal
+staging/OCC/publication wiring. Those are existing acceptance requirements, not
+waived by this read-only validator. Journal writing/replay guards remain active;
+public history, metrics/verify, transfer/restore/fork and the complete crash matrix
+remain mandatory. No Pulse operation or additional spec consolidation occurred.

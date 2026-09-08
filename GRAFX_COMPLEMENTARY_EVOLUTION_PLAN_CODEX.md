@@ -3,6 +3,13 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / validação de append / 2026-09-08:** transição entre diretório e
+stream validada contra predecessor íntegro, com recusa de páginas faltantes,
+extras, stamps errados e reescritas históricas com CRC válido. Regra exata de
+tempo lógico e registro máximo incluídos. 691 testes agrupados em 21,47 s;
+reconstrução da visão após crash, staging/publicação e replay completos ainda
+pendentes. [Contrato e evidência](docs/specs/SPEC-GX-CAP-1.md). Pulse/specs intocados.
+
 **GX-CAP-1B / vínculo COMMIT–replay / 2026-09-08:** os COMMITs individuais agora
 acompanham os efeitos no selector e nos subplanos de recovery/checkpoint. Preflight
 valida ownership/ordem/watermark e recusa mutação durante callbacks antes de

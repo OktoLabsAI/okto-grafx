@@ -201,6 +201,49 @@ cross-file count/time/fragment coverage, initialization vs missing-history check
 normal staging/OCC and idempotent page replay. Both journal integration guards
 remain in force until those conditions are implemented and tested.
 
+### Canonical append transition validation
+
+`CommitCatalogStore.validate_append_images` now checks one complete, stamped
+append against an independently established **predecessor** page view. Inputs
+name previous COMMIT, new COMMIT and activation LSN; the predecessor head must
+match those independently supplied coordinates. The provider is required to be
+stable and physically proved by its caller, not inferred from CRCs or this value.
+
+Admission bounds the image tuple to `ceil(65,596 / C) + 3`, where `C=page_size-76`;
+too many images refuse before provider reads. At least three images are needed.
+Every target is an exact journal file/page, duplicates refuse, image size/CRC and
+the exact final-COMMIT page stamp are checked, and page seq must be even. Input
+fields/immutable bytes are captured before provider calls. The overlay must advance
+entry_count by one, append 60..65,596 stream bytes, preserve activation and end at
+the expected COMMIT. Its image locations must be **exactly** the affected stream
+tail/fragments, directory tail and directory head: missing images cannot fall back
+to predecessor pages, and unrelated images (including a rewritten stream header)
+are refused.
+
+The last directory entry must start at the old stream extent and identify the
+same COMMIT. Record reconstruction checks all new fragments, envelope CRC, store
+UUID, sequence and timestamp agreement. Logical time must equal the exact
+`max(observed_at, previous_ordered_at+1us)` rule (observed_at for the first entry),
+not merely be monotonic. Canonical re-planning against the predecessor compares
+the complete incoming images, preserving their allowed even seq and final LSN.
+This rejects coherent checksummed rewrites of old stream/directory prefixes.
+
+The method returns a validated record **value**, never an apply permit, durable
+ACK or physical-view certificate. Callers still own immutable staged inputs and
+the normal provenance/OCC/publication proof. The validator must not be used with
+an already/partially applied live head as if it were the predecessor; that view
+must first be safely reconstructed by the recovery integration. Repeating value
+validation against the same predecessor is not proof of integrated crash replay.
+Initialization/partial-file classification, reconstruction and automatic wiring
+remain required; both integration guards remain active.
+
+Work reads only predecessor heads and its last directory/record plus supplied new
+images. No full history scan or binary lookup is used. Tests with 0..128 preceding
+entries and 512/8192-byte pages used at most five predecessor reads for small old
+records. The exact 65,596-byte maximum after a split tail uses at most 154 images
+at page size 512; validating after a maximum old record stays within 156 reads.
+No end-to-end speedup or physical-I/O latency claim is made from these operation counts.
+
 ### Remaining complete-capability acceptance matrix
 
 | Cut / race | Required outcome |

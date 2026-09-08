@@ -14,6 +14,14 @@
 
 ## Resumo vigente — 2026-09-08
 
+GX-CAP-1 ganhou validação de uma transição completa de append do histórico contra
+uma visão anterior íntegra: diretório/stream, COMMIT/UUID/tempo, páginas exatas e
+preservação de prefixos, inclusive reescritas com CRC válido. 691 testes agrupados
+em 21,47 s; limites de leituras e registro máximo medidos sem varrer o histórico.
+Ainda não reconstrói a visão anterior após aplicação parcial nem habilita o
+journal automaticamente. [Evidência e limites](docs/specs/SPEC-GX-CAP-1.md).
+Pulse instalado e as specs reservadas permanecem intocados.
+
 GX-CAP-1 avançou na ligação do replay aos COMMITs individuais: preservação de
 epoch/transaction ID/LSN nos subplanos de recovery e checkpoint, validação de
 ownership e assinatura capturada antes de callbacks de decodificação. 826 testes

@@ -30,7 +30,10 @@ from okto_grafx.domain.txn.commit_catalog import (
     decode_commit_catalog_entry,
 )
 from okto_grafx.domain.txn.commit_identity import CommitId, assign_commit_time
-from okto_grafx.domain.txn.records import COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE
+from okto_grafx.domain.txn.records import (
+    COMMIT_DIRECTORY_FILE as COMMIT_DIRECTORY_FILE,
+    COMMIT_STREAM_FILE as COMMIT_STREAM_FILE,
+)
 
 
 _HEAD = Struct("<8sHH16sQQQQq")
@@ -432,6 +435,110 @@ class CommitCatalogStore:
         images.append(self._block_image(_DIRECTORY, ordinal_base, directory_prefix + item.encode()))
         images.append(self._header_image(_DIRECTORY, new_head))
         return CommitCatalogPlan(new_head, tuple(images))
+
+    def validate_append_images(
+        self, images: tuple[CommitCatalogPageImage, ...], *,
+        previous_sequence: int, sequence: int, activation_sequence: int,
+    ) -> CommitCatalogEntry:
+        """Validate one complete stamped append against a proved predecessor view.
+
+        The provider MUST represent the predecessor, not a partially applied or
+        newer head. Recovery must establish that view before using this validator;
+        this method neither reconstructs it nor grants physical authority. No
+        image is applied. Caller-owned fields are captured before provider calls.
+        Work is bounded by the old/new last record sizes, never retained history.
+        """
+        for value in (previous_sequence, sequence, activation_sequence):
+            CommitId(self._uuid, value)
+        if not activation_sequence <= previous_sequence < sequence:
+            raise _invalid("append_sequence")
+        if type(images) is not tuple:
+            raise _invalid("append_images")
+        maximum = (MAX_COMMIT_RECORD_BYTES + self._capacity - 1) // self._capacity + 3
+        if len(images) > maximum:
+            raise GrafxTransactionBudgetExceeded(
+                "Commit catalog append image count exceeds its bounded format.",
+                field="append_images", limit=maximum, observed=len(images),
+            )
+        if len(images) < 3:
+            raise _corrupt("append_images")
+        incoming: dict[tuple[str, int], bytes] = {}
+        sequences: dict[tuple[str, int], int] = {}
+        for image in images:
+            if (
+                type(image) is not CommitCatalogPageImage or type(image.file) is not str
+                or image.file not in {COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE}
+                or type(image.page_index) is not int or not 0 <= image.page_index < NO_PAGE
+                or type(image.raw) is not bytes or len(image.raw) != self._page_size
+            ):
+                raise _corrupt("append_image")
+            location = (image.file, image.page_index)
+            if location in incoming:
+                raise _corrupt("append_duplicate")
+            page = Page.from_bytes(image.raw, page_index=image.page_index)
+            if page.page_lsn != sequence or page.seq % 2:
+                raise _corrupt("append_page_stamp")
+            incoming[location] = image.raw
+            sequences[location] = page.seq
+
+        predecessor_pages: dict[tuple[str, int], bytes] = {}
+
+        def before_read(file: str, index: int) -> bytes:
+            key = (file, index)
+            if key not in predecessor_pages:
+                predecessor_pages[key] = self._read_page(file, index)
+            return predecessor_pages[key]
+
+        before = CommitCatalogStore(before_read, database_uuid=self._uuid, page_size=self._page_size)
+        previous = before.read_head()
+        if previous.last_sequence != previous_sequence or previous.activation_sequence != activation_sequence:
+            raise _corrupt("published_coverage")
+
+        def after_read(file: str, index: int) -> bytes:
+            raw = incoming.get((file, index))
+            return before_read(file, index) if raw is None else raw
+
+        after = CommitCatalogStore(after_read, database_uuid=self._uuid, page_size=self._page_size)
+        head = after.read_head()
+        if (
+            head.activation_sequence != activation_sequence or head.last_sequence != sequence
+            or head.entry_count != previous.entry_count + 1
+            or not _MIN_RECORD_BYTES <= head.stream_bytes - previous.stream_bytes <= MAX_COMMIT_RECORD_BYTES
+        ):
+            raise _corrupt("append_coverage")
+        locations = {
+            (COMMIT_DIRECTORY_FILE, 0),
+            (COMMIT_DIRECTORY_FILE, 1 + previous.entry_count // self._per_page),
+        }
+        locations.update(
+            (COMMIT_STREAM_FILE, 1 + index)
+            for index in range(previous.stream_bytes // self._capacity, (head.stream_bytes - 1) // self._capacity + 1)
+        )
+        if set(incoming) != locations:
+            raise _corrupt("append_locations")
+        item = after._item(head.entry_count - 1, head)
+        if item.offset != previous.stream_bytes or item.sequence != sequence:
+            raise _corrupt("append_offset")
+        record = after._record(item, head)
+        if previous.entry_count and record.timing.ordered_at.micros <= previous.last_ordered_micros:
+            raise _corrupt("append_time")
+        expected_time = assign_commit_time(
+            record.timing.observed_at,
+            Timestamp(previous.last_ordered_micros) if previous.entry_count else None,
+        )
+        if record.timing != expected_time:
+            raise _corrupt("append_time")
+        expected = before.plan_append(record)
+        if expected.head != head:
+            raise _corrupt("append_coverage")
+        for image in expected.images:
+            location = (image.file, image.page_index)
+            canonical = Page.from_bytes(image.raw, page_index=image.page_index)
+            canonical.page_lsn = sequence
+            canonical.seq = sequences[location]
+            if canonical.to_bytes() != incoming[location]:
+                raise _corrupt("append_prefix")
+        return record
 
     def lookup(self, identity: CommitId, *, read_lsn: int) -> CommitCatalogEntry | None:
         """Exact O(log N) ordinal lookup, bounded to read_lsn and the retained horizon.
