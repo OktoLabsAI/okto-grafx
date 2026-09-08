@@ -18,17 +18,23 @@ complexity cliff on an already selected path.
 
 Branch: `feature/v0.0.4`
 
-Current integration queue (2026-09-07): the two-hop bounded-output correction is
-implemented/tested in Community `7559ba7`, awaiting accumulated deployment. The
-already selected write/provenance investigation found source-reference equality
-scans (953 Entity rows / 203 Decision rows for one live read-only answer). A
-Community helper for the existing native exact hash index is proven in isolation:
-1002 scanned rows become 3 seek candidates with identical active-lineage output,
-plus snapshot/update/reopen and writer-fence tests. It is not wired to bootstrap
-or enabled in production yet. Required next steps are strict known-auxiliary-index
-certification, bootstrap integration and one accumulated quality/deploy checkpoint;
-see Community `docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`. This addresses the existing
-source-lookup complexity path, not a new engine format or exploratory timing gate.
+Current integration checkpoint (2026-09-07): Community `a5a5c3c` is deployed in
+Pulse PID 23228, including the bounded two-hop output correction (`7559ba7`) and
+11 native exact source-reference indexes. Bootstrap is fenced/idempotent; schema
+certification validates a closed auxiliary inventory and exact physical index
+generations, preserving refusal of unknown extras and mismatched files/nonces.
+Focused tests and one populated migration/cold-reopen regression passed before
+deployment. A SHA256-verified quiescent board copy was preserved before DDL.
+On read-only before/after copies, Entity 953 scans and Decision 203 scans became
+one seek candidate each with identical results. Additional index files total
+5,873,664 bytes; buffer budget unchanged. Whole-write overhead and admission
+peak memory are not isolated, and these observations do not prove an end-to-end
+write speedup. Native verify(all) is clean: 14,850 pages / 8,739 records / zero
+findings. UI graph/stats returned HTTP 200, 500/2779 nodes, zero edge-table failures.
+The 21 pending specs and cognitive ledger digest remain unchanged; no live
+consolidation or repair replay was triggered. Details and timing limitations:
+Community `docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`. Full cold latency/write cost
+remain the previously recorded residual scope, not new exploratory gates.
 
 Base: `ea4b5ff` (`0.0.3`)
 

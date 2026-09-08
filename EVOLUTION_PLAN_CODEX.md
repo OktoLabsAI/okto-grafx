@@ -21,17 +21,24 @@ Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |
-| Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a0b3c9f`; carregados no Pulse PID 31060, 500/2779 nós pela UI e ledger cognitivo preservado. |
-| Two-hop: montagem limitada ao resultado | Community `7559ba7`, 25 testes; aguardando deploy acumulado. Consultas por layout continuam residuais, não foram declaradas eliminadas. |
-| Identidade/proveniência por source ref | Índice exato Community em validação isolada: 1002 scans → 3 candidatos, mesmo resultado. Integrar certificação do inventário e bootstrap antes de ativar no board. |
-| Latência completa fria / custo completo de escrita | Não encerrados por medições isoladas. Priorizar o acesso por source ref já identificado no caminho de escrita; não consumir specs nem repetir benchmarks marginais. |
+| Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a5a5c3c`; carregados no Pulse PID 23228, 500/2779 nós pela UI e ledger cognitivo preservado. |
+| Two-hop: montagem limitada ao resultado | Community `7559ba7`, 25 testes; deploy acumulado concluído. Consultas por layout continuam residuais, não foram declaradas eliminadas. |
+| Identidade/proveniência por source ref | Bootstrap e certificação estrita integrados em Community `a5a5c3c`; 11 índices ativos. No board, Entity: 953 scans → 1 candidato; Decision: 203 → 1, resultados idênticos. |
+| Latência completa fria / custo completo de escrita | Não encerrados por medições isoladas. O acesso por source ref está entregue; o custo integral de escrita e manutenção dos índices ainda requer benchmark reservado, sem consumir specs nesta etapa. |
 | Corpus reservado | 21 specs pendentes, zero em progresso; não consolidar, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
 | Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |
 
-Próxima sequência finita: certificar índices auxiliares conhecidos sem aceitar
-extras arbitrários → conectar bootstrap idempotente → regressão proporcional e
-deploy acumulado. Detalhes do acesso por source ref no Community:
-`docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`.
+Checkpoint finito concluído: certificação fechada de auxiliares conhecidos e
+gerações físicas → bootstrap idempotente → regressão proporcional → deploy
+acumulado. Cópia quiescente preservada antes do DDL; verificação nativa integral
+limpa (14.850 páginas, 8.739 registros, zero achados). A UI retornou grafo e totais
+com HTTP 200 e zero tabelas de arestas com falha. Os índices acrescentam
+5.873.664 bytes; não foi elevado o orçamento de buffer. Nenhuma consolidação,
+redrive/rebuild/reset ou repetição dos sete reparos foi iniciada. O runtime usa
+fontes, não uma nova instalação global/publicação. Detalhes, testes, limites das
+medições e recuperação automática de admissão no Community:
+`docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`. Permanecem as frentes já registradas de
+latência fria/custo integral de escrita e os planos globais, sem criar novos gates.
 
 ## Histórico de execução — checkpoint iniciado em 2026-09-06
 
