@@ -67,6 +67,7 @@ import hashlib
 from collections.abc import Callable, Sequence
 from typing import Protocol, cast, runtime_checkable
 
+from okto_grafx.domain.control_record import ControlRecordReader
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -415,6 +416,7 @@ class RecoveryManager:
         database_uuid: bytes | None = None,
         control_format_version: int = 1,
         control_file_nonce: int = 0,
+        control_read_if_exists: ControlRecordReader | None = None,
     ) -> None:
         """Build the manager over the stores and ports one recovery pass needs.
 
@@ -516,6 +518,7 @@ class RecoveryManager:
                 database_uuid=database_uuid,
                 control_format_version=control_format_version,
                 file_nonce=control_file_nonce,
+                control_read_if_exists=control_read_if_exists,
             )
         )
         self._redo_engine = CommitRedo(pool, index_manager)  # type: ignore[arg-type]

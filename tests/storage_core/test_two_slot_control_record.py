@@ -6,6 +6,7 @@ import pytest
 
 from okto_grafx.adapters.storage_fault import FaultInjectingStorageDevice
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
+from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.adapters.coordination_local import (
     LeaseRecord,
     ReaderRecord,
@@ -15,9 +16,10 @@ from okto_grafx.adapters.coordination_local import (
 from okto_grafx.domain.control_record import (
     CONTROL_FILE_PAGES,
     ControlRecordKind,
+    ControlRecordReader,
     TwoSlotControlRecordStore,
 )
-from okto_grafx.domain.errors import GrafxCorruptionDetected
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.page.layout import MAX_U64, MIN_PAGE_SIZE, PageHeader
 from okto_grafx.domain.txn.commit_state import CommitState
 
@@ -142,6 +144,7 @@ def _store(
     temporary: str = TEMP,
     nonce: int = 11,
     database_uuid: bytes = DATABASE_UUID,
+    read_if_exists: ControlRecordReader | None = read_control_if_exists,
 ) -> TwoSlotControlRecordStore:
     """Return one commit-state-kind store over the supplied test device."""
     return TwoSlotControlRecordStore(
@@ -151,6 +154,7 @@ def _store(
         database_uuid=database_uuid,
         file_nonce=nonce,
         temporary=temporary,
+        read_if_exists=read_if_exists,
     )
 
 
@@ -189,6 +193,74 @@ def test_control_reads_use_only_a_capability_declared_by_the_concrete_type() -> 
     assert observed is not None
     assert observed.payload == b"first"
     assert direct.calls == ["exists", "read_log"]
+
+
+def test_manual_domain_composition_without_a_reader_uses_only_the_literal_port() -> None:
+    inner = MemoryStorageDevice()
+    _store(inner).publish(b"first")
+    device = _FusedRecordingDevice(inner)
+    observed = _store(device, read_if_exists=None).read()
+    assert observed is not None and observed.payload == b"first"
+    assert device.calls == ["exists", "read_log"]
+
+
+def test_inherited_fused_methods_do_not_opt_in_a_new_concrete_type() -> None:
+    class Inherited(_FusedRecordingDevice):
+        pass
+
+    inner = MemoryStorageDevice()
+    _store(inner).publish(b"first")
+    device = Inherited(inner)
+    observed = _store(device).read()
+    assert observed is not None and observed.payload == b"first"
+    assert device.calls == ["exists", "read_log"]
+
+
+def test_fused_capability_resolution_remains_fresh_and_instance_instrumented(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner = MemoryStorageDevice()
+    _store(inner).publish(b"first")
+    device = _FusedRecordingDevice(inner)
+    store = _store(device)
+    assert store.read() is not None
+    original = device.read_log_if_exists
+    instrumented: list[str] = []
+
+    def observed(file: str, offset: int, length: int) -> bytes | None:
+        instrumented.append(file)
+        return original(file, offset, length)
+
+    monkeypatch.setattr(device, "read_log_if_exists", observed)
+    assert store.read() is not None
+    assert instrumented == [FILE]
+
+    # Removing the concrete declaration revokes opt-in even while the instance
+    # instrumentation remains callable. The store must not cache this authority.
+    monkeypatch.setattr(_FusedRecordingDevice, "read_log_if_exists", None)
+    device.calls.clear()
+    assert store.read() is not None
+    assert instrumented == [FILE]
+    assert device.calls == ["exists", "read_log"]
+
+
+@pytest.mark.parametrize("reader", [False, 1, object()])
+def test_malformed_injected_readers_are_refused(reader: object) -> None:
+    with pytest.raises(GrafxConfigurationError) as refused:
+        _store(MemoryStorageDevice(), read_if_exists=reader)  # type: ignore[arg-type]
+    assert refused.value.details["field"] == "read_if_exists"
+
+
+def test_injected_read_failure_is_not_reclassified_as_absence() -> None:
+    failure = RuntimeError("control read failed")
+
+    def reader(storage: object, file: str, offset: int, length: int) -> bytes | None:
+        raise failure
+
+    store = _store(MemoryStorageDevice(), read_if_exists=reader)
+    with pytest.raises(RuntimeError) as caught:
+        store.read()
+    assert caught.value is failure
 
 
 def test_a_warm_publication_is_exactly_one_page_write_and_one_barrier() -> None:

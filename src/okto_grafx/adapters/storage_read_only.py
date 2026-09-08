@@ -12,6 +12,7 @@ from __future__ import annotations
 from types import TracebackType
 from typing import NoReturn, Self
 
+from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.domain.errors import GrafxUnsupportedOperation
 from okto_grafx.domain.ids import PageIndex
 from okto_grafx.domain.ports.storage import StorageDevice
@@ -118,13 +119,7 @@ class ReadOnlyStorageDevice:
         ``exists`` and a present name is read normally; a race that removes it is allowed to
         propagate the wrapped ``read_log`` refusal unchanged.
         """
-        implementation = vars(type(self.__device)).get("read_log_if_exists")
-        if callable(implementation):
-            fused_read = getattr(self.__device, "read_log_if_exists")
-            return fused_read(file, offset, length)
-        if not self.__device.exists(file):
-            return None
-        return self.__device.read_log(file, offset, length)
+        return read_control_if_exists(self.__device, file, offset, length)
 
     def log_size(self, file: str) -> int:
         """Return the wrapped log size unchanged."""

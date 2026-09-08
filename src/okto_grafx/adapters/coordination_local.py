@@ -47,6 +47,7 @@ from functools import lru_cache
 from math import isfinite
 from typing import TypeVar
 
+from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.domain.control_record import (
     ControlRecordKind,
     TwoSlotControlRecordStore,
@@ -963,6 +964,7 @@ class LocalProcessCoordinator:
                 database_uuid=database_uuid,
                 file_nonce=nonce,
                 temporary=f"{self._lease_file}.{self._owner}.tmp",
+                read_if_exists=read_control_if_exists,
             )
             if self._lease_slots is not None:
                 return

@@ -2,8 +2,8 @@
 
 2026-09-08, `feature/v0.0.4`. This addresses the nine findings already recorded
 in `RETAINED_METRIC_SAMPLING_0_0_4.md`; it is not a new performance acceptance gate.
-The complete architecture gate remains **failing**. The first checkpoint left five
-occurrences; the recovery checkpoint below reduces this to four in three modules.
+The complete architecture gate remains **failing**. Query, recovery and control-I/O
+checkpoints below reduce the original nine occurrences to three in two modules.
 
 ## Corrected engine synchronization placement
 
@@ -130,3 +130,58 @@ and 60-second thread timeouts remain enabled. Ruff and diff whitespace checks pa
 No gate waiver and no all-plan completion claim. This checkpoint is source-only:
 the running Pulse remains on installed Grafx a82d3bf; no pending spec was consumed,
 no live graph was opened by tests, and no restart/deployment/rebuild/redrive occurred.
+
+## Control-record I/O composition checkpoint — 2026-09-08
+
+Removed concrete-type namespace inspection from `domain.control_record`.
+`adapters.control_record_io.read_control_if_exists` now owns exactly the previous
+selection algorithm. The concrete type must explicitly declare a callable fused
+method; inherited methods and generic `__getattr__` forwarding do not opt in.
+Selection is fresh on every call, then resolves through the instance so local
+instrumentation remains effective. No capability, identity or authority is cached.
+Absent opt-in retains exists/read_log, including an error if the name disappears
+between those calls. None and empty bytes remain distinct.
+
+TwoSlotControlRecordStore receives an optional `read_if_exists` operation typed by
+the pure ControlRecordReader alias. Manual compositions without it use the literal
+storage port; they do not inspect adapter implementation namespaces. An invalid
+non-callable reader is refused. The normal public composition explicitly supplies
+the adapter operation through TransactionManager/RecoveryManager -> CommitStateStore
+-> slot store. LocalProcessCoordinator and offline control migration also supply it.
+ReadOnlyStorageDevice uses the same adapter selection logic while retaining every
+write refusal and its unchanged external signature.
+
+This preserves the optimized native path, not just a slower compatible fallback.
+The public integration test spies actual LocalStorageDevice fused operations and
+proves calls for writer.lease and commit.state during a commit, plus commit.state on
+writable and read-only reopen. Existing strict/generation descriptor tests still
+prove the exact observation counts. Manual low-level consumers wanting the fused
+optimization now inject this reader from their composition layer; neither public
+connect settings nor the mandatory StorageDevice/PortRegistry contract is expanded.
+
+The domain still owns bounded image sizes, slot checksums, generation rollback,
+legacy length consistency, reread limits, physical publication and durability
+barriers. No format, snapshot/OCC protocol, multi-reader/writer assumption or public
+Pulse API changed. This is an architectural repair preserving an existing gain,
+not a newly measured speedup or another full-write benchmark.
+
+Evidence:
+
+- Initial control/readonly/descriptor/downgrade slice: **99 passed in 1.10 s**.
+- Added tests for pure fallback, inherited capability refusal, fresh selection
+  after class declaration replacement, instance instrumentation, malformed callback
+  and exception identity. Public reopen fixture initially omitted its prerequisite
+  checkpoint and was correctly refused; the fixture now checkpoints, not the engine.
+- Grouped control/readonly/descriptor/downgrade/slot-crash/control-retirement/
+  commit-state-fallback/startup/public-crash/import gate: **394 passed, 3 failed in
+  12.43 s**. Failures are schema.py, index_manager.py and the aggregate import gate.
+- Coordination publication: **10 passed in 0.28 s**, separately collected because
+  its absolute `from conftest` conflicts with txn/conftest when combined. The failed
+  collection attempt is not a passing or skipped-test result; both intended groups
+  were rerun to completion without relaxing the skip gate.
+- Strict markers, 60-second thread timeouts, Ruff and diff checks retained.
+
+Remaining occurrences: schema.py thread lock/weak-key proof registry (two), and
+index_manager.py context-local commit authority/projection (one). No gate waiver.
+Source-only; Pulse stays on installed a82d3bf and all twenty benchmark specs remain
+reserved. No live consolidation, migration, graph reset, redrive or restart.

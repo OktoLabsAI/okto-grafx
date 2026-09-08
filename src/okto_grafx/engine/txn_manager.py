@@ -68,6 +68,7 @@ from time import perf_counter_ns
 from types import TracebackType
 from typing import Any, Literal
 
+from okto_grafx.domain.control_record import ControlRecordReader
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -780,6 +781,7 @@ class TransactionManager:
         database_uuid: bytes | None = None,
         control_format_version: int = 1,
         control_file_nonce: int = 0,
+        control_read_if_exists: ControlRecordReader | None = None,
         process_identity_provider: Callable[[], object] | None = None,
         catalog_changes_are_wal_logged: bool = False,
     ) -> None:
@@ -828,6 +830,7 @@ class TransactionManager:
             database_uuid=database_uuid,
             control_format_version=control_format_version,
             file_nonce=control_file_nonce,
+            control_read_if_exists=control_read_if_exists,
         )
         self._commit_redo = CommitRedo(pool, index_manager)
         self._clock: Clock = clock

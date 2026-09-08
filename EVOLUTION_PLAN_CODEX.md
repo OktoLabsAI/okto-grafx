@@ -51,7 +51,7 @@ Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 | Preparação local de proveniência | Core `e1e9d08` elimina varreduras repetidas, mantendo fallback para colisão de ID; 24 testes passaram. Exercitado pela consolidação autorizada no PID 2124; preservado no novo PID 34048. |
 | Latência completa fria / custo completo de escrita | Uma spec real: commit MCP 22,981 s, 5 nós/10 arestas; entrega Global 131,489 s, sem retry/erro. Priorizar atribuição desse custo completo; ganhos nativos isolados não encerram a frente. |
 | Corpus reservado | 20 specs pendentes, 20 consolidadas, zero em progresso; apenas uma consumida nesta autorização. Demais pendentes idênticas. Não consolidar outras, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
-| Dívida de arquitetura já registrada | Locks do query engine e inspeção de atributos do recovery fornecidos pela composição externa; classificação de `heapq` e enum público reconciliada com testes negativos. Checkpoint recovery: 366 testes passam; 4 falham no gate por 4 ocorrências restantes em 3 módulos. Contrato público inalterado; composição interna de RecoveryManager exige `attribute_probe`. Correção parcial, fonte apenas: `docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`. |
+| Dívida de arquitetura já registrada | Locks do query engine, inspeção do recovery e seleção de leitura combinada dos control records fornecidos pela composição externa. Caminho otimizado confirmado via API pública; contratos de Pulse/connect/StorageDevice inalterados. Checkpoint control-I/O: 394 testes passam e 3 falham no gate; publicação da coordenação 10/10 separadamente. Restam 3 ocorrências em 2 módulos. Composição interna de RecoveryManager exige `attribute_probe`; leitores combinados são injetados. Correção parcial, fonte apenas: `docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`. |
 | Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |
 
 Checkpoint finito concluído: certificação fechada de auxiliares conhecidos e
@@ -97,7 +97,7 @@ idêntico; 701 testes passaram. **Ganho de memória, não de tempo demonstrado**
 sem reiniciar Pulse ou consumir outra spec. Detalhes e limites em
 `docs/VERIFICATION_RETAINED_HISTORY_0_0_4.md`. A atribuição dos 131,489 s da entrega
 real permanece pendente. As nove ocorrências estáticas registradas nesse momento
-foram reduzidas a quatro nos checkpoints posteriores descritos em
+foram reduzidas a três nos checkpoints posteriores descritos em
 `docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`; o gate ainda não está fechado.
 
 ## Histórico de execução — checkpoint iniciado em 2026-09-06

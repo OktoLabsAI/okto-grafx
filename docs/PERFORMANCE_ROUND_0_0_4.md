@@ -799,3 +799,15 @@ slice: **366 passed, 4 failed in 13.10 s**. Remaining architecture debt is four
 occurrences across three modules (plus the aggregate assertion), not a waived gate.
 This is source-only; no new spec consumption or deployment. See the recovery
 checkpoint in the same report for constructor migration and exact evidence.
+
+Next existing-debt checkpoint: concrete fused-control-read selection moved to the
+storage adapter, explicitly wired through normal txn/recovery/coordination/offline
+migration compositions. Pure manual compositions retain the literal port fallback;
+public integration and descriptor-count tests prove the native fused path survives.
+Fresh concrete opt-in and instance instrumentation remain; forwarding/inherited
+capabilities cannot bypass admission. ReadOnlyStorageDevice shares the same selector.
+Grouped result **394 passed, 3 failed in 12.43 s**, plus **10 coordination publication
+tests in 0.28 s** in a separate invocation to avoid existing conftest import collision.
+Only schema.py (two mechanisms), index_manager.py (one), and the aggregate gate still
+fail. Source-only, no new speedup claim or spec consumption. Full evidence and manual
+composition guidance are in `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.

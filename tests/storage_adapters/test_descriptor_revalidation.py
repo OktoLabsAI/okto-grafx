@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from okto_grafx.adapters.storage_local import LocalStorageDevice
+from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.domain.control_record import (
     ControlRecordKind,
     TwoSlotControlRecordStore,
@@ -384,6 +385,7 @@ def test_two_slot_control_io_keeps_one_strict_proof_per_actual_descriptor_hit(
             database_uuid=DATABASE_UUID,
             file_nonce=17,
             temporary=CONTROL_TEMP,
+            read_if_exists=read_control_if_exists,
         )
         assert store.publish(b"one") == 1
         assert store.read() is not None  # cold descriptor admission

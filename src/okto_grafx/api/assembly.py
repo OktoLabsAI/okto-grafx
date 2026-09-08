@@ -50,6 +50,7 @@ from okto_grafx.adapters.coordination_local import (
 )
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
+from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
 from okto_grafx.adapters.query_spill_local import LocalQuerySpillFactory
 from okto_grafx.adapters.storage_local import LocalStorageDevice
@@ -479,6 +480,7 @@ def assemble_database(
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
+            control_read_if_exists=read_control_if_exists,
         )
         # FR-1: a writable reopen replays BEFORE catalog payloads are interpreted. A read-only
         # reopen proves from both commit.state and the WAL that replay is unnecessary, then may
@@ -533,6 +535,7 @@ def assemble_database(
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
+            control_read_if_exists=read_control_if_exists,
             process_identity_provider=os.getpid,
             catalog_changes_are_wal_logged=True,
         )
