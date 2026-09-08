@@ -249,6 +249,8 @@ Pulse was not restarted/upgraded; the 20 reserved pending specs were not consume
 
 ### CAP-1B prepared terminal-LSN binding — 2026-09-08
 
+Immutable implementation checkpoint: `2d01f1793b8190afe8a7b2f8c21fb0e41913b337`.
+
 `prepare_append` now admits/captures metadata and observed time before storage
 reads, requires head coverage equal to the coordinator's durable sequence, computes
 ordered time once and returns a bounded attempt-local prepared value. Its `bind`

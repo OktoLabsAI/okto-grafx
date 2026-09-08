@@ -230,6 +230,8 @@ redo, control publication, required-grammar refusal, backup/restore and verify.
 
 ## Prepared append and terminal-LSN binding — CAP-1B
 
+Immutable implementation checkpoint: `2d01f1793b8190afe8a7b2f8c21fb0e41913b337`.
+
 `CommitCatalogStore.prepare_append` now closes the journal-image-count/CommitId
 dependency without rereading host storage while retargeting. It requires the exact
 current durable COMMIT sequence supplied by the coordinator. A valid catalog head

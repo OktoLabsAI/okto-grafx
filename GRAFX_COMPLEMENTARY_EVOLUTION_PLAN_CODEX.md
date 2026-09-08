@@ -10,6 +10,7 @@ durante o ajuste. A preparação exige cobertura igual ao controle durável info
 sem anexar registros de catálogo. Integração com staging/OCC/ativação/replay ainda
 pendente; a lista fechada de pontos de ligação está em `COMMIT_CATALOG_V1.md`.
 Não é cache de autoridade nem capability habilitada no Pulse.
+Checkpoint imutável: `2d01f1793b8190afe8a7b2f8c21fb0e41913b337`.
 
 **GX-CAP-1B / armazenamento paginado / 2026-09-08:** implementados o planejador
 privado de imagens de páginas, append limitado à cauda, lookup binário por identidade
