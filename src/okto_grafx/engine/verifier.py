@@ -156,6 +156,7 @@ class _CanonicalIndexVerification:
         "remaining_indexes",
         "resolved_refs",
         "scan_failures",
+        "scanned_refs",
         "seeded",
         "tables",
         "versions",
@@ -168,6 +169,7 @@ class _CanonicalIndexVerification:
             tuple[int, str], tuple[tuple[RecordRef, HeapVersion], ...]
         ] = {}
         self.scan_failures: dict[tuple[int, str], GrafxError] = {}
+        self.scanned_refs: dict[tuple[int, str], set[int]] = {}
         self.resolved_refs: dict[tuple[int, str], set[int]] = {}
         self.seeded: set[tuple[int, str]] = set()
         self.remaining_indexes: dict[tuple[int, str], int] = {}
@@ -190,6 +192,7 @@ class _CanonicalIndexVerification:
         self.remaining_indexes.pop(identity, None)
         self.versions.pop(identity, None)
         self.scan_failures.pop(identity, None)
+        self.scanned_refs.pop(identity, None)
         self.resolved_refs.pop(identity, None)
         self.seeded.discard(identity)
 
@@ -1321,10 +1324,14 @@ class Verifier:
         table: TableDef,
         shared: _CanonicalIndexVerification,
     ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
-        """Return the one canonical scan of a table for this call, or raise its one failure.
+        """Fully decode one table, retaining only values that coverage can need.
 
         The scan runs at most once per table per verification; a failure is kept and raised
         again to every later asker, so each index reports it where it always did.
+        Ended built-in versions still pass the complete decoder, including overflow and tuple
+        validation. Their payloads are then discarded: coverage never requires their keys.
+        Exact physical references are retained separately for resolution seeding, published
+        only after the entire scan succeeds. Foreign version objects keep their former path.
         """
         failure = shared.scan_failures.get(identity)
         if failure is not None:
@@ -1332,11 +1339,19 @@ class Verifier:
         versions = shared.versions.get(identity)
         if versions is None:
             try:
-                versions = tuple(self._heap.scan_all(table))  # type: ignore[union-attr]
+                retained: list[tuple[RecordRef, HeapVersion]] = []
+                scanned_refs: set[int] = set()
+                for ref, version in self._heap.scan_all(table):  # type: ignore[union-attr]
+                    if type(ref) is RecordRef:
+                        scanned_refs.add(ref.encode())
+                    if type(version) is not HeapVersion or version.live:
+                        retained.append((ref, version))
+                versions = tuple(retained)
             except GrafxError as caught:
                 shared.scan_failures[identity] = caught
                 raise
             shared.versions[identity] = versions
+            shared.scanned_refs[identity] = scanned_refs
         return versions
 
     def _seed_resolved_refs(
@@ -1377,7 +1392,7 @@ class Verifier:
         if held != table:
             return
         try:
-            versions = self._canonical_versions(identity, table, shared)
+            self._canonical_versions(identity, table, shared)
         except GrafxError:
             return
         # Publish the seeded marker only after this particular index proved that it exposes a
@@ -1385,9 +1400,7 @@ class Verifier:
         # non-covering index for the same table must not suppress the optimization for a later
         # valid one; all failure paths above remain canonical fallbacks.
         shared.seeded.add(identity)
-        resolved_refs.update(
-            ref.encode() for ref, _version in versions if type(ref) is RecordRef
-        )
+        resolved_refs.update(shared.scanned_refs[identity])
 
     def _verify_index_covers_the_heap(
         self,

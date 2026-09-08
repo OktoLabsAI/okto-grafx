@@ -732,3 +732,16 @@ unchanged. Full write/delivery remains the material performance front, not close
 by private subsecond transaction samples. Evidence and limitations:
 `PULSE_SINGLE_SPEC_INSTALLED_0_0_4.md`. No further spec consumption is authorized
 by this checkpoint itself; historical unrelated debt remains recorded.
+
+### Global certification retention — 2026-09-08
+
+Read-only attribution on the preserved Global fixture found full verification
+dominating its certification (31.901 of 32.004 profiled seconds); this does not
+attribute the live 131.489-second delivery. Native index verification now fully
+decodes historical versions but retains only payloads needed for live coverage,
+keeping every validated reference and all corruption/fallback checks. The private
+DecisionDigest memo dropped from 23,304 decoded versions to 2,261 (~90%); full
+verification reports remained identical. Combined tests: 701 passed in 34.57 s.
+No wall-time gain is claimed (13.327/15.163 s with concurrent tests), and no
+marginal gate was repeated. Source-only, queued for accumulated deployment;
+20 reserved specs untouched. See `VERIFICATION_RETAINED_HISTORY_0_0_4.md`.

@@ -63,6 +63,16 @@ com **20** pendentes preservadas. Saúde final de board/discovery retornou healt
 mas há snapshots diagnósticos stale e dívidas históricas não tratadas. Evidências,
 tempos reais e limitações: `docs/PULSE_SINGLE_SPEC_INSTALLED_0_0_4.md`.
 
+Seguimento em 2026-09-08: a certificação Global foi perfilada somente em cópia
+privada. A verificação nativa agora descarta os valores históricos já decodificados
+que não participam da cobertura, mantendo todas as referências e checagens.
+DecisionDigest: 23.304 → 2.261 versões com valores retidos, relatório integral
+idêntico; 701 testes passaram. **Ganho de memória, não de tempo demonstrado**:
+13,327/15,163 s no par com testes concorrentes. Fonte pronta para deploy acumulado,
+sem reiniciar Pulse ou consumir outra spec. Detalhes e limites em
+`docs/VERIFICATION_RETAINED_HISTORY_0_0_4.md`. A atribuição dos 131,489 s da entrega
+real e as nove ocorrências estáticas de arquitetura permanecem pendentes.
+
 ## Histórico de execução — checkpoint iniciado em 2026-09-06
 
 - **Rodada 0.0.4, Wave 3 em execução.** Além da Wave 2 concluída até STO-M1, `b8906f6`
