@@ -81,3 +81,44 @@ Source-only until an accumulated deployment is explicitly recorded. Pulse PID 21
 remains on installed Grafx 2db169d. No further spec was consolidated, and the twenty
 reserved specs, historical DLQ and SQLite data were not changed. The nine recorded
 static architecture findings remain open; focused regression is not an all-plan pass.
+
+## Accumulated deployment completed — 2026-09-08 00:57 local
+
+This section supersedes the source-only status above. Built and installed
+Grafx **0.0.4@a82d3bf** into Python 3.13 user site-packages, accumulating retention
+78aaf93, shared bucket walks 10e79d4 and destination batching a82d3bf. Wheel SHA-256:
+`51879D0485B400C5D2A597AD2F1E5BC5D125157988D942947842533E3EE95B57`.
+numpy 2.5.2 and google-crc32c 1.8.0 remain installed. No PyPI/main/UV-environment
+publication or installation was performed. The earlier wheel remains available.
+
+Pulse PID 2124 was interrupted through its owned session; shutdown completed,
+the session was terminal (exit 1), process absent and both ports free before
+restart. New Pulse **0.3.3 PID 34048**, session 25464, listens on **8100/8101**.
+Core **9e91ea9** and Community **7158383** are source imports; Grafx alone is the
+installed wheel. Data home remains `C:/Users/jpamb/.okto-pulse`. Community's unrelated
+pre-existing worktree modifications were preserved.
+
+Installed/source hashes agree for query_engine, index_manager and verifier:
+
+- query_engine.py: `360A2C80F049E8689DC5D571AC56B3A2182551D839836EE61C2734A2794BBF59`
+- index_manager.py: `28E112E0B0A2F5FB63349B3E4980802EEA0BCBB2CDAF30DE89AAD294C7B6E6A6`
+- verifier.py: `094346606CAD7A3CB0BB6C54ACDCDBBED6EC8457F3C7A0E5037E7452E88CAEF0`
+
+Post-deploy evidence:
+
+- Frontend HTTP root returns 200; API and MCP share PID 34048. This is availability
+  evidence, not a new browser rendering/performance audit.
+- Schema introspection succeeds. Canonical MCP Cypher returns the five previously
+  consolidated Alternatives and one Decision link each, 5 rows, no truncation:
+  0.333 s full tool call / 183.2 ms executor. No commit was replayed.
+- All 20 pending cognitive items exactly equal their pre-stop API projections.
+- First cold Health reported budget-limited pending diagnostics, not corruption.
+  Follow-up reports board **healthy**, discovery **healthy**, metrics **available**,
+  total_nodes **2,965**, queue_depth **0**, board DLQ **0**. Overall remains
+  **at_risk** due to historical policy DLQ (439); Global DLQ 224 and one canonical
+  debt remain. Some snapshots are stale/refresh-scheduled and native runtime budget
+  is incomplete. These are not hidden or relabeled all-green.
+
+Bounded private deployment/readback/Health/pending evidence:
+`.grafx-tmp/deploy-a82d3bf-live-evidence.json`, SHA-256
+`BD2C759154375D5F0E0D5D87D78C46042EDE43137A630FBFE936F56ADD17CC36`.

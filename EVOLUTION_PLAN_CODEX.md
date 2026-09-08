@@ -12,13 +12,13 @@
 > `docs/PERFORMANCE_ROUND_0_0_4.md`. Itens específicos do Pulse permanecem na camada Community;
 > o Core continua agnóstico ao backend de grafo.
 
-## Resumo vigente — 2026-09-07
+## Resumo vigente — 2026-09-08
 
 Adendo 2026-09-08: a investigação do ACK Global encontrou uma contagem de arestas
 O(S*E) no Core, substituída por projeção local O(S+E), sem dispensar leituras ou
 provas pré/pós-flush. 73 testes passaram; inventário privado de 2.253 vínculos:
 1,219 s → 0,0034 s na contagem isolada, sem alegação de ganho total nos 131,489 s.
-Implementação ainda não carregada no Pulse ativo; não houve nova consolidação.
+Implementação Core `9e91ea9` carregada no novo Pulse PID 34048; não houve nova consolidação.
 Detalhes no Core: `docs/GLOBAL_DELIVERY_EDGE_INVENTORY.md`.
 
 Atribuição posterior em cópias privadas: inventários/metadados do Board abaixo de
@@ -29,7 +29,13 @@ a percorrer cada bucket solicitado uma vez, mantendo provas de heap/certificado;
 posterior ao destino escalar mantém lotes de até 64 passos e o memo já limitado:
 consulta de saída 4,771 → 4,464 s, entrada 5,627 → 3,231 s em cópia privada, com
 2.253 resultados idênticos. Não declara os 131 s resolvidos nem um novo run vivo.
-Fonte apenas, sem nova spec: `docs/GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md` e
+Deploy acumulado concluído: Grafx **0.0.4@a82d3bf** instalado com accel, Pulse
+0.3.3 PID **34048** nas portas 8100/8101, Core `9e91ea9`, Community `7158383`.
+214 testes na regressão da integração; hashes instalados conferidos e leitura MCP
+dos cinco nós/vínculos concluída. Board/Global healthy; overall at_risk pela DLQ
+histórica de políticas, sem ocultar snapshots stale/runtime budget incompleto.
+20 itens pendentes idênticos antes/depois. Sem nova spec, rebuild ou redrive.
+Rastreabilidade: `docs/GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md` e
 `docs/GLOBAL_DESTINATION_BATCHING_0_0_4.md`.
 
 Este resumo prevalece sobre os checkpoints cronológicos abaixo; eles ficam
@@ -39,10 +45,10 @@ Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |
-| Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a5a5c3c`; deploy preservado no atual Pulse PID 2124. O checkpoint anterior validou 500/2779 nós pela UI. |
+| Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a5a5c3c`; implementação preservada no atual Pulse PID 34048. O checkpoint anterior validou 500/2779 nós pela UI. |
 | Two-hop: montagem limitada ao resultado | Community `7559ba7`, 25 testes; deploy acumulado concluído. Consultas por layout continuam residuais, não foram declaradas eliminadas. |
 | Identidade/proveniência por source ref | Bootstrap e certificação estrita integrados em Community `a5a5c3c`; 11 índices ativos. No board, Entity: 953 scans → 1 candidato; Decision: 203 → 1, resultados idênticos. |
-| Preparação local de proveniência | Core `e1e9d08` elimina varreduras repetidas, mantendo fallback para colisão de ID; 24 testes passaram. Carregado no PID 2124 e exercitado pela consolidação autorizada de uma spec. |
+| Preparação local de proveniência | Core `e1e9d08` elimina varreduras repetidas, mantendo fallback para colisão de ID; 24 testes passaram. Exercitado pela consolidação autorizada no PID 2124; preservado no novo PID 34048. |
 | Latência completa fria / custo completo de escrita | Uma spec real: commit MCP 22,981 s, 5 nós/10 arestas; entrega Global 131,489 s, sem retry/erro. Priorizar atribuição desse custo completo; ganhos nativos isolados não encerram a frente. |
 | Corpus reservado | 20 specs pendentes, 20 consolidadas, zero em progresso; apenas uma consumida nesta autorização. Demais pendentes idênticas. Não consolidar outras, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
 | Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |

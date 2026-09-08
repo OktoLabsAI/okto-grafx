@@ -768,3 +768,12 @@ post-certificates reduced from 2,255/2,253 to 38/36. No new timing gate or live
 consolidation; full delivery is still unresolved. Fallbacks preserve streaming
 LIMIT, owner overlays, operational quotas and specialized witnesses. Implementation,
 quality evidence and deployment boundary: `GLOBAL_DESTINATION_BATCHING_0_0_4.md`.
+
+Accumulated deployment subsequently completed: Grafx 0.0.4@a82d3bf installed wheel,
+Core 9e91ea9, Community 7158383, Pulse 0.3.3 PID 34048. Prior process terminal and
+ports free before restart. 214 grouped tests passed; installed/source hashes agree.
+MCP readback of the authorized spec's five Alternatives/links passed and all twenty
+pending items are unchanged. Board/Global healthy; overall at_risk remains due to
+historical policy DLQ, with some stale diagnostics/runtime-budget gaps still visible.
+No new consolidation or end-to-end delivery benchmark. See that report's deployment
+section for exact artifact hash and evidence.
