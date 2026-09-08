@@ -123,6 +123,8 @@ multiprocess, lookup/verify, metrics and logical-transfer work listed above.
 
 ### CAP-1A execution evidence — 2026-09-08
 
+Immutable implementation checkpoint: `474335962eeae20a937d6a444bcc3f7b2c2f110f`.
+
 The tests were written first and the initial run refused collection because the
 new identity module did not exist. After implementation, the dedicated slice is
 **87 passed in 0.23 s**. The all-transaction/public-output/import-boundary group

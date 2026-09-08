@@ -9,6 +9,7 @@ e cálculo puro de tempo lógico. 985 testes agrupados passaram, incluindo 87
 específicos; tipagem estrita/Ruff verdes. A capability persistente e pública
 continua pendente, sem mudança no Pulse ou novas specs consolidadas.
 Registro: [`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md).
+Checkpoint imutável: `474335962eeae20a937d6a444bcc3f7b2c2f110f`.
 
 **Execução 2026-09-08:** GX-CAP-0 ganhou seis ADRs, estratégia de manifest,
 especificações por milestone e enforcement de fronteiras de source/wheel em
