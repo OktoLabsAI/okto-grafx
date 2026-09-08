@@ -62,7 +62,31 @@ Profile: `.grafx-tmp/global-writable-open-20260908.prof`; bounded harness:
 
 ## Deployment
 
-Source milestone only, queued for accumulated deployment. Pulse PID 28232 remains
-on installed Grafx 0.0.4@9b41f36. No restart, spec consolidation, delivery replay,
-rebuild, reset or DLQ redrive was performed. Twenty pending specs remain reserved.
-The wider evolution and full-write latency tasks remain open.
+Installed afterward on 2026-09-08: **Grafx 0.0.4@807bce6**, wheel SHA-256
+`3A4FC91CF8E5F4CE43BE6C7C08C39057C7206FACAC6AA30760A893E7A32D1C44`.
+An isolated installation of this wheel passed **24 focused tests in 6.97 s**
+(recovery floor, checkpoint scope and ST-7), retaining strict markers and the
+60-second thread timeout. Its import path was checked explicitly.
+
+Pulse PID 28232 shut down gracefully; its owning terminal reached exit 1 and
+both PID and listening ports were absent before package replacement. Installed
+into Python 3.13 user site-packages with NumPy 2.5.2 and google-crc32c 1.8.0;
+recovery/index/transaction/heap module hashes match source. Pulse **0.3.3 PID 15940**
+now serves 8100/8101 using unchanged Community/Core source paths and the installed
+native package, not native source injection. HTTP root returned 200.
+
+Authenticated canonical readback returned exactly the same five Alternative /
+Decision rows, in 0.142 s MCP (readiness sample only). The complete 40-item ledger
+and all 20 pending projections remained identical. No new spec consolidation,
+delivery replay, rebuild, reset or DLQ redrive was issued.
+
+Initial cold health metrics were explicitly unavailable with refresh running;
+the subsequent probe returned Board/Global healthy, metrics available, 2,965
+nodes and queue zero. Overall remains at_risk due to historical policy DLQ;
+224 Global DLQ items, 439 policy DLQ items and one canonical debt are not hidden
+or repaired by installation. The wider evolution and full-write latency tasks
+remain open; this is not a second live consolidation timing.
+
+Sanitized evidence: `.grafx-tmp/deploy-807bce6-live-evidence.json`, SHA-256
+`760B3346905A9D9522C7A4C755E2ABE754AE7C7D7EA4493BE6AF55339EA1B6F7`.
+No PyPI publication or main merge.

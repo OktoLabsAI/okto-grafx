@@ -874,3 +874,17 @@ admission keep their original independent observations. Private Global fixture:
 sequential sample, not a full-Pulse speedup claim. Final grouped quality slice:
 756 passed in 20.87 s, Ruff/diff clean. Source only; no spec consumed or runtime
 replacement. Details: `RECOVERY_FLOOR_PHOTO_0_0_4.md`.
+
+Subsequent accumulated deployment: installed 0.0.4@807bce6 with accel, 24 focused
+isolated-wheel tests passed (6.97 s); installed module hashes checked. Pulse 0.3.3
+PID 15940 now serves both ports. Five canonical rows, the complete 40-item ledger
+and 20 pending specs are unchanged. Board/Global healthy, available metrics,
+queue zero; historical policy DLQ keeps overall at_risk. No additional live
+consolidation or end-to-end speedup claim. See the same recovery milestone.
+
+Private attribution through actual Core `_do_graph_commit` and Community/native
+transaction: 1.896 s profiled for the same five authored candidates, 5 nodes /
+10 edges and zero full-verification findings. Fixed embeddings and omitted
+production health/relational/MCP boundaries prevent comparison with the 22.981 s
+live commit. No new micro-optimization selected or reserved spec consumed.
+Profile and limitations: `GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.

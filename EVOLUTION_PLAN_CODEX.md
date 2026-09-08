@@ -57,8 +57,20 @@ verificações pré-redo, somente no intervalo nativo de WAL limpo/ledger saudá
 sob o mesmo permit. Headers de índices continuam frescos a cada verificação;
 pós-redo e admissão final permanecem independentes. Cópia Global: 44 → 33 walks,
 2,835 → 2,409 s de connect, 2.261 IDs idênticos; não é ganho total do Pulse.
-756 testes agrupados passaram. Fonte apenas, aguardando deploy acumulado, sem
-nova spec: `docs/RECOVERY_FLOOR_PHOTO_0_0_4.md`.
+756 testes agrupados passaram. Deploy posterior concluído: **0.0.4@807bce6**
+instalado com accel, Pulse **0.3.3 PID 15940**. Wheel isolado: 24 testes/6,97 s;
+hashes instalados conferidos. Leitura dos cinco vínculos e ledger completo de
+40 itens idênticos; 20 specs pendentes preservadas. Board/Global healthy, métricas
+disponíveis, fila zero; overall at_risk pela dívida histórica já registrada.
+Este checkpoint substitui a identidade instalada 9b41f36/PID 28232 acima.
+Evidência: `docs/RECOVERY_FLOOR_PHOTO_0_0_4.md`.
+
+Commit de grafo pelo Core/Community real, em nova cópia privada com os mesmos
+cinco candidatos já utilizados: 1,896 s perfilados, 5 nós/10 arestas, zero avisos
+e zero achados no verify integral. Exclui embeddings reais, Health de admissão,
+SQLite/outbox e MCP; **não substitui os 22,981 s do commit real**. Nenhuma outra
+spec foi consumida nem micro-otimização selecionada a partir desse perfil.
+Detalhes e limites: `docs/GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.
 
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |

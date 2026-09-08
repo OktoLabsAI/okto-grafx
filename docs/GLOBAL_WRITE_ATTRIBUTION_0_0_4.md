@@ -77,3 +77,39 @@ performance acceptance threshold or new reserved-spec consumption is required.
 Evidence: `.grafx-tmp/global-write-attribution-20260908.json`, SHA-256
 `A24DC0CB70584F68920EF60358A5ECEA382C90EEAEFEA13D6BBCB10722A3120E`.
 Harness: `.grafx-tmp/measure_global_flush_phases.py` (private copied graph only).
+
+## Board graph commit isolated through the actual Core and Community — 2026-09-08
+
+Replayed the already authored five node/five edge candidates only on a new private
+copy, `core-commit-phases-20260908`, of the preserved pre-source-index board fixture.
+The actual Community bootstrap created 11 source indexes before timing. The actual
+Core `_do_graph_commit` then used `CommunityGrafxGraphTransaction` and native Grafx
+0.0.4@807bce6, with connectivity, provenance, reconciliation, scoring and commit intact.
+Only the private resolver/outer fence and embedding provider were substituted;
+the latter returned an existing valid 384-dimensional vector on each of five calls.
+
+The profiled graph phase took **1.896 s**: 5 nodes and 10 edges added, 26 audit
+records and 5 source records returned, no warnings. Post-commit checkpoint and full
+`verify('all')` reported zero findings; all five new nodes were read back from the
+private copy. No live session, outbox, source ledger or reserved spec was modified.
+
+| Nested profile boundary | Calls | Cumulative seconds |
+| --- | ---: | ---: |
+| Full `_do_graph_commit` | 1 | 1.896 |
+| Native `Database.execute` | 208 | 1.433 |
+| Relevance recomputation | 1 batch / 11 nodes | 0.655 |
+| Scoring input reads (inside recomputation) | 11 | 0.602 |
+| Public result owned-plan recipe construction (inside execute) | 208 | 0.361 |
+| Native transaction commit | 1 | 0.347 |
+
+These are overlapping cumulative profiler boundaries, not additive phase timings.
+The run excludes real embedding/model work, production health admission, routing
+fences, relational audit/outbox persistence, MCP and session finalization. The
+copied graph also has different history and cache state. Therefore **1.896 s is
+not a new live consolidation result and is not an attributable reduction from
+22.981 s**. It localizes work without consuming another reserved spec. No additional
+optimization was selected solely from the sub-second entries in this table.
+
+Private harness `.grafx-tmp/profile_core_graph_commit.py` and cProfile artifact
+`.grafx-tmp/core-graph-commit-20260908.prof` are retained. The harness mutates its
+private copy; rerunning it requires a fresh copy and a distinct private session.
