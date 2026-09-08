@@ -17,6 +17,7 @@ from okto_grafx.domain.ids import PROVISIONAL_CSN
 from okto_grafx.domain.model.value import Timestamp
 from okto_grafx.domain.page import Page
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry
+from okto_grafx.domain.txn.commit_catalog import CommitKind
 from okto_grafx.domain.txn.commit_identity import CommitId, assign_commit_time
 from okto_grafx.domain.txn.commit_metadata import CommitMetadata, MetadataLimits
 from okto_grafx.engine.commit_catalog_store import (
@@ -376,3 +377,89 @@ def test_maximum_record_has_bounded_page_plan() -> None:
     assert len(plan.images) == math.ceil(65596 / (512 - 76)) + 2
     images.apply(plan)
     assert store.lookup(value.identity, read_lsn=10) == value
+
+
+@pytest.mark.parametrize("large", [False, True])
+@pytest.mark.parametrize("kind", [CommitKind.DATA, CommitKind.MAINTENANCE])
+def test_prepared_append_retargets_final_csn_without_host_io(large: bool, kind: CommitKind) -> None:
+    images, store = stack()
+    images.apply(store.plan_append(entry(10)))
+    metadata = entry(20, large=large).metadata_bytes
+    observed = Timestamp(5)  # Wall clock regressed below the last durable ordered time.
+    prepared = store.prepare_append(
+        expected_last_sequence=10, observed_at=observed, metadata_bytes=metadata, kind=kind,
+    )
+    read_count = len(images.reads)
+    object.__setattr__(observed, "micros", 100000)  # Caller mutation cannot move the captured time.
+    # Ordinary page/index effects and a COMMIT contribute 18 records; a segment
+    # roll adds one more LSN. The journal adds its known full-image cardinality.
+    predicted = 10 + 18 + prepared.image_count
+    initial = prepared.bind(predicted)
+    final = prepared.bind(predicted + 1)
+    assert len(initial.images) == len(final.images) == prepared.image_count
+    assert [len(i.raw) for i in initial.images] == [len(i.raw) for i in final.images]
+    assert [(i.file, i.page_index) for i in initial.images] == [(i.file, i.page_index) for i in final.images]
+    assert len(images.reads) == read_count
+    assert prepared.bind(predicted + 1) == final
+    images.apply(final)
+    record = store.lookup(CommitId(UUID, predicted + 1), read_lsn=predicted + 1)
+    assert record is not None
+    assert record.kind is kind
+    assert record.metadata_bytes == metadata
+    assert record.timing.observed_at.micros == 5
+    assert record.timing.ordered_at.micros == 11
+    assert record.timing.clock_adjusted
+    assert store.lookup(CommitId(UUID, predicted), read_lsn=predicted + 1) is None
+    assert store.verify().entry_count == 2
+
+
+@pytest.mark.parametrize("expected", [7, 11])
+def test_preparation_refuses_valid_head_that_does_not_match_published_control(expected: int) -> None:
+    images, store = stack()
+    images.apply(store.plan_append(entry(10)))
+    before = dict(images.pages)
+    with pytest.raises(GrafxCorruptionDetected) as failure:
+        store.prepare_append(expected_last_sequence=expected, observed_at=Timestamp(10))
+    assert failure.value.details["field"] == "published_coverage"
+    assert images.pages == before
+
+
+@pytest.mark.parametrize("invalid", ["metadata", "clock", "kind", "baseline"])
+def test_invalid_preparation_is_refused_before_first_storage_read(invalid: str) -> None:
+    images, store = stack()
+    images.reads.clear()
+    with pytest.raises((GrafxConfigurationError, GrafxCorruptionDetected)):
+        store.prepare_append(
+            expected_last_sequence=True if invalid == "baseline" else 7,
+            observed_at="now" if invalid == "clock" else Timestamp(10),  # type: ignore[arg-type]
+            kind=1 if invalid == "kind" else CommitKind.DATA,  # type: ignore[arg-type]
+            metadata_bytes=b"broken" if invalid == "metadata" else None,
+        )
+    assert images.reads == []
+
+
+def test_prepared_append_is_bounded_by_tail_not_total_history() -> None:
+    images, store = stack()
+    for sequence in range(10, 2010, 2):
+        images.apply(store.plan_append(entry(sequence)))
+    images.reads.clear()
+    prepared = store.prepare_append(expected_last_sequence=2008, observed_at=Timestamp(3000))
+    assert len(images.reads) <= 5
+    captured_reads = list(images.reads)
+    # A later host-side replacement cannot change this attempt's bytes. It also
+    # cannot make them authoritative: the caller still owes staging/OCC/fence checks.
+    images.pages = {}
+    assert prepared.bind(2020).head.last_sequence == 2020
+    assert images.reads == captured_reads
+
+
+def test_preparation_clock_overflow_refuses_without_effects() -> None:
+    images, store = stack()
+    final_time = CommitCatalogEntry(
+        CommitId(UUID, 10), assign_commit_time(Timestamp(2**63 - 1), None),
+    )
+    images.apply(store.plan_append(final_time))
+    before = dict(images.pages)
+    with pytest.raises(GrafxConfigurationError):
+        store.prepare_append(expected_last_sequence=10, observed_at=Timestamp(0))
+    assert images.pages == before

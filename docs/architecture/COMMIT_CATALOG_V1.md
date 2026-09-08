@@ -227,3 +227,52 @@ files. Reapplication of a complete image set is byte-idempotent, but this is not
 yet a claim of transactional/crash recovery. Future wiring must incorporate these
 images in private staging, both OCC passes, WAL segment-roll retargeting, full-image
 redo, control publication, required-grammar refusal, backup/restore and verify.
+
+## Prepared append and terminal-LSN binding — CAP-1B
+
+`CommitCatalogStore.prepare_append` now closes the journal-image-count/CommitId
+dependency without rereading host storage while retargeting. It requires the exact
+current durable COMMIT sequence supplied by the coordinator. A valid catalog head
+that does not cover that sequence refuses as `published_coverage`; syntactic validity
+alone is insufficient. Metadata/kind/observed-time admission and detachment precede
+the first page-provider call. Ordered time is then assigned once from the validated
+head; ties/regression advance one microsecond and overflow refuses before effects.
+
+The prepared value holds only immutable bytes for the bounded pages actually read
+(the two reserved headers, last directory block and last-record/tail fragments),
+the canonical new record, and its image count. `bind(final_sequence)` rebuilds the
+record CRC, directory entry, head and fragment images at the terminal COMMIT LSN.
+It preserves locations/cardinality/raw page sizes, checks the captured baseline and
+does not call the original storage provider or a clock. Metadata/time/kind do not
+change when the WAL inserts a segment-header LSN. This is an attempt-local payload
+capture, **not a cache/bundle of physical authority** or permission to reuse old
+proofs: the coordinator still owes the normal fence, descriptor, staging and OCC
+protocols. Discard it when the attempt ends; it cannot authorize another commit.
+
+Integration locations are concrete and remain **unwired** in this checkpoint:
+
+- `_commit_with_writing`: prepare from the current view after any identity-floor
+  subcommit; privately stage locations before the physical second OCC. Keep the
+  first OCC and every originally pre-staged page on the original snapshot.
+- `_build_records`: include the already known journal image count, then bind the
+  record to the calculated COMMIT sequence and preserve private staging proofs.
+- `_retarget_commit_batch`: rebind journal contents as well as page stamps/index
+  effects when the WAL's real raw-batch plan rolls. Do not merely alter page_lsn
+  while leaving the envelope/directory/head at the provisional candidate.
+- `_commit_identity_floor_plan` also calls those builders: it needs a maintenance
+  catalog entry, not an exemption that leaves the head behind durable control.
+- Attempt cleanup must discard these staged inputs without carrying them into a
+  retry's original-snapshot page set. Budgets include captured/staged payloads and
+  the final WAL batch. No metadata serialization may first run after durability.
+
+Activation/recovery must persist the legacy boundary in a way that distinguishes
+an activated-but-not-yet-initialized catalog from lost catalog files. It must not
+infer an empty history solely from missing files and the latest control LSN. This
+is the existing legacy-boundary/non-corruption requirement, not an optional fallback.
+
+Tests cover data/maintenance, small/large metadata, deterministic rebinding,
+caller timestamp mutation, stale/future head relative to control, pre-I/O admission,
+clock overflow and history-independent capture. The actual WalManager size/roll
+planner converges in both roll/no-roll cases without appending catalog records:
+the size-only test envelopes are not a supported journal WAL grammar. All production
+allowlists, capability bits, activation and public API remain unchanged.

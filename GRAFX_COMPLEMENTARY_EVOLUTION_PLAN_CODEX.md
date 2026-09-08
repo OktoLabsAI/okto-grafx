@@ -3,6 +3,14 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / binding do LSN final / 2026-09-08:** preparação limitada por tentativa
+e ajuste da identidade ao COMMIT LSN implementados, sem reler storage ou relógio
+durante o ajuste. A preparação exige cobertura igual ao controle durável informado.
+471 testes agrupados em 15,72 s, incluindo o planejador real do WAL com/sem roll,
+sem anexar registros de catálogo. Integração com staging/OCC/ativação/replay ainda
+pendente; a lista fechada de pontos de ligação está em `COMMIT_CATALOG_V1.md`.
+Não é cache de autoridade nem capability habilitada no Pulse.
+
 **GX-CAP-1B / armazenamento paginado / 2026-09-08:** implementados o planejador
 privado de imagens de páginas, append limitado à cauda, lookup binário por identidade
 e verificação completa da cobertura anunciada. 59 testes específicos; grupo final

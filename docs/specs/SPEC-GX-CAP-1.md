@@ -246,3 +246,37 @@ and physically proved lookup. The integrated crash/multiprocess matrix, old-read
 refusal, restore/import identities, metrics and public facade remain required.
 The page planner's replay test is byte-idempotence, **not** that integrated gate.
 Pulse was not restarted/upgraded; the 20 reserved pending specs were not consumed.
+
+### CAP-1B prepared terminal-LSN binding — 2026-09-08
+
+`prepare_append` now admits/captures metadata and observed time before storage
+reads, requires head coverage equal to the coordinator's durable sequence, computes
+ordered time once and returns a bounded attempt-local prepared value. Its `bind`
+rebuilds the envelope, directory/head and fragment images at the final COMMIT LSN
+without host reads or resampling time. Fixed-width sequences preserve image count,
+locations and raw encoded size. Both data and maintenance records are tested.
+
+The real WalManager planner is exercised with size-only envelopes for roll and
+no-roll: a second preview after rebinding returns the same terminal, and the WAL
+bytes/tail remain unchanged. These tests deliberately do **not** append unsupported
+journal effects. Runtime staging, required grammar and recovery are still unwired;
+the exact call sites/cleanup obligations are listed in
+[COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md).
+
+Final grouped command:
+
+```text
+python -m pytest tests/txn/test_commit_catalog_store.py
+  tests/txn/test_commit_catalog_record.py tests/txn/test_commit_provenance_values.py
+  tests/txn/test_page_stamp_plan.py tests/wal/test_commit_catalog_batch_sizing.py
+  tests/wal/test_wal_batch_planning.py tests/test_import_boundary.py
+  tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**471 passed in 15.72 s**; strict mypy passes the store and both affected test modules;
+Ruff/diff-check pass. The store-specific suite is now 71 tests (including its previous
+59), with two additional real-planner cases. This group overlaps previous checkpoints
+and is not a full engine regression or the outstanding integrated crash matrix.
+No Pulse operation, additional consolidation, deployment, release or change to the
+multi-reader/writer/OCC/WAL durability protocol occurred.

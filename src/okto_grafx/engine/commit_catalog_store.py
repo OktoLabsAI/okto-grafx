@@ -8,9 +8,10 @@ It neither opens files nor acquires locks nor acknowledges a durable outcome.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from struct import Struct
+from types import MappingProxyType
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -19,14 +20,16 @@ from okto_grafx.domain.errors import (
     GrafxTransactionBudgetExceeded,
 )
 from okto_grafx.domain.ids import NO_PAGE, PROVISIONAL_CSN
+from okto_grafx.domain.model.value import Timestamp
 from okto_grafx.domain.page import FileHeader, FileKind, Page, PageType
 from okto_grafx.domain.page.layout import validate_page_size
 from okto_grafx.domain.txn.commit_catalog import (
     MAX_COMMIT_RECORD_BYTES,
     CommitCatalogEntry,
+    CommitKind,
     decode_commit_catalog_entry,
 )
-from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.txn.commit_identity import CommitId, assign_commit_time
 
 
 COMMIT_DIRECTORY_FILE = "commits.dir"
@@ -76,6 +79,53 @@ class CommitCatalogPlan:
 
     head: CommitCatalogHead
     images: tuple[CommitCatalogPageImage, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCommitCatalogAppend:
+    """One commit attempt's detached inputs, not reusable physical authority.
+
+    The transaction coordinator must prepare under its current publication fence,
+    stage through normal private provenance and include all locations in the second
+    OCC pass. This value ONLY closes the batch-size/terminal-LSN dependency; it does
+    not permit reuse after leaving that attempt or grant permission to publish.
+    """
+
+    previous_sequence: int
+    image_count: int
+    _database_uuid: bytes = field(repr=False)
+    _page_size: int = field(repr=False)
+    _record: bytes = field(repr=False)
+    _pages: Mapping[tuple[str, int], bytes] = field(repr=False)
+
+    def bind(self, sequence: int) -> CommitCatalogPlan:
+        """Regenerate complete images at the final COMMIT LSN, with zero host I/O.
+
+        Raw page lengths and record cardinality are invariant under retargeting.
+        Compression must still follow the existing raw-batch roll decision so its
+        compressed-size feedback cannot move the chosen terminal LSN a second time.
+        """
+        identity = CommitId(self._database_uuid, sequence)
+        if sequence <= self.previous_sequence:
+            raise _invalid("commit_order")
+        captured = decode_commit_catalog_entry(
+            self._record, expected_store_uuid=self._database_uuid,
+        )
+        candidate = CommitCatalogEntry(identity, captured.timing, captured.metadata_bytes, captured.kind)
+
+        def read(file: str, index: int) -> bytes:
+            try:
+                return self._pages[file, index]
+            except KeyError:
+                raise _corrupt("prepared_page_coverage") from None
+
+        store = CommitCatalogStore(read, database_uuid=self._database_uuid, page_size=self._page_size)
+        if store.read_head().last_sequence != self.previous_sequence:
+            raise _corrupt("prepared_baseline")
+        plan = store.plan_append(candidate)
+        if len(plan.images) != self.image_count:
+            raise _corrupt("prepared_cardinality")
+        return plan
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +342,50 @@ class CommitCatalogStore:
         return CommitCatalogPlan(head, (
             self._header_image(_DIRECTORY, head), self._header_image(_STREAM, head),
         ))
+
+    def prepare_append(
+        self, *, expected_last_sequence: int, observed_at: Timestamp,
+        metadata_bytes: bytes | None = None, kind: CommitKind = CommitKind.DATA,
+    ) -> PreparedCommitCatalogAppend:
+        """Capture one bounded attempt before WAL sizing, with a mandatory control baseline.
+
+        Admission precedes reads. The caller samples observed_at exactly once via
+        its Clock port; this module never samples time. The head must cover the
+        current durable COMMIT supplied by the coordinator, not merely be valid.
+        Reads remain inside that caller's established physical-view/fence protocol.
+        The bounded capture is used only to size/rebind this attempt, not to cache
+        authority for future transactions or bypass descriptor revalidation.
+        """
+        CommitId(self._uuid, expected_last_sequence)
+        # Validate and detach the entire payload before invoking the page provider.
+        admitted = CommitCatalogEntry(
+            CommitId(self._uuid, 1), assign_commit_time(observed_at, None), metadata_bytes, kind,
+        )
+        admitted = decode_commit_catalog_entry(admitted.encode())
+        pages: dict[tuple[str, int], bytes] = {}
+
+        def read(file: str, index: int) -> bytes:
+            location = (file, index)
+            if location not in pages:
+                pages[location] = self._read_page(file, index)
+            return pages[location]
+
+        captured_store = CommitCatalogStore(read, database_uuid=self._uuid, page_size=self._page_size)
+        head = captured_store.read_head()
+        if head.last_sequence != expected_last_sequence:
+            raise _corrupt("published_coverage")
+        timing = assign_commit_time(
+            admitted.timing.observed_at,
+            Timestamp(head.last_ordered_micros) if head.entry_count else None,
+        )
+        prototype = CommitCatalogEntry(
+            CommitId(self._uuid, head.last_sequence + 1), timing, admitted.metadata_bytes, admitted.kind,
+        )
+        plan = captured_store.plan_append(prototype)
+        return PreparedCommitCatalogAppend(
+            head.last_sequence, len(plan.images), self._uuid, self._page_size,
+            prototype.encode(), MappingProxyType(dict(pages)),
+        )
 
     def plan_append(self, entry: CommitCatalogEntry) -> CommitCatalogPlan:
         """Plan bounded full images without allocating pages or changing input pages."""
