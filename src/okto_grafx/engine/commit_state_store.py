@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from okto_grafx.domain.control_record import (
     ControlRecordKind,
+    ControlRecordReader,
     TwoSlotControlRecordStore,
 )
 from okto_grafx.domain.errors import (
@@ -54,6 +55,7 @@ class CommitStateStore:
         database_uuid: bytes | None = None,
         file_nonce: int = 0,
         control_format_version: int = 1,
+        control_read_if_exists: ControlRecordReader | None = None,
     ) -> None:
         """Bind a storage namespace and the owner identity used for the staging file.
 
@@ -87,6 +89,7 @@ class CommitStateStore:
                 database_uuid=database_uuid,
                 file_nonce=file_nonce,
                 temporary=self._temporary_file,
+                read_if_exists=control_read_if_exists,
             )
             pin = getattr(storage, "pin_descriptor", None)
             if callable(pin):

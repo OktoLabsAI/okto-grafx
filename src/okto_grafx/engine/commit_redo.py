@@ -17,18 +17,25 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxRecoveryRefused,
 )
-from okto_grafx.domain.ids import Lsn, NO_LSN
+from okto_grafx.domain.ids import Lsn, NO_LSN, PROVISIONAL_CSN
 from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
-from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
-from okto_grafx.domain.txn.records import decode_page_write, is_redoable_page_file
+from okto_grafx.domain.recovery.decision import (
+    CommittedReplay, committed_replay, validate_commit_boundaries,
+)
+from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.txn.records import (
+    COMMIT_CATALOG_PAGE_FILES, decode_page_write, is_redoable_page_file,
+)
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.engine.buffer_pool import (
     MAX_REDO_GAP_PAGES,
     BufferPool,
     apply_page_image,
 )
+from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore, read_catalog_page_images
+from okto_grafx.engine.commit_catalog_store import CommitCatalogPageImage, CommitCatalogStore
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -89,7 +96,10 @@ class _PreflightedReplay:
     replay: CommittedReplay
     effects: tuple[WalRecord, ...]
     incomplete_effects: tuple[WalRecord, ...]
+    commit_records: tuple[WalRecord, ...]
+    commit_signature: tuple[tuple[object, ...], ...]
     last_committed_lsn: Lsn
+    checkpoint_lsn: Lsn | None
     allow_unregistered_indexes: bool
     allow_page_coalescing: bool
     record_signature: tuple[tuple[object, ...], ...]
@@ -104,14 +114,16 @@ _PREFLIGHT_SEAL: object = object()
 class CommitRedo:
     """Replay committed page and logical-index effects through their idempotent doors."""
 
-    __slots__ = ("_pool", "_index_manager")
+    __slots__ = ("_pool", "_index_manager", "_database_uuid")
 
     def __init__(
-        self, pool: BufferPool, index_manager: IndexManager | None = None
+        self, pool: BufferPool, index_manager: IndexManager | None = None,
+        *, database_uuid: bytes | None = None,
     ) -> None:
         """Bind the pool and, when this database has indexes, its index registry."""
         self._pool = pool
         self._index_manager = index_manager
+        self._database_uuid = None if database_uuid is None else CommitId(database_uuid, 1).database_uuid
 
     def replay(self, records: Iterable[WalRecord]) -> CommitRedoResult:
         """Select committed effects from WAL-order ``records`` and apply them without flushing."""
@@ -123,6 +135,7 @@ class CommitRedo:
         *,
         _preflighted: object | None = None,
         _passage: object | None = None,
+        _checkpoint_lsn: Lsn | None = None,
     ) -> CommitRedoResult:
         """Apply ``replay.effects`` in order, leaving durability publication to the caller.
 
@@ -143,14 +156,24 @@ class CommitRedo:
             _preflighted,
             allow_unregistered_indexes=False,
             passage=_passage,
+            checkpoint_lsn=_checkpoint_lsn,
         )
         if proof is not None:
             prepared_pages = proof.prepared_pages
         else:
+            validate_commit_boundaries(replay)
+            self._validate_replay_floor(replay, _checkpoint_lsn)
+            commit_records = replay.commit_records
+            commit_signature = self._record_signature(commit_records)
             prepared_pages, _signature, _contains_index_reset = self._preflight(
                 replay.effects,
                 allow_unregistered_indexes=False,
+                allow_commit_catalog=_checkpoint_lsn is not None and self._database_uuid is not None,
             )
+            self._validate_native_catalog(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
+            if self._record_signature(replay.effects) != _signature:
+                raise GrafxRecoveryRefused("Replay changed during preflight.", field="preflighted_replay")
+            self._require_unchanged_commit_records(replay, commit_records, commit_signature)
 
         pages_applied = 0
         index_effects = 0
@@ -266,6 +289,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool = False,
         _passage: object | None = None,
+        _checkpoint_lsn: Lsn | None = None,
     ) -> object:
         """Validate a complete dispatch plan without applying any of its effects.
 
@@ -287,10 +311,19 @@ class CommitRedo:
                 field="allow_unregistered_indexes",
                 value=type(allow_unregistered_indexes).__name__,
             )
+        validate_commit_boundaries(replay)
+        self._validate_replay_floor(replay, _checkpoint_lsn)
+        commit_records = replay.commit_records
+        commit_signature = self._record_signature(commit_records)
         prepared_pages, signature, contains_index_reset = self._preflight(
             replay.effects,
             allow_unregistered_indexes=allow_unregistered_indexes,
+            allow_commit_catalog=_checkpoint_lsn is not None and self._database_uuid is not None,
         )
+        self._validate_native_catalog(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
+        if self._record_signature(replay.effects) != signature:
+            raise GrafxRecoveryRefused("Replay changed during preflight.", field="preflighted_replay")
+        self._require_unchanged_commit_records(replay, commit_records, commit_signature)
         return _PreflightedReplay(
             seal=_PREFLIGHT_SEAL,
             owner=self,
@@ -298,7 +331,10 @@ class CommitRedo:
             replay=replay,
             effects=replay.effects,
             incomplete_effects=replay.incomplete_effects,
+            commit_records=commit_records,
+            commit_signature=commit_signature,
             last_committed_lsn=replay.last_committed_lsn,
+            checkpoint_lsn=_checkpoint_lsn,
             allow_unregistered_indexes=allow_unregistered_indexes,
             allow_page_coalescing=len(prepared_pages) == len(replay.effects),
             record_signature=signature,
@@ -307,6 +343,145 @@ class CommitRedo:
             prepared_pages=prepared_pages,
         )
 
+    @staticmethod
+    def _validate_replay_floor(replay: CommittedReplay, checkpoint_lsn: Lsn | None) -> None:
+        """Bind native replay to its caller-proved checkpoint, before decoding or I/O."""
+        if checkpoint_lsn is None:
+            return
+        if type(checkpoint_lsn) is not int or not 0 <= checkpoint_lsn < PROVISIONAL_CSN:
+            raise GrafxRecoveryRefused("Invalid replay checkpoint.", field="checkpoint_lsn")
+        if (
+            replay.commit_records and replay.commit_records[0].lsn <= checkpoint_lsn
+            or not replay.commit_records and (
+                replay.effects or replay.last_committed_lsn not in {0, checkpoint_lsn}
+            )
+        ):
+            raise GrafxRecoveryRefused(
+                "Replay COMMIT boundaries do not start strictly after the checkpoint.",
+                field="checkpoint_lsn", checkpoint_lsn=checkpoint_lsn,
+            )
+
+    def _validate_native_catalog(
+        self, replay: CommittedReplay,
+        prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
+        *, checkpoint_lsn: Lsn | None,
+    ) -> None:
+        horizon = self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=checkpoint_lsn)
+        images = tuple(CommitCatalogPageImage(page.file, page.page_index, page.image)
+                       for _position, page in prepared_pages if page.file in COMMIT_CATALOG_PAGE_FILES)
+        if horizon is None:
+            if images or checkpoint_lsn is not None and any(
+                self._pool.storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES
+            ):
+                raise GrafxRecoveryRefused("Journal effects require schema activation.", field="commit_catalog_activation")
+            return
+        # Unqualified historical dispatcher use retains its ordinary-pages-only contract.
+        if checkpoint_lsn is None:
+            return
+        storage = self._pool.storage
+        final_sequence = replay.last_committed_lsn if replay.commit_records else checkpoint_lsn
+        if final_sequence <= horizon:
+            if images or any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
+                raise GrafxRecoveryRefused("History exists before its first tracked COMMIT.", field="commit_catalog_activation")
+            return
+        if self._database_uuid is None:
+            raise GrafxRecoveryRefused("Commit history replay requires database identity.", field="commit_catalog_replay")
+        store = CommitCatalogStore(storage.read_page, database_uuid=self._database_uuid, page_size=self._pool.page_size)
+        if not replay.commit_records:
+            store.validate_published_head(sequence=checkpoint_lsn, activation_sequence=horizon, file_size=storage.file_size)
+            return
+        store.validate_redo(replay, previous_sequence=checkpoint_lsn, activation_sequence=horizon)
+        store.validate_redo_targets(
+            images, previous_sequence=checkpoint_lsn, sequence=final_sequence, activation_sequence=horizon,
+            file_size=lambda file: storage.file_size(file) if storage.exists(file) else 0,
+            resident_image=lambda file, index: cast(bytes | None, self._pool._resident_page_image(file, index)),
+        )
+
+    def _validate_catalog_transitions(
+        self, replay: CommittedReplay,
+        prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
+        *, checkpoint_lsn: Lsn | None = None,
+    ) -> int | None:
+        """Prove complete schema-catalog snapshots before native replay can mutate.
+
+        Legacy hand-composed effect-only plans retain the dispatcher contract;
+        actual WAL selectors provide terminal records. Missing physical tails
+        cannot supply a missing catalog image. With a caller-proved checkpoint, an activation after that floor
+        must be introduced by its own complete schema snapshot in this range.
+        """
+        if not replay.commit_records:
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
+        grouped: dict[tuple[int, int], list[tuple[int, bytes]]] = {}
+        for _position, prepared in prepared_pages:
+            if prepared.file == CATALOG_FILE:
+                record = prepared.record
+                grouped.setdefault((record.epoch, record.txn_id), []).append((prepared.page_index, prepared.image))
+        if not grouped:
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
+        seen = False
+        previous_horizon: int | None = None
+        for terminal in replay.commit_records:
+            images = grouped.get((terminal.epoch, terminal.txn_id))
+            if images is None:
+                continue
+            catalog = read_catalog_page_images(tuple(images), page_size=self._pool.page_size, sequence=terminal.lsn)
+            horizon = catalog.commit_catalog_activation
+            if (
+                horizon is not None and horizon > terminal.lsn
+                or not seen and checkpoint_lsn is not None and horizon is not None
+                and checkpoint_lsn < horizon != terminal.lsn
+                or seen and previous_horizon is not None and horizon != previous_horizon
+                or seen and previous_horizon is None and horizon is not None and horizon != terminal.lsn
+            ):
+                raise GrafxRecoveryRefused(
+                    "Catalog replay changes or invents the commit-history activation horizon.",
+                    field="commit_catalog_activation", lsn=terminal.lsn,
+                )
+            previous_horizon = horizon
+            seen = True
+        return previous_horizon
+
+    def _validate_catalog_without_schema_effects(
+        self, replay: CommittedReplay, checkpoint_lsn: Lsn | None,
+    ) -> int | None:
+        """Use current pages, never a mutable/stale adopted catalog, for native gaps.
+
+        No schema image exists to repair or establish activation in this range.
+        Reading the canonical catalog through this already-fenced pool is therefore
+        mandatory. This is one schema read per native replay, not a graph/history
+        walk, and creates no persistent or cached authority.
+        """
+        if checkpoint_lsn is None:
+            return None  # Legacy standalone dispatcher has no native control context.
+        storage = self._pool.storage
+        exists = storage.exists(CATALOG_FILE)
+        empty = not exists or storage.page_count(CATALOG_FILE) == 0
+        if empty:
+            if any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
+                raise GrafxRecoveryRefused(
+                    "Commit-history files have no schema catalog establishing activation.",
+                    field="commit_catalog_activation",
+                )
+        if not exists:
+            return None  # Uninitialized/legacy stack; no history may be inferred.
+        if empty and checkpoint_lsn == 0 and not replay.commit_records:
+            return None  # Fresh empty file, before bootstrap; no COMMIT is being certified.
+        horizon = CatalogStore(self._pool).read_from_pages().commit_catalog_activation
+        if horizon is None:
+            if any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
+                raise GrafxRecoveryRefused(
+                    "Commit-history files require an activated schema catalog.",
+                    field="commit_catalog_activation",
+                )
+            return None
+        if horizon > checkpoint_lsn:
+            raise GrafxRecoveryRefused(
+                "Post-checkpoint activation has no schema snapshot in the selected WAL range.",
+                field="commit_catalog_activation", checkpoint_lsn=checkpoint_lsn,
+                activation_lsn=horizon,
+            )
+        return horizon
+
     def _verify_preflight_for(
         self,
         replay: CommittedReplay,
@@ -314,6 +489,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object,
+        checkpoint_lsn: Lsn | None = None,
     ) -> object | None:
         """Consume one exact proof once so later private facts need no second decode.
 
@@ -326,6 +502,7 @@ class CommitRedo:
             preflighted,
             allow_unregistered_indexes=allow_unregistered_indexes,
             passage=passage,
+            checkpoint_lsn=checkpoint_lsn,
         )
         return None if compatible is None else self._verified_preflight(compatible)
 
@@ -375,6 +552,11 @@ class CommitRedo:
         meta_baselines: dict[tuple[str, int], Page | None] | None = None,
     ) -> tuple[bool, frozenset[int]]:
         """Classify one decoded page without granting authority to manager lookalikes."""
+        if file in COMMIT_CATALOG_PAGE_FILES:
+            # Full journal validation is mandatory before this fact is consumed.
+            # Audit history changes no heap/MVCC table watermark; treating it as
+            # unknown would make every journal append scan all indexed tables.
+            return True, frozenset()
         manager = self._index_manager
         if manager is None:
             return False, frozenset()
@@ -407,6 +589,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object,
+        checkpoint_lsn: Lsn | None = None,
     ) -> object:
         """Return a compatible proof, performing the full preflight when necessary."""
         compatible = self._compatible_preflight(
@@ -414,6 +597,7 @@ class CommitRedo:
             preflighted,
             allow_unregistered_indexes=allow_unregistered_indexes,
             passage=passage,
+            checkpoint_lsn=checkpoint_lsn,
         )
         if compatible is not None:
             return self._verified_preflight(compatible)
@@ -421,6 +605,7 @@ class CommitRedo:
             replay,
             allow_unregistered_indexes=allow_unregistered_indexes,
             _passage=passage,
+            _checkpoint_lsn=checkpoint_lsn,
         )
         assert isinstance(fresh, _PreflightedReplay)
         return self._verified_preflight(fresh)
@@ -433,6 +618,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object,
+        checkpoint_lsn: Lsn | None = None,
     ) -> object | None:
         """Project a valid full proof onto its exact all-page subplan without decoding again."""
         source = self._compatible_preflight(
@@ -440,12 +626,14 @@ class CommitRedo:
             preflighted,
             allow_unregistered_indexes=allow_unregistered_indexes,
             passage=passage,
+            checkpoint_lsn=checkpoint_lsn,
         )
         if source is None:
             return None
         if (
             page_replay.last_committed_lsn != source_replay.last_committed_lsn
             or page_replay.incomplete_effects
+            or page_replay.commit_records is not source_replay.commit_records
             or len(page_replay.effects) != len(source.prepared_pages)
         ):
             return None
@@ -463,7 +651,10 @@ class CommitRedo:
             replay=page_replay,
             effects=page_replay.effects,
             incomplete_effects=page_replay.incomplete_effects,
+            commit_records=page_replay.commit_records,
+            commit_signature=source.commit_signature,
             last_committed_lsn=page_replay.last_committed_lsn,
+            checkpoint_lsn=source.checkpoint_lsn,
             allow_unregistered_indexes=False,
             allow_page_coalescing=source.allow_page_coalescing,
             record_signature=tuple(
@@ -475,6 +666,60 @@ class CommitRedo:
             prepared_pages=prepared_pages,
         )
 
+    def _preflight_index_subplan(
+        self, source_replay: CommittedReplay, index_replay: CommittedReplay,
+        preflighted: object, *, allow_unregistered_indexes: bool,
+        passage: object, checkpoint_lsn: Lsn | None = None,
+    ) -> object:
+        """Inherit full catalog validation, then strictly revalidate index dispatch.
+
+        The catalog was proved on the complete range and its pages have now been
+        adopted. Only the exact index complement may use that proof; registry
+        lookups are NOT inherited from the earlier unregistered-index allowance.
+        """
+        source = self._compatible_preflight(
+            source_replay, preflighted,
+            allow_unregistered_indexes=allow_unregistered_indexes,
+            passage=passage, checkpoint_lsn=checkpoint_lsn,
+        )
+        if (
+            source is None
+            or index_replay.last_committed_lsn != source_replay.last_committed_lsn
+            or index_replay.commit_records is not source_replay.commit_records
+            or index_replay.incomplete_effects
+        ):
+            raise GrafxRecoveryRefused("Index replay does not match its complete preflight.", field="preflighted_replay")
+        expected = tuple(record for record in source.effects if record.record_type in _INDEX_EFFECTS)
+        if len(expected) != len(index_replay.effects) or any(
+            actual is not original for actual, original in zip(index_replay.effects, expected)
+        ):
+            raise GrafxRecoveryRefused("Index replay is not the exact index subplan.", field="preflighted_replay")
+        index_effects = index_replay.effects
+        prepared, signature, contains_reset = self._preflight(
+            index_effects, allow_unregistered_indexes=False,
+        )
+        self._require_unchanged_commit_records(source_replay, source.commit_records, source.commit_signature)
+        if (
+            self._compatible_preflight(source_replay, source,
+                allow_unregistered_indexes=allow_unregistered_indexes,
+                passage=passage, checkpoint_lsn=checkpoint_lsn) is None
+            or index_replay.effects is not index_effects
+            or index_replay.commit_records is not source.commit_records
+            or index_replay.last_committed_lsn != source.last_committed_lsn
+            or index_replay.incomplete_effects
+            or self._record_signature(source_replay.effects) != source.record_signature
+        ):
+            raise GrafxRecoveryRefused("Complete replay changed during index preflight.", field="preflighted_replay")
+        return _PreflightedReplay(
+            seal=_PREFLIGHT_SEAL, owner=self, passage=passage, replay=index_replay,
+            effects=index_replay.effects, incomplete_effects=index_replay.incomplete_effects,
+            commit_records=source.commit_records, commit_signature=source.commit_signature,
+            last_committed_lsn=index_replay.last_committed_lsn,
+            checkpoint_lsn=source.checkpoint_lsn, allow_unregistered_indexes=False,
+            allow_page_coalescing=False, record_signature=signature, signature_verified=True,
+            contains_index_reset=contains_reset, prepared_pages=prepared,
+        )
+
     def _compatible_preflight(
         self,
         replay: CommittedReplay,
@@ -482,6 +727,7 @@ class CommitRedo:
         *,
         allow_unregistered_indexes: bool,
         passage: object | None,
+        checkpoint_lsn: Lsn | None = None,
     ) -> _PreflightedReplay | None:
         """Return a genuine exact proof or None so the caller revalidates normally."""
         if (
@@ -495,12 +741,19 @@ class CommitRedo:
             or preflighted.replay is not replay
             or preflighted.effects is not replay.effects
             or preflighted.incomplete_effects is not replay.incomplete_effects
+            or preflighted.commit_records is not replay.commit_records
             or preflighted.last_committed_lsn != replay.last_committed_lsn
+            or preflighted.checkpoint_lsn != checkpoint_lsn
+            or checkpoint_lsn is not None and type(checkpoint_lsn) is not int
         ):
             return None
         if (
             not preflighted.signature_verified
-            and preflighted.record_signature != self._record_signature(replay.effects)
+            and (
+                preflighted.record_signature != self._record_signature(replay.effects)
+                or any(not isinstance(record.payload, bytes) for record in replay.commit_records)
+                or preflighted.commit_signature != self._record_signature(replay.commit_records)
+            )
         ):
             return None
         return preflighted
@@ -517,7 +770,10 @@ class CommitRedo:
             replay=proof.replay,
             effects=proof.effects,
             incomplete_effects=proof.incomplete_effects,
+            commit_records=proof.commit_records,
+            commit_signature=proof.commit_signature,
             last_committed_lsn=proof.last_committed_lsn,
+            checkpoint_lsn=proof.checkpoint_lsn,
             allow_unregistered_indexes=proof.allow_unregistered_indexes,
             allow_page_coalescing=proof.allow_page_coalescing,
             record_signature=proof.record_signature,
@@ -525,6 +781,21 @@ class CommitRedo:
             contains_index_reset=proof.contains_index_reset,
             prepared_pages=proof.prepared_pages,
         )
+
+    def _require_unchanged_commit_records(
+        self, replay: CommittedReplay, records: tuple[WalRecord, ...],
+        signature: tuple[tuple[object, ...], ...],
+    ) -> None:
+        """Do not seal callback-mutated terminal values after validating earlier ones."""
+        if (
+            replay.commit_records is not records
+            or any(not isinstance(record.payload, bytes) for record in records)
+            or signature != self._record_signature(records)
+        ):
+            raise GrafxRecoveryRefused(
+                "Replay commit boundaries changed during preflight; no effect was applied.",
+                field="commit_boundaries",
+            )
 
     @staticmethod
     def _record_signature(
@@ -568,12 +839,17 @@ class CommitRedo:
         effects: tuple[WalRecord, ...],
         *,
         allow_unregistered_indexes: bool,
+        allow_commit_catalog: bool = False,
     ) -> tuple[
         tuple[tuple[int, _PreparedPageEffect], ...],
         tuple[tuple[object, ...], ...],
         bool,
     ]:
         """Refuse an incomplete or malformed dispatch plan before the first mutation."""
+        if allow_commit_catalog:
+            assert self._database_uuid is not None
+            CommitCatalogStore(self._pool.storage.read_page, database_uuid=self._database_uuid,
+                               page_size=self._pool.page_size)._capture_redo_payloads(effects)
         missing_manager_lsn: Lsn | None = None
         contains_index_reset = False
         simulated_page_counts: dict[str, int] = {}
@@ -618,7 +894,13 @@ class CommitRedo:
                     format_version=record.format_version,
                     flags=record.flags,
                 )
-                if not is_redoable_page_file(write.file):
+                journal = write.file in COMMIT_CATALOG_PAGE_FILES
+                if journal and not allow_commit_catalog:
+                    raise GrafxRecoveryRefused(
+                        "Commit catalog replay is not enabled by this build; no effect was applied.",
+                        field="commit_catalog_replay", lsn=record.lsn,
+                    )
+                if not journal and not is_redoable_page_file(write.file):
                     raise GrafxRecoveryRefused(
                         f"Committed page record {record.lsn} names non-data file "
                         f"{write.file!r}; no effect was applied.",

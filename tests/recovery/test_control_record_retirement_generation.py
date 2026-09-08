@@ -22,6 +22,8 @@ tests exercise every window that exists ABOVE the port.
 
 from __future__ import annotations
 
+from okto_grafx.runtime.capability_probe import port_has_attribute
+
 import hashlib
 import subprocess
 import sys
@@ -184,6 +186,7 @@ def _manager(
         stack.quarantine,
         stack.pool,
         stack.metrics,  # type: ignore[arg-type]
+        attribute_probe=port_has_attribute,
         **settings,  # type: ignore[arg-type]
     )
 

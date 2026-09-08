@@ -35,9 +35,11 @@ from okto_grafx.domain.wal.record import (
     WAL_FORMAT_VERSION,
     WAL_LEGACY_FORMAT_VERSION,
     WAL_V2_FLAG_PAGE_IMAGE_ZLIB1,
+    WAL_V2_FLAG_COMMIT_CATALOG_V1,
     WAL_V2_FLAG_REQUIRED,
     WalRecord,
     WalRecordType,
+    v2_record_semantics_error,
 )
 
 __all__ = [
@@ -54,6 +56,9 @@ __all__ = [
     "encode_page_write",
     "encode_page_write_record",
     "is_redoable_page_file",
+    "COMMIT_DIRECTORY_FILE",
+    "COMMIT_STREAM_FILE",
+    "COMMIT_CATALOG_PAGE_FILES",
 ]
 
 MAX_FILE_NAME_BYTES: int = 0xFFFF
@@ -65,6 +70,10 @@ _UNCOMPRESSED_LENGTH: struct.Struct = struct.Struct("<I")
 _MAX_PAGE_INDEX_FIELD: int = 0xFFFFFFFF
 _REDOABLE_PAGE_FILES: frozenset[str] = frozenset({"heap.dat", "catalog.dat"})
 _PAGE_IMAGE_ZLIB1_FLAGS: int = WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_PAGE_IMAGE_ZLIB1
+COMMIT_DIRECTORY_FILE: str = "commits.dir"
+COMMIT_STREAM_FILE: str = "commits.dat"
+COMMIT_CATALOG_PAGE_FILES: frozenset[str] = frozenset({COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE})
+_COMMIT_CATALOG_FLAGS: int = WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_COMMIT_CATALOG_V1
 
 
 def is_redoable_page_file(file: object) -> bool:
@@ -191,7 +200,11 @@ def encode_page_write_record(
     *,
     compress: bool,
 ) -> EncodedPageWrite:
-    """Encode one page record, selecting v2 only when zlib makes it strictly smaller."""
+    """Encode a page, retaining mandatory journal semantics even without compression.
+
+    This codec does not authorize journal publication or register a replay target.
+    Ordinary data pages keep legacy framing unless compression is strictly smaller.
+    """
 
     if not isinstance(compress, bool):
         raise GrafxConfigurationError(
@@ -200,12 +213,15 @@ def encode_page_write_record(
             value=type(compress).__name__,
         )
     legacy = encode_page_write(file, page_index, image)
+    journal = file in COMMIT_CATALOG_PAGE_FILES
+    version = WAL_FORMAT_VERSION if journal else WAL_LEGACY_FORMAT_VERSION
+    flags = _COMMIT_CATALOG_FLAGS if journal else 0
     if not compress:
-        return EncodedPageWrite(legacy, WAL_LEGACY_FORMAT_VERSION, 0)
+        return EncodedPageWrite(legacy, version, flags)
     raw_image = bytes(image)
     compressed = zlib.compress(raw_image, level=1)
     if len(compressed) + _UNCOMPRESSED_LENGTH.size >= len(raw_image):
-        return EncodedPageWrite(legacy, WAL_LEGACY_FORMAT_VERSION, 0)
+        return EncodedPageWrite(legacy, version, flags)
     prefix_length = len(legacy) - len(raw_image)
     payload = b"".join(
         (
@@ -214,7 +230,7 @@ def encode_page_write_record(
             compressed,
         )
     )
-    return EncodedPageWrite(payload, WAL_FORMAT_VERSION, _PAGE_IMAGE_ZLIB1_FLAGS)
+    return EncodedPageWrite(payload, WAL_FORMAT_VERSION, _PAGE_IMAGE_ZLIB1_FLAGS | flags)
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +307,11 @@ def decode_page_write(
     raw, file, page_index, minimum = _decode_page_write_prefix(payload)
     if format_version == WAL_LEGACY_FORMAT_VERSION:
         # V1 flags were always opaque and must not acquire retrospective meaning.
+        if file in COMMIT_CATALOG_PAGE_FILES:
+            raise GrafxSchemaVersionMismatch(
+                "Commit catalog pages require explicit WAL-v2 journal semantics.",
+                field="commit_catalog_grammar",
+            )
         return PageWrite(file=file, page_index=page_index, image=raw[minimum:])
     if format_version != WAL_FORMAT_VERSION:
         raise GrafxSchemaVersionMismatch(
@@ -299,14 +320,26 @@ def decode_page_write(
             value=format_version,
             supported=WAL_FORMAT_VERSION,
         )
-    if flags != _PAGE_IMAGE_ZLIB1_FLAGS:
+    semantic_error = v2_record_semantics_error(WalRecordType.WRITE_PAGE, flags)
+    if semantic_error is not None:
         raise GrafxSchemaVersionMismatch(
-            f"WRITE_PAGE v2 requires flags 0x{_PAGE_IMAGE_ZLIB1_FLAGS:04x}; got "
-            f"{flags!r}.",
+            semantic_error,
             field="flags",
             value=flags,
-            supported=_PAGE_IMAGE_ZLIB1_FLAGS,
         )
+    journal = bool(flags & WAL_V2_FLAG_COMMIT_CATALOG_V1)
+    if journal and file not in COMMIT_CATALOG_PAGE_FILES:
+        raise GrafxCorruptionDetected(
+            "Commit catalog WAL semantics name a non-journal target.",
+            field="commit_catalog_target",
+        )
+    if not journal and file in COMMIT_CATALOG_PAGE_FILES:
+        raise GrafxSchemaVersionMismatch(
+            "Commit catalog pages require explicit WAL-v2 journal semantics.",
+            field="commit_catalog_grammar",
+        )
+    if not flags & WAL_V2_FLAG_PAGE_IMAGE_ZLIB1:
+        return PageWrite(file=file, page_index=page_index, image=raw[minimum:])
     compressed_offset = minimum + _UNCOMPRESSED_LENGTH.size
     if len(raw) < compressed_offset:
         raise GrafxCorruptionDetected(

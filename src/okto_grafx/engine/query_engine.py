@@ -52,14 +52,13 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
-from _thread import LockType
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from heapq import heappop, heappush
 from types import MappingProxyType
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from math import isnan
-from threading import Lock
 from typing import cast
 
 from okto_grafx.domain.errors import (
@@ -84,6 +83,7 @@ from okto_grafx.domain.index.catalog import (
 )
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
+    ORDERED_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
@@ -95,6 +95,7 @@ from okto_grafx.domain.index.keys import (
     index_key,
     record_id_key,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.engine.index_manager import (
     HashIndex,
@@ -107,6 +108,7 @@ from okto_grafx.engine.index_manager import (
 )
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID
 from okto_grafx.engine.vector_engine import VectorEngine
+from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import (
     ENDPOINT_COLUMNS,
@@ -114,11 +116,16 @@ from okto_grafx.domain.model.schema import (
     ColumnDef,
     EmbeddingSpaceDef,
     TableDef,
+    _UNMATERIALIZED_COLUMN,
+    _encode_tuple_with_proof,
+    TupleEncodingProofs,
+    _is_unmaterialized_column,
     encode_tuple,
 )
 from okto_grafx.domain.model.value import (
     INT64_MAX,
     INT64_MIN,
+    VECTOR_VALUE_TYPES,
     Timestamp,
     Value,
     ValueType,
@@ -140,6 +147,8 @@ from okto_grafx.domain.txn.context import (
     PendingRowRef,
     RowIntent,
     RowOperation,
+    TransactionContext,
+    TransactionMode,
 )
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.txn.snapshot import Snapshot
@@ -199,7 +208,9 @@ from okto_grafx.domain.query.plan import (
     IndexSeek,
     LimitRows,
     MergePattern,
+    NodeMultiKeySeek,
     NodeScan,
+    OrderedNodeMerge,
     OptionalRows,
     PlanNode,
     ProduceResults,
@@ -292,6 +303,14 @@ _STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES: int = _PARSE_CACHE_MAX_ENTRIES
 _IN_LIST_MEMO_MAX_TOTAL_ELEMENTS: int = 4_096
 _PLAN_CACHE_MAX_ENTRIES: int = 128
 _PREPARED_PLAN_VERSION: int = 1
+_COMPILED_PREDICATE_MAX_ENTRIES: int = 256
+"""Ceiling of the engine-local compiled WHERE predicates (EXEC-CSE).
+
+A compiled predicate is a tree of closures derived from one plan expression -- no row, no
+value, no snapshot, nothing a later statement could reuse as authority -- kept by the identity
+of the expression object of a cached plan, so a plan executed again never compiles again.  The
+oldest entry leaves when the ceiling is reached; the plan cache itself holds 128 plans.
+"""
 
 # An endpoint locator is derived, transaction-local acceleration.  These two ceilings are its
 # complete memory contract: identifiers and the exact page-chain proof share one budget, and a
@@ -323,6 +342,43 @@ _OWNER_LANDING_FINGERPRINT_ENTRY_BYTES: int = 256
 _OWNER_LANDING_RESULT_BASE_BYTES: int = 512
 _OWNER_LANDING_MISS_BYTES: int = 192
 _OWNER_LANDING_PAYLOAD_MULTIPLIER: int = 16
+_OWNER_LANDING_TUPLE_SLOT_BYTES: int = 8
+_OWNER_LANDING_SCALAR_BYTES: int = 40
+_OWNER_LANDING_STRING_BASE_BYTES: int = 80
+_OWNER_LANDING_STRING_CHAR_BYTES: int = 4
+_OWNER_LANDING_BYTES_BASE_BYTES: int = 40
+_OWNER_LANDING_OBJECT_BYTES: int = 96
+_OWNER_LANDING_VECTOR_BASE_BYTES: int = 128
+_OWNER_LANDING_VECTOR_COMPONENT_BYTES: int = 32
+_VECTOR_FREE_CANONICAL_READ = HeapStore.read
+_VECTOR_FREE_CANONICAL_DECODE = HeapStore._decode_version
+_VECTOR_FREE_CANONICAL_VALIDATED = IndexManager.validated_versions
+_BATCH_LANDING_CANONICAL_SCALAR = IndexManager.validated_identity_landings
+_BATCH_LANDING_CANONICAL_MANY = IndexManager.validated_identity_landings_many
+"""Shape tariff of one retained landing (KGRUN-M4).
+
+Each constant dominates the CPython footprint of the object it meters: a scalar cell is one
+reference plus a 24-28 byte int/float; a str is 49 + 1 x len (ASCII) up to 76 + 4 x len (UCS-4);
+a vector is a tuple of floats (40 + 32 x n) inside a small slotted object.  The charge is a pure
+function of the decoded values (their types, string lengths and vector dimension), so it is the
+same on every platform and run, and it stays above the measured footprint (15.8 KiB real against
+18.5 KiB charged for a 45-column row with a 384-float vector) without the 16 x payload rule, which
+overcharged that row 2.7 x and starved the cache at 777 landings.
+"""
+
+# Repeated relationship layouts in one Pulse page resolve the same endpoint keys under the
+# same transaction snapshot.  Keep only that exact validated result frontier, bounded within
+# the decoded-landing budget.  The value is deliberately not configurable: it changes cost,
+# never answers, and making it a knob would create a second operational contract before the
+# workload has justified one.
+_PRIMARY_KEY_RESOLUTION_MAX_ENTRIES: int = 4_096
+_PRIMARY_KEY_RESOLUTION_ENTRY_BYTES: int = 512
+_NATIVE_VALIDATED_VERSIONS_MANY = IndexManager.validated_versions_many
+_NATIVE_VALIDATED_VERSIONS_MANY_REUSING = (
+    IndexManager.validated_versions_many_reusing
+)
+_SCALAR_PK_CANONICAL_READ_SLOT = HeapStore._read_slot
+_SCALAR_PK_CANONICAL_VALIDATED_ITEMS = IndexManager._validated_items
 
 QUERY_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -398,7 +454,17 @@ class RowBinding:
         if position is not None:
             if position >= len(self.version.values):
                 return None
-            return self.version.values[position]
+            value = self.version.values[position]
+            if _is_unmaterialized_column(value):
+                raise GrafxPlanError(
+                    "An internal projected row was read outside its closed column plan.",
+                    field="projection",
+                    value=key,
+                    table=self.table.name,
+                    variable=self.variable,
+                    position=position,
+                )
+            return value
         if self.polymorphic:
             return None
         raise GrafxPlanError(
@@ -465,7 +531,7 @@ class _OwnedPlanDoor:
     """
 
     clone: Callable[[], PlanNode]
-    _lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
+    _lock: AbstractContextManager[object] = field(repr=False, compare=False)
     _materialised: PlanNode | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -965,6 +1031,7 @@ class _HeldRow:
     identity: int | None
     reference: object
     token: int | None = None
+    encoding_proof: object = None
 
 
 class _RevisionList(list[object]):
@@ -1095,6 +1162,26 @@ class _PrimaryKeyTxnMemo:
     row_intents_by_table: dict[int, list[RowIntent]] = field(default_factory=dict)
     row_intent_index_complete: bool = True
     has_delete_intent: bool = False
+    resolutions: dict[tuple[object, ...], _PrimaryKeyResolutionCache] = field(
+        default_factory=dict
+    )
+    resolution_entries: int = 0
+
+
+@dataclass(slots=True)
+class _PrimaryKeyResolutionCache:
+    """Bounded exact-index answers owned by one transaction/snapshot/store generation."""
+
+    store: object
+    snapshot: object
+    registry_revision: int
+    heap_epoch: int
+    generation: object
+    entries: OrderedDict[
+        bytes,
+        tuple[tuple[tuple[RecordRef, HeapVersion], ...], int],
+    ] = field(default_factory=OrderedDict)
+    used_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -1175,6 +1262,15 @@ class _Context:
     # their source is a NodeScan. The set is derived once from the immutable physical plan; every
     # blocking or semantically wider shape is absent and keeps the canonical grouped scan.
     short_circuit_traversals: frozenset[int] = frozenset()
+    # Exact, statement-local column sets for a closed single-source node scan. The outer key is
+    # the physical scan node identity and the inner key is table_id (one table for NodeScan,
+    # potentially many for AllNodesScan). Absence means the canonical full-row decoder.
+    node_scan_projections: dict[int, dict[int, frozenset[int]]] = field(
+        default_factory=dict
+    )
+    # A closed one-hop read may validate landing vectors without allocating them.
+    # This is a per-operator proof, never a change to an index's authority.
+    vector_free_landings: frozenset[int] = frozenset()
     # Hashed IN parameter lists keyed by parameter name.  ``None`` records a declined build, so
     # the linear walk is chosen once for that parameter rather than re-examined on every row.
     in_list_memos: dict[str, _InListMemo | None] = field(default_factory=dict)
@@ -1245,6 +1341,7 @@ class _Context:
         identity: int | None,
         *,
         token: int | None = None,
+        encoding_proof: object = None,
     ) -> None:
         """Hold one row until the whole statement has been built without refusing.
 
@@ -1256,7 +1353,15 @@ class _Context:
         """
         self._require_statement_write_capacity()
         self.staged_rows.append(
-            _HeldRow(_HELD_INSERT, table, values, identity, None, token)
+            _HeldRow(
+                _HELD_INSERT,
+                table,
+                values,
+                identity,
+                None,
+                token,
+                encoding_proof,
+            )
         )
         self.staged_partitions.append((table.table_id, key))
 
@@ -1344,9 +1449,20 @@ class _Context:
         try:
             for held in self.staged_rows:
                 if held.operation is _HELD_INSERT:
-                    transaction.stage_row_insert(
-                        held.table, held.values or (), record_id=held.identity
+                    proved_stage = getattr(
+                        transaction, "_stage_row_insert_with_encoding_proof", None
                     )
+                    if held.encoding_proof is not None and callable(proved_stage):
+                        proved_stage(
+                            held.table,
+                            held.values or (),
+                            record_id=held.identity,
+                            encoding_proof=held.encoding_proof,
+                        )
+                    else:
+                        transaction.stage_row_insert(
+                            held.table, held.values or (), record_id=held.identity
+                        )
                 elif held.operation is _HELD_UPDATE:
                     transaction.stage_row_update(
                         held.table, held.reference, held.values or ()
@@ -2013,9 +2129,56 @@ class _OwnerLandingBudget:
 def _owner_landing_result_bytes(
     table: TableDef, found: tuple[object, HeapVersion] | None
 ) -> int | None:
-    """Return a conservative charge, or decline optional retention without changing the row."""
+    """Return a conservative charge, or decline optional retention without changing the row.
+
+    The charge is the shape tariff of the decoded values: deterministic, computed from types,
+    string lengths and vector dimensions only, and above the real footprint of every shape it
+    knows.  A row holding a compound value (LIST or MAP) has no bounded shape and keeps the
+    former rule, 16 x its stored payload length, re-encoding a synthetic version once when the
+    heap did not authenticate a length.
+    """
     if found is None:
         return _OWNER_LANDING_MISS_BYTES
+    values = found[1].values
+    charge = _OWNER_LANDING_RESULT_BASE_BYTES + (
+        _OWNER_LANDING_SCALAR_BYTES + _OWNER_LANDING_TUPLE_SLOT_BYTES * len(values)
+    )
+    compound = False
+    for column, value in zip(table.columns, values):
+        if _is_unmaterialized_column(value):
+            charge += _OWNER_LANDING_TUPLE_SLOT_BYTES
+            continue
+        if value is None:
+            charge += _OWNER_LANDING_TUPLE_SLOT_BYTES
+            continue
+        kind = column.type
+        if kind is ValueType.STRING:
+            charge += (
+                _OWNER_LANDING_STRING_BASE_BYTES
+                + _OWNER_LANDING_STRING_CHAR_BYTES * len(cast(str, value))
+            )
+        elif kind in VECTOR_VALUE_TYPES:
+            # Pending SET can carry a not-yet-encoded value of the wrong type.
+            # Optional retention must not replace the canonical schema refusal
+            # with an AttributeError while estimating the cache charge.
+            if type(value) is not VectorValue:
+                return None
+            charge += (
+                _OWNER_LANDING_VECTOR_BASE_BYTES
+                + _OWNER_LANDING_VECTOR_COMPONENT_BYTES
+                * len(value.values)
+            )
+        elif kind is ValueType.BYTES:
+            charge += _OWNER_LANDING_BYTES_BASE_BYTES + len(cast(bytes, value))
+        elif kind is ValueType.LIST or kind is ValueType.MAP:
+            compound = True
+            break
+        elif kind is ValueType.TIMESTAMP or kind is ValueType.UUID:
+            charge += _OWNER_LANDING_OBJECT_BYTES
+        else:
+            charge += _OWNER_LANDING_SCALAR_BYTES
+    if not compound:
+        return charge
     authenticated = found[1].stored_payload_bytes
     if authenticated is not None:
         return (
@@ -2023,7 +2186,7 @@ def _owner_landing_result_bytes(
             + authenticated * _OWNER_LANDING_PAYLOAD_MULTIPLIER
         )
     try:
-        stored_bytes = len(encode_tuple(table, found[1].values))
+        stored_bytes = len(encode_tuple(table, values))
     except (GrafxError, MemoryError):
         # Accounting is optional acceleration.  The version was already decoded and validated by
         # the heap (or built by the owner's validated intent reducer), so a failure to size a
@@ -2079,10 +2242,12 @@ class _OwnerLandingView:
     ``changed`` and ``ended`` are then applied in the same order as the former full-table map.
 
     Results are memoized across statements only while the transaction, snapshot, schema,
-    fingerprint and heap epoch still vouch for them.  Admission precedes every cache mutation.  If
-    any result would exceed the shared bytes or entries ceiling, all decoded results of this table
-    are discarded and this view becomes lookup-only.  The query is never refused for acceleration
-    capacity.  When both this result cache and the D-02 prefix locator exceed their independent
+    fingerprint and heap epoch still vouch for them.  Admission precedes every cache mutation.
+    The retained results of one view form a least-recently-used set under the shared bytes and
+    entries ceiling: a result that would exceed the ceiling first evicts this view's own least
+    recently used results, and when nothing of this view is left to evict it is simply not
+    retained -- the cache never grows past the ceiling, never disables itself for the rest of
+    the transaction, and the query is never refused for acceleration capacity (KGRUN-M4).  When both this result cache and the D-02 prefix locator exceed their independent
     ceilings, the honest residual worst case is one canonical O(N) lookup per distinct landing;
     eliminating that case requires the separately governed persistent identity access path.
     """
@@ -2155,7 +2320,7 @@ class _OwnerLandingView:
             self._base_bytes = base_bytes if budget is not None else 0
             self._base_entries = base_entries if budget is not None else 0
             self._cache: dict[
-                object, tuple[tuple[object, HeapVersion] | None, int]
+                object, tuple[tuple[object, HeapVersion] | None | int, int]
             ] = {}
             self._cache_bytes = 0
             self._cache_entries = 0
@@ -2190,9 +2355,12 @@ class _OwnerLandingView:
         )
 
     def get(
-        self, identity: object, context: _Context
+        self, identity: object, context: _Context, *, materialize_vectors: bool = True
     ) -> tuple[object, HeapVersion] | None:
         """Return one owner-visible identity, memoizing only after successful admission."""
+        # Partial rows never answer a later full-entity/vector read in this transaction.
+        # Physical identities are integers or PendingRowRef, never this private tuple key.
+        cache_key = identity if materialize_vectors else (identity, "vector_free")
         with self._guard:
             if self._retired:
                 raise GrafxTransactionStateError(
@@ -2201,39 +2369,44 @@ class _OwnerLandingView:
                     table=self._table.name,
                     table_id=self._table.table_id,
                 )
-            cached = self._cache.get(identity)
+            cached = self._cache.get(cache_key)
             if cached is not None:
-                return cached[0]
+                # A hit becomes the most recently used entry (dict order is the LRU order).
+                del self._cache[cache_key]
+                self._cache[cache_key] = cached
+                return cast(tuple[object, HeapVersion] | None, cached[0])
             self._active += 1
         lease_open = True
         try:
             # The identity door can walk and decode heap pages.  It is deliberately outside the
             # injected registry guard; only the immutable overlay references above are leased.
-            found = self._resolve(identity, context)
+            found = (
+                self._resolve(identity, context)
+                if materialize_vectors
+                else self._resolve(identity, context, materialize_vectors=False)
+            )
             charge = _owner_landing_result_bytes(self._table, found)
+            if charge is not None and not materialize_vectors:
+                charge += 128  # conservative retention tariff for the private key tuple
             with self._guard:
                 try:
                     if (
                         not self._retired
                         and self._cache_enabled
                         and charge is not None
-                        and identity not in self._cache
+                        and cache_key not in self._cache
                     ):
                         budget = self._budget
-                        if budget is not None:
+                        if budget is not None and self._reserve_evicting_locked(
+                            budget, charge
+                        ):
                             try:
-                                budget.reserve(bytes_=charge, entries=1)
-                            except _OwnerLandingCapacity:
-                                self._discard_results_locked()
-                                self._cache_enabled = False
-                            else:
-                                try:
-                                    self._cache[identity] = (found, charge)
-                                except BaseException:
-                                    budget.release(bytes_=charge, entries=1)
-                                    raise
-                                self._cache_bytes += charge
-                                self._cache_entries += 1
+                                self._cache[cache_key] = (found, charge)
+                            except BaseException:
+                                budget.release(bytes_=charge, entries=1)
+                                raise
+                            self._cache_bytes += charge
+                            self._cache_entries += 1
                 finally:
                     self._leave_locked()
                     lease_open = False
@@ -2242,6 +2415,142 @@ class _OwnerLandingView:
             if lease_open:
                 with self._guard:
                     self._leave_locked()
+
+    def landings_many(
+        self, identities: Sequence[int], context: _Context, index: object,
+    ) -> tuple[tuple[object, HeapVersion] | None, ...]:
+        """Batch unstaged snapshot misses in the bounded vector-free payload memo.
+
+        Repeated destinations retain the same scalar cache benefit. Full rows
+        never consume these entries; quota exhaustion declines retention, not
+        validation. No partial batch is retained before all identity checks pass.
+        """
+        with self._guard:
+            if self._retired:
+                raise GrafxTransactionStateError(
+                    "A transaction-local landing view was retired before its query finished.",
+                    field="owner_landing_view", table=self._table.name,
+                    table_id=self._table.table_id,
+                )
+            answers = {}
+            for identity in identities:
+                key = (identity, "vector_free")
+                cached = self._cache.get(key)
+                if cached is not None:
+                    answers[identity] = cached[0]
+                    del self._cache[key]
+                    self._cache[key] = cached
+            self._active += 1
+        try:
+            missing = tuple(identity for identity in dict.fromkeys(identities)
+                            if identity not in answers)
+            if missing:
+                groups = self._engine._indexes.validated_identity_landings_many(
+                    index, tuple(record_id_key(identity) for identity in missing), context.snapshot,
+                )
+                if len(groups) != len(missing):
+                    raise GrafxIndexError(
+                        "Identity landing validation returned an invalid result group count.",
+                        field="index_batch", index=index.name,
+                        expected=len(missing), observed=len(groups),
+                    )
+                for identity, group in zip(missing, groups):
+                    if len(group) > 1:
+                        raise GrafxCorruptionDetected(
+                            f"Identity index {index.name!r} resolved record {identity} of "
+                            f"table {self._table.name!r} to {len(group)} snapshot-visible versions.",
+                            file=index.file, table=self._table.name, table_id=self._table.table_id,
+                            record_id=identity, field="record_id", index=index.name, count=len(group),
+                        )
+                    found = None
+                    if group:
+                        ref, version = group[0]
+                        found = (ref, replace(version, values=tuple(
+                            _UNMATERIALIZED_COLUMN if column.type in VECTOR_VALUE_TYPES else value
+                            for column, value in zip(self._table.columns, version.values)
+                        )))
+                    answers[identity] = found
+                with self._guard:
+                    if not self._retired and self._cache_enabled and self._budget is not None:
+                        for identity in missing:
+                            key = (identity, "vector_free")
+                            found = answers[identity]
+                            charge = _owner_landing_result_bytes(self._table, found)
+                            if key in self._cache or charge is None:
+                                continue
+                            charge += 128
+                            if self._reserve_evicting_locked(self._budget, charge):
+                                try:
+                                    self._cache[key] = (found, charge)
+                                except BaseException:
+                                    self._budget.release(bytes_=charge, entries=1)
+                                    raise
+                                self._cache_bytes += charge
+                                self._cache_entries += 1
+            return tuple(answers[identity] for identity in identities)
+        finally:
+            with self._guard:
+                self._leave_locked()
+
+    def counts_many(
+        self, identities: Sequence[int], context: _Context, index: object,
+    ) -> tuple[int, ...]:
+        """Retain bounded READ-only presence proofs, separate from all row values.
+
+        This shares the existing snapshot/owner/heap-epoch view, LRU budget and
+        retirement lifecycle. Presence never satisfies full or vector-free row
+        reads. The native caller has already excluded writes and custom hooks.
+        """
+        with self._guard:
+            if self._retired:
+                raise GrafxTransactionStateError(
+                    "A transaction-local landing view was retired before its query finished.",
+                    field="owner_landing_view", table=self._table.name,
+                    table_id=self._table.table_id,
+                )
+            answers: dict[int, int] = {}
+            for identity in identities:
+                key = (identity, "presence")
+                cached = self._cache.get(key)
+                if cached is not None:
+                    answers[identity] = cast(int, cached[0])
+                    del self._cache[key]
+                    self._cache[key] = cached
+            self._active += 1
+        try:
+            missing = tuple(identity for identity in dict.fromkeys(identities)
+                            if identity not in answers)
+            if missing:
+                counts = self._engine._indexes.validated_identity_counts_many(
+                    index, tuple(record_id_key(identity) for identity in missing), context.snapshot,
+                )
+                if len(counts) != len(missing):
+                    raise GrafxIndexError(
+                        "Identity count validation returned an invalid result group count.",
+                        field="index_batch", index=index.name,
+                        expected=len(missing), observed=len(counts),
+                    )
+                answers.update(zip(missing, counts))
+                with self._guard:
+                    if not self._retired and self._cache_enabled and self._budget is not None:
+                        for identity, count in zip(missing, counts):
+                            key = (identity, "presence")
+                            # Never retain an invalid duplicate witness as a successful proof.
+                            if count not in (0, 1) or key in self._cache:
+                                continue
+                            charge = 512  # tuple key, bounded id/count, dict and LRU overhead
+                            if self._reserve_evicting_locked(self._budget, charge):
+                                try:
+                                    self._cache[key] = (count, charge)
+                                except BaseException:
+                                    self._budget.release(bytes_=charge, entries=1)
+                                    raise
+                                self._cache_bytes += charge
+                                self._cache_entries += 1
+            return tuple(answers[identity] for identity in identities)
+        finally:
+            with self._guard:
+                self._leave_locked()
 
     def close(self) -> None:
         """Drop payloads, overlays and their exact charges at transaction settlement."""
@@ -2263,7 +2572,7 @@ class _OwnerLandingView:
             self._budget = None
 
     def _resolve(
-        self, identity: object, context: _Context
+        self, identity: object, context: _Context, *, materialize_vectors: bool = True
     ) -> tuple[object, HeapVersion] | None:
         """Apply the former full-map overlay to one physical or pending identity."""
         if isinstance(identity, PendingRowRef):
@@ -2284,15 +2593,26 @@ class _OwnerLandingView:
                 ),
             )
 
-        physical = _visible_identity_with_ref(
-            self._engine,
-            context,
-            self._table,
-            cast(RecordId, identity),
+        physical = (
+            _visible_identity_with_ref(
+                self._engine, context, self._table, cast(RecordId, identity)
+            )
+            if materialize_vectors
+            else _visible_identity_with_ref(
+                self._engine, context, self._table, cast(RecordId, identity), landing=True
+            )
         )
         if physical is None:
             return None
         ref, version = physical
+        if not materialize_vectors:
+            # The identity-only decoder's proof values must not become row values.
+            # Convert every vector position to the projected decoder's guarded marker;
+            # owner updates below replace this with their complete, validated tuple.
+            version = replace(version, values=tuple(
+                _UNMATERIALIZED_COLUMN if column.type in VECTOR_VALUE_TYPES else value
+                for column, value in zip(self._table.columns, version.values)
+            ))
         if ref in self._ended:
             return None
         if ref in self._changed:
@@ -2301,6 +2621,30 @@ class _OwnerLandingView:
                 return None
             version = replace(version, values=values)
         return ref, version
+
+    def _reserve_evicting_locked(
+        self, budget: _OwnerLandingBudget, charge: int
+    ) -> bool:
+        """Reserve one result charge, evicting this view's LRU results while that helps.
+
+        Only results of this view are evicted, oldest first, so a saturated shared budget makes a
+        view trade its own stale results for fresh ones and never touches another view's.  When
+        this view holds nothing more to release and the reservation still fails, the result is
+        not retained and the cache stays enabled for the next one.  Caller holds the guard.
+        """
+        while True:
+            try:
+                budget.reserve(bytes_=charge, entries=1)
+            except _OwnerLandingCapacity:
+                if not self._cache:
+                    return False
+                oldest = next(iter(self._cache))
+                _found, released = self._cache.pop(oldest)
+                budget.release(bytes_=released, entries=1)
+                self._cache_bytes -= released
+                self._cache_entries -= 1
+            else:
+                return True
 
     def _leave_locked(self) -> None:
         """Finish one heap-I/O lease; caller holds the injected re-entrant guard."""
@@ -2715,6 +3059,31 @@ class _PreparedPlanKey:
     version: int = _PREPARED_PLAN_VERSION
 
 
+def _dirty_primary_key_seek_definition(definition: object, catalog: Catalog) -> bool:
+    """Say whether one dirty-table index has the exact overlay implemented by IndexSeek.
+
+    This intentionally recognizes only Grafx's automatic exact primary-key artifact.  A custom
+    exact index over the same column may share its bytes, but it does not share the frozen name
+    and ownership contract used by the transaction-local primary-key fold.  Keeping the proof
+    this narrow makes an unfamiliar or speculative artifact take the established scan fallback.
+    """
+    if not isinstance(definition, IndexDefinition):
+        return False
+    if definition.visibility is not IndexVisibility.EXACT:
+        return False
+    if not catalog.has_table(definition.table_name):
+        return False
+    table = catalog.table(definition.table_name)
+    if (
+        table.kind != "node"
+        or table.table_id != definition.table_id
+        or table.primary_key is None
+        or definition.name != primary_key_index_name(table.name)
+    ):
+        return False
+    return definition.positions == (table.column_index(table.primary_key),)
+
+
 def _catalog_active_index(
     manager: object,
     name: str,
@@ -2833,6 +3202,9 @@ class QueryEngine:
         "_plan_cache",
         "_owned_prepared_plans",
         "_statement_authority_memo",
+        "_compiled_predicates",
+        "_compiled_predicates_lock",
+        "_tuple_encoding_proofs",
     )
 
     def __init__(
@@ -2849,6 +3221,8 @@ class QueryEngine:
         schema_artifact_section: Callable[..., object] | None = None,
         custom_index_preparer: Callable[..., CatalogIndexDefinition] | None = None,
         endpoint_locator_guard: AbstractContextManager[object] | None = None,
+        compiled_predicate_guard: AbstractContextManager[object] | None = None,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
         max_statement_writes: int | None = None,
         max_result_rows: int | None = None,
         max_intermediate_rows: int | None = None,
@@ -2861,6 +3235,7 @@ class QueryEngine:
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._heap = heap
         self._pool = pool
         # Tables whose primary-key index could not be created. Reported rather than
@@ -2889,6 +3264,12 @@ class QueryEngine:
             max_bytes=_OWNER_LANDING_MAX_BYTES,
             max_entries=_OWNER_LANDING_MAX_ENTRIES,
             guard=self._endpoint_guard,
+        )
+        self._compiled_predicates: dict[int, _CompiledPredicate] = {}
+        # Guards only the lookup, publication and eviction of compiled predicates: never held
+        # while compiling, evaluating a row or doing I/O.
+        self._compiled_predicates_lock = (
+            self._endpoint_guard if compiled_predicate_guard is None else compiled_predicate_guard
         )
         self._endpoint_memo: dict[int, _EndpointTxnMemo] = {}
         self._endpoint_budget = _EndpointLocatorBudget(
@@ -3027,6 +3408,39 @@ class QueryEngine:
             cache_text=text,
         ).root
 
+    def _compiled_predicate(
+        self, expression: Expression, context: _Context
+    ) -> _CompiledPredicate:
+        """Return the closures of one WHERE predicate, compiling it at most once per plan.
+
+        Keyed by the identity of the expression object, which the cached plan keeps alive; the
+        entry is reused only while it is for that exact object and the planner's coalesce types
+        it was compiled with still hold.  Bounded by ``_COMPILED_PREDICATE_MAX_ENTRIES``; the
+        oldest entry leaves first.  It holds no row, value or snapshot: nothing here is
+        authority beyond the life of the statement that runs it.
+
+        Readers of one engine may run on several threads: the dictionary is only read, published
+        or trimmed under ``_compiled_predicates_lock``, which is never held while compiling (so
+        the concurrent compile of one predicate is at most repeated, never serialized with row
+        evaluation) and the first published entry wins so every thread runs the same closures.
+        """
+        cache = self._compiled_predicates
+        key = id(expression)
+        with self._compiled_predicates_lock:
+            entry = cache.get(key)
+            if entry is not None and entry.serves(expression, context):
+                return entry
+        compiled = _compile_predicate(expression, context)
+        with self._compiled_predicates_lock:
+            entry = cache.get(key)
+            if entry is not None and entry.serves(expression, context):
+                return entry
+            cache.pop(key, None)
+            while len(cache) >= _COMPILED_PREDICATE_MAX_ENTRIES:
+                cache.pop(next(iter(cache)))
+            cache[key] = compiled
+        return compiled
+
     def _planned_for(
         self,
         statement: Statement,
@@ -3118,6 +3532,7 @@ class QueryEngine:
         columns: tuple[str, ...],
         bucket_count: int | None,
         expected_cardinality: int | None,
+        layout: str | None,
         txn: object,
     ) -> QueryResult:
         """Run the Python index door through the same analysis and plan as textual DDL."""
@@ -3129,6 +3544,7 @@ class QueryEngine:
                 columns=columns,
                 bucket_count=bucket_count,
                 expected_cardinality=expected_cardinality,
+                layout=layout,
             ),
             txn,
         )
@@ -3251,6 +3667,8 @@ class QueryEngine:
                 result_node=root.child,
                 union_coercions=_bound_union_columns(plan, bound),
                 index_authority=authority,
+                node_scan_projections=_closed_node_scan_projections(root.child),
+                vector_free_landings=_closed_vector_free_landings(root.child),
             )
             _bind_timestamp_values(plan, context)
             _validate_bound_subscript_types(plan, bound)
@@ -3288,7 +3706,15 @@ class QueryEngine:
         without_indexes_for: frozenset[int] = frozenset(),
         authority: _IndexAuthorityProjection | None = None,
     ) -> tuple[object, ...]:
-        """Return usable index definitions, withholding tables that need an owner overlay."""
+        """Return usable index definitions, retaining safe owner-overlay primary seeks.
+
+        A dirty table used to lose every index for the rest of its transaction.  That is safe,
+        but turns the common ``create nodes, then connect them`` ingestion shape into one full
+        node scan per endpoint.  The automatic primary-key index is different from a general
+        secondary index: :func:`_index_seek` can overlay the transaction's incrementally folded
+        primary-key ownership map on its durable candidates.  Keep only that exact access path
+        for a dirty table; every other index still falls back to the canonical scan.
+        """
         if self._indexes is None:
             return ()
         # A STALE index is withheld from the planner, and that is a correctness rule rather than
@@ -3308,9 +3734,9 @@ class QueryEngine:
             usable: list[object] = []
             for index in indexes:
                 definition = index.definition
-                if (
-                    getattr(index, "stale", False)
-                    or definition.table_id in without_indexes_for
+                if getattr(index, "stale", False) or (
+                    definition.table_id in without_indexes_for
+                    and not _dirty_primary_key_seek_definition(definition, catalog)
                 ):
                     continue
                 if not catalog.has_table(definition.table_name):
@@ -3331,7 +3757,10 @@ class QueryEngine:
             index.definition
             for index in indexes
             if not getattr(index, "stale", False)
-            and index.definition.table_id not in without_indexes_for
+            and (
+                index.definition.table_id not in without_indexes_for
+                or _dirty_primary_key_seek_definition(index.definition, catalog)
+            )
             and (
                 (
                     table := tables.get(
@@ -3639,6 +4068,8 @@ class QueryEngine:
             union_coercions=_bound_union_columns(plan, parameters),
             index_authority=index_authority,
             short_circuit_traversals=_short_circuit_traversals(root.child),
+            node_scan_projections=_closed_node_scan_projections(root.child),
+            vector_free_landings=_closed_vector_free_landings(root.child),
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
@@ -3790,6 +4221,8 @@ class QueryEngine:
                 positions=node.positions,
                 bucket_count=node.bucket_count,
                 expected_cardinality=node.expected_cardinality,
+                layout=node.layout,
+                key_derivation=node.key_derivation,
             )
             after = set(staged_pages()) if callable(staged_pages) else set()
             statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
@@ -4183,7 +4616,7 @@ class QueryEngine:
             self._working.pop(txn_id, None)
             self._settle_owner_memo(txn_id)
             self._settle_endpoint_memo(txn_id)
-            self._primary_key_memos.pop(txn_id, None)
+            self._settle_primary_key_memo(txn_id)
             self._txn_effects.pop(txn_id, None)
             return
         # The transaction's own journal, replayed in reverse -- never a prune against a catalog.
@@ -4197,7 +4630,7 @@ class QueryEngine:
         self._working.pop(txn_id, None)
         self._settle_owner_memo(txn_id)
         self._settle_endpoint_memo(txn_id)
-        self._primary_key_memos.pop(txn_id, None)
+        self._settle_primary_key_memo(txn_id)
         self._txn_effects.pop(txn_id, None)
 
     def _settle_owner_memo(self, txn_id: int) -> None:
@@ -4220,6 +4653,13 @@ class QueryEngine:
         # silently turning settlement into heap I/O under the lock.
         for locator in closers:
             locator.close()
+
+    def _settle_primary_key_memo(self, txn_id: int) -> None:
+        """Release every metered exact-key result on every terminal transaction path."""
+        with self._endpoint_guard:
+            memo = self._primary_key_memos.pop(txn_id, None)
+            if memo is not None:
+                _discard_primary_key_resolution_caches(self, memo)
 
     @property
     def skipped_indexes(self) -> tuple[str, ...]:
@@ -4373,6 +4813,7 @@ class QueryEngine:
                 positions=definition.positions,
                 visibility=definition.visibility,
                 key_derivation=definition.key_derivation,
+                layout=definition.layout,
                 automatic=True,
                 expected_cardinality=expected_cardinality,
                 generations=(generation,),
@@ -4409,7 +4850,16 @@ class QueryEngine:
     ) -> None:
         """Create and observe one v2 generation without granting committed authority early."""
         if committed_table is None:
-            candidate = HashIndex(definition, self._pool, self._metrics.sink)
+            if definition.layout is IndexLayout.ORDERED:
+                from okto_grafx.engine.ordered_index import OrderedIndex
+
+                candidate = OrderedIndex(
+                    definition, self._pool, self._metrics.sink
+                )
+            else:
+                candidate = HashIndex(
+                    definition, self._pool, self._metrics.sink
+                )
         else:
             # `_schema` already owns COMMIT_SECTION through schema_artifact_section.  Grafx
             # materialises heap rows only inside that same section, so the durable heap cannot
@@ -5105,6 +5555,22 @@ def _with_rows(
         yield _Row(bindings=projected)
 
 
+def _scanned_node_versions(
+    engine: QueryEngine,
+    table: TableDef,
+    snapshot: object,
+    materialized_positions: frozenset[int] | None,
+) -> Iterator[tuple[RecordRef, HeapVersion]]:
+    """Choose the closed projected scan only for the exact built-in heap."""
+    if materialized_positions is not None and type(engine.heap) is HeapStore:
+        return engine.heap.scan_projected(
+            table,
+            snapshot,  # type: ignore[arg-type]
+            materialized_positions,
+        )
+    return engine.heap.scan(table, snapshot)  # type: ignore[arg-type]
+
+
 def _all_nodes_scan(
     engine: QueryEngine, node: AllNodesScan, context: _Context
 ) -> Iterator[_Row]:
@@ -5122,9 +5588,15 @@ def _all_nodes_scan(
         for table in node.tables
     ]
     single_source = isinstance(node.child, SingleRow)
+    projections = getattr(context, "node_scan_projections", {}).get(id(node), {})
     for row in engine._rows(node.child, context):
         for table, changed, inserted in views:
-            for ref, version in engine.heap.scan(table, snapshot):
+            for ref, version in _scanned_node_versions(
+                engine,
+                table,
+                snapshot,
+                projections.get(table.table_id),
+            ):
                 if ref in changed:
                     latest = changed[ref]
                     if latest is None:
@@ -5163,6 +5635,11 @@ def _node_scan(
     snapshot = context.snapshot
     changed, inserted = _transaction_row_view(context, node.table, include_held=False)
     single_source = isinstance(node.child, SingleRow)
+    projection = (
+        getattr(context, "node_scan_projections", {})
+        .get(id(node), {})
+        .get(node.table.table_id)
+    )
     for row in engine._rows(node.child, context):
         yield from _logical_node_rows_for_input(
             engine,
@@ -5174,6 +5651,7 @@ def _node_scan(
             changed=changed,
             inserted=inserted,
             single_source=single_source,
+            materialized_positions=projection,
         )
 
 
@@ -5188,10 +5666,13 @@ def _logical_node_rows_for_input(
     changed: Mapping[object, tuple[Value, ...] | None],
     inserted: Sequence[tuple[object, tuple[Value, ...]]],
     single_source: bool,
+    materialized_positions: frozenset[int] | None = None,
 ) -> Iterator[_Row]:
     """Yield one table's scan-equivalent rows for an already-produced input row."""
 
-    for ref, version in engine.heap.scan(table, snapshot):
+    for ref, version in _scanned_node_versions(
+        engine, table, snapshot, materialized_positions
+    ):
         if ref in changed:
             latest = changed[ref]
             if latest is None:
@@ -5229,6 +5710,34 @@ _ENCODING_COMPLETE_EXACT_TYPES: frozenset[ValueType] = frozenset(
     }
 )
 """Scalar kinds whose stored bytes are complete for the language's equality relation."""
+
+
+def _string_probe_frontier(
+    table: TableDef, position: int, values: tuple[object, ...]
+) -> int | None:
+    """Return the distinct encoded-key count of exact ASCII ``str`` probes of a STRING column.
+
+    ``index_key`` encodes a STRING value as its tag, length and UTF-8 bytes, an injective map:
+    two ``str`` probes are the same key exactly when they are equal, so the distinct count of
+    the encoding route is known without encoding -- provided the encoding route would have
+    accepted every probe.  Only ASCII text is provably encodable without encoding it (a lone
+    surrogate is an exact ``str`` that UTF-8 refuses), so any non-ASCII probe returns ``None``.
+    ``None`` is not a count: it means some probe is not an exact ASCII ``str`` (a subclass, a
+    number, a compound value, non-ASCII text), and the caller must take the encoding route,
+    which stays the single oracle for refusals and cross-representation probes, raising exactly
+    what it raised before and at the same point.  A ``None`` probe is skipped exactly as the
+    encoder skips it.
+    """
+    if table.columns[position].type is not ValueType.STRING:
+        return None
+    distinct: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        if type(value) is not str or not value.isascii():
+            return None
+        distinct.add(value)
+    return len(distinct)
 
 
 def _exact_probe_is_encoding_complete(
@@ -5348,7 +5857,30 @@ def _index_seek(
         and node.index == primary_key_index_name(node.table.name)
     )
     ended = _ended_by_this_transaction(context)
-    changed, inserted = _transaction_row_view(context, node.table, include_held=False)
+    logical_overlay: (
+        tuple[
+            dict[object, tuple[Value, ...] | None],
+            list[tuple[object, tuple[Value, ...]]],
+        ]
+        | None
+    ) = None
+
+    def scan_overlay() -> tuple[
+        dict[object, tuple[Value, ...] | None],
+        list[tuple[object, tuple[Value, ...]]],
+    ]:
+        nonlocal logical_overlay
+        if logical_overlay is None:
+            logical_overlay = _transaction_row_view(
+                context, node.table, include_held=False
+            )
+        return logical_overlay
+
+    primary_state = (
+        _transaction_primary_key_state(engine, context, node.table, primary_position)
+        if reuse_validated_version and primary_position is not None
+        else None
+    )
     single_source = isinstance(node.child, SingleRow)
     selected_index: object | None = None
     index_resolved = False
@@ -5367,6 +5899,7 @@ def _index_seek(
             # (INT64/DOUBLE, signed zero and nested numeric values), so a single hash probe could
             # otherwise omit true rows.  Filter here because the planner correctly consumed the
             # equality terms when it chose IndexSeek.
+            changed, inserted = scan_overlay()
             for candidate in _logical_node_rows_for_input(
                 engine,
                 table=node.table,
@@ -5398,7 +5931,40 @@ def _index_seek(
         for position, value in zip(positions, values):
             template[position] = value
         key = index_key(template, positions)
-        for ref, version in _index_lookup_versions(
+        statement_primary: _PrimaryKeyStatementMemo | None = None
+        overlay_candidates: tuple[tuple[object, _PrimaryKeyOutcome], ...] = ()
+        if primary_state is not None and primary_position is not None:
+            # Refresh the held-row suffix per driving row.  An UNWIND/SET statement can change
+            # this same table while the seek pipeline is still producing input rows.
+            statement_primary = _statement_primary_key_state(
+                context, node.table, primary_position, primary_state
+            )
+            selected = _primary_key_seek_candidates(
+                primary_state, statement_primary, values[0]
+            )
+            if selected is None:
+                # A legacy insert without a pending identity cannot be reconstructed from the
+                # incremental ownership fold.  Preserve its established duck-typed semantics by
+                # using the complete logical scan for this one probe.
+                changed, inserted = scan_overlay()
+                for candidate in _logical_node_rows_for_input(
+                    engine,
+                    table=node.table,
+                    variable=node.variable,
+                    input_row=row,
+                    context=context,
+                    snapshot=snapshot,
+                    changed=changed,
+                    inserted=inserted,
+                    single_source=single_source,
+                ):
+                    binding = candidate.bindings[node.variable]
+                    if _equal(binding.version.values[primary_position], values[0]):
+                        yield candidate
+                continue
+            overlay_candidates = selected
+        yielded: set[object] = set()
+        versions = _index_lookup_versions(
             engine,
             manager,
             node.index,
@@ -5407,9 +5973,25 @@ def _index_seek(
             reuse_validated_version=reuse_validated_version,
             ended=ended,
             selected_index=selected_index,
-        ):
+        )
+        if reuse_validated_version and primary_position is not None:
+            cached_group = _scalar_primary_key_group(
+                engine, context, manager, selected_index, key, node.table,
+                primary_position,
+            )
+            if cached_group is not None:
+                versions = iter(cached_group)
+        for ref, version in versions:
             if ref in ended:
                 continue  # ended by this transaction: the same rule the scan applies
+            if primary_state is not None and statement_primary is not None:
+                replaced, outcome = _primary_key_current_outcome(
+                    primary_state, statement_primary, ref
+                )
+                if replaced:
+                    if outcome is None or outcome.operation is RowOperation.DELETE:
+                        continue
+                    version = replace(version, values=outcome.values)
             if not all(
                 _equal(version.values[position], value)
                 for position, value in zip(positions, values)
@@ -5423,6 +6005,29 @@ def _index_seek(
                 variable=node.variable, table=node.table, ref=ref, version=version
             )
             context.count("rows_seeked")
+            yielded.add(ref)
+            yield _Row(bindings=bindings)
+        for reference, outcome in overlay_candidates:
+            if reference in yielded or outcome.operation is RowOperation.DELETE:
+                continue
+            if isinstance(reference, PendingRowRef):
+                binding = _pending_binding(
+                    node.variable,
+                    node.table,
+                    outcome.values,
+                    reference=reference,
+                )
+            else:
+                version = replace(engine.heap.read(reference), values=outcome.values)
+                binding = RowBinding(
+                    variable=node.variable,
+                    table=node.table,
+                    ref=reference,
+                    version=version,
+                )
+            bindings = {} if single_source else dict(row.bindings)
+            bindings[node.variable] = binding
+            context.count("rows_seeked")
             yield _Row(bindings=bindings)
 
 
@@ -5433,6 +6038,328 @@ Chosen from the shape of the two costs, not tuned to a machine: a lookup costs a
 reads however large the edge table is, and the grouped scan costs the whole edge table once.
 NodeScan and AllNodesScan frontiers bypass this limit and scan immediately because their plan
 already promises a whole-table walk. Unknown producers retain the conservative hybrid fallback."""
+
+
+def _scalar_primary_key_group(
+    engine: QueryEngine,
+    context: _Context,
+    manager: object,
+    store: object,
+    key: bytes,
+    table: TableDef,
+    position: int,
+) -> tuple[tuple[RecordRef, HeapVersion], ...] | None:
+    """Share the bounded PK memo with scalar read seeks, never its certificates.
+
+    A one-key batch validates the same candidate sequence as the scalar exact
+    door. Reuse still opens a fresh stable index/heap view on every statement;
+    only bucket traversal and payload materialization may be reused. Writer
+    statements and specialized scalar collaborators keep their existing door.
+    """
+    if type(context.txn) is not TransactionContext or context.txn.mode is not TransactionMode.READ:
+        return None
+    many = getattr(manager, "validated_versions_many", None)
+    definition = getattr(store, "definition", None)
+    if (
+        type(manager) is not IndexManager
+        or type(engine.heap) is not HeapStore
+        or getattr(engine.heap.read, "__func__", None) is not _VECTOR_FREE_CANONICAL_READ
+        or getattr(engine.heap._decode_version, "__func__", None) is not _VECTOR_FREE_CANONICAL_DECODE
+        or getattr(engine.heap._read_slot, "__func__", None) is not _SCALAR_PK_CANONICAL_READ_SLOT
+        or getattr(manager.validated_versions, "__func__", None) is not _VECTOR_FREE_CANONICAL_VALIDATED
+        or getattr(manager._validated_items, "__func__", None) is not _SCALAR_PK_CANONICAL_VALIDATED_ITEMS
+        or getattr(many, "__func__", None) is not _NATIVE_VALIDATED_VERSIONS_MANY
+        or not isinstance(definition, IndexDefinition)
+        or definition.table_id != table.table_id
+        or definition.table_name != table.name
+        or definition.positions != (position,)
+        or definition.key_derivation != COLUMN_KEY_DERIVATION
+        or definition.visibility is not IndexVisibility.EXACT
+    ):
+        return None
+    groups = _memoized_primary_key_groups(
+        engine, context, manager, store, (key,), table, position, many,
+    )
+    if len(groups) != 1:
+        raise GrafxIndexError(
+            "Scalar primary-key validation returned an invalid result group count.",
+            field="index_batch", index=definition.name, expected=1, observed=len(groups),
+        )
+    return groups[0]
+
+
+def _closed_vector_free_landings(root: PlanNode) -> frozenset[int]:
+    """Prove a closed read cannot inspect the selected landing vectors.
+
+    Keep the same traversal, row order, frontier, physical checks and admission.
+    Typed single hops qualify for scalar projections/filters/aggregates. Optional
+    hops with unconsumed targets also qualify across a closed WITH pipeline.
+    UNION, range/path traversal, writes and unknown operators keep full rows.
+    A bare target or a target vector anywhere in the pipeline declines.
+    """
+    unused = _unused_optional_landings(root)
+    if unused:
+        return unused
+    expressions: list[Expression] = []
+    planned = root
+    while True:
+        kind = type(planned)
+        if kind is FilterRows:
+            expressions.append(planned.predicate)
+        elif kind is ProjectRows:
+            expressions.extend(item.expression for item in planned.items)
+        elif kind is AggregateRows:
+            if planned.preserve_group_bindings:
+                return frozenset()
+            expressions.extend(item.expression for item in planned.grouping)
+            expressions.extend(item.call for item in planned.aggregations)
+        elif kind is SortRows:
+            expressions.extend(item.expression for item in planned.keys)
+            expressions.extend(value for value in (
+                planned.retained_limit, planned.retained_skip,
+            ) if value is not None)
+        elif kind in (LimitRows, SkipRows):
+            expressions.append(planned.count)
+        elif kind is not DistinctRows:
+            break
+        planned = planned.child
+    if type(planned) is RelationshipScan:
+        # Edge-first scans resolve BOTH endpoints. Decline the whole optimization
+        # if either can expose a vector, or if bindings could come from another
+        # source. This changes decoding only, never edge/endpoint visibility.
+        if (
+            type(planned.child) is not SingleRow
+            or planned.from_variable == planned.to_variable
+            or planned.relationship in (planned.from_variable, planned.to_variable)
+        ):
+            return frozenset()
+        vectors_by_variable = {
+            variable: {column.name for column in table.columns
+                       if column.type in VECTOR_VALUE_TYPES}
+            for variable, table in (
+                (planned.from_variable, planned.from_table),
+                (planned.to_variable, planned.to_table),
+            )
+        }
+        if not any(vectors_by_variable.values()):
+            return frozenset()
+        if planned.predicate is not None:
+            expressions.append(planned.predicate)
+        pending = list(expressions)
+        while pending:
+            expression = pending.pop()
+            if (
+                type(expression) is FunctionCall
+                and expression.name.upper() == LABEL_FUNCTION
+                and len(expression.arguments) == 1
+                and type(expression.arguments[0]) is Variable
+                and expression.arguments[0].name in vectors_by_variable
+                and not expression.named_arguments
+                and not expression.distinct and not expression.star
+            ):
+                continue
+            if type(expression) is Property and type(expression.subject) is Variable:
+                if expression.key in vectors_by_variable.get(expression.subject.name, ()):
+                    return frozenset()
+                continue
+            if type(expression) is Variable and expression.name in vectors_by_variable:
+                return frozenset()
+            pending.extend(expression.children())
+        return frozenset((id(planned),))
+    if type(planned) is not TraverseRelationship:
+        return frozenset()
+    hop = planned
+    if (
+        hop.min_hops != 1 or hop.max_hops != 1 or hop.path_variable is not None
+        or hop.target_bound or hop.target_table is None or hop.target == hop.source
+        or hop.direction is Direction.UNDIRECTED
+    ):
+        return frozenset()
+    vector_names = {
+        column.name for column in hop.target_table.columns
+        if column.type in VECTOR_VALUE_TYPES
+    }
+    if not vector_names:
+        return frozenset()
+    source = hop.child
+    while type(source) is FilterRows:
+        expressions.append(source.predicate)
+        source = source.child
+    if (
+        type(source) not in (NodeScan, IndexSeek)
+        or type(source.child) is not SingleRow or source.variable != hop.source
+    ):
+        return frozenset()
+    if type(source) is IndexSeek:
+        expressions.extend(source.key_values)
+    pending = list(expressions)
+    while pending:
+        expression = pending.pop()
+        if (
+            type(expression) is FunctionCall and expression.name.upper() == LABEL_FUNCTION
+            and len(expression.arguments) == 1
+            and type(expression.arguments[0]) is Variable
+            and expression.arguments[0].name == hop.target
+            and not expression.named_arguments and not expression.distinct and not expression.star
+        ):
+            continue
+        if type(expression) is Property and type(expression.subject) is Variable:
+            if expression.subject.name == hop.target and expression.key in vector_names:
+                return frozenset()
+            continue
+        if type(expression) is Variable and expression.name == hop.target:
+            return frozenset()
+        pending.extend(expression.children())
+    return frozenset((id(hop),))
+
+
+def _unused_optional_landings(root: PlanNode) -> frozenset[int]:
+    """Prove optional degree pipelines never consume their landing bindings.
+
+    Only the anchor survives grouping/WITH. No landing is projected, renamed,
+    tested or used as another hop's source. Full anchor/edge values and every
+    landing's validation remain; only unused vector components may be omitted.
+    Unknown operators and binding aliases decline the entire proof.
+    """
+    expressions: list[Expression] = []
+    aliases: set[str] = set()
+    hops: list[TraverseAnyRelationship] = []
+    planned = root
+    while True:
+        kind = type(planned)
+        if kind in (ProjectRows, WithRows):
+            expressions.extend(item.expression for item in planned.items)
+            aliases.update(item.alias for item in planned.items if item.alias is not None)
+        elif kind is AggregateRows:
+            expressions.extend(item.expression for item in planned.grouping)
+            expressions.extend(item.call for item in planned.aggregations)
+        elif kind is FilterRows:
+            expressions.append(planned.predicate)
+        elif kind in (LimitRows, SkipRows):
+            expressions.append(planned.count)
+        elif kind is TraverseAnyRelationship:
+            if not planned.optional:
+                return frozenset()
+            hops.append(planned)
+            if planned.predicate is not None:
+                expressions.append(planned.predicate)
+        elif kind is not DistinctRows:
+            break
+        planned = planned.child
+    if (
+        not hops or type(planned) not in (NodeScan, IndexSeek)
+        or type(planned.child) is not SingleRow
+        or any(hop.source != planned.variable for hop in hops)
+    ):
+        return frozenset()
+    targets = {hop.target for hop in hops}
+    if (
+        len(targets) != len(hops) or planned.variable in targets
+        or aliases & targets or any(hop.relationship in targets for hop in hops)
+    ):
+        return frozenset()
+    if type(planned) is IndexSeek:
+        expressions.extend(planned.key_values)
+    pending = list(expressions)
+    while pending:
+        expression = pending.pop()
+        if type(expression) is Variable and expression.name in targets:
+            return frozenset()
+        pending.extend(expression.children())
+    return frozenset(id(hop) for hop in hops)
+
+
+def _closed_node_scan_projections(
+    root: PlanNode,
+) -> dict[int, dict[int, frozenset[int]]]:
+    """Plan projections for one closed, read-only, single-source node pipeline.
+
+    Projection is declined unless the entire physical path is a linear combination of filters,
+    result projection, ordering, DISTINCT and a window over exactly one NodeScan/AllNodesScan
+    driven by SingleRow. Every expression is walked: direct properties of the scan variable are
+    retained, while a bare occurrence of that variable declines the optimization because it may
+    expose or inspect the complete entity. Expressions over other computed aliases do not need
+    stored columns. This makes the proof intentionally narrower than the query language.
+    """
+    expressions: list[Expression] = []
+    planned = root
+    while True:
+        kind = type(planned)
+        if kind is FilterRows:
+            expressions.append(planned.predicate)  # type: ignore[attr-defined]
+        elif kind is ProjectRows:
+            expressions.extend(
+                item.expression
+                for item in planned.items  # type: ignore[attr-defined]
+            )
+        elif kind is SortRows:
+            expressions.extend(
+                item.expression
+                for item in planned.keys  # type: ignore[attr-defined]
+            )
+            if planned.retained_limit is not None:  # type: ignore[attr-defined]
+                expressions.append(planned.retained_limit)  # type: ignore[attr-defined]
+            if planned.retained_skip is not None:  # type: ignore[attr-defined]
+                expressions.append(planned.retained_skip)  # type: ignore[attr-defined]
+        elif kind in (LimitRows, SkipRows):
+            expressions.append(planned.count)  # type: ignore[attr-defined]
+        elif kind is not DistinctRows:
+            break
+        planned = planned.child  # type: ignore[attr-defined]
+
+    if type(planned) is NodeScan:
+        if type(planned.child) is not SingleRow:
+            return {}
+        variable = planned.variable
+        tables = (planned.table,)
+    elif type(planned) is AllNodesScan:
+        if type(planned.child) is not SingleRow:
+            return {}
+        variable = planned.variable
+        tables = planned.tables
+    else:
+        return {}
+
+    property_names: set[str] = set()
+    pending = list(expressions)
+    while pending:
+        expression = pending.pop()
+        if (
+            type(expression) is FunctionCall
+            and expression.name.upper() == LABEL_FUNCTION
+            and len(expression.arguments) == 1
+            and type(expression.arguments[0]) is Variable
+            and expression.arguments[0].name == variable
+            and not expression.named_arguments
+            and not expression.distinct
+            and not expression.star
+        ):
+            # label(n) reads the binding's table identity, not its stored values.
+            continue
+        if type(expression) is Property:
+            subject = expression.subject
+            if type(subject) is Variable:
+                if subject.name == variable:
+                    property_names.add(expression.key)
+                continue
+            pending.append(subject)
+            continue
+        if type(expression) is Variable:
+            if expression.name == variable:
+                return {}
+            continue
+        pending.extend(expression.children())
+
+    by_table: dict[int, frozenset[int]] = {}
+    for table in tables:
+        positions = frozenset(
+            position
+            for name in property_names
+            if (position := table.column_positions.get(name)) is not None
+        )
+        if len(positions) < len(table.columns):
+            by_table[table.table_id] = positions
+    return {id(planned): by_table} if by_table else {}
 
 
 def _short_circuit_traversals(root: PlanNode) -> frozenset[int]:
@@ -5715,6 +6642,109 @@ def _planned_table_for_variable(root: PlanNode, variable: str) -> TableDef | Non
     return None
 
 
+_BATCH_LANDING_CANONICAL_GET = _OwnerLandingView.get
+
+
+def _admits_batched_landings(
+    engine: QueryEngine, node: TraverseRelationship, context: _Context,
+) -> bool:
+    """Admit bounded prefetch only when the closed consumer must read every hop.
+
+    A streaming LIMIT must never inspect a later endpoint. Nor may batching move
+    a configured quota's refusal across validation. Those shapes, staged owner writes
+    and specialized scalar witnesses retain the original per-row access path.
+    An exact native WRITE context with ``wrote == False`` has no row intents,
+    WAL records, physical images or write partitions. Its closed read-only
+    preflight can use the same bounded snapshot batches; eligibility is tested
+    again for each statement, never carried into subsequent staged work.
+    """
+    manager = engine._indexes
+    if (
+        type(context.txn) is not TransactionContext
+        or (
+            context.txn.mode is not TransactionMode.READ
+            and (context.txn.mode is not TransactionMode.WRITE or context.txn.wrote)
+        )
+        or engine._max_intermediate_rows is not None
+        or engine._max_traversal_expansions is not None
+        or engine._max_traversal_paths is not None
+        or engine._query_memory_budget_bytes is not None
+        or node.min_hops != 1 or node.max_hops != 1 or node.target_bound
+        or node.path_variable is not None or node.target_table is None
+        or node.direction is Direction.UNDIRECTED
+        or getattr(getattr(manager, "validated_identity_landings", None), "__func__", None)
+        is not _BATCH_LANDING_CANONICAL_SCALAR
+        or getattr(getattr(manager, "validated_identity_landings_many", None), "__func__", None)
+        is not _BATCH_LANDING_CANONICAL_MANY
+        or getattr(manager._validated_items, "__func__", None)
+        is not _SCALAR_PK_CANONICAL_VALIDATED_ITEMS
+    ):
+        return False
+    consumer = context.result_node
+    blocking = False
+    while consumer is not node:
+        kind = type(consumer)
+        if kind in (AggregateRows, SortRows):
+            blocking = True
+        elif kind in (LimitRows, SkipRows):
+            if blocking:
+                return False
+        elif kind not in (ProjectRows, FilterRows, DistinctRows):
+            return False
+        consumer = consumer.child
+    return blocking
+
+
+def _batched_landing_steps(
+    engine: QueryEngine, context: _Context,
+    steps: Iterator[tuple[object, HeapVersion, TableDef, object]],
+    view_at: Callable[[TableDef], _OwnerLandingView],
+) -> Iterator[tuple[object, HeapVersion, TableDef, object, bool,
+                    tuple[RecordRef, HeapVersion] | None]]:
+    """Resolve at most 64 detached steps, then emit them in their original order.
+
+    New witnesses are proved in one stable view before any row of the batch is
+    available to the blocking consumer. Repeated destinations use the same
+    transaction-local, bounded payload memo as scalar landings.
+    """
+    try:
+        first = next(steps)
+    except StopIteration:
+        return
+    # A missing source/edge must not inspect the destination index eagerly.
+    index = _endpoint_identity_index(engine, context, first[2])
+    if index is None:
+        yield *first, False, None
+        for candidate in steps:
+            yield *candidate, False, None
+        return
+    view = view_at(first[2])
+    if (
+        type(view) is not _OwnerLandingView
+        or getattr(view.get, "__func__", None) is not _BATCH_LANDING_CANONICAL_GET
+    ):
+        yield *first, False, None
+        for candidate in steps:
+            yield *candidate, False, None
+        return
+    frontier = [first]
+    while True:
+        for _ in range(64 - len(frontier)):
+            try:
+                frontier.append(next(steps))
+            except StopIteration:
+                break
+        if not frontier:
+            return
+        landings = view.landings_many(
+            tuple(item[3] for item in frontier), context, index,
+        )
+        for (ref, edge, table, identity), landing in zip(frontier, landings):
+            yield ref, edge, table, identity, True, landing
+        frontier = []
+        landings = ()
+
+
 def _traverse(
     engine: QueryEngine, node: TraverseRelationship, context: _Context
 ) -> Iterator[_Row]:
@@ -5772,14 +6802,30 @@ def _traverse(
     landing_views: dict[int, _OwnerLandingView] = {}
 
     ended = _ended_by_this_transaction(context)
+    vector_free = (
+        id(node) in context.vector_free_landings
+        and type(engine.heap) is HeapStore
+        and type(engine._indexes) is IndexManager
+        and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
+        and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
+        and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
+    )
+    batch_landings = vector_free and _admits_batched_landings(engine, node, context)
 
-    def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
-        """Return one owner-visible node through a single lazy view per landing table."""
+    def view_at(table: TableDef) -> _OwnerLandingView:
         view = landing_views.get(table.table_id)
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity, context)
+        return view
+
+    def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
+        """Return one owner-visible node through a single lazy view per landing table."""
+        view = view_at(table)
+        return (
+            view.get(identity, context, materialize_vectors=False)
+            if vector_free else view.get(identity, context)
+        )
 
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
@@ -5817,12 +6863,20 @@ def _traverse(
             reached: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = []
             for record_id, _table, path in frontier:
                 taken = {edge.ref for edge in path}
-                for ref, version, next_table, next_id in steps(record_id):
+                candidates = steps(record_id)
+                resolved = (
+                    _batched_landing_steps(engine, context, iter(candidates), view_at)
+                    if batch_landings else
+                    ((*candidate, False, None) for candidate in candidates)
+                )
+                for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
                     if charge_expansions:
                         context.admit_traversal_expansion()
                     if ref in taken:
                         continue
-                    if (
+                    if prevalidated:
+                        landing = batch_landing
+                    elif (
                         isinstance(bound_target, RowBinding)
                         and _overlay_identity(bound_target) == next_id
                         and bound_target.table.table_id == next_table.table_id
@@ -5911,8 +6965,19 @@ def _traverse_any(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity, context)
+        return (
+            view.get(identity, context, materialize_vectors=False)
+            if vector_free else view.get(identity, context)
+        )
 
+    vector_free = (
+        id(node) in context.vector_free_landings
+        and type(engine.heap) is HeapStore
+        and type(engine._indexes) is IndexManager
+        and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
+        and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
+        and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
+    )
     walkers = []
     for table in node.tables:
         changes: Mapping[object, tuple[Value, ...] | None] = {}
@@ -5928,8 +6993,10 @@ def _traverse_any(
                     table,
                     catalog.table(table.from_table),
                     catalog.table(table.to_table),
-                    True,
-                    False,
+                    node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
+                    and (node.source_table is None or table.from_table == node.source_table),
+                    node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
+                    and (node.source_table is None or table.to_table == node.source_table),
                     ended,
                     changes,
                     pending,
@@ -5947,10 +7014,13 @@ def _traverse_any(
                 value=node.source,
             )
         identity = _overlay_identity(start)
+        matched = False
         for table, steps in walkers:
             for ref, version, next_table, next_id in steps(identity):
                 if charge_expansions:
                     context.admit_traversal_expansion()
+                if node.target_table is not None and next_table.name != node.target_table:
+                    continue
                 landing = node_at(next_table, next_id)
                 if landing is None:
                     continue
@@ -5963,17 +7033,28 @@ def _traverse_any(
                     table=next_table,
                     ref=landing_ref,
                     version=landing_version,
+                    polymorphic=node.optional and node.target_table is None,
                 )
                 bindings[node.relationship] = RowBinding(
                     variable=node.relationship,
                     table=table,
                     ref=ref,
                     version=version,
+                    polymorphic=node.relationship_polymorphic,
                 )
                 context.count("rows_scanned")
-                yield _Row(
+                candidate = _Row(
                     bindings=bindings, computed=row.computed, columns=row.columns
                 )
+                if node.predicate is not None and not _predicate_admits(node.predicate, candidate, context):
+                    continue
+                matched = True
+                yield candidate
+        if node.optional and not matched:
+            bindings = dict(row.bindings)
+            bindings[node.target] = None
+            bindings[node.relationship] = None
+            yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
 
 def _relationship_scan(
@@ -5998,6 +7079,14 @@ def _relationship_scan(
         changed, pending = _owner_edges(context, relationship)
     ended = _ended_by_this_transaction(context)
     landing_views: dict[int, _OwnerLandingView] = {}
+    vector_free = (
+        id(node) in context.vector_free_landings
+        and type(engine.heap) is HeapStore
+        and type(engine._indexes) is IndexManager
+        and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
+        and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
+        and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
+    )
 
     def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
         """Resolve one endpoint against the transaction-private landing view."""
@@ -6005,7 +7094,10 @@ def _relationship_scan(
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
-        return view.get(identity, context)
+        return (
+            view.get(identity, context, materialize_vectors=False)
+            if vector_free else view.get(identity, context)
+        )
 
     def judged(version: HeapVersion, ref: object) -> RowBinding | None:
         """Return the edge binding when the predicate keeps this edge, refusing non-booleans."""
@@ -6116,6 +7208,589 @@ def _relationship_scan(
             yield _Row(bindings=bindings)
 
 
+def _primary_key_resolution_charge(
+    table: TableDef,
+    key: bytes,
+    group: tuple[tuple[RecordRef, HeapVersion], ...],
+) -> int | None:
+    """Conservatively meter one retained exact-key answer without affecting its semantics."""
+    charge = _PRIMARY_KEY_RESOLUTION_ENTRY_BYTES + len(key) * 2
+    if not group:
+        miss = _owner_landing_result_bytes(table, None)
+        return None if miss is None else charge + miss
+    for found in group:
+        retained = _owner_landing_result_bytes(table, found)
+        if retained is None:
+            return None
+        charge += retained
+    return charge
+
+
+def _discard_primary_key_resolution_state(
+    engine: QueryEngine,
+    memo: _PrimaryKeyTxnMemo,
+    identity: tuple[object, ...],
+    state: _PrimaryKeyResolutionCache,
+) -> None:
+    """Remove one exact cache and release its complete shared-budget reservation."""
+    if memo.resolutions.get(identity) is state:
+        memo.resolutions.pop(identity)
+    count = len(state.entries)
+    if count:
+        engine._owner_budget.release(bytes_=state.used_bytes, entries=count)
+        memo.resolution_entries -= count
+    state.entries.clear()
+    state.used_bytes = 0
+
+
+def _discard_primary_key_resolution_caches(
+    engine: QueryEngine, memo: _PrimaryKeyTxnMemo
+) -> None:
+    """Release all transaction-owned exact-key results; caller holds the endpoint guard."""
+    for identity, state in tuple(memo.resolutions.items()):
+        _discard_primary_key_resolution_state(engine, memo, identity, state)
+    memo.resolution_entries = 0
+
+
+def _evict_primary_key_resolution_lru(
+    engine: QueryEngine,
+    memo: _PrimaryKeyTxnMemo,
+    state: _PrimaryKeyResolutionCache,
+) -> bool:
+    """Evict this store's oldest answer, returning whether one existed."""
+    if not state.entries:
+        return False
+    _key, (_group, charge) = state.entries.popitem(last=False)
+    state.used_bytes -= charge
+    memo.resolution_entries -= 1
+    engine._owner_budget.release(bytes_=charge, entries=1)
+    return True
+
+
+def _admit_primary_key_resolution(
+    engine: QueryEngine,
+    memo: _PrimaryKeyTxnMemo,
+    state: _PrimaryKeyResolutionCache,
+    key: bytes,
+    group: tuple[tuple[RecordRef, HeapVersion], ...],
+    charge: int,
+) -> bool:
+    """Reserve before retaining, evicting only this exact store's own LRU results."""
+    while True:
+        if memo.resolution_entries >= _PRIMARY_KEY_RESOLUTION_MAX_ENTRIES:
+            if not _evict_primary_key_resolution_lru(engine, memo, state):
+                return False
+            continue
+        try:
+            engine._owner_budget.reserve(bytes_=charge, entries=1)
+        except _OwnerLandingCapacity:
+            if not _evict_primary_key_resolution_lru(engine, memo, state):
+                return False
+        else:
+            try:
+                state.entries[key] = (group, charge)
+            except BaseException:
+                engine._owner_budget.release(bytes_=charge, entries=1)
+                raise
+            state.used_bytes += charge
+            memo.resolution_entries += 1
+            return True
+
+
+def _memoized_primary_key_groups(
+    engine: QueryEngine,
+    context: _Context,
+    manager: object,
+    store: object,
+    keys: tuple[bytes, ...],
+    table: TableDef,
+    position: int,
+    canonical_many: Callable[..., object],
+) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+    """Reuse exact PK answers only under all transaction, registry and storage fences.
+
+    Custom managers and monkey-patched implementations keep the canonical multi-key door.  A
+    native cache hit still opens a fresh page-0 certificate and companion heap view; only the
+    already-proved bucket traversal and heap payload decode are skipped.  Any generation change
+    revalidates the complete request inside IndexManager, while a local heap/registry transition
+    during a cached read triggers one uncached read before the answer is returned.
+    """
+    reuse_many = getattr(manager, "validated_versions_many_reusing", None)
+    if (
+        type(manager) is not IndexManager
+        or not callable(reuse_many)
+        or getattr(reuse_many, "__func__", None)
+        is not _NATIVE_VALIDATED_VERSIONS_MANY_REUSING
+        or getattr(canonical_many, "__func__", None)
+        is not _NATIVE_VALIDATED_VERSIONS_MANY
+    ):
+        return tuple(canonical_many(store, keys, context.snapshot))
+
+    revision = getattr(manager, "_registry_revision", None)
+    if type(revision) is not int:
+        return tuple(canonical_many(store, keys, context.snapshot))
+    identified = _revisioned_txn_memo(engine, context.txn)
+    if identified is None:
+        return tuple(canonical_many(store, keys, context.snapshot))
+    txn_id, memo = identified
+    snapshot = context.snapshot
+    heap_epoch = engine.heap._derived_read_epoch()
+    identity = _primary_key_table_identity(table, position)
+    observed: _PrimaryKeyResolutionCache | None = None
+    generation: object | None = None
+    cached: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
+    with engine._endpoint_guard:
+        if engine._primary_key_memos.get(txn_id) is memo:
+            candidate = memo.resolutions.get(identity)
+            if candidate is not None and (
+                candidate.store is not store
+                or candidate.snapshot is not snapshot
+                or candidate.registry_revision != revision
+                or candidate.heap_epoch != heap_epoch
+            ):
+                _discard_primary_key_resolution_state(
+                    engine, memo, identity, candidate
+                )
+                candidate = None
+            if candidate is not None:
+                observed = candidate
+                generation = candidate.generation
+                cached = {
+                    key: candidate.entries[key][0]
+                    for key in dict.fromkeys(keys)
+                    if key in candidate.entries
+                }
+
+    next_generation, reused, raw_groups = reuse_many(
+        store,
+        keys,
+        snapshot,
+        generation=generation,
+        cached=cached,
+    )
+    groups = tuple(raw_groups)
+    after_revision = getattr(manager, "_registry_revision", None)
+    after_epoch = engine.heap._derived_read_epoch()
+    publish_revision = revision
+    publish_epoch = heap_epoch
+    publishable = after_revision == revision and after_epoch == heap_epoch
+    if reused and not publishable:
+        # The cached values were correctly bracketed by their index certificate, but a local
+        # heap/registry fence moved while the statement was in flight.  Re-read every key rather
+        # than asking callers to reason about which unrelated epoch transition occurred.
+        publish_revision = after_revision
+        publish_epoch = after_epoch
+        next_generation, reused, raw_groups = reuse_many(
+            store,
+            keys,
+            snapshot,
+            generation=None,
+            cached={},
+        )
+        groups = tuple(raw_groups)
+        publishable = (
+            type(publish_revision) is int
+            and getattr(manager, "_registry_revision", None) == publish_revision
+            and engine.heap._derived_read_epoch() == publish_epoch
+        )
+
+    if not publishable or type(publish_revision) is not int:
+        return groups
+
+    # Preserve the caller's established structured refusal for a hostile implementation that
+    # violates the aligned-batch contract; it validates the length immediately after return.
+    if len(groups) != len(keys):
+        return groups
+    unique_groups = dict(zip(keys, groups, strict=True))
+    with engine._endpoint_guard:
+        if engine._primary_key_memos.get(txn_id) is not memo:
+            return groups
+        current = memo.resolutions.get(identity)
+        if current is not observed:
+            # A concurrent resolver or settlement replaced the exact state observed above.  This
+            # answer remains valid under its own certificate, but must not overwrite the newer
+            # cache authority.
+            return groups
+        if current is None:
+            current = _PrimaryKeyResolutionCache(
+                store=store,
+                snapshot=snapshot,
+                registry_revision=publish_revision,
+                heap_epoch=publish_epoch,
+                generation=next_generation,
+            )
+            memo.resolutions[identity] = current
+        elif not reused or current.generation != next_generation:
+            _discard_primary_key_resolution_state(engine, memo, identity, current)
+            current = _PrimaryKeyResolutionCache(
+                store=store,
+                snapshot=snapshot,
+                registry_revision=publish_revision,
+                heap_epoch=publish_epoch,
+                generation=next_generation,
+            )
+            memo.resolutions[identity] = current
+        else:
+            current.registry_revision = publish_revision
+            current.heap_epoch = publish_epoch
+
+        for key, group in unique_groups.items():
+            if key in current.entries:
+                current.entries.move_to_end(key)
+                continue
+            charge = _primary_key_resolution_charge(table, key, group)
+            if charge is not None:
+                _admit_primary_key_resolution(
+                    engine, memo, current, key, group, charge
+                )
+        if not current.entries:
+            memo.resolutions.pop(identity, None)
+    return groups
+
+
+def _node_multi_key_seek(
+    engine: QueryEngine, node: NodeMultiKeySeek, context: _Context
+) -> Iterator[_Row]:
+    """Read a closed primary-key list of one node table through its exact multi-key index.
+
+    NODE-IN-SEEK.  Capability selection happens before the first lookup: a missing/stale store,
+    an engine without the multi-key door, a table this transaction has written, a probe that is
+    not a list or a probe the durable key cannot represent completely all execute the retained
+    canonical scan, which sits under the very same predicate as this operator, so the scan
+    judges, refuses and counts exactly what it judged before.  The durable allocation frontier
+    then selects the scan for a small table before any index certificate is opened, by the
+    rule the incident seek measured: every probe is a validated bucket read and a landing,
+    every scanned row one decode, so a table whose ids ever allocated are at most half the
+    distinct probes is cheaper to walk (measured on a 182-row table: 40 probes seek in 21-28 ms
+    against a 33-69 ms scan, 500 probes seek in 103-181 ms against a 63-105 ms scan).  Every
+    later refusal propagates: falling back after a partial certified read could hide a
+    generation replacement or a corrupt heap candidate.  Hits are validated against the heap
+    under the snapshot and yielded in heap order, the order the scan yields them, so LIMIT and
+    every operator above observe the same sequence either way.
+    """
+
+    manager = engine._indexes
+    many = getattr(manager, "validated_versions_many", None)
+    authority = context.index_authority
+    if manager is None or not callable(many) or authority is None:
+        yield from engine._rows(node.fallback, context)
+        return
+
+    position = node.key_position
+    store = authority.named(node.index)
+    definition = getattr(store, "definition", None)
+    if (
+        store is None
+        or not isinstance(definition, IndexDefinition)
+        or definition.name != node.index
+        or definition.table_id != node.table.table_id
+        or definition.table_name != node.table.name
+        or definition.positions != (position,)
+        or definition.key_derivation != COLUMN_KEY_DERIVATION
+        or definition.visibility is not IndexVisibility.EXACT
+        or getattr(store, "stale", True) is not False
+    ):
+        yield from engine._rows(node.fallback, context)
+        return
+
+    if node.table.table_id in _intent_table_ids(engine, context.txn):
+        # An exact index describes only durable heap versions: the owner's pending rows and
+        # pending keys are visible only to the scan's logical overlay.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    raw = _evaluate(node.keys, _Row(bindings={}), context)
+    if raw is None:
+        # ``x IN NULL`` is UNKNOWN for every row, exactly as the incident seek treats it.
+        return
+    if type(raw) not in (list, tuple):
+        # Preserve the canonical IN refusal (and custom Sequence behaviour) in the fallback.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    # Freeze a caller-owned list before encoding so one execution never observes a moving
+    # parameter frontier while it is opening durable index certificates.
+    values = tuple(raw)
+
+    # next_record_id is the durable O(1) upper bound strictly beyond every identity ever
+    # allocated for this table; deletions can only overestimate its live cardinality, which
+    # conservatively favours the seek.  A table without an extent never allocated a page and
+    # holds no stored row (its pending rows were excluded above), so it answers empty without
+    # a scan or a certificate; a table whose pages exist keeps the canonical scan, which walks
+    # and validates that physical chain.  The comparison uses integers so the boundary is
+    # exact and deterministic on every platform.
+    extent = engine.heap.extent_of(node.table)
+    allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
+
+    def small_table() -> Iterator[_Row]:
+        if extent is not None:
+            yield from engine._rows(node.fallback, context)
+
+    # KGRUN-M3: exact ASCII strings count their distinct keys without encoding; any other
+    # probe shape takes the encoding route below, which remains the single oracle.
+    exact_frontier = _string_probe_frontier(node.table, position, values)
+    if exact_frontier is not None and allocated_upper * 2 <= exact_frontier:
+        yield from small_table()
+        return
+
+    unique: dict[bytes, Value] = {}
+    for value in values:
+        if value is None:
+            continue
+        if not _exact_probe_is_encoding_complete(node.table, (position,), (value,)):
+            yield from engine._rows(node.fallback, context)
+            return
+        template: list[Value] = [None] * node.table.arity
+        template[position] = cast(Value, value)
+        try:
+            key = index_key(template, (position,))
+        except (GrafxIndexError, SchemaMismatchError):
+            # The encoder refuses only the probe's own shape (a lone surrogate, a form the key
+            # cannot carry); the scan compares that probe by value and raises nothing, so the
+            # scan keeps the answer.  No certificate has been opened yet.
+            yield from engine._rows(node.fallback, context)
+            return
+        unique.setdefault(key, cast(Value, value))
+
+    if allocated_upper * 2 <= len(unique):
+        yield from small_table()
+        return
+
+    keys = tuple(unique)
+    groups = _memoized_primary_key_groups(
+        engine, context, manager, store, keys, node.table, position, many
+    )
+    if len(groups) != len(keys):
+        raise GrafxIndexError(
+            f"Multi-key validation for index {node.index!r} returned {len(groups)} result "
+            f"groups for {len(keys)} keys.",
+            field="index_batch",
+            index=node.index,
+            expected=len(keys),
+            observed=len(groups),
+        )
+    resolved: dict[RecordId, tuple[object, HeapVersion]] = {}
+    for (_key, value), hits in zip(unique.items(), groups, strict=True):
+        for ref, version in hits:
+            if not _equal(version.values[position], value):
+                continue
+            previous = resolved.setdefault(version.record_id, (ref, version))
+            if previous[0] != ref:
+                raise GrafxCorruptionDetected(
+                    f"Primary-key index {node.index!r} resolved one snapshot-visible key to "
+                    f"multiple rows of {node.table.name!r}.",
+                    table=node.table.name,
+                    table_id=node.table.table_id,
+                    field="primary_key",
+                    index=node.index,
+                )
+    ordered = sorted(
+        resolved.values(), key=lambda item: cast(RecordRef, item[0]).encode()
+    )
+    for ref, version in ordered:
+        context.count("rows_seeked")
+        yield _Row(
+            bindings={
+                node.variable: RowBinding(
+                    variable=node.variable,
+                    table=node.table,
+                    ref=ref,
+                    version=version,
+                )
+            }
+        )
+
+
+@dataclass(slots=True)
+class _OrderedMergeCandidate:
+    """One current table head ordered best-first for Python's minimum heap."""
+
+    key: bytes
+    ordinal: int
+    ref: RecordRef
+    version: HeapVersion
+
+    def __lt__(self, other: _OrderedMergeCandidate) -> bool:
+        """Expose larger ordered keys first and retain catalog table order for exact ties."""
+        if self.key != other.key:
+            return self.key > other.key
+        if self.ordinal != other.ordinal:
+            return self.ordinal < other.ordinal
+        return self.ref.encode() < other.ref.encode()
+
+
+def _ordered_node_merge(
+    engine: QueryEngine, node: OrderedNodeMerge, context: _Context
+) -> Iterator[_Row]:
+    """Merge the certified descending head of each node table in ``O(K log T)``.
+
+    Every capability and bound is validated before the first ordered iterator is advanced. A
+    failure there retains the complete canonical scan. Once a certificate has been opened no
+    fallback is legal: all selected rows remain private until every iterator has closed under
+    the same certificate, and drift, corruption or an incomplete generation propagates.
+    """
+
+    authority = context.index_authority
+    if authority is None or type(engine.heap) is not HeapStore:
+        yield from engine._rows(node.fallback, context)
+        return
+    if len(node.tables) != len(node.indexes):
+        yield from engine._rows(node.fallback, context)
+        return
+    if {table.table_id for table in node.tables} & _intent_table_ids(
+        engine, context.txn
+    ):
+        # Ordered artifacts describe durable heap versions only. The owner-visible overlay is
+        # implemented by the fallback scan and must remain the single authority for dirty rows.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    stores: list[object] = []
+    definitions: list[IndexDefinition] = []
+    for table, name in zip(node.tables, node.indexes, strict=True):
+        store = authority.named(name)
+        definition = getattr(store, "definition", None)
+        timestamp_position = table.column_positions.get(node.timestamp_column)
+        string_position = table.column_positions.get(node.string_column)
+        if (
+            store is None
+            or not isinstance(definition, IndexDefinition)
+            or timestamp_position is None
+            or string_position is None
+            or definition.name != name
+            or definition.table_id != table.table_id
+            or definition.table_name != table.name
+            or definition.positions != (timestamp_position, string_position)
+            or definition.layout is not IndexLayout.ORDERED
+            or definition.key_derivation != ORDERED_KEY_DERIVATION
+            or definition.visibility is not IndexVisibility.EXACT
+            or getattr(store, "stale", True) is not False
+            or not callable(getattr(store, "iter_visible_desc", None))
+        ):
+            yield from engine._rows(node.fallback, context)
+            return
+        stores.append(store)
+        definitions.append(definition)
+
+    wanted = _window(node.limit, context, "LIMIT")
+    if wanted == 0:
+        # The canonical path is the authority for eager expression validation at a zero window.
+        yield from engine._rows(node.fallback, context)
+        return
+
+    upper_keys: list[bytes | None] = [None] * len(stores)
+    if node.upper_timestamp is not None and node.upper_string is not None:
+        empty = _Row(bindings={})
+        upper_timestamp = _evaluate(node.upper_timestamp, empty, context)
+        upper_string = _evaluate(node.upper_string, empty, context)
+        if not isinstance(upper_timestamp, Timestamp) or type(upper_string) is not str:
+            yield from engine._rows(node.fallback, context)
+            return
+        for ordinal, (table, definition) in enumerate(
+            zip(node.tables, definitions, strict=True)
+        ):
+            values: list[Value] = [None] * table.arity
+            values[table.column_index(node.timestamp_column)] = upper_timestamp
+            values[table.column_index(node.string_column)] = upper_string
+            try:
+                upper_keys[ordinal] = definition.key_for(values)
+            except (GrafxIndexError, SchemaMismatchError):
+                yield from engine._rows(node.fallback, context)
+                return
+
+    admits = (
+        None
+        if node.predicate is None
+        else _predicate_admitter(node.predicate, context)
+    )
+    iterators: list[Iterator[tuple[bytes, RecordRef, HeapVersion]]] = []
+    selected: list[_Row] = []
+    failure: BaseException | None = None
+
+    def next_admitted(ordinal: int) -> _OrderedMergeCandidate | None:
+        iterator = iterators[ordinal]
+        table = node.tables[ordinal]
+        for key, ref, version in iterator:
+            row = _Row(
+                bindings={
+                    node.variable: RowBinding(
+                        variable=node.variable,
+                        table=table,
+                        ref=ref,
+                        version=version,
+                        polymorphic=True,
+                    )
+                }
+            )
+            context.count("ordered_candidates_examined")
+            context.count("rows_scanned")
+            if admits is None or admits(row):
+                return _OrderedMergeCandidate(key, ordinal, ref, version)
+        return None
+
+    try:
+        for table, store, upper_key in zip(
+            node.tables, stores, upper_keys, strict=True
+        ):
+            iterator = store.iter_visible_desc(  # type: ignore[attr-defined]
+                engine.heap,
+                table,
+                context.snapshot,
+                upper_key=upper_key,
+            )
+            iterators.append(iter(iterator))
+
+        queue: list[_OrderedMergeCandidate] = []
+        for ordinal in range(len(iterators)):
+            candidate = next_admitted(ordinal)
+            if candidate is not None:
+                heappush(queue, candidate)
+
+        while queue and len(selected) < wanted:
+            candidate = heappop(queue)
+            table = node.tables[candidate.ordinal]
+            selected.append(
+                _Row(
+                    bindings={
+                        node.variable: RowBinding(
+                            variable=node.variable,
+                            table=table,
+                            ref=candidate.ref,
+                            version=candidate.version,
+                            polymorphic=True,
+                        )
+                    }
+                )
+            )
+            if len(selected) == wanted:
+                break
+            following = next_admitted(candidate.ordinal)
+            if following is not None:
+                heappush(queue, following)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        cleanup_failure: BaseException | None = failure
+        for iterator in iterators:
+            try:
+                _close_iterator(iterator)
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        "An ordered table iterator also failed to close with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
+
+    context.count("ordered_merge_tables", len(stores))
+    context.count("ordered_merge_rows", len(selected))
+    yield from selected
+
+
 def _relationship_incident_seek(
     engine: QueryEngine, node: RelationshipIncidentSeek, context: _Context
 ) -> Iterator[_Row]:
@@ -6185,21 +7860,25 @@ def _relationship_incident_seek(
 
     empty = _Row(bindings={})
 
-    def encoded_keys(
-        expression: Expression,
-        table: TableDef,
-        position: int,
-    ) -> tuple[tuple[bytes, Value], ...] | None:
+    def probe_values(expression: Expression) -> tuple[object, ...] | None:
+        """Evaluate one probe list exactly once; None keeps the canonical fallback."""
         raw = _evaluate(expression, empty, context)
         if raw is None:
             return ()
         if type(raw) not in (list, tuple):
             # Preserve the canonical IN refusal (and custom Sequence behaviour) in the fallback.
             return None
-        unique: dict[bytes, Value] = {}
         # Freeze a caller-owned list before encoding so one execution never observes a moving
         # parameter frontier while it is opening durable index certificates.
-        for value in tuple(raw):
+        return tuple(raw)
+
+    def encoded_keys(
+        values: tuple[object, ...],
+        table: TableDef,
+        position: int,
+    ) -> tuple[tuple[bytes, Value], ...] | None:
+        unique: dict[bytes, Value] = {}
+        for value in values:
             if value is None:
                 continue
             if not _exact_probe_is_encoding_complete(table, (position,), (value,)):
@@ -6210,9 +7889,9 @@ def _relationship_incident_seek(
             unique.setdefault(key, cast(Value, value))
         return tuple(unique.items())
 
-    from_keys = encoded_keys(node.from_keys, node.from_table, node.from_key_position)
-    to_keys = encoded_keys(node.to_keys, node.to_table, node.to_key_position)
-    if from_keys is None or to_keys is None:
+    from_values = probe_values(node.from_keys)
+    to_values = probe_values(node.to_keys)
+    if from_values is None or to_values is None:
         yield from engine._rows(node.fallback, context)
         return
 
@@ -6225,12 +7904,61 @@ def _relationship_incident_seek(
     # integer arithmetic so the boundary is exact and deterministic on every platform.  This
     # decision happens before validated_versions_many opens the first durable index certificate.
     extent = engine.heap.extent_of(node.table)
-    allocated_upper = (
-        0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
+    allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
+
+    def proved_empty() -> bool:
+        """Answer the union of a table that has no page at all without reading anything.
+
+        BATCH-REL-1.  A table without an extent never allocated a page, so it holds no stored
+        relationship; the pending ones of this transaction were excluded above (a dirty table
+        keeps the canonical plan).  The proof is exclusively the missing extent: a table whose
+        pages exist while ``next_record_id`` still sits at the first id keeps the canonical
+        scan, which walks and validates that physical chain and may reveal its corruption.
+
+        The scan the former rule chose for a pageless table cost 8-19 ms a layout on the
+        production board (its fixed setup: the probe memo, the operator chain) against
+        0.6-1.5 ms for the seek, and about forty of its sixty-six layouts are pageless: the old
+        selector answered the fan-out in 1.27-1.47 s where every seek took 0.77-0.89 s and the
+        per-layout oracle 0.69-0.72 s.  Answering empty here opens no index and reads no page,
+        so nothing becomes observable that the scan of nothing left unobserved, and every
+        refusal that precedes this point still fires: in the exact-ASCII branch nothing was
+        encoded and nothing needs to be; any other probe shape does not enter that branch, so
+        the encoder runs first and an unencodable string or a mixed frontier is refused exactly
+        as before.  The edge-first branch is what answered, so its statistic is kept.
+        """
+        if extent is not None:
+            return False
+        context.count("edge_scans")
+        return True
+    # KGRUN-M3: the edge-first scan is chosen BEFORE up to 2 x 500 probes are encoded, when the
+    # distinct frontier is known exactly without encoding.  A STRING key column encodes an exact
+    # ``str`` probe injectively (tag, length, UTF-8 bytes), so distinct strings are distinct keys
+    # and equal strings share one key: the count below is the count the encoding route would
+    # produce, and the branch chosen is therefore the same.  Every other probe shape (subclass,
+    # numeric, mixed) keeps the encoding route, which remains the single oracle for refusals and
+    # cross-representation probes; the scan branch never reads a key it did not encode.
+    exact_from = _string_probe_frontier(
+        node.from_table, node.from_key_position, from_values
     )
+    exact_to = _string_probe_frontier(node.to_table, node.to_key_position, to_values)
+    if (
+        exact_from is not None
+        and exact_to is not None
+        and allocated_upper * 2 <= exact_from + exact_to
+    ):
+        if not proved_empty():
+            yield from engine._rows(node.fallback, context)
+        return
+
+    from_keys = encoded_keys(from_values, node.from_table, node.from_key_position)
+    to_keys = encoded_keys(to_values, node.to_table, node.to_key_position)
+    if from_keys is None or to_keys is None:
+        yield from engine._rows(node.fallback, context)
+        return
     probe_frontier = len(from_keys) + len(to_keys)
     if allocated_upper * 2 <= probe_frontier:
-        yield from engine._rows(node.fallback, context)
+        if not proved_empty():
+            yield from engine._rows(node.fallback, context)
         return
 
     def aligned_many(
@@ -6256,7 +7984,25 @@ def _relationship_incident_seek(
         position: int,
     ) -> dict[RecordId, tuple[object, HeapVersion]]:
         keys = tuple(key for key, _value in keyed)
-        groups = aligned_many(store, keys)
+        groups = _memoized_primary_key_groups(
+            engine,
+            context,
+            manager,
+            store,
+            keys,
+            table,
+            position,
+            many,
+        )
+        if len(groups) != len(keys):
+            raise GrafxIndexError(
+                f"Multi-key validation for index {getattr(store, 'name', None)!r} returned "
+                f"{len(groups)} result groups for {len(keys)} keys.",
+                field="index_batch",
+                index=getattr(store, "name", None),
+                expected=len(keys),
+                observed=len(groups),
+            )
         resolved: dict[RecordId, tuple[object, HeapVersion]] = {}
         for (_key, value), hits in zip(keyed, groups, strict=True):
             for ref, version in hits:
@@ -6321,7 +8067,9 @@ def _relationship_incident_seek(
                         field="index_candidate",
                     )
 
-    ordered = sorted(candidates.items(), key=lambda item: cast(RecordRef, item[0]).encode())
+    ordered = sorted(
+        candidates.items(), key=lambda item: cast(RecordRef, item[0]).encode()
+    )
     endpoint_rows: list[tuple[object, HeapVersion, RecordId, RecordId]] = []
     source_ids: set[RecordId] = set()
     target_ids: set[RecordId] = set()
@@ -6348,7 +8096,9 @@ def _relationship_incident_seek(
         """Resolve the opposite landings through one identity-index certificate when present."""
 
         resolved = dict(cached)
-        missing = tuple(record_id for record_id in record_ids if record_id not in resolved)
+        missing = tuple(
+            record_id for record_id in record_ids if record_id not in resolved
+        )
         if not missing:
             return resolved, True
         identity_index = _endpoint_identity_index(engine, context, table)
@@ -6477,24 +8227,372 @@ def _filter_rows(
     error: it is the unknown of the three-valued logic, and the row goes because unknown is not
     true -- which is also why this cannot be written as ``if value``.
     """
+    admits = _predicate_admitter(node.predicate, context)
     for row in engine._rows(node.child, context):
-        if _predicate_admits(node.predicate, row, context):
+        if admits(row):
             yield row
+
+
+_COMPILED_MISS: object = object()
+"""The per-row memo slot value of a shared subexpression not yet reached on this row."""
+
+
+class _CompiledPredicate:
+    """One WHERE predicate compiled to closures over the executor's own leaf functions.
+
+    EXEC-CSE (with KGRUN-M1 inside): the recursive walk of :func:`_evaluate` decides the kind of
+    every node on every row; here each node is resolved once, at compile time, to a closure that
+    calls the very same leaf functions (``_truth``, ``_equal``, ``_ordered``, ``_read_variable``,
+    ``_evaluate_parameter``, ``RowBinding.value``, the coalesce body) in the same order, with
+    the same short-circuit and the same refusals.  Every node kind without a closure of its own
+    (``IN``, text operators, arithmetic, CASE, lists, maps, subscripts, other functions) is a
+    closure that calls :func:`_evaluate` on that subtree, so the canonical walk remains the single
+    oracle there.  ``coalesce`` resolves its name at compile time and shares the executor's
+    selection body.  Structurally identical subtrees (the seven ``coalesce(n.revocation_reason,
+    '')`` of the Pulse page) share one per-row memo slot filled the first time the path reaches
+    it -- never earlier -- which preserves short-circuit and the order of errors.  A row carrying
+    ``computed`` (aggregation) never takes the compiled form: ``_evaluate`` consults that memo at
+    every node and the compiled form consults it at none.
+    """
+
+    __slots__ = ("expression", "function", "slots", "calls")
+
+    def __init__(
+        self,
+        expression: Expression,
+        function: Callable[[_Row, _Context, list[object] | None], object],
+        slots: int,
+        calls: tuple[tuple[int, ValueType | None], ...],
+    ) -> None:
+        self.expression = expression
+        self.function = function
+        self.slots = slots
+        self.calls = calls
+
+    def serves(self, expression: Expression, context: _Context) -> bool:
+        """Say whether this compilation is for this exact expression under this context."""
+        if self.expression is not expression:
+            return False
+        types = context.coalesce_types
+        for call_id, resolved in self.calls:
+            if types.get(call_id) is not resolved:
+                return False
+        return True
+
+
+def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPredicate:
+    """Compile one expression tree to closures; see :class:`_CompiledPredicate`."""
+    keys: dict[int, tuple] = {}
+    counts: dict[tuple, int] = {}
+    calls: list[tuple[int, ValueType | None]] = []
+    coalesce_types = context.coalesce_types
+
+    def key_of(node: Expression) -> tuple:
+        known = keys.get(id(node))
+        if known is not None:
+            return known
+        kind = type(node)
+        if kind is Literal:
+            # A closed key, built without calling into the value: exact safe types by value
+            # (a float by its bits, so 0.0 and -0.0 stay apart), anything else by identity, so
+            # two distinct objects never share a slot.
+            value = node.value
+            value_kind = type(value)
+            if (
+                value is None
+                or value_kind is bool
+                or value_kind is int
+                or value_kind is str
+                or value_kind is bytes
+            ):
+                key: tuple = ("L", value_kind.__name__, value)
+            elif value_kind is float:
+                key = ("L", "float", value.hex())
+            else:
+                key = ("L", "id", id(value))
+        elif kind is Parameter:
+            key = ("P", node.name)
+        elif kind is Variable:
+            key = ("V", node.name)
+        elif kind is Property:
+            key = ("R", node.key, key_of(node.subject))
+        elif kind is NullCheck:
+            key = ("N", bool(node.negated), key_of(node.operand))
+        elif kind is UnaryOperation:
+            key = ("U", node.operator, key_of(node.operand))
+        elif kind is BinaryOperation:
+            key = ("B", node.operator, key_of(node.left), key_of(node.right))
+        elif kind is FunctionCall:
+            # Two calls share a slot only when the planner resolved the same result type for
+            # both; the type is part of the key and is re-checked on every reuse (serves()).
+            resolved = coalesce_types.get(id(node))
+            calls.append((id(node), resolved))
+            key = (
+                "F",
+                node.name.upper(),
+                bool(node.distinct),
+                bool(node.star),
+                tuple(key_of(argument) for argument in node.arguments),
+                tuple(
+                    (argument.name, key_of(argument.value))
+                    for argument in node.named_arguments
+                ),
+                resolved,
+            )
+        else:
+            # Anything else runs through the canonical walk as a whole and is never shared, so
+            # nothing below it is keyed or even visited here.
+            key = ("X", id(node))
+        keys[id(node)] = key
+        counts[key] = counts.get(key, 0) + 1
+        return key
+
+    key_of(expression)
+    slot_of: dict[tuple, int] = {}
+    fallbacks = 0
+    instrumented: dict[int, bool] = {}
+
+    def shared(
+        node: Expression, function: Callable[..., object]
+    ) -> Callable[..., object]:
+        kind = type(node)
+        if kind is Literal or kind is Parameter or kind is Variable:
+            return function
+        key = keys[id(node)]
+        # A subtree that reaches the canonical walk anywhere is never memoized: the walk does
+        # not count the mapping reads it performs, so a repeated fallback could turn two
+        # observable reads into one.
+        if counts.get(key, 0) < 2 or not instrumented[id(node)]:
+            return function
+        slot = slot_of.get(key)
+        if slot is None:
+            slot = slot_of[key] = len(slot_of)
+
+        def memoized(row: _Row, ctx: _Context, memo: list[object]) -> object:
+            value = memo[slot]
+            if value is _COMPILED_MISS:
+                reads_before = memo[-1]
+                value = function(row, ctx, memo)
+                # A subtree that read a property of anything but a matched row (a mapping
+                # parameter, a mapping variable) is never memoized: such a read may be observable
+                # or mutable, and the canonical walk performs it once per occurrence.
+                if memo[-1] == reads_before:
+                    memo[slot] = value
+            return value
+
+        return memoized
+
+    def compile_node(node: Expression) -> Callable[..., object]:
+        fallbacks_before = fallbacks
+        function = compile_kind(node)
+        # Instrumented only when neither this node nor anything compiled below it fell back.
+        instrumented[id(node)] = fallbacks == fallbacks_before
+        return function
+
+    def compile_kind(node: Expression) -> Callable[..., object]:
+        kind = type(node)
+        if kind is Literal:
+            constant = node.value
+
+            def literal(row: _Row, ctx: _Context, memo: object) -> object:
+                return constant
+
+            return literal
+        if kind is Parameter:
+
+            def parameter(row: _Row, ctx: _Context, memo: object) -> object:
+                return _evaluate_parameter(node, row, ctx, None)
+
+            return parameter
+        if kind is Variable:
+
+            def variable(row: _Row, ctx: _Context, memo: object) -> object:
+                return _read_variable(node, row, None)
+
+            return variable
+        if kind is Property:
+            subject = shared(node.subject, compile_node(node.subject))
+            key = node.key
+
+            def prop(row: _Row, ctx: _Context, memo: object) -> object:
+                value = subject(row, ctx, memo)
+                if value is None:
+                    return None
+                if type(value) is RowBinding:
+                    return value.value(key)
+                # A mapping subject or a refusal, decided from the value already obtained (the
+                # subject is never evaluated twice); the read is counted so no memo slot keeps it.
+                if memo is not None:
+                    memo[-1] += 1  # type: ignore[index]
+                return _property_of(value, node)
+
+            return prop
+        if kind is NullCheck:
+            operand = shared(node.operand, compile_node(node.operand))
+            negated = bool(node.negated)
+
+            def null_check(row: _Row, ctx: _Context, memo: object) -> object:
+                value = operand(row, ctx, memo)
+                return (value is not None) if negated else (value is None)
+
+            return null_check
+        if kind is UnaryOperation and node.operator == "NOT":
+            operand = shared(node.operand, compile_node(node.operand))
+
+            def negation(row: _Row, ctx: _Context, memo: object) -> object:
+                truth = _truth(operand(row, ctx, memo))
+                return None if truth is None else (not truth)
+
+            return negation
+        if kind is BinaryOperation:
+            operator = node.operator
+            if operator in ("AND", "OR", "XOR", "=", "<>", "<", "<=", ">", ">="):
+                left = shared(node.left, compile_node(node.left))
+                right = shared(node.right, compile_node(node.right))
+                if operator == "AND":
+
+                    def conjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_truth = _truth(left(row, ctx, memo))
+                        if left_truth is False:
+                            return False
+                        right_truth = _truth(right(row, ctx, memo))
+                        if right_truth is False:
+                            return False
+                        if left_truth is None or right_truth is None:
+                            return None
+                        return left_truth and right_truth
+
+                    return conjunction
+                if operator == "OR":
+
+                    def disjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_truth = _truth(left(row, ctx, memo))
+                        if left_truth is True:
+                            return True
+                        right_truth = _truth(right(row, ctx, memo))
+                        if right_truth is True:
+                            return True
+                        if left_truth is None or right_truth is None:
+                            return None
+                        return left_truth or right_truth
+
+                    return disjunction
+                if operator == "XOR":
+
+                    def exclusive(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_value = left(row, ctx, memo)
+                        right_value = right(row, ctx, memo)
+                        left_truth, right_truth = (
+                            _truth(left_value),
+                            _truth(right_value),
+                        )
+                        if left_truth is None or right_truth is None:
+                            return None
+                        return left_truth != right_truth
+
+                    return exclusive
+                if operator == "=":
+
+                    def equality(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_value = left(row, ctx, memo)
+                        right_value = right(row, ctx, memo)
+                        if left_value is None or right_value is None:
+                            return None
+                        return _equal(left_value, right_value)
+
+                    return equality
+                if operator == "<>":
+
+                    def inequality(row: _Row, ctx: _Context, memo: object) -> object:
+                        left_value = left(row, ctx, memo)
+                        right_value = right(row, ctx, memo)
+                        if left_value is None or right_value is None:
+                            return None
+                        return not _equal(left_value, right_value)
+
+                    return inequality
+
+                def ordering(row: _Row, ctx: _Context, memo: object) -> object:
+                    return _ordered(
+                        operator, left(row, ctx, memo), right(row, ctx, memo)
+                    )
+
+                return ordering
+        if (
+            kind is FunctionCall
+            and node.name.upper() == COALESCE_FUNCTION
+            and not node.named_arguments
+            and not node.distinct
+            and not node.star
+        ):
+            arguments = tuple(
+                shared(argument, compile_node(argument)) for argument in node.arguments
+            )
+
+            def coalesce(row: _Row, ctx: _Context, memo: object) -> object:
+                values = tuple(argument(row, ctx, memo) for argument in arguments)
+                return _coalesce_selected(node, values, ctx)
+
+            return coalesce
+
+        nonlocal fallbacks
+        fallbacks += 1
+
+        def canonical(row: _Row, ctx: _Context, memo: object) -> object:
+            return _evaluate(node, row, ctx)
+
+        return canonical
+
+    function = shared(expression, compile_node(expression))
+    return _CompiledPredicate(expression, function, len(slot_of), tuple(calls))
+
+
+def _predicate_admitter(
+    expression: Expression, context: _Context
+) -> Callable[[_Row], bool]:
+    """Return the exact three-valued WHERE door of one node execution.
+
+    The compiled closures are resolved once per execution (the planner bound every coalesce
+    type before the first row, so nothing they were compiled against changes mid-stream) and
+    applied to each already-bound row; a row carrying an aggregation memo is judged by the
+    canonical walk, which consults that memo at every node.
+    """
+    engine = context.engine
+    compiled: _CompiledPredicate | None = None
+
+    def admits(row: _Row) -> bool:
+        nonlocal compiled
+        if row.computed is None:
+            if compiled is None:
+                # Nothing is compiled, cached or even keyed before the first row that needs it:
+                # a child that yields no row leaves the predicate untouched, as the walk did.
+                compiled = engine._compiled_predicate(expression, context)
+            slots = compiled.slots
+            if slots:
+                memo: list[object] | None = [_COMPILED_MISS] * slots
+                memo.append(0)  # the count of non-row property reads on this row
+            else:
+                memo = None
+            value = compiled.function(row, context, memo)
+        else:
+            value = _evaluate(expression, row, context)
+        if value is None:
+            return False
+        if not isinstance(value, bool):
+            raise GrafxPlanError(
+                "A WHERE predicate is a condition, not a value; "
+                f"{expression.describe()} produced {type(value).__name__}.",
+                field="predicate",
+                value=type(value).__name__,
+            )
+        return value
+
+    return admits
 
 
 def _predicate_admits(expression: Expression, row: _Row, context: _Context) -> bool:
     """Apply the executor's exact three-valued WHERE rule to one already-bound row."""
-    value = _evaluate(expression, row, context)
-    if value is None:
-        return False
-    if not isinstance(value, bool):
-        raise GrafxPlanError(
-            "A WHERE predicate is a condition, not a value; "
-            f"{expression.describe()} produced {type(value).__name__}.",
-            field="predicate",
-            value=type(value).__name__,
-        )
-    return value
+    return _predicate_admitter(expression, context)(row)
 
 
 def _vector_search(
@@ -6828,7 +8926,6 @@ def _filtered_vector_search(
         )
     ):
         return None
-
     # The planned space must be fixed before discovery.  A dynamic expression historically runs
     # only after child materialisation and therefore cannot safely select an index here.
     if type(node.space) is not Literal or node.space.value != node.column_space:
@@ -6858,9 +8955,11 @@ def _filtered_vector_search(
             }
         )
 
+    admits = _predicate_admitter(filtered.predicate, context)
+
     def row_admits(ref: RecordRef, version: HeapVersion) -> bool:
         """Evaluate only the structurally proved, row-local Pulse predicate."""
-        return _predicate_admits(filtered.predicate, row_of(ref, version), context)
+        return admits(row_of(ref, version))
 
     proof = vectors._prepare_filtered_candidates(
         space=node.column_space,
@@ -7240,6 +9339,7 @@ _SPILL_VALUE_MAP = b"OGQM\x01"
 _SPILL_VALUE_PATH = b"OGQH\x01"
 _SPILL_VALUE_BINDING = b"OGQB\x01"
 _SPILL_VALUE_PENDING = b"OGQR\x01"
+_SPILL_VALUE_UNMATERIALIZED = b"OGQU\x01"
 _AGGREGATE_GROUP_OVERHEAD = 64
 _AGGREGATE_SLOT_OVERHEAD = 64
 _AGGREGATE_VALUE_OVERHEAD = 16
@@ -7792,6 +9892,11 @@ class _SpillRowCodec:
         return token
 
     def _detach(self, value: object) -> Value:
+        if _is_unmaterialized_column(value):
+            # A projected binding can cross a blocking operator's temporary spill. Preserve its
+            # closed-plan proof as an engine-private tag; never coerce the sentinel into a public
+            # stored value and never materialise a column the scan deliberately omitted.
+            return (_SPILL_VALUE_UNMATERIALIZED,)
         if isinstance(value, RowBinding):
             reference: Value
             if isinstance(value.ref, PendingRowRef):
@@ -7850,6 +9955,8 @@ class _SpillRowCodec:
             return self._restore_binding(value)
         if tag == _SPILL_VALUE_PENDING:
             return self._restore_pending(value)
+        if tag == _SPILL_VALUE_UNMATERIALIZED and len(value) == 1:
+            return _UNMATERIALIZED_COLUMN
         if tag == _SPILL_VALUE_SCALAR and len(value) == 2:
             kind = value_type_of(value[1])
             if kind not in (ValueType.LIST, ValueType.MAP):
@@ -8183,12 +10290,112 @@ def _compare_sort_spill_keys(left: bytes, right: bytes) -> int:
     return _spill_compare(left_ordinal, right_ordinal)
 
 
+def _batched_relationship_count(
+    engine: QueryEngine, node: AggregateRows, context: _Context,
+) -> int | None:
+    """Count a closed relationship scan with bounded, fully validated endpoints.
+
+    No entity, vector or property escapes this exact COUNT-only shape. The
+    frontier holds at most 64 integer endpoint pairs, not heap payloads or an
+    unbounded table map. Owner writes, hooks and operational row/spill/traversal
+    quotas retain the canonical path and its refusal/admission order.
+    """
+    scan = node.child
+    manager = engine._indexes
+    if (
+        type(scan) is not RelationshipScan or type(scan.child) is not SingleRow
+        or scan.predicate is not None or node.grouping or node.preserve_group_bindings
+        or len(node.aggregations) != 1
+        or type(context.txn) is not TransactionContext
+        or context.txn.mode is not TransactionMode.READ
+        or engine._max_intermediate_rows is not None
+        or engine._max_traversal_expansions is not None
+        or engine._max_traversal_paths is not None
+        or engine._query_memory_budget_bytes is not None
+        or type(engine.heap) is not HeapStore or type(manager) is not IndexManager
+        or getattr(engine.heap.read, "__func__", None) is not _VECTOR_FREE_CANONICAL_READ
+        or getattr(engine.heap._decode_version, "__func__", None) is not _VECTOR_FREE_CANONICAL_DECODE
+        or getattr(manager.validated_versions, "__func__", None) is not _VECTOR_FREE_CANONICAL_VALIDATED
+        or getattr(getattr(manager, "validated_identity_landings", None), "__func__", None)
+        is not _COUNT_CANONICAL_LANDINGS
+        or getattr(getattr(manager, "validated_identity_counts_many", None), "__func__", None)
+        is not _COUNT_CANONICAL_MANY
+    ):
+        return None
+    call = node.aggregations[0].call
+    if (
+        call.name.upper() != "COUNT" or call.distinct or call.named_arguments
+        or not (call.star or (
+            len(call.arguments) == 1 and type(call.arguments[0]) is Variable
+            and call.arguments[0].name == scan.relationship
+        ))
+        or scan.from_variable == scan.to_variable
+        or scan.relationship in (scan.from_variable, scan.to_variable)
+    ):
+        return None
+    from_index = _endpoint_identity_index(engine, context, scan.from_table)
+    to_index = _endpoint_identity_index(engine, context, scan.to_table)
+    if from_index is None or to_index is None:
+        return None
+    ended = _ended_by_this_transaction(context)
+    views = {
+        table.table_id: _owner_landing_view(engine, context, table, ended)
+        for table in (scan.from_table, scan.to_table)
+    }
+
+    def visible(table: TableDef, index: object, identities: Sequence[int]) -> tuple[bool, ...]:
+        counts = views[table.table_id].counts_many(identities, context, index)
+        if len(counts) != len(identities):
+            raise GrafxIndexError(
+                "Identity count validation returned an invalid result group count.",
+                field="index_batch", index=index.name,
+                expected=len(identities), observed=len(counts),
+            )
+        for identity, count in zip(identities, counts):
+            if count > 1:
+                raise GrafxCorruptionDetected(
+                    f"Identity index {index.name!r} resolved record {identity} of "
+                    f"table {table.name!r} to {count} snapshot-visible versions.",
+                    file=index.file, table=table.name, table_id=table.table_id,
+                    record_id=identity, field="record_id", index=index.name, count=count,
+                )
+        return tuple(count == 1 for count in counts)
+
+    def count_frontier(frontier: list[tuple[int, int]]) -> int:
+        from_visible = visible(scan.from_table, from_index, [pair[0] for pair in frontier])
+        # Preserve the scalar short circuit: a missing source never probes its target.
+        targets = [pair[1] for pair, present in zip(frontier, from_visible) if present]
+        return sum(visible(scan.to_table, to_index, targets)) if targets else 0
+
+    context.count("edge_scans")
+    total = 0
+    frontier: list[tuple[int, int]] = []
+    for _ref, version in engine.heap.scan(scan.table, context.snapshot):
+        frontier.append((version.values[0], version.values[1]))
+        if len(frontier) == 64:
+            total += count_frontier(frontier)
+            frontier.clear()
+    if frontier:
+        total += count_frontier(frontier)
+    if total:
+        context.count("rows_scanned", total)
+    return total
+
+
+_COUNT_CANONICAL_LANDINGS = IndexManager.validated_identity_landings
+_COUNT_CANONICAL_MANY = IndexManager.validated_identity_counts_many
+
+
 def _aggregate_rows(
     engine: QueryEngine, node: AggregateRows, context: _Context
 ) -> Iterator[_Row]:
     """Produce one row per group, carrying the grouping keys and the aggregates."""
     if getattr(engine, "_query_memory_budget_bytes", None) is not None:
         yield from _spilled_aggregate_rows(engine, node, context)
+        return
+    count = _batched_relationship_count(engine, node, context)
+    if count is not None:
+        yield _Row(bindings={}, computed={node.aggregations[0].call: count})
         return
     groups: dict[object, tuple[list[object], dict[Expression, _Accumulator]]] = {}
     order: list[object] = []
@@ -8321,10 +10528,15 @@ def _aggregate_input_payload(
     row: _Row,
     context: _Context,
     nan_identities: _NaNIdentityRegistry,
+    group_codec: _SpillRowCodec | None = None,
 ) -> tuple[bytes, bytes, tuple[Value, ...]]:
     """Evaluate and safely encode one aggregate input row before releasing it."""
     raw_keys = tuple(_evaluate(item.expression, row, context) for item in node.grouping)
-    keys = tuple(_spill_detach_value(value) for value in raw_keys)
+    # A grouping key can be a carried entity for a subsequent WITH/traversal.
+    # Public value detachment loses RowBinding identity/capability; use the same
+    # budgeted private codec as other blocking operators, never a heap reread.
+    keys = tuple((group_codec._detach(value) if group_codec is not None
+                  else _spill_detach_value(value)) for value in raw_keys)
     signature = _spill_encode(
         _spill_pack_internal(
             tuple(_freeze(value) for value in raw_keys),
@@ -8359,6 +10571,7 @@ def _aggregate_input_payload(
 
 def _decode_aggregate_input(
     payload: bytes,
+    *, encoded_group_keys: bool = False,
 ) -> tuple[tuple[Value, ...], tuple[Value, ...]]:
     value = _spill_decode(payload, key=False)
     if (
@@ -8373,7 +10586,8 @@ def _decode_aggregate_input(
             field="query_spill.record",
             value="aggregate_input",
         )
-    return tuple(_spill_restore_value(item) for item in value[1]), value[2]
+    keys = value[1] if encoded_group_keys else tuple(_spill_restore_value(item) for item in value[1])
+    return keys, value[2]
 
 
 def _decode_aggregate_entry(
@@ -8652,7 +10866,8 @@ class _SpilledAggregateState:
         accumulator.add_value(value, sort_key=sort_key, apply_distinct=False)
 
 
-def _decode_aggregate_output(payload: bytes, node: AggregateRows) -> _Row:
+def _decode_aggregate_output(payload: bytes, node: AggregateRows,
+                             group_codec: _SpillRowCodec | None = None) -> _Row:
     value = _spill_decode(payload, key=False)
     if (
         not isinstance(value, tuple)
@@ -8680,7 +10895,8 @@ def _decode_aggregate_output(payload: bytes, node: AggregateRows) -> _Row:
             value="aggregate_results",
         )
     computed: dict[Expression, object] = {
-        item.expression: item_value for item, item_value in zip(node.grouping, keys)
+        item.expression: (group_codec._restore(item_value) if group_codec is not None else item_value)
+        for item, item_value in zip(node.grouping, keys)
     }
     computed.update(
         {
@@ -8697,6 +10913,7 @@ def _spilled_aggregate_rows(
     """Group through bounded external passes, retaining only one aggregate state in core."""
     workspace, _budget = engine._spill_workspace(node.label)
     nan_identities = _NaNIdentityRegistry(workspace)
+    group_codec = _SpillRowCodec(context, workspace) if node.preserve_group_bindings else None
     source = workspace.sorter(_compare_group_spill_keys)
     output = workspace.sorter(_compare_ordinal_spill_keys)
     current: _SpilledAggregateState | None = None
@@ -8715,7 +10932,7 @@ def _spilled_aggregate_rows(
                     observed=ordinal,
                 )
             signature, payload, _keys = _aggregate_input_payload(
-                node, row, context, nan_identities
+                node, row, context, nan_identities, group_codec
             )
             source.append(
                 _spill_encode(("group", signature, ordinal), key=True), payload
@@ -8734,7 +10951,7 @@ def _spilled_aggregate_rows(
         current_signature: bytes | None = None
         for key, payload in source_records:
             signature, ordinal = _spill_pair_key(key, kind="group")
-            keys, entries = _decode_aggregate_input(payload)
+            keys, entries = _decode_aggregate_input(payload, encoded_group_keys=group_codec is not None)
             if current_signature != signature:
                 if current is not None:
                     output.append(
@@ -8752,7 +10969,7 @@ def _spilled_aggregate_rows(
 
         output_records = output.records()
         for _key, payload in output_records:
-            yield _decode_aggregate_output(payload, node)
+            yield _decode_aggregate_output(payload, node, group_codec)
     except BaseException as caught:
         failure = caught
         raise
@@ -8780,6 +10997,14 @@ def _spilled_aggregate_rows(
                         "A query spill iterator also failed to close with "
                         f"{type(close_failure).__name__}: {close_failure}"
                     )
+        try:
+            if group_codec is not None:
+                group_codec.close()
+        except BaseException as close_failure:
+            if cleanup_failure is None:
+                cleanup_failure = close_failure
+            else:
+                cleanup_failure.add_note(f"Aggregate group codec cleanup also failed: {close_failure}")
         try:
             nan_identities.close()
         except BaseException as close_failure:
@@ -8998,6 +11223,11 @@ def _sort_rows(
         yield from _spilled_sort_rows(engine, node, context)
         return
     if node.retained_limit is not None:
+        if type(node.child) is ProjectRows:
+            yield from _top_projected_rows(
+                engine, node, node.child, node.retained_limit, context
+            )
+            return
         yield from _top_rows(engine, node, node.retained_limit, context)
         return
     rows = list(engine._rows(node.child, context))
@@ -9214,8 +11444,17 @@ def _top_rows(
         else 0
     )
     retained = skipped + limit
+    yield from _top_rows_from(
+        node, engine._rows(node.child, context), retained, context
+    )
+
+
+def _top_rows_from(
+    node: SortRows, rows: Iterator[_Row], retained: int, context: _Context
+) -> Iterator[_Row]:
+    """Retain the best ``retained`` rows of a stream in the order the query asked for."""
     heap: list[_TopCandidate] = []
-    for position, row in enumerate(engine._rows(node.child, context)):
+    for position, row in enumerate(rows):
         keys = tuple(
             (_sort_key(_sort_value(key, row, context)), key.descending)
             for key in node.keys
@@ -9239,6 +11478,244 @@ def _top_rows(
     # reversing them restores exact query order in O(K log K), within the O(N log K) bound.
     worst_first = [_top_heap_pop(heap).row for _ in range(len(heap))]
     yield from reversed(worst_first)
+
+
+@dataclass(slots=True)
+class _TopProjectedCandidate(_TopCandidate):
+    """A retained row whose projection may still be partial (KGRUN-3).
+
+    ``row`` carries the columns evaluated so far; ``source`` is the row they were projected
+    from, and ``complete`` says whether every item was already evaluated on it.
+    """
+
+    source: _Row
+    complete: bool
+
+
+_MISSING_BINDING = object()
+
+
+class _DeferredProjection:
+    """The plan of one bounded projection: which items may wait for the retained rows.
+
+    KGRUN-3.  Between a projection and the bounded sort above it, most rows are discarded, yet
+    every one of them was projected.  An item is deferred only when its evaluation is TOTAL on
+    the row -- it can neither raise nor observe anything -- so evaluating it after the retention
+    instead of before is not observable: a literal; a parameter (bound and refused before the
+    first row); a property of a variable bound to a matched row that declares the column (or
+    to a polymorphic match, where an undeclared column is null) or to null; ``label`` of such a
+    variable; a positional ``coalesce`` of those whose result type the planner resolved to
+    something other than DOUBLE (so no coercion can fail).  Everything else -- an operator, a
+    function, a variable the row does not bind, a map subject, an aggregation memo -- is
+    evaluated for every row exactly where the canonical
+    projection evaluated it, in the same order, so every refusal happens at the same row with
+    the same message.  An item a sort key names as an alias is evaluated for every row as well,
+    because the key reads it from the projected columns.
+    """
+
+    __slots__ = (
+        "eager",
+        "items",
+        "names",
+        "proven_tables",
+        "requirements",
+        "deferred_any",
+    )
+
+    def __init__(self, project: ProjectRows, node: SortRows, context: _Context) -> None:
+        items = project.items
+        self.items = items
+        self.names: tuple[str, ...] | None = None
+        aliased = _sort_key_variables(node.keys)
+        requirements: dict[str, set[str]] = {}
+        eager: list[int] = []
+        for position, item in enumerate(items):
+            if item.name in aliased or not _deferrable(
+                item.expression, requirements, context
+            ):
+                eager.append(position)
+        self.eager = tuple(eager)
+        self.requirements = tuple(
+            (variable, tuple(keys)) for variable, keys in requirements.items()
+        )
+        # Missing properties are total only for a polymorphic binding.  The same table can
+        # legitimately reach an internal producer in both modes, so the proof cache must retain
+        # the mode as well as the immutable table identity.
+        self.proven_tables: dict[str, tuple[TableDef, bool]] = {}
+        self.deferred_any = len(eager) < len(items)
+
+    def proven(self, row: _Row) -> bool:
+        """Say whether every deferred item is total on this row."""
+        if row.computed is not None:
+            return False
+        bindings = row.bindings
+        proven_tables = self.proven_tables
+        for variable, keys in self.requirements:
+            binding = bindings.get(variable, _MISSING_BINDING)
+            if binding is None:
+                continue
+            if type(binding) is not RowBinding:
+                return False
+            table = binding.table
+            cached = proven_tables.get(variable)
+            if (
+                cached is not None
+                and cached[0] is table
+                and cached[1] is binding.polymorphic
+            ):
+                continue
+            if not binding.polymorphic:
+                positions = table.column_positions
+                for key in keys:
+                    if key not in positions:
+                        return False
+            proven_tables[variable] = (table, binding.polymorphic)
+        return True
+
+
+def _sort_key_variables(keys: tuple[SortItem, ...]) -> frozenset[str]:
+    """Return every variable name a sort key mentions anywhere in its expression."""
+    names: set[str] = set()
+    pending: list[Expression] = [key.expression for key in keys]
+    while pending:
+        expression = pending.pop()
+        if type(expression) is Variable:
+            names.add(expression.name)
+        pending.extend(expression.children())
+    return frozenset(names)
+
+
+def _deferrable(
+    expression: Expression, requirements: dict[str, set[str]], context: _Context
+) -> bool:
+    """Say whether an item is total on every row its proof admits, recording the proof."""
+    kind = type(expression)
+    if kind is Literal or kind is Parameter:
+        return True
+    if kind is Property:
+        subject = expression.subject
+        if type(subject) is not Variable:
+            return False
+        requirements.setdefault(subject.name, set()).add(expression.key)
+        return True
+    if kind is FunctionCall:
+        if expression.named_arguments or expression.distinct or expression.star:
+            return False
+        name = expression.name.upper()
+        if name == LABEL_FUNCTION:
+            if len(expression.arguments) != 1:
+                return False
+            subject = expression.arguments[0]
+            if type(subject) is not Variable:
+                return False
+            requirements.setdefault(subject.name, set())
+            return True
+        if name == COALESCE_FUNCTION:
+            resolved = context.coalesce_types.get(id(expression))
+            if resolved is None or resolved is ValueType.DOUBLE:
+                return False
+            return bool(expression.arguments) and all(
+                type(argument) is Literal
+                or type(argument) is Parameter
+                or (
+                    type(argument) is Property
+                    and type(argument.subject) is Variable
+                    and _deferrable(argument, requirements, context)
+                )
+                for argument in expression.arguments
+            )
+    return False
+
+
+def _top_projected_rows(
+    engine: QueryEngine,
+    node: SortRows,
+    project: ProjectRows,
+    retained_limit: Expression,
+    context: _Context,
+) -> Iterator[_Row]:
+    """Order a bounded, projected result while projecting the discarded rows only partially.
+
+    The canonical shape is ``SortRows(retained) -> ProjectRows -> child``.  This door consumes
+    the child's rows itself, evaluates on every row exactly the items the canonical projection
+    could refuse on (and the ones a sort key reads by alias), retains the best rows with the
+    same heap, and evaluates the remaining, provably total items on the retained rows only.
+    Every row is still admitted to the projection's intermediate-row budget in the same
+    position, the names are rendered once on the first row, and a LIMIT of zero keeps the
+    canonical path, so the child, its budgets and every refusal stay observable.
+    """
+    limit = _window(retained_limit, context, "LIMIT")
+    skipped = (
+        _window(node.retained_skip, context, "SKIP")
+        if node.retained_skip is not None
+        else 0
+    )
+    retained = skipped + limit
+    if retained == 0:
+        yield from _top_rows_from(
+            node, engine._rows(project, context), retained, context
+        )
+        return
+    plan = _DeferredProjection(project, node, context)
+    if not plan.deferred_any:
+        yield from _top_rows_from(
+            node, engine._rows(project, context), retained, context
+        )
+        return
+    items = plan.items
+    eager = plan.eager
+    names: tuple[str, ...] | None = None
+    admit = context.admit_intermediate
+    heap: list[_TopCandidate] = []
+    for position, source in enumerate(engine._rows(project.child, context)):
+        if names is None:
+            names = tuple(item.name for item in items)
+        if plan.proven(source):
+            complete = False
+            columns = {
+                names[index]: _evaluate(items[index].expression, source, context)
+                for index in eager
+            }
+        else:
+            complete = True
+            columns = {
+                name: _evaluate(item.expression, source, context)
+                for name, item in zip(names, items)
+            }
+        admit(project)
+        row = _Row(bindings=source.bindings, computed=source.computed, columns=columns)
+        keys = tuple(
+            (_sort_key(_sort_value(key, row, context)), key.descending)
+            for key in node.keys
+        )
+        candidate = _TopProjectedCandidate(
+            keys=keys,
+            position=position,
+            row=row,
+            source=source,
+            complete=complete,
+        )
+        if len(heap) < retained:
+            _top_heap_push(heap, candidate)
+        elif candidate.precedes(heap[0]):
+            _top_heap_replace(heap, candidate)
+    worst_first = [_top_heap_pop(heap) for _ in range(len(heap))]
+    for candidate in reversed(worst_first):
+        row = candidate.row
+        if candidate.complete:
+            yield row
+            continue
+        partial = row.columns
+        source = candidate.source
+        columns = {
+            name: (
+                partial[name]  # type: ignore[index]
+                if index in eager
+                else _evaluate(item.expression, source, context)
+            )
+            for index, (name, item) in enumerate(zip(names, items))  # type: ignore[arg-type]
+        }
+        yield _Row(bindings=source.bindings, computed=source.computed, columns=columns)
 
 
 def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:
@@ -9432,7 +11909,13 @@ def _rewrite_held_insert(
         context.staged_rows.insert(
             position,
             _HeldRow(
-                _HELD_INSERT, held.table, settled, held.identity, None, held.token
+                _HELD_INSERT,
+                held.table,
+                settled,
+                held.identity,
+                None,
+                held.token,
+                None,
             ),
         )
         new_key = _partition_key(binding.table, settled)
@@ -9640,14 +12123,14 @@ def _write_pattern(
     """Materialise and stage the nodes and edges one written pattern names."""
     merging = isinstance(node, MergePattern)
     bindings = dict(row.bindings)
-    staged: list[tuple[TableDef, tuple[Value, ...], int | None, int]] = []
+    staged: list[tuple[TableDef, tuple[Value, ...], int | None, int, object]] = []
     fresh: set[str] = set()
     for written in node.nodes:
         if written.variable is None:
             continue
         if written.table is None:
             continue
-        values = materialise_row(
+        values, encoding_proof = _materialise_row_with_proof(
             engine, written.table, written.properties, row, context
         )
         if merging:
@@ -9660,24 +12143,45 @@ def _write_pattern(
             engine, written.table, values, context, also=[held[1] for held in staged]
         )
         pending = _pending_binding(written.variable, written.table, values)
-        staged.append((written.table, values, None, context.token_for(pending)))
+        staged.append(
+            (
+                written.table,
+                values,
+                None,
+                context.token_for(pending),
+                encoding_proof,
+            )
+        )
         fresh.add(written.variable)
         bindings[written.variable] = pending
-    edges: list[tuple[TableDef, tuple[Value, ...]]] = []
+    edges: list[tuple[TableDef, tuple[Value, ...], object]] = []
     for edge in node.relationships:
-        materialised = _materialise_edge(engine, edge, bindings, fresh, row, context)
-        if merging and _matching_edge(engine, edge, materialised, context):
+        table, values, encoding_proof = _materialise_edge(
+            engine, edge, bindings, fresh, row, context
+        )
+        if merging and _matching_edge(engine, edge, (table, values), context):
             context.count("relationships_matched")
             continue
-        edges.append(materialised)
+        edges.append((table, values, encoding_proof))
     _require_write_transaction(context.txn)
-    for table, values, identity, token in staged:
+    for table, values, identity, token, encoding_proof in staged:
         context.hold(
-            table, values, _partition_key(table, values), identity, token=token
+            table,
+            values,
+            _partition_key(table, values),
+            identity,
+            token=token,
+            encoding_proof=encoding_proof,
         )
         context.count("rows_created")
-    for table, values in edges:
-        context.hold(table, values, _partition_key(table, values), None)
+    for table, values, encoding_proof in edges:
+        context.hold(
+            table,
+            values,
+            _partition_key(table, values),
+            None,
+            encoding_proof=encoding_proof,
+        )
         context.count("relationships_created")
     return _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
@@ -9855,6 +12359,8 @@ def _visible_identity_with_ref(
     context: _Context,
     table: TableDef,
     record_id: RecordId,
+    *,
+    landing: bool = False,
 ) -> tuple[RecordRef, HeapVersion] | None:
     """Resolve one identity through the statement's fixed index or canonical heap access path.
 
@@ -9862,14 +12368,30 @@ def _visible_identity_with_ref(
     visible versions are corruption.  No heap scan follows either result.  Tables without that
     access path retain the bounded reusable prefix locator below, including all of its existing
     capacity, lifecycle and fail-closed stored-data behaviour.
+
+    ``landing=True`` (RELSEEK-M4) is for a caller that consumes only the header fields of the
+    version it proves -- the physical endpoint witness of an edge -- and never a column: on the
+    identity-index path the heap then validates vector bodies without building the vector
+    objects.  The version it returns carries the decoder's sentinel in vector positions, which
+    ``value_type_of`` refuses, so it can never be encoded or published as a row.  The two other
+    access paths below have no such door and decode completely, which is only slower.
     """
     identity_index = _endpoint_identity_index(engine, context, table)
     if identity_index is not None:
         manager = engine.require_indexes()
         # Selection already proved this capability.  Do not catch AttributeError or any other
         # read failure here: after adoption, fallback would hide a generation change or damage.
+        # The landing form is an optional capability asked for by name: a collaborator that
+        # offers validated_identity_landings answers without vector objects, and one that only
+        # implements the ordinary validated_versions(index, key, snapshot) contract answers
+        # through it, with the same rows and the same refusals.  No signature introspection.
+        validate = (
+            getattr(manager, "validated_identity_landings", None) if landing else None
+        )
+        if validate is None:
+            validate = manager.validated_versions
         found = tuple(
-            manager.validated_versions(
+            validate(
                 identity_index,
                 record_id_key(record_id),
                 context.snapshot,
@@ -9998,8 +12520,15 @@ def _require_physical_endpoint(
     expected_ref: RecordRef,
     end: str,
 ) -> HeapVersion:
-    """Validate a binding's physical witness against the canonical snapshot-visible identity."""
-    canonical = _visible_identity_with_ref(engine, context, endpoint_table, identity)
+    """Validate a binding's physical witness against the canonical snapshot-visible identity.
+
+    Only the header fields of the canonical version are consumed here and by the caller (its
+    physical reference and its record id), so the landing form of the identity door is used:
+    vector bodies are validated without building the vector objects (RELSEEK-M4).
+    """
+    canonical = _visible_identity_with_ref(
+        engine, context, endpoint_table, identity, landing=True
+    )
     if canonical is None:
         # A visible row outside the table's canonical page chain is corruption, not absence.
         disconnected = engine.heap._revalidate_visible_ref(
@@ -10064,7 +12593,7 @@ def _materialise_edge(
     fresh: set[str],
     row: _Row,
     context: _Context,
-) -> tuple[TableDef, tuple[Value, ...]]:
+) -> tuple[TableDef, tuple[Value, ...], object]:
     """Return the stored tuple of one edge, refusing endpoints that cannot be named yet.
 
     An endpoint is a RecordId, and the identity of a row created by THIS statement does not
@@ -10181,7 +12710,7 @@ def _materialise_edge(
                 binding,
             )
         )
-    properties = materialise_row(
+    properties, encoding_proof = _materialise_row_with_proof(
         engine,
         edge.table,
         edge.properties,
@@ -10224,7 +12753,7 @@ def _materialise_edge(
     # before a page is allocated for it.
     for guard in guards:
         context.hold_read(*guard)
-    return edge.table, properties
+    return edge.table, properties, encoding_proof
 
 
 def _pending_binding(
@@ -10556,6 +13085,16 @@ def _revisioned_txn_memo(
     memo = engine._primary_key_memos.get(txn_id)
     if memo is not None and memo.txn is txn and memo.intents is raw:
         return txn_id, memo
+    if memo is not None:
+        # A defensive transaction-id reuse/replacement must not strand decoded exact-key
+        # results in the shared owner budget.  Ordinary calls never enter this guarded path.
+        if memo.resolutions:
+            with engine._endpoint_guard:
+                if engine._primary_key_memos.get(txn_id) is memo:
+                    engine._primary_key_memos.pop(txn_id, None)
+                    _discard_primary_key_resolution_caches(engine, memo)
+        elif engine._primary_key_memos.get(txn_id) is memo:
+            engine._primary_key_memos.pop(txn_id, None)
     if isinstance(raw, _RevisionList):
         tracked = raw
     elif isinstance(raw, list):
@@ -10702,6 +13241,71 @@ def _statement_primary_key_state(
         )
     memo.state.cursor = len(held)
     return memo
+
+
+def _primary_key_current_outcome(
+    base: _PrimaryKeyFoldState,
+    statement: _PrimaryKeyStatementMemo,
+    reference: object,
+) -> tuple[bool, _PrimaryKeyOutcome | None]:
+    """Return the owner-visible replacement for one durable index hit, when any."""
+    if reference in statement.changed_refs:
+        return True, statement.state.outcomes.get(reference)
+    if reference in base.outcomes:
+        return True, base.outcomes.get(reference)
+    return False, None
+
+
+def _primary_key_state_owners(
+    state: _PrimaryKeyFoldState, key: Value
+) -> Iterator[tuple[object, Value]]:
+    """Yield owners filed under one equality key without walking unrelated transaction rows."""
+    identity = _primary_key_identity(key)
+    if identity is None:
+        for owner, observed in state.mutable_key_owners.items():
+            if _equal(observed, key):
+                yield owner, observed
+        return
+    for owner, observed in state.key_owners.get(identity, {}).items():
+        if _equal(observed, key):
+            yield owner, observed
+
+
+def _primary_key_seek_candidates(
+    base: _PrimaryKeyFoldState,
+    statement: _PrimaryKeyStatementMemo,
+    key: Value,
+) -> tuple[tuple[object, _PrimaryKeyOutcome], ...] | None:
+    """Return transaction-local rows under ``key``, or decline an unidentifiable legacy row.
+
+    The base fold is incremental across statements and the statement fold is incremental across
+    held rows.  Looking up their key buckets is therefore proportional to the number of matching
+    transaction-local owners (one for a valid primary key), rather than to all nodes created so
+    far.  A current-statement replacement shadows the corresponding base owner exactly as the
+    canonical row reducer does.
+    """
+    selected: list[tuple[object, _PrimaryKeyOutcome]] = []
+
+    def add(state: _PrimaryKeyFoldState, *, exclude: set[object]) -> bool:
+        for owner, _observed in _primary_key_state_owners(state, key):
+            if owner in exclude:
+                continue
+            if isinstance(owner, _PrimaryKeyLegacyOwner):
+                return False
+            outcome = state.outcomes.get(owner)
+            if outcome is None:
+                # Only legacy reference-less inserts lack an outcome.  Keep the fallback closed
+                # for foreign transaction collaborators that reproduce that shape differently.
+                return False
+            if outcome.operation is not RowOperation.DELETE:
+                selected.append((owner, outcome))
+        return True
+
+    if not add(base, exclude=statement.changed_refs):
+        return None
+    if not add(statement.state, exclude=set()):
+        return None
+    return tuple(selected)
 
 
 def _primary_key_conflicts(
@@ -11443,8 +14047,36 @@ def materialise_row(
     that forbids one -- so a missing primary key is caught here rather than becoming a row nobody
     can find. The final check is the domain model's own ``encode_tuple``, because arity,
     nullability and column type already have exactly one definition and a second one here would
-    be free to drift from it (amendment A24). Its bytes are discarded: this call is the
-    validation, and the heap encodes again when it actually stores the row.
+    be free to drift from it (amendment A24). Internal write paths may retain its bytes behind a
+    sealed, exact-object proof; this public helper exposes only the values and therefore keeps
+    the established return contract.
+    """
+    materialised, _encoding_proof = _materialise_row_with_proof(
+        engine,
+        table,
+        properties,
+        row,
+        context,
+        endpoints=endpoints,
+    )
+    return materialised
+
+
+def _materialise_row_with_proof(
+    engine: QueryEngine,
+    table: TableDef,
+    properties: MapExpression | None,
+    row: _Row,
+    context: _Context,
+    *,
+    endpoints: tuple[int, int] | None = None,
+) -> tuple[tuple[Value, ...], object]:
+    """Materialise one row and retain the exact bytes its validation produced.
+
+    A relationship that still carries a pending endpoint is validated through a fixed-width
+    stand-in and therefore receives no reusable proof: the commit resolves and encodes its real
+    endpoint values before the heap can see them.  Every ordinary row retains both the exact
+    values object and its sealed schema proof, never a bare object id.
     """
     values: list[Value] = [None] * table.arity
     if endpoints is not None:
@@ -11470,8 +14102,14 @@ def materialise_row(
     # validated against the width it will occupy. Nothing about the promise is waved through:
     # the commit path resolves it and re-encodes the resolved row before anything is written,
     # and every column the caller actually wrote is checked here exactly as before.
-    encode_tuple(table, _validatable_row(table, materialised))
-    return materialised
+    validatable = _validatable_row(table, materialised)
+    if validatable is materialised:
+        _payload, encoding_proof = _encode_tuple_with_proof(
+            table, materialised, protocol=engine._tuple_encoding_proofs
+        )
+        return materialised, encoding_proof
+    encode_tuple(table, validatable)
+    return materialised, None
 
 
 def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value, ...]:
@@ -11483,10 +14121,9 @@ def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value,
     line, and two doors drawing it differently is how a token eventually walks through one.
     """
     endpoints = ENDPOINT_COLUMN_COUNT if table.kind == "rel" else 0
-    substituted: list[Value] = []
+    substituted: list[Value] | None = None
     for position, value in enumerate(values):
         if not isinstance(value, PendingRowRef):
-            substituted.append(value)
             continue
         if position >= endpoints:
             raise GrafxUnsupportedOperation(
@@ -11499,15 +14136,17 @@ def _validatable_row(table: TableDef, values: tuple[Value, ...]) -> tuple[Value,
                 table=table.name,
                 operation="pending_value",
             )
-        substituted.append(SIZING_ENDPOINT)
-    return tuple(substituted)
+        if substituted is None:
+            substituted = list(values)
+        substituted[position] = SIZING_ENDPOINT
+    return values if substituted is None else tuple(substituted)
 
 
 def _column_named(table: TableDef, key: str) -> ColumnDef:
     """Return one column of a table, refusing a name it does not declare."""
-    for column in table.columns:
-        if column.name == key:
-            return column
+    position = table.column_positions.get(key)
+    if position is not None:
+        return table.columns[position]
     declared = ", ".join(column.name for column in table.columns)
     raise GrafxPlanError(
         f"Table {table.name!r} has no column named {key!r}; it declares {declared}.",
@@ -11586,6 +14225,8 @@ _HANDLERS: dict[type, _Handler] = {
     WithRows: _with_rows,  # type: ignore[dict-item]
     AllNodesScan: _all_nodes_scan,  # type: ignore[dict-item]
     NodeScan: _node_scan,  # type: ignore[dict-item]
+    NodeMultiKeySeek: _node_multi_key_seek,  # type: ignore[dict-item]
+    OrderedNodeMerge: _ordered_node_merge,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
@@ -11720,6 +14361,15 @@ def _evaluate_property(
     subject = _evaluate(expression.subject, row, context)
     if subject is None:
         return None
+    if type(subject) is RowBinding:
+        # KGRUN-M1: the matched row is the common case; the abstract Mapping test below walks
+        # the ABC registry and is only reached by a map subject or a refusal.
+        return subject.value(expression.key)
+    return _property_of(subject, expression)
+
+
+def _property_of(subject: object, expression: Property) -> object:
+    """Read one property of an already evaluated, non-null subject."""
     if isinstance(subject, Mapping):
         return _map_property_value(subject, expression)
     if not isinstance(subject, RowBinding):
@@ -13626,6 +16276,13 @@ def _coalesce(expression: FunctionCall, row: _Row, context: _Context) -> object:
     values = tuple(
         _evaluate(argument, row, context) for argument in expression.arguments
     )
+    return _coalesce_selected(expression, values, context)
+
+
+def _coalesce_selected(
+    expression: FunctionCall, values: tuple[object, ...], context: _Context
+) -> object:
+    """Select and coerce the coalesce answer from already evaluated arguments."""
     selected = next((value for value in values if value is not None), None)
     if selected is None:
         return None

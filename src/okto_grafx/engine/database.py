@@ -34,7 +34,7 @@ from __future__ import annotations
 import struct
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
@@ -1448,6 +1448,7 @@ class Maintenance:
         *,
         bucket_count: int | None = None,
         expected_cardinality: int | None = None,
+        layout: str = "hash",
     ) -> IndexView:
         """Delegate custom exact-index creation to the database."""
         return self._database.create_index(
@@ -1456,6 +1457,7 @@ class Maintenance:
             columns,
             bucket_count=bucket_count,
             expected_cardinality=expected_cardinality,
+            layout=layout,
         )
 
     def rehash_index(
@@ -1471,6 +1473,10 @@ class Maintenance:
             bucket_count=bucket_count,
             expected_cardinality=expected_cardinality,
         )
+
+    def rebuild_index(self, name: str) -> IndexView:
+        """Delegate immutable exact-index reconstruction to the database."""
+        return self._database.rebuild_index(name)
 
     def rehash_index_if_needed(
         self,
@@ -1514,6 +1520,7 @@ class Database:
         "_catalog",
         "_catalog_view_memo",
         "_plan_view_memo",
+        "_plan_guard_factory",
         "_heap",
         "_wal",
         "_transactions",
@@ -1585,6 +1592,7 @@ class Database:
         recovery: object = None,
         vectors: object = None,
         queries: object = None,
+        plan_guard_factory: Callable[[], AbstractContextManager[object]] | None = None,
         verifier_factory: Callable[[], object] | None = None,
         recovery_report: object = None,
         attached_indexes: Sequence[str] = (),
@@ -1618,6 +1626,7 @@ class Database:
         self._plan_view_memo: OrderedDict[
             int, tuple[PlanNode, PlanNode]
         ] = OrderedDict()
+        self._plan_guard_factory = plan_guard_factory
         self._heap: HeapStore = heap
         self._wal: WalManager = wal
         self._transactions: TransactionManager = transactions
@@ -2256,6 +2265,7 @@ class Database:
                     max_string_characters=self._max_query_value_characters,
                     internally_owned_plan=_engine_owns_prepared_plan(engine, plan),
                     plan_memo=self._plan_view_memo,
+                    plan_guard_factory=self._plan_guard_factory,
                 )
                 if metadata.plan is None:
                     raise GrafxConfigurationError(
@@ -2435,6 +2445,7 @@ class Database:
                     )
                 ),
                 plan_memo=self._plan_view_memo,
+                plan_guard_factory=self._plan_guard_factory,
             )
 
     def _run_many(
@@ -2830,12 +2841,15 @@ class Database:
         *,
         bucket_count: int | None = None,
         expected_cardinality: int | None = None,
+        layout: str = "hash",
     ) -> IndexView:
         """Create and atomically publish one custom exact index.
 
         The operation owns a fresh, dedicated write transaction. ``bucket_count`` selects the
         physical directory directly; ``expected_cardinality`` lets Grafx derive it. Supplying
-        both is refused by the same planner used by textual ``CREATE INDEX``.
+        both is refused by the same planner used by textual ``CREATE INDEX``. The ordered
+        layout is selected explicitly with ``layout='ordered'`` and accepts only a
+        TIMESTAMP+STRING key, without hash sizing hints.
         """
         with self._public_operation("create_index"):
             self._require_open()
@@ -2869,6 +2883,7 @@ class Database:
                     "expected_cardinality", expected_cardinality
                 )
             )
+            wanted_layout = _require_text("layout", layout)
 
             transaction = self.begin("write")
             try:
@@ -2884,6 +2899,7 @@ class Database:
                         columns=wanted_columns,
                         bucket_count=wanted_bucket_count,
                         expected_cardinality=wanted_expected_cardinality,
+                        layout=wanted_layout,
                         txn=transaction._context,
                     )
                 transaction.commit()
@@ -2940,6 +2956,41 @@ class Database:
                     name=wanted_name,
                     bucket_count=wanted_bucket_count,
                     expected_cardinality=wanted_expected_cardinality,
+                )
+                transaction.commit()
+            except BaseException as failure:
+                if transaction.active:
+                    try:
+                        transaction.rollback()
+                    except BaseException as cleanup_failure:
+                        _note_cleanup_failure(failure, cleanup_failure)
+                raise
+
+            self._refresh_index_inventory()
+            return self._committed_index_receipt(wanted_name)
+
+    def rebuild_index(self, name: str) -> IndexView:
+        """Rebuild one exact index into a compact, immutable fresh generation.
+
+        The active generation remains authoritative until the complete replacement and its WAL
+        publication are durable. The former generation is retained as ``STALE`` for rollback and
+        audit provenance; no in-place reset can expose a partially rebuilt tree.
+        """
+
+        with self._public_operation("rebuild_index"):
+            self._require_open()
+            self._require_writable("rebuild an exact index")
+            self._require_component(
+                "indexes", self._indexes, "the index framework (C7)"
+            )
+            wanted_name = _require_text("name", name)
+
+            transaction = self.begin("write")
+            try:
+                self._transactions.prepare_index_rehash(
+                    transaction._context,
+                    name=wanted_name,
+                    rebuild=True,
                 )
                 transaction.commit()
             except BaseException as failure:
@@ -3979,6 +4030,17 @@ class Database:
         """
         self._require_open()
         self._publish_metrics()
+
+    def read_index_status(self, name: str) -> IndexView:
+        """Read an active index's validated durable header into an immutable DTO.
+
+        Unlike ``indexes``, this explicit I/O operation faults in a cold header.
+        It validates catalog/physical generation identity, but does not rebuild,
+        clear staleness, certify heap coverage, or advance a watermark.
+        """
+        with self._public_operation("read_index_status"):
+            self._require_open()
+            return self._committed_index_receipt(_require_text("index", name))
 
     def inspect_index(self, name: str) -> tuple[IndexEntry, ...]:
         """Return immutable entry DTOs from one secondary index.

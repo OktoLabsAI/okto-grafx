@@ -259,4 +259,4 @@ The final evidence names Grafx `f0b55b7b6facc916118f342c774cb06e56bf17e3`, Commu
 `384a7722ff6772a2e89ca95225ab759ec5c7cab5af9939f405ef7b5ec2802aae`. Because the report records
 `machine_idle_asserted=false`, these are structural acceptance counts, not a throughput claim. The
 paired control artifact and full reproduction provenance are recorded in
-[`docs/PERFORMANCE.md`](../PERFORMANCE.md).
+[`docs/PERFORMANCE.md`](../reports/PERFORMANCE_HISTORY.md).

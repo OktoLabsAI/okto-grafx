@@ -33,6 +33,7 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.index.definition import IndexDefinition
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.ledger.entry import (
     LedgerEntry,
     LedgerEntryType,
@@ -166,6 +167,7 @@ _EXACT_ENUM_LEAF_TYPES: frozenset[type[Enum]] = frozenset(
         DistanceMetric,
         FailureReason,
         IndexVisibility,
+        IndexLayout,
         LedgerEntryType,
         LedgerOriginClass,
         LedgerReason,
@@ -777,6 +779,16 @@ def _assert_capability_free(root: object, *, surface: str) -> None:
         ), (surface, value_type.__name__)
         assert not callable(value), (surface, value_type.__name__)
         assert _BACKDOOR_NAMES.isdisjoint(dir(value)), (surface, value_type.__name__)
+
+
+def test_index_layout_is_an_exact_public_leaf_not_permission_for_arbitrary_enums() -> None:
+    class ForeignLayout(str, Enum):
+        HASH = 'hash'
+
+    _assert_capability_free(IndexLayout.HASH, surface='index.layout')
+    _assert_capability_free(IndexLayout.ORDERED, surface='index.layout')
+    with pytest.raises(AssertionError):
+        _assert_capability_free(ForeignLayout.HASH, surface='index.layout')
 
 
 def test_database_and_transaction_have_complete_static_public_property_allowlists() -> (

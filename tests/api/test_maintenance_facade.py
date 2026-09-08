@@ -43,6 +43,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
             "enable_wal_page_compression",
             "create_index",
             "rehash_index",
+            "rebuild_index",
             "rehash_index_if_needed",
         }
     )
@@ -64,6 +65,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     )
     assert get_type_hints(Maintenance.create_index)["return"] is IndexView
     assert get_type_hints(Maintenance.rehash_index)["return"] is IndexView
+    assert get_type_hints(Maintenance.rebuild_index)["return"] is IndexView
     assert get_type_hints(Maintenance.rehash_index_if_needed)["return"] == (
         IndexView | None
     )
@@ -142,11 +144,12 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         *,
         bucket_count: int | None = None,
         expected_cardinality: int | None = None,
+        layout: str = "hash",
     ) -> object:
         calls.append(
             (
                 "create_index",
-                (name, table, columns, bucket_count, expected_cardinality),
+                (name, table, columns, bucket_count, expected_cardinality, layout),
             )
         )
         return index_result
@@ -180,6 +183,10 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         )
         return index_result
 
+    def rebuild_index(_database: Database, name: str) -> object:
+        calls.append(("rebuild_index", name))
+        return index_result
+
     try:
         with monkeypatch.context() as boundary:
             boundary.setattr(Database, "checkpoint", checkpoint)
@@ -196,6 +203,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             )
             boundary.setattr(Database, "create_index", create_index)
             boundary.setattr(Database, "rehash_index", rehash_index)
+            boundary.setattr(Database, "rebuild_index", rebuild_index)
             boundary.setattr(
                 Database,
                 "rehash_index_if_needed",
@@ -233,6 +241,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
                 )
                 is index_result
             )
+            assert maintenance.rebuild_index("by_name") is index_result
     finally:
         database.close()
 
@@ -246,10 +255,11 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         ("bloat", "Person"),
         (
             "create_index",
-            ("by_name", "Person", ("name",), None, 1_000),
+            ("by_name", "Person", ("name",), None, 1_000, "hash"),
         ),
         ("rehash_index", ("by_name", 128, None)),
         ("rehash_index_if_needed", ("by_name", 2)),
+        ("rebuild_index", "by_name"),
     ]
 
 
@@ -279,6 +289,9 @@ def test_a_retained_maintenance_facade_obeys_database_lifecycle() -> None:
 
     with pytest.raises(GrafxUnsupportedOperation):
         maintenance.rehash_index("by_name", bucket_count=128)
+
+    with pytest.raises(GrafxUnsupportedOperation):
+        maintenance.rebuild_index("by_name")
 
     with pytest.raises(GrafxUnsupportedOperation):
         maintenance.rehash_index_if_needed("by_name")

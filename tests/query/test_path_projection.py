@@ -1,7 +1,7 @@
-"""Finite acceptance gate for the one Pulse path projection admitted by M-PULSE-2O.
+"""Finite acceptance gate for typed, directed one-hop path projection.
 
-The capability is deliberately literal.  It is not a general path value implementation: the
-only admitted AST is ``MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path``.
+The capability is deliberately bounded. It is not a general path value implementation:
+``MATCH path = (a:Label)-[r:Type]->(b:Label) RETURN path`` admits caller-defined identifiers.
 It may carry only a terminal literal non-negative ``LIMIT``. These tests freeze both halves of
 that statement: the narrow parser/analyser/planner gate and the Kuzu/Ladybug-compatible public
 value produced for each matching edge.
@@ -829,21 +829,14 @@ def test_path_projection_is_refused_in_either_union_branch_even_with_analysis(
 
 
 NEAR_MISSES = (
-    "MATCH p = (a:Decision)-[r:supersedes]->(b:Decision) RETURN p",
-    "MATCH path = (x:Decision)-[r:supersedes]->(b:Decision) RETURN path",
-    "MATCH path = (a:Decision)-[q:supersedes]->(b:Decision) RETURN path",
-    "MATCH path = (a:Decision)-[r:supersedes]->(c:Decision) RETURN path",
     "MATCH path = (a)-[r:supersedes]->(b:Decision) RETURN path",
-    "MATCH path = (a:Bug)-[r:supersedes]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision:Bug)-[r:supersedes]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision)-[r:supersedes]->(b) RETURN path",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Bug) RETURN path",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision:Bug) RETURN path",
     "MATCH path = (a:Decision {id: 'd1'})-[r:supersedes]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision)-[r:supersedes {layer: 'canonical'}]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision)-[]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision)-[r]->(b:Decision) RETURN path",
-    "MATCH path = (a:Decision)-[r:supports]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision)-[r:supersedes|supports]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision)<-[r:supersedes]-(b:Decision) RETURN path",
     "MATCH path = (a:Decision)-[r:supersedes]-(b:Decision) RETURN path",
@@ -1007,8 +1000,6 @@ def test_every_near_miss_stays_outside_the_literal_recogniser(text: str) -> None
 @pytest.mark.parametrize(
     "text",
     (
-        "MATCH p = (a:Decision)-[r:supersedes]->(b:Decision) RETURN p",
-        "MATCH path = (a:Decision)-[r:supports]->(b:Decision) RETURN path",
         "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path.id",
         "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN size(path)",
         "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path AS p",

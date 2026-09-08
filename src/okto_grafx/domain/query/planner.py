@@ -39,11 +39,13 @@ from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
 from okto_grafx.domain.index.catalog import CatalogIndexDefinition
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
+    ORDERED_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
     index_definition_matches_table,
 )
 from okto_grafx.domain.index.keys import custom_index_sizing
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
@@ -51,6 +53,7 @@ from okto_grafx.domain.model.value import VECTOR_DTYPES, ValueType, value_type_o
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import (
     QueryAnalysis,
+    Aggregation,
     SimilarityUse,
     analyze,
     exact_path_projection,
@@ -58,6 +61,8 @@ from okto_grafx.domain.query.analysis import (
     named_path,
     named_path_refusal,
     optional_match_refusal,
+    correlated_optional_pipeline,
+    is_aggregate,
     untyped_one_hop_source,
     union_refusal,
     polymorphic_node_refusal,
@@ -118,7 +123,9 @@ from okto_grafx.domain.query.plan import (
     IndexSeek,
     LimitRows,
     MergePattern,
+    NodeMultiKeySeek,
     NodeScan,
+    OrderedNodeMerge,
     OptionalRows,
     PlanNode,
     ProduceResults,
@@ -181,8 +188,6 @@ It carries spaces on purpose. A user variable is an ASCII identifier and can nev
 so an anonymous binding can never be shadowed by, or shadow, something the caller wrote.
 """
 
-_PATH_PROJECTION_NODE_TABLE: str = "Decision"
-_PATH_PROJECTION_RELATIONSHIP_TABLE: str = "supersedes"
 _PATH_PROJECTION_NODE_KEYS = frozenset({"_ID", "_LABEL"})
 _PATH_PROJECTION_RELATIONSHIP_KEYS = frozenset({"_SRC", "_DST", "_LABEL", "_ID"})
 """The catalog declaration required by the one projected path."""
@@ -490,6 +495,7 @@ class _Planner:
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
     polymorphic_variables: set[str] = field(default_factory=set)
+    polymorphic_tables: dict[str, tuple[TableDef, ...]] = field(default_factory=dict)
     typed_endpoint_form: bool = False
     path_projection: PatternPath | None = None
     untyped_one_hop_label: str | None = None
@@ -1028,23 +1034,53 @@ class _Planner:
                 field="table",
                 value=table.name,
             )
-        bucket_count, expected_cardinality = custom_index_sizing(
-            bucket_count=statement.bucket_count,
-            expected_cardinality=statement.expected_cardinality,
-        )
+        layout = IndexLayout.parse(statement.layout or IndexLayout.HASH.value)
+        if layout is IndexLayout.ORDERED:
+            if (
+                statement.bucket_count is not None
+                or statement.expected_cardinality is not None
+            ):
+                raise GrafxPlanError(
+                    "An ordered index has no hash-directory sizing options.",
+                    field="layout",
+                    value=layout.value,
+                )
+            bucket_count = 1
+            expected_cardinality = None
+            key_derivation = ORDERED_KEY_DERIVATION
+        else:
+            bucket_count, expected_cardinality = custom_index_sizing(
+                bucket_count=statement.bucket_count,
+                expected_cardinality=statement.expected_cardinality,
+            )
+            key_derivation = COLUMN_KEY_DERIVATION
         definition = IndexDefinition.on(
             table,
             name=statement.name,
             columns=statement.columns,
             visibility=IndexVisibility.EXACT,
             bucket_count=bucket_count,
+            key_derivation=key_derivation,
+            layout=layout,
         )
+        if layout is IndexLayout.ORDERED:
+            first, second = (table.columns[position] for position in definition.positions)
+            if first.type is not ValueType.TIMESTAMP or second.type is not ValueType.STRING:
+                raise GrafxPlanError(
+                    "An ordered index requires TIMESTAMP then STRING key columns; "
+                    f"got {first.type.name} then {second.type.name}.",
+                    field="columns",
+                    value=statement.columns,
+                    table=table.name,
+                )
         logical = CatalogIndexDefinition(
             name=definition.name,
             table_id=definition.table_id,
             table_name=definition.table_name,
             positions=definition.positions,
             visibility=definition.visibility,
+            key_derivation=definition.key_derivation,
+            layout=definition.layout,
             expected_cardinality=expected_cardinality,
         )
         self._require_new_index_name(logical.name)
@@ -1054,6 +1090,8 @@ class _Planner:
             positions=logical.positions,
             bucket_count=definition.bucket_count,
             expected_cardinality=logical.expected_cardinality,
+            layout=logical.layout,
+            key_derivation=logical.key_derivation,
         )
 
     def _require_new_index_name(self, name: str) -> None:
@@ -1334,7 +1372,8 @@ class _Planner:
         self.untyped_one_hop_label = (
             None if untyped_source is None else untyped_source.labels[0]
         )
-        if untyped_source is not None or projected_path is not None:
+        if (untyped_source is not None or projected_path is not None
+                or statement.with_clauses or correlated_optional_pipeline(statement)):
             # Each literal recogniser judged the STATEMENT, while the pipeline below also reads
             # the analysis -- which a caller may have supplied. A supplied summary that claims
             # an aggregation gets one: _result inserts AggregateRows over a statement that
@@ -1364,12 +1403,20 @@ class _Planner:
                 expression=statement.unwind_clause.expression,
             )
         similarity_terms: list[Expression] = []
-        for clause in statement.match_clauses:
+        correlated = correlated_optional_pipeline(statement)
+        reading_clauses = statement.ordered_read_clauses() if correlated else statement.match_clauses
+        for clause in reading_clauses:
+            if isinstance(clause, WithClause):
+                pipeline = self._with_clause(pipeline, clause)
+                continue
+            if clause.optional and correlated:
+                pipeline = self._correlated_optional(pipeline, clause)
+                continue
             pipeline, deferred = self._match_clause(pipeline, clause)
             similarity_terms.extend(deferred)
         pipeline = self._similarity(pipeline, statement, similarity_terms)
         optional = [clause for clause in statement.match_clauses if clause.optional]
-        if optional:
+        if optional and not correlated:
             # Above every filter of the clause, residual and deferred alike: the WHERE belongs
             # to the OPTIONAL, so "no rows" has to mean no rows AFTER all of it. The gate above
             # has already proved the shape, which is why one node of one pattern can be read
@@ -1378,8 +1425,9 @@ class _Planner:
                 child=pipeline,
                 alias=optional[0].patterns[0].nodes[0].variable,
             )
-        for clause in statement.with_clauses:
-            pipeline = self._with_clause(pipeline, clause)
+        if not correlated:
+            for clause in statement.with_clauses:
+                pipeline = self._with_clause(pipeline, clause)
         for clause in statement.updating_clauses:
             pipeline = self._updating_clause(pipeline, clause)
         self._record_polymorphic_properties(statement)
@@ -1406,6 +1454,58 @@ class _Planner:
             writes=statement.writes,
         )
 
+    def _correlated_optional(self, pipeline: PlanNode, clause: MatchClause) -> PlanNode:
+        """Plan an optional incident expansion over snapshot-visible relationship tables."""
+        pattern = clause.patterns[0]
+        source, target = pattern.nodes
+        edge = pattern.relationships[0]
+        anchor = self.tables[source.variable]
+        if edge.types:
+            candidates = (self._relationship_table(edge),)
+        else:
+            candidates = tuple(t for t in self.catalog.tables() if t.kind == "rel")
+        selected = []
+        for table in sorted(candidates, key=lambda t: t.table_id):
+            self._table_named(table.from_table, "from")
+            self._table_named(table.to_table, "to")
+            outgoing = edge.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
+            incoming = edge.direction in (Direction.INCOMING, Direction.UNDIRECTED)
+            if ((outgoing and table.from_table == anchor.name)
+                    or (incoming and table.to_table == anchor.name)):
+                selected.append(table)
+        target_name = target.variable or self._anonymous()
+        if target.labels:
+            target_definition = self._table_named(target.labels[0], "label")
+            if target_definition.kind != "node":
+                raise GrafxPlanError("An optional hop target must name a node table.")
+            self.tables[target_name] = target_definition
+        elif target.variable:
+            self.polymorphic_variables.add(target.variable)
+            landing_names = set()
+            for table in selected:
+                if edge.direction in (Direction.OUTGOING, Direction.UNDIRECTED) and table.from_table == anchor.name:
+                    landing_names.add(table.to_table)
+                if edge.direction in (Direction.INCOMING, Direction.UNDIRECTED) and table.to_table == anchor.name:
+                    landing_names.add(table.from_table)
+            self.polymorphic_tables[target.variable] = tuple(
+                table for table in self._node_tables() if table.name in landing_names
+            )
+        if edge.variable and edge.types:
+            self.tables[edge.variable] = candidates[0]
+        elif edge.variable:
+            self.polymorphic_variables.add(edge.variable)
+            self.polymorphic_tables[edge.variable] = tuple(selected)
+        if clause.predicate is not None and self._reads_similarity(clause.predicate):
+            raise GrafxPlanError("An optional hop predicate cannot perform vector search.")
+        return TraverseAnyRelationship(
+            child=pipeline, source=source.variable, target=target_name,
+            relationship=edge.variable or self._anonymous(), tables=tuple(selected),
+            direction=edge.direction, optional=True, source_table=anchor.name,
+            target_table=target.labels[0] if target.labels else None,
+            relationship_polymorphic=not edge.types,
+            predicate=clause.predicate,
+        )
+
     def _with_clause(self, pipeline: PlanNode, clause: WithClause) -> PlanNode:
         """Plan one WITH stage: the projection, then the WHERE that belongs to it."""
         for item in clause.items:
@@ -1417,6 +1517,20 @@ class _Planner:
             # provable for every use of the name below it: parts[1] is a STRING because parts
             # is the string_split() this stage projected.
             self.alias_definitions[item.alias] = item.expression
+        aggregations = tuple(
+            Aggregation(position=position, call=call)
+            for position, item in enumerate(clause.items)
+            for call in walk(item.expression) if is_aggregate(call)
+        )
+        if aggregations:
+            grouped_positions = {aggregate.position for aggregate in aggregations}
+            pipeline = AggregateRows(
+                child=pipeline,
+                grouping=tuple(item for position, item in enumerate(clause.items)
+                               if position not in grouped_positions),
+                aggregations=aggregations,
+                preserve_group_bindings=True,
+            )
         pipeline = WithRows(child=pipeline, items=clause.items)
         if clause.predicate is not None:
             # The predicate belongs to THIS stage, so it filters what the projection produced
@@ -1758,7 +1872,7 @@ class _Planner:
                 if expression.subject.name == self.unwind_alias:
                     return self._unwind_static_postfix_type(expression, owner=owner)
                 if expression.subject.name in self.polymorphic_variables:
-                    return self._polymorphic_property_type(expression.key, owner)
+                    return self._polymorphic_property_type(expression.key, owner, expression.subject.name)
                 table = self.tables.get(expression.subject.name)
                 if table is None:
                     message = f"{owner} reads {expression.describe()}, whose variable has no table."
@@ -2079,7 +2193,7 @@ class _Planner:
             if argument.subject.name in self.polymorphic_variables:
                 # A node matched without a label: the family is whatever the tables that
                 # declare the column agree on, and null when none of them declares it.
-                return self._polymorphic_property_type(argument.key, call.name)
+                return self._polymorphic_property_type(argument.key, call.name, argument.subject.name)
             table = self.tables.get(argument.subject.name)
             if table is None:
                 message = (
@@ -2325,7 +2439,71 @@ class _Planner:
         seek, remaining = self._index_seek(pipeline, variable, table, terms)
         if seek is not None:
             return seek, remaining, variable
+        if standalone:
+            keyed = self._node_multi_key_seek(pipeline, variable, table, terms)
+            if keyed is not None:
+                return keyed, terms, variable
         return NodeScan(child=pipeline, variable=variable, table=table), terms, variable
+
+    def _node_multi_key_seek(
+        self,
+        pipeline: PlanNode,
+        variable: str,
+        table: TableDef,
+        terms: Sequence[Expression],
+    ) -> PlanNode | None:
+        """Return the multi-key seek for ``n.pk IN $keys`` leading a standalone labelled node.
+
+        NODE-IN-SEEK.  The term must be the first local term of the conjunction: seeking on a
+        later conjunct would evaluate it before the terms written ahead of it and could suppress
+        a refusal the scan path raises on every row the seek eliminates.  Only a parameter list
+        is admitted; a literal list, a non-primary-key column, a polymorphic node, a nested
+        pattern and a table without its automatic exact primary-key index keep the scan.  No
+        term is consumed: the whole conjunction stays above the seek exactly as it stays above
+        the scan, so both paths judge, refuse and count the predicate the same way.
+        """
+        if type(pipeline) is not SingleRow or not terms or table.primary_key is None:
+            return None
+        term = terms[0]
+        if (
+            not isinstance(term, BinaryOperation)
+            or term.operator != "IN"
+            or not isinstance(term.left, Property)
+            or not isinstance(term.left.subject, Variable)
+            or term.left.subject.name != variable
+            or term.left.key != table.primary_key
+            or not isinstance(term.right, Parameter)
+        ):
+            return None
+        position = table.column_index(table.primary_key)
+        automatic = {
+            definition.name
+            for definition in automatic_index_definitions(table)
+            if definition.positions == (position,)
+            and definition.visibility is IndexVisibility.EXACT
+            and definition.key_derivation == COLUMN_KEY_DERIVATION
+        }
+        chosen: IndexDefinition | None = None
+        for definition in self.indexes:
+            if (
+                definition.name in automatic
+                and index_definition_matches_table(definition, table)
+                and definition.visibility is IndexVisibility.EXACT
+                and definition.key_derivation == COLUMN_KEY_DERIVATION
+                and definition.positions == (position,)
+            ):
+                chosen = definition
+                break
+        if chosen is None:
+            return None
+        return NodeMultiKeySeek(
+            fallback=NodeScan(child=pipeline, variable=variable, table=table),
+            variable=variable,
+            table=table,
+            keys=term.right,
+            key_position=position,
+            index=chosen.name,
+        )
 
     def _match_every_node(
         self,
@@ -2366,7 +2544,7 @@ class _Planner:
         """Return True when this variable names a matched row, table or no table."""
         return name in self.tables or name in self.polymorphic_variables
 
-    def _polymorphic_property_type(self, key: str, owner: str) -> ValueType | None:
+    def _polymorphic_property_type(self, key: str, owner: str, variable: str) -> ValueType | None:
         """Return the one type a property has across the tables that declare it.
 
         A polymorphic match reads one name across many tables, so the property is typed only
@@ -2381,7 +2559,7 @@ class _Planner:
 
         declared = [
             (table.name, column.type)
-            for table in self._node_tables()
+            for table in self.polymorphic_tables.get(variable, self._node_tables())
             for column in (self._column_of(table, key),)
             if column is not None
         ]
@@ -2396,7 +2574,7 @@ class _Planner:
             f"{name}.{key} is {value_type.name}" for name, value_type in declared
         )
         raise GrafxPlanError(
-            f"{owner} reads {key!r} on a node that names no label, and the tables do not agree "
+            f"{owner} reads {key!r} on a polymorphic binding, and the tables do not agree "
             f"on what it is: {listing}.",
             field="property",
             value=key,
@@ -2413,7 +2591,7 @@ class _Planner:
                     continue
                 if subject.name not in self.polymorphic_variables:
                     continue
-                self._polymorphic_property_type(node.key, node.describe())
+                self._polymorphic_property_type(node.key, node.describe(), subject.name)
 
     def _typed_endpoint_source(self, pattern: PatternPath) -> TableDef | None:
         """Return the table a label-free source reads, when the query is the one shape for it.
@@ -3129,30 +3307,34 @@ class _Planner:
         return found if found.keys() == expected.keys() else None
 
     def _require_path_projection_schema(self, table: TableDef) -> None:
-        """Require the exact relationship declaration the projected path was frozen against.
+        """Require the relationship declaration to match both written path endpoints.
 
         The ordinary traversal checks the table at its starting end. Its labelled target is
         otherwise resolved from the label the query wrote, without proving that label is the
         relationship's declared ``to_table``. That is insufficient for a path value: publishing
-        ``b:Decision`` while the edge actually lands in another table would encode a path the
-        query did not match. The literal form therefore closes both ends before any row streams.
+        a target label while the edge actually lands in another table would encode a path the
+        query did not match. Close both ends before any row streams.
         """
+        pattern = self.path_projection
+        assert pattern is not None  # Only the exact typed shape can publish a path value.
+        source_label, target_label = (node.labels[0] for node in pattern.nodes)
         if not (
-            table.name == _PATH_PROJECTION_RELATIONSHIP_TABLE
-            and table.from_table == _PATH_PROJECTION_NODE_TABLE
-            and table.to_table == _PATH_PROJECTION_NODE_TABLE
+            table.name == pattern.relationships[0].types[0]
+            and table.from_table == source_label
+            and table.to_table == target_label
         ):
             raise GrafxPlanError(
-                "The projected path reads a 'supersedes' relationship declared from Decision "
-                "to Decision; the catalog declaration does not match that frozen endpoint pair.",
+                "The projected path endpoint labels do not match the relationship's "
+                "catalog declaration.",
                 field="endpoint",
                 value=table.name,
                 from_table=table.from_table,
                 to_table=table.to_table,
             )
 
-        node_table = self._table_named(_PATH_PROJECTION_NODE_TABLE, "label")
-        self._require_path_property_keys(node_table, _PATH_PROJECTION_NODE_KEYS)
+        for label in (source_label, target_label):
+            node_table = self._table_named(label, "label")
+            self._require_path_property_keys(node_table, _PATH_PROJECTION_NODE_KEYS)
         self._require_path_property_keys(table, _PATH_PROJECTION_RELATIONSHIP_KEYS)
 
     @staticmethod
@@ -3346,6 +3528,7 @@ class _Planner:
         if (
             clause is None
             or statement.updating_clauses
+            or statement.with_clauses
             or residual
             or clause.distinct
             or self.analysis.aggregated
@@ -3524,6 +3707,9 @@ class _Planner:
                 ),
                 aggregations=self.analysis.aggregations,
             )
+        ordered = self._ordered_node_merge(pipeline, clause)
+        if ordered is not None:
+            pipeline = ordered
         pipeline = ProjectRows(child=pipeline, items=self._projected(clause))
         if clause.distinct:
             pipeline = DistinctRows(child=pipeline)
@@ -3539,6 +3725,295 @@ class _Planner:
         if clause.limit is not None:
             pipeline = LimitRows(child=pipeline, count=clause.limit)
         return pipeline
+
+    def _ordered_node_merge(
+        self, pipeline: PlanNode, clause: ReturnClause
+    ) -> OrderedNodeMerge | None:
+        """Select the closed Pulse keyset path or retain the complete canonical pipeline."""
+
+        if (
+            self.analysis.aggregated
+            or clause.distinct
+            or clause.skip is not None
+            or clause.limit is None
+            or len(clause.sort_items) != 2
+        ):
+            return None
+        first, second = clause.sort_items
+        if not first.descending or not second.descending:
+            return None
+        if not isinstance(first.expression, Property) or not isinstance(
+            second.expression, Property
+        ):
+            return None
+        first_subject = first.expression.subject
+        second_subject = second.expression.subject
+        if (
+            not isinstance(first_subject, Variable)
+            or not isinstance(second_subject, Variable)
+            or first_subject.name != second_subject.name
+        ):
+            return None
+
+        predicate: Expression | None = None
+        scan = pipeline
+        if isinstance(scan, FilterRows):
+            predicate = scan.predicate
+            scan = scan.child
+        if (
+            not isinstance(scan, AllNodesScan)
+            or not isinstance(scan.child, SingleRow)
+            or scan.variable != first_subject.name
+            or not scan.tables
+        ):
+            return None
+        if predicate is not None and not self._ordered_filter_is_total(
+            predicate, scan.variable
+        ):
+            return None
+        if any(
+            not self._ordered_scalar_is_total(item.expression, scan.variable)
+            for item in clause.items
+        ):
+            return None
+
+        timestamp_column = first.expression.key
+        string_column = second.expression.key
+        ordered_tables: list[TableDef] = []
+        index_names: list[str] = []
+        for table in scan.tables:
+            timestamp_definition = self._column_of(table, timestamp_column)
+            string_definition = self._column_of(table, string_column)
+            if timestamp_definition is None or string_definition is None:
+                if predicate is not None and self._ordered_filter_excludes_table(
+                    predicate, scan.variable, table
+                ):
+                    continue
+                return None
+            timestamp_position = table.column_index(timestamp_column)
+            string_position = table.column_index(string_column)
+            if (
+                timestamp_definition.type is not ValueType.TIMESTAMP
+                or string_definition.type is not ValueType.STRING
+                or table.primary_key != string_column
+            ):
+                return None
+            candidates = sorted(
+                (
+                    definition.name
+                    for definition in self.indexes
+                    if index_definition_matches_table(definition, table)
+                    and definition.layout is IndexLayout.ORDERED
+                    and definition.visibility is IndexVisibility.EXACT
+                    and definition.key_derivation == ORDERED_KEY_DERIVATION
+                    and definition.positions
+                    == (timestamp_position, string_position)
+                ),
+                key=str.casefold,
+            )
+            if not candidates:
+                return None
+            ordered_tables.append(table)
+            index_names.append(candidates[0])
+
+        if not ordered_tables:
+            return None
+
+        upper_timestamp: Expression | None = None
+        upper_string: Expression | None = None
+        if predicate is not None:
+            bound = self._ordered_keyset_bound(
+                predicate,
+                variable=scan.variable,
+                timestamp_column=timestamp_column,
+                string_column=string_column,
+            )
+            if bound is not None:
+                upper_timestamp, upper_string = bound
+
+        return OrderedNodeMerge(
+            fallback=pipeline,
+            variable=scan.variable,
+            tables=tuple(ordered_tables),
+            indexes=tuple(index_names),
+            timestamp_column=timestamp_column,
+            string_column=string_column,
+            limit=clause.limit,
+            predicate=predicate,
+            upper_timestamp=upper_timestamp,
+            upper_string=upper_string,
+        )
+
+    @classmethod
+    def _ordered_filter_excludes_table(
+        cls, expression: Expression, variable: str, table: TableDef
+    ) -> bool:
+        """Prove that a polymorphic table can never make the WHERE predicate true.
+
+        A missing property reads as ``NULL``.  SQL/Cypher comparisons involving that value are
+        therefore unknown and a filter rejects the row.  This deliberately small proof lets an
+        internal metadata table that lacks the ordered columns stay out of a polymorphic merge,
+        but only when the complete predicate proves that every one of its rows is rejected.
+        """
+
+        if isinstance(expression, BinaryOperation):
+            if expression.operator == "AND":
+                return cls._ordered_filter_excludes_table(
+                    expression.left, variable, table
+                ) or cls._ordered_filter_excludes_table(
+                    expression.right, variable, table
+                )
+            if expression.operator == "OR":
+                return cls._ordered_filter_excludes_table(
+                    expression.left, variable, table
+                ) and cls._ordered_filter_excludes_table(
+                    expression.right, variable, table
+                )
+            if expression.operator in ("=", "<>", "<", "<=", ">", ">="):
+                return cls._ordered_operand_is_missing_property(
+                    expression.left, variable, table
+                ) or cls._ordered_operand_is_missing_property(
+                    expression.right, variable, table
+                )
+            return False
+        if isinstance(expression, NullCheck) and expression.negated:
+            return cls._ordered_operand_is_missing_property(
+                expression.operand, variable, table
+            )
+        return False
+
+    @staticmethod
+    def _ordered_operand_is_missing_property(
+        expression: Expression, variable: str, table: TableDef
+    ) -> bool:
+        return (
+            isinstance(expression, Property)
+            and isinstance(expression.subject, Variable)
+            and expression.subject.name == variable
+            and all(column.name != expression.key for column in table.columns)
+        )
+
+    @staticmethod
+    def _ordered_filter_is_total(expression: Expression, variable: str) -> bool:
+        """Admit only the scalar predicate subset that cannot hide a late refusal."""
+
+        if isinstance(expression, NullCheck):
+            return _Planner._ordered_filter_operand(expression.operand, variable)
+        if isinstance(expression, UnaryOperation):
+            return expression.operator == "NOT" and _Planner._ordered_filter_is_total(
+                expression.operand, variable
+            )
+        if not isinstance(expression, BinaryOperation):
+            return False
+        if expression.operator in ("AND", "OR"):
+            return _Planner._ordered_filter_is_total(
+                expression.left, variable
+            ) and _Planner._ordered_filter_is_total(expression.right, variable)
+        if expression.operator == "IN":
+            return _Planner._ordered_filter_operand(
+                expression.left, variable
+            ) and isinstance(expression.right, ListExpression) and all(
+                _Planner._ordered_scalar_is_total(element, variable)
+                for element in expression.right.elements
+            )
+        if expression.operator not in ("=", "<>", "<", "<=", ">", ">="):
+            return False
+        return _Planner._ordered_filter_operand(
+            expression.left, variable
+        ) and _Planner._ordered_filter_operand(expression.right, variable)
+
+    @staticmethod
+    def _ordered_filter_operand(expression: Expression, variable: str) -> bool:
+        """Recognize total leaves used by the Pulse page filters and keyset predicate."""
+
+        return _Planner._ordered_scalar_is_total(expression, variable)
+
+    @staticmethod
+    def _ordered_scalar_is_total(expression: Expression, variable: str) -> bool:
+        """Recognize scalar expressions that cannot hide a refusal below the ordered K."""
+
+        if isinstance(expression, (Literal, Parameter)):
+            return True
+        if isinstance(expression, Property):
+            return isinstance(expression.subject, Variable) and (
+                expression.subject.name == variable
+            )
+        if not isinstance(expression, FunctionCall):
+            return False
+        if expression.named_arguments or expression.distinct or expression.star:
+            return False
+        name = expression.name.upper()
+        if name == LABEL_FUNCTION:
+            return len(expression.arguments) == 1 and isinstance(
+                expression.arguments[0], Variable
+            ) and expression.arguments[0].name == variable
+        if name == TIMESTAMP_FUNCTION:
+            # Literal/parameter conversions are bound before the first row. A property conversion
+            # can refuse only on a later row, which an early LIMIT must never conceal.
+            return len(expression.arguments) == 1 and isinstance(
+                expression.arguments[0], (Literal, Parameter)
+            )
+        if name == COALESCE_FUNCTION:
+            return bool(expression.arguments) and all(
+                _Planner._ordered_scalar_is_total(argument, variable)
+                for argument in expression.arguments
+            )
+        return False
+
+    @staticmethod
+    def _ordered_keyset_bound(
+        predicate: Expression,
+        *,
+        variable: str,
+        timestamp_column: str,
+        string_column: str,
+    ) -> tuple[Expression, Expression] | None:
+        """Extract only ``ts < bound OR (ts = bound AND id < bound)`` from conjunctions."""
+
+        terms: list[Expression] = []
+        pending = [predicate]
+        while pending:
+            current = pending.pop()
+            if isinstance(current, BinaryOperation) and current.operator == "AND":
+                pending.extend((current.right, current.left))
+            else:
+                terms.append(current)
+
+        def property_is(expression: Expression, column: str) -> bool:
+            return (
+                isinstance(expression, Property)
+                and isinstance(expression.subject, Variable)
+                and expression.subject.name == variable
+                and expression.key == column
+            )
+
+        for term in terms:
+            if not isinstance(term, BinaryOperation) or term.operator != "OR":
+                continue
+            earlier = term.left
+            tied = term.right
+            if (
+                not isinstance(earlier, BinaryOperation)
+                or earlier.operator != "<"
+                or not property_is(earlier.left, timestamp_column)
+                or not isinstance(tied, BinaryOperation)
+                or tied.operator != "AND"
+            ):
+                continue
+            same_time = tied.left
+            earlier_id = tied.right
+            if (
+                not isinstance(same_time, BinaryOperation)
+                or same_time.operator != "="
+                or not property_is(same_time.left, timestamp_column)
+                or same_time.right != earlier.right
+                or not isinstance(earlier_id, BinaryOperation)
+                or earlier_id.operator != "<"
+                or not property_is(earlier_id.left, string_column)
+            ):
+                continue
+            return earlier.right, earlier_id.right
+        return None
 
     def _projected(self, clause: ReturnClause) -> tuple[ReturnItem, ...]:
         """Return the projected items, giving every one of them the name it is read under."""

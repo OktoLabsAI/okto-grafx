@@ -19,11 +19,13 @@ from enum import Enum
 from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
+    ORDERED_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     index_generation_file,
     require_index_name,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.keys import (
     MAX_EXPECTED_CARDINALITY,
     validate_bucket_count,
@@ -33,6 +35,7 @@ from okto_grafx.domain.model.schema import is_identifier
 
 __all__ = [
     "IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY",
+    "ORDERED_SECONDARY_INDEXES_V1_CAPABILITY",
     "CatalogIndexDefinition",
     "IndexGenerationDescriptor",
     "IndexGenerationState",
@@ -41,6 +44,9 @@ __all__ = [
 
 IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: str = "identity_secondary_indexes_v1"
 """Required catalog-v2 capability introduced by P2-ID v1."""
+
+ORDERED_SECONDARY_INDEXES_V1_CAPABILITY: str = "ordered_secondary_indexes_v1"
+"""Required catalog-v2 capability for persistent ordered exact indexes."""
 
 _MAX_U32: int = 0xFFFFFFFF
 _MAX_U64: int = 0xFFFFFFFFFFFFFFFF
@@ -174,6 +180,7 @@ class CatalogIndexDefinition:
     positions: tuple[int, ...]
     visibility: IndexVisibility
     key_derivation: str = COLUMN_KEY_DERIVATION
+    layout: IndexLayout = IndexLayout.HASH
     automatic: bool = False
     expected_cardinality: int | None = None
     generations: tuple[IndexGenerationDescriptor, ...] = ()
@@ -272,6 +279,8 @@ class CatalogIndexDefinition:
 
         visibility = IndexVisibility.parse(self.visibility)
         object.__setattr__(self, "visibility", visibility)
+        layout = IndexLayout.parse(self.layout)
+        object.__setattr__(self, "layout", layout)
         if visibility is not IndexVisibility.EXACT:
             raise GrafxIndexError(
                 "Catalog-v2 managed indexes are exact access paths; proximity/vector "
@@ -283,11 +292,52 @@ class CatalogIndexDefinition:
         if self.key_derivation not in {
             COLUMN_KEY_DERIVATION,
             RECORD_ID_KEY_DERIVATION,
+            ORDERED_KEY_DERIVATION,
         }:
             raise GrafxIndexError(
-                "P2-ID v1 persists only the columns and record_id_u64_v1 key derivations.",
+                "The catalog persists only the columns, record_id_u64_v1 and "
+                "ordered_timestamp_string_v1 key derivations.",
                 field="key_derivation",
                 value=self.key_derivation,
+                index=self.name,
+            )
+        if layout is IndexLayout.ORDERED:
+            if self.key_derivation != ORDERED_KEY_DERIVATION:
+                raise GrafxIndexError(
+                    "An ordered catalog index requires the ordered_timestamp_string_v1 "
+                    "derivation.",
+                    field="key_derivation",
+                    value=self.key_derivation,
+                    index=self.name,
+                )
+            if len(self.positions) != 2:
+                raise GrafxIndexError(
+                    "The ordered v1 layout keys exactly two column positions.",
+                    field="positions",
+                    value=repr(self.positions),
+                    index=self.name,
+                )
+            if self.automatic:
+                raise GrafxIndexError(
+                    "Ordered v1 indexes are created explicitly, not as schema-derived "
+                    "automatic indexes.",
+                    field="automatic",
+                    value=True,
+                    index=self.name,
+                )
+            if self.expected_cardinality is not None:
+                raise GrafxIndexError(
+                    "The ordered v1 layout has no expected-cardinality sizing option.",
+                    field="expected_cardinality",
+                    value=self.expected_cardinality,
+                    index=self.name,
+                )
+        elif self.key_derivation == ORDERED_KEY_DERIVATION:
+            raise GrafxIndexError(
+                "The ordered_timestamp_string_v1 derivation belongs only to the ordered "
+                "layout.",
+                field="layout",
+                value=layout.value,
                 index=self.name,
             )
         self._validate_key_contract(visibility)
@@ -376,6 +426,18 @@ class CatalogIndexDefinition:
                     index=self.name,
                 )
             previous_nonce = generation.artifact_nonce
+            if (
+                self.layout is IndexLayout.ORDERED
+                and generation.bucket_count != 1
+            ):
+                raise GrafxIndexError(
+                    "An ordered generation reserves bucket_count=1 as its binary-stable "
+                    "sentinel.",
+                    field="bucket_count",
+                    value=generation.bucket_count,
+                    index=self.name,
+                    artifact_nonce=generation.artifact_nonce,
+                )
             active_count += generation.state is IndexGenerationState.ACTIVE
             building_count += generation.state is IndexGenerationState.BUILDING
         if active_count > 1:
@@ -555,4 +617,5 @@ class CatalogIndexDefinition:
             bucket_count=selected.bucket_count,
             key_derivation=self.key_derivation,
             artifact_nonce=selected.artifact_nonce,
+            layout=self.layout,
         )

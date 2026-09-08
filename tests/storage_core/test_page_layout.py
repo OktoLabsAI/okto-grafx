@@ -151,7 +151,7 @@ def test_a_slot_entry_outside_sixteen_bits_is_refused() -> None:
 
 
 def test_the_page_type_values_are_the_ones_the_contract_lists() -> None:
-    assert [int(member) for member in PageType] == [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    assert [int(member) for member in PageType] == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     assert PageType.FREE == 0
     assert PageType.META == 1
     assert PageType.HEAP == 2
@@ -161,6 +161,9 @@ def test_the_page_type_values_are_the_ones_the_contract_lists() -> None:
     assert PageType.OVERFLOW == 6
     assert PageType.CONTROL_SLOT == 7
     assert PageType.CONTROL_HEADER == 8
+    assert PageType.INDEX_ORDERED_ROOT == 9
+    assert PageType.INDEX_ORDERED_INTERNAL == 10
+    assert PageType.INDEX_ORDERED_LEAF == 11
 
 
 @pytest.mark.parametrize("page_size", [MIN_PAGE_SIZE, 512, 1024, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE])

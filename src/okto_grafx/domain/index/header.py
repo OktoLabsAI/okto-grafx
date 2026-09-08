@@ -31,12 +31,15 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.ids import NO_LSN, PROVISIONAL_CSN, Lsn
 from okto_grafx.domain.index.definition import DEFINITION_DIGEST_SIZE
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 
 __all__ = [
     "INDEX_HEADER_FORMAT_VERSION",
     "INDEX_HEADER_SIZE",
     "INDEX_HEADER_SLOT",
+    "ORDERED_INDEX_HEADER_FORMAT_VERSION",
+    "ORDERED_INDEX_HEADER_SIZE",
     "IndexHeader",
 ]
 
@@ -44,13 +47,28 @@ INDEX_HEADER_SLOT: int = 1
 """Slot 1 of the reserved header page. Slot 0 belongs to the file header C1 writes."""
 
 INDEX_HEADER_FORMAT_VERSION: int = 2
-"""The version this build writes. Version 1 remains readable with nonce zero."""
+"""The version the established hash layout writes. Version 1 remains readable."""
+
+ORDERED_INDEX_HEADER_FORMAT_VERSION: int = 3
+"""The header version that carries an explicit ordered-layout discriminator."""
 
 _HEADER_V1_STRUCT: struct.Struct = struct.Struct("<HBBIIQQ16s")
 _HEADER_STRUCT: struct.Struct = struct.Struct("<HBBIIQQ16sQ")
+_ORDERED_HEADER_STRUCT: struct.Struct = struct.Struct("<HBBB3xIIQQ16sQ")
 
 INDEX_HEADER_SIZE: int = _HEADER_STRUCT.size
-"""Bytes of the encoded index header record."""
+"""Bytes of the established format-2 hash index header record."""
+
+ORDERED_INDEX_HEADER_SIZE: int = _ORDERED_HEADER_STRUCT.size
+"""Bytes of the format-3 ordered index header record."""
+
+_LAYOUT_CODES: dict[IndexLayout, int] = {
+    IndexLayout.HASH: 1,
+    IndexLayout.ORDERED: 2,
+}
+_LAYOUT_BY_CODE: dict[int, IndexLayout] = {
+    code: layout for layout, code in _LAYOUT_CODES.items()
+}
 
 _VISIBILITY_CODES: dict[IndexVisibility, int] = {
     IndexVisibility.EXACT: 1,
@@ -83,6 +101,7 @@ class IndexHeader:
     artifact_nonce: int = 0
     format_version: int = INDEX_HEADER_FORMAT_VERSION
     flags: int = 0
+    layout: IndexLayout = IndexLayout.HASH
 
     def __post_init__(self) -> None:
         """Refuse a header whose fields could not be encoded or could not be true."""
@@ -92,6 +111,7 @@ class IndexHeader:
                 field="visibility",
                 value=repr(self.visibility),
             )
+        object.__setattr__(self, "layout", IndexLayout.parse(self.layout))
         if not isinstance(self.digest, (bytes, bytearray, memoryview)):
             raise GrafxIndexError(
                 f"An index header needs a digest of bytes; got {type(self.digest).__name__}.",
@@ -126,6 +146,19 @@ class IndexHeader:
                     field=field,
                     value=repr(value),
                 )
+        if self.format_version > ORDERED_INDEX_HEADER_FORMAT_VERSION:
+            raise GrafxSchemaVersionMismatch(
+                "This build cannot encode a future index header format.",
+                field="format_version",
+                value=self.format_version,
+                supported=ORDERED_INDEX_HEADER_FORMAT_VERSION,
+            )
+        if self.format_version == 0:
+            raise GrafxIndexError(
+                "An index header cannot use format version zero.",
+                field="format_version",
+                value=0,
+            )
         for field, value in (
             ("built_through_lsn", self.built_through_lsn),
             ("reconciled_through_lsn", self.reconciled_through_lsn),
@@ -136,6 +169,36 @@ class IndexHeader:
                     f"heap versions in {field}.",
                     field=field,
                     value=value,
+                )
+        if self.format_version < ORDERED_INDEX_HEADER_FORMAT_VERSION:
+            if self.layout is not IndexLayout.HASH:
+                raise GrafxIndexError(
+                    "Index header formats 1 and 2 describe only the hash layout.",
+                    field="layout",
+                    value=self.layout.value,
+                    format_version=self.format_version,
+                )
+        elif self.format_version == ORDERED_INDEX_HEADER_FORMAT_VERSION:
+            if self.layout is not IndexLayout.ORDERED:
+                raise GrafxIndexError(
+                    "Index header format 3 is reserved for the ordered layout.",
+                    field="layout",
+                    value=self.layout.value,
+                    format_version=self.format_version,
+                )
+            if self.visibility is not IndexVisibility.EXACT:
+                raise GrafxIndexError(
+                    "Index header format 3 describes only an exact ordered access path.",
+                    field="visibility",
+                    value=self.visibility.value,
+                    format_version=self.format_version,
+                )
+            if self.bucket_count != 1:
+                raise GrafxIndexError(
+                    "Index header format 3 reserves bucket_count=1 as its layout sentinel.",
+                    field="bucket_count",
+                    value=self.bucket_count,
+                    format_version=self.format_version,
                 )
 
     def advanced_to(self, lsn: Lsn) -> IndexHeader:
@@ -196,6 +259,19 @@ class IndexHeader:
                 self.reconciled_through_lsn,
                 self.digest,
             )
+        if self.format_version == ORDERED_INDEX_HEADER_FORMAT_VERSION:
+            return _ORDERED_HEADER_STRUCT.pack(
+                self.format_version,
+                _VISIBILITY_CODES[self.visibility],
+                _LAYOUT_CODES[self.layout],
+                self.flags,
+                self.table_id,
+                self.bucket_count,
+                self.built_through_lsn,
+                self.reconciled_through_lsn,
+                self.digest,
+                self.artifact_nonce,
+            )
         return _HEADER_STRUCT.pack(
             self.format_version,
             _VISIBILITY_CODES[self.visibility],
@@ -226,14 +302,48 @@ class IndexHeader:
                 value=len(image),
             )
         format_version = struct.unpack_from("<H", image, 0)[0]
-        if format_version > INDEX_HEADER_FORMAT_VERSION:
+        if format_version > ORDERED_INDEX_HEADER_FORMAT_VERSION:
             raise GrafxSchemaVersionMismatch(
-                f"This build reads index format {INDEX_HEADER_FORMAT_VERSION} and below; the "
+                f"This build reads index format {ORDERED_INDEX_HEADER_FORMAT_VERSION} and "
+                "below; the "
                 f"file declares {format_version}.",
                 field="format_version",
                 value=format_version,
             )
-        if format_version >= 2:
+        if format_version == 0:
+            raise GrafxCorruptionDetected(
+                "An index header declares format version zero.",
+                field="format_version",
+                value=0,
+            )
+        if format_version == ORDERED_INDEX_HEADER_FORMAT_VERSION:
+            if len(image) < ORDERED_INDEX_HEADER_SIZE:
+                raise GrafxCorruptionDetected(
+                    f"An ordered index header needs {ORDERED_INDEX_HEADER_SIZE} bytes; got "
+                    f"{len(image)}.",
+                    field="index_header",
+                    value=len(image),
+                )
+            (
+                format_version,
+                visibility,
+                layout_code,
+                flags,
+                table_id,
+                bucket_count,
+                built_through_lsn,
+                reconciled_through_lsn,
+                digest,
+                artifact_nonce,
+            ) = _ORDERED_HEADER_STRUCT.unpack_from(image, 0)
+            layout = _LAYOUT_BY_CODE.get(layout_code)
+            if layout is None:
+                raise GrafxCorruptionDetected(
+                    f"An index header declares unknown layout code {layout_code}.",
+                    field="layout",
+                    value=layout_code,
+                )
+        elif format_version >= 2:
             if len(image) < INDEX_HEADER_SIZE:
                 raise GrafxCorruptionDetected(
                     f"An index header at format {format_version} needs {INDEX_HEADER_SIZE} "
@@ -252,6 +362,7 @@ class IndexHeader:
                 digest,
                 artifact_nonce,
             ) = _HEADER_STRUCT.unpack_from(image, 0)
+            layout = IndexLayout.HASH
         else:
             (
                 format_version,
@@ -264,6 +375,7 @@ class IndexHeader:
                 digest,
             ) = _HEADER_V1_STRUCT.unpack_from(image, 0)
             artifact_nonce = 0
+            layout = IndexLayout.HASH
         known = _VISIBILITY_BY_CODE.get(visibility)
         if known is None:
             raise GrafxCorruptionDetected(
@@ -296,4 +408,5 @@ class IndexHeader:
             artifact_nonce=artifact_nonce,
             format_version=format_version,
             flags=flags,
+            layout=layout,
         )

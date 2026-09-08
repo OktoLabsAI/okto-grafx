@@ -47,6 +47,7 @@ def _labels(result: QueryResult) -> list[str]:
 
 def _assert_public_rows_hold_no_pending_reference(result: QueryResult) -> None:
     """Pin the public boundary: transient row identities are never result values."""
+
     def contains_pending(value: object) -> bool:
         if isinstance(value, PendingRowRef):
             return True
@@ -66,9 +67,7 @@ def test_created_node_is_visible_to_keyed_and_unkeyed_match(database: object) ->
     with database.begin("write") as txn:
         txn.execute("CREATE (:Person {id: 1, name: 'Ada', age: 36})")
 
-        keyed = txn.execute(
-            "MATCH (p:Person {id: 1}) RETURN p.id, p.name, p.age"
-        )
+        keyed = txn.execute("MATCH (p:Person {id: 1}) RETURN p.id, p.name, p.age")
         unkeyed = txn.execute(
             "MATCH (p:Person) RETURN p.id, p.name, p.age ORDER BY p.id"
         )
@@ -88,17 +87,13 @@ def test_created_node_can_be_set_then_read_and_committed(database: object) -> No
         changed = txn.execute(
             "MATCH (p:Person {id: 1}) SET p.name = 'Ada L' SET p.age = 37"
         )
-        owned = txn.execute(
-            "MATCH (p:Person {id: 1}) RETURN p.name, p.age"
-        )
+        owned = txn.execute("MATCH (p:Person {id: 1}) RETURN p.name, p.age")
 
         assert changed.statistics["rows_updated"] == 2
         assert owned.rows == (("Ada L", 37),)
         _assert_public_rows_hold_no_pending_reference(owned)
 
-    committed = database.execute(
-        "MATCH (p:Person {id: 1}) RETURN p.name, p.age"
-    )
+    committed = database.execute("MATCH (p:Person {id: 1}) RETURN p.name, p.age")
     assert committed.rows == (("Ada L", 37),)
 
 
@@ -151,9 +146,9 @@ def test_nested_pending_binding_is_detached_before_a_write_is_released(
         assert changed.rows == (((0,),),)
         _assert_public_rows_hold_no_pending_reference(changed)
 
-    assert database.execute(
-        "MATCH (p:Person {id: 1}) RETURN p.name"
-    ).rows == (("after",),)
+    assert database.execute("MATCH (p:Person {id: 1}) RETURN p.name").rows == (
+        ("after",),
+    )
 
 
 def test_created_node_can_be_deleted_then_stays_absent_after_commit(
@@ -197,26 +192,23 @@ def test_pending_node_identity_does_not_alias_other_pending_nodes(
         txn.execute("CREATE (:Person {id: 2, name: 'Grace', age: 37})")
 
         deleted = txn.execute(
-            "MATCH (a:Person), (b:Person) "
-            "WHERE a = b AND b.id = 1 DELETE a"
+            "MATCH (a:Person), (b:Person) WHERE a = b AND b.id = 1 DELETE a"
         )
 
         assert deleted.statistics["rows_deleted"] == 1
-        assert txn.execute(
-            "MATCH (p:Person) RETURN p.id ORDER BY p.id"
-        ).rows == ((2,),)
+        assert txn.execute("MATCH (p:Person) RETURN p.id ORDER BY p.id").rows == ((2,),)
 
     assert database.execute("MATCH (p:Person) RETURN p.id").rows == ((2,),)
 
 
-def test_cartesian_rows_delete_one_pending_reference_only_once(database: object) -> None:
+def test_cartesian_rows_delete_one_pending_reference_only_once(
+    database: object,
+) -> None:
     with database.begin("write") as txn:
         txn.execute("CREATE (:Person {id: 1, name: 'Ada', age: 36})")
         txn.execute("CREATE (:Person {id: 2, name: 'Grace', age: 37})")
 
-        deleted = txn.execute(
-            "MATCH (a:Person), (b:Person) WHERE a.id = 1 DELETE a"
-        )
+        deleted = txn.execute("MATCH (a:Person), (b:Person) WHERE a.id = 1 DELETE a")
 
         assert deleted.statistics["rows_deleted"] == 1
         assert txn.execute("MATCH (p:Person) RETURN p.id").rows == ((2,),)
@@ -224,7 +216,9 @@ def test_cartesian_rows_delete_one_pending_reference_only_once(database: object)
     assert database.execute("MATCH (p:Person) RETURN p.id").rows == ((2,),)
 
 
-def test_uncommitted_node_overlay_is_visible_only_to_its_owner(database: object) -> None:
+def test_uncommitted_node_overlay_is_visible_only_to_its_owner(
+    database: object,
+) -> None:
     writer = database.begin("write")
     writer.execute("CREATE (:Person {id: 1, name: 'Ada', age: 36})")
     assert writer.execute("MATCH (p:Person) RETURN p.name").rows == (("Ada",),)
@@ -240,20 +234,78 @@ def test_uncommitted_node_overlay_is_visible_only_to_its_owner(database: object)
     assert database.execute("MATCH (p:Person) RETURN p.name").rows == (("Ada",),)
 
 
-def test_dirty_table_scans_then_committed_table_uses_its_exact_index(
+def test_dirty_table_uses_overlayed_exact_index_before_and_after_commit(
     database: object,
 ) -> None:
     with database.begin("write") as txn:
         txn.execute("CREATE (:Person {id: 1, name: 'Ada', age: 36})")
         dirty = txn.execute("MATCH (p:Person {id: 1}) RETURN p.name")
 
-        assert "NodeScan" in _labels(dirty)
-        assert "IndexSeek" not in _labels(dirty)
+        assert dirty.rows == (("Ada",),)
+        assert "IndexSeek" in _labels(dirty)
+        assert "NodeScan" not in _labels(dirty)
+        assert dirty.statistics["rows_seeked"] == 1
 
     committed = database.execute("MATCH (p:Person {id: 1}) RETURN p.name")
     assert committed.rows == (("Ada",),)
     assert "IndexSeek" in _labels(committed)
     assert "NodeScan" not in _labels(committed)
+
+
+def test_dirty_primary_seek_overlays_key_update_value_update_and_delete(
+    database: object,
+) -> None:
+    with database.begin("write") as seed:
+        seed.execute("CREATE (:Person {id: 1, name: 'Ada', age: 36})")
+
+    with database.begin("write") as txn:
+        txn.execute("MATCH (p:Person {id: 1}) SET p.id = 2 SET p.name = 'Ada L'")
+
+        old = txn.execute("MATCH (p:Person {id: 1}) RETURN p.name")
+        moved = txn.execute("MATCH (p:Person {id: 2}) RETURN p.name")
+        txn.execute("MATCH (p:Person {id: 2}) DELETE p")
+        deleted = txn.execute("MATCH (p:Person {id: 2}) RETURN p.name")
+
+        assert old.rows == ()
+        assert moved.rows == (("Ada L",),)
+        assert deleted.rows == ()
+        for result in (old, moved, deleted):
+            assert "IndexSeek" in _labels(result)
+            assert "NodeScan" not in _labels(result)
+
+    assert database.execute("MATCH (p:Person) RETURN p.id").rows == ()
+
+
+def test_two_dirty_primary_endpoint_seeks_do_not_scan_the_node_table(
+    tmp_path: Path,
+) -> None:
+    handle = okto_grafx.connect(str(tmp_path / "edge-db"))
+    try:
+        with handle.begin("write") as schema:
+            schema.execute(
+                "CREATE NODE TABLE Entity(id STRING, name STRING, PRIMARY KEY(id))"
+            )
+            schema.execute("CREATE REL TABLE Links(FROM Entity TO Entity)")
+
+        with handle.begin("write") as txn:
+            for identity in range(100):
+                txn.execute(
+                    "CREATE (:Entity {id: $id, name: $name})",
+                    {"id": f"n{identity}", "name": f"node-{identity}"},
+                )
+            linked = txn.execute(
+                "MATCH (a:Entity {id: $source}), (b:Entity {id: $target}) "
+                "CREATE (a)-[:Links]->(b) RETURN a.id, b.id",
+                {"source": "n17", "target": "n83"},
+            )
+
+            assert linked.rows == (("n17", "n83"),)
+            assert linked.statistics["rows_seeked"] == 2
+            assert linked.statistics.get("rows_scanned", 0) == 0
+            assert _labels(linked).count("IndexSeek") == 2
+            assert "NodeScan" not in _labels(linked)
+    finally:
+        handle.close()
 
 
 @pytest.mark.parametrize(
@@ -266,9 +318,7 @@ def test_dirty_table_scans_then_committed_table_uses_its_exact_index(
 def test_pending_update_or_delete_budget_refusal_restores_the_statement(
     tmp_path: Path, statement: str
 ) -> None:
-    handle = okto_grafx.connect(
-        str(tmp_path / "budget-db"), max_transaction_rows=1
-    )
+    handle = okto_grafx.connect(str(tmp_path / "budget-db"), max_transaction_rows=1)
     try:
         with handle.begin("write") as schema:
             schema.execute(
@@ -289,14 +339,14 @@ def test_pending_update_or_delete_budget_refusal_restores_the_statement(
             "txn_id": writer.txn_id,
         }
         assert tuple(writer._context.row_intents) == accepted
-        assert writer.execute(
-            "MATCH (p:Person {id: 1}) RETURN p.name"
-        ).rows == (("Ada",),)
+        assert writer.execute("MATCH (p:Person {id: 1}) RETURN p.name").rows == (
+            ("Ada",),
+        )
         writer.commit()
 
-        assert handle.execute(
-            "MATCH (p:Person {id: 1}) RETURN p.name"
-        ).rows == (("Ada",),)
+        assert handle.execute("MATCH (p:Person {id: 1}) RETURN p.name").rows == (
+            ("Ada",),
+        )
     finally:
         handle.close()
 
@@ -336,9 +386,12 @@ def test_failed_relationship_handover_discards_endpoint_read_guards(
         assert tuple(writer._context.row_intents) == expected_rows
         assert writer._context.read_partitions == expected_reads
         assert writer._context.write_partitions == expected_writes
-        assert writer.execute(
-            "MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id, b.id"
-        ).rows == ()
+        assert (
+            writer.execute(
+                "MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id, b.id"
+            ).rows
+            == ()
+        )
     finally:
         writer.rollback()
 
@@ -346,9 +399,7 @@ def test_failed_relationship_handover_discards_endpoint_read_guards(
 def test_budget_refusal_mid_handover_unwinds_stored_and_pending_deletes(
     tmp_path: Path,
 ) -> None:
-    handle = okto_grafx.connect(
-        str(tmp_path / "handover-db"), max_transaction_rows=2
-    )
+    handle = okto_grafx.connect(str(tmp_path / "handover-db"), max_transaction_rows=2)
     try:
         with handle.begin("write") as schema:
             schema.execute(
@@ -375,14 +426,18 @@ def test_budget_refusal_mid_handover_unwinds_stored_and_pending_deletes(
             "txn_id": writer.txn_id,
         }
         assert tuple(writer._context.row_intents) == accepted
-        assert writer.execute(
-            "MATCH (p:Person) RETURN p.id ORDER BY p.id"
-        ).rows == ((1,), (2,), (9,))
+        assert writer.execute("MATCH (p:Person) RETURN p.id ORDER BY p.id").rows == (
+            (1,),
+            (2,),
+            (9,),
+        )
         writer.commit()
 
-        assert handle.execute(
-            "MATCH (p:Person) RETURN p.id ORDER BY p.id"
-        ).rows == ((1,), (2,), (9,))
+        assert handle.execute("MATCH (p:Person) RETURN p.id ORDER BY p.id").rows == (
+            (1,),
+            (2,),
+            (9,),
+        )
     finally:
         handle.close()
 
@@ -402,9 +457,7 @@ def test_similarity_over_a_dirty_node_table_refuses_before_vector_search(
             )
 
         writer = handle.begin("write")
-        writer.execute(
-            "CREATE (:Chunk {id: 1, embedding: [1.0, 0.0, 0.0, 0.0]})"
-        )
+        writer.execute("CREATE (:Chunk {id: 1, embedding: [1.0, 0.0, 0.0, 0.0]})")
 
         def search_must_not_run(*_args: object, **_kwargs: object) -> object:
             raise AssertionError("dirty-owner refusal must precede the vector engine")
@@ -442,7 +495,9 @@ def test_pending_node_cannot_reach_the_heap_as_a_relationship_endpoint(
             schema.execute("CREATE REL TABLE Knows(FROM Person TO Person, since INT64)")
 
         def endpoint_check_must_not_run(*_args: object, **_kwargs: object) -> object:
-            raise AssertionError("a pending endpoint must not reach the physical heap door")
+            raise AssertionError(
+                "a pending endpoint must not reach the physical heap door"
+            )
 
         monkeypatch.setattr(
             type(handle._heap), "require_endpoints", endpoint_check_must_not_run
@@ -455,7 +510,9 @@ def test_pending_node_cannot_reach_the_heap_as_a_relationship_endpoint(
                 "CREATE (b:Person {id: 11, name: 'B'}) "
                 "CREATE (a)-[:Knows {since: 2020}]->(b)"
             )
-        assert same_statement_raised.value.details["operation"] == "relationship_endpoint"
+        assert (
+            same_statement_raised.value.details["operation"] == "relationship_endpoint"
+        )
         assert same_statement_raised.value.details["field"] == "source"
         assert same_statement._context.row_intents == []
         same_statement.rollback()
@@ -485,12 +542,14 @@ def test_detach_delete_refuses_an_incident_relationship_held_by_same_statement(
             assert raised.value.details["operation"] == "detach_delete"
             assert writer._context.row_intents == []
 
-        assert handle.execute(
-            "MATCH (p:Person) RETURN p.id ORDER BY p.id"
-        ).rows == ((1,), (2,))
-        assert handle.execute(
-            "MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.id"
-        ).rows == ()
+        assert handle.execute("MATCH (p:Person) RETURN p.id ORDER BY p.id").rows == (
+            (1,),
+            (2,),
+        )
+        assert (
+            handle.execute("MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.id").rows
+            == ()
+        )
     finally:
         handle.close()
 
@@ -506,9 +565,7 @@ def test_same_statement_pending_node_named_twice_by_delete_is_cancelled_once(
         assert result.statistics["rows_deleted"] == 1
         assert writer._context.row_intents == []
 
-    assert database.execute(
-        "MATCH (p:Person {id: 99}) RETURN p.id"
-    ).rows == ()
+    assert database.execute("MATCH (p:Person {id: 99}) RETURN p.id").rows == ()
 
 
 def test_malformed_pending_sequence_is_refused_before_heap_access(

@@ -11,6 +11,7 @@ import pytest
 
 import okto_grafx
 from okto_grafx.engine import query_engine as engine_module
+from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.query_engine import (
     _build_in_list_memo,
     _equal,
@@ -157,6 +158,10 @@ def test_memo_is_built_once_per_parameter_per_statement(
 def test_ceiling_declines_once_and_the_walk_answers(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # One walk per scanned row is a property of the scan path.  This statement is the exact
+    # shape NODE-IN-SEEK answers through the primary-key index, which judges the predicate on
+    # the twenty hits only; pin the scan so the memo's own behaviour is what is measured.
+    monkeypatch.setattr(IndexManager, "validated_versions_many", None, raising=False)
     monkeypatch.setattr(engine_module, "_IN_LIST_MEMO_MAX_TOTAL_ELEMENTS", 8)
     builds: list[object] = []
     original = engine_module._build_in_list_memo

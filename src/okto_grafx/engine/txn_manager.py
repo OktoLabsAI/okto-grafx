@@ -68,6 +68,7 @@ from time import perf_counter_ns
 from types import TracebackType
 from typing import Any, Literal
 
+from okto_grafx.domain.control_record import ControlRecordReader
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -86,6 +87,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     CATALOG_LEGACY_FORMAT_VERSION,
+    COMMIT_CATALOG_V1_CAPABILITY,
     HEAP_RECLAIM_V1_CAPABILITY,
     WAL_RECORD_V2_CAPABILITY,
     Catalog,
@@ -109,6 +111,7 @@ from okto_grafx.domain.index.catalog import (
     identity_index_name,
 )
 from okto_grafx.domain.index.definition import (
+    COLUMN_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
@@ -118,6 +121,7 @@ from okto_grafx.domain.index.keys import (
     identity_index_sizing,
     rehash_index_sizing,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.index.visibility import ReconcileReport
 from okto_grafx.domain.ports.clock import Clock
@@ -126,7 +130,14 @@ from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.page.layout import MAX_U64
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, RecordHeader
-from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, TableDef, encode_tuple
+from okto_grafx.domain.model.schema import (
+    ENDPOINT_COLUMN_COUNT,
+    TableDef,
+    _encode_tuple_with_proof,
+    _proved_tuple_payload,
+    TupleEncodingProofs,
+)
+from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
@@ -151,6 +162,7 @@ from okto_grafx.domain.txn.partitions import (
     validate_partitions_per_table,
 )
 from okto_grafx.domain.txn.records import (
+    COMMIT_CATALOG_PAGE_FILES,
     WalRecord,
     WalRecordLike,
     WalRecordType,
@@ -167,8 +179,8 @@ from okto_grafx.engine.commit_state_store import (
     CommitStateStore,
 )
 from okto_grafx.engine.commit_redo import CommitRedo
-from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapVacuumPlan
-from okto_grafx.engine.index_manager import IndexManager
+from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapStore, HeapVacuumPlan
+from okto_grafx.engine.index_manager import IndexManager, IndexStore
 from okto_grafx.engine.wal_manager import WalManager
 from okto_grafx.engine.coordination import (
     COMMIT_SECTION,
@@ -217,6 +229,12 @@ _CANONICAL_COMMIT_INDEX_PROJECTION_SCOPE = (
     IndexManager._commit_index_projection_scope
 )
 """Exact post-rebase projection door; subclasses retain their observable selection calls."""
+
+_CANONICAL_HEAP_INSERT = HeapStore.insert
+_CANONICAL_HEAP_INSERT_RESERVED = HeapStore.insert_reserved
+_CANONICAL_HEAP_INSERT_INITIAL_RESERVED = HeapStore.insert_initial_reserved
+_CANONICAL_HEAP_UPDATE = HeapStore.update
+"""Heap doors that accept the private tuple-encoding proof without changing collaborators."""
 
 TRANSACTION_MANAGER_METRICS: tuple[MetricDescriptor, ...] = tuple(
     metric(name)
@@ -687,6 +705,7 @@ class TransactionManager:
         "_catalog",
         "_coordinator",
         "_commit_state_store",
+        "_tuple_encoding_proofs",
         "_commit_redo",
         "_clock",
         "_metrics",
@@ -696,11 +715,13 @@ class TransactionManager:
         "_index_authority_sync_required",
         "_heap_reclaim_capable",
         "_wal_record_v2_capable",
+        "_commit_catalog_capable",
         "_catalog_changes_are_wal_logged",
         "_partitions_per_table",
         "_identity_lease_size",
         "_identity_leases",
         "_index_catalog_activation_plans",
+        "_commit_catalog_activation_plans",
         "_identity_process",
         "_identity_process_invalid",
         "_process_identity_provider",
@@ -766,6 +787,8 @@ class TransactionManager:
         database_uuid: bytes | None = None,
         control_format_version: int = 1,
         control_file_nonce: int = 0,
+        control_read_if_exists: ControlRecordReader | None = None,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
         process_identity_provider: Callable[[], object] | None = None,
         catalog_changes_are_wal_logged: bool = False,
     ) -> None:
@@ -803,6 +826,7 @@ class TransactionManager:
                 value=type(writable).__name__,
             )
         self._writable: bool = writable
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._wal: Any = wal
         self._pool: BufferPool = pool
         self._heap: Any = heap
@@ -814,8 +838,9 @@ class TransactionManager:
             database_uuid=database_uuid,
             control_format_version=control_format_version,
             file_nonce=control_file_nonce,
+            control_read_if_exists=control_read_if_exists,
         )
-        self._commit_redo = CommitRedo(pool, index_manager)
+        self._commit_redo = CommitRedo(pool, index_manager, database_uuid=database_uuid)
         self._clock: Clock = clock
         self._metrics: MetricsSink = metrics
         self._active_commit_trace: _CommitTrace | None = None
@@ -870,6 +895,7 @@ class TransactionManager:
         self._index_catalog_activation_plans: dict[
             TxnId, _IndexCatalogActivationPlan
         ] = {}
+        self._commit_catalog_activation_plans: dict[TxnId, tuple[bytes, Csn]] = {}
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
         )
@@ -1346,6 +1372,70 @@ class TransactionManager:
                     )
                 return True
 
+    def prepare_commit_catalog_activation(self, txn: TransactionContext) -> bool:
+        """Internal activation-only vertical slice; no public entry point yet.
+
+        Publish the horizon in legacy-compatible catalog page WAL before journal
+        effects. Until journal staging/replay is connected, later writes refuse
+        explicitly rather than create untracked commits. Used only by temporary
+        integration fixtures until the complete capability is certified.
+        """
+        operation = "prepare commit catalog activation"
+        self._require_fresh_index_catalog_transaction(txn, operation=operation, purpose=operation)
+        with self._participant_section():
+            self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog) or source.format_version != CATALOG_FORMAT_VERSION:
+                    raise GrafxUnsupportedOperation(
+                        "Commit catalog activation requires the identity-index catalog first.",
+                        field="format_version", remedy="maintenance.ensure_identity_indexes",
+                    )
+                if source.requires_capability(COMMIT_CATALOG_V1_CAPABILITY):
+                    return False
+                candidate = source.copy().enable_commit_catalog(1)
+                image = candidate.serialize()
+                for page_index, page_image in self._catalog.stage(candidate):
+                    self._stage_page_image(txn, self._file_ids.catalog_file, page_index, page_image)
+                self._commit_catalog_activation_plans[txn.txn_id] = (image, 1)
+                return True
+
+    def _require_commit_catalog_writer_ready(self, *, refresh: bool = False) -> None:
+        """Fail closed during this internal activation-only integration checkpoint."""
+        if refresh:
+            # A transaction may have begun before a foreign activation. After
+            # first OCC and authority adoption, test the CURRENT catalog, not the
+            # capability cached at begin. This is an existing proved view, not a
+            # new physical-authority shortcut or a whole-catalog serialization.
+            source = getattr(self._catalog, "catalog", None)
+            self._commit_catalog_capable = bool(
+                isinstance(source, Catalog)
+                and source.requires_capability(COMMIT_CATALOG_V1_CAPABILITY)
+            )
+        if self._commit_catalog_capable:
+            raise GrafxUnsupportedOperation(
+                "Commit catalog write publication is not enabled by this build yet.",
+                field="commit_catalog_publication", capability=COMMIT_CATALOG_V1_CAPABILITY,
+            )
+
+    def _rebind_commit_catalog_activation(self, txn: TransactionContext, sequence: int) -> bool:
+        original = self._commit_catalog_activation_plans.get(txn.txn_id)
+        if original is None:
+            return False
+        candidate = Catalog.deserialize(original[0])
+        candidate._retarget_commit_catalog_activation(1, sequence)
+        rebound = self._catalog.stage(candidate)
+        old_locations = {key for key in txn.page_images if key[0] == self._file_ids.catalog_file}
+        new_locations = {(self._file_ids.catalog_file, index) for index, _ in rebound}
+        if old_locations != new_locations:
+            raise GrafxTransactionStateError("Activation retarget changed page cardinality.", field="commit_catalog_activation")
+        for index, image in rebound:
+            self._stage_page_image(txn, self._file_ids.catalog_file, index, image)
+        self._commit_catalog_activation_plans[txn.txn_id] = (original[0], sequence)
+        return True
+
     def prepare_vacuum(
         self,
         txn: TransactionContext,
@@ -1442,6 +1532,8 @@ class TransactionManager:
         positions: tuple[int, ...],
         bucket_count: int,
         expected_cardinality: int | None,
+        layout: IndexLayout = IndexLayout.HASH,
+        key_derivation: str = COLUMN_KEY_DERIVATION,
     ) -> CatalogIndexDefinition:
         """Seal a full custom exact-index build into one fresh write transaction.
 
@@ -1496,6 +1588,8 @@ class TransactionManager:
                     positions=positions,
                     bucket_count=bucket_count,
                     expected_cardinality=expected_cardinality,
+                    layout=layout,
+                    key_derivation=key_derivation,
                     operation=operation,
                 )
                 published = self._published_state_in_section().last_committed_lsn
@@ -1542,21 +1636,24 @@ class TransactionManager:
         name: str,
         bucket_count: int | None = None,
         expected_cardinality: int | None = None,
+        rebuild: bool = False,
     ) -> CatalogIndexDefinition:
-        """Seal one growth-only foreground rehash into a dedicated transaction.
+        """Seal one immutable foreground replacement into a dedicated transaction.
 
-        The detached generation is built later by the ordinary commit path, after the first
-        OCC pass and while the writer lease plus ``COMMIT_SECTION`` are held.  Catalog v2 keeps
-        the former ACTIVE generation as STALE.  A v1 automatic exact index is coactivated with
-        catalog v2 in the same commit, replacing its not-yet-built migration generation so the
-        target is scanned exactly once.
+        Rehash grows a hash directory. Rebuild retains the current physical sizing and works for
+        both hash and ordered layouts, making the ordered path's append-only pages compact again.
+        In both modes the detached generation is built later by the ordinary commit path, after
+        the first OCC pass and while the writer lease plus ``COMMIT_SECTION`` are held. Catalog
+        v2 keeps the former ACTIVE generation as STALE.
         """
 
-        operation = "prepare exact-index rehash"
+        operation = (
+            "prepare exact-index rebuild" if rebuild else "prepare exact-index rehash"
+        )
         self._require_fresh_index_catalog_transaction(
             txn,
             operation=operation,
-            purpose="Exact-index rehash",
+            purpose="Exact-index rebuild" if rebuild else "Exact-index rehash",
         )
 
         with self._participant_section():
@@ -1582,6 +1679,13 @@ class TransactionManager:
 
                 published = self._published_state_in_section().last_committed_lsn
                 if source.format_version == CATALOG_LEGACY_FORMAT_VERSION:
+                    if rebuild:
+                        raise GrafxUnsupportedOperation(
+                            "Exact-index rebuild requires catalog v2 generation authority.",
+                            operation=operation,
+                            field="format_version",
+                            value=source.format_version,
+                        )
                     return self._prepare_legacy_index_rehash(
                         txn,
                         source,
@@ -1615,11 +1719,33 @@ class TransactionManager:
                 # freshness flag is deliberately repairable by the full shadow build.
                 selected = manager.active_index(logical.name, catalog=source)
                 selected.open()
-                resolved_count, resolved_expected = rehash_index_sizing(
-                    active.bucket_count,
-                    bucket_count=bucket_count,
-                    expected_cardinality=expected_cardinality,
-                )
+                if rebuild:
+                    if bucket_count is not None or expected_cardinality is not None:
+                        raise GrafxConfigurationError(
+                            "An exact-index rebuild retains physical sizing; use rehash for "
+                            "a hash-directory growth request.",
+                            operation=operation,
+                            field="sizing",
+                            bucket_count=repr(bucket_count),
+                            expected_cardinality=repr(expected_cardinality),
+                        )
+                    resolved_count = active.bucket_count
+                    resolved_expected = logical.expected_cardinality
+                else:
+                    if logical.layout is IndexLayout.ORDERED:
+                        raise GrafxUnsupportedOperation(
+                            "An ordered index has no hash directory to rehash; rebuild it into "
+                            "a compact fresh generation instead.",
+                            operation=operation,
+                            field="layout",
+                            value=logical.layout.value,
+                            index=logical.name,
+                        )
+                    resolved_count, resolved_expected = rehash_index_sizing(
+                        active.bucket_count,
+                        bucket_count=bucket_count,
+                        expected_cardinality=expected_cardinality,
+                    )
 
                 candidate = Catalog.deserialize(source.serialize())
                 candidate_logical = candidate.index_definition(logical.name)
@@ -1775,6 +1901,8 @@ class TransactionManager:
         positions: tuple[int, ...],
         bucket_count: int,
         expected_cardinality: int | None,
+        layout: IndexLayout,
+        key_derivation: str,
         operation: str,
     ) -> tuple[TableDef, CatalogIndexDefinition]:
         """Validate one custom definition without changing catalog, txn or nonce state."""
@@ -1811,6 +1939,8 @@ class TransactionManager:
             table_name=table.name,
             positions=positions,
             visibility=IndexVisibility.EXACT,
+            key_derivation=key_derivation,
+            layout=layout,
             automatic=False,
             expected_cardinality=expected_cardinality,
             generations=(placeholder,),
@@ -1825,6 +1955,17 @@ class TransactionManager:
                     value=position,
                     index=provisional.name,
                     table=table.name,
+                )
+        if provisional.layout is IndexLayout.ORDERED:
+            first, second = (table.columns[position] for position in provisional.positions)
+            if first.type is not ValueType.TIMESTAMP or second.type is not ValueType.STRING:
+                raise GrafxConfigurationError(
+                    f"Ordered index {provisional.name!r} requires TIMESTAMP then STRING; "
+                    f"got {first.type.name} then {second.type.name}.",
+                    operation=operation,
+                    field="positions",
+                    value=provisional.positions,
+                    index=provisional.name,
                 )
         if source.has_index_definition(provisional.name):
             raise GrafxConfigurationError(
@@ -2646,6 +2787,10 @@ class TransactionManager:
             and source.format_version == CATALOG_FORMAT_VERSION
             and source.requires_capability(WAL_RECORD_V2_CAPABILITY)
         )
+        self._commit_catalog_capable = bool(
+            isinstance(source, Catalog)
+            and source.requires_capability(COMMIT_CATALOG_V1_CAPABILITY)
+        )
 
     def _synchronize_committed_indexes(
         self,
@@ -3116,6 +3261,7 @@ class TransactionManager:
                 page_staging_capability=self._page_staging_capability,
                 max_transaction_rows=self._max_transaction_rows,
                 max_transaction_bytes=self._max_transaction_bytes,
+                tuple_encoding_proofs=self._tuple_encoding_proofs,
             )
             self._require_not_closed("begin a transaction")
             self._open[transaction.txn_id] = transaction
@@ -3344,6 +3490,7 @@ class TransactionManager:
         )
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._open.pop(txn.txn_id, None)
+        self._commit_catalog_activation_plans.pop(txn.txn_id, None)
         mode = txn.mode.value
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
@@ -3797,6 +3944,8 @@ class TransactionManager:
                 # rename, so only names that still exist are durable targets. Foreign images
                 # skipped as already-newer are covered by the canonical inventory below.
                 with self._close_wait_hazard():
+                    barrier_files.update(file for file in COMMIT_CATALOG_PAGE_FILES
+                                         if self._pool.storage.exists(file))
                     modified_files = {
                         file for file, _page_index in self._pool.modified_pages()
                     }
@@ -4121,10 +4270,12 @@ class TransactionManager:
             in (int(WalRecordType.INDEX_WRITE), int(WalRecordType.INDEX_RECONCILE))
         )
         page_replay = CommittedReplay(
-            effects=page_records, last_committed_lsn=replay.last_committed_lsn
+            effects=page_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
         index_replay = CommittedReplay(
-            effects=index_records, last_committed_lsn=replay.last_committed_lsn
+            effects=index_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
 
         # A long-lived participant may checkpoint WAL written by another process. Its catalog
@@ -4143,12 +4294,14 @@ class TransactionManager:
             replay,
             allow_unregistered_indexes=touched_catalog,
             _passage=redo_passage,
+            _checkpoint_lsn=checkpoint,
         )
         verified_full_preflight = self._commit_redo._verify_preflight_for(
             replay,
             full_preflight,
             allow_unregistered_indexes=touched_catalog,
             passage=redo_passage,
+            checkpoint_lsn=checkpoint,
         )
         if verified_full_preflight is not None:
             full_preflight = verified_full_preflight
@@ -4172,6 +4325,7 @@ class TransactionManager:
                 full_preflight,
                 allow_unregistered_indexes=touched_catalog,
                 passage=redo_passage,
+                checkpoint_lsn=checkpoint,
             )
             if page_preflight is None:
                 raise GrafxRecoveryRefused(
@@ -4182,6 +4336,7 @@ class TransactionManager:
                 page_replay,
                 _preflighted=page_preflight,
                 _passage=redo_passage,
+                _checkpoint_lsn=checkpoint,
             )
         if touched_catalog:
             self._catalog.adopt(self._catalog.read_from_pages())
@@ -4205,7 +4360,15 @@ class TransactionManager:
             manager.check_replay_floor(checkpoint, watermarks=watermarks)
         index_result = None
         if not skip_reapply:
-            index_result = self._commit_redo.apply(index_replay)
+            index_preflight = self._commit_redo._preflight_index_subplan(
+                replay, index_replay, full_preflight,
+                allow_unregistered_indexes=touched_catalog, passage=redo_passage,
+                checkpoint_lsn=checkpoint,
+            )
+            index_result = self._commit_redo.apply(
+                index_replay, _preflighted=index_preflight, _passage=redo_passage,
+                _checkpoint_lsn=checkpoint,
+            )
             assert page_result is not None
             for result in (page_result, index_result):
                 self._commit_redo.flush(result)
@@ -4279,6 +4442,7 @@ class TransactionManager:
                                 self._index_catalog_activation_plans.pop(
                                     txn.txn_id, None
                                 )
+                                self._commit_catalog_activation_plans.pop(txn.txn_id, None)
                                 failure = _accumulate_failure(
                                     failure,
                                     self._drain_transaction_descriptor_scope(
@@ -4303,6 +4467,7 @@ class TransactionManager:
                         self._participant_pin = None
                         self._identity_leases.clear()
                         self._index_catalog_activation_plans.clear()
+                        self._commit_catalog_activation_plans.clear()
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -4428,6 +4593,7 @@ class TransactionManager:
             self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
+            self._require_commit_catalog_writer_ready()
             activation_plan = self._index_catalog_activation_plans.get(txn.txn_id)
             if activation_plan is not None:
                 self._validate_index_catalog_activation_plan(txn, activation_plan)
@@ -4516,6 +4682,12 @@ class TransactionManager:
                                     index_authority_may_have_changed
                                 ),
                             )
+                        # A v1 durable control fence cannot contain this v2-only
+                        # capability. Preserve legacy physical-only transactions'
+                        # pre-barrier catalog-read/unsaved-value contract.
+                        self._require_commit_catalog_writer_ready(
+                            refresh=durable.format_version >= COMMIT_STATE_FORMAT_VERSION,
+                        )
                         manager = self._index_manager
                         projection_scope = getattr(
                             manager, "_commit_index_projection_scope", None
@@ -4696,7 +4868,7 @@ class TransactionManager:
                                 if commit_trace is not None:
                                     commit_trace.increment(COMMIT_RETARGETS_TOTAL)
                             self._materialized = None
-                            if not raw_batch_rolls:
+                            if not raw_batch_rolls and txn.txn_id not in self._commit_catalog_activation_plans:
                                 records = self._compress_page_records(records, images)
                             self._validate_wal_batch_budget(txn, records)
                             if commit_trace is not None and (
@@ -5041,6 +5213,19 @@ class TransactionManager:
         # provenance hook below: a malformed pending identity must not reach any collaborator,
         # and certainly must not be mistaken for a physical RecordRef by the heap.
         self._validate_row_intents(txn)
+        activation = self._commit_catalog_activation_plans.get(txn.txn_id)
+        if activation is not None:
+            expected_catalog = Catalog.deserialize(activation[0])
+            expected_catalog._retarget_commit_catalog_activation(1, activation[1])
+            expected_images = {
+                (self._file_ids.catalog_file, index): image
+                for index, image in self._catalog.stage(expected_catalog)
+            }
+            if txn.row_intents or txn.pending_records or txn.page_images != expected_images:
+                raise GrafxConfigurationError(
+                    "Commit catalog activation requires an unchanged dedicated transaction.",
+                    field="commit_catalog_activation",
+                )
         unproved = txn.unproved_page_images()
         if unproved:
             raise GrafxConfigurationError(
@@ -5388,6 +5573,7 @@ class TransactionManager:
         CSN, while the live frames stay provisional until durability is established.
         """
         base = _require_lsn("last_lsn", self._wal.last_lsn)
+        self._require_commit_catalog_writer_ready()
         page_stamps = self._group_page_stamps(rows)
         staged = list(txn.staged_pages())
         # Preserve the pre-TXN-4 deterministic page order; the grouping map follows row order.
@@ -5415,17 +5601,6 @@ class TransactionManager:
         # records, because they are part of that batch: they lengthen it, and the number they
         # carry is the number the lengthened batch gives the COMMIT record. Counting them first
         # is what breaks that circle; `_stage_index_changes` refuses if the count was wrong.
-        index_record_count = self._index_record_count(txn, rows)
-        predicted = (
-            base + len(staged) + len(txn.pending_records) + index_record_count + 1
-        )
-        if predicted >= PROVISIONAL_CSN:
-            raise GrafxTransactionStateError(
-                "The write-ahead log has exhausted its usable commit-number space; the maximum "
-                "unsigned value is reserved for provisional heap versions.",
-                field="last_lsn",
-                value=base,
-            )
         manager = self._index_manager
         uses_canonical_index_staging = (
             type(manager) is IndexManager
@@ -5436,6 +5611,29 @@ class TransactionManager:
             )
             is TransactionManager._stage_index_changes
         )
+        resolved_indexes: list[tuple[IndexStore, ...] | None] | None = (
+            [] if uses_canonical_index_staging else None
+        )
+        index_record_count = (
+            self._index_record_count(
+                txn,
+                rows,
+                _resolved_indexes=resolved_indexes,
+            )
+            if uses_canonical_index_staging
+            else self._index_record_count(txn, rows)
+        )
+        predicted = (
+            base + len(staged) + len(txn.pending_records) + index_record_count + 1
+        )
+        if predicted >= PROVISIONAL_CSN:
+            raise GrafxTransactionStateError(
+                "The write-ahead log has exhausted its usable commit-number space; the maximum "
+                "unsigned value is reserved for provisional heap versions.",
+                field="last_lsn",
+                value=base,
+            )
+        self._rebind_commit_catalog_activation(txn, predicted)
         if uses_canonical_index_staging:
             # Count and staging run in this same COMMIT_SECTION against the same immutable
             # catalog authority.  Carry that one-shot observation into the verifier instead of
@@ -5447,6 +5645,7 @@ class TransactionManager:
                 rows,
                 predicted,
                 _expected_record_count=index_record_count,
+                _resolved_indexes=resolved_indexes,
             )
         else:
             self._stage_index_changes(txn, rows, predicted)
@@ -5584,8 +5783,12 @@ class TransactionManager:
             else self._group_page_stamps(rows)
         )
         self._materialized = None
+        rebound_activation = self._rebind_commit_catalog_activation(txn, new_csn)
         for file, page_index, image in images:
             page = reusable.get((file, page_index))
+            if rebound_activation and file == self._file_ids.catalog_file:
+                image = txn.page_images[(file, page_index)]
+                page = None  # Catalog body changed, not only its generic page stamp.
             stamps = page_stamps.get(page_index, ()) if file == self._heap_file else ()
             if page is None:
                 # Not produced by _build_records in this attempt (a caller-built batch):
@@ -5659,7 +5862,11 @@ class TransactionManager:
             return None, ()
 
     def _index_record_count(
-        self, txn: TransactionContext, rows: Sequence[_RowWrite]
+        self,
+        txn: TransactionContext,
+        rows: Sequence[_RowWrite],
+        *,
+        _resolved_indexes: list[tuple[IndexStore, ...] | None] | None = None,
     ) -> int:
         """Return how many log records the index staging of these rows will produce.
 
@@ -5680,28 +5887,68 @@ class TransactionManager:
         for row in rows:
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
+                if _resolved_indexes is not None:
+                    _resolved_indexes.append(None)
                 continue
             table_name = getattr(row.table, "name", None)
             if not isinstance(table_name, str):
                 table_name = None
+            active_indexes = (
+                manager.active_indexes_for(
+                    table_id,
+                    table_name=table_name,
+                    table=row.table,
+                    txn=txn,
+                )
+                if _resolved_indexes is not None
+                else None
+            )
+            if _resolved_indexes is not None:
+                _resolved_indexes.append(active_indexes)
             if row.ended is not None:
-                total += manager.row_entry_count(
-                    table_id,
-                    row.ended_values,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                    txn=txn,
+                count = (
+                    manager.row_entry_count(
+                        table_id,
+                        row.ended_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                    )
+                    if active_indexes is None
+                    else manager.row_entry_count(
+                        table_id,
+                        row.ended_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                        _active_indexes=active_indexes,
+                    )
                 )
+                total += count
             if row.born is not None:
-                total += manager.row_entry_count(
-                    table_id,
-                    row.born_values,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                    txn=txn,
+                count = (
+                    manager.row_entry_count(
+                        table_id,
+                        row.born_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                    )
+                    if active_indexes is None
+                    else manager.row_entry_count(
+                        table_id,
+                        row.born_values,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        txn=txn,
+                        _active_indexes=active_indexes,
+                    )
                 )
+                total += count
         return total
 
     def _stage_index_changes(
@@ -5711,6 +5958,7 @@ class TransactionManager:
         csn: Csn,
         *,
         _expected_record_count: int | None = None,
+        _resolved_indexes: Sequence[tuple[IndexStore, ...] | None] | None = None,
     ) -> None:
         """Stage, on every index covering each written row, the entries that row owes it.
 
@@ -5730,40 +5978,85 @@ class TransactionManager:
         if manager is None:
             return
         before = len(txn.pending_records)
+        if _resolved_indexes is not None and len(_resolved_indexes) != len(rows):
+            raise GrafxTransactionStateError(
+                "The resolved index plan no longer matches the row batch it was built for.",
+                txn_id=txn.txn_id,
+                expected=len(rows),
+                produced=len(_resolved_indexes),
+            )
         expected = (
             self._index_record_count(txn, rows)
             if _expected_record_count is None
             else _expected_record_count
         )
-        for row in rows:
+        for position, row in enumerate(rows):
             table_id = getattr(row.table, "table_id", None)
             if table_id is None:
                 continue
             table_name = getattr(row.table, "name", None)
             if not isinstance(table_name, str):
                 table_name = None
+            active_indexes = (
+                None
+                if _resolved_indexes is None
+                else _resolved_indexes[position]
+            )
+            if _resolved_indexes is not None and active_indexes is None:
+                raise GrafxTransactionStateError(
+                    "The resolved index plan omitted a row with a table identity.",
+                    txn_id=txn.txn_id,
+                    table_id=table_id,
+                    row_position=position,
+                )
             if row.ended is not None:
-                manager.stage_row_delete(
-                    txn,
-                    table_id,
-                    row.ended,
-                    row.ended_values,
-                    csn,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                )
+                if active_indexes is None:
+                    manager.stage_row_delete(
+                        txn,
+                        table_id,
+                        row.ended,
+                        row.ended_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                    )
+                else:
+                    manager.stage_row_delete(
+                        txn,
+                        table_id,
+                        row.ended,
+                        row.ended_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        _active_indexes=active_indexes,
+                    )
             if row.born is not None:
-                manager.stage_row_insert(
-                    txn,
-                    table_id,
-                    row.born,
-                    row.born_values,
-                    csn,
-                    record_id=row.record_id,
-                    table_name=table_name,
-                    table=row.table,
-                )
+                if active_indexes is None:
+                    manager.stage_row_insert(
+                        txn,
+                        table_id,
+                        row.born,
+                        row.born_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                    )
+                else:
+                    manager.stage_row_insert(
+                        txn,
+                        table_id,
+                        row.born,
+                        row.born_values,
+                        csn,
+                        record_id=row.record_id,
+                        table_name=table_name,
+                        table=row.table,
+                        _active_indexes=active_indexes,
+                    )
         produced = len(txn.pending_records) - before
         if produced != expected:
             raise GrafxTransactionStateError(
@@ -5974,8 +6267,18 @@ class TransactionManager:
                 continue
             if intent.operation is RowOperation.UPDATE:
                 record_id, ending = self._index_row_at(intent.reference)
-                reference = heap.update(
-                    intent.table, intent.reference, intent.values, provisional
+                update = heap.update
+                update_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(update, "__func__", None) is _CANONICAL_HEAP_UPDATE
+                    else {}
+                )
+                reference = update(
+                    intent.table,
+                    intent.reference,
+                    intent.values,
+                    provisional,
+                    **update_kwargs,
                 )
                 written.append(
                     _RowWrite(
@@ -5997,12 +6300,20 @@ class TransactionManager:
                 # The extent did not exist at the locked planning point.  Install its final
                 # batch floor with the first row; every later row is then below that same floor
                 # and does not rewrite page zero.  This remains one ordinary user commit.
-                reference = heap.insert_initial_reserved(
+                insert_initial = heap.insert_initial_reserved
+                initial_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(insert_initial, "__func__", None)
+                    is _CANONICAL_HEAP_INSERT_INITIAL_RESERVED
+                    else {}
+                )
+                reference = insert_initial(
                     intent.table,
                     record_id,
                     intent.values,
                     provisional,
                     next_record_id=initial_floor,
+                    **initial_kwargs,
                 )
                 initialized_tables.add(table_id)
             elif initial_floor is not None or position in identities.leased_positions:
@@ -6010,19 +6321,37 @@ class TransactionManager:
                 if extent_proof is None:
                     extent_proof = heap.reserved_extent_proof(intent.table, record_id)
                     reserved_extent_proofs[table_id] = extent_proof
-                reference = heap.insert_reserved(
+                insert_reserved = heap.insert_reserved
+                reserved_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(insert_reserved, "__func__", None)
+                    is _CANONICAL_HEAP_INSERT_RESERVED
+                    else {}
+                )
+                reference = insert_reserved(
                     intent.table,
                     record_id,
                     intent.values,
                     provisional,
                     extent_proof=extent_proof,
+                    **reserved_kwargs,
                 )
             else:
                 # The first row of a table has no extent to reserve yet.  Its ordinary insert
                 # creates the extent and advances the floor atomically with the user commit;
                 # leasing starts on the next transaction.
-                reference = heap.insert(
-                    intent.table, record_id, intent.values, provisional
+                insert = heap.insert
+                insert_kwargs = (
+                    {"_encoding_proof": intent._encoding_proof}
+                    if getattr(insert, "__func__", None) is _CANONICAL_HEAP_INSERT
+                    else {}
+                )
+                reference = insert(
+                    intent.table,
+                    record_id,
+                    intent.values,
+                    provisional,
+                    **insert_kwargs,
                 )
             written.append(
                 _RowWrite(
@@ -6078,10 +6407,15 @@ class TransactionManager:
                 intent,
                 values=values,
                 record_id=intent.record_id if identity is None else identity,
+                # Resolving a pending endpoint creates a different values tuple.  Its former
+                # proof covered only the fixed-width validation stand-in and must not cross the
+                # heap boundary; _refuse_unresolved_intents seals the resolved row below.
+                _encoding_proof=(
+                    None if slots is not None else intent._encoding_proof
+                ),
             )
         settled_rows = tuple(resolved)
-        self._refuse_unresolved_intents(txn, settled_rows)
-        return settled_rows
+        return self._refuse_unresolved_intents(txn, settled_rows)
 
     def _prepare_identity_plan(
         self, txn: TransactionContext
@@ -6415,6 +6749,7 @@ class TransactionManager:
             epoch=_NO_EPOCH,
             owner=self,
             page_staging_capability=self._page_staging_capability,
+            tuple_encoding_proofs=self._tuple_encoding_proofs,
         )
         self._next_txn_id += 1
         # The context is intentionally not present in ``_open``; use the same unforgeable
@@ -6718,7 +7053,7 @@ class TransactionManager:
 
     def _refuse_unresolved_intents(
         self, txn: TransactionContext, intents: Sequence[RowIntent]
-    ) -> None:
+    ) -> tuple[RowIntent, ...]:
         """Refuse anything still carrying a private identity, and re-encode what will be stored.
 
         A typed refusal rather than an ``assert``: this is the boundary that keeps a transient
@@ -6727,8 +7062,10 @@ class TransactionManager:
         will be written are checked against the schema HERE, before the first of them lands, so a
         row whose resolved endpoint does not fit its column refuses while nothing has moved.
         """
+        validated: list[RowIntent] = []
         for position, intent in enumerate(intents):
             if intent.operation is RowOperation.DELETE:
+                validated.append(intent)
                 continue
             for slot, value in enumerate(intent.values):
                 if isinstance(value, PendingRowRef):
@@ -6751,7 +7088,16 @@ class TransactionManager:
                     txn_id=txn.txn_id,
                 )
             self._refuse_unstored_endpoints(txn, intent, position)
-            encode_tuple(intent.table, intent.values)
+            proof = intent._encoding_proof
+            if _proved_tuple_payload(
+                intent.table, intent.values, proof, protocol=self._tuple_encoding_proofs
+            ) is None:
+                _payload, proof = _encode_tuple_with_proof(
+                    intent.table, intent.values, protocol=self._tuple_encoding_proofs
+                )
+                intent = replace(intent, _encoding_proof=proof)
+            validated.append(intent)
+        return tuple(validated)
 
     def _refuse_unstored_endpoints(
         self, txn: TransactionContext, intent: RowIntent, position: int
@@ -7713,6 +8059,7 @@ class TransactionManager:
         descriptor_failure = self._drain_transaction_descriptor_scope(txn.txn_id)
         self._open.pop(txn.txn_id, None)
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
+        self._commit_catalog_activation_plans.pop(txn.txn_id, None)
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
         return self._mode_counts[mode], descriptor_failure

@@ -1,0 +1,201 @@
+# Configuration reference
+
+[Documentation index](README.md) · [Operations](OPERATIONS.md)
+
+
+
+`connect(path, **options)` builds a `DatabaseConfig`. Every option is validated and copied to exact
+built-in scalar values before any adapter or persisted descriptor sees it; an invalid option is
+refused with the field name the caller actually wrote.
+
+Use `from okto_grafx import DatabaseConfig, connect`. `DatabaseConfig` is immutable;
+changing your own settings object does not reconfigure an open handle. Unless
+noted otherwise, operational options are selected at open and apply to that handle.
+`connect` also accepts `pathlib.Path`; `DatabaseConfig.path` itself is a string.
+Unknown keywords and the removed `vector_recall_target` refuse with a typed error.
+
+## Defaults and effect
+
+| Option | Default | Notes |
+|---|---|---|
+| `path` | Required | Local database directory, or `":memory:"` for independent ephemeral storage |
+| `page_size` | `8192` | Fixed for the life of the database |
+| `partitions_per_table` | `64` | Persisted at creation; existing identity wins on reopen. Changes logical conflict granularity, not physical-page independence |
+| `identity_lease_size` | `64` | Burn-only row-id range reserved durably per refill; larger values reduce heap page-0 metadata commits at the cost of wider harmless gaps after close/crash |
+| `buffer_budget_bytes` | `64 MiB` | Per database, never shared; must hold at least two configured pages |
+| `max_open_files` | `256` | Lazy per-database descriptor-cache ceiling; tune down for descriptor-constrained or multi-database hosts |
+| `descriptor_revalidation` | `"strict"` | `"strict"` proves every cached descriptor hit; `"generation"` amortizes proofs for a closed canonical-file whitelist and requires an exclusively Grafx/Pulse-managed directory |
+| `recovery_policy` | `"replay"` | `"replay"` permits safe replay/tail handling; `"refuse"` refuses damaged history. Neither permits unproved recovery; use `read_only` to prohibit repair |
+| `lease_ttl_seconds` | `5.0` | How long a writer's lease stays valid without renewal |
+| `lease_timeout_seconds` | `10.0` | How long to wait for another writer's lease |
+| `commit_lock_timeout_seconds` | `30.0` | How long to wait at the commit section |
+| `reader_stall_threshold_seconds` | `15.0` | Coordinator stall/liveness threshold; not permission to reclaim beneath an actual reader or proof of vacuum quiescence |
+| `wal_segment_bytes` | `4 MiB` | Log segment target, from 256 B through the reader's 1 GiB ceiling; an exceptional batch that would cross the ceiling is refused before writing |
+| `wal_max_bytes` | `None` | Optional soft high-water trigger: after a durable write, checkpoint when live WAL bytes reach this value; reader pins, atomic batches and deferred recycling may retain more without data loss |
+| `checkpoint_interval_records` | `512` | After a durable write, checkpoint when the published WAL distance reaches this many records; a failed attempt is reported and retried after the next write |
+| `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
+| `max_result_rows` | `None` | Optional hard limit on public result rows; row N+1 is refused before it is retained and before any remaining input is consumed |
+| `max_intermediate_rows` | `None` | Optional hard limit per non-terminal physical operator over one execution; it is not a cumulative query-wide count |
+| `query_memory_budget_bytes` | `None` | Optional logical retained-byte ceiling per blocking sort, result-DISTINCT or aggregate operator; enables safe adapter-backed external spill without measuring RSS |
+| `max_traversal_expansions` | `None` | Optional cumulative per-query limit on relationship candidates examined by graph-pattern operators; candidate N+1 is refused before derived landing/filter work |
+| `max_traversal_paths` | `None` | Optional cumulative per-query limit on visible paths admitted by graph-pattern operators; path N+1 is refused before frontier retention or return |
+| `max_query_value_characters` | `65536` | Per-string parameter/result boundary; configurable from 1 through the hard 1,048,576-character guard; query-source literals keep their separate 16,384-character ceiling |
+| `max_transaction_rows` | `None` | Optional hard limit on retained `row_intents` in one transaction |
+| `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
+| `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
+| `max_index_build_entries` | `None` | Optional hard limit on final exact entries across one detached shadow-build batch; counted to at most N+1 and refused before catalog staging or the first generation file is created |
+| `automatic_index_expected_cardinality` | `None` | Keyword-only expected rows per newly materialized automatic exact index; derives 1..4096 eager buckets at 64 expected entries each, activates an empty writable catalog to v2, is persisted with that generation, and never rehashes an existing index |
+| `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
+| `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
+| `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
+| `codec` | `"pure"` | `"pure"` binds the byte-contract oracle; `"numpy"` explicitly selects the NumPy-backed, byte-identical dense-directory codec and requires `[accel]` |
+| `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
+| `checksum` | `"auto"` | `"auto"` detects an accepted accelerator, `"pure"` selects the reference, `"native"` requires the native provider; selection is process-global |
+| `vector_exact_scan_threshold` | `4096` | Nonnegative candidate threshold for exact-vs-approximate selection; zero permits ANN whenever its other eligibility conditions hold. Inspect the returned regime, not just table size |
+| `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
+| `read_only` | `False` | No replay/repair; requires checkpoint-complete state and may refuse after a newer acknowledged commit. Distinct from `db.execute()`'s read transaction |
+
+## Types, ranges and persistence
+
+Integer settings reject booleans. Time settings accept finite positive int/float
+seconds, not booleans, infinity or NaN. Optional integer limits accept `None` or a
+strictly positive integer: zero does **not** mean unlimited. Strings are
+case-sensitive selector values as listed above; booleans must be exact booleans.
+
+| Setting family | Allowed values / compatibility |
+| --- | --- |
+| `page_size` | Integer power of two, 512–32,768 bytes; persisted, must match on every open |
+| `partitions_per_table` | Integer 1–65,535 at creation; persisted/adopted on reopen |
+| `identity_lease_size`, `max_open_files`, `checkpoint_interval_records` | Positive integer; operational; row-ID reservations already burned are never returned |
+| `buffer_budget_bytes` | Positive integer, at least two pages of configured size; per handle, not total RSS |
+| `wal_segment_bytes` | Integer 256–1,073,741,824 bytes; target segment size, not a hard per-transaction guarantee |
+| `wal_max_bytes` | `None` or positive integer bytes; soft checkpoint trigger, not hard disk quota |
+| `max_statement_writes`, `max_result_rows`, `max_intermediate_rows`, `max_traversal_expansions`, `max_traversal_paths`, `max_transaction_rows`, `max_index_build_entries` | `None` or positive integer counts; each has its own accounting scope above |
+| `max_transaction_bytes`, `max_wal_batch_bytes`, `query_memory_budget_bytes` | `None` or positive integer bytes; different deterministic accounting models, not interchangeable |
+| `automatic_index_expected_cardinality` | `None` or integer 1–262,144; only new generations, hint persisted with generation; not a resize command |
+| `vector_exact_scan_threshold` | Integer ≥ 0; runtime selection, not a persisted HNSW construction parameter |
+| `vector_ef_search` | Integer 1–1,048,576; approximate-query beam |
+| `max_query_value_characters` | Integer 1–1,048,576 characters; default 65,536; source literal ceiling remains 16,384 |
+| `lease_ttl_seconds`, `lease_timeout_seconds`, `commit_lock_timeout_seconds`, `reader_stall_threshold_seconds` | Finite positive seconds; neither a general statement deadline nor async cancellation |
+| `metrics_destination` | `None` for noop; nonempty file for json; literal loopback `host:port`/`[IPv6]:port` for default OpenMetrics safety; port 0–65,535 |
+
+Do not treat all positive integers as capacity promises: the relevant layout,
+engine operation and available device space can impose additional typed refusals.
+Custom registries supply their own adapters; selector presence does not override
+caller-owned resources. See [ports](PORTS.md).
+
+## Tuning guidance
+
+- Start with `[accel]`, strict identity validation and defaults; measure before
+  raising buffer sizes. Three independent 64 MiB handles have a 192 MiB nominal
+  page envelope **plus** Python objects, vectors, temporary values and OS caches.
+- Use query/transaction limits for untrusted or variable-size inputs. `None`
+  preserves unbounded behavior. Split ingest into application-chosen atomic
+  batches; Grafx does not secretly split a transaction to fit a budget.
+- Increase timeouts only for a measured legitimate wait; never hide deadlock,
+  stolen lease or unknown commit outcomes with endless retries.
+- Larger identity ranges can reduce metadata work but create harmless gaps after
+  abort/close/crash; never use internal row IDs as a gap-free business sequence.
+- Size new indexes when cardinality is known. Oversizing eager buckets consumes
+  memory/disk and slows full scans; unknown growth uses explicit maintenance.
+- Keep all handles' checksum policy coherent: the last process-global provider
+  selection can affect other databases' CPU cost, though accepted digests are identical.
+
+## Detailed descriptor, metrics and budget contracts
+
+`descriptor_revalidation="strict"` is the safe default: on every cached hit, the local adapter
+proves that the logical name still names the physical file held by its descriptor. The opt-in
+`"generation"` mode keeps control records, `grafx.meta` and unknown names strict, but amortizes that
+proof for canonical heap, catalog, index and WAL files. It must be used only when Okto Grafx and
+Okto Pulse are the exclusive writers of the database directory. An external replacement of a
+whitelisted file can otherwise remain undetected until a directed proof of that name, a full
+generation invalidation or reopen, and a stale descriptor can read or write an inode no longer
+named by the directory. The option is inert for `":memory:"`; a caller-supplied registry is validated
+but its storage adapter is not reconfigured by it. See
+[`ST2_DESCRIPTOR_REVALIDATION.md`](architecture/ST2_DESCRIPTOR_REVALIDATION.md) for the exact
+whitelist, transition table, coexistence rules, advantages and risks.
+The read-only `database.descriptor_revalidation` property reports the effective process-local mode;
+it is deliberately not part of the persisted `database.identity` record.
+
+Without an override, an OpenMetrics destination must name a literal IP address that
+`ipaddress.ip_address(host).is_loopback` classifies as loopback, for example IPv4 `127/8` or IPv6 `::1`.
+Hostnames are not resolved for this decision, so even `localhost` is refused. A remote address or
+hostname requires `allow_remote_metrics=True`; setting it for the no-op or JSON sink is itself
+refused. Each remote-address or hostname publisher admitted by that override emits one
+`RuntimeWarning` when it starts. This consent changes only where OpenMetrics may bind: it does not
+add authentication, TLS or a firewall.
+
+Configure IPv6 loopback as `metrics_destination="[::1]:0"`. The publisher binds `::1` with
+`AF_INET6`, and `Database.metrics_endpoint` reports the usable bracketed URL
+`http://[::1]:<chosen-port>/metrics`.
+
+Recall is an offline calibration result, not a per-database runtime promise. The former
+`vector_recall_target` connection option was removed; passing it now returns a typed migration
+error. Set the benchmark floor with
+`python -m bench.harness.gate --metrics <metrics.json> --require-recall --recall-target <floor>`.
+Use `vector_ef_search` when the intended change is the HNSW work performed by runtime queries.
+
+The four transaction limits are opt-in: `None` preserves the unbounded behaviour. Exceeding one
+raises the non-retryable `GrafxTransactionBudgetExceeded`. A refused statement restores its exact
+pre-statement staging, and a refused final WAL batch is rejected before append; these refusals do
+not truncate the WAL or persist a partial statement.
+
+The two query row limits are opt-in positive integers. `max_result_rows` counts the public
+terminal incrementally; it consumes row N+1 only to refuse it, before retaining it or consuming the
+rest of the stream and before `context.release()`. `max_intermediate_rows` counts each non-terminal
+physical operator separately for the whole execution. A public terminal is charged only as result;
+a terminal with no public columns is charged as intermediate. Overrun raises the non-retryable
+`GrafxQueryBudgetExceeded`, without truncating state or releasing a partial write statement.
+
+The two traversal limits are likewise opt-in positive integers, but are cumulative across every
+graph-pattern operator in one query. Variable and untyped traversal charge an expansion for each
+candidate yielded by their selected endpoint source, before repeat-edge and landing checks; a
+fixed relationship scan charges each stored or pending relationship it encounters, before its
+pushed predicate and endpoint checks. A path is charged only after the applicable pushed predicate
+and landing visibility checks, immediately before the path can enter a variable-length frontier or
+be returned by a one-hop scan. The first over-limit unit is refused before it is retained or
+returned. These limits cover Cypher relationship traversal and scans, not the separate internal
+HNSW navigation performed by a vector-search operator. Physical rows read once to construct a
+grouped endpoint fallback are auxiliary scan work and are not charged as candidate expansions.
+When disabled the limits do not add traversal counters to `QueryResult.statistics`; when enabled,
+the corresponding `traversal_expansions` or `traversal_paths` statistic records admitted work on
+successful queries.
+
+`max_query_value_characters` bounds each string parameter and each string copied across the public
+query-result boundary. It defaults to 65,536 characters, while query-source string literals retain
+their independent 16,384-character lexer ceiling. Applications may lower the value or raise it up
+to the hard 1,048,576-character guard; values above the effective ceiling are refused before page
+access. The option is process-local and does not change the on-disk format.
+
+`query_memory_budget_bytes` is a separate opt-in positive integer. `None` preserves the previous
+in-memory sort, top-N, result-DISTINCT and aggregation paths. When configured, each `SortRows`,
+`DistinctRows` and `AggregateRows` gets its own counter and uses adapter-owned external merge runs,
+so input cardinality no longer causes those operators' retained logical bytes to grow without the
+configured ceiling. The counter is deterministic **logical retention, never process RSS**: a
+buffered/run-head record is
+charged `32 + len(versioned_key) + len(versioned_payload)` bytes; one active aggregate group is
+charged 64 bytes plus its versioned detached key and 64 bytes per aggregate slot; each retained
+`COLLECT` or `MIN`/`MAX` value adds 16 bytes plus its versioned detached value; each strongly
+retained NaN identity adds 64 bytes; and a transaction-private held-row identity needed by
+result-DISTINCT adds 128 bytes plus its versioned detached values. Python object headers, allocator
+arenas, encoding/comparison temporaries, OS caches and the final caller-owned result are
+deliberately outside this portable accounting model.
+
+Spill records use purpose- and version-tagged `Value` encodings and a versioned run header; they
+never use pickle. Files live in an isolated adapter temporary directory, outside the database
+namespace; binary merge levels keep their in-memory path metadata O(log N), and all artifacts are
+removed on success, refusal, cancellation and cursor close. Cleanup failure is not silently
+accepted. A single record must fit beside another merge head, so its logical charge must be at most
+half the configured budget. Result `DISTINCT` and aggregate `DISTINCT` values spill too, preserving
+the first occurrence and its order. `COLLECT` still
+has to become one public tuple, so a group whose result itself exceeds the budget is refused rather
+than represented by a disk proxy. Enabling this option also routes `ORDER BY ... LIMIT` through the
+bounded external path instead of the faster O(K) top-N heap.
+
+`max_result_rows` and `max_intermediate_rows` remain independent and authoritative with spill
+enabled. This first byte-budget boundary does not cover `EagerRows`, vector-search candidate
+materialisation, deadlines, RSS or public result retention; use the row limits and cursor API for
+those separate boundaries. It changes no snapshot, transaction, WAL, OCC, durable format,
+multiwriter or multireader rule.
+
+---

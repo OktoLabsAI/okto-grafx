@@ -13,7 +13,8 @@ reader detect that the bytes were written under a different schema before it dec
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from math import isfinite
 from types import MappingProxyType
@@ -27,12 +28,16 @@ from okto_grafx.domain.model.value import (
     VECTOR_VALUE_TYPES,
     Value,
     ValueType,
+    Timestamp,
+    Uuid,
+    VectorValue,
     _U32,
+    _append_encoded_value,
     _decode_expected_value_body,
+    _decode_vector_mode,
     _require,
     _validate_value,
     decode_value,
-    encode_value,
     value_type_of,
 )
 from okto_grafx.domain.ports.vectormath import DistanceMetric
@@ -556,11 +561,13 @@ def _reject(table: TableDef, column: ColumnDef, position: int, detail: str) -> S
     )
 
 
-def _check_column_value(table: TableDef, position: int, column: ColumnDef, value: Value) -> None:
-    """Refuse a value that the column does not declare, instead of coercing it."""
+def _check_column_value(
+    table: TableDef, position: int, column: ColumnDef, value: Value
+) -> ValueType:
+    """Return the checked value type, refusing a value the column does not declare."""
     if value is None:
         if column.nullable:
-            return
+            return ValueType.NULL
         raise _reject(table, column, position, "a null is not allowed in this column.")
     observed = value_type_of(value)
     if observed is not column.type:
@@ -570,6 +577,7 @@ def _check_column_value(table: TableDef, position: int, column: ColumnDef, value
             position,
             f"a {observed.name} value cannot be stored in a {column.type.name} column.",
         )
+    return observed
 
 
 def endpoint_column_defs() -> tuple[ColumnDef, ColumnDef]:
@@ -643,11 +651,110 @@ def encode_tuple(table: TableDef, values: Sequence[Value]) -> bytes:
             expected_arity=table.arity,
             observed_arity=len(values),
         )
-    parts: list[bytes] = []
+    encoded = bytearray()
     for position, (column, value) in enumerate(zip(table.columns, values)):
-        _check_column_value(table, position, column, value)
-        parts.append(encode_value(value))
-    return b"".join(parts)
+        kind = _check_column_value(table, position, column, value)
+        _append_encoded_value(encoded, value, kind=kind)
+    return bytes(encoded)
+
+
+@dataclass(frozen=True, slots=True)
+class TupleEncodingProofs:
+    """Private composed protocol; opaque proofs belong to their minting registry."""
+
+    encode: Callable[[TableDef, Sequence[Value]], tuple[bytes, object | None]]
+    payload: Callable[[TableDef, Sequence[Value], object], bytes | None]
+    forget: Callable[[object], None]
+
+
+def _tuple_encoding_proof_protocol(
+    entries: MutableMapping[object, tuple[object, object, bytes]],
+    guard: AbstractContextManager[object],
+) -> TupleEncodingProofs:
+    """Build the private proof that lets one exact immutable row reuse its encoding.
+
+    The registry and guard are injected by composition; the opaque proof type lives
+    only in this closure. A proof never authenticates an
+    ``id()`` by itself: its registry entry retains the exact table, values tuple and bytes object
+    produced by :func:`encode_tuple`.  A copied/replaced intent, another tuple with equal values,
+    or a caller-authored object therefore misses and must take the canonical encoder again.
+
+    Weak keys bound retention to the proof's own lifetime.  The lock protects only registry
+    publication/lookup/removal; encoding itself and every heap operation remain concurrent.
+    """
+
+    class Proof:
+        __slots__ = ("__weakref__",)
+
+    def proof_safe(value: object) -> bool:
+        """Return whether normal Python code cannot mutate this encoded value in place."""
+        value_type = type(value)
+        if value is None or value_type in (bool, int, float, str, bytes):
+            return True
+        if value_type in (Timestamp, Uuid, VectorValue):
+            return True
+        if value_type is tuple:
+            return all(proof_safe(item) for item in value)
+        # LIST/MAP also accept list/dict and BYTES accepts bytearray.  Their outer row tuple can
+        # retain its identity while a nested value changes, so identity alone cannot authorize
+        # reuse.  Unknown subclasses stay on the canonical path for the same reason.
+        return False
+
+    def encode_with_proof(
+        table: TableDef, values: Sequence[Value]
+    ) -> tuple[bytes, object | None]:
+        payload = encode_tuple(table, values)
+        if type(values) is not tuple or not all(proof_safe(value) for value in values):
+            return payload, None
+        proof = Proof()
+        with guard:
+            entries[proof] = (table, values, payload)
+        return payload, proof
+
+    def proved_payload(
+        table: TableDef, values: Sequence[Value], proof: object
+    ) -> bytes | None:
+        if type(proof) is not Proof:
+            return None
+        with guard:
+            entry = entries.get(proof)
+        if entry is None:
+            return None
+        proved_table, proved_values, payload = entry
+        if proved_table is table and proved_values is values:
+            return payload
+        return None
+
+    def forget(proof: object) -> None:
+        if type(proof) is not Proof:
+            return
+        with guard:
+            entries.pop(proof, None)
+
+    return TupleEncodingProofs(encode_with_proof, proved_payload, forget)
+
+
+def _encode_tuple_with_proof(
+    table: TableDef, values: Sequence[Value], *, protocol: TupleEncodingProofs | None = None
+) -> tuple[bytes, object | None]:
+    """Encode canonically; retain a proof only with an explicitly composed protocol."""
+    return (encode_tuple(table, values), None) if protocol is None else protocol.encode(table, values)
+
+
+def _proved_tuple_payload(
+    table: TableDef, values: Sequence[Value], proof: object,
+    *, protocol: TupleEncodingProofs | None = None,
+) -> bytes | None:
+    """Resolve only through the participant's own proof registry."""
+    return None if protocol is None else protocol.payload(table, values, proof)
+
+
+def _forget_tuple_encoding_proof(
+    proof: object, *, protocol: TupleEncodingProofs | None = None
+) -> None:
+    """Revoke a local proof; another participant's proof is never recognized here."""
+    if protocol is not None:
+        protocol.forget(proof)
 
 
 def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:
@@ -657,6 +764,57 @@ def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:
     number of values and then continues did not come from this encoder.
     """
     return _decode_tuple(table, buf, materialized_positions=None)
+
+
+def decode_tuple_landing(table: TableDef, buf: bytes) -> tuple[Value, ...]:
+    """Return the row for an identity landing: every check of ``decode_tuple``, no vector object.
+
+    An identity landing consumes the header of the version it validates (its record id and its
+    physical reference) and never a vector component, so the vector body is validated exactly as
+    ``decode_tuple`` validates it (tag, header, dimension, space reference, body length, trailing
+    bytes) and the 384-float object is simply not built.  The vector positions carry the shared
+    decoder's ``_ValidatedValue`` sentinel, which is deliberately NOT a stored value: any attempt
+    to type, encode or publish it is refused by ``value_type_of`` (RELSEEK-M4).  Every scalar
+    column is decoded and judged exactly as ``decode_tuple`` does.
+    """
+    return _decode_tuple(
+        table, buf, materialized_positions=None, materialize_vectors=False
+    )
+
+
+class _UnmaterializedColumn:
+    """Private proof that a projected column was validated but not retained."""
+
+    __slots__ = ()
+
+
+_UNMATERIALIZED_COLUMN = _UnmaterializedColumn()
+
+
+def _is_unmaterialized_column(value: object) -> bool:
+    """Return whether ``value`` is the private projected-row sentinel."""
+    return value is _UNMATERIALIZED_COLUMN
+
+
+def _decode_tuple_projection(
+    table: TableDef,
+    buf: bytes,
+    materialized_positions: frozenset[int],
+) -> tuple[Value, ...]:
+    """Validate a complete row while retaining only the selected positional values.
+
+    This is an internal execution proof, not a public row decoder. The returned tuple preserves
+    the table's full positional shape so trusted query consumers can use their ordinary column
+    offsets; positions outside the closed plan carry an unforgeable sentinel. Every omitted
+    value still passes the canonical non-materialising parser, including UTF-8, recursive MAP
+    key, vector-boundary and trailing-payload validation.
+    """
+    return _decode_tuple(
+        table,
+        buf,
+        materialized_positions=materialized_positions,
+        preserve_positions=True,
+    )
 
 
 def decode_relationship_endpoints(
@@ -692,107 +850,113 @@ def _decode_tuple(
     buf: bytes,
     *,
     materialized_positions: frozenset[int] | None,
+    materialize_vectors: bool = True,
+    preserve_positions: bool = False,
 ) -> tuple[Value, ...]:
-    """Validate one tuple and retain either every value or selected positions."""
-    values: list[Value] = []
+    """Validate one tuple and retain either every value or selected positions.
+
+    ``materialize_vectors=False`` is the identity-landing form (RELSEEK-M4): a vector column
+    whose stored tag matches the plan is validated by ``_decode_vector_mode`` exactly as the
+    materialising branch validates it, and its position carries the decoder's private sentinel
+    instead of a ``VectorValue``.  A mismatched tag still takes the generic decoder, so the
+    corruption-before-mismatch rule below is untouched.
+    """
+    values: list[Value] = (
+        [_UNMATERIALIZED_COLUMN] * len(table.columns)  # type: ignore[list-item]
+        if preserve_positions
+        else []
+    )
     offset = 0
-    if materialized_positions is None:
-        for position, (expected_tag, expected_type, nullable, column) in enumerate(
-            table._decode_plan
-        ):
-            tag_offset = offset
-            if offset >= len(buf):
-                # Keep the generic oracle's classified short-tag refusal verbatim.
-                value, offset = decode_value(buf, offset)
-            else:
-                stored_tag = buf[offset]
-                if stored_tag == expected_tag:
-                    if expected_type is ValueType.STRING:
-                        # STRING dominates wide graph rows.  Keep the generic decoder as the
-                        # single oracle for mismatched tags and compound values, but execute this
-                        # already-planned scalar body in the table loop so every ordinary string
-                        # does not pay another Python dispatch.  The checks and error taxonomy are
-                        # byte-for-byte the same operations as _decode_expected_value_body.
-                        offset += 1
-                        _require(buf, offset, _U32.size, "length")
-                        length = _U32.unpack_from(buf, offset)[0]
-                        offset += _U32.size
-                        _require(buf, offset, length, "string")
-                        following = offset + length
-                        try:
-                            value = bytes(buf[offset:following]).decode("utf-8")
-                        except UnicodeDecodeError as failure:
-                            raise GrafxCorruptionDetected(
-                                "A stored STRING is not valid UTF-8.",
-                                field="string",
-                                offset=offset,
-                                length=length,
-                            ) from failure
-                        offset = following
-                    else:
-                        value, offset = _decode_expected_value_body(
-                            buf, offset + 1, expected_type
-                        )
-                elif stored_tag == int(ValueType.NULL):
-                    value = None
-                    offset += 1
-                else:
-                    # A mismatched value is still decoded completely before schema rejection.
-                    # This preserves the rule that malformed stored bytes are corruption rather
-                    # than being hidden by the schema mismatch they would otherwise reach first.
-                    value, offset = decode_value(buf, offset)
-            if value is None:
-                if not nullable:
-                    raise _reject(
-                        table,
-                        column,
-                        position,
-                        "a null is not allowed in this column.",
+    for position, (expected_tag, expected_type, nullable, column) in enumerate(
+        table._decode_plan
+    ):
+        tag_offset = offset
+        materialize = (
+            materialized_positions is None or position in materialized_positions
+        )
+        if offset >= len(buf):
+            # Keep the generic oracle's classified short-tag refusal verbatim.
+            value, offset = decode_value(buf, offset)
+        else:
+            stored_tag = buf[offset]
+            if stored_tag == expected_tag:
+                if (
+                    expected_type in VECTOR_VALUE_TYPES
+                    and (not materialize or not materialize_vectors)
+                ):
+                    value, offset = _decode_vector_mode(
+                        buf, offset + 1, expected_type, materialize=False
                     )
-                values.append(value)
-                continue
-            if buf[tag_offset] != expected_tag:
-                observed = value_type_of(value)
-                raise _reject(
-                    table,
-                    column,
-                    position,
-                    f"a stored {observed.name} value does not belong to "
-                    f"a {column.type.name} column.",
-                )
-            values.append(value)
-    else:
-        for position, column in enumerate(table.columns):
-            tag_offset = offset
-            materialize = position in materialized_positions
-            if materialize:
+                elif expected_type is ValueType.STRING:
+                    # STRING dominates wide graph rows.  Keep the generic decoder as the single
+                    # oracle for mismatched tags and compound values, but execute this planned
+                    # body in the table loop. A skipped string is decoded and discarded: UTF-8
+                    # validation is part of the durable format and projection cannot remove it.
+                    offset += 1
+                    _require(buf, offset, _U32.size, "length")
+                    length = _U32.unpack_from(buf, offset)[0]
+                    offset += _U32.size
+                    _require(buf, offset, length, "string")
+                    following = offset + length
+                    try:
+                        value = bytes(buf[offset:following]).decode("utf-8")
+                    except UnicodeDecodeError as failure:
+                        raise GrafxCorruptionDetected(
+                            "A stored STRING is not valid UTF-8.",
+                            field="string",
+                            offset=offset,
+                            length=length,
+                        ) from failure
+                    offset = following
+                elif materialize:
+                    value, offset = _decode_expected_value_body(
+                        buf, offset + 1, expected_type
+                    )
+                else:
+                    offset = _validate_value(buf, offset)
+                    value = None
+            elif stored_tag == int(ValueType.NULL):
+                value = None
+                offset += 1
+            elif materialize:
+                # A mismatched value is still decoded completely before schema rejection. This
+                # preserves the rule that malformed stored bytes are corruption rather than
+                # being hidden by the schema mismatch they would otherwise reach first.
                 value, offset = decode_value(buf, offset)
             else:
                 offset = _validate_value(buf, offset)
                 value = None
-            stored = ValueType(buf[tag_offset])
-            is_null = stored is ValueType.NULL
-            if is_null:
-                if not column.nullable:
-                    raise _reject(
-                        table,
-                        column,
-                        position,
-                        "a null is not allowed in this column.",
-                    )
-                if materialize:
-                    values.append(None)
-                continue
-            if stored is not column.type:
-                observed = value_type_of(value) if materialize else stored
+        if buf[tag_offset] == int(ValueType.NULL):
+            if not nullable:
                 raise _reject(
                     table,
                     column,
                     position,
-                    f"a stored {observed.name} value does not belong to "
-                    f"a {column.type.name} column.",
+                    "a null is not allowed in this column.",
                 )
             if materialize:
+                if preserve_positions:
+                    values[position] = None
+                else:
+                    values.append(None)
+            continue
+        if buf[tag_offset] != expected_tag:
+            observed = (
+                value_type_of(value)
+                if materialize
+                else ValueType(buf[tag_offset])
+            )
+            raise _reject(
+                table,
+                column,
+                position,
+                f"a stored {observed.name} value does not belong to "
+                f"a {column.type.name} column.",
+            )
+        if materialize:
+            if preserve_positions:
+                values[position] = value  # type: ignore[assignment]
+            else:
                 values.append(value)  # type: ignore[arg-type]
     if offset != len(buf):
         raise GrafxCorruptionDetected(

@@ -54,11 +54,12 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from contextvars import ContextVar
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from types import MethodType
 from typing import NamedTuple, TypeVar
 
+from okto_grafx.domain.ports.scoped_value import ScopedValue
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -84,6 +85,7 @@ from okto_grafx.domain.ids import (
 from okto_grafx.domain.index.contract import SecondaryIndex, StagingTransaction
 from okto_grafx.domain.index.definition import (
     INDEX_DIRECTORY,
+    RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
     index_definition_matches_table,
@@ -100,6 +102,7 @@ from okto_grafx.domain.index.header import (
     INDEX_HEADER_SLOT,
     IndexHeader,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.records import (
     IndexChange,
@@ -137,6 +140,7 @@ from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
 from okto_grafx.engine.buffer_pool import (
     BufferPool,
+    _page_count_if_present,
     refuse_endless_chain,
     visited_pages,
 )
@@ -202,18 +206,8 @@ _LIVE_COMMIT_HOT_BUCKET_MIN_EFFECTS: int = 2
 _LIVE_COMMIT_AUTHORITY_SEAL: object = object()
 """Module-private proof installed only by the transaction manager's fenced commit door."""
 
-_LIVE_COMMIT_AUTHORITY: ContextVar[object | None] = ContextVar(
-    "okto_grafx_live_commit_authority", default=None
-)
-"""Call-local authority whose mutable scope is revoked before its context is reset."""
-
 _COMMIT_INDEX_PROJECTION_SEAL: object = object()
 """Module-private proof for one post-rebase index selection inside COMMIT_SECTION."""
-
-_COMMIT_INDEX_PROJECTION: ContextVar[object | None] = ContextVar(
-    "okto_grafx_commit_index_projection", default=None
-)
-"""Attempt-local immutable index selection; never retained across commit-section exit."""
 
 _LIVE_HOT_HOOK_NAMES: tuple[str, ...] = (
     "_apply_change",
@@ -746,9 +740,10 @@ class IndexStore:
         header identity, definition digest and every corruption refusal remain mandatory.
         """
         storage = self._pool.storage
-        if (not proved_present and not storage.exists(self.file)) or storage.page_count(
-            self.file
-        ) == 0:
+        present = _page_count_if_present(
+            storage, self.file, proved_present=proved_present
+        )
+        if present is None or present == 0:
             return False
         with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
             if page.is_pristine():
@@ -786,7 +781,18 @@ class IndexStore:
         """
         storage = self._pool.storage
         created = False
-        if not proved_present and not storage.exists(self.file):
+        present = (
+            storage.page_count(self.file)
+            if proved_present
+            else _page_count_if_present(storage, self.file)
+        )
+        # Production devices refuse an absent name from page_count.  The zero-page exists probe
+        # retains compatibility with narrow collaborators that encode both "missing" and
+        # "empty existing file" as zero, without taxing an established index.
+        missing = present is None or (
+            present == 0 and not proved_present and not storage.exists(self.file)
+        )
+        if missing:
             try:
                 storage.create(self.file)
                 created = True
@@ -960,9 +966,10 @@ class IndexStore:
     def _read_header(self, *, proved_present: bool = False) -> IndexHeader:
         """Return the index header stored in slot 1 of the reserved header page."""
         storage = self._pool.storage
-        if (not proved_present and not storage.exists(self.file)) or storage.page_count(
-            self.file
-        ) == 0:
+        present = _page_count_if_present(
+            storage, self.file, proved_present=proved_present
+        )
+        if present is None or present == 0:
             raise GrafxIndexError(
                 f"Index {self.name!r} has no file yet; create it before using it.",
                 field="file",
@@ -1193,6 +1200,8 @@ class IndexStore:
         into a refusal of its own. What certifies the traversal is unchanged: the fresh post-read
         of :meth:`finish_exact_read`. A foreign page-0 transition between two lookups is seen
         there, costs one of the bounded retries, and the retry re-proves from the device.
+        Materialization refusals also complete that post-proof: a mixed-generation
+        error cannot be attributed to a stable view before its generation is checked.
         """
         rebuild_required_lsn = required_lsn
         required_lsn = self._required_table_position(required_lsn)
@@ -1805,7 +1814,27 @@ class IndexStore:
         return 0 if staged is None else len(staged.changes)
 
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
+        """Apply staged changes with full scalar validation and the original port signature.
+
+        The native manager's closed fast path supplies its execution-local
+        transport through a separate private door. A custom commit override
+        calling super() continues to use this ordinary two-argument contract.
+        """
+        return self._commit_with_context(txn, csn)
+
+    def _commit_with_context(
+        self,
+        txn: StagingTransaction,
+        csn: Csn,
+        *,
+        _live_context: ScopedValue | None = None,
+    ) -> int:
         """Apply everything this transaction staged, at the log position the commit received.
+
+        Ordinary callers pass only txn/csn and retain scalar validation. The
+        native manager may additionally pass its private execution-local transport;
+        the current thread/task must still hold an active sealed scope for this
+        exact store/transaction. Passing a captured scope value is insufficient.
 
         The stamps inside the entries are the ones the caller declared when it staged them, and
         this method does not rewrite them. That is deliberate and it is what keeps the live path
@@ -1860,11 +1889,12 @@ class IndexStore:
                 value=len(resets),
             )
         reset = resets[0] if resets else None
-        authority = _LIVE_COMMIT_AUTHORITY.get()
+        authority = None if _live_context is None else _live_context.get()
         live_hot = bool(
             isinstance(authority, _LiveCommitAuthority)
             and authority.active
             and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
+            and authority.manager._live_commit_context is _live_context
             and authority.txn is txn
             and authority.store is self
         )
@@ -2627,7 +2657,18 @@ class IndexStore:
                 ):
                     continue
                 raise
-            result = operation(certificate)
+            try:
+                result = operation(certificate)
+            except GrafxError:
+                # A carried pre-certificate may meet a freshly published bucket
+                # while companion heap frames still name the prior generation.
+                # In that mixed view even a slot refusal is not yet a stable
+                # verdict. Complete the same post-proof before propagating it;
+                # a changed generation retries within the existing bound. A
+                # stable failure retains its exact original exception/traceback.
+                if self.finish_exact_read(certificate, required_lsn):
+                    raise
+                continue
             if self.finish_exact_read(certificate, required_lsn):
                 return result
         raise GrafxIndexError(
@@ -2667,6 +2708,38 @@ class IndexStore:
             bucket_of(wanted, self._definition.bucket_count), wanted
         )
         return found
+
+    def _candidate_groups_unchecked(
+        self, keys: Sequence[bytes],
+    ) -> Iterator[tuple[bytes, tuple[IndexEntry, ...]]]:
+        """Walk each requested hash bucket once within the caller's stable view.
+
+        Only candidate work is shared, never a visibility answer or certificate.
+        Each key retains chain/slot order. Groups may be visited in bucket order;
+        callers restore input order only after all heap proofs and the post-fence.
+        Specialized stores and scalar hooks retain their original access path.
+        """
+        if (
+            type(self) is not HashIndex
+            or getattr(self._candidates_unchecked, "__func__", None) is not _BATCH_CANONICAL_CANDIDATES
+            or getattr(self._scan_bucket, "__func__", None) is not _BATCH_CANONICAL_BUCKET_SCAN
+        ):
+            for key in keys:
+                yield key, self._candidates_unchecked(key)
+            return
+        buckets: dict[int, list[bytes]] = {}
+        for key in keys:
+            buckets.setdefault(bucket_of(key, self._definition.bucket_count), []).append(key)
+        for bucket, wanted in buckets.items():
+            if len(wanted) == 1:
+                yield wanted[0], self._candidates_unchecked(wanted[0])
+                continue
+            _pages, entries = self._scan_bucket(bucket, keys=frozenset(wanted))
+            groups: dict[bytes, list[IndexEntry]] = {key: [] for key in wanted}
+            for entry in entries:
+                groups[entry.key].append(entry)
+            for key in wanted:
+                yield key, tuple(groups.pop(key))
 
     def walk(self) -> tuple[IndexEntry, ...]:
         """Return every stored entry of this index, bucket by bucket.
@@ -3043,6 +3116,13 @@ class IndexStore:
         not hidden behind a decline: preparation propagates their typed refusal while the batch
         is still mutation-free.
         """
+        # The directory replaces every physical hook named by ``_LIVE_HOT_HOOK_NAMES``.  The
+        # live-commit caller already makes this check for its whole batch; replay can mix stores
+        # and therefore checks at the individual bucket door.  A subclass or a runtime fault
+        # injector that changes one hook must observe the scalar protocol instead of having its
+        # behavior silently bypassed by the accelerator.
+        if not self._uses_canonical_live_hot_hooks():
+            return None
         if page_limit < 1:
             return None
         pages: list[PageIndex] = []
@@ -3673,6 +3753,7 @@ class IndexStore:
         ref: RecordRef | None = None,
         *,
         first_matching_page: bool = False,
+        keys: frozenset[bytes] | None = None,
     ) -> tuple[tuple[PageIndex, ...], tuple[IndexEntry, ...]]:
         """Validate one chain and optionally collect matches during that same page pass.
 
@@ -3737,6 +3818,16 @@ class IndexStore:
                         # with a match, while its preceding chain walk still validated every
                         # page type/link. Preserve that bounded work and error surface exactly.
                         matching_complete = True
+                elif keys is not None:
+                    for slot, image in page.iter_slot_views():
+                        raw, encoded_ref, born, dead, versioned = _validated_image(image)
+                        stored_key = bytes(raw[INDEX_ENTRY_HEADER_SIZE:])
+                        if stored_key in keys:
+                            matches.append(IndexEntry(
+                                key=stored_key, ref=RecordRef.decode(encoded_ref),
+                                versioned=versioned, born_csn=born, dead_csn=dead,
+                                page=index, slot=slot,
+                            ))
                 following = page.next_page
             pages.append(index)
             index = following
@@ -3863,6 +3954,10 @@ class IndexStore:
         return txn_id
 
 
+_BATCH_CANONICAL_CANDIDATES = IndexStore._candidates_unchecked
+_BATCH_CANONICAL_BUCKET_SCAN = IndexStore._scan_bucket
+
+
 class HashIndex(IndexStore):
     """The reference EXACT index of M1: a hash index whose hits are candidates.
 
@@ -3885,6 +3980,14 @@ class HashIndex(IndexStore):
                 f"declares {definition.visibility.value}.",
                 field="visibility",
                 value=definition.visibility.value,
+                index=definition.name,
+            )
+        if definition.layout is not IndexLayout.HASH:
+            raise GrafxIndexError(
+                f"A HashIndex cannot open the {definition.layout.value!r} layout declared by "
+                f"definition {definition.name!r}.",
+                field="layout",
+                value=definition.layout.value,
                 index=definition.name,
             )
         super().__init__(definition, pool, metrics)
@@ -3977,6 +4080,12 @@ class ProximityIndex(IndexStore):
 _CANONICAL_LIVE_HOT_HOOKS = tuple(
     getattr(IndexStore, name) for name in _LIVE_HOT_HOOK_NAMES
 )
+
+_CANONICAL_INDEX_STORE_COMMIT = IndexStore.commit
+"""Only the unchanged native commit accepts an injected execution-context transport."""
+
+_CANONICAL_INDEX_CONTEXT_COMMIT = IndexStore._commit_with_context
+"""The private native body; the ordinary commit port keeps its two-argument signature."""
 
 
 _TableIdentity = tuple[int, str]
@@ -4183,6 +4292,8 @@ class IndexManager:
         "_schema_new_table_observed",
         "_registry_revision",
         "_definition_match",
+        "_projection_context",
+        "_live_commit_context",
     )
 
     def __init__(
@@ -4192,11 +4303,34 @@ class IndexManager:
         metrics: MetricsSink,
         *,
         artifact_nonce: Callable[[], int] | None = None,
+        projection_context: ScopedValue | None = None,
+        live_commit_context: ScopedValue | None = None,
     ) -> None:
-        """Build the registry over the pool and heap of one database."""
+        """Build the registry over the pool and heap of one database.
+
+        Public assembly supplies separate context-local projection and live-commit
+        transports. Omitting them in a manual composition retains fresh canonical
+        selection and scalar physical application. Neither is replaced by
+        unsynchronized manager-local state.
+        """
         self._pool: BufferPool = pool
         self._heap: HeapStore = heap
         self._metrics: MetricsSink = metrics
+        for field_name, transport in (
+            ("projection_context", projection_context),
+            ("live_commit_context", live_commit_context),
+        ):
+            if transport is not None and any(
+                not callable(getattr(transport, name, None))
+                for name in ("get", "bind")
+            ):
+                raise GrafxConfigurationError(
+                    "A commit context must supply get and bind operations.",
+                    field=field_name,
+                    value=type(transport).__name__,
+                )
+        self._projection_context = projection_context
+        self._live_commit_context = live_commit_context
         self._indexes: dict[str, IndexStore] = {}
         self._index_keys_by_table: dict[tuple[int, str], set[str]] = {}
         self._published_lsn: Lsn = NO_LSN
@@ -5026,11 +5160,20 @@ class IndexManager:
         validating door.  Zero is never an occupied generation identity.
         """
 
+        indexes = self.indexes()
+        needs_header = any(index.definition.artifact_nonce == 0 for index in indexes)
+        persisted = (
+            frozenset(self._pool.storage.list_files(f"{INDEX_DIRECTORY}/"))
+            if needs_header
+            else frozenset()
+        )
         occupied: set[int] = set()
-        for index in self.indexes():
+        for index in indexes:
             nonce = index.definition.artifact_nonce
             if nonce == 0:
-                nonce = index.open().artifact_nonce
+                nonce = index.open(
+                    proved_present=index.file in persisted
+                ).artifact_nonce
             if nonce != 0:
                 occupied.add(nonce)
         return frozenset(occupied)
@@ -5315,7 +5458,9 @@ class IndexManager:
         self, txn: StagingTransaction
     ) -> _CommitIndexProjection | None:
         """Return this call's valid projection, or None outside its exact transaction scope."""
-        projection = _COMMIT_INDEX_PROJECTION.get()
+        projection = (
+            None if self._projection_context is None else self._projection_context.get()
+        )
         if not (
             isinstance(projection, _CommitIndexProjection)
             and projection.active
@@ -5454,12 +5599,26 @@ class IndexManager:
                 if index in self._detached_speculative_indexes
             ),
         )
-        token = _COMMIT_INDEX_PROJECTION.set(projection)
+        # A manual composition with no context transport keeps canonical fresh
+        # selection. Public assembly provides a context-local slot, never a plain
+        # mutable manager field that another writer could observe as authority.
         try:
-            yield projection
+            scope = (
+                nullcontext()
+                if self._projection_context is None
+                else self._projection_context.bind(projection)
+            )
+            with scope:
+                try:
+                    yield projection
+                finally:
+                    # Revoke before resetting transport; delayed context copies
+                    # must not retain active authority after this scope exits.
+                    projection.active = False
         finally:
+            # Even a malformed host transport that fails while binding may have
+            # retained the payload. It must never keep a usable authority.
             projection.active = False
-            _COMMIT_INDEX_PROJECTION.reset(token)
 
     def _validate_commit_index_projection(
         self, projection: _CommitIndexProjection
@@ -6299,6 +6458,7 @@ class IndexManager:
         table_name: str | None = None,
         table: object | None = None,
         txn: StagingTransaction | None = None,
+        _active_indexes: Sequence[IndexStore] | None = None,
     ) -> int:
         """Count entries this row owes without deriving or hashing value keys.
 
@@ -6308,14 +6468,19 @@ class IndexManager:
         domain as staging without trying to encode an empty DELETE value tuple.
         """
 
-        return sum(
-            1
-            for index in self.active_indexes_for(
+        indexes = (
+            self.active_indexes_for(
                 table_id,
                 table_name=table_name,
                 table=table,
                 txn=txn,
             )
+            if _active_indexes is None
+            else _active_indexes
+        )
+        return sum(
+            1
+            for index in indexes
             if index.definition.owes_entry_for_record(record_id, values)
         )
 
@@ -6330,12 +6495,18 @@ class IndexManager:
         record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
+        _active_indexes: Sequence[IndexStore] | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the entry this new row version owes it."""
         records: list[WalRecord] = []
-        for index in self.active_indexes_for(
-            table_id, table_name=table_name, table=table, txn=txn
-        ):
+        indexes = (
+            self.active_indexes_for(
+                table_id, table_name=table_name, table=table, txn=txn
+            )
+            if _active_indexes is None
+            else _active_indexes
+        )
+        for index in indexes:
             definition = index.definition
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
@@ -6361,12 +6532,18 @@ class IndexManager:
         record_id: object | None = None,
         table_name: str | None = None,
         table: object | None = None,
+        _active_indexes: Sequence[IndexStore] | None = None,
     ) -> tuple[WalRecord, ...]:
         """Stage, on every index of the table, the end of the entry this row version had."""
         records: list[WalRecord] = []
-        for index in self.active_indexes_for(
-            table_id, table_name=table_name, table=table, txn=txn
-        ):
+        indexes = (
+            self.active_indexes_for(
+                table_id, table_name=table_name, table=table, txn=txn
+            )
+            if _active_indexes is None
+            else _active_indexes
+        )
+        for index in indexes:
             definition = index.definition
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
@@ -6436,23 +6613,29 @@ class IndexManager:
 
         The surrounding transaction manager already holds its participant section, writer lease
         and cross-process ``COMMIT_SECTION``. A context-local seal carries only that authority
-        through ordinary/custom ``commit`` overrides; it cannot leak to a direct low-level call
+        through ordinary/custom manager ``commit`` overrides; it cannot leak to a direct low-level call
         in another thread or survive success/failure.
         """
+        if self._live_commit_context is None:
+            return self.commit(txn, csn)
         authority = _LiveCommitAuthority(
             seal=_LIVE_COMMIT_AUTHORITY_SEAL,
             manager=self,
             txn=txn,
         )
-        token = _LIVE_COMMIT_AUTHORITY.set(authority)
         try:
-            return self.commit(txn, csn)
+            with self._live_commit_context.bind(authority):
+                try:
+                    return self.commit(txn, csn)
+                finally:
+                    # Revoke before the host restores its token. Context copies
+                    # retain this object, not a still-valid independent permit.
+                    authority.active = False
+                    authority.store = None
         finally:
-            # Context copies retain this same scope object. Revoke it before resetting the
-            # current context so no delayed task can inherit a still-valid capability.
+            # A failed bind/entry can also retain the object: fail closed there.
             authority.active = False
             authority.store = None
-            _LIVE_COMMIT_AUTHORITY.reset(token)
 
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
         """Apply, on every index, what this transaction staged, and return how many changes moved.
@@ -6477,7 +6660,9 @@ class IndexManager:
         staged_tables = {
             index.definition.table_id for index in indexes if observations[index]
         }
-        authority = _LIVE_COMMIT_AUTHORITY.get()
+        authority = (
+            None if self._live_commit_context is None else self._live_commit_context.get()
+        )
         authorised_scope = (
             authority
             if (
@@ -6494,7 +6679,22 @@ class IndexManager:
             if authorised_scope is not None:
                 authorised_scope.store = index
             try:
-                moved = index.commit(txn, csn)
+                commit = index.commit
+                if (
+                    authorised_scope is not None
+                    and type(commit) is MethodType
+                    and commit.__self__ is index
+                    and commit.__func__ is _CANONICAL_INDEX_STORE_COMMIT
+                ):
+                    # Pass the transport, not the authority value: a call in a
+                    # different execution context cannot borrow this scope.
+                    moved = _CANONICAL_INDEX_CONTEXT_COMMIT(
+                        index, txn, csn, _live_context=self._live_commit_context
+                    )
+                else:
+                    # Preserve custom store overrides and their existing two-arg
+                    # contract. They keep scalar validation, not ambient authority.
+                    moved = commit(txn, csn)
             finally:
                 if authorised_scope is not None:
                     authorised_scope.store = None
@@ -6884,6 +7084,7 @@ class IndexManager:
 
         resolved: list[tuple[WalRecord, IndexStore, IndexChange]] = []
         excluded: set[IndexStore] = set()
+        ordered: set[IndexStore] = set()
         resolution_memo: dict[str, IndexStore] | None = (
             {} if type(self).active_index is IndexManager.active_index else None
         )
@@ -6937,6 +7138,15 @@ class IndexManager:
                 )
             resolved.append((record, store, change))
             if (
+                store.definition.layout is IndexLayout.ORDERED
+                and change.operation is not IndexOperation.RESET
+                and store._rebuild_authority is None
+                and not store._replaying
+                and store._stale_reason is None
+                and callable(getattr(store, "apply_replay_batch", None))
+            ):
+                ordered.add(store)
+            elif (
                 change.operation is IndexOperation.RESET
                 or not self._batch_replay_compatible(store)
                 or store._rebuild_authority is not None
@@ -6948,12 +7158,18 @@ class IndexManager:
                 # authority even if the two records are far apart in WAL order.
                 excluded.add(store)
 
+        # Eligibility is store-wide. A later RESET or specialised state revokes an earlier
+        # ordered observation from this same WAL subsequence.
+        ordered.difference_update(excluded)
+
         common_records = tuple(
-            record for record, store, _change in resolved if store not in excluded
+            record
+            for record, store, _change in resolved
+            if store not in excluded and store not in ordered
         )
-        if not common_records:
+        if not common_records and not ordered:
             return None
-        if not excluded:
+        if not excluded and not ordered:
             # Preserve an override's observable preparation door. The built-in path can consume
             # the exact passage-local decode/resolution above; a custom override keeps receiving
             # the original single positional sequence and retains its complete protocol.
@@ -6972,23 +7188,39 @@ class IndexManager:
             return self.apply_common_replay_batch(records)
 
         common_resolved = tuple(
-            item for item in resolved if item[1] not in excluded
+            item
+            for item in resolved
+            if item[1] not in excluded and item[1] not in ordered
         )
-        prepared = (
-            self._prepare_common_replay_batch(
-                common_records,
-                _resolved=common_resolved,
+        prepared = None
+        if common_records:
+            prepared = (
+                self._prepare_common_replay_batch(
+                    common_records,
+                    _resolved=common_resolved,
+                )
+                if can_reuse_resolved
+                else self._prepare_common_replay_batch(common_records)
             )
-            if can_reuse_resolved
-            else self._prepare_common_replay_batch(common_records)
-        )
-        if prepared is None:
-            return None
+            if prepared is None:
+                return None
 
         moved_by_store: dict[IndexStore, bool] = {
-            state.store: False for state in prepared.stores
+            state.store: False for state in (() if prepared is None else prepared.stores)
         }
-        common_items = iter(prepared.items)
+        common_items = iter(() if prepared is None else prepared.items)
+        ordered_batches: dict[IndexStore, tuple[tuple[IndexChange, ...], Lsn]] = {}
+        for store in ordered:
+            items = tuple(
+                (change, lsn_of(record))
+                for record, candidate, change in resolved
+                if candidate is store
+            )
+            ordered_batches[store] = (
+                tuple(change for change, _position in items),
+                max(position for _change, position in items),
+            )
+        ordered_applied: set[IndexStore] = set()
         touched: list[IndexStore] = []
         touched_set: set[IndexStore] = set()
         try:
@@ -6996,6 +7228,14 @@ class IndexManager:
                 if store not in touched_set:
                     touched_set.add(store)
                     touched.append(store)
+                if store in ordered:
+                    if store in ordered_applied:
+                        continue
+                    changes, through_lsn = ordered_batches[store]
+                    apply_ordered = getattr(store, "apply_replay_batch")
+                    apply_ordered(changes, through_lsn=through_lsn)
+                    ordered_applied.add(store)
+                    continue
                 if store in excluded:
                     if not self.apply(record):
                         raise GrafxIndexError(
@@ -7021,7 +7261,8 @@ class IndexManager:
                     store._replaying = False
                 moved_by_store[store] = moved_by_store[store] or moved
 
-            self._publish_common_replay_headers(prepared, moved_by_store)
+            if prepared is not None:
+                self._publish_common_replay_headers(prepared, moved_by_store)
             return tuple(store.file for store in touched)
         except Exception as failure:
             for store in touched:
@@ -7117,6 +7358,109 @@ class IndexManager:
             project=lambda ref, version: (ref, version),
         )
 
+    def validated_identity_landings(
+        self, index: IndexStore, key: bytes, snapshot: SnapshotLike
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Return validated versions for an identity landing, without vector objects (RELSEEK-M4).
+
+        An optional capability beside :meth:`validated_versions`, with the same contract and the
+        same certificate: a caller that consumes only the header fields of the versions it
+        proves asks for it by name, and a collaborator that does not offer it is used through
+        ``validated_versions`` instead.  The heap validates every version through
+        :meth:`HeapStore.read_landing`, which performs every check of ``read`` but does not
+        build vector objects.  It is accepted only for a record-id derived index, whose key never
+        touches a column, so the sentinel a landing carries in vector positions can neither be
+        compared nor published: the versions it returns are proofs, never rows.
+        """
+        return self._validated_items(
+            index,
+            key,
+            snapshot,
+            project=lambda ref, version: (ref, version),
+            landing=True,
+        )
+
+    def validated_identity_counts_many(
+        self,
+        index: IndexStore,
+        keys: Sequence[bytes],
+        snapshot: SnapshotLike,
+    ) -> tuple[int, ...]:
+        """Count visible identity witnesses under one exact pre/post certificate.
+
+        Like scalar identity landings, every candidate is decoded and checked,
+        including vector bodies. Only cardinalities survive the callback, so a
+        bounded frontier need not retain all endpoint payloads. Counts above one
+        remain observable to the query's canonical duplicate-identity refusal.
+        No answer escapes until the whole batch's post-certificate succeeds.
+        """
+        definition = index.definition
+        if definition.key_derivation != RECORD_ID_KEY_DERIVATION:
+            raise GrafxIndexError(
+                f"Index {definition.name!r} derives its key from columns and cannot validate "
+                "identity landings.",
+                field="key_derivation", value=definition.key_derivation,
+                index=definition.name, file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        wanted_by_position = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted_by_position))
+        if not distinct:
+            return ()
+
+        def confirm(certificate: _IndexReadCertificate) -> tuple[int, ...]:
+            self._prepare_heap_view(index.file, certificate)
+            answers: dict[bytes, int] = {}
+            for wanted, candidates in index._candidate_groups_unchecked(distinct):
+                count = 0
+                for entry in candidates:
+                    version = self._heap.read_landing(entry.ref)
+                    if version.table_id != definition.table_id:
+                        raise GrafxCorruptionDetected(
+                            f"Index {definition.name!r} points at a row of table "
+                            f"{version.table_id} and covers table {definition.table_id}.",
+                            file=index.file, page=entry.page, slot=entry.slot,
+                            index=definition.name, field="table_id",
+                        )
+                    if not snapshot.visible(version.xmin, version.xmax):
+                        continue
+                    if definition.entry_key_for_record(version.record_id, version.values) != entry.key:
+                        continue
+                    count += 1
+                answers[wanted] = count
+            return tuple(answers[wanted] for wanted in wanted_by_position)
+
+        return index._stable_view(read_lsn, confirm)
+
+    def validated_identity_landings_many(
+        self, index: IndexStore, keys: Sequence[bytes], snapshot: SnapshotLike,
+    ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+        """Return vector-free identity witnesses under one whole-batch fence.
+
+        Like scalar landings, every candidate payload (including history) is
+        validated. The caller must keep vector proof markers out of row values.
+        No prefix escapes before the post-certificate; retries rebuild all groups.
+        """
+        definition = index.definition
+        if definition.key_derivation != RECORD_ID_KEY_DERIVATION:
+            raise GrafxIndexError(
+                f"Index {definition.name!r} derives its key from columns and cannot validate "
+                "identity landings.",
+                field="key_derivation", value=definition.key_derivation,
+                index=definition.name, file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        wanted = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted))
+        if not distinct:
+            return ()
+        return index._stable_view(
+            read_lsn,
+            lambda certificate: self._validated_version_groups(
+                index, wanted, distinct, snapshot, certificate, landing=True,
+            ),
+        )
+
     def validated_versions_many(
         self,
         index: IndexStore,
@@ -7152,46 +7496,140 @@ class IndexManager:
                 file=index.file,
             )
         read_lsn = index._require_exact_read_lsn(snapshot)
-        definition = index.definition
         wanted_by_position = tuple(index._require_key(key) for key in keys)
         distinct = tuple(dict.fromkeys(wanted_by_position))
         if not distinct:
             return ()
 
+        return index._stable_view(
+            read_lsn,
+            lambda certificate: self._validated_version_groups(
+                index,
+                wanted_by_position,
+                distinct,
+                snapshot,
+                certificate,
+            ),
+        )
+
+    def validated_versions_many_reusing(
+        self,
+        index: IndexStore,
+        keys: Sequence[bytes],
+        snapshot: SnapshotLike,
+        *,
+        generation: object | None,
+        cached: Mapping[bytes, tuple[tuple[RecordRef, HeapVersion], ...]],
+    ) -> tuple[
+        object,
+        bool,
+        tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...],
+    ]:
+        """Reuse transaction-owned key results only inside a newly stable exact view.
+
+        The caller owns and bounds ``cached``; this component owns its authority. A cached group
+        is used only when a fresh pre-certificate is exactly the private generation returned by
+        an earlier successful call. The ordinary post-certificate still brackets the answer. If
+        either certificate changes, ``_stable_view`` retries the whole callback and every key is
+        validated canonically in the new generation before anything leaves this method.
+
+        ``bool`` reports whether the supplied generation authorized cached groups in the final
+        successful attempt. The returned opaque generation has meaning only when handed back to
+        this same method for this exact index; unfamiliar tokens simply miss the cache.
+        """
+        if index.visibility is IndexVisibility.PROXIMITY:
+            raise GrafxIndexError(
+                f"Index {index.name!r} has proximity visibility and does not validate heap "
+                "versions during lookup.",
+                field="visibility",
+                value=index.visibility.value,
+                index=index.name,
+                file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        wanted_by_position = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted_by_position))
+        if not distinct:
+            return generation, True, ()
+
         def confirm(
             certificate: _IndexReadCertificate,
-        ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
-            """Probe every distinct key and validate every candidate inside this certificate."""
-            self._prepare_heap_view(index.file, certificate)
-            answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
-            for wanted in distinct:
-                accepted: list[tuple[RecordRef, HeapVersion]] = []
-                for entry in index._candidates_unchecked(wanted):
-                    version = self._heap.read(entry.ref)
-                    if version.table_id != definition.table_id:
-                        raise GrafxCorruptionDetected(
-                            f"Index {definition.name!r} points at a row of table "
-                            f"{version.table_id} and covers table {definition.table_id}.",
-                            file=index.file,
-                            page=entry.page,
-                            slot=entry.slot,
-                            index=definition.name,
-                            field="table_id",
-                        )
-                    if not snapshot.visible(version.xmin, version.xmax):
-                        continue
-                    if (
-                        definition.entry_key_for_record(
-                            version.record_id, version.values
-                        )
-                        != entry.key
-                    ):
-                        continue
-                    accepted.append((entry.ref, version))
-                answers[wanted] = tuple(accepted)
-            return tuple(answers[wanted] for wanted in wanted_by_position)
+        ) -> tuple[
+            object,
+            bool,
+            tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...],
+        ]:
+            reusable = (
+                type(generation) is _IndexReadCertificate
+                and certificate == generation
+            )
+            missing = tuple(
+                wanted
+                for wanted in distinct
+                if not reusable or wanted not in cached
+            )
+            fresh_groups = self._validated_version_groups(
+                index,
+                missing,
+                missing,
+                snapshot,
+                certificate,
+            )
+            answers = (
+                {wanted: cached[wanted] for wanted in distinct if wanted in cached}
+                if reusable
+                else {}
+            )
+            answers.update(zip(missing, fresh_groups, strict=True))
+            return (
+                certificate,
+                reusable,
+                tuple(answers[wanted] for wanted in wanted_by_position),
+            )
 
         return index._stable_view(read_lsn, confirm)
+
+    def _validated_version_groups(
+        self,
+        index: IndexStore,
+        wanted_by_position: Sequence[bytes],
+        distinct: Sequence[bytes],
+        snapshot: SnapshotLike,
+        certificate: _IndexReadCertificate,
+        *,
+        landing: bool = False,
+    ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+        """Validate already-canonical keys inside the caller's exact-read certificate."""
+        # Even an all-cached answer must attach the companion heap view to this exact durable
+        # generation.  The caller may skip payload decodes, never the storage-view fence.
+        self._prepare_heap_view(index.file, certificate)
+        definition = index.definition
+        read = self._heap.read_landing if landing else self._heap.read
+        answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
+        for wanted, candidates in index._candidate_groups_unchecked(distinct):
+            accepted: list[tuple[RecordRef, HeapVersion]] = []
+            for entry in candidates:
+                version = read(entry.ref)
+                if version.table_id != definition.table_id:
+                    raise GrafxCorruptionDetected(
+                        f"Index {definition.name!r} points at a row of table "
+                        f"{version.table_id} and covers table {definition.table_id}.",
+                        file=index.file,
+                        page=entry.page,
+                        slot=entry.slot,
+                        index=definition.name,
+                        field="table_id",
+                    )
+                if not snapshot.visible(version.xmin, version.xmax):
+                    continue
+                if (
+                    definition.entry_key_for_record(version.record_id, version.values)
+                    != entry.key
+                ):
+                    continue
+                accepted.append((entry.ref, version))
+            answers[wanted] = tuple(accepted)
+        return tuple(answers[wanted] for wanted in wanted_by_position)
 
     def _validated_items(
         self,
@@ -7200,10 +7638,24 @@ class IndexManager:
         snapshot: SnapshotLike,
         *,
         project: Callable[[RecordRef, HeapVersion], _ReadResult],
+        landing: bool = False,
     ) -> tuple[_ReadResult, ...]:
         """Validate exact candidates once and project each accepted heap proof."""
         read_lsn = index._require_exact_read_lsn(snapshot)
         definition = index.definition
+        if landing and definition.key_derivation != RECORD_ID_KEY_DERIVATION:
+            # A landing version carries an unmaterialised vector sentinel; re-deriving a
+            # column key from it would compare a proof shape with stored bytes.  Refuse before
+            # any view opens rather than let a sentinel reach a key comparison.
+            raise GrafxIndexError(
+                f"Index {definition.name!r} derives its key from columns and cannot validate "
+                "identity landings.",
+                field="key_derivation",
+                value=definition.key_derivation,
+                index=definition.name,
+                file=index.file,
+            )
+        read = self._heap.read_landing if landing else self._heap.read
         wanted = index._require_key(key)
 
         def confirm(
@@ -7213,7 +7665,7 @@ class IndexManager:
             self._prepare_heap_view(index.file, certificate)
             confirmed: list[_ReadResult] = []
             for entry in index._candidates_unchecked(wanted):
-                version = self._heap.read(entry.ref)
+                version = read(entry.ref)
                 if version.table_id != definition.table_id:
                     raise GrafxCorruptionDetected(
                         f"Index {definition.name!r} points at a row of table "
@@ -7569,7 +8021,15 @@ class IndexManager:
             definition, through_lsn
         )
 
-        index = HashIndex(definition, self._pool, self._metrics)
+        ordered = definition.layout is IndexLayout.ORDERED
+        if ordered:
+            from okto_grafx.engine.ordered_index import OrderedIndex
+
+            index: IndexStore = OrderedIndex(
+                definition, self._pool, self._metrics
+            )
+        else:
+            index = HashIndex(definition, self._pool, self._metrics)
         index._set_creation_nonce(definition.artifact_nonce)
         collision = next(
             (
@@ -7595,40 +8055,67 @@ class IndexManager:
             # distinguishes our new orphan-safe generation from another participant's bytes.
             self._pool.storage.create(index.file, exclusive=True)
             created = True
-            index.create(proved_present=True)
-
-            empty_build = _EmptyIndexBuild()
-            for ref, key, ended_at in self._detached_exact_generation_entries(
-                definition, position, table
-            ):
-                insert = IndexChange(
-                    index=definition.name,
-                    operation=IndexOperation.INSERT,
-                    key=key,
-                    ref=ref,
-                )
-                accelerated = index._apply_empty_build_change(
-                    empty_build, insert, position
-                )
-                if accelerated is None:
-                    index._apply_change(insert, position)
-                if ended_at is not None:
-                    tombstone = IndexChange(
+            if ordered:
+                create_bulk = getattr(index, "create_bulk", None)
+                if not callable(create_bulk):
+                    raise GrafxUnsupportedOperation(
+                        "The ordered index store has no detached bulk-build door.",
+                        field="ordered_bulk_build",
                         index=definition.name,
-                        operation=IndexOperation.TOMBSTONE,
+                    )
+                create_bulk(
+                    (
+                        IndexEntry(
+                            key=key,
+                            ref=ref,
+                            versioned=False,
+                            dead_csn=(
+                                NO_CSN if ended_at is None else ended_at
+                            ),
+                        )
+                        for ref, key, ended_at in self._detached_exact_generation_entries(
+                            definition, position, table
+                        )
+                    ),
+                    applied_through_lsn=position,
+                    _precreated=True,
+                )
+            else:
+                index.create(proved_present=True)
+
+                empty_build = _EmptyIndexBuild()
+                for ref, key, ended_at in self._detached_exact_generation_entries(
+                    definition, position, table
+                ):
+                    insert = IndexChange(
+                        index=definition.name,
+                        operation=IndexOperation.INSERT,
                         key=key,
                         ref=ref,
-                        csn=ended_at,
                     )
                     accelerated = index._apply_empty_build_change(
-                        empty_build, tombstone, position
+                        empty_build, insert, position
                     )
                     if accelerated is None:
-                        index._apply_change(tombstone, position)
+                        index._apply_change(insert, position)
+                    if ended_at is not None:
+                        tombstone = IndexChange(
+                            index=definition.name,
+                            operation=IndexOperation.TOMBSTONE,
+                            key=key,
+                            ref=ref,
+                            csn=ended_at,
+                        )
+                        accelerated = index._apply_empty_build_change(
+                            empty_build, tombstone, position
+                        )
+                        if accelerated is None:
+                            index._apply_change(tombstone, position)
 
             # The header claim is flushed before verification, and the final checkpoint below
             # then barriers the complete verified generation as one unreachable shadow.
-            index.advance_built_through(position)
+            if not ordered:
+                index.advance_built_through(position)
             entry_findings = self._verify_entries(index)
             coverage_findings = self._verify_coverage(index)
             findings = (*entry_findings, *coverage_findings)

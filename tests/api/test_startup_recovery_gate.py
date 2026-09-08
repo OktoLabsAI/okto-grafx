@@ -31,6 +31,41 @@ def _all_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
+def test_public_composition_retains_fused_control_reads_for_commit_and_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native optimization stays wired through coordination, txn and recovery."""
+    original = LocalStorageDevice.read_log_if_exists
+    calls: list[str] = []
+
+    def observed(
+        self: LocalStorageDevice, file: str, offset: int, length: int
+    ) -> bytes | None:
+        calls.append(file)
+        return original(self, file, offset, length)
+
+    monkeypatch.setattr(LocalStorageDevice, "read_log_if_exists", observed)
+    root = tmp_path / "fused-control"
+    with connect(root, page_size=PAGE_SIZE) as database:
+        calls.clear()
+        with database.begin("write") as transaction:
+            transaction.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
+        assert COMMIT_STATE_FILE in calls
+        assert "control/writer.lease" in calls
+        database.checkpoint()
+
+    calls.clear()
+    with connect(root, page_size=PAGE_SIZE, read_only=True) as database:
+        assert COMMIT_STATE_FILE in calls
+        with database.begin("read") as transaction:
+            assert tuple(transaction.execute("MATCH (p:Person) RETURN p.id").rows) == ()
+
+    calls.clear()
+    with connect(root, page_size=PAGE_SIZE) as database:
+        assert COMMIT_STATE_FILE in calls
+        assert database.catalog.catalog.table("Person").primary_key == "id"
+
+
 def test_read_only_refuses_a_wal_commit_hidden_by_restored_old_state_without_writing(
     tmp_path: Path,
 ) -> None:

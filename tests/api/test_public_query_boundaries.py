@@ -41,6 +41,7 @@ from okto_grafx.domain.query.plan import (
     PlanNode,
     ProduceResults,
     ProjectRows,
+    RelationshipScan,
     SingleRow,
     TraverseRelationship,
     UnionRows,
@@ -276,14 +277,18 @@ def test_owned_relationship_plan_rebuilds_schema_values_and_their_caches() -> No
         first = database.explain(query)
         second = database.explain(query)
 
-        first_traverse = next(
-            node for node in first.walk() if type(node) is TraverseRelationship
+        first_relationship = next(
+            node
+            for node in first.walk()
+            if type(node) in (RelationshipScan, TraverseRelationship)
         )
-        second_traverse = next(
-            node for node in second.walk() if type(node) is TraverseRelationship
+        second_relationship = next(
+            node
+            for node in second.walk()
+            if type(node) in (RelationshipScan, TraverseRelationship)
         )
-        first_table = first_traverse.table
-        second_table = second_traverse.table
+        first_table = first_relationship.table
+        second_table = second_relationship.table
         assert first_table is not second_table
         assert first_table.columns is not second_table.columns
         assert all(
@@ -308,12 +313,18 @@ def test_owned_relationship_plan_rebuilds_schema_values_and_their_caches() -> No
         object.__setattr__(first_table.columns[-1], "name", "corrupted")
         third = database.explain(query)
 
-    third_traverse = next(
-        node for node in third.walk() if type(node) is TraverseRelationship
+    third_relationship = next(
+        node
+        for node in third.walk()
+        if type(node) in (RelationshipScan, TraverseRelationship)
     )
-    assert third_traverse.table.name == "E"
-    assert third_traverse.table.columns[-1].name == "w"
-    assert dict(third_traverse.table.column_positions) == {"_from": 0, "_to": 1, "w": 2}
+    assert third_relationship.table.name == "E"
+    assert third_relationship.table.columns[-1].name == "w"
+    assert dict(third_relationship.table.column_positions) == {
+        "_from": 0,
+        "_to": 1,
+        "w": 2,
+    }
 
 
 def test_non_owned_collaborator_plan_never_reaches_the_trusted_clone_recipe(
@@ -419,6 +430,62 @@ def test_parameter_and_result_maps_are_mutable_but_owned_and_lists_are_tuples() 
     assert observed == {"nested": (1,)}
     observed["owned"] = True
     assert "owned" not in source
+
+
+def test_exact_parameter_dict_keeps_scalar_validation_off_the_recursive_door(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    def unexpected(*args: object, **kwargs: object) -> object:
+        raise AssertionError("an exact scalar entered the recursive parameter copier")
+
+    monkeypatch.setattr(public_views, "_query_value_snapshot", unexpected)
+
+    detached = public_views._query_parameters_snapshot(
+        {
+            "none": None,
+            "flag": True,
+            "integer": INT64_MAX,
+            "real": 1.25,
+            "text": "owned already",
+            "bytes": b"immutable",
+        }
+    )
+
+    assert detached == {
+        "none": None,
+        "flag": True,
+        "integer": INT64_MAX,
+        "real": 1.25,
+        "text": "owned already",
+        "bytes": b"immutable",
+    }
+
+
+def test_exact_parameter_dict_delegates_non_exact_or_compound_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import okto_grafx.engine.public_views as public_views
+
+    class Tagged(str):
+        pass
+
+    original = public_views._query_value_snapshot
+    observed: list[type[object]] = []
+
+    def counted(value: object, **kwargs: object) -> object:
+        observed.append(type(value))
+        return original(value, **kwargs)
+
+    monkeypatch.setattr(public_views, "_query_value_snapshot", counted)
+
+    detached = public_views._query_parameters_snapshot(
+        {"plain": 1, "tagged": Tagged("x"), "nested": [2]}
+    )
+
+    assert detached == {"plain": 1, "tagged": "x", "nested": (2,)}
+    assert observed == [Tagged, list, int]
 
 
 def test_shared_acyclic_values_are_accepted_and_detached_per_occurrence() -> None:

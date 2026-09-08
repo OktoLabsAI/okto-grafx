@@ -7,6 +7,13 @@ conflict rather than silently deviating — a unilateral interface change breaks
 Authority chain: `docs/specs/SPEC-M1.md` and `docs/specs/SPEC-VEC.md` are the requirements;
 this contract is the single agreed realization of them.
 
+Documentation routing update (2026-09-08): the only active backlog is
+[ROADMAP.md](../../ROADMAP.md). Historical `PUNCHLIST.md`, Round 7 and evolution
+plan references below resolve to the [consolidated source archive](../archive/ROADMAP_SOURCES.md).
+New gaps are recorded in the roadmap, not a recreated punch-list. The current
+[performance policy](../PERFORMANCE.md) supersedes historical timing gates only;
+storage, concurrency, recovery and quality invariants are unchanged.
+
 ---
 
 ## 0. Non-negotiables (from the board guidelines and binding decisions D1–D9)
@@ -641,7 +648,7 @@ intermediate `meta=v2/complete=v1` state is resumable by a writer and read-only 
 | off | type | field |
 |---|---|---|
 | 0 | u32 | `checksum` — CRC-32C over bytes[4:page_size] |
-| 4 | u16 | `page_type` 0 free · 1 meta · 2 heap · 3 catalog · 4 index_hash · 5 index_hnsw · 6 overflow · 7 control_slot · 8 control_header |
+| 4 | u16 | `page_type` 0 free · 1 meta · 2 heap · 3 catalog · 4 index_hash · 5 index_hnsw · 6 overflow · 7 control_slot · 8 control_header · 9 index_ordered_root · 10 index_ordered_internal · 11 index_ordered_leaf |
 | 6 | u16 | `flags` |
 | 8 | u64 | `page_lsn` — LSN of the last WAL record applied to this page (redo idempotence) |
 | 16 | u32 | `seq` — even = stable, odd = being written (torn-read detection helper) |
@@ -713,8 +720,11 @@ Record types: `1 BEGIN · 2 WRITE_PAGE · 3 COMMIT · 4 ABORT · 5 CHECKPOINT ·
 **Decoder rule:** the decoder accepts every declared supported header version, then applies the
 closed record-type/flags grammar for that version. Round-trip tests per supported version are
 mandatory (TR-4). WAL v1 flags remain opaque and gain no retrospective meaning. In WAL v2, bit
-`0x0001` means REQUIRED, bit `0x0004` means `PAGE_IMAGE_ZLIB1` and bit `0x0008` means
-SKIPPABLE; the only v2 grammar currently emitted is `WRITE_PAGE` with the first two bits set. An
+`0x0001` means REQUIRED, bit `0x0004` means `PAGE_IMAGE_ZLIB1`, bit `0x0008` means
+SKIPPABLE and bit `0x0010` means `COMMIT_CATALOG_V1`. WRITE_PAGE accepts exactly
+`0x0005` (ordinary compressed page), `0x0011` (raw journal page), or `0x0015`
+(compressed journal page). Journal framing is implemented but automatic journal
+emission/replay remain disabled; those targets refuse before any replay effect. An
 unknown v2 type is skippable only with exactly `0x0008`; flags zero are fail-closed so forgetting to
 mark a future required type cannot silently drop it. Unsupported semantics and a known type without
 a v2 grammar are typed schema-version refusals and must not be truncated, appended past or recycled.
@@ -727,8 +737,18 @@ The compressed `WRITE_PAGE` v2 payload retains the v1 clear prefix
 consume exactly one complete stream and must produce exactly the declared length before the normal
 page codec validates the image. Emission requires the persistent catalog-v2 capability
 `wal_record_v2`, activated in a preceding v1-only transaction. A raw batch that would roll to a new
-segment remains entirely v1 so compression cannot change the `SEGMENT_HEADER`/terminal-CSN plan.
+segment keeps ordinary page effects in v1 so compression cannot change the
+`SEGMENT_HEADER`/terminal-CSN plan. Future journal effects must retain their required
+`0x0011` v2 framing even on roll; uncompressed does not mean legacy journal semantics.
 See `WAL_PAGE_COMPRESSION_V1.md`.
+
+Journal WRITE_PAGE targets are exactly `commits.dir` or `commits.dat`; both retain
+the same clear target prefix. Raw journal images follow the prefix directly;
+compressed images reuse the bounded compression grammar above. A journal bit on
+another target is corrupt known semantics; journal targets without the bit are
+typed schema-version refusals, never a legacy fallback. Full-page validation and
+cross-file publication/recovery proof remain necessary beyond this payload codec.
+See [COMMIT_CATALOG_V1](COMMIT_CATALOG_V1.md).
 
 `COMMIT` payload (canonical, versioned): `snapshot_lsn u64 | read_partition_count u32 |
 write_partition_count u32 | read_partitions[u64...] | write_partitions[u64...] | page_touch_count u32 |
@@ -789,6 +809,16 @@ class EmbeddingSpaceDef:
 
 `Catalog` exposes `tables()`, `table(name)`, `spaces()`, `space(name)`, `next_table_id()`,
 `next_space_id()` and is itself persisted through `catalog.dat` as normal WAL-covered pages.
+
+Internal CAP-1B catalog-v2 extension: required capability bit 4 (`commit_catalog_v1`)
+adds a checksummed u64 activation COMMIT LSN at byte offset 44, immediately after
+the ordinary v2 extension, before schema bodies. It is absent when the capability
+is absent; legacy bytes are unchanged. The horizon is 1..PROVISIONAL_CSN-1 and
+unknown required capabilities refuse before body interpretation. The private
+activation transaction remains v1 WAL and does not create journal files. Automatic
+journal publication/replay and public APIs are not yet enabled; subsequent writes
+on experimentally activated stores explicitly refuse. Exact format, remaining
+integration requirements and evidence: [COMMIT_CATALOG_V1](COMMIT_CATALOG_V1.md).
 
 ---
 
@@ -1000,6 +1030,20 @@ Algorithm (FROZEN):
 7. `recovery_policy="refuse"` raises `GrafxRecoveryRefused` **instead of step 3** and leaves
    everything on disk untouched.
 
+CAP-1B replay lineage: the internal `CommittedReplay.commit_records` tuple retains
+individual COMMIT envelopes, including empty outcomes, in addition to selected
+effects and the maximum watermark. Startup recovery and checkpoint page/index
+subplans preserve the exact tuple. When supplied, boundaries must be forward,
+unique by `(epoch, txn_id)`, end at the advertised watermark, and own every
+selected effect at a strictly earlier LSN; incomplete effects cannot belong to
+those terminal transactions. Preflight captures terminal signatures before
+decoding pages and refuses callback mutation before sealing/applying the plan.
+Passage-bound proof reuse also checks terminal tuple/signature identity. An old
+hand-constructed effect-only plan retains its prior behavior, but is not proof
+of commit-history coverage. Journal replay remains explicitly refused until
+the complete cross-file protocol is integrated; these boundaries alone do not
+certify catalog contents, a WAL barrier or physical authority.
+
 ```python
 class LedgerStore:
     def append(self, entry: LedgerEntry) -> int
@@ -1146,7 +1190,7 @@ class QueryEngine:
 Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TABLE` /
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`, and `-[:R*]->`
 for the default bound), the narrow root `OPTIONAL MATCH (v:Label)`, `WHERE`, `RETURN`
-(`DISTINCT`, aliases), one leading `UNWIND`, non-aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
+(`DISTINCT`, aliases), one leading `UNWIND`, scalar or aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
 aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
 `string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
 evaluates every argument from left to right and returns the first non-null one, or null when all
@@ -1216,8 +1260,13 @@ stage projects each name once. A carried matched variable keeps its binding, so 
 still read its properties and still write it, while a computed item is a value and never a `SET`
 or `DELETE` target. The `WHERE` belongs to the stage it was written under and therefore filters
 what that projection produced, which is what lets a guard such as `size(parts) >= 2` protect the
-stage after it. Aggregation, `DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` inside a `WITH`, a `MATCH`
-after one, a `WITH` after a clause that writes, and `UNWIND` combined with `WITH` are all refused.
+stage after it. Since 0.0.4 aggregate WITH items use the same native `AggregateRows` operator as
+RETURN; all non-aggregate items are grouping keys. An empty input with no grouping key still
+produces the global aggregate (e.g. count zero); grouping by a node over an empty input produces
+no row. Aggregate nesting is refused. Grouped entity bindings survive byte-budget spill using
+the private operator-row codec, preserving their original snapshot and owner-overlay identity.
+`DISTINCT`, `ORDER BY`, `SKIP` and `LIMIT` inside a `WITH`, a mandatory `MATCH`
+after one, a `WITH` after a clause that writes, and `UNWIND` combined with `WITH` remain refused.
 `WithRows` is streaming -- one row in, one row out -- and participates once, through the common
 operator wrapper, in `max_intermediate_rows`.
 
@@ -1228,10 +1277,38 @@ term, runs before `OptionalRows`: if the complete match produces no row, that op
 row binding `v` to null; if it produces rows, it forwards only those rows and adds nothing.
 Consequently `v.property` and `label(v)` answer null, `count(v)` is zero and `count(*)` is one on
 the extension. The scan remains the ordinary owner-only snapshot view, and the synthetic row is
-subject to the ordinary result and intermediate-row budgets. A chained optional, one following
-`MATCH`, `WITH` or `UNWIND`, any write, an anonymous/unlabelled/multi-labelled/map node, a path,
-relationship or multiple pattern is refused before streaming. Parser, analysis and planner each
-repeat the structural gate so supplied trees or supplied analysis cannot widen the form.
+subject to the ordinary result and intermediate-row budgets. This root-only form does not admit
+an anonymous/unlabelled/multi-labelled/map node or multiple patterns. Parser, analysis and planner
+each repeat the structural gate so supplied trees or supplied analysis cannot widen the form.
+
+Since 0.0.4 a second form admits `MATCH (a:Label) [WHERE ...] OPTIONAL MATCH (a)-[r]-(b)
+[WHERE ...] RETURN ...`. The root is one named node with exactly one label (an inline root map
+is allowed). The optional clause is one correlated single hop, outgoing, incoming or undirected,
+with zero or one relationship type and zero or one target label. Target and relationship names
+are optional; supplied aliases must be distinct. The optional source may repeat the root label.
+This form also admits additional incident OPTIONAL hops from the same anchor, interleaved with
+WITH projections/aggregations. The AST retains their written order. For example, count outgoing
+edges in a WITH before expanding incoming edges to avoid multiplying the two degrees. Each hop
+introduces fresh target/relationship aliases; the anchor must remain in scope. An incompatible
+typed relationship endpoint produces a null optional extension, not an invented relationship.
+Optional inline maps, ranges, named paths, additional mandatory MATCH clauses, UNWIND, writes and
+vector-search predicates in the optional clause remain refused. This is not arbitrary optional
+join support; vector search also cannot cross the new interleaved projection barriers.
+No Pulse schema or scoring formula is encoded in the engine. LIMIT-to-vector-top-k fusion
+remains disabled across WITH stages, which may filter or aggregate candidate rows.
+
+All matching edges retain multiplicity. Each anchor with no edge satisfying the target label
+and complete optional WHERE produces one row with null target/relationship: `count(r)=0`,
+`count(*)=1`. An empty mandatory root produces no such row. An undirected self-loop has two
+directional matches (`count(r)=2`, `count(DISTINCT r)=1`), as in typed traversal. Existing scalar,
+aggregate, ordering and window rules apply; unsupported expression/type combinations still fail.
+Label-free targets and untyped relationships read missing properties as null. Property families
+are checked across eligible tables before streaming; incompatible families are refused and
+integer/double families promote under the existing polymorphic rules.
+`TraverseAnyRelationship` expands only incident tables in catalog table-id order, using the
+existing indexed/batched traversal access paths, owner overlay and one statement snapshot.
+Existing traversal, result and intermediate budgets remain enforced. No storage format, WAL,
+OCC, durability or reader/writer admission protocol changes are involved.
 
 `left UNION right` is admitted in one deliberately closed form: exactly two top-level, read-only
 queries, each ending in `RETURN`, followed by one global duplicate elimination. Column positions
@@ -1254,8 +1331,8 @@ supplied analysis. The same bounded expression-depth and parameter-count limits 
 combined statement; alias expansion used only for type proof is memoized and never rewrites the
 executable branch AST.
 
-`MATCH (a:Decision)-[r]->(b) RETURN a.id` is admitted literally, and it is the only untyped hop
-this engine reads. Those names and that label are part of the form: a relationship that names no
+`MATCH (a:Decision)-[r]->(b) RETURN a.id` is admitted literally as the standalone mandatory
+untyped-hop form. Those names and that label are part of that form: a relationship that names no
 type names no table, so the answer is defined only where the tables it could live in are, and
 they are the relationship tables whose `from_table` is `Decision`. They are enumerated in
 table_id order, and multiplicity is preserved in both directions -- two parallel edges between
@@ -1270,7 +1347,7 @@ fan-out. A candidate whose `to_table` the catalog does not hold fails before str
 the same door a typed hop uses; it is not filtered out, because filtering would answer with the
 sound tables and give no sign the answer was partial.
 
-Every other untyped spelling keeps the refusal and the message it already had: an incoming or
+Outside the correlated optional form described above, every other untyped spelling keeps its refusal: an incoming or
 undirected hop, an anonymous relationship, a written or implicit range, an inline map, a
 different source or target name, another label or none, a target carrying a label, a `WHERE`, a
 second pattern or `MATCH`, a named path, and any `RETURN` other than the single unaliased
@@ -1313,13 +1390,19 @@ and the pattern records that a `*` was typed rather than inferring it from the h
 
 A path may also be NAMED, in `MATCH path = (a:A)-[r:T]->(b:B) [WHERE ...] RETURN ...`. Ordinarily
 the name is decorative: it is written and checked but not read, and the plan is the plan of the
-same query without the name. There is one closed Pulse compatibility exception that reads it:
+same query without the name. A closed typed one-hop form reads it:
 
 ```
-MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path
+MATCH journey = (source:Person)-[edge:Knows]->(target:Person) RETURN journey
 ```
 
-That exact AST returns one one-hop path value for every matching relationship, preserving
+Since 0.0.4 the path, endpoint and relationship aliases and schema names are caller-defined
+bare identifiers; the four aliases must be distinct. The two endpoint labels may differ,
+provided the named relationship's catalog declaration matches them exactly. A literal
+non-negative terminal LIMIT is optional. This also admits storage-owned relationship names
+without encoding a client application's physical naming convention in Grafx.
+
+That shape returns one one-hop path value for every matching relationship, preserving
 parallel-edge multiplicity. The map carries `_NODES` and `_RELS`; nodes carry `_ID`, `_LABEL`
 and every catalog property, while the relationship carries `_SRC`, `_DST`, `_LABEL`, `_ID` and
 every user property. Endpoint identities equal the corresponding node identities. The numbers
@@ -1329,13 +1412,13 @@ list values remain tuples; the Pulse provider performs its narrow tuple-to-list 
 [`PULSE-PATH-VALUE-1.0.md`](../specs/PULSE-PATH-VALUE-1.0.md) freezes the differential oracle,
 key order, identity correlations and public Pulse layer rewrites.
 
-Because those maps have structural keys, this projection refuses a `Decision` property named
-`_ID` or `_LABEL`, or a `supersedes` property named `_SRC`, `_DST`, `_LABEL` or `_ID`, during
+Because those maps have structural keys, this projection refuses a property on either endpoint
+named `_ID` or `_LABEL`, or a relationship property named `_SRC`, `_DST`, `_LABEL` or `_ID`, during
 planning and before any row streams. The names remain legal for schemas outside this projection;
 the physical relationship endpoint columns `_from` and `_to` are not user properties and remain
 accepted and omitted from the public map.
 
-Every other read of a path name -- another name, label, relationship type or direction, a
+Every wider read of a path name -- an incoming or undirected hop, a
 property/function, `WHERE`, `ORDER BY`, alias, additional item or clause, map, written range,
 multiple hop, write, or `UNION` branch -- is refused before streaming. Decorative paths keep
 their existing exact form: one `MATCH` of one pattern, one named outgoing hop of one type with no
@@ -1426,8 +1509,15 @@ directories and buffer bookkeeping are included; allocator arenas, interpreter-s
 variations, collaborators, arbitrary read-view tokens and temporary values owned only by an
 executing call stack are excluded. The gauge is an estimate
 of retained Python memory, not process RSS and not the eviction/admission budget. It is sampled
-on reported residency-topology changes; the immutable `Database.pool` health view recomputes the
-current estimate, so routine unpins do not acquire an O(resident frames) telemetry cost.
+on residency-topology reports. From 0.0.4, after each automatic sample it waits
+`max(1, last_estimate_bytes // page_size)` such reports before sampling again.
+The first report samples immediately. Nominal used-byte reporting is unchanged;
+skipped retained estimates are not re-emitted as fresh observations. The gauge
+is a sampled trend, not a peak or a wall-time-bounded current reading, and can lag
+growth/shrink or remain unchanged while idle. The immutable `Database.pool`
+health view always recomputes the current estimate, independently of that cadence.
+Routine unpins and each individual cold admission therefore do not require a
+whole-pool retained-memory walk. Sampling never controls admission or eviction.
 Descriptor-cache counters are cumulative per local-device lifetime and deliberately carry no
 file/path label. The adapter snapshots their deltas under its own guard and emits afterward; when
 a pool storage call nests that operation, the existing contained-metrics boundary drains the
@@ -2679,7 +2769,7 @@ was started before they existed. A standard that rises during the review is not 
 **Everything else is a PUNCH-LIST note, not a rejection** -- and the critic still reports it:
 mutation survivors whose behaviour is correct; unpinned constants; stale docstrings; masked guards
 that behave correctly; message quality; cosmetics; hypotheses that could not be demonstrated. These
-accumulate in `docs/architecture/PUNCHLIST.md` and are worked in W6 integration hardening.
+accumulate in `ROADMAP.md` (historical detail in `docs/archive/ROADMAP_SOURCES.md`) and are worked in W6 integration hardening.
 
 **Round cap: two more rounds per W1 component.** A round that produces only punch-list notes is a
 **SIGN-OFF with punch list**, not a rejection. If a genuine blocker survives two more rounds, the
@@ -2807,3 +2897,24 @@ A component gets **two** correction rounds per rejection. A blocking defect surv
 recorded as a carried finding and the component ships with it stated. The bar is a database that does
 not lose, duplicate or corrupt data, does not return wrong results, and does not lie about what it did
 -- proven by tests that exist, with the remaining gaps written down.
+
+## Explicit durable index status (2026-09-07)
+
+`Database.read_index_status(name) -> IndexView` is an explicit read-I/O operation.
+It reads and validates the active generation's durable header under the existing
+catalog/freshness protocol and returns detached immutable metadata. Unlike the
+cheap `database.indexes` and `database.vectors` observations, its watermark does
+not depend on page-zero cache residency. It does not rebuild an index, advance
+its watermark, clear staleness or prove full heap/index coverage. Consumers that
+certify coverage must still use verification and publication fencing. Cheap
+observations retain their no-page-fault contract; `None` means unobserved, not zero.
+
+## Closed scalar traversal materialization (0.0.4)
+
+A proved single-hop scalar query may omit allocation of unused destination vector
+components, never their durable validation. Full-entity/vector reads and unproved
+plans retain full materialization. Partial landing rows are internal, guarded and
+separately keyed in the existing bounded transaction-local cache; they cannot
+answer a later full read. Traversal order, multiplicity, frontier, budgets and
+index/heap certificates are unchanged. See `docs/VECTOR_FREE_TRAVERSAL_0_0_4.md`
+for the proof boundary, fallback, adversarial evidence and measured limitations.

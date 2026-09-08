@@ -9,6 +9,25 @@ including the on-disk format.
 
 ### Added
 
+- Reorganized documentation around consumer integration: tutorial, synchronous/async
+  service recipes, complete public signature/DTO appendix, 36-field configuration
+  reference, Cypher subset, CLI, indexes/vectors and operational recovery/commit outcomes.
+- Consolidated eleven prior evolution/performance/agent plans into one immutable
+  source archive with a preservation manifest; `ROADMAP.md` is the sole active
+  queue for capabilities, corrective work and known limitations. Dated evidence
+  moved to `docs/reports/`; README links the current performance table and roadmap.
+- Added offline documentation/link/API/configuration/archive checks and executable
+  consumer examples. Corrected CLI help about transactional DDL rollback; no query,
+  storage, concurrency or durability behavior changed in this documentation refactor.
+
+- Connected internal commit-catalog WAL validation to native recovery/checkpoint page replay.
+  Complete per-COMMIT coverage, database identity, target LSN/content and physical extents are
+  checked before applying any effect; partial valid/unwritten page sets and repeated replay are
+  supported. WAL and journal data barriers precede publication. CRC-invalid targets still fail
+  closed; automatic journal emission and public commit-history APIs remain disabled.
+- Made the closed CRC-provider argument-convention table immutable, preserving its fixed two
+  providers without adding an exception to the storage-core shared-state isolation check.
+
 - Added an explicitly selected, per-database `codec="numpy"` page adapter backed by NumPy from
   `[accel]`. It preserves page format v1 byte-for-byte, uses the pure codec for small directories
   and as the sole authority for invalid-image refusals, and reports both page-codec and effective
@@ -567,7 +586,7 @@ stabilization and Pulse-compatibility work completed before publication.
   before it is installed, and numpy vector math selected only by explicit configuration.
 - **Windows and POSIX as equal citizens** (D9), with a suite that requires a platform-specific test
   to declare its counterpart and every skip to be attributed.
-- **Performance documentation with in-tree instruments**: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
+- **Performance documentation with in-tree instruments**: [`docs/PERFORMANCE.md`](docs/reports/PERFORMANCE_HISTORY.md)
   records measured numbers with their machine, build and load conditions —
   `tools/measure_concurrency.py` (multi-process read/write latency under load, correctness-gated)
   and `tools/measure_traversal.py` (traversal shapes with index-vs-scan equality) reproduce them.

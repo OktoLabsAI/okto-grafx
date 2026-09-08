@@ -28,6 +28,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 from okto_grafx.domain.errors import GrafxPlanError
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.ports.vectormath import DistanceMetric
@@ -60,7 +61,9 @@ __all__ = [
     "IndexSeek",
     "LimitRows",
     "MergePattern",
+    "NodeMultiKeySeek",
     "NodeScan",
+    "OrderedNodeMerge",
     "OptionalRows",
     "PlanNode",
     "ProduceResults",
@@ -244,6 +247,50 @@ class AllNodesScan(PlanNode):
 
 
 @dataclass(frozen=True, slots=True)
+class OrderedNodeMerge(PlanNode):
+    """Bounded descending merge of one exact ordered generation per node table.
+
+    ``fallback`` is the complete canonical scan/filter pipeline. It is used only before an
+    ordered certificate is opened when the runtime collaborator cannot discharge the planned
+    capability. Once iteration starts, any drift or damage propagates rather than mixing a
+    partially produced ordered prefix with a scan.
+    """
+
+    fallback: PlanNode
+    variable: str
+    tables: tuple[TableDef, ...]
+    indexes: tuple[str, ...]
+    timestamp_column: str
+    string_column: str
+    limit: Expression
+    predicate: Expression | None = None
+    upper_timestamp: Expression | None = None
+    upper_string: Expression | None = None
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the canonical fallback as the operator's proof-preserving child."""
+        return (self.fallback,)
+
+    def details(self) -> Mapping[str, object]:
+        """Return the exact order, participating generations and optional bound."""
+        return {
+            "variable": self.variable,
+            "tables": ", ".join(table.name for table in self.tables) or "none",
+            "indexes": ", ".join(self.indexes) or "none",
+            "order": f"{self.timestamp_column} DESC, {self.string_column} DESC",
+            "upper_bound": (
+                "none"
+                if self.upper_timestamp is None or self.upper_string is None
+                else (
+                    f"({self.upper_timestamp.describe()}, "
+                    f"{self.upper_string.describe()})"
+                )
+            ),
+            "limit": self.limit.describe(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class NodeScan(PlanNode):
     """Every version of one node table the snapshot can see, once per incoming row.
 
@@ -344,11 +391,12 @@ class TraverseRelationship(PlanNode):
 
 @dataclass(frozen=True, slots=True)
 class TraverseAnyRelationship(PlanNode):
-    """One outgoing hop that names no type, walked across every table it could live in.
+    """One incident hop across eligible tables, optionally null-extending each anchor.
 
     A typed hop names its table and :class:`TraverseRelationship` walks it. An untyped hop names
-    none, and the honest answer is not to pick one: it is every relationship table that leaves
-    the source's label, walked in a fixed order so the same query answers the same way twice.
+    none, and the honest answer is not to pick one: it is every eligible relationship table.
+    Correlated optional hops additionally support incoming/undirected or typed expansion,
+    a target label and a predicate evaluated before per-anchor null extension.
 
     The tables are ordered by ``table_id``, which is the order the catalog assigned them and the
     only order that does not depend on how a name happens to sort. Multiplicity is preserved
@@ -364,6 +412,12 @@ class TraverseAnyRelationship(PlanNode):
     target: str
     relationship: str
     tables: tuple[TableDef, ...]
+    direction: Direction = Direction.OUTGOING
+    optional: bool = False
+    source_table: str | None = None
+    target_table: str | None = None
+    relationship_polymorphic: bool = False
+    predicate: Expression | None = None
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -371,11 +425,17 @@ class TraverseAnyRelationship(PlanNode):
 
     def details(self) -> Mapping[str, object]:
         """Return the endpoints and the tables this hop may live in, in walk order."""
-        return {
+        details = {
             "source": self.source,
             "target": self.target,
             "tables": ", ".join(table.name for table in self.tables),
         }
+        if self.optional:
+            details["optional"] = "true"
+            details["direction"] = self.direction.value
+            if self.predicate is not None:
+                details["predicate"] = self.predicate.describe()
+        return details
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +475,42 @@ class RelationshipScan(PlanNode):
         if self.predicate is not None:
             details["predicate"] = self.predicate.describe()
         return details
+
+
+@dataclass(frozen=True, slots=True)
+class NodeMultiKeySeek(PlanNode):
+    """Resolve a closed primary-key list of one node table through its exact multi-key index.
+
+    The operator is admitted only for a standalone labelled node whose first local term is
+    ``n.<primary key> IN $parameter``.  ``fallback`` is the canonical scan of the same table for
+    the same statement, and the predicate itself stays above this operator, replayed over every
+    row either path produces: a missing/stale capability, a probe that is not a list or that the
+    durable key cannot represent, or a table this transaction has already written change only
+    the access path, never the answer or the refusal.  The runtime still validates every
+    exact-index candidate against the heap under the transaction snapshot before yielding it.
+    """
+
+    fallback: PlanNode
+    variable: str
+    table: TableDef
+    keys: Expression
+    key_position: int
+    index: str
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the exact canonical fallback retained by this access path."""
+        return (self.fallback,)
+
+    def details(self) -> Mapping[str, object]:
+        """Describe the closed predicate and the exact index it needs."""
+        return {
+            "variable": self.variable,
+            "table": self.table.name,
+            "index": self.index,
+            "predicate": (
+                f"{self.variable}.{self.table.primary_key} IN {self.keys.describe()}"
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,6 +653,9 @@ class AggregateRows(PlanNode):
     child: PlanNode
     grouping: tuple[ReturnItem, ...]
     aggregations: tuple[Aggregation, ...]
+    # WITH carries matched entities to downstream graph operators; RETURN can
+    # detach them to public values and retain its compact spill representation.
+    preserve_group_bindings: bool = False
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are grouped."""
@@ -924,6 +1023,8 @@ class CreateIndex(PlanNode):
     positions: tuple[int, ...]
     bucket_count: int
     expected_cardinality: int | None
+    layout: IndexLayout
+    key_derivation: str
 
     def details(self) -> Mapping[str, object]:
         """Return the fully resolved logical definition and sizing intent."""
@@ -933,6 +1034,8 @@ class CreateIndex(PlanNode):
             "positions": ", ".join(str(position) for position in self.positions),
             "bucket_count": self.bucket_count,
             "expected_cardinality": self.expected_cardinality or "none",
+            "layout": self.layout.value,
+            "key_derivation": self.key_derivation,
         }
 
 

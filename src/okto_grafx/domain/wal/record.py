@@ -32,6 +32,7 @@ __all__ = [
     "WAL_V2_FLAG_REQUIRED",
     "WAL_V2_FLAG_SKIPPABLE",
     "WAL_V2_FLAG_PAGE_IMAGE_ZLIB1",
+    "WAL_V2_FLAG_COMMIT_CATALOG_V1",
     "WAL_HEADER_LENGTH",
     "CHECKSUM_LENGTH",
     "SUPPORTED_FORMAT_VERSIONS",
@@ -65,6 +66,9 @@ WAL_V2_FLAG_SKIPPABLE: int = 0x0008
 
 WAL_V2_FLAG_PAGE_IMAGE_ZLIB1: int = 0x0004
 """The WRITE_PAGE image body uses bounded zlib level-1 compression."""
+
+WAL_V2_FLAG_COMMIT_CATALOG_V1: int = 0x0010
+"""Required WRITE_PAGE semantics for commit history, independent of compression."""
 
 WAL_HEADER_LENGTH: int = 48
 """Bytes of fixed header in a version 1 record."""
@@ -142,11 +146,13 @@ def v2_record_semantics_error(record_type: int, flags: int) -> str | None:
     """Return why a v2 type/flags pair is unsupported, or ``None`` when it is closed-safe."""
 
     compressed_page_flags = WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_PAGE_IMAGE_ZLIB1
+    journal_flags = WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_COMMIT_CATALOG_V1
     if record_type == int(WalRecordType.WRITE_PAGE):
-        if flags == compressed_page_flags:
+        if flags in {compressed_page_flags, journal_flags, journal_flags | WAL_V2_FLAG_PAGE_IMAGE_ZLIB1}:
             return None
         return (
-            f"WRITE_PAGE v2 requires flags 0x{compressed_page_flags:04x}; got "
+            "WRITE_PAGE v2 requires exactly compressed-page (0x0005), "
+            "commit-catalog (0x0011), or compressed commit-catalog (0x0015) flags; got "
             f"0x{flags:04x}."
         )
     if not is_known_record_type(record_type):

@@ -50,6 +50,7 @@ from okto_grafx.adapters.coordination_local import (
 )
 from okto_grafx.adapters.graph_guard import ConditionGuard
 from okto_grafx.adapters.metrics_contained import ContainedMetricsSink
+from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.adapters.metrics_noop import NoOpMetricsSink
 from okto_grafx.adapters.query_spill_local import LocalQuerySpillFactory
 from okto_grafx.adapters.storage_local import LocalStorageDevice
@@ -63,6 +64,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION
 from okto_grafx.domain.page.checksum import crc32c
@@ -87,6 +89,7 @@ from okto_grafx.engine.index_manager import (
     index_file,
     primary_key_index_name,
 )
+from okto_grafx.engine.ordered_index import OrderedIndex
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import register_catalog
 from okto_grafx.engine.quarantine import QuarantineStore
@@ -105,6 +108,9 @@ from okto_grafx.runtime.config import (
     _openmetrics_host_port,
 )
 from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
+from okto_grafx.runtime.capability_probe import port_has_attribute
+from okto_grafx.runtime.scoped_value import ContextLocalValue
+from okto_grafx.runtime.tuple_encoding_proofs import new_tuple_encoding_proofs
 
 __all__ = [
     "LABEL_DIGEST_BYTES",
@@ -371,9 +377,15 @@ def assemble_database(
         quarantine = QuarantineStore(storage, clock, metrics)
         ledger = LedgerStore(storage, clock, metrics, quarantine=quarantine)
         catalog = CatalogStore(pool)
-        heap = HeapStore(pool, catalog)
+        tuple_encoding_proofs = new_tuple_encoding_proofs()
+        heap = HeapStore(pool, catalog, tuple_encoding_proofs=tuple_encoding_proofs)
         indexes = IndexManager(
-            pool, heap, metrics, artifact_nonce=_new_control_file_nonce
+            pool,
+            heap,
+            metrics,
+            artifact_nonce=_new_control_file_nonce,
+            projection_context=ContextLocalValue("okto_grafx_commit_index_projection"),
+            live_commit_context=ContextLocalValue("okto_grafx_live_commit_authority"),
         )
         vectors = VectorEngine(
             catalog=catalog,
@@ -436,11 +448,11 @@ def assemble_database(
                     attached_names.append(name)
             return newly_attached
 
-        def load_catalog_and_sync_existing_indexes() -> tuple[str, ...]:
-            """Interpret catalog bytes only after recovery has replayed their page images."""
+        def load_catalog() -> bool:
+            """Interpret proved catalog bytes before constructing catalog-dependent services."""
             nonlocal catalog_loaded
             if not catalog.is_bootstrapped():
-                return ()
+                return False
             if not catalog_loaded:
                 # Re-derive then adopt, the same non-destructive route recovery itself uses.
                 # When catalog pages were replayed this is an idempotent second reading; when
@@ -449,6 +461,12 @@ def assemble_database(
                 # unsaved changes must never be discarded by a later callback.
                 catalog.adopt(catalog.read_from_pages())
                 catalog_loaded = True
+            return True
+
+        def load_catalog_and_sync_existing_indexes() -> tuple[str, ...]:
+            """Load then adopt the existing baseline required by writable recovery."""
+            if not load_catalog():
+                return ()
             # Existing files form the only baseline recovery may certify. Creating an empty
             # index from a retained WAL suffix would turn absence into a silently short path.
             return sync_indexes(existing_only=True)
@@ -460,6 +478,7 @@ def assemble_database(
             quarantine,
             pool,
             metrics,
+            attribute_probe=port_has_attribute,
             catalog=catalog,
             index_manager=indexes,
             index_sync=load_catalog_and_sync_existing_indexes,
@@ -469,6 +488,7 @@ def assemble_database(
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
+            control_read_if_exists=read_control_if_exists,
         )
         # FR-1: a writable reopen replays BEFORE catalog payloads are interpreted. A read-only
         # reopen proves from both commit.state and the WAL that replay is unnecessary, then may
@@ -476,7 +496,12 @@ def assemble_database(
         if config.read_only:
             recovery.require_read_only_consistent()
             _require_published_stores(catalog, heap)
-            load_catalog_and_sync_existing_indexes()
+            # No redo runs on this path. The manager constructor needs the catalog
+            # capability flags but does not consume index artifacts. Adopt those
+            # once at the existing final read-only sync below, not twice around a
+            # constructor that only wires transaction state. Recovery's callback
+            # and all later transaction-level synchronization remain unchanged.
+            load_catalog()
             report = None
         else:
             report = recovery.run()
@@ -518,6 +543,8 @@ def assemble_database(
             database_uuid=identity.database_uuid,
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
+            control_read_if_exists=read_control_if_exists,
+            tuple_encoding_proofs=tuple_encoding_proofs,
             process_identity_provider=os.getpid,
             catalog_changes_are_wal_logged=True,
         )
@@ -544,6 +571,8 @@ def assemble_database(
             # Separate from BufferPool's lock: endpoint memo accounting is atomic, while the
             # heap walk it enables never holds this guard across page I/O.
             endpoint_locator_guard=threading.RLock(),
+            compiled_predicate_guard=threading.Lock(),
+            tuple_encoding_proofs=tuple_encoding_proofs,
             max_statement_writes=config.max_statement_writes,
             max_result_rows=config.max_result_rows,
             max_intermediate_rows=config.max_intermediate_rows,
@@ -633,6 +662,7 @@ def assemble_database(
         recovery=recovery,
         vectors=vectors,
         queries=queries,
+        plan_guard_factory=threading.Lock,
         verifier_factory=_verifier_factory(pool, metrics, heap, catalog, indexes),
         recovery_report=report,
         attached_indexes=attached,
@@ -725,7 +755,11 @@ def _attach_primary_key_indexes(
         if definition.visibility is not IndexVisibility.EXACT:
             continue
         try:
-            index = HashIndex(definition, pool, metrics)
+            index = (
+                OrderedIndex(definition, pool, metrics)
+                if definition.layout is IndexLayout.ORDERED
+                else HashIndex(definition, pool, metrics)
+            )
             try:
                 current = indexes.index(index.name)
             except GrafxIndexError as failure:

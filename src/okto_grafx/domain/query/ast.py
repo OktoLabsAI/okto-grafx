@@ -726,6 +726,17 @@ class Query(Statement):
     # stage BELONGS is decided by describe() and the planner, both of which place it
     # between the MATCH clauses and the clauses that write.
     with_clauses: tuple[WithClause, ...] = ()
+    # Only needed when reads and projections interleave. Older programmatic trees
+    # retain their MATCH-then-WITH meaning without a new positional argument.
+    read_clause_order: tuple[str, ...] = ()
+
+    def ordered_read_clauses(self) -> tuple[MatchClause | WithClause, ...]:
+        """Return the reading pipeline (validated by analysis before planning)."""
+        if not self.read_clause_order:
+            return (*self.match_clauses, *self.with_clauses)
+        matches, projections = iter(self.match_clauses), iter(self.with_clauses)
+        return tuple(next(matches if kind == "match" else projections)
+                     for kind in self.read_clause_order)
 
     @property
     def writes(self) -> bool:
@@ -735,8 +746,7 @@ class Query(Statement):
     def describe(self) -> str:
         """Return the query as it would be written back."""
         parts = [] if self.unwind_clause is None else [self.unwind_clause.describe()]
-        parts.extend(clause.describe() for clause in self.match_clauses)
-        parts.extend(clause.describe() for clause in self.with_clauses)
+        parts.extend(clause.describe() for clause in self.ordered_read_clauses())
         parts.extend(clause.describe() for clause in self.updating_clauses)
         if self.return_clause is not None:
             parts.append(self.return_clause.describe())
@@ -797,6 +807,7 @@ class CreateIndexStatement(Statement):
     columns: tuple[str, ...]
     bucket_count: int | None = None
     expected_cardinality: int | None = None
+    layout: str | None = None
 
     def describe(self) -> str:
         """Return the statement as it would be written back."""
@@ -812,6 +823,8 @@ class CreateIndexStatement(Statement):
                 f"{body} OPTIONS expected_cardinality = "
                 f"{self.expected_cardinality}"
             )
+        if self.layout is not None:
+            return f"{body} OPTIONS layout = {self.layout}"
         return body
 
 

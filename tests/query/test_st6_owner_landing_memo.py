@@ -170,9 +170,10 @@ def test_a_write_to_another_table_leaves_the_landing_view_standing(
         decodes.clear()
         assert sorted(txn.execute(TRAVERSE).rows) == [(1, "t1"), (2, "t2")]
         assert scans["B"] == 0
-        # The dirty A frontier visits its newly changed row too, so B3 is requested for the first
-        # time.  B1/B2 remain cached: one new identity decode, never a three-row landing scan.
-        assert decodes["B"] == 1
+        # The dirty-table primary-key overlay keeps this exact ``a.id = 1`` access on IndexSeek.
+        # A3 is therefore no longer visited merely because A is dirty, and the standing B1/B2
+        # landing view answers without decoding the unrelated B3 row.
+        assert decodes["B"] == 0
 
 
 def test_update_then_delete_in_one_transaction_never_resurrects_the_landing(

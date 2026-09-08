@@ -20,6 +20,7 @@ from okto_grafx.domain.page import Page
 import okto_grafx.engine.index_manager as index_manager_module
 from okto_grafx.engine.index_manager import HashIndex, IndexManager, IndexStore
 from okto_grafx.engine.txn_manager import TransactionManager
+from okto_grafx.runtime.scoped_value import ContextLocalValue
 
 from .conftest import Database, TransactionDouble
 
@@ -248,13 +249,14 @@ def test_copied_authority_context_is_revoked_after_the_fenced_call() -> None:
             captured.append(copy_context())
             return 0
 
-    manager = CapturingManager(database.pool, database.heap, database.metrics)
+    context = ContextLocalValue("captured-live-commit")
+    manager = CapturingManager(
+        database.pool, database.heap, database.metrics, live_commit_context=context
+    )
     txn = TransactionDouble(txn_id=109)
 
     assert manager._commit_under_write_authority(txn, COMMIT_LSN) == 0  # noqa: SLF001
-    inherited = captured[0].run(
-        index_manager_module._LIVE_COMMIT_AUTHORITY.get  # noqa: SLF001
-    )
+    inherited = captured[0].run(context.get)
 
     assert isinstance(inherited, index_manager_module._LiveCommitAuthority)  # noqa: SLF001
     assert inherited.active is False

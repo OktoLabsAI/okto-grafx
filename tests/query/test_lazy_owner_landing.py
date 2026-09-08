@@ -113,47 +113,80 @@ def test_requested_landing_payload_corruption_is_not_hidden() -> None:
     stack.engine.settle_schema(71, committed=False)
 
 
-def test_on_disk_landing_reuses_the_authenticated_payload_length_for_accounting(
+def test_landing_charge_is_the_shape_tariff_and_never_re_encodes_the_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """KGRUN-M4: on-disk and synthetic versions with equal values pay one shape charge."""
     stack = build_query_stack()
     ref = _insert_people(stack, 1)[0]
     table = stack.table("Person")
     version = stack.heap.read(ref)
-    expected_payload_bytes = len(encode_tuple(table, version.values))
-    assert version.stored_payload_bytes == expected_payload_bytes
+    payload_bytes = len(encode_tuple(table, version.values))
+    assert version.stored_payload_bytes == payload_bytes
+    synthetic = replace(version, values=version.values)
+    assert synthetic.stored_payload_bytes is None
 
     def unexpected_encode(*args: object, **kwargs: object) -> bytes:
-        raise AssertionError("an authenticated on-disk payload must not be re-encoded")
+        raise AssertionError("a row without compound values must not be re-encoded")
 
     monkeypatch.setattr(query_engine_module, "encode_tuple", unexpected_encode)
 
-    assert _owner_landing_result_bytes(table, (ref, version)) == (
+    charge = _owner_landing_result_bytes(table, (ref, version))
+    assert charge is not None
+    assert charge == _owner_landing_result_bytes(table, (ref, synthetic))
+    # The tariff dominates the object (a 4-cell row is a few hundred bytes) and stays far below
+    # the former 16 x payload rule, which is what starved the cache.
+    assert query_engine_module._OWNER_LANDING_RESULT_BASE_BYTES < charge
+    assert charge < (
         query_engine_module._OWNER_LANDING_RESULT_BASE_BYTES
-        + expected_payload_bytes * _OWNER_LANDING_PAYLOAD_MULTIPLIER
+        + payload_bytes * _OWNER_LANDING_PAYLOAD_MULTIPLIER
+    )
+    assert _owner_landing_result_bytes(table, None) == (
+        query_engine_module._OWNER_LANDING_MISS_BYTES
     )
 
 
-def test_changed_or_synthetic_landing_keeps_the_canonical_encoding_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stack = build_query_stack()
-    ref = _insert_people(stack, 1)[0]
-    table = stack.table("Person")
-    changed = replace(stack.heap.read(ref), values=(1, "changed", 9, "city"))
-    assert changed.stored_payload_bytes is None
-    original = encode_tuple
-    calls = 0
+def test_landing_charge_grows_with_string_length_and_vector_dimension() -> None:
+    """The shape tariff is a deterministic function of lengths and dimensions."""
+    from okto_grafx.domain.model.schema import ColumnDef, TableDef
+    from okto_grafx.domain.model.value import ValueType, VectorValue
 
-    def observed_encode(table_arg: object, values: object) -> bytes:
-        nonlocal calls
-        calls += 1
-        return original(table_arg, values)
+    table = TableDef(
+        table_id=9,
+        name="Shape",
+        kind="node",
+        columns=(
+            ColumnDef("id", ValueType.STRING, nullable=False),
+            ColumnDef("s", ValueType.STRING),
+            ColumnDef("v", ValueType.VECTOR_F32, vector_space="emb"),
+            ColumnDef("n", ValueType.INT64),
+        ),
+        primary_key="id",
+    )
 
-    monkeypatch.setattr(query_engine_module, "encode_tuple", observed_encode)
+    def charge(*values: object) -> int:
+        version = query_engine_module.HeapVersion(
+            record_id=1,
+            xmin=1,
+            xmax=0,
+            values=values,
+            prev=None,
+            schema_version=table.schema_version,
+            deleted=False,
+            table_id=table.table_id,
+        )
+        found = _owner_landing_result_bytes(table, (object(), version))
+        assert found is not None
+        return found
 
-    assert _owner_landing_result_bytes(table, (ref, changed)) is not None
-    assert calls == 1
+    short = charge("a", "b" * 10, VectorValue((0.0,) * 4, 1, "float32"), 1)
+    longer = charge("a", "b" * 20, VectorValue((0.0,) * 4, 1, "float32"), 1)
+    wider = charge("a", "b" * 10, VectorValue((0.0,) * 8, 1, "float32"), 1)
+    null_vector = charge("a", "b" * 10, None, 1)
+    assert longer - short == 10 * query_engine_module._OWNER_LANDING_STRING_CHAR_BYTES
+    assert wider - short == 4 * query_engine_module._OWNER_LANDING_VECTOR_COMPONENT_BYTES
+    assert null_vector < short
+    assert charge("a", "b" * 10, VectorValue((0.0,) * 4, 1, "float32"), 1) == short
 
 
 @pytest.mark.parametrize(
@@ -169,7 +202,7 @@ def test_changed_or_synthetic_landing_keeps_the_canonical_encoding_fallback(
     ),
     ids=("byte-ceiling", "entry-ceiling"),
 )
-def test_result_quota_discards_retention_but_never_denies_the_landing(
+def test_result_quota_declines_retention_but_never_denies_or_disables_the_landing(
     monkeypatch: pytest.MonkeyPatch,
     max_bytes: int,
     max_entries: int,
@@ -202,7 +235,8 @@ def test_result_quota_discards_retention_but_never_denies_the_landing(
     slot = memo.tables[stack.table("Person").table_id]
     assert slot.view is view
     assert view._cache == {}
-    assert view._cache_enabled is False
+    # KGRUN-M4: a refusal declines this result only; the view keeps admitting later ones.
+    assert view._cache_enabled is True
     assert stack.engine._owner_budget._used_bytes == (
         _OWNER_LANDING_MEMO_BYTES
         + _OWNER_LANDING_TABLE_BYTES
@@ -213,6 +247,148 @@ def test_result_quota_discards_retention_but_never_denies_the_landing(
     stack.engine.settle_schema(71, committed=False)
     assert stack.engine._owner_budget._used_bytes == 0
     assert stack.engine._owner_budget._used_entries == 0
+
+
+def test_result_quota_evicts_the_least_recently_used_landing_of_the_same_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KGRUN-M4: past the ceiling the view trades its oldest result, never disables itself."""
+    stack = build_query_stack()
+    refs = _insert_people(stack, 3)
+    table = stack.table("Person")
+    charge = _owner_landing_result_bytes(table, (refs[0], stack.heap.read(refs[0])))
+    assert charge is not None
+    base = (
+        _OWNER_LANDING_MEMO_BYTES
+        + _OWNER_LANDING_TABLE_BYTES
+        + _OWNER_LANDING_VIEW_BASE_BYTES
+    )
+    # Room for exactly one retained result: a second one must evict the first.
+    stack.engine._owner_budget = _OwnerLandingBudget(
+        max_bytes=base + charge + charge // 2,
+        max_entries=1_000,
+        guard=stack.engine._endpoint_guard,
+    )
+    resolved: list[int] = []
+    original = query_engine_module._visible_identity_with_ref
+
+    def counted(engine: object, context: object, table_arg: object, identity: int):
+        resolved.append(identity)
+        return original(engine, context, table_arg, identity)
+
+    monkeypatch.setattr(query_engine_module, "_visible_identity_with_ref", counted)
+    context = _context(stack)
+    view = _owner_landing_view(stack.engine, context, table, frozenset())
+    budget = stack.engine._owner_budget
+
+    assert view.get(1, context)[0] == refs[0]
+    assert list(view._cache) == [1]
+    assert view.get(2, context)[0] == refs[1]
+    assert list(view._cache) == [2], "the least recently used result was evicted"
+    assert view.get(2, context)[0] == refs[1]
+    assert view.get(1, context)[0] == refs[0]
+    assert list(view._cache) == [1]
+    assert view.get(3, context)[0] == refs[2]
+    assert resolved == [1, 2, 1, 3]
+    assert view._cache_enabled is True
+    assert budget._used_bytes == base + charge
+    assert budget._used_entries == 4
+    assert view._cache_entries == 1 and view._cache_bytes == charge
+
+    stack.engine.settle_schema(71, committed=False)
+    assert budget._used_bytes == 0
+    assert budget._used_entries == 0
+
+
+def test_a_hit_becomes_the_most_recently_used_landing() -> None:
+    stack = build_query_stack()
+    refs = _insert_people(stack, 3)
+    table = stack.table("Person")
+    charge = _owner_landing_result_bytes(table, (refs[0], stack.heap.read(refs[0])))
+    assert charge is not None
+    base = (
+        _OWNER_LANDING_MEMO_BYTES
+        + _OWNER_LANDING_TABLE_BYTES
+        + _OWNER_LANDING_VIEW_BASE_BYTES
+    )
+    stack.engine._owner_budget = _OwnerLandingBudget(
+        max_bytes=base + 2 * charge + charge // 2,
+        max_entries=1_000,
+        guard=stack.engine._endpoint_guard,
+    )
+    context = _context(stack)
+    view = _owner_landing_view(stack.engine, context, table, frozenset())
+    view.get(1, context)
+    view.get(2, context)
+    view.get(1, context)  # hit: 1 is now the most recently used
+    view.get(3, context)  # evicts 2, not 1
+    assert list(view._cache) == [1, 3]
+    assert stack.engine._owner_budget._used_bytes == base + 2 * charge
+    stack.engine.settle_schema(71, committed=False)
+    assert stack.engine._owner_budget._used_bytes == 0
+
+
+def test_concurrent_landings_never_exceed_the_ceiling_and_answer_correctly() -> None:
+    """KGRUN-M4: eviction under contention keeps the budget exact and every answer right."""
+    stack = build_query_stack()
+    refs = _insert_people(stack, 12)
+    table = stack.table("Person")
+    charge = _owner_landing_result_bytes(table, (refs[0], stack.heap.read(refs[0])))
+    assert charge is not None
+    base = (
+        _OWNER_LANDING_MEMO_BYTES
+        + _OWNER_LANDING_TABLE_BYTES
+        + _OWNER_LANDING_VIEW_BASE_BYTES
+    )
+    stack.engine._owner_budget = _OwnerLandingBudget(
+        max_bytes=base + 3 * charge + charge // 2,
+        max_entries=1_000,
+        guard=stack.engine._endpoint_guard,
+    )
+    budget = stack.engine._owner_budget
+    context = _context(stack)
+    view = _owner_landing_view(stack.engine, context, table, frozenset())
+    ready = threading.Barrier(8)
+    outcomes: queue.SimpleQueue[object] = queue.SimpleQueue()
+
+    def worker(start: int) -> None:
+        try:
+            ready.wait(5)
+            for round_ in range(3):
+                for identity in range(start, start + 4):
+                    found = view.get(identity, context)
+                    assert found is not None and found[0] == refs[identity - 1]
+                    assert budget._used_bytes <= budget._max_bytes
+            outcomes.put(True)
+        except BaseException as failure:  # pragma: no cover - rendered by parent assertion
+            outcomes.put(failure)
+
+    threads = [threading.Thread(target=worker, args=(1 + n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+        assert not thread.is_alive()
+    for _thread in threads:
+        result = outcomes.get_nowait()
+        if isinstance(result, BaseException):
+            raise result
+    assert view._cache_enabled is True
+    assert view._cache_entries <= 3
+    # Which identities survive depends on the interleaving, and identities 10 and 11 carry one
+    # more name character than the others: the budget must equal the tariff of exactly the
+    # retained landings, whichever they are.
+    retained = list(view._cache.values())
+    assert len(retained) == view._cache_entries
+    assert all(
+        kept_charge == _owner_landing_result_bytes(table, found)
+        for found, kept_charge in retained
+    )
+    assert budget._used_bytes == base + sum(kept_charge for _found, kept_charge in retained)
+    assert budget._used_bytes <= budget._max_bytes
+    stack.engine.settle_schema(71, committed=False)
+    assert budget._used_bytes == 0
+    assert budget._used_entries == 0
 
 
 def test_view_admission_failure_releases_its_table_slot_and_uses_local_fallback() -> None:

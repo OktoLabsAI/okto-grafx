@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
 
 from okto_grafx.domain.errors import (
@@ -25,7 +25,13 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
 )
 from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, RecordRef, TxnId
-from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT, encode_tuple
+from okto_grafx.domain.model.schema import (
+    ENDPOINT_COLUMN_COUNT,
+    _forget_tuple_encoding_proof,
+    _proved_tuple_payload,
+    TupleEncodingProofs,
+    encode_tuple,
+)
 from okto_grafx.domain.txn.partitions import page_partition
 from okto_grafx.domain.txn.records import (
     WalRecord,
@@ -51,6 +57,14 @@ SIZING_ENDPOINT: int = 1
 
 Any positive INT64 gives the same answer -- the encoding is fixed width -- so this constant
 exists to say that the choice is arbitrary ON PURPOSE and carries no meaning into the row.
+"""
+
+_MAX_RETAINED_TUPLE_ENCODING_BYTES: int = 8 * 1024 * 1024
+"""Per-transaction ceiling for optional WRITE-1 payload reuse.
+
+The row intents themselves remain governed by the public transaction budgets.  This separate
+ceiling prevents the acceleration from retaining an unbounded second representation when a
+caller leaves those budgets open: once full, subsequent rows simply take the canonical encoder.
 """
 
 
@@ -130,6 +144,10 @@ class RowIntent:
     record_id: int | None = None
     operation: RowOperation = RowOperation.INSERT
     reference: object = None
+    # Private, revocable acceleration only.  It is excluded from value equality so the domain
+    # outcome remains exactly table/values/identity/operation/reference; the commit boundary
+    # accepts it only through schema.py's sealed exact-object protocol.
+    _encoding_proof: object = dataclass_field(default=None, repr=False, compare=False)
 
 
 class TransactionMode(str, Enum):
@@ -240,6 +258,8 @@ class TransactionContext:
         "_max_transaction_rows",
         "_max_transaction_bytes",
         "_staged_payload_bytes",
+        "_retained_tuple_encoding_bytes",
+        "_tuple_encoding_proofs",
         "_staging_marks",
         "_next_pending_token",
         "_pending_row_refs",
@@ -259,6 +279,7 @@ class TransactionContext:
         page_staging_capability: object,
         max_transaction_rows: int | None = None,
         max_transaction_bytes: int | None = None,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
     ) -> None:
         """Open a transaction bound to the manager that created it.
 
@@ -293,6 +314,8 @@ class TransactionContext:
             "max_transaction_bytes", max_transaction_bytes
         )
         self._staged_payload_bytes: int = 0
+        self._retained_tuple_encoding_bytes: int = 0
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._staging_marks: list[
             tuple[
                 tuple[int, int, int],
@@ -300,6 +323,7 @@ class TransactionContext:
                 dict[tuple[str, PageIndex], bytes],
                 set[int],
                 set[int],
+                int,
                 int,
             ]
         ] = []
@@ -573,6 +597,41 @@ class TransactionContext:
         in an endpoint slot; the commit path resolves it to the node's record id before anything
         durable is written, and refuses if the promise cannot be kept.
         """
+        return self._stage_row_insert(
+            table, values, record_id=record_id, encoding_proof=None
+        )
+
+    def _stage_row_insert_with_encoding_proof(
+        self,
+        table: object,
+        values: Iterable[object],
+        *,
+        record_id: int | None = None,
+        encoding_proof: object,
+    ) -> PendingRowRef:
+        """Stage through the ordinary door while carrying an optional exact encoding proof.
+
+        The proof is never trusted here.  It merely travels with the immutable values object to
+        the commit boundary, where the schema protocol either recognizes the exact pair or runs
+        the canonical encoder.  Keeping this as a private companion preserves every existing
+        public/custom transaction signature.
+        """
+        return self._stage_row_insert(
+            table,
+            values,
+            record_id=record_id,
+            encoding_proof=encoding_proof,
+        )
+
+    def _stage_row_insert(
+        self,
+        table: object,
+        values: Iterable[object],
+        *,
+        record_id: int | None,
+        encoding_proof: object,
+    ) -> PendingRowRef:
+        """Implement both insert staging doors without weakening their validation."""
         self._require_active()
         self._require_write_mode("stage a row")
         if record_id is not None and (
@@ -587,15 +646,21 @@ class TransactionContext:
         accepted_table = _require_table(table)
         accepted_values = tuple(values)
         self._require_stageable_values(accepted_table, accepted_values)
-        payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
+        payload_bytes = self._row_payload_bytes(
+            accepted_table, accepted_values, encoding_proof
+        )
         self._require_payload_capacity(payload_bytes)
         pending = self._allocate_pending_row_ref(accepted_table)
+        accepted_proof = self._retain_tuple_encoding_proof(
+            accepted_table, accepted_values, encoding_proof
+        )
         self.row_intents.append(
             RowIntent(
                 table=accepted_table,
                 values=accepted_values,
                 record_id=record_id,
                 reference=pending,
+                _encoding_proof=accepted_proof,
             )
         )
         self._staged_payload_bytes += payload_bytes
@@ -689,6 +754,7 @@ class TransactionContext:
                 set(self.read_partitions),
                 set(self.write_partitions),
                 self._staged_payload_bytes,
+                self._retained_tuple_encoding_bytes,
             )
         )
         return mark
@@ -731,9 +797,12 @@ class TransactionContext:
             read_partitions,
             write_partitions,
             payload_bytes,
+            retained_encoding_bytes,
         ) = self._staging_marks.pop()
         discarded_intents = tuple(self.row_intents[rows:])
         del self.row_intents[rows:]
+        for intent in discarded_intents:
+            _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
         remaining_insert_ids = {
             id(intent.reference)
             for intent in self.row_intents
@@ -759,6 +828,7 @@ class TransactionContext:
         self.write_partitions.clear()
         self.write_partitions.update(write_partitions)
         self._staged_payload_bytes = payload_bytes
+        self._retained_tuple_encoding_bytes = retained_encoding_bytes
 
     def settle_staging_mark(self, mark: tuple[int, int, int]) -> None:
         """Forget the exact snapshot after its statement transferred successfully."""
@@ -816,6 +886,7 @@ class TransactionContext:
             _read_partitions,
             _write_partitions,
             _payload_bytes,
+            _retained_encoding_bytes,
         ) in self._staging_marks:
             for location, image in images.items():
                 identity = (location, id(image))
@@ -831,7 +902,7 @@ class TransactionContext:
         """Return whether a live mark keeps this exact page generation as a preimage."""
         return any(
             images.get(location) is image
-            for _mark, images, _proofs, _reads, _writes, _size in self._staging_marks
+            for _mark, images, _proofs, _reads, _writes, _size, _retained in self._staging_marks
         )
 
     def _require_row_count_capacity(self) -> None:
@@ -866,7 +937,12 @@ class TransactionContext:
             txn_id=self._txn_id,
         )
 
-    def _row_payload_bytes(self, table: object, values: tuple[object, ...]) -> int:
+    def _row_payload_bytes(
+        self,
+        table: object,
+        values: tuple[object, ...],
+        encoding_proof: object = None,
+    ) -> int:
         """Return the canonical encoded payload size of one inserted or updated row.
 
         An endpoint that still names a pending identity is measured as the id it will become. The
@@ -877,7 +953,33 @@ class TransactionContext:
         """
         if self._max_transaction_bytes is None:
             return 0
-        return len(encode_tuple(table, _sizing_values(values)))  # type: ignore[arg-type]
+        sized = _sizing_values(values)
+        payload = (
+            _proved_tuple_payload(table, values, encoding_proof, protocol=self._tuple_encoding_proofs)
+            if sized is values
+            else None
+        )
+        if payload is None:
+            payload = encode_tuple(table, sized)  # type: ignore[arg-type]
+        return len(payload)
+
+    def _retain_tuple_encoding_proof(
+        self,
+        table: object,
+        values: tuple[object, ...],
+        encoding_proof: object,
+    ) -> object:
+        """Retain a proved payload only while this transaction's private cache has room."""
+        payload = _proved_tuple_payload(table, values, encoding_proof, protocol=self._tuple_encoding_proofs)
+        if payload is None:
+            _forget_tuple_encoding_proof(encoding_proof, protocol=self._tuple_encoding_proofs)
+            return None
+        observed = self._retained_tuple_encoding_bytes + len(payload)
+        if observed > _MAX_RETAINED_TUPLE_ENCODING_BYTES:
+            _forget_tuple_encoding_proof(encoding_proof, protocol=self._tuple_encoding_proofs)
+            return None
+        self._retained_tuple_encoding_bytes = observed
+        return encoding_proof
 
     def _require_stageable_values(
         self, table: object, values: tuple[object, ...], *, inserting: bool = True
@@ -926,7 +1028,9 @@ class TransactionContext:
             )
         if intent.operation is RowOperation.DELETE:
             return 0
-        return self._row_payload_bytes(intent.table, intent.values)
+        return self._row_payload_bytes(
+            intent.table, intent.values, intent._encoding_proof
+        )
 
     def _record_payload_bytes(self, record: WalRecordLike) -> int:
         """Return the exact encoded size retained by one staged logical WAL record."""
@@ -1006,12 +1110,18 @@ class TransactionContext:
     def mark_committed(self, csn: Csn) -> None:
         """Move the transaction to its committed end state."""
         self._require_active()
+        for intent in self.row_intents:
+            _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
+        self._retained_tuple_encoding_bytes = 0
         self._state = TransactionState.COMMITTED
         self._commit_csn = csn
 
     def mark_aborted(self) -> None:
         """Move the transaction to its rolled-back end state and drop everything it staged."""
         self._require_active()
+        for intent in self.row_intents:
+            _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
+        self._retained_tuple_encoding_bytes = 0
         self._state = TransactionState.ABORTED
         self.read_partitions.clear()
         self.write_partitions.clear()

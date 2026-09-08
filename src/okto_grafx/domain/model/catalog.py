@@ -12,6 +12,7 @@ blob. The common layout is
     magic 8B "GRFXCTLG" | format_version u16 | reserved u16 |
     table_count u32 | space_count u32 | next_table_id u32 | next_space_id u32 |
     [v2: required_capabilities u64 | index_count u32 | reserved u32] |
+    [commit_catalog_v1: activation_commit_lsn u64] |
     tables | spaces | [v2: indexes] | crc32c u32
 
 with tables ordered by table_id and spaces ordered by space_id, so the same catalog always
@@ -25,6 +26,8 @@ from collections.abc import Iterable
 from types import MappingProxyType
 from typing import NoReturn
 
+from okto_grafx.domain.ids import PROVISIONAL_CSN
+
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -34,6 +37,7 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.index.catalog import (
     IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,
+    ORDERED_SECONDARY_INDEXES_V1_CAPABILITY,
     CatalogIndexDefinition,
     IndexGenerationDescriptor,
     IndexGenerationState,
@@ -41,10 +45,12 @@ from okto_grafx.domain.index.catalog import (
 )
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
+    ORDERED_KEY_DERIVATION,
     RECORD_ID_KEY_DERIVATION,
     IndexDefinition,
     automatic_index_definitions,
 )
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import (
     SPACE_STATE_ACTIVE,
@@ -61,7 +67,9 @@ __all__ = [
     "CATALOG_MAGIC",
     "CATALOG_FORMAT_VERSION",
     "HEAP_RECLAIM_V1_CAPABILITY",
+    "ORDERED_SECONDARY_INDEXES_V1_CAPABILITY",
     "WAL_RECORD_V2_CAPABILITY",
+    "COMMIT_CATALOG_V1_CAPABILITY",
     "Catalog",
 ]
 
@@ -80,6 +88,9 @@ HEAP_RECLAIM_V1_CAPABILITY: str = "heap_reclaim_v1"
 WAL_RECORD_V2_CAPABILITY: str = "wal_record_v2"
 """Required capability allowing compressed WRITE_PAGE records in retained WAL."""
 
+COMMIT_CATALOG_V1_CAPABILITY: str = "commit_catalog_v1"
+"""Required capability guarding the persisted commit-history activation horizon."""
+
 _PREAMBLE = struct.Struct("<8sHHIIII")
 _V2_EXTENSION = struct.Struct("<QII")
 _INDEX_META = struct.Struct("<BBBBHHQ")
@@ -95,14 +106,26 @@ _MAX_TEXT = 0xFFFF
 _IDENTITY_SECONDARY_INDEXES_V1_BIT = 1 << 0
 _HEAP_RECLAIM_V1_BIT = 1 << 1
 _WAL_RECORD_V2_BIT = 1 << 2
+_ORDERED_SECONDARY_INDEXES_V1_BIT = 1 << 3
+_COMMIT_CATALOG_V1_BIT = 1 << 4
+
+
 _KNOWN_CAPABILITY_BITS = (
-    _IDENTITY_SECONDARY_INDEXES_V1_BIT | _HEAP_RECLAIM_V1_BIT | _WAL_RECORD_V2_BIT
+    _IDENTITY_SECONDARY_INDEXES_V1_BIT
+    | _HEAP_RECLAIM_V1_BIT
+    | _WAL_RECORD_V2_BIT
+    | _ORDERED_SECONDARY_INDEXES_V1_BIT
+    | _COMMIT_CATALOG_V1_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
         IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY: _IDENTITY_SECONDARY_INDEXES_V1_BIT,
         HEAP_RECLAIM_V1_CAPABILITY: _HEAP_RECLAIM_V1_BIT,
         WAL_RECORD_V2_CAPABILITY: _WAL_RECORD_V2_BIT,
+        ORDERED_SECONDARY_INDEXES_V1_CAPABILITY: (
+            _ORDERED_SECONDARY_INDEXES_V1_BIT
+        ),
+        COMMIT_CATALOG_V1_CAPABILITY: _COMMIT_CATALOG_V1_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -110,7 +133,11 @@ _TAG_TO_VISIBILITY = MappingProxyType(
     {value: key for key, value in _VISIBILITY_TO_TAG.items()}
 )
 _DERIVATION_TO_TAG = MappingProxyType(
-    {COLUMN_KEY_DERIVATION: 1, RECORD_ID_KEY_DERIVATION: 2}
+    {
+        COLUMN_KEY_DERIVATION: 1,
+        RECORD_ID_KEY_DERIVATION: 2,
+        ORDERED_KEY_DERIVATION: 3,
+    }
 )
 _TAG_TO_DERIVATION = MappingProxyType(
     {value: key for key, value in _DERIVATION_TO_TAG.items()}
@@ -123,6 +150,19 @@ _STATE_TO_TAG = MappingProxyType(
     }
 )
 _TAG_TO_STATE = MappingProxyType({value: key for key, value in _STATE_TO_TAG.items()})
+_LAYOUT_TO_TAG = MappingProxyType(
+    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1}
+)
+_TAG_TO_LAYOUT = MappingProxyType(
+    {value: key for key, value in _LAYOUT_TO_TAG.items()}
+)
+
+
+def _require_commit_catalog_sequence(sequence: int) -> None:
+    if type(sequence) is not int or not 0 < sequence < PROVISIONAL_CSN:
+        raise GrafxConfigurationError(
+            "Invalid commit catalog activation sequence.", field="commit_catalog_activation"
+        )
 
 
 class Catalog:
@@ -140,6 +180,7 @@ class Catalog:
         "_spaces_by_id",
         "_format_version",
         "_required_capabilities",
+        "_commit_catalog_activation",
         "_indexes",
         "_indexes_by_key",
         "_index_definitions_by_table",
@@ -155,6 +196,7 @@ class Catalog:
         self._spaces_by_id: dict[int, EmbeddingSpaceDef] = {}
         self._format_version: int = CATALOG_LEGACY_FORMAT_VERSION
         self._required_capabilities: frozenset[str] = frozenset()
+        self._commit_catalog_activation: int | None = None
         self._indexes: dict[str, CatalogIndexDefinition] = {}
         self._indexes_by_key: dict[str, CatalogIndexDefinition] = {}
         self._index_definitions_by_table: dict[
@@ -188,6 +230,36 @@ class Catalog:
         """Test one required capability without allocating the public ordered snapshot."""
 
         return capability in self._required_capabilities
+
+    @property
+    def commit_catalog_activation(self) -> int | None:
+        """The persisted legacy horizon, not inferred from missing history files."""
+        return self._commit_catalog_activation
+
+    def enable_commit_catalog(self, activation_sequence: int) -> Catalog:
+        """Set a one-way horizon on a detached value; this does not enable a public API."""
+        self._require_index_catalog()
+        _require_commit_catalog_sequence(activation_sequence)
+        if self._commit_catalog_activation is not None:
+            if self._commit_catalog_activation != activation_sequence:
+                raise GrafxConfigurationError(
+                    "An activated commit catalog cannot move its legacy boundary.",
+                    field="commit_catalog_activation",
+                )
+            return self
+        self._commit_catalog_activation = activation_sequence
+        self._required_capabilities = frozenset((*self._required_capabilities, COMMIT_CATALOG_V1_CAPABILITY))
+        self._invalidate_derived()
+        return self
+
+    def _retarget_commit_catalog_activation(self, old_sequence: int, new_sequence: int) -> None:
+        """Rebind a detached, unpublished activation image during exact WAL sizing."""
+        _require_commit_catalog_sequence(old_sequence)
+        _require_commit_catalog_sequence(new_sequence)
+        if self._commit_catalog_activation != old_sequence or not self.requires_capability(COMMIT_CATALOG_V1_CAPABILITY):
+            raise GrafxConfigurationError("Activation retarget baseline differs.", field="commit_catalog_activation")
+        self._commit_catalog_activation = new_sequence
+        self._invalidate_derived()
 
     def index_definitions(self) -> tuple[CatalogIndexDefinition, ...]:
         """Return catalog-managed exact indexes in canonical registry order."""
@@ -404,9 +476,13 @@ class Catalog:
                 supported=CATALOG_FORMAT_VERSION,
             )
         self._format_version = CATALOG_FORMAT_VERSION
-        self._required_capabilities = frozenset(
-            (IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY,)
-        )
+        capabilities = {IDENTITY_SECONDARY_INDEXES_V1_CAPABILITY}
+        if any(
+            definition.layout is IndexLayout.ORDERED
+            for definition in validated.values()
+        ):
+            capabilities.add(ORDERED_SECONDARY_INDEXES_V1_CAPABILITY)
+        self._required_capabilities = frozenset(capabilities)
         self._install_indexes(validated)
         return self
 
@@ -418,6 +494,13 @@ class Catalog:
         self._require_index_catalog()
         proposed = (*self.index_definitions(), definition)
         validated = self._validated_index_authority(proposed, stored=False)
+        if definition.layout is IndexLayout.ORDERED:
+            self._required_capabilities = frozenset(
+                (
+                    *self._required_capabilities,
+                    ORDERED_SECONDARY_INDEXES_V1_CAPABILITY,
+                )
+            )
         self._install_indexes(validated)
         return definition
 
@@ -621,6 +704,13 @@ class Catalog:
                     "Catalog format 2 requires identity_secondary_indexes_v1.",
                     field="required_capabilities",
                 )
+            if any(
+                definition.layout is IndexLayout.ORDERED for definition in indexes
+            ) and not capability_bits & _ORDERED_SECONDARY_INDEXES_V1_BIT:
+                raise GrafxConfigurationError(
+                    "An ordered index requires ordered_secondary_indexes_v1.",
+                    field="required_capabilities",
+                )
         parts: list[bytes] = [
             _PREAMBLE.pack(
                 CATALOG_MAGIC,
@@ -634,6 +724,11 @@ class Catalog:
         ]
         if self._format_version == CATALOG_FORMAT_VERSION:
             parts.append(_V2_EXTENSION.pack(capability_bits, len(indexes), 0))
+        if bool(capability_bits & _COMMIT_CATALOG_V1_BIT) != (self._commit_catalog_activation is not None):
+            raise GrafxConfigurationError("Commit catalog horizon and capability differ.", field="commit_catalog_activation")
+        if self._commit_catalog_activation is not None:
+            _require_commit_catalog_sequence(self._commit_catalog_activation)
+            parts.append(_U64.pack(self._commit_catalog_activation))
         for table in self.tables():
             parts.append(_encode_table(table))
         for space in self.spaces():
@@ -669,6 +764,7 @@ class Catalog:
         clone._spaces_by_id = dict(self._spaces_by_id)
         clone._format_version = self._format_version
         clone._required_capabilities = self._required_capabilities
+        clone._commit_catalog_activation = self._commit_catalog_activation
         clone._indexes = dict(self._indexes)
         clone._indexes_by_key = dict(self._indexes_by_key)
         clone._index_definitions_by_table = dict(self._index_definitions_by_table)
@@ -756,6 +852,16 @@ class Catalog:
                     value=extension_reserved,
                     offset=offset - _U32.size,
                 )
+            if COMMIT_CATALOG_V1_CAPABILITY in required_capabilities:
+                if offset + _U64.size > body_end:
+                    raise GrafxCorruptionDetected("Missing commit catalog horizon.", field="commit_catalog_activation")
+                sequence = _U64.unpack_from(raw, offset)[0]
+                try:
+                    _require_commit_catalog_sequence(sequence)
+                except GrafxConfigurationError:
+                    raise GrafxCorruptionDetected("Invalid commit catalog horizon.", field="commit_catalog_activation") from None
+                catalog._commit_catalog_activation = sequence
+                offset += _U64.size
         tables: list[TableDef] = []
         spaces: list[EmbeddingSpaceDef] = []
         indexes: list[CatalogIndexDefinition] = []
@@ -786,6 +892,17 @@ class Catalog:
             _require_canonical_order(tables, spaces, indexes)
         catalog._install_loaded(tables, spaces)
         if format_version == CATALOG_FORMAT_VERSION:
+            if any(
+                definition.layout is IndexLayout.ORDERED for definition in indexes
+            ) and (
+                ORDERED_SECONDARY_INDEXES_V1_CAPABILITY
+                not in required_capabilities
+            ):
+                raise GrafxCorruptionDetected(
+                    "The catalog carries an ordered index without its required capability.",
+                    field="required_capabilities",
+                    value=ORDERED_SECONDARY_INDEXES_V1_CAPABILITY,
+                )
             validated = catalog._validated_index_authority(
                 indexes,
                 stored=True,
@@ -931,6 +1048,25 @@ class Catalog:
                         f"{table.name!r}, whose stored arity is {stored_arity}.",
                         field="positions",
                         value=position,
+                        index=definition.name,
+                    )
+            if definition.layout is IndexLayout.ORDERED:
+                if table.kind != "node":
+                    refuse(
+                        f"Ordered index {definition.name!r} belongs to a node table.",
+                        field="table_id",
+                        value=definition.table_id,
+                        index=definition.name,
+                    )
+                first, second = (
+                    table.columns[position] for position in definition.positions
+                )
+                if first.type is not ValueType.TIMESTAMP or second.type is not ValueType.STRING:
+                    refuse(
+                        f"Ordered index {definition.name!r} requires TIMESTAMP then STRING; "
+                        f"got {first.type.name} then {second.type.name}.",
+                        field="positions",
+                        value=definition.positions,
                         index=definition.name,
                     )
 
@@ -1094,6 +1230,7 @@ def _logical_index_identity(definition: CatalogIndexDefinition) -> tuple[object,
         definition.positions,
         definition.visibility,
         definition.key_derivation,
+        definition.layout,
         definition.automatic,
     )
 
@@ -1113,6 +1250,7 @@ def _matches_automatic_exact(
         and definition.positions == candidate.positions
         and definition.visibility is candidate.visibility
         and definition.key_derivation == candidate.key_derivation
+        and definition.layout is candidate.layout
     )
 
 
@@ -1168,6 +1306,7 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
     try:
         visibility_tag = _VISIBILITY_TO_TAG[definition.visibility]
         derivation_tag = _DERIVATION_TO_TAG[definition.key_derivation]
+        layout_tag = _LAYOUT_TO_TAG[definition.layout]
     except KeyError as failure:
         raise GrafxConfigurationError(
             f"Index {definition.name!r} uses a contract catalog format 2 cannot encode.",
@@ -1182,7 +1321,7 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
             visibility_tag,
             derivation_tag,
             1 if definition.automatic else 0,
-            0,
+            layout_tag,
             len(definition.positions),
             len(definition.generations),
             definition.expected_cardinality or 0,
@@ -1215,17 +1354,18 @@ def _decode_catalog_index(
         visibility_tag,
         derivation_tag,
         automatic,
-        reserved,
+        layout_tag,
         position_count,
         generation_count,
         expected_cardinality,
     ) = _INDEX_META.unpack_from(raw, offset)
     offset += _INDEX_META.size
-    if reserved != 0:
+    layout = _TAG_TO_LAYOUT.get(layout_tag)
+    if layout is None:
         raise GrafxCorruptionDetected(
-            f"Index {name!r} has a non-zero reserved metadata byte.",
-            field="reserved",
-            value=reserved,
+            f"Index {name!r} declares unknown layout tag {layout_tag}.",
+            field="layout",
+            value=layout_tag,
             index=name,
         )
     visibility = _TAG_TO_VISIBILITY.get(visibility_tag)
@@ -1295,6 +1435,7 @@ def _decode_catalog_index(
             positions=tuple(positions),
             visibility=visibility,
             key_derivation=key_derivation,
+            layout=layout,
             automatic=automatic == 1,
             expected_cardinality=expected_cardinality or None,
             generations=tuple(generations),

@@ -4,7 +4,10 @@ Every paged file of a database is a sequence of pages of the same size, and ever
 with the same header at the same offsets, little-endian:
 
     0  u32 checksum    CRC-32C over bytes[4:page_size]
-    4  u16 page_type   0 free, 1 meta, 2 heap, 3 catalog, 4 index_hash, 5 index_hnsw, 6 overflow
+    4  u16 page_type   0 free, 1 meta, 2 heap, 3 catalog, 4 index_hash, 5 index_hnsw,
+                       6 overflow, 7 control_slot, 8 control_header,
+                       9 index_ordered_root, 10 index_ordered_internal,
+                       11 index_ordered_leaf
     6  u16 flags
     8  u64 page_lsn    LSN of the last WAL record applied to this page, for redo idempotence
     16 u32 seq         even is stable, odd is being written, which is the torn-read helper
@@ -104,6 +107,9 @@ class PageType(IntEnum):
     OVERFLOW = 6
     CONTROL_SLOT = 7
     CONTROL_HEADER = 8
+    INDEX_ORDERED_ROOT = 9
+    INDEX_ORDERED_INTERNAL = 10
+    INDEX_ORDERED_LEAF = 11
 
 
 def is_unwritten_image(raw: bytes, page_size: int) -> bool:

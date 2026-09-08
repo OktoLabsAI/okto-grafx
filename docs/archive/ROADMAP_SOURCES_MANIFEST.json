@@ -1,0 +1,101 @@
+[
+  {
+    "source": "EVOLUTION_PLAN_CODEX.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "da7a5fde736e4173ad93b4cf48361a483ebbb032069a773d5c2482f1233337af",
+    "archived_sha256_lf": "fa2ee005852ab22952de692dde421c85e746c26ffaf9bd78111b438d4442ceee",
+    "original_lines": 5250,
+    "archived_lines": 5250,
+    "anchor": "source-evolution-plan-codex"
+  },
+  {
+    "source": "GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "d7f3a8297d4426c108b55e18bbb929e353129a963492d3944e58adbb4974acf4",
+    "archived_sha256_lf": "75f8abaad8ca31139571900d5dc4d0a9f4018cb45ea79f5ae62bb103dac84cb6",
+    "original_lines": 2427,
+    "archived_lines": 2427,
+    "anchor": "source-grafx-complementary-evolution-plan-codex"
+  },
+  {
+    "source": "AGENT_FIRST_EVOLUTION_PLAN_CODEX.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "238bea215c07e9a507b23251da34b5a7055fa2f0b648f8a9a96aafc150e25e61",
+    "archived_sha256_lf": "238bea215c07e9a507b23251da34b5a7055fa2f0b648f8a9a96aafc150e25e61",
+    "original_lines": 1848,
+    "archived_lines": 1848,
+    "anchor": "source-agent-first-evolution-plan-codex"
+  },
+  {
+    "source": "GRAFX_PERFORMANCE_ROUND_FINAL.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "5b25e3068fca55d0d3d26606b90f3e6f63662fc4d5d9a443e99b558fba76b970",
+    "archived_sha256_lf": "5b25e3068fca55d0d3d26606b90f3e6f63662fc4d5d9a443e99b558fba76b970",
+    "original_lines": 522,
+    "archived_lines": 522,
+    "anchor": "source-grafx-performance-round-final"
+  },
+  {
+    "source": "FABLE_PERFORMANCE_GRAFX.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "1592f20cb7a204299630075ac0c350463b40a9db76d958a2ea7f5923dabd3594",
+    "archived_sha256_lf": "1592f20cb7a204299630075ac0c350463b40a9db76d958a2ea7f5923dabd3594",
+    "original_lines": 1131,
+    "archived_lines": 1131,
+    "anchor": "source-fable-performance-grafx"
+  },
+  {
+    "source": "docs/PERFORMANCE_ROUND_0_0_2.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "d7a90e5fd9b22530a07d2c1f8dfefdc8470a7b02ecbb55b61be2e88bb582f20e",
+    "archived_sha256_lf": "d7a90e5fd9b22530a07d2c1f8dfefdc8470a7b02ecbb55b61be2e88bb582f20e",
+    "original_lines": 2222,
+    "archived_lines": 2222,
+    "anchor": "source-performance-round-0-0-2"
+  },
+  {
+    "source": "docs/PERFORMANCE_ROUND_0_0_3.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "2222e1b22b4d3ea07e249a225ac30466e022636f751fba175985d578b0d102d8",
+    "archived_sha256_lf": "2222e1b22b4d3ea07e249a225ac30466e022636f751fba175985d578b0d102d8",
+    "original_lines": 525,
+    "archived_lines": 525,
+    "anchor": "source-performance-round-0-0-3"
+  },
+  {
+    "source": "docs/PERFORMANCE_ROUND_0_0_4.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "cb3d408af3643a1b2e2161d4eb2f4764c08a5aba2fc032b63124d3319f35acf1",
+    "archived_sha256_lf": "cb3d408af3643a1b2e2161d4eb2f4764c08a5aba2fc032b63124d3319f35acf1",
+    "original_lines": 930,
+    "archived_lines": 930,
+    "anchor": "source-performance-round-0-0-4"
+  },
+  {
+    "source": "docs/architecture/ROUND7-PLAN.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "b8ad2fd4406e0011173a221a29daf30fa6805f737c7f41f6969c221314a96d5f",
+    "archived_sha256_lf": "b8ad2fd4406e0011173a221a29daf30fa6805f737c7f41f6969c221314a96d5f",
+    "original_lines": 448,
+    "archived_lines": 448,
+    "anchor": "source-round7-plan"
+  },
+  {
+    "source": "docs/architecture/PUNCHLIST.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "e8abd93decd03d5a573ffe395a17dcbc6aa2e4b5e1e4785cd0bf493d844d3300",
+    "archived_sha256_lf": "e8abd93decd03d5a573ffe395a17dcbc6aa2e4b5e1e4785cd0bf493d844d3300",
+    "original_lines": 1339,
+    "archived_lines": 1339,
+    "anchor": "source-punchlist"
+  },
+  {
+    "source": "docs/architecture/RESUME.md",
+    "source_commit": "485ea074bf2b9e174200b44bb74c7adb54c1ecab",
+    "original_sha256_lf": "9bed63e5c0504a6c04b8ebe993b346337ca128f4f7b55d62f2c574d859bec8e8",
+    "archived_sha256_lf": "9bed63e5c0504a6c04b8ebe993b346337ca128f4f7b55d62f2c574d859bec8e8",
+    "original_lines": 35,
+    "archived_lines": 35,
+    "anchor": "source-resume"
+  }
+]

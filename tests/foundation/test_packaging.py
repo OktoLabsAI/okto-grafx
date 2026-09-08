@@ -40,6 +40,23 @@ def test_the_build_uses_setuptools_with_a_src_layout(manifest: dict[str, Any]) -
     assert manifest["tool"]["setuptools"]["packages"]["find"]["where"] == ["src"]
 
 
+def test_package_discovery_excludes_optional_sibling_wheels(
+    manifest: dict[str, Any], tmp_path: Path,
+) -> None:
+    from setuptools import find_namespace_packages
+
+    for name in ("okto_grafx/api", "okto_grafx_agent", "okto_grafx_mcp",
+                 "okto_grafx_workspace", "okto_grafx_algorithms", "okto_grafx_interop"):
+        (tmp_path / name).mkdir(parents=True)
+    # Prove the historical selector actually admits the unwanted package; a
+    # non-discoverable sentinel would make the new exclusion test vacuous.
+    legacy = find_namespace_packages(str(tmp_path), include=["okto_grafx*"])
+    assert "okto_grafx_agent" in legacy and "okto_grafx_mcp" in legacy
+    selection = manifest["tool"]["setuptools"]["packages"]["find"]
+    actual = find_namespace_packages(str(tmp_path), include=selection["include"])
+    assert set(actual) == {"okto_grafx", "okto_grafx.api"}
+
+
 def test_there_is_no_runtime_dependency(manifest: dict[str, Any]) -> None:
     # G3: the wheel is pure Python and the stdlib is the only runtime requirement.
     assert manifest["project"]["dependencies"] == []
@@ -222,9 +239,16 @@ def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
         project,
         ignore=shutil.ignore_patterns(
             "__pycache__", "*.pyc", "*.egg-info", ".git", "build", "dist", ".pytest_cache",
-            ".venv", "venv", "*.db", ".mutation-battery*",
+            ".venv", "venv", "*.db", ".mutation-battery*", ".grafx-tmp",
         ),
     )
+    # GX-CAP-0: make optional-package exclusion observable in the real artifact.
+    # The former include=["okto_grafx*"] silently bundled these sibling wheels.
+    for sibling in ("okto_grafx_agent", "okto_grafx_workspace", "okto_grafx_mcp",
+                    "okto_grafx_algorithms", "okto_grafx_interop"):
+        package = project / "src" / sibling
+        package.mkdir(exist_ok=True)
+        (package / "__init__.py").write_text("# packaging boundary sentinel\n", encoding="utf-8")
     output = workspace / "dist"
     build = subprocess.run(
         [

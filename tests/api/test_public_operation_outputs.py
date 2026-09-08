@@ -932,6 +932,7 @@ def test_checkpoint_refuses_contradictory_recycle_reports(
         ("verify", (Verifier, "verify")),
         ("checkpoint", (TransactionManager, "checkpoint")),
         ("inspect_index", (IndexManager, "active_index")),
+        ("read_index_status", (IndexManager, "active_index")),
         ("search_vectors", (VectorEngine, "search")),
     ),
 )
@@ -965,6 +966,7 @@ def test_each_public_operation_contains_only_ordinary_collaborator_failures(
             "verify": lambda: database.verify("all"),
             "checkpoint": database.checkpoint,
             "inspect_index": lambda: database.inspect_index("missing"),
+            "read_index_status": lambda: database.read_index_status("missing"),
             "search_vectors": lambda: database.search_vectors(
                 reader,
                 space="s",

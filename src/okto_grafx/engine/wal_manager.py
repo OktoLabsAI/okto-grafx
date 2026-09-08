@@ -357,6 +357,7 @@ class WalManager:
     """The segmented write-ahead log of one database."""
 
     __slots__ = (
+        "_planned_canonical",
         "_storage",
         "_clock",
         "_metrics",
@@ -388,6 +389,11 @@ class WalManager:
         descriptor: str,
     ) -> None:
         """Build the manager over its three ports. Nothing touches the device until ``open``."""
+        # WRITE-4: the canonical form of the records the last preview validated, keyed by the
+        # identity of the source record and holding it (so the id keeps naming that object),
+        # published only by a preview that succeeded whole and consumed by the append that
+        # follows before it opens any door that can fail (see _plan_batch).
+        self._planned_canonical: dict[int, tuple[WalRecord, WalRecord]] = {}
         _require_port("storage", storage, STORAGE_PORT_METHODS)
         _require_port("clock", clock, CLOCK_PORT_METHODS)
         _require_port("metrics", metrics, METRICS_PORT_METHODS)
@@ -881,10 +887,13 @@ class WalManager:
         checks immediately before it writes, so a foreign tail change becomes a clean refusal
         instead of a batch whose payload names a different commit number.
         """
+        self._planned_canonical = {}
         self._require_open()
         self._refresh_tail_if_needed()
         self._require_healthy()
-        _batch, _body_length, _rolling, terminal = self._plan_batch(records)
+        _batch, _body_length, _rolling, terminal = self._plan_batch(
+            records, remember=True
+        )
         return terminal
 
     def append_many(
@@ -904,13 +913,19 @@ class WalManager:
         :meth:`barrier` returns, and this method deliberately does not take one, so a caller can
         group many appends behind a single barrier.
         """
+        # WRITE-4: the preview's memo is consumed here, before any door that can refuse, so
+        # whatever this call does next -- refuse, fail, write -- leaves nothing behind.
+        planned = self._planned_canonical
+        self._planned_canonical = {}
         self._require_open()
         # CF-6: an unheld call re-derives the shared tail before assigning a sequence number. A
         # commit that already owns COMMIT_SECTION may instead reuse the picture established by
         # hold_tail(); no foreign append can move it until that context is released.
         self._refresh_tail_if_needed()
         self._require_healthy()
-        batch, _body_length, rolling, terminal = self._plan_batch(records)
+        batch, _body_length, rolling, terminal = self._plan_batch(
+            records, planned=planned
+        )
         if expected_terminal_lsn is not None:
             expected = _require_lsn("expected_terminal_lsn", expected_terminal_lsn)
             if terminal != expected:
@@ -1011,10 +1026,25 @@ class WalManager:
         return lsn
 
     def _plan_batch(
-        self, records: Sequence[WalRecord]
+        self,
+        records: Sequence[WalRecord],
+        *,
+        remember: bool = False,
+        planned: Mapping[int, tuple[WalRecord, WalRecord]] | None = None,
     ) -> tuple[tuple[WalRecord, ...], int, bool, Lsn]:
-        """Validate a batch and return its encoded length, roll decision and terminal LSN."""
-        batch = self._validate_batch(records)
+        """Validate a batch and return its encoded length, roll decision and terminal LSN.
+
+        WRITE-4.  The preview a commit takes through :meth:`planned_terminal_lsn` and the append
+        that follows plan the same batch twice.  The record-intrinsic half of the plan -- the
+        canonical, descriptor-stamped form of each exact ``WalRecord`` -- depends only on the
+        immutable record, so the preview remembers it per object and the append reuses it for
+        every object it receives again; everything the tail decides (the epoch refusal, the
+        roll, the terminal number, the segment ceiling) is re-derived on every plan.  The memo
+        lives from one preview to the next append and holds nothing but the caller's own records.
+        """
+        batch, remembered = self._validate_batch(
+            records, remember=remember, planned=planned
+        )
         body_length = sum(record.encoded_length() for record in batch)
         rolling = self._needs_roll(body_length)
         header_length = (
@@ -1045,10 +1075,22 @@ class WalManager:
                 field="last_lsn",
                 value=self._last_lsn,
             )
+        if remember:
+            # Published only now, after every check of the plan passed.
+            self._planned_canonical = remembered
         return batch, body_length, rolling, terminal
 
-    def _validate_batch(self, records: Sequence[WalRecord]) -> tuple[WalRecord, ...]:
+    def _validate_batch(
+        self,
+        records: Sequence[WalRecord],
+        *,
+        remember: bool = False,
+        planned: Mapping[int, tuple[WalRecord, WalRecord]] | None = None,
+    ) -> tuple[tuple[WalRecord, ...], dict[int, tuple[WalRecord, WalRecord]]]:
         """Return the batch, stamped with this log's descriptor, or refuse it whole.
+
+        The second value is what a remembering plan may publish once it succeeds whole: the
+        canonical form of every record by the identity of its source, the source held with it.
 
         Nothing here touches the device, which is what makes the epoch refusal of BR-7 exact:
         a stale writer is turned away before a single byte can reach the disk.
@@ -1068,6 +1110,9 @@ class WalManager:
                 value=0,
             )
         batch: list[WalRecord] = []
+        if planned is None:
+            planned = {}
+        remembered: dict[int, tuple[WalRecord, WalRecord]] = {}
         for position, record in enumerate(records):
             if type(record) is not WalRecord:
                 observed = _builtin_type_name(record)
@@ -1076,7 +1121,22 @@ class WalManager:
                     field="records",
                     value=position,
                 )
-            record = _canonical_record(record, position)
+            known = planned.get(id(record))
+            if (
+                known is not None
+                and known[0] is record
+                and _record_is_exact(record, position)
+            ):
+                # The same exact object the preview canonicalised: the checks its
+                # construction ran, then its remembered form (no construction).
+                WalRecord.__post_init__(record)
+                source, record = known
+            else:
+                source, record = record, _canonical_record(
+                    record, position, self._descriptor
+                )
+            if remember:
+                remembered[id(source)] = (source, record)
             if record.lsn != NO_LSN:
                 raise GrafxConfigurationError(
                     "The log assigns sequence numbers; entry "
@@ -1098,12 +1158,8 @@ class WalManager:
                     current_epoch=self._max_epoch,
                     position=position,
                 )
-            batch.append(
-                record
-                if record.descriptor
-                else record.with_descriptor(self._descriptor)
-            )
-        return tuple(batch)
+            batch.append(record)
+        return tuple(batch), remembered
 
     def _needs_roll(self, body_length: int) -> bool:
         """Return True when this batch has to start a new segment."""
@@ -2087,37 +2143,79 @@ def _builtin_type_name(value: object) -> str:
     return str.__str__(declared)
 
 
-def _canonical_record(record: WalRecord, position: int) -> WalRecord:
-    """Copy one exact record into exact built-ins before planning or virtual methods run."""
+_RECORD_INTEGER_FIELDS: tuple[str, ...] = (
+    "record_type",
+    "lsn",
+    "epoch",
+    "txn_id",
+    "flags",
+    "format_version",
+)
 
-    def value_of(field: str) -> object:
-        """Read one slot from the exact record without invoking subclass lookup."""
-        try:
-            return object.__getattribute__(record, field)
-        except Exception as failure:
-            cause = _builtin_type_name(failure)
-            raise GrafxConfigurationError(
-                f"Entry {position} of the WAL batch has no readable {field!r}; got {cause}.",
-                field="records",
-                value=position,
-                record_field=field,
-                cause=cause,
-            ) from failure
 
-    def integer(field: str) -> int:
-        """Copy one integer slot through the built-in implementation."""
-        value = value_of(field)
-        if type(value) is bool or not issubclass(type(value), int):
-            observed = _builtin_type_name(value)
-            raise GrafxConfigurationError(
-                f"Entry {position} of the WAL batch has a non-integer {field!r}: {observed}.",
-                field=field,
-                value=observed,
-                position=position,
-            )
-        return int.__int__(value)
+def _record_slot(record: WalRecord, field: str, position: int) -> object:
+    """Read one slot from the exact record without invoking subclass lookup."""
+    try:
+        return object.__getattribute__(record, field)
+    except Exception as failure:
+        cause = _builtin_type_name(failure)
+        raise GrafxConfigurationError(
+            f"Entry {position} of the WAL batch has no readable {field!r}; got {cause}.",
+            field="records",
+            value=position,
+            record_field=field,
+            cause=cause,
+        ) from failure
 
-    raw_payload = value_of("payload")
+
+def _record_integer(value: object, field: str, position: int) -> int:
+    """Copy one integer slot through the built-in implementation."""
+    if type(value) is bool or not issubclass(type(value), int):
+        observed = _builtin_type_name(value)
+        raise GrafxConfigurationError(
+            f"Entry {position} of the WAL batch has a non-integer {field!r}: {observed}.",
+            field=field,
+            value=observed,
+            position=position,
+        )
+    return int.__int__(value)
+
+
+def _record_is_exact(record: WalRecord, position: int) -> bool:
+    """Say whether every slot of the record already holds an exact built-in.
+
+    The same slot reads and the same type refusals as :func:`_canonical_record`, in the same
+    order, so a record this answers ``False`` for is refused or copied exactly as before.
+    """
+    if type(_record_slot(record, "payload", position)) is not bytes:
+        return False
+    if type(_record_slot(record, "descriptor", position)) is not str:
+        return False
+    for field in _RECORD_INTEGER_FIELDS:
+        if type(_record_slot(record, field, position)) is not int:
+            return False
+    return True
+
+
+def _canonical_record(
+    record: WalRecord, position: int, descriptor: str = ""
+) -> WalRecord:
+    """Return one exact record in exact built-ins, stamped with ``descriptor`` when it has none.
+
+    WRITE-M1: a record whose six integers are exact ``int``, whose payload is exact ``bytes``
+    and whose descriptor is exact ``str`` is returned as the object it is, after the same field
+    checks its construction ran (``__post_init__``, in the same order, so every refusal keeps its
+    field and message); anything else is copied field by field, as before.  WRITE-M2: the log's
+    descriptor is stamped in that one copy, or in one ``with_descriptor`` of the exact record,
+    never in a second construction.
+    """
+    if _record_is_exact(record, position):
+        # Already exact: the checks a construction would run, on the object itself.
+        WalRecord.__post_init__(record)
+        if not descriptor or object.__getattribute__(record, "descriptor"):
+            return record
+        return record.with_descriptor(descriptor)
+    raw_payload = _record_slot(record, "payload", position)
     if not isinstance(raw_payload, (bytes, bytearray, memoryview)):
         observed = _builtin_type_name(raw_payload)
         raise GrafxConfigurationError(
@@ -2142,7 +2240,7 @@ def _canonical_record(record: WalRecord, position: int) -> WalRecord:
             value=cause,
             position=position,
         ) from failure
-    raw_descriptor = value_of("descriptor")
+    raw_descriptor = _record_slot(record, "descriptor", position)
     if not issubclass(type(raw_descriptor), str):
         observed = _builtin_type_name(raw_descriptor)
         raise GrafxConfigurationError(
@@ -2151,17 +2249,20 @@ def _canonical_record(record: WalRecord, position: int) -> WalRecord:
             value=observed,
             position=position,
         )
-    return WalRecord(
-        record_type=integer("record_type"),
-        payload=payload,
-        descriptor=str.__str__(raw_descriptor),
-        lsn=integer("lsn"),
-        epoch=integer("epoch"),
-        txn_id=integer("txn_id"),
-        flags=integer("flags"),
-        format_version=integer("format_version"),
+    integers = tuple(
+        _record_integer(_record_slot(record, field, position), field, position)
+        for field in _RECORD_INTEGER_FIELDS
     )
-
+    return WalRecord(
+        record_type=integers[0],
+        payload=payload,
+        descriptor=str.__str__(raw_descriptor) or descriptor,
+        lsn=integers[1],
+        epoch=integers[2],
+        txn_id=integers[3],
+        flags=integers[4],
+        format_version=integers[5],
+    )
 
 def _validate_segment_bytes(segment_bytes: object) -> int:
     """Return a roll size that every reader of this build can open."""

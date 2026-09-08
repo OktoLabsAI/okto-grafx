@@ -505,17 +505,19 @@ def test_relationship_endpoint_projection_validates_every_type_without_retaining
     )
     payload = encode_tuple(table, values)
     assert decode_tuple(table, payload) == values
-    calls: list[int] = []
-    original = schema_module.decode_value
+    calls: list[ValueType] = []
+    original = schema_module._decode_expected_value_body
 
-    def counted(buf: bytes, offset: int = 0, *, depth: int = 0) -> tuple[object, int]:
-        calls.append(offset)
-        return original(buf, offset, depth=depth)
+    def counted(
+        buf: bytes, offset: int, expected: ValueType
+    ) -> tuple[object, int]:
+        calls.append(expected)
+        return original(buf, offset, expected)
 
-    monkeypatch.setattr(schema_module, "decode_value", counted)
+    monkeypatch.setattr(schema_module, "_decode_expected_value_body", counted)
 
     assert decode_relationship_endpoints(table, payload) == (11, 22)
-    assert calls == [0, 9], "only the two selected INT64 values are materialised"
+    assert calls == [ValueType.INT64, ValueType.INT64]
 
 
 def _relationship_with_property(kind: ValueType, *, nullable: bool = False) -> TableDef:

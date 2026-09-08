@@ -149,7 +149,13 @@ unchanged, and the library parser itself stays ASCII/fail-closed.
 `OPTIONAL MATCH` left this table in M-PULSE-2K. The admitted form is deliberately limited to
 one named, labelled node as the first and only MATCH clause of a read-only query; an empty scan
 or a WHERE that removes every candidate produces one null-extended row. Wider optional patterns
-remain refused. `unbounded variable length` left this table in M-PULSE-2J: an omitted upper bound is read
+remain refused in that historical milestone. Version 0.0.4 additionally supports a labelled
+mandatory node followed by one correlated optional relationship hop, including the literal
+Key Decisions query `MATCH (d:Decision) OPTIONAL MATCH (d)-[r]-() RETURN d.id, count(r)`.
+This is native, generic execution, not an adapter rewrite keyed to a Pulse query. Direction,
+edge multiplicity, isolated nodes, optional WHERE, budgets and transaction overlays are covered
+in `tests/query/test_correlated_optional.py`; the complete supported subset is in CONTRACT.md.
+`unbounded variable length` left this table in M-PULSE-2J: an omitted upper bound is read
 as the twenty hops the endpoint already rewrites it to, so the engine and the endpoint agree
 about what the omission means. `named path` left it in M-PULSE-2I. `path projection` stayed, and moved from the
 parser to the analysis in the same batch: the syntax it is written in now parses, so what

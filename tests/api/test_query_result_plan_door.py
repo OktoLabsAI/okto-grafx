@@ -13,6 +13,7 @@ public constructor.
 from __future__ import annotations
 
 import dataclasses
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 
@@ -132,7 +133,7 @@ def test_concurrent_reads_materialise_one_stable_tree_for_the_result() -> None:
         assert release.wait(timeout=2)
         return ProduceResults(child=SingleRow(), columns=("value",))
 
-    result = _owned_query_result(plan=_OwnedPlanDoor(clone))
+    result = _owned_query_result(plan=_OwnedPlanDoor(clone, Lock()))
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(lambda: result.plan)
         assert entered.wait(timeout=2)
@@ -145,6 +146,48 @@ def test_concurrent_reads_materialise_one_stable_tree_for_the_result() -> None:
     assert runs == 1
     assert first_plan is second_plan
     assert result.plan is first_plan
+
+
+def test_composition_supplies_one_independent_guard_per_lazy_result(monkeypatch) -> None:
+    guards = []
+
+    def factory():
+        guard = Lock()
+        guards.append(guard)
+        return guard
+
+    with connect(':memory:') as database:
+        monkeypatch.setattr(database, '_plan_guard_factory', factory)
+        first = database.execute(STATEMENT)
+        second = database.execute(STATEMENT)
+    assert len(guards) == 2 and guards[0] is not guards[1]
+    assert _stored_plan(first)._lock is guards[0]
+    assert _stored_plan(second)._lock is guards[1]
+    assert first.plan is not second.plan
+    assert all(not guard.locked() for guard in guards)
+
+
+def test_pure_manual_composition_without_guard_factory_detaches_eagerly() -> None:
+    root = ProduceResults(child=SingleRow(), columns=('value',))
+    result = public_views._query_result_view(
+        QueryResult(columns=('value',), rows=((1,),), plan=root),
+        internally_owned_plan=True, plan_memo=OrderedDict(),
+    )
+    assert type(_stored_plan(result)) is ProduceResults
+    assert result.plan == root and result.plan is not root
+
+
+def test_guard_factory_failure_is_normalized_at_result_boundary() -> None:
+    def broken():
+        raise RuntimeError('guard unavailable')
+
+    root = ProduceResults(child=SingleRow(), columns=('value',))
+    with pytest.raises(GrafxPlanError):
+        public_views._query_result_view(
+            QueryResult(columns=('value',), rows=((1,),), plan=root),
+            internally_owned_plan=True, plan_memo=OrderedDict(),
+            plan_guard_factory=broken,
+        )
 
 
 def test_equality_repr_and_replace_materialise_each_side_privately(
@@ -175,7 +218,7 @@ def test_equality_repr_and_replace_materialise_each_side_privately(
 def test_the_public_constructor_refuses_a_sealed_plan_door() -> None:
     raw = ProduceResults(child=SingleRow(), columns=("value",))
     with pytest.raises(GrafxPlanError) as refused:
-        QueryResult(columns=("value",), rows=((1,),), plan=_OwnedPlanDoor(lambda: raw))  # type: ignore[arg-type]
+        QueryResult(columns=("value",), rows=((1,),), plan=_OwnedPlanDoor(lambda: raw, Lock()))  # type: ignore[arg-type]
     assert "sealed plan door is engine-private" in str(refused.value)
 
     # The frozen dataclass still refuses user assignment of the field.

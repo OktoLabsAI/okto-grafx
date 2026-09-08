@@ -65,9 +65,9 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Sequence
-from inspect import getattr_static
 from typing import Protocol, cast, runtime_checkable
 
+from okto_grafx.domain.control_record import ControlRecordReader
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -118,9 +118,13 @@ from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.coordination import COMMIT_SECTION
+from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.quarantine import QuarantineStore, is_protected
+
+_CANONICAL_REPLAY_FLOOR = IndexManager.check_replay_floor
+_CANONICAL_WATERMARK_PHOTO = IndexManager.table_watermark_photo
 
 __all__ = [
     "MAX_LEDGER_BODY_BYTES",
@@ -402,6 +406,7 @@ class RecoveryManager:
         pool: BufferPool,
         metrics: MetricsSink,
         *,
+        attribute_probe: Callable[[object, str], bool],
         catalog: object = None,
         index_manager: object = None,
         index_sync: Callable[[], object] | None = None,
@@ -415,8 +420,14 @@ class RecoveryManager:
         database_uuid: bytes | None = None,
         control_format_version: int = 1,
         control_file_nonce: int = 0,
+        control_read_if_exists: ControlRecordReader | None = None,
     ) -> None:
         """Build the manager over the stores and ports one recovery pass needs.
+
+        ``attribute_probe`` is supplied by the composition root: it observes
+        declared members without evaluating descriptors, with dynamic lookup
+        only for absent declarations. Host introspection is not an engine
+        dependency. The engine still owns the required shape and refusal.
 
         ``catalog`` and ``control_probe`` are optional because a database can be recovered
         without them: a catalog store is needed only to complete the CF-4 route, and a probe
@@ -433,7 +444,13 @@ class RecoveryManager:
         Naming the same setting twice with two different values has no correct reading, so it is
         refused rather than resolved by an ordering rule nobody can see from the call site.
         """
-        _require_port("storage", storage, STORAGE_PORT_METHODS)
+        if not callable(attribute_probe):
+            raise GrafxConfigurationError(
+                "Recovery attribute_probe must be callable.",
+                field="attribute_probe",
+                value=type(attribute_probe).__name__,
+            )
+        _require_port("storage", storage, STORAGE_PORT_METHODS, attribute_probe)
         _require_port(
             "wal",
             wal,
@@ -446,8 +463,11 @@ class RecoveryManager:
                 "barrier",
                 "force_barrier_range",
             ),
+            attribute_probe,
         )
-        _require_port("metrics", metrics, ("enabled", "register", "increment"))
+        _require_port(
+            "metrics", metrics, ("enabled", "register", "increment"), attribute_probe
+        )
         if not isinstance(ledger, LedgerStore):
             raise GrafxConfigurationError(
                 f"Recovery needs a LedgerStore; got {type(ledger).__name__}.",
@@ -502,9 +522,10 @@ class RecoveryManager:
                 database_uuid=database_uuid,
                 control_format_version=control_format_version,
                 file_nonce=control_file_nonce,
+                control_read_if_exists=control_read_if_exists,
             )
         )
-        self._redo_engine = CommitRedo(pool, index_manager)  # type: ignore[arg-type]
+        self._redo_engine = CommitRedo(pool, index_manager, database_uuid=database_uuid)  # type: ignore[arg-type]
         if self._metrics.enabled:
             for declared in RECOVERY_METRICS:
                 self._metrics.register(declared)
@@ -715,15 +736,37 @@ class RecoveryManager:
         # must not leave either an applied page prefix or unrelated control/index publication
         # behind merely because static validation used to live inside the later redo step.
         preflighted, preflight_touched_catalog = self._preflight_committed_replay(
-            replay, permit
+            replay, permit, checkpoint_lsn=state.checkpoint_lsn
         )
+        replay_floor_watermarks = None
         if manager is not None and not state_was_damaged:
             # The checkpoint is the replay floor. An index already behind it cannot be completed
             # from the retained WAL suffix and must be marked stale BEFORE replay; otherwise the
             # final mark_built_through would certify a permanently missing historical entry.
             # Even the in-memory verdict follows preflight so a byte-identical refusal has no
             # state transition to unwind.
-            manager.check_replay_floor(state.checkpoint_lsn, persist_stale=False)
+            if (
+                type(self) is RecoveryManager
+                and type(manager) is IndexManager
+                and IndexManager.check_replay_floor is _CANONICAL_REPLAY_FLOOR
+                and IndexManager.table_watermark_photo is _CANONICAL_WATERMARK_PHOTO
+                and RecoveryManager._repair_ledger is _CANONICAL_LEDGER_REPAIR
+                and type(self._ledger) is LedgerStore
+                and self._ledger.damage is None
+                and not plan.damaged
+                and self._policy != POLICY_REFUSE
+            ):
+                # The two pre-redo floor checks share one heap picture only in this closed
+                # clean-log/healthy-ledger interval. No page replay, catalog adoption or
+                # external commit can intervene under this permit. Both index-header checks
+                # still run; redo and post-section open take their own fresh photographs.
+                replay_floor_watermarks = manager.table_watermark_photo()
+                manager.check_replay_floor(
+                    state.checkpoint_lsn, persist_stale=False,
+                    watermarks=replay_floor_watermarks,
+                )
+            else:
+                manager.check_replay_floor(state.checkpoint_lsn, persist_stale=False)
         outcome = OUTCOME_CLEAN
         entries_created = 0
         if plan.damaged:
@@ -758,7 +801,13 @@ class RecoveryManager:
         ):
             # Only after the policy has accepted mutation may the conservative verdict become a
             # durable stale bit. The refuse policy promises byte-for-byte non-interference.
-            manager.check_replay_floor(state.checkpoint_lsn, persist_stale=True)
+            if replay_floor_watermarks is None:
+                manager.check_replay_floor(state.checkpoint_lsn, persist_stale=True)
+            else:
+                manager.check_replay_floor(
+                    state.checkpoint_lsn, persist_stale=True,
+                    watermarks=replay_floor_watermarks,
+                )
         replayed = self._redo(
             plan,
             findings,
@@ -1360,7 +1409,7 @@ class RecoveryManager:
             )
 
     def _preflight_committed_replay(
-        self, replay: CommittedReplay, permit: _RecoveryPermit
+        self, replay: CommittedReplay, permit: _RecoveryPermit, *, checkpoint_lsn: Lsn
     ) -> tuple[object, bool]:
         """Validate every committed effect before recovery performs its first mutation.
 
@@ -1382,6 +1431,7 @@ class RecoveryManager:
             replay,
             allow_unregistered_indexes=touched_catalog,
             _passage=permit,
+            _checkpoint_lsn=checkpoint_lsn,
         )
         return proof, touched_catalog
 
@@ -1426,10 +1476,12 @@ class RecoveryManager:
             )
 
         page_replay = CommittedReplay(
-            effects=page_records, last_committed_lsn=replay.last_committed_lsn
+            effects=page_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
         index_replay = CommittedReplay(
-            effects=index_records, last_committed_lsn=replay.last_committed_lsn
+            effects=index_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
         manager = self._index_manager
         if not preflight_touched_catalog and self._index_sync is not None:
@@ -1447,6 +1499,7 @@ class RecoveryManager:
             preflighted,
             allow_unregistered_indexes=preflight_touched_catalog,
             passage=permit,
+            checkpoint_lsn=state.checkpoint_lsn,
         )
         touched_catalog = preflight_touched_catalog
         page_preflight = self._redo_engine._project_page_preflight(
@@ -1455,6 +1508,7 @@ class RecoveryManager:
             full_preflight,
             allow_unregistered_indexes=touched_catalog,
             passage=permit,
+            checkpoint_lsn=state.checkpoint_lsn,
         )
         if page_preflight is None:
             raise GrafxRecoveryRefused(
@@ -1474,6 +1528,7 @@ class RecoveryManager:
             page_replay,
             _preflighted=page_preflight,
             _passage=permit,
+            _checkpoint_lsn=state.checkpoint_lsn,
         )
         if touched_catalog:
             self._adopt_catalog(findings)
@@ -1493,7 +1548,15 @@ class RecoveryManager:
                 persist_stale=self._policy != POLICY_REFUSE,
                 watermarks=watermarks,
             )
-        index_result = self._redo_engine.apply(index_replay)
+        index_preflight = self._redo_engine._preflight_index_subplan(
+            replay, index_replay, full_preflight,
+            allow_unregistered_indexes=touched_catalog, passage=permit,
+            checkpoint_lsn=state.checkpoint_lsn,
+        )
+        index_result = self._redo_engine.apply(
+            index_replay, _preflighted=index_preflight, _passage=permit,
+            _checkpoint_lsn=state.checkpoint_lsn,
+        )
 
         # Make every replayed heap/catalog/index effect visible to the device before certifying
         # derived indexes. If a data flush fails, no fresh header may get ahead of the data it
@@ -1969,6 +2032,9 @@ class RecoveryManager:
 _CATALOG_FILE: str = "catalog.dat"
 
 
+_CANONICAL_LEDGER_REPAIR = RecoveryManager._repair_ledger
+
+
 def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str]:
     """Return the bytes a ledger entry may carry, and the detail that explains what it carries.
 
@@ -1984,7 +2050,12 @@ def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str
     )
 
 
-def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
+def _require_port(
+    slot: str,
+    instance: object,
+    methods: Sequence[str],
+    attribute_probe: Callable[[object, str], bool],
+) -> None:
     """Refuse a port or collaborator that cannot answer the doors recovery opens (G5).
 
     Inspect declared attributes without invoking descriptors.  In particular, ``damage`` is
@@ -1993,25 +2064,25 @@ def _require_port(slot: str, instance: object, methods: Sequence[str]) -> None:
     keeps transparent ``__getattr__`` wrappers compatible; as with ``hasattr``, only
     ``AttributeError`` means that a door is absent and every other exception remains visible.
     """
-    missing = [name for name in methods if not _port_has_attribute(instance, name)]
+    missing: list[str] = []
+    for name in methods:
+        present = attribute_probe(instance, name)
+        if type(present) is not bool:
+            raise GrafxConfigurationError(
+                "Recovery attribute_probe must return an exact bool.",
+                field="attribute_probe",
+                slot=slot,
+                member=name,
+                value=type(present).__name__,
+            )
+        if not present:
+            missing.append(name)
     if missing:
         raise GrafxPortNotConfigured(
             f"The {slot} port of recovery is missing {', '.join(missing)}.",
             slot=slot,
             missing=tuple(missing),
         )
-
-
-def _port_has_attribute(instance: object, name: str) -> bool:
-    """Return whether ``instance`` declares or dynamically supplies ``name`` without eager IO."""
-    try:
-        getattr_static(instance, name)
-    except AttributeError:
-        try:
-            getattr(instance, name)
-        except AttributeError:
-            return False
-    return True
 
 
 def _one_policy(recovery_policy: object, policy: object) -> object:

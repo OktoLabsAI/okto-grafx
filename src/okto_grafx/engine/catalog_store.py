@@ -18,7 +18,7 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxTransactionStateError,
 )
-from okto_grafx.domain.ids import NO_PAGE, PageIndex
+from okto_grafx.domain.ids import NO_PAGE, PROVISIONAL_CSN, PageIndex
 from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.page import (
     HEADER_PAGE_INDEX,
@@ -46,6 +46,60 @@ CATALOG_FILE: str = "catalog.dat"
 
 MINIMUM_FRAMES: int = 2
 """Frames the catalog needs at once: one chain page being written and the header page."""
+
+
+def read_catalog_page_images(
+    images: tuple[tuple[int, bytes], ...], *, page_size: int, sequence: int,
+) -> Catalog:
+    """Decode a complete staged catalog, never consulting or adopting physical pages.
+
+    CatalogStore.stage always includes header, complete chain and released pages.
+    This checks that contract from WAL after-images even across partial apply.
+    It returns data, not physical authority or permission to replay the images.
+    """
+    def refuse(field: str) -> GrafxCorruptionDetected:
+        return GrafxCorruptionDetected("Invalid complete catalog page-image set.", file=CATALOG_FILE, field=field)
+
+    if type(sequence) is not int or not 0 < sequence < PROVISIONAL_CSN:
+        raise refuse("commit_sequence")
+    if type(images) is not tuple or len(images) < 2:
+        raise refuse("catalog_images")
+    pages: dict[int, Page] = {}
+    for index, raw in images:
+        if type(index) is not int or not 0 <= index < NO_PAGE or index in pages:
+            raise refuse("catalog_image_address")
+        if type(raw) is not bytes or len(raw) != page_size:
+            raise refuse("catalog_image_size")
+        page = Page.from_bytes(raw, page_index=index)
+        if page.page_lsn != sequence or page.seq % 2 or page.flags or page.header().reserved:
+            raise refuse("catalog_image_stamp")
+        pages[index] = page
+    header_page = pages.get(HEADER_PAGE_INDEX)
+    if header_page is None or header_page.page_type != PageType.META or header_page.slot_count != 1 or header_page.next_page != NO_PAGE:
+        raise refuse("catalog_image_header")
+    header = FileHeaderPage.read(header_page)
+    if header.kind != FileKind.CATALOG or header.page_size != page_size:
+        raise refuse("catalog_image_header")
+    if not 0 < header.payload_length <= (len(pages) - 1) * chunk_capacity(page_size):
+        raise refuse("catalog_image_coverage")
+    chunks: list[bytes] = []
+    visited: set[int] = {HEADER_PAGE_INDEX}
+    index = header.root_page
+    while index != NO_PAGE:
+        if index in visited or index not in pages or len(visited) >= len(pages):
+            raise refuse("catalog_image_chain")
+        visited.add(index)
+        page = pages[index]
+        if page.page_type != PageType.CATALOG or page.slot_count != 1 or page.is_slot_free(0):
+            raise refuse("catalog_image_chunk")
+        chunks.append(page.read_slot(0))
+        index = page.next_page
+    if sum(map(len, chunks)) != header.payload_length:
+        raise refuse("catalog_image_coverage")
+    for index, page in pages.items():
+        if index not in visited and (page.page_type != PageType.FREE or page.slot_count or page.next_page != NO_PAGE):
+            raise refuse("catalog_image_unreferenced")
+    return Catalog.deserialize(b"".join(chunks))
 
 
 class CatalogStore:

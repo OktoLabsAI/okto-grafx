@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.adapters.coordination_local import (
     LEASE_SECTION,
     decode_lease_record,
@@ -70,6 +71,7 @@ def _slot_payload(
     """Return the newest logical payload regardless of whether the current file is v1 or v2."""
     record = TwoSlotControlRecordStore(
         storage,  # type: ignore[arg-type]
+        read_if_exists=read_control_if_exists,
         file=file,
         record_kind=kind,
         database_uuid=identity.database_uuid,

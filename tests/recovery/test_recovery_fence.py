@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from okto_grafx.runtime.capability_probe import port_has_attribute
+
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -76,6 +78,7 @@ def _manager(stack: Stack, coordinator: _Coordinator, wal: object) -> RecoveryMa
         stack.quarantine,
         stack.pool,
         stack.metrics,  # type: ignore[arg-type]
+        attribute_probe=port_has_attribute,
         catalog=stack.catalog,
         coordinator=coordinator,
         commit_lock_timeout=2.5,

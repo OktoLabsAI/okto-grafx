@@ -79,17 +79,19 @@ def test_a_vector_space_statement_keeps_its_options_unresolved() -> None:
 
 
 @pytest.mark.parametrize(
-    ("suffix", "bucket_count", "expected_cardinality"),
+    ("suffix", "bucket_count", "expected_cardinality", "layout"),
     [
-        ("", None, None),
-        (" OPTIONS bucket_count = 128", 128, None),
-        (" OPTIONS expected_cardinality = 4097", None, 4097),
+        ("", None, None, None),
+        (" OPTIONS bucket_count = 128", 128, None, None),
+        (" OPTIONS expected_cardinality = 4097", None, 4097, None),
+        (" OPTIONS layout = ordered", None, None, "ordered"),
     ],
 )
-def test_a_custom_index_statement_preserves_key_order_and_one_sizing_hint(
+def test_a_custom_index_statement_preserves_key_order_and_one_option(
     suffix: str,
     bucket_count: int | None,
     expected_cardinality: int | None,
+    layout: str | None,
 ) -> None:
     statement = parse(
         "CREATE INDEX by_city_age FOR (p:Person) ON (p.city, p.age)" + suffix
@@ -103,6 +105,7 @@ def test_a_custom_index_statement_preserves_key_order_and_one_sizing_hint(
     assert statement.columns == ("city", "age")
     assert statement.bucket_count == bucket_count
     assert statement.expected_cardinality == expected_cardinality
+    assert statement.layout == layout
     assert parse(statement.describe()) == statement
 
 
@@ -118,6 +121,10 @@ def test_a_custom_index_statement_preserves_key_order_and_one_sizing_hint(
         (
             "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS bucket_count = 0",
             "bucket_count",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS layout = 'ordered'",
+            "layout",
         ),
     ],
 )
@@ -137,6 +144,7 @@ def test_a_custom_index_refuses_invalid_shape_before_planning(
         "OPTIONS bucket_count = $b",
         "OPTIONS bucket_count = 64 OPTIONS expected_cardinality = 4096",
         "OPTIONS bucket_count = 64, expected_cardinality = 4096",
+        "OPTIONS layout = ordered OPTIONS bucket_count = 64",
     ],
 )
 def test_a_custom_index_accepts_at_most_one_literal_sizing_hint(tail: str) -> None:

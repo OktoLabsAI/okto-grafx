@@ -60,8 +60,12 @@ from okto_grafx.domain.model.schema import (
     SOURCE_COLUMN,
     TARGET_COLUMN,
     TableDef,
+    _proved_tuple_payload,
+    TupleEncodingProofs,
     decode_relationship_endpoints,
     decode_tuple,
+    decode_tuple_landing,
+    _decode_tuple_projection,
     encode_tuple,
 )
 from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
@@ -165,6 +169,20 @@ FIRST_RECORD_ID: RecordId = 1
 One rather than zero, so that zero stays available to every caller as "no such row", which is
 what section 3 already means by it for an Lsn and an Epoch.
 """
+
+
+def _write_payload(
+    table: TableDef, values: Sequence[Value], encoding_proof: object,
+    protocol: TupleEncodingProofs | None = None,
+) -> bytes:
+    """Return proved bytes for this exact row, or run the canonical encoder.
+
+    The proof is only an optional acceleration.  Equal values in another tuple, a replaced
+    intent, a revoked proof and every custom/caller-authored object all miss closed and are
+    validated by :func:`encode_tuple` before a page is pinned or changed.
+    """
+    payload = _proved_tuple_payload(table, values, encoding_proof, protocol=protocol)
+    return encode_tuple(table, values) if payload is None else payload
 
 
 def _require_wide_field(field: str, value: int) -> int:
@@ -620,10 +638,12 @@ class HeapStore:
         "_extent_slots_epoch",
         "_bootstrapped_epoch",
         "_extent_proof_seal",
+        "_tuple_encoding_proofs",
     )
 
     def __init__(
-        self, pool: BufferPool, catalog: CatalogStore, *, file: str = HEAP_FILE
+        self, pool: BufferPool, catalog: CatalogStore, *, file: str = HEAP_FILE,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
     ) -> None:
         """Bind the heap to a buffer pool, the catalog that names its tables, and its file."""
         if pool.capacity_pages < MINIMUM_FRAMES:
@@ -636,6 +656,7 @@ class HeapStore:
             )
         self._pool: BufferPool = pool
         self._catalog: CatalogStore = catalog
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._file: str = file
         # The resolved tail of each table, so an append stays O(1) after the first walk. It is a
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
@@ -1483,6 +1504,8 @@ class HeapStore:
         record_id: RecordId,
         values: tuple[Value, ...],
         xmin: Csn,
+        *,
+        _encoding_proof: object = None,
     ) -> RecordRef:
         """Store the first version of a record and return where it was placed.
 
@@ -1496,7 +1519,7 @@ class HeapStore:
         """
         _require_commit_number("xmin", xmin)
         _require_record_id(record_id)
-        payload = encode_tuple(table, values)
+        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
         extent_epoch = self._derived_read_epoch()
         extent, _ = self._observe_record_id_extent(table, record_id)
         extent_proof = self._new_extent_proof(extent, derived_epoch=extent_epoch)
@@ -1518,6 +1541,7 @@ class HeapStore:
         xmin: Csn,
         *,
         extent_proof: object | None = None,
+        _encoding_proof: object = None,
     ) -> RecordRef:
         """Store a row whose identity is already below this table's durable floor.
 
@@ -1576,7 +1600,7 @@ class HeapStore:
                 record_id=record_id,
                 durable_floor=durable_floor,
             )
-        payload = encode_tuple(table, values)
+        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
         header = RecordHeader(
             record_id=record_id,
             xmin=xmin,
@@ -1595,6 +1619,7 @@ class HeapStore:
         xmin: Csn,
         *,
         next_record_id: RecordId,
+        _encoding_proof: object = None,
     ) -> RecordRef:
         """Create a table's first extent with one batch-wide identity floor.
 
@@ -1634,7 +1659,7 @@ class HeapStore:
                 record_id=record_id,
                 next_record_id=floor,
             )
-        payload = encode_tuple(table, values)
+        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
         extent = self._create_extent(table, next_record_id=floor)
         extent_proof = self._new_extent_proof(extent)
         header = RecordHeader(
@@ -1693,6 +1718,8 @@ class HeapStore:
         ref: RecordRef,
         values: Sequence[Value],
         xmin: Csn,
+        *,
+        _encoding_proof: object = None,
     ) -> RecordRef:
         """Write a new version of a record, chained to the old one, and end the old one.
 
@@ -1749,7 +1776,8 @@ class HeapStore:
             )
         # The tuple is encoded before anything is pinned: a row that does not match its schema
         # must not reach a page, and it must not hold a pin while it finds that out.
-        payload = encode_tuple(table, tuple(values))
+        accepted_values = values if type(values) is tuple else tuple(values)
+        payload = _write_payload(table, accepted_values, _encoding_proof, self._tuple_encoding_proofs)
         with self._pool.pinned(self._file, ref.page) as old_page:
             self._require_table_page(old_page, table)
             if ref.slot < FIRST_RECORD_SLOT:
@@ -1958,6 +1986,31 @@ class HeapStore:
 
         for ref, header, content in self._walk(table, accept=visible):
             yield ref, self._decode_version_with_header(table, header, content)
+
+    def scan_projected(
+        self,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        materialized_positions: frozenset[int],
+    ) -> Iterator[tuple[RecordRef, HeapVersion]]:
+        """Yield visible rows while retaining only a closed positional projection.
+
+        Visibility and the physical walk are exactly :meth:`scan`. The complete payload remains
+        schema-validated before a row leaves this door; only allocations for unrequested values
+        are omitted. This method is an internal capability selected only for the exact built-in
+        heap and a query plan that proves every later property read.
+        """
+
+        def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            return snapshot.visible(xmin, xmax)
+
+        for ref, header, content in self._walk(table, accept=visible):
+            yield ref, self._decode_version_with_header(
+                table,
+                header,
+                content,
+                materialized_positions=materialized_positions,
+            )
 
     def scan_relationship_endpoints(
         self, table: TableDef, snapshot: SnapshotLike
@@ -2174,6 +2227,18 @@ class HeapStore:
 
         A chain that returns to a version it already visited is corruption, not a loop to walk.
         """
+        return self._walk_version_chain(ref)
+
+    def _walk_version_chain(
+        self, ref: RecordRef, verified: dict[int, int] | None = None
+    ) -> tuple[RecordRef, ...]:
+        """Walk with the canonical checks, optionally stopping at a proven clean suffix.
+
+        Only the verifier supplies ``verified``: it owns this memo for one table in one
+        stable verification call. Values are complete suffix lengths, not visibility or
+        durability certificates. Failures never populate it. With a memo the returned
+        tuple is only the newly walked prefix; the public API always walks the full chain.
+        """
         chain: list[RecordRef] = []
         seen: set[int] = visited_pages()
         # A version chain visits distinct slots, so the pages of the file times the slots a page
@@ -2184,6 +2249,7 @@ class HeapStore:
             + 1
         )
         current: RecordRef | None = ref
+        suffix_length = 0
         while current is not None:
             refuse_endless_chain(self._file, len(chain) + 1, limit)
             encoded = current.encode()
@@ -2196,10 +2262,19 @@ class HeapStore:
                     slot=current.slot,
                     field="cycle",
                 )
+            if verified is not None and encoded in verified:
+                suffix_length = verified[encoded]
+                # Reusing a suffix must not weaken the independent finite-walk bound.
+                refuse_endless_chain(self._file, len(chain) + suffix_length, limit)
+                break
             seen.add(encoded)
             chain.append(current)
             _table_id, content = self._read_slot(current)
             current = RecordHeader.decode(content).previous
+        if verified is not None:
+            for visited in reversed(chain):
+                suffix_length += 1
+                verified[visited.encode()] = suffix_length
         return tuple(chain)
 
     def extent_of(self, table: TableDef) -> TableExtent | None:
@@ -3204,8 +3279,30 @@ class HeapStore:
             table, RecordHeader.decode(content), content
         )
 
+    def read_landing(self, ref: RecordRef) -> HeapVersion:
+        """Return the version at that location for an identity landing (RELSEEK-M4).
+
+        Everything :meth:`read` checks is checked here, in the same order, with the same
+        refusals; the only difference is that vector bodies are validated without building the
+        vector object, because a landing consumes the header fields of the version it proves and
+        never a component.  The vector positions of ``values`` carry the decoder's private
+        sentinel, which ``value_type_of`` refuses, so such a version cannot be encoded or
+        published as a row: it is a proof, not a row.
+        """
+        table_id, content = self._read_slot(ref)
+        table = self._catalog.catalog.table_by_id(table_id)
+        return self._decode_version_with_header(
+            table, RecordHeader.decode(content), content, landing=True
+        )
+
     def _decode_version_with_header(
-        self, table: TableDef, header: RecordHeader, content: bytes
+        self,
+        table: TableDef,
+        header: RecordHeader,
+        content: bytes,
+        *,
+        landing: bool = False,
+        materialized_positions: frozenset[int] | None = None,
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
         payload = self._validated_payload(table, header, content)
@@ -3213,7 +3310,15 @@ class HeapStore:
             record_id=header.record_id,
             xmin=header.xmin,
             xmax=header.xmax,
-            values=decode_tuple(table, payload),
+            values=(
+                decode_tuple_landing(table, payload)
+                if landing
+                else (
+                    _decode_tuple_projection(table, payload, materialized_positions)
+                    if materialized_positions is not None
+                    else decode_tuple(table, payload)
+                )
+            ),
             prev=header.previous,
             schema_version=header.schema_version,
             deleted=bool(header.flags & RECORD_FLAG_DELETED),

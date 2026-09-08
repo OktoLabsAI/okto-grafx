@@ -5,9 +5,9 @@ name and nothing in the query refers to it. So the name is decorative: it change
 may SAY and nothing about what a query DOES. That is the whole claim of this file, and the
 sharpest way to state it is that the plan is identical to the same query without the name.
 
-What keeps a decoration honest is the refusal surface around it. A name nobody may read still
-has to be a name nobody may read -- in RETURN, in WHERE, in ORDER BY, as a property subject --
-and it still has to collide with the node and relationship names beside it.
+What keeps a decoration honest is the refusal surface around it. Outside the separately tested
+standalone one-hop path projection, properties, predicates and ordering cannot read the name.
+It must also remain distinct from the node and relationship names beside it.
 """
 
 from __future__ import annotations
@@ -135,13 +135,12 @@ def test_the_owner_sees_its_own_edge_and_a_rollback_removes_it(
     assert database.execute(NAMED).rows == (("a1", "canonical"),)
 
 
-# --- nothing may read it -----------------------------------------------------------------------
+# --- expressions outside the standalone path projection remain refused -------------------------
 
 
 @pytest.mark.parametrize(
     "query",
     [
-        "MATCH path = (a:A)-[r:R]->(b:B) RETURN path",
         "MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length",
         "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id, path",
         "MATCH path = (a:A)-[r:R]->(b:B) WHERE path IS NULL RETURN a.id",
@@ -162,7 +161,7 @@ def test_the_refusal_says_the_path_is_unreadable_rather_than_unbound(
     database: object,
 ) -> None:
     with pytest.raises(GrafxPlanError) as raised:
-        database.execute("MATCH path = (a:A)-[r:R]->(b:B) RETURN path")
+        database.execute("MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length")
 
     assert "written and never read" in str(raised.value)
     assert raised.value.details == {"field": "variable", "value": "path"}
@@ -337,9 +336,9 @@ def test_the_analysis_refuses_the_same_trees_on_its_own() -> None:
     ("name", "query", "columns"),
     [
         (
-            "the projection itself",
-            "MATCH path = (a:A)-[r:R]->(b:B) RETURN path",
-            ("path",),
+            "a projected property",
+            "MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length",
+            ("path.length",),
         ),
         (
             "a read in the predicate",

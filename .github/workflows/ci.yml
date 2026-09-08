@@ -64,6 +64,11 @@ jobs:
       - name: Enforce the zero-diagnostic baseline
         run: python -m ruff check .
 
+      - name: Validate public documentation and consolidated roadmap
+        run: |
+          python tools/generate_api_reference.py --check
+          python tools/check_documentation.py
+
   consumer:
     name: installed consumer (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

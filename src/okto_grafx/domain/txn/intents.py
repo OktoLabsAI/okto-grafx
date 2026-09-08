@@ -62,6 +62,10 @@ def reduce_row_intents(intents: Sequence[RowIntent]) -> tuple[RowIntent, ...]:
                     record_id=previous.record_id,
                     operation=RowOperation.INSERT,
                     reference=reference,
+                    # The update's values replace the insert's exact values object.  Carry only
+                    # a proof attached to that replacement; retaining the insert proof here
+                    # would let equal-looking but different bytes cross the commit boundary.
+                    _encoding_proof=intent._encoding_proof,
                 )
                 continue
             if intent.operation is RowOperation.DELETE:

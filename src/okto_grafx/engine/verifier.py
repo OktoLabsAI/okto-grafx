@@ -67,6 +67,8 @@ from okto_grafx.domain.ids import (
 )
 from okto_grafx.domain.index.definition import index_definition_matches_table
 from okto_grafx.domain.index.keys import index_key
+from okto_grafx.domain.index.layout import IndexLayout
+from okto_grafx.domain.index.ordered_root import ORDERED_ROOT_PAGE_B
 from okto_grafx.domain.model.record import RECORD_HEADER_SIZE, HeapVersion, RecordHeader
 from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
 from okto_grafx.domain.model.schema import TableDef
@@ -136,6 +138,9 @@ DEFAULT_VERIFIED_FILES: tuple[str, ...] = ("heap.dat", "catalog.dat")
 _HEAP_DESCRIPTOR_SLOT: int = 0
 _FIRST_RECORD_SLOT: int = 1
 
+_CANONICAL_VERSION_CHAIN = HeapStore.version_chain
+_CANONICAL_READ_SLOT = HeapStore._read_slot
+
 _CANONICAL_INDEX_TYPES: tuple[type[object], ...] = (
     HashIndex,
     ProximityIndex,
@@ -151,6 +156,8 @@ class _CanonicalIndexVerification:
         "remaining_indexes",
         "resolved_refs",
         "scan_failures",
+        "scanned_refs",
+        "seeded",
         "tables",
         "versions",
     )
@@ -162,7 +169,9 @@ class _CanonicalIndexVerification:
             tuple[int, str], tuple[tuple[RecordRef, HeapVersion], ...]
         ] = {}
         self.scan_failures: dict[tuple[int, str], GrafxError] = {}
+        self.scanned_refs: dict[tuple[int, str], set[int]] = {}
         self.resolved_refs: dict[tuple[int, str], set[int]] = {}
+        self.seeded: set[tuple[int, str]] = set()
         self.remaining_indexes: dict[tuple[int, str], int] = {}
 
     def register(self, index: object) -> None:
@@ -183,7 +192,9 @@ class _CanonicalIndexVerification:
         self.remaining_indexes.pop(identity, None)
         self.versions.pop(identity, None)
         self.scan_failures.pop(identity, None)
+        self.scanned_refs.pop(identity, None)
         self.resolved_refs.pop(identity, None)
+        self.seeded.discard(identity)
 
 
 def _index_table_identity(index: object) -> tuple[int, str] | None:
@@ -264,8 +275,11 @@ class Verifier:
         # finding on a later run of the same verifier.
         reported: set[tuple[str, PageIndex]] = set()
         if scope_covers(scope, SCOPE_PAGES):
+            reachable_by_file = self._ordered_reachable_pages()
             for file in self._paged_files():
-                seen, found = self._verify_pages(file, reported)
+                seen, found = self._verify_pages(
+                    file, reported, reachable=reachable_by_file.get(file)
+                )
                 pages_checked += seen
                 findings.extend(found)
                 if seen:
@@ -298,8 +312,35 @@ class Verifier:
                 names.append(name)
         return tuple(name for name in names if self._pool.storage.exists(name))
 
+    def _ordered_reachable_pages(self) -> dict[str, frozenset[PageIndex]]:
+        """Return, per ORDERED artifact file, the tree pages its selected root reaches.
+
+        The layout comes from the store's own definition, the same authority the catalog
+        resolved it through, and the reachable set from a fresh, complete proof: the store
+        reads its certificate and traverses the whole tree.  A file no store names, a store
+        without the door, and a store whose proof is absent or failed anywhere are absent
+        from the mapping: every page of such a file keeps every verdict.
+        """
+        reachable: dict[str, frozenset[PageIndex]] = {}
+        for index in self._indexes:
+            definition = getattr(index, "definition", None)
+            if getattr(definition, "layout", None) is not IndexLayout.ORDERED:
+                continue
+            name = _index_file(index)
+            door = getattr(index, "reachable_pages", None)
+            if not name or not callable(door):
+                continue
+            pages = door()
+            if pages is not None:
+                reachable[name] = frozenset(pages)
+        return reachable
+
     def _verify_pages(
-        self, file: str, reported: set[tuple[str, PageIndex]]
+        self,
+        file: str,
+        reported: set[tuple[str, PageIndex]],
+        *,
+        reachable: frozenset[PageIndex] | None = None,
     ) -> tuple[int, list[VerificationFinding]]:
         """Verify every page of one file, straight off the device.
 
@@ -321,7 +362,7 @@ class Verifier:
                 )
             ]
         for index in range(total):
-            page = self._decode_page(file, index, findings, reported)
+            page = self._decode_page(file, index, findings, reported, reachable=reachable)
             checked += 1
             if page is None:
                 continue
@@ -357,6 +398,8 @@ class Verifier:
         index: PageIndex,
         findings: list[VerificationFinding],
         reported: set[tuple[str, PageIndex]],
+        *,
+        reachable: frozenset[PageIndex] | None = None,
     ) -> Page | None:
         """Read and decode one page, counting the checksum and reporting a failure as a finding.
 
@@ -404,6 +447,22 @@ class Verifier:
                     "this file was grown before its header was written. No replay repairs a "
                     "file header, because a header is written when the file is created.",
                 )
+                return None
+            if (
+                reachable is not None
+                and index > ORDERED_ROOT_PAGE_B
+                and index not in reachable
+            ):
+                # OIX-2B/O2.  An ORDERED artifact is append-only copy-on-write: a publication
+                # allocates its new pages, writes them, barriers them, and only then writes a
+                # root that references them.  A page allocated but never written and reached
+                # by no valid root is the orphan of a publication interrupted between the
+                # allocation and the write; no replay will ever fill it, because a COW page
+                # carries no log image, and only a compacting rebuild reclaims it.  It is not
+                # a loss and not a finding.  A page the selected root does reach keeps this
+                # verdict whatever the scope -- zeroed under a live handle it is damage, and
+                # the page walk names it before the tree walk refuses it.  The two root pages
+                # and a file whose certificate cannot be read keep every verdict.
                 return None
             self._report_page(
                 findings,
@@ -991,6 +1050,17 @@ class Verifier:
         """
         findings: list[VerificationFinding] = []
         checked = 0
+        # A long history used to rewalk every older suffix for every stored version:
+        # quadratic work despite checking the same stable physical graph. Keep only
+        # successful suffix lengths, local to this table/call, never across admission.
+        # Custom heap collaborators retain their observable per-record protocol.
+        verified_chains: dict[int, int] | None = (
+            {}
+            if type(self._heap) is HeapStore
+            and HeapStore.version_chain is _CANONICAL_VERSION_CHAIN
+            and HeapStore._read_slot is _CANONICAL_READ_SLOT
+            else None
+        )
         for page_index in chain:
             page = self._decode_page(heap_file, page_index, findings, reported)
             if page is None:
@@ -1004,7 +1074,14 @@ class Verifier:
                     continue
                 checked += 1
                 findings.extend(
-                    self._verify_record(table, heap_file, page, page_index, slot)
+                    self._verify_record(
+                        table,
+                        heap_file,
+                        page,
+                        page_index,
+                        slot,
+                        verified_chains=verified_chains,
+                    )
                 )
         return checked, findings
 
@@ -1015,6 +1092,8 @@ class Verifier:
         page: Page,
         page_index: PageIndex,
         slot: int,
+        *,
+        verified_chains: dict[int, int] | None = None,
     ) -> list[VerificationFinding]:
         """Check one stored version against the slot that holds it.
 
@@ -1077,7 +1156,11 @@ class Verifier:
                 )
         if header.previous is not None and self._heap is not None:
             try:
-                self._heap.version_chain(RecordRef(page_index, slot))
+                ref = RecordRef(page_index, slot)
+                if verified_chains is None:
+                    self._heap.version_chain(ref)
+                else:
+                    self._heap._walk_version_chain(ref, verified_chains)
             except GrafxError as failure:
                 findings.append(
                     VerificationFinding(
@@ -1174,6 +1257,13 @@ class Verifier:
             if shared is not None and table_identity is not None
             else None
         )
+        if resolved_refs is not None and self._heap is not None:
+            self._seed_resolved_refs(
+                index,
+                table_identity,  # type: ignore[arg-type]
+                shared,  # type: ignore[arg-type]
+                resolved_refs,
+            )
         for entry in entries:
             checked += 1
             location = FindingLocation(
@@ -1227,6 +1317,90 @@ class Verifier:
             )
         )
         return checked, findings
+
+    def _canonical_versions(
+        self,
+        identity: tuple[int, str],
+        table: TableDef,
+        shared: _CanonicalIndexVerification,
+    ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+        """Fully decode one table, retaining only values that coverage can need.
+
+        The scan runs at most once per table per verification; a failure is kept and raised
+        again to every later asker, so each index reports it where it always did.
+        Ended built-in versions still pass the complete decoder, including overflow and tuple
+        validation. Their payloads are then discarded: coverage never requires their keys.
+        Exact physical references are retained separately for resolution seeding, published
+        only after the entire scan succeeds. Foreign version objects keep their former path.
+        """
+        failure = shared.scan_failures.get(identity)
+        if failure is not None:
+            raise failure
+        versions = shared.versions.get(identity)
+        if versions is None:
+            try:
+                retained: list[tuple[RecordRef, HeapVersion]] = []
+                scanned_refs: set[int] = set()
+                for ref, version in self._heap.scan_all(table):  # type: ignore[union-attr]
+                    if type(ref) is RecordRef:
+                        scanned_refs.add(ref.encode())
+                    if type(version) is not HeapVersion or version.live:
+                        retained.append((ref, version))
+                versions = tuple(retained)
+            except GrafxError as caught:
+                shared.scan_failures[identity] = caught
+                raise
+            shared.versions[identity] = versions
+            shared.scanned_refs[identity] = scanned_refs
+        return versions
+
+    def _seed_resolved_refs(
+        self,
+        index: object,
+        identity: tuple[int, str],
+        shared: _CanonicalIndexVerification,
+        resolved_refs: set[int],
+    ) -> None:
+        """Seed the references the canonical scan of the table already proved resolvable.
+
+        CKPTCERT-1.  ``HeapStore.read`` and ``HeapStore.scan_all`` open the same doors to a
+        slot: the walk accepts a page only as a data page owned by this table, skips the
+        descriptor slot, and decodes the same bytes with the same decoder.  The one thing
+        ``read`` does on its own is resolve the table through the catalog the heap holds, so
+        the scan is trusted for a reference only while that catalog names a definition equal to
+        the one the scan decoded with; otherwise every entry keeps its own read and its own
+        finding.  The scan runs only where the coverage check would run it, and a scan that
+        fails seeds nothing and is reported where it always was, by that check, while the
+        entries are still resolved one by one -- a broken heap never hides a broken index and a
+        broken index never hides a broken heap.  Nothing here outlives the verification of the
+        table's last index.
+        """
+        if identity in shared.seeded:
+            return
+        if shared.catalog_failure is not None:
+            return
+        definition = getattr(index, "definition", None)
+        if not getattr(definition, "positions", None):
+            return
+        table = shared.tables.get(identity)
+        if table is None or not index_definition_matches_table(definition, table):
+            return
+        try:
+            held = self._heap.catalog.catalog.table_by_id(table.table_id)  # type: ignore[union-attr]
+        except GrafxError:
+            return
+        if held != table:
+            return
+        try:
+            self._canonical_versions(identity, table, shared)
+        except GrafxError:
+            return
+        # Publish the seeded marker only after this particular index proved that it exposes a
+        # valid built-in definition and the heap/catalog pair agreed.  An earlier malformed or
+        # non-covering index for the same table must not suppress the optimization for a later
+        # valid one; all failure paths above remain canonical fallbacks.
+        shared.seeded.add(identity)
+        resolved_refs.update(shared.scanned_refs[identity])
 
     def _verify_index_covers_the_heap(
         self,
@@ -1290,17 +1464,7 @@ class Verifier:
                     self._heap.scan_all(table)
                 )
             else:
-                scan_failure = shared.scan_failures.get(identity)
-                if scan_failure is not None:
-                    raise scan_failure
-                versions = shared.versions.get(identity, ())
-                if identity not in shared.versions:
-                    try:
-                        versions = tuple(self._heap.scan_all(table))
-                    except GrafxError as failure:
-                        shared.scan_failures[identity] = failure
-                        raise
-                    shared.versions[identity] = versions
+                versions = self._canonical_versions(identity, table, shared)
         except GrafxError as failure:
             return [
                 VerificationFinding(

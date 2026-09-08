@@ -33,6 +33,7 @@ from okto_grafx.engine.query_engine import (
     _Accumulator,
     _Row,
     _node_scan,
+    _column_named,
     _sort_key,
 )
 from tests.query.stack import QueryStack, build_query_stack, vector
@@ -82,6 +83,22 @@ def test_a_binding_uses_the_tables_precomputed_column_position() -> None:
     )
 
     assert binding.value("name") == "Ada"
+
+
+def test_write_column_lookup_uses_the_precomputed_position_without_iteration() -> None:
+    target = ColumnDef("name", ValueType.STRING)
+
+    class Columns:
+        def __getitem__(self, position: int) -> ColumnDef:
+            assert position == 1
+            return target
+
+        def __iter__(self) -> Iterator[ColumnDef]:
+            raise AssertionError("a successful write column lookup scanned every column")
+
+    table = SimpleNamespace(column_positions={"name": 1}, columns=Columns())
+
+    assert _column_named(table, "name") is target
 
 
 def test_a_scan_rooted_at_single_row_does_not_copy_its_empty_bindings() -> None:

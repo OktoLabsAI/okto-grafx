@@ -51,6 +51,7 @@ def test_result_limit_accepts_exactly_and_stops_consuming_at_limit_plus_one(
 
     refused = _stack(5, max_result_rows=2)
     original_scan = HeapStore.scan
+    original_projected_scan = HeapStore.scan_projected
     consumed = 0
 
     def counted_scan(
@@ -61,7 +62,21 @@ def test_result_limit_accepts_exactly_and_stops_consuming_at_limit_plus_one(
             consumed += 1
             yield found
 
+    def counted_projected_scan(
+        heap: HeapStore,
+        table: TableDef,
+        snapshot: Snapshot,
+        materialized_positions: frozenset[int],
+    ) -> Iterator[tuple[object, object]]:
+        nonlocal consumed
+        for found in original_projected_scan(
+            heap, table, snapshot, materialized_positions
+        ):
+            consumed += 1
+            yield found
+
     monkeypatch.setattr(HeapStore, "scan", counted_scan)
+    monkeypatch.setattr(HeapStore, "scan_projected", counted_projected_scan)
     with pytest.raises(GrafxQueryBudgetExceeded) as raised:
         _run(refused, "MATCH (p:Person) RETURN p.id")
 
@@ -110,8 +125,7 @@ def test_query_budget_refusal_never_releases_partial_writes(
 
         with pytest.raises(GrafxQueryBudgetExceeded) as raised:
             transaction.execute(
-                "MATCH (p:Person) CREATE (:Copy {id: p.id}) "
-                "RETURN p.id ORDER BY p.id"
+                "MATCH (p:Person) CREATE (:Copy {id: p.id}) RETURN p.id ORDER BY p.id"
             )
 
         assert raised.value.details["field"] == field

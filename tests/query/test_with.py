@@ -228,11 +228,6 @@ def test_a_variable_a_stage_dropped_is_refused_for_being_dropped() -> None:
         ("MATCH (n:Decision) WITH n AS m RETURN m.id", "item", "n AS m"),
         ("WITH 1 AS a, a + 1 AS b RETURN b", "variable", "a"),
         (
-            "MATCH (n:Decision) WITH count(n) AS total RETURN total",
-            "expression",
-            "count(n)",
-        ),
-        (
             "MATCH (n:Decision) WITH n WHERE count(n) > 1 RETURN n.id",
             "expression",
             "(count(n) > 1)",

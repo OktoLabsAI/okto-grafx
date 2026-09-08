@@ -10,7 +10,9 @@ from okto_grafx.domain.errors import (
     GrafxPlanError,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.ast import BinaryOperation, Direction, Literal, Parameter
@@ -527,6 +529,35 @@ def test_a_custom_index_plan_preserves_an_explicit_legal_bucket_count() -> None:
     assert planned.root.expected_cardinality is None
 
 
+def test_an_ordered_custom_index_plan_persists_its_narrow_key_contract() -> None:
+    catalog = build_catalog()
+    catalog.add_table(
+        TableDef(
+            table_id=6,
+            name="Event",
+            kind="node",
+            columns=(
+                ColumnDef(name="id", type=ValueType.STRING, nullable=False),
+                ColumnDef(name="created_at", type=ValueType.TIMESTAMP, nullable=False),
+            ),
+            primary_key="id",
+        )
+    )
+
+    planned = plan_text(
+        "CREATE INDEX by_time FOR (e:Event) ON (e.created_at, e.id) "
+        "OPTIONS layout = ordered",
+        catalog=catalog,
+    )
+
+    assert isinstance(planned.root, CreateIndex)
+    assert planned.root.positions == (1, 0)
+    assert planned.root.bucket_count == 1
+    assert planned.root.expected_cardinality is None
+    assert planned.root.layout is IndexLayout.ORDERED
+    assert planned.root.key_derivation == "ordered_timestamp_string_v1"
+
+
 @pytest.mark.parametrize(
     ("text", "error", "field"),
     [
@@ -567,6 +598,17 @@ def test_a_custom_index_plan_preserves_an_explicit_legal_bucket_count() -> None:
             "CREATE INDEX PERSON_ID FOR (p:Person) ON (p.name)",
             GrafxPlanError,
             "name",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.age, p.name) "
+            "OPTIONS layout = ordered",
+            GrafxPlanError,
+            "columns",
+        ),
+        (
+            "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS layout = nope",
+            GrafxIndexError,
+            "layout",
         ),
     ],
 )

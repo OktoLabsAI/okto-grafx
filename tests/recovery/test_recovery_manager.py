@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from okto_grafx.runtime.capability_probe import port_has_attribute
+
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -958,6 +960,8 @@ def test_replaying_a_page_twice_leaves_the_page_identical(stack: Stack) -> None:
 
 
 def test_a_committed_page_is_put_back_after_the_apply_was_lost(stack: Stack) -> None:
+    # The lost apply is the heap change, not the preexisting catalog bootstrap.
+    stack.pool.flush(CATALOG_FILE)
     image = make_page_image(stack.codec, [b"committed"], page_index=3)
     # The first append also writes the segment header; later batches do not.
     predicted = stack.wal.last_lsn + 2 + (0 if stack.wal.segments() else 1)
@@ -1036,6 +1040,7 @@ def test_a_clean_tail_with_an_effect_but_no_outcome_refuses_without_mutation(
 def test_an_aborted_transaction_contributes_nothing_to_the_redo(stack: Stack) -> None:
     from okto_grafx.domain.txn.records import encode_page_write
 
+    stack.pool.flush(CATALOG_FILE)
     image = make_page_image(stack.codec, [b"aborted"], page_index=6)
     stack.wal.append_many(
         [
@@ -1475,26 +1480,27 @@ def test_the_catalog_is_re_derived_from_the_replayed_pages_and_adopted(
     from okto_grafx.domain.txn.commit_record import CommitPayload
     from okto_grafx.domain.txn.records import encode_page_write
 
-    stack.catalog.catalog.add_table(_table())
-    pages = stack.catalog.save()
+    proposed = stack.catalog.read_from_pages()
+    proposed.add_table(_table())
+    # A committed schema change stages its complete chain AND header, without
+    # installing the proposed catalog before WAL durability. save() returns only
+    # chain locations and would smuggle an uncovered, already-applied header into
+    # this fixture, masking the very repair path this test needs to exercise.
+    pages = stack.catalog.stage(proposed)
     stack.pool.flush()
     images = [
-        (CATALOG_FILE, page, stack.storage.read_page(CATALOG_FILE, page))  # type: ignore[attr-defined]
-        for page in pages
+        (CATALOG_FILE, page, raw)
+        for page, raw in pages
     ]
-    predicted = stack.wal.last_lsn + len(images) + 1
+    assert tuple(stack.catalog.read_from_pages().tables()) == ()
     records = []
     for file, page_index, raw in images:
-        decoded = stack.codec.decode_page(raw, verify=True)
-        decoded.page_lsn = predicted
         records.append(
             WalRecord(
                 record_type=int(WalRecordType.WRITE_PAGE),
                 epoch=1,
                 txn_id=2,
-                payload=encode_page_write(
-                    file, page_index, stack.codec.encode_page(decoded)
-                ),
+                payload=encode_page_write(file, page_index, raw),
                 descriptor=DESCRIPTOR,
             )
         )
@@ -1509,7 +1515,14 @@ def test_the_catalog_is_re_derived_from_the_replayed_pages_and_adopted(
             descriptor=DESCRIPTOR,
         )
     )
-    stack.wal.append_many(records)
+    # The first/rolling segment consumes an LSN as well. Rebind the fixed-size
+    # raw images with the real batch planner, exactly as the writer must do.
+    terminal = stack.wal.planned_terminal_lsn(records)
+    for i, (file, page_index, raw) in enumerate(images):
+        decoded = stack.codec.decode_page(raw, verify=True)
+        decoded.page_lsn = terminal
+        records[i] = replace(records[i], payload=encode_page_write(file, page_index, stack.codec.encode_page(decoded)))
+    assert stack.wal.append_many(records, expected_terminal_lsn=terminal) == terminal
     stack.wal.barrier()
     reopened = _reopened(stack)
     report = reopened.recovery().run()
@@ -1553,6 +1566,7 @@ def test_a_collaborator_of_the_wrong_type_is_refused_at_construction(
             stack.quarantine,
             stack.pool,
             metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
     with pytest.raises(GrafxConfigurationError):
         RecoveryManager(
@@ -1562,6 +1576,7 @@ def test_a_collaborator_of_the_wrong_type_is_refused_at_construction(
             "not a quarantine",  # type: ignore[arg-type]
             stack.pool,
             metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
     with pytest.raises(GrafxConfigurationError):
         RecoveryManager(
@@ -1571,6 +1586,7 @@ def test_a_collaborator_of_the_wrong_type_is_refused_at_construction(
             stack.quarantine,
             "not a pool",  # type: ignore[arg-type]
             metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
 
 
@@ -1594,6 +1610,7 @@ def test_a_log_that_cannot_answer_the_doors_recovery_opens_is_refused(
             stack.quarantine,
             stack.pool,
             stack.metrics,  # type: ignore[arg-type]
+            attribute_probe=port_has_attribute,
         )
     assert caught.value.details["slot"] == "wal"
 

@@ -17,7 +17,7 @@ MARKED_PYTHON = re.compile(
     re.DOTALL,
 )
 PUBLIC_EXAMPLES = (
-    pytest.param(ROOT / "README.md", 1, id="readme"),
+    pytest.param(ROOT / "docs" / "INTEGRATION.md", 1, id="integration"),
     pytest.param(ROOT / "docs" / "PORTS.md", 4, id="ports"),
 )
 

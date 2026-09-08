@@ -28,6 +28,8 @@ from okto_grafx.domain.index.keys import (
     record_id_key,
     validate_bucket_count,
 )
+from okto_grafx.domain.index.layout import IndexLayout
+from okto_grafx.domain.index.ordered_keys import ordered_index_key
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import (
     MAX_IDENTIFIER_LENGTH,
@@ -42,6 +44,7 @@ __all__ = [
     "COLUMN_KEY_DERIVATION",
     "DEFINITION_DIGEST_SIZE",
     "RECORD_ID_KEY_DERIVATION",
+    "ORDERED_KEY_DERIVATION",
     "INDEX_DIRECTORY",
     "INDEX_FILE_SUFFIX",
     "IndexDefinition",
@@ -70,6 +73,13 @@ under the wrong one answers with nothing while looking perfectly healthy.
 
 RECORD_ID_KEY_DERIVATION: str = "record_id_u64_v1"
 """The built-in derivation whose key is the row's stable unsigned identity."""
+
+ORDERED_KEY_DERIVATION: str = "ordered_timestamp_string_v1"
+"""The order-preserving v1 derivation for one TIMESTAMP and one STRING column.
+
+The codec is introduced with the ordered store. Naming the derivation in the durable definition
+now prevents an ordered artifact from ever being opened under the hash key encoder.
+"""
 
 
 def index_file(name: str) -> str:
@@ -149,6 +159,7 @@ class IndexDefinition:
     bucket_count: int = DEFAULT_BUCKET_COUNT
     key_derivation: str = COLUMN_KEY_DERIVATION
     artifact_nonce: int = 0
+    layout: IndexLayout = IndexLayout.HASH
 
     def __post_init__(self) -> None:
         """Refuse a definition that could not name a file, a table, or a key."""
@@ -227,9 +238,49 @@ class IndexDefinition:
                 index=self.name,
             )
         object.__setattr__(self, "visibility", IndexVisibility.parse(self.visibility))
+        object.__setattr__(self, "layout", IndexLayout.parse(self.layout))
         object.__setattr__(
             self, "bucket_count", validate_bucket_count(self.bucket_count)
         )
+        if self.layout is IndexLayout.ORDERED:
+            if self.visibility is not IndexVisibility.EXACT:
+                raise GrafxIndexError(
+                    "The ordered v1 layout is an exact access path.",
+                    field="visibility",
+                    value=self.visibility.value,
+                    index=self.name,
+                )
+            if self.key_derivation != ORDERED_KEY_DERIVATION:
+                raise GrafxIndexError(
+                    "The ordered v1 layout requires the ordered_timestamp_string_v1 key "
+                    "derivation.",
+                    field="key_derivation",
+                    value=self.key_derivation,
+                    index=self.name,
+                )
+            if len(self.positions) != 2:
+                raise GrafxIndexError(
+                    "The ordered v1 layout keys exactly two column positions.",
+                    field="positions",
+                    value=repr(self.positions),
+                    index=self.name,
+                )
+            if self.bucket_count != 1:
+                raise GrafxIndexError(
+                    "The ordered v1 layout reserves bucket_count=1 as a binary-stable "
+                    "sentinel; it is not a sizing option.",
+                    field="bucket_count",
+                    value=self.bucket_count,
+                    index=self.name,
+                )
+        elif self.key_derivation == ORDERED_KEY_DERIVATION:
+            raise GrafxIndexError(
+                "The ordered_timestamp_string_v1 derivation belongs only to the ordered "
+                "layout.",
+                field="layout",
+                value=self.layout.value,
+                index=self.name,
+            )
 
     @classmethod
     def on(
@@ -242,6 +293,7 @@ class IndexDefinition:
         bucket_count: int = DEFAULT_BUCKET_COUNT,
         key_derivation: str = COLUMN_KEY_DERIVATION,
         artifact_nonce: int = 0,
+        layout: IndexLayout | str = IndexLayout.HASH,
     ) -> IndexDefinition:
         """Return the definition of an index over these columns of this table.
 
@@ -283,6 +335,7 @@ class IndexDefinition:
             bucket_count=bucket_count,
             key_derivation=key_derivation,
             artifact_nonce=artifact_nonce,
+            layout=IndexLayout.parse(layout),
         )
 
     @property
@@ -319,6 +372,8 @@ class IndexDefinition:
         rule would come back empty while the structure looked perfectly healthy. Refusing is the
         only answer that cannot be mistaken for a working index.
         """
+        if self.key_derivation == ORDERED_KEY_DERIVATION:
+            return ordered_index_key(values, self.positions)
         if self.key_derivation != COLUMN_KEY_DERIVATION:
             raise GrafxIndexError(
                 f"Index {self.name!r} declares the {self.key_derivation!r} key derivation, which "
@@ -393,17 +448,20 @@ class IndexDefinition:
         bytes for the same row. The name is in it too, because a file renamed under another
         index's name is not that index.
         """
-        material = "\n".join(
-            (
-                self.name,
-                str(self.table_id),
-                self.table_name,
-                ",".join(str(position) for position in self.positions),
-                self.visibility.value,
-                str(self.bucket_count),
-                self.key_derivation,
-            )
+        fields = (
+            self.name,
+            str(self.table_id),
+            self.table_name,
+            ",".join(str(position) for position in self.positions),
+            self.visibility.value,
+            str(self.bucket_count),
+            self.key_derivation,
         )
+        # Preserve every established HASH digest byte-for-byte. Ordered artifacts append their
+        # physical layout so no file can be adopted under the other placement contract.
+        if self.layout is IndexLayout.ORDERED:
+            fields = (*fields, self.layout.value)
+        material = "\n".join(fields)
         return hashlib.blake2b(
             material.encode("utf-8"), digest_size=DEFINITION_DIGEST_SIZE
         ).digest()
@@ -528,6 +586,7 @@ def index_definition_matches_table(
             and definition.positions == expected.positions
             and definition.visibility is expected.visibility
             and definition.key_derivation == expected.key_derivation
+            and definition.layout is expected.layout
         )
     stored_arity = len(table.columns) + (2 if table.kind == "rel" else 0)
     return all(position < stored_arity for position in definition.positions)

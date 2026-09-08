@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
@@ -44,6 +45,7 @@ from okto_grafx.domain.index.catalog import (
 )
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.header import INDEX_HEADER_SLOT, IndexHeader
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.ids import MAX_PAGE_INDEX, MAX_SLOT_ID, NULL_REF, RecordRef
 from okto_grafx.domain.ledger.entry import (
@@ -121,6 +123,8 @@ from okto_grafx.domain.query.plan import (
     IndexSeek,
     LimitRows,
     MergePattern,
+    NodeMultiKeySeek,
+    OrderedNodeMerge,
     NodeScan,
     OptionalRows,
     PlanNode,
@@ -686,6 +690,11 @@ class IndexView:
         """Return the active physical generation's bucket count."""
         return self.definition.bucket_count
 
+    @property
+    def layout(self) -> IndexLayout:
+        """Return the durable physical organization selected by the catalog."""
+        return self.definition.layout
+
 
 @dataclass(frozen=True, slots=True)
 class IndexRegistryView:
@@ -1218,6 +1227,11 @@ def _index_definition(value: Any) -> IndexDefinition:
         ),
         artifact_nonce=_builtin_int(
             _domain_field(value, IndexDefinition, "artifact_nonce")
+        ),
+        layout=_string_enum(
+            _domain_field(value, IndexDefinition, "layout"),
+            IndexLayout,
+            field="index.layout",
         ),
     )
 
@@ -1785,11 +1799,26 @@ def _query_parameters_snapshot(
     marker = id(value)
     active = {marker}
     detached: dict[str, Value] = {}
-    for position, (raw_name, raw_value) in enumerate(
-        _bounded_mapping_pairs(value, limit=MAX_PARAMETERS, field="parameters")
-    ):
-        name = _builtin_text(
-            raw_name, field=f"parameters[{position}].name", empty=False
+    exact_parameters = type(value) is dict
+    pairs = (
+        dict.items(value)
+        if exact_parameters
+        else _bounded_mapping_pairs(value, limit=MAX_PARAMETERS, field="parameters")
+    )
+    for position, (raw_name, raw_value) in enumerate(pairs):
+        if position >= MAX_PARAMETERS:
+            raise GrafxConfigurationError(
+                f"The parameters mapping may hold at most {MAX_PARAMETERS} entries.",
+                field="parameters",
+                value=position + 1,
+                limit=MAX_PARAMETERS,
+            )
+        name = (
+            raw_name
+            if exact_parameters and type(raw_name) is str and raw_name
+            else _builtin_text(
+                raw_name, field=f"parameters[{position}].name", empty=False
+            )
         )
         if len(name) > MAX_NAME_CHARACTERS:
             raise GrafxConfigurationError(
@@ -1805,13 +1834,28 @@ def _query_parameters_snapshot(
                 value=name,
                 reason="duplicate",
             )
-        detached[name] = _query_value_snapshot(
-            raw_value,
-            field=f"parameters.{name}",
-            depth=0,
-            active=active,
-            max_string_characters=max_string_characters,
-        )
+        field = f"parameters.{name}"
+        raw_type = type(raw_value)
+        if exact_parameters and (raw_value is None or raw_type is bool):
+            detached[name] = raw_value
+        elif exact_parameters and raw_type is int:
+            detached[name] = _require_int64(raw_value, field=field)
+        elif exact_parameters and raw_type is float:
+            detached[name] = raw_value
+        elif exact_parameters and raw_type is str:
+            detached[name] = _require_text_length(
+                raw_value, field=field, limit=max_string_characters
+            )
+        elif exact_parameters and raw_type is bytes:
+            detached[name] = raw_value
+        else:
+            detached[name] = _query_value_snapshot(
+                raw_value,
+                field=field,
+                depth=0,
+                active=active,
+                max_string_characters=max_string_characters,
+            )
     return detached
 
 
@@ -2400,6 +2444,8 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
         IndexSeek,
         LimitRows,
         MergePattern,
+        NodeMultiKeySeek,
+        OrderedNodeMerge,
         NodeScan,
         OptionalRows,
         ProduceResults,
@@ -2481,7 +2527,10 @@ def _query_plan_view(
         raise _malformed_plan_error(failure) from failure
 
 
-def _query_owned_plan_door(value: object, memo: _OwnedPlanViewMemo) -> object:
+def _query_owned_plan_door(
+    value: object, memo: _OwnedPlanViewMemo,
+    guard_factory: Callable[[], AbstractContextManager[object]],
+) -> object:
     """Seal one proven internal root's clone recipe into a door for exactly one result.
 
     The door defers the clone until the result's plan is actually read, so a caller that only
@@ -2492,7 +2541,7 @@ def _query_owned_plan_door(value: object, memo: _OwnedPlanViewMemo) -> object:
     from okto_grafx.engine.query_engine import _OwnedPlanDoor
 
     try:
-        return _OwnedPlanDoor(_query_owned_plan_recipe(value, memo))
+        return _OwnedPlanDoor(_query_owned_plan_recipe(value, memo), guard_factory())
     except GrafxPlanError:
         raise
     except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
@@ -2955,6 +3004,7 @@ def _query_result_view(
     max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     internally_owned_plan: bool = False,
     plan_memo: _OwnedPlanViewMemo | None = None,
+    plan_guard_factory: Callable[[], AbstractContextManager[object]] | None = None,
 ) -> QueryResult:
     """Rebuild one result and normalize every malformed collaborator shape as a plan error."""
     try:
@@ -2963,6 +3013,7 @@ def _query_result_view(
             max_string_characters=max_string_characters,
             internally_owned_plan=internally_owned_plan,
             plan_memo=plan_memo,
+            plan_guard_factory=plan_guard_factory,
         )
     except GrafxPlanError:
         raise
@@ -2982,6 +3033,7 @@ def _query_result_snapshot(
     max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     internally_owned_plan: bool = False,
     plan_memo: _OwnedPlanViewMemo | None = None,
+    plan_guard_factory: Callable[[], AbstractContextManager[object]] | None = None,
 ) -> QueryResult:
     """Rebuild one fully materialised query result outside the page-access section."""
     # Local import avoids making the query engine depend on the public-view module that rebuilds
@@ -3061,7 +3113,13 @@ def _query_result_snapshot(
     elif internally_owned_plan and plan_memo is not None:
         # A root the exact engine proved it owns is sealed behind a door: the result carries the
         # compiled recipe and builds its own independent tree only if someone reads the plan.
-        plan = _query_owned_plan_door(raw_plan, plan_memo)
+        # A manually assembled serial engine without a guard factory retains
+        # eager detachment. Only the composition can create a synchronized door.
+        plan = (
+            _query_owned_plan_door(raw_plan, plan_memo, plan_guard_factory)
+            if plan_guard_factory is not None else
+            _query_plan_view(raw_plan, internally_owned=True, memo=plan_memo)
+        )
     else:
         # Everything else keeps the eager hostile rebuild: the tree is validated and detached
         # here, before the result exists, and no collaborator callable is ever kept.
@@ -4200,6 +4258,11 @@ def _catalog_index_definition(value: Any) -> CatalogIndexDefinition:
             _domain_field(value, CatalogIndexDefinition, "key_derivation"),
             field="index.key_derivation",
             empty=False,
+        ),
+        layout=_string_enum(
+            _domain_field(value, CatalogIndexDefinition, "layout"),
+            IndexLayout,
+            field="index.layout",
         ),
         automatic=_builtin_bool(
             _domain_field(value, CatalogIndexDefinition, "automatic")

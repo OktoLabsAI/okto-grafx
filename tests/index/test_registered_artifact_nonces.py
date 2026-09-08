@@ -94,6 +94,60 @@ def test_legacy_registered_definition_opens_header_for_its_nonce(
     assert calls == 1
 
 
+def test_legacy_nonce_inventory_lists_once_and_carries_presence_proof(
+    pool: BufferPool,
+    heap_store: HeapStore,
+    metrics: Any,
+    person_table: TableDef,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = IndexManager(pool, heap_store, metrics, artifact_nonce=lambda: 73)
+    first = manager.register(
+        HashIndex(
+            IndexDefinition.on(
+                person_table,
+                name="person_by_name",
+                columns=("name",),
+                visibility=IndexVisibility.EXACT,
+            ),
+            pool,
+            metrics,
+        )
+    )
+    second = manager.register(
+        HashIndex(
+            IndexDefinition.on(
+                person_table,
+                name="person_by_id",
+                columns=("id",),
+                visibility=IndexVisibility.EXACT,
+            ),
+            pool,
+            metrics,
+        )
+    )
+    listed = 0
+    proofs: list[tuple[str, bool]] = []
+    original_list = pool.storage.list_files
+    original_open = HashIndex.open
+
+    def counted_list(prefix: str = "") -> tuple[str, ...]:
+        nonlocal listed
+        listed += 1
+        return original_list(prefix)
+
+    def observed_open(self: HashIndex, *, proved_present: bool = False) -> object:
+        proofs.append((self.file, proved_present))
+        return original_open(self, proved_present=proved_present)
+
+    monkeypatch.setattr(pool.storage, "list_files", counted_list)
+    monkeypatch.setattr(HashIndex, "open", observed_open)
+
+    assert manager._registered_artifact_nonces() == frozenset({73})
+    assert listed == 1
+    assert proofs == sorted(((first.file, True), (second.file, True)))
+
+
 def test_legacy_header_refusal_remains_fail_closed(
     manager: IndexManager,
     pool: BufferPool,

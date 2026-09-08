@@ -1052,6 +1052,46 @@ def test_a_second_connect_cycle_replays_no_corpus_in_either_door(
     assert crc32c_implementation() == checksum_native.NATIVE_ADAPTER_NAME
 
 
+@pytest.mark.parametrize(
+    ("mode", "details"),
+    (
+        ("bool", {"field": "implementation", "result_type": "bool"}),
+        ("huge", {"field": "implementation", "produced": 1 << 40}),
+        ("raise", {"field": "crc32c", "cause": "RuntimeError"}),
+    ),
+)
+def test_the_collapsed_closed_provider_path_keeps_runtime_refusals(
+    mode: str,
+    details: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    forget_the_memo: None,
+    restore_the_reference: None,
+) -> None:
+    state = "correct"
+
+    def provider(crc: int, data: bytes) -> int:
+        if state == "bool":
+            return True
+        if state == "huge":
+            return 1 << 40
+        if state == "raise":
+            raise RuntimeError("late provider failure")
+        return crc32c_reference(data, crc)
+
+    module = _fake_google_module(provider)
+    with monkeypatch.context() as patch:
+        _install_fake_google(patch, module)
+        NativeCrc32c().install()
+        state = mode
+        with pytest.raises(GrafxConfigurationError) as raised:
+            crc32c(b"after-corpus", 7)
+
+    for field, expected in details.items():
+        assert raised.value.details[field] == expected
+    assert raised.value.details["length"] == len(b"after-corpus")
+    assert raised.value.details["seed"] == 7
+
+
 def test_replacing_the_provider_function_replays_both_doors_and_a_wrong_one_is_refused(
     monkeypatch: pytest.MonkeyPatch, forget_the_memo: None, restore_the_reference: None
 ) -> None:

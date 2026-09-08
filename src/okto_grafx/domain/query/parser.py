@@ -383,36 +383,49 @@ class _Parser:
 
         bucket_count: int | None = None
         expected_cardinality: int | None = None
+        layout: str | None = None
         if self._match_keyword("OPTIONS"):
             option_token = self._current
-            option = self._take_name("bucket_count or expected_cardinality")
+            option = self._take_name("bucket_count, expected_cardinality or layout")
             folded = option.lower()
             if option_token.quoted or folded not in {
                 "bucket_count",
                 "expected_cardinality",
+                "layout",
             }:
                 raise self._refuse(
-                    "An index sizing option is bucket_count or expected_cardinality; "
+                    "An index option is bucket_count, expected_cardinality or layout; "
                     f"got {option!r}",
                     field="option",
                     value=option,
                 )
             self._take_symbol("=")
-            token = self._current
-            if token.kind is not TokenKind.INTEGER:
-                raise self._unexpected("a positive integer sizing value")
-            self._advance()
-            value = int(token.value)
-            if value <= 0:
-                raise self._refuse(
-                    f"The {folded} option must be positive; got {value}",
-                    field=folded,
-                    value=value,
-                )
-            if folded == "bucket_count":
-                bucket_count = value
+            if folded == "layout":
+                value_token = self._current
+                if value_token.kind is not TokenKind.NAME or value_token.quoted:
+                    raise self._refuse(
+                        "An index layout is an unquoted layout name.",
+                        field="layout",
+                        value=value_token.text,
+                    )
+                value = self._take_name("the index layout")
+                layout = value
             else:
-                expected_cardinality = value
+                token = self._current
+                if token.kind is not TokenKind.INTEGER:
+                    raise self._unexpected("a positive integer sizing value")
+                self._advance()
+                value = int(token.value)
+                if value <= 0:
+                    raise self._refuse(
+                        f"The {folded} option must be positive; got {value}",
+                        field=folded,
+                        value=value,
+                    )
+                if folded == "bucket_count":
+                    bucket_count = value
+                else:
+                    expected_cardinality = value
 
         return CreateIndexStatement(
             name=name,
@@ -421,6 +434,7 @@ class _Parser:
             columns=tuple(columns),
             bucket_count=bucket_count,
             expected_cardinality=expected_cardinality,
+            layout=layout,
         )
 
     def _create_node_table(self) -> CreateNodeTableStatement:
@@ -536,6 +550,8 @@ class _Parser:
         return_clause: ReturnClause | None = None
         clauses = 0
         optional_root = False
+        read_order: list[str] = []
+        interleaved = False
         while (
             self._current.kind is not TokenKind.END
             and not self._at_symbol(";")
@@ -548,7 +564,7 @@ class _Parser:
                     field="clauses",
                     value=MAX_CLAUSES,
                 )
-            if optional_root and not self._at_keyword("RETURN"):
+            if optional_root and len(match_clauses) == 1 and not self._at_keyword("RETURN"):
                 # WHERE was already taken by the clause itself, so RETURN is the only word that
                 # may follow an OPTIONAL MATCH here. One guard answers every trailing clause at
                 # once -- a second MATCH, a WITH, an UNWIND, anything that writes -- and answers
@@ -568,25 +584,23 @@ class _Parser:
                 unwind_clause = self._unwind_clause()
                 continue
             if (
-                clauses == 1
-                and self._at_keyword("OPTIONAL")
+                self._at_keyword("OPTIONAL")
                 and self._at_keyword("MATCH", ahead=1)
             ):
-                # Deliberately the NARROWEST recognition that can read the admitted form: the
-                # word is only a keyword as the FIRST clause and only immediately before MATCH.
-                # Anything else -- OPTIONAL after a MATCH, a second OPTIONAL MATCH, OPTIONAL
-                # before some other word -- falls through to the clause dispatch below and earns
-                # exactly the refusal it earned before this milestone, down to the message. That
-                # matters beyond taste: the corpus records the error text of every refused probe,
-                # so a refusal reworded here would move objects this milestone must not touch.
+                # Root optional nodes and correlated one-hop optional expansions have
+                # distinct shape checks. Validate the latter once RETURN is available.
+                if updating_clauses or return_clause is not None or unwind_clause is not None:
+                    raise self._refuse("OPTIONAL MATCH must precede projection and writes", field="clause")
                 self._advance()
                 clause = self._match_clause(optional=True)
-                defect = optional_clause_defect(clause)
+                defect = optional_clause_defect(clause) if clauses == 1 else None
                 if defect is not None:
                     message, value = defect
                     raise self._refuse(message, field="pattern", value=value)
                 optional_root = True
                 match_clauses.append(clause)
+                read_order.append("match")
+                interleaved = interleaved or bool(with_clauses)
                 continue
             if self._at_keyword("MATCH"):
                 if with_clauses:
@@ -603,6 +617,7 @@ class _Parser:
                         value="MATCH",
                     )
                 match_clauses.append(self._match_clause())
+                read_order.append("match")
                 continue
             if return_clause is not None:
                 raise self._refuse(
@@ -629,6 +644,7 @@ class _Parser:
                         value="WITH",
                     )
                 with_clauses.append(self._with_clause())
+                read_order.append("with")
                 continue
             updating_clauses.append(self._updating_clause())
         if (
@@ -645,13 +661,25 @@ class _Parser:
                 field="clause",
                 value="RETURN",
             )
-        return Query(
+        query = Query(
             unwind_clause=unwind_clause,
             match_clauses=tuple(match_clauses),
             with_clauses=tuple(with_clauses),
             updating_clauses=tuple(updating_clauses),
             return_clause=return_clause,
+            read_clause_order=tuple(read_order) if interleaved else (),
         )
+        if any(c.optional for c in match_clauses) and len(match_clauses) > 1:
+            from okto_grafx.domain.query.analysis import correlated_optional_pipeline
+
+            if not correlated_optional_pipeline(query):
+                raise self._refuse(
+                    "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop",
+                    field="clause", value="OPTIONAL MATCH",
+                )
+        elif optional_root and (unwind_clause is not None or with_clauses):
+            raise self._refuse("An OPTIONAL MATCH cannot follow UNWIND or WITH", field="clause")
+        return query
 
     def _unwind_clause(self) -> UnwindClause:
         """Parse ``UNWIND <expression> AS <alias>``."""

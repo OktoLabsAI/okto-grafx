@@ -109,6 +109,31 @@ class _FreshPageWitness:
     page_index: PageIndex
     image: bytes
 
+
+def _page_count_if_present(
+    storage: StorageDevice, file: str, *, proved_present: bool = False
+) -> int | None:
+    """Return a file's page count, or ``None`` for one initially absent name.
+
+    ``page_count`` already performs the exact-name and descriptor proof needed to size a file.
+    Calling ``exists`` immediately before it repeats that namespace walk on the established-file
+    hot path. Its typed ``missing_file`` refusal and Python's exact ``FileNotFoundError`` adapter
+    signal are translated only when the caller has not supplied a preceding directory proof.
+    Every other storage/corruption failure, and a missing file after ``proved_present=True``,
+    remains fail-closed and byte-for-byte observable to the caller.
+    """
+    try:
+        return storage.page_count(file)
+    except GrafxCorruptionDetected as failure:
+        if proved_present or failure.details.get("reason") != "missing_file":
+            raise
+        return None
+    except FileNotFoundError:
+        if proved_present:
+            raise
+        return None
+
+
 BUFFER_BUDGET_USED_BYTES: str = "oktografx_buffer_budget_used_bytes"
 BUFFER_RETAINED_ESTIMATE_BYTES: str = "oktografx_buffer_retained_estimate_bytes"
 BUFFER_RETAINED_ESTIMATOR_VERSION: str = "python-v2"
@@ -529,6 +554,7 @@ class BufferPool:
         "_metrics",
         "_metrics_enabled",
         "_metrics_defer",
+        "_retained_sample_countdown",
         "_budget_bytes",
         "_db_label",
         "_guard",
@@ -578,6 +604,7 @@ class BufferPool:
         self._metrics: MetricsSink = metrics
         metrics_enabled = metrics.enabled
         self._metrics_enabled: bool = metrics_enabled
+        self._retained_sample_countdown: int = 0
         self._metrics_defer: Callable[[], AbstractContextManager[object]] | None = (
             metrics_defer if metrics_enabled else None
         )
@@ -1226,7 +1253,7 @@ class BufferPool:
             try:
                 page = self._read_page(file, page_index)
             except BaseException:
-                usage: tuple[float, float] | None = None
+                usage: tuple[float, float | None] | None = None
                 with self._guard:
                     if self._loads.get(key) is load:
                         del self._loads[key]
@@ -1246,7 +1273,7 @@ class BufferPool:
                         pass
                 raise
 
-            usage: tuple[float, float] | None = None
+            usage: tuple[float, float | None] | None = None
             retry = False
             with self._guard:
                 current = self._loads.get(key)
@@ -1299,6 +1326,23 @@ class BufferPool:
             if usage is not None:
                 self._emit_usage(usage)
             return page
+
+    @_guarded
+    def _resident_page_image(self, file: str, page_index: PageIndex) -> bytes | None:
+        """Capture a replay target without admission, eviction, pinning or write-back.
+
+        The native caller owns the participant/COMMIT fence. This is not a
+        freshness certificate: redo validates both this local image and storage.
+        Dirty doomed frames would have independent write-back authority, so refuse.
+        """
+        _require_page_index("page_index", page_index)
+        if any(frame.page.dirty for frame in self._doomed.get((file, page_index), ())):
+            raise GrafxUnsupportedOperation(
+                "Journal replay cannot certify a dirty detached target.",
+                field="redo_target_dirty", file=file, page=page_index,
+            )
+        frame = self._frames.get((file, page_index))
+        return None if frame is None else frame.page.to_bytes()
 
     def read_fresh_page(self, file: str, page_index: PageIndex) -> Page:
         """Read one detached page from the device, bypassing every resident frame.
@@ -2207,6 +2251,55 @@ class BufferPool:
         return True
 
     @_guarded
+    def replace_clean_page_without_read(
+        self, file: str, page_index: PageIndex, image: Page
+    ) -> None:
+        """Publish a complete non-header replacement without decoding the target first.
+
+        Dual-copy authority pages deliberately replace the older or damaged copy after the
+        other copy has selected the publication target.  Requiring a pin here would first decode
+        that disposable target and let one bad checksum prevent its repair.  This door keeps the
+        normal pool/page-write serialization, refuses local dirty authority, discards clean or
+        pinned-stale frames, and then uses the ordinary checksum/sequence publication path.
+
+        Page zero is excluded because its cross-process compare-and-swap requires the device
+        sequence carried by an owning frame.  Callers must already hold whatever higher-level
+        dual-authority fence proves that overwriting this non-header page is safe.
+        """
+
+        _require_page_index("page_index", page_index)
+        if not isinstance(image, Page):
+            raise GrafxCorruptionDetected(
+                "A blind page replacement needs a complete Page image.",
+                field="page",
+                value=type(image).__name__,
+                file=file,
+                page=page_index,
+            )
+        if page_index == HEADER_PAGE_INDEX:
+            raise GrafxUnsupportedOperation(
+                "Page 0 requires an owning frame for its sequence compare-and-swap.",
+                field="page_sequence_base",
+                file=file,
+                page=page_index,
+            )
+        if image.page_index != page_index:
+            raise GrafxCorruptionDetected(
+                "A blind page replacement was offered at a different physical index.",
+                field="page_index",
+                value=image.page_index,
+                expected=page_index,
+                file=file,
+                page=page_index,
+            )
+
+        self._wait_for_evictions(file, page_index)
+        self._wait_for_loads()
+        self.discard_clean_page(file, page_index)
+        self._publish_page(file, page_index, image, frame=None)
+        self._remember_write_back(file, page_index)
+
+    @_guarded
     def discard_clean_file(self, file: str) -> int:
         """Forget every clean frame of ``file`` without writing a byte.
 
@@ -2919,28 +3012,43 @@ class BufferPool:
                 del self._abandoned[file]
         self._refresh_dirty_candidate(key)
 
-    def _usage_reading(self) -> tuple[float, float] | None:
-        """Capture callback-free usage under the guard, or None when telemetry is disabled."""
+    def _usage_reading(self) -> tuple[float, float | None] | None:
+        """Capture nominal usage and, when due, a fresh retained-memory sample.
+
+        A full retained-object walk for every new frame makes cold admission
+        quadratic with metrics enabled. Amortize that diagnostic over topology
+        reports proportional to its last retained size in page equivalents.
+        No clock/host callback or cached authority enters this decision. Explicit
+        retained_bytes_estimate() remains an unconditional current-state walk.
+        """
 
         if not self._metrics_active():
             return None
-        return (float(self.used_bytes()), float(self._retained_bytes_estimate()))
+        used = self.used_bytes()
+        if self._retained_sample_countdown > 0:
+            self._retained_sample_countdown -= 1
+            # Do not re-emit a cached estimate as though it were freshly sampled.
+            return (float(used), None)
+        retained = self._retained_bytes_estimate()
+        self._retained_sample_countdown = max(1, retained // self._page_size) - 1
+        return (float(used), float(retained))
 
     def _metrics_active(self) -> bool:
         """Honor a sink switched off after assembly without enabling an unsafe late opt-in."""
 
         return self._metrics_enabled and self._metrics.enabled
 
-    def _emit_usage(self, reading: tuple[float, float]) -> None:
+    def _emit_usage(self, reading: tuple[float, float | None]) -> None:
         """Emit a previously captured usage pair; callers hold no pool guard."""
 
         used, retained = reading
         self._metrics.set_gauge(BUFFER_BUDGET_USED_BYTES, used, self._labels)
-        self._metrics.set_gauge(
-            BUFFER_RETAINED_ESTIMATE_BYTES,
-            retained,
-            self._retained_labels,
-        )
+        if retained is not None:
+            self._metrics.set_gauge(
+                BUFFER_RETAINED_ESTIMATE_BYTES,
+                retained,
+                self._retained_labels,
+            )
 
     def _report_usage(self) -> None:
         """Publish the resident bytes of this database under its own label."""
@@ -3009,7 +3117,12 @@ def _require_reserved_header_page(pool: BufferPool, file: str) -> None:
     takes the file header with it. A file that exists and holds nothing at all is the one case
     where an allocation reaches it, so it is closed before anything is touched.
     """
-    if pool.storage.exists(file) and pool.storage.page_count(file) == 0:
+    present = _page_count_if_present(pool.storage, file)
+    # Some deliberately narrow test/storage collaborators represent an absent file as a zero
+    # page count instead of the production adapter's typed missing_file refusal.  Pay exists only
+    # on that cold ambiguous boundary; populated files take the single page_count proof.
+    zero_length_file = present == 0 and pool.storage.exists(file)
+    if zero_length_file:
         raise GrafxCorruptionDetected(
             f"The file {file!r} has no reserved header page, so the first page a chain "
             f"allocated would be page {HEADER_PAGE_INDEX}.",

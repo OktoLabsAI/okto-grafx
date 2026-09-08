@@ -13,11 +13,13 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from struct import Struct
+from types import MappingProxyType
 
 import pytest
 
 from okto_grafx.domain.page import MAX_PAGE_SIZE, PAGE_HEADER_SIZE, SLOT_ENTRY_SIZE, Page
 from okto_grafx.domain.page import slotted as slotted_page
+from okto_grafx.domain.page import checksum as checksum_module
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
@@ -79,6 +81,12 @@ def test_no_module_of_the_storage_core_binds_a_mutable_container(path: Path) -> 
             assert node.value.func.id not in {"list", "dict", "set", "bytearray"}, (
                 f"{path.name} builds the mutable container {names} at module level"
             )
+
+
+def test_closed_checksum_provider_conventions_are_immutable_format_only_data() -> None:
+    conventions = checksum_module._CLOSED_PROVIDER_CRC_FIRST
+    assert isinstance(conventions, MappingProxyType)
+    assert conventions == {("google_crc32c", "extend"): True, ("crc32c", "crc32c"): False}
 
 
 def test_the_only_format_memo_is_bounded_and_contains_no_database_identity() -> None:

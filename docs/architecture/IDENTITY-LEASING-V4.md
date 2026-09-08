@@ -840,4 +840,3 @@ Cada slice é no mínimo um commit atômico, suite-green e sem squash posterior.
 
 Nenhum slice de reservation ou consumer depende de comportamento ainda não provado de
 recovery/checkpoint/OCC.
-

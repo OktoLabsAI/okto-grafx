@@ -596,23 +596,12 @@ def untyped_one_hop_source(query: Query) -> NodePattern | None:
     return source
 
 
-_PATH_PROJECTION_NAME = "path"
-_PATH_PROJECTION_SOURCE = "a"
-_PATH_PROJECTION_RELATIONSHIP = "r"
-_PATH_PROJECTION_TARGET = "b"
-_PATH_PROJECTION_NODE_LABEL = "Decision"
-_PATH_PROJECTION_RELATIONSHIP_TYPE = "supersedes"
-"""Every identifier fixed by the one path projection this subset reads."""
-
-
 def _is_literal_row_count(value: object) -> bool:
     """True for a row count written as a literal non-negative integer, else False.
 
-    A LIMIT is admitted on this one projection because the row bound is the only
-    thing about it a caller may vary, and because refusing it made the projection
-    unreachable in practice: a client that appends ``LIMIT`` to every read -- as
-    Pulse Tier Power does whenever the caller wrote none -- could never send the
-    one statement this subset admits.
+    A literal LIMIT bounds this closed projection for clients that append a
+    ceiling to every graph read. Schema identifiers and aliases may vary; the
+    remaining clause shape stays fixed.
 
     Everything else stays out. A parameter or an arithmetic expression is not a
     number until something evaluates it, and a bound this recogniser cannot read
@@ -628,14 +617,15 @@ def _is_literal_row_count(value: object) -> bool:
 
 
 def exact_path_projection(query: Query) -> PatternPath | None:
-    """Return the path when ``query`` is the one literal path projection, else None.
+    """Return the path when ``query`` is a typed one-hop path projection, else None.
 
-    The admitted statement is exactly ``MATCH path = (a:Decision)-[r:supersedes]->``
-    ``(b:Decision) RETURN path`` at the AST boundary, optionally followed by ``LIMIT`` and a
+    The admitted shape is ``MATCH path = (a:Label)-[r:Type]->``
+    ``(b:Label) RETURN path`` at the AST boundary, optionally followed by ``LIMIT`` and a
     literal non-negative integer.  Lexical trivia the parser discards --
     whitespace, keyword case and a trailing semicolon -- is deliberately not reconstructed.
     Every semantic field, class, container, flag and identifier is checked exactly so a tree a
-    caller built cannot turn this one measured query into a family of unmeasured path reads.
+    caller built cannot widen it into ranges, arbitrary joins or path expressions.
+    Names and schema identifiers are caller-defined; catalog binding proves both endpoints.
 
     This recognises and never refuses.  A miss reaches the pre-existing named-path refusal, which
     preserves the error surface for every other reading of a path name.
@@ -661,7 +651,7 @@ def exact_path_projection(query: Query) -> PatternPath | None:
     pattern = clause.patterns[0]
     if type(pattern) is not PatternPath:
         return None
-    if type(pattern.variable) is not str or pattern.variable != _PATH_PROJECTION_NAME:
+    if not _is_written_path_name(pattern.variable):
         return None
     if type(pattern.nodes) is not tuple or len(pattern.nodes) != 2:
         return None
@@ -673,29 +663,22 @@ def exact_path_projection(query: Query) -> PatternPath | None:
         return None
     if type(hop) is not RelationshipPattern:
         return None
-    for node, variable in (
-        (source, _PATH_PROJECTION_SOURCE),
-        (target, _PATH_PROJECTION_TARGET),
-    ):
-        if type(node.variable) is not str or node.variable != variable:
+    for node in (source, target):
+        if not _is_written_path_name(node.variable):
             return None
         if type(node.labels) is not tuple or len(node.labels) != 1:
             return None
-        if (
-            type(node.labels[0]) is not str
-            or node.labels[0] != _PATH_PROJECTION_NODE_LABEL
-        ):
+        if not _is_written_path_name(node.labels[0]):
             return None
         if node.properties is not None:
             return None
-    if type(hop.variable) is not str or hop.variable != _PATH_PROJECTION_RELATIONSHIP:
+    if not _is_written_path_name(hop.variable):
         return None
     if type(hop.types) is not tuple or len(hop.types) != 1:
         return None
-    if (
-        type(hop.types[0]) is not str
-        or hop.types[0] != _PATH_PROJECTION_RELATIONSHIP_TYPE
-    ):
+    if not _is_written_path_name(hop.types[0]):
+        return None
+    if len({pattern.variable, source.variable, target.variable, hop.variable}) != 4:
         return None
     if hop.direction is not Direction.OUTGOING or hop.properties is not None:
         return None
@@ -724,19 +707,52 @@ def exact_path_projection(query: Query) -> PatternPath | None:
     expression = item.expression
     if type(expression) is not Variable or type(expression.name) is not str:
         return None
-    if expression.name != _PATH_PROJECTION_NAME:
+    if expression.name != pattern.variable:
         return None
     return pattern
 
 
-def optional_match_refusal(query: Query) -> tuple[str, str] | None:
-    """Return the refusal an OPTIONAL MATCH earns outside the one admitted shape, or None.
+def correlated_optional_hop(query: Query) -> PatternPath | None:
+    """Recognize a labelled node followed by a correlated, single optional hop.
 
-    The admitted shape is narrow on purpose: the first and only clause of a read-only query,
-    one pattern, one named node, one label, no inline map. Everything a wider OPTIONAL MATCH
-    would need -- a null-extended traversal, a second clause deciding what "no match" means for
-    names bound above it -- is a different milestone, and answering those forms half-way would
-    be worse than refusing them.
+    Names, labels, direction, projection and row windows are caller-defined.
+    Wider optional joins remain refused until they have execution semantics.
+    """
+    if (len(query.match_clauses) != 2 or query.unwind_clause is not None
+            or query.with_clauses or query.updating_clauses or query.return_clause is None):
+        return None
+    root, optional = query.match_clauses
+    if root.optional is not False or optional.optional is not True:
+        return None
+    if len(root.patterns) != 1 or len(optional.patterns) != 1:
+        return None
+    base, hop = root.patterns[0], optional.patterns[0]
+    if (base.variable is not None or base.relationships or len(base.nodes) != 1
+            or hop.variable is not None or len(hop.nodes) != 2 or len(hop.relationships) != 1):
+        return None
+    anchor = base.nodes[0]
+    source, target = hop.nodes
+    edge = hop.relationships[0]
+    if (not anchor.variable or len(anchor.labels) != 1
+            or source.variable != anchor.variable
+            or source.labels not in ((), anchor.labels)
+            or source.properties is not None or target.properties is not None
+            or len(target.labels) > 1 or len(edge.types) > 1
+            or edge.properties is not None or edge.hop_range_written
+            or edge.min_hops != 1 or edge.max_hops != 1
+            or type(edge.direction) is not Direction):
+        return None
+    names = [name for name in (anchor.variable, target.variable, edge.variable) if name]
+    if len(names) != len(set(names)):
+        return None
+    return hop
+
+
+def optional_match_refusal(query: Query) -> tuple[str, str] | None:
+    """Refuse OPTIONAL MATCH outside the root-node and correlated single-hop forms.
+
+    Root-node optional queries extend an empty scan once. Correlated optional hops extend each
+    unmatched anchor separately, after the optional predicate. Wider joins remain refused.
 
     Asked at both doors, and for EVERY query rather than only the ones the parser marked. A tree
     built by hand reaches ``analyze`` and a caller's own analysis reaches ``build_plan``, and the
@@ -747,6 +763,14 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
     asked to render itself while the refusal was being built, and a refusal that raises reports
     nothing at all.
     """
+    order = query.read_clause_order
+    if type(order) is not tuple or any(type(kind) is not str or kind not in ("match", "with") for kind in order):
+        return "A reading pipeline records only MATCH and WITH clause kinds.", "clause"
+    if order and (order.count("match") != len(query.match_clauses)
+                  or order.count("with") != len(query.with_clauses)):
+        return "A reading pipeline must include each MATCH and WITH exactly once.", "clause"
+    if order and not correlated_optional_pipeline(query):
+        return "Interleaved projections require correlated optional incident reads.", "clause"
     for clause in query.match_clauses:
         if type(clause.optional) is not bool:
             return (
@@ -756,10 +780,11 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
     optional = [clause for clause in query.match_clauses if clause.optional]
     if not optional:
         return None
+    if correlated_optional_pipeline(query):
+        return None
     if len(query.match_clauses) != 1:
         return (
-            "An OPTIONAL MATCH is the only pattern clause of a query in this subset; it may "
-            "not be chained with another MATCH.",
+            "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop.",
             "clause",
         )
     if query.unwind_clause is not None or query.with_clauses or query.updating_clauses:
@@ -777,6 +802,26 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
             "clause",
         )
     return optional_clause_defect(optional[0])
+
+
+def correlated_optional_pipeline(query: Query) -> bool:
+    """Admit bounded incident hops with explicit projection barriers, not arbitrary joins.
+
+    Each hop expands the original labelled anchor. WITH may aggregate each hop
+    before the next expansion, avoiding accidental degree Cartesian products.
+    Ordinary binding analysis separately enforces projection scope and aliases.
+    """
+    if (len(query.match_clauses) < 2 or query.unwind_clause is not None
+            or query.updating_clauses or query.return_clause is None):
+        return False
+    root = query.match_clauses[0]
+    for optional in query.match_clauses[1:]:
+        probe = Query(match_clauses=(root, optional), return_clause=query.return_clause)
+        if correlated_optional_hop(probe) is None:
+            return False
+    # A root scan cannot be postponed until after a projection. Ordinary MATCH
+    # after WITH is deliberately still outside this bounded extension.
+    return not query.read_clause_order or query.read_clause_order[0] == "match"
 
 
 def named_path(query: Query) -> PatternPath | None:
@@ -1033,13 +1078,27 @@ class _Analyzer:
             )
         if self._query.unwind_clause is not None:
             self._unwind_clause(self._query.unwind_clause)
-        for clause in self._query.match_clauses:
-            self._match_clause(clause)
-        for clause in self._query.with_clauses:
-            self._with_clause(clause)
+        for clause in self._query.ordered_read_clauses():
+            if isinstance(clause, MatchClause):
+                if clause.optional and len(self._query.match_clauses) > 1:
+                    source = clause.patterns[0].nodes[0].variable
+                    self._require_bound(source, "a correlated OPTIONAL MATCH")
+                    for name in (clause.patterns[0].nodes[1].variable,
+                                 clause.patterns[0].relationships[0].variable):
+                        if name and (self._binding(name) is not None or name in self._discarded):
+                            raise self._refuse("An optional incident hop introduces fresh endpoint and relationship names.", field="variable", value=name)
+                self._match_clause(clause)
+            else:
+                self._with_clause(clause)
         for clause in self._query.updating_clauses:
             self._updating_clause(clause)
         grouping, aggregations = self._return_clause()
+        if (self._similarity is not None and self._query.with_clauses
+                and any(clause.optional for clause in self._query.match_clauses)):
+            raise self._refuse(
+                "Vector search cannot cross interleaved optional projection barriers.",
+                field="function", value="similarity",
+            )
         return QueryAnalysis(
             statement=self._query,
             bindings=tuple(self._bindings),
@@ -1327,9 +1386,8 @@ class _Analyzer:
                 value=expression.describe(),
             )
         self._check_expression(expression, where="a WITH item")
-        # A stage projects the row it received one row at a time, so there is no group here for
-        # an aggregate to summarise; WITH count(n) is a different clause from the one this is.
-        self._refuse_aggregate(expression, "WITH")
+        # Aggregate calls are validated by _check_expression, exactly as in RETURN.
+        # The planner inserts the same budgeted grouping operator before WITH.
         self._refuse_shadowed_alias(item)
         return Binding(
             name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False

@@ -8,6 +8,7 @@ then barriers that file; a concurrent reader can always fall back to the other v
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import struct
 
@@ -33,6 +34,7 @@ __all__ = [
     "CONTROL_SLOT_PAGES",
     "ControlRecordKind",
     "ControlRecordRead",
+    "ControlRecordReader",
     "TwoSlotControlRecordStore",
 ]
 
@@ -43,6 +45,9 @@ CONTROL_SLOT_FORMAT_VERSION: int = 1
 CONTROL_HEADER_MAGIC: bytes = b"OKTOCTRL"
 CONTROL_SLOT_MAGIC: bytes = b"OKTOSLOT"
 CONTROL_READ_ATTEMPTS: int = 4
+
+ControlRecordReader = Callable[[StorageDevice, str, int, int], bytes | None]
+"""Injected storage read operation; adapter capability selection is not domain policy."""
 
 _HEADER_BODY = struct.Struct("<8sHHI16sQQ16s")
 _HEADER_CRC = struct.Struct("<I")
@@ -85,21 +90,7 @@ class _Slot:
 def _read_log_if_exists(
     storage: StorageDevice, file: str, offset: int, length: int
 ) -> bytes | None:
-    """Use an explicitly declared fused read, or preserve the literal port fallback.
-
-    Adapter-only capabilities are opt-in by concrete type. Looking in the type dictionary is
-    deliberate: a generic wrapper that forwards unknown attributes through ``__getattr__`` has
-    not proved that it preserves the fused operation's identity semantics. Such a wrapper keeps
-    the ordinary ``exists`` then ``read_log`` sequence, including any missing-file refusal from
-    the second door.
-    """
-    implementation = vars(type(storage)).get("read_log_if_exists")
-    if callable(implementation):
-        # Resolve the now-proved method through the instance so adapter-local instrumentation
-        # wrappers remain effective. The type-dictionary gate above is what prevents an
-        # unrelated ``__getattr__`` from advertising the capability.
-        fused_read = getattr(storage, "read_log_if_exists")
-        return fused_read(file, offset, length)
+    """Read through the literal storage port without discovering adapter capabilities."""
     if not storage.exists(file):
         return None
     return storage.read_log(file, offset, length)
@@ -398,6 +389,7 @@ class TwoSlotControlRecordStore:
         "_file_nonce",
         "_kind",
         "_last_seen",
+        "_read_if_exists",
         "_storage",
         "_temporary",
     )
@@ -411,9 +403,24 @@ class TwoSlotControlRecordStore:
         database_uuid: bytes,
         file_nonce: int,
         temporary: str,
+        read_if_exists: ControlRecordReader | None = None,
     ) -> None:
-        """Bind one file and its bootstrap nonce without creating or reading it."""
+        """Bind one file and its bootstrap nonce without creating or reading it.
+
+        The composition may supply a read operation which selects a proved
+        adapter fused read. Without it, use only exists/read_log from the
+        storage port. This store never discovers adapter-only capabilities.
+        """
         self._storage = storage
+        if read_if_exists is not None and not callable(read_if_exists):
+            raise GrafxConfigurationError(
+                "Control read_if_exists must be callable when supplied.",
+                field="read_if_exists",
+                value=type(read_if_exists).__name__,
+            )
+        self._read_if_exists = (
+            _read_log_if_exists if read_if_exists is None else read_if_exists
+        )
         self._file = file
         self._kind = _require_kind(record_kind)
         self._database_uuid = _require_database_uuid(database_uuid)
@@ -679,7 +686,7 @@ class TwoSlotControlRecordStore:
         """
         storage = self._storage
         expected_size = CONTROL_FILE_PAGES * storage.page_size
-        observed = _read_log_if_exists(storage, self._file, 0, expected_size + 1)
+        observed = self._read_if_exists(storage, self._file, 0, expected_size + 1)
         if observed is None:
             return None
         image = bytes(observed)
