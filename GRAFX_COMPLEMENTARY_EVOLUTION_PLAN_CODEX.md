@@ -3,6 +3,13 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / 2026-09-08:** codec do registro persistente e decoder dos metadados
+implementados/validados na mesma branch `feature/gx-cap-1`: 379 testes verdes,
+incluindo 3.000 entradas modificadas; tipagem estrita/Ruff verdes. O contrato
+`docs/architecture/COMMIT_CATALOG_V1.md` define encoding e gates de crash, mas o
+storage paginado, ativação e integração commit/recovery continuam pendentes.
+Nenhum formato foi ativado no Pulse; nenhuma spec adicional foi consolidada.
+
 **GX-CAP-1 / 2026-09-08:** primeiro slice de domínio implementado em
 `feature/gx-cap-1`: CommitId qualificado, admissão limitada/imutável de metadados
 e cálculo puro de tempo lógico. 985 testes agrupados passaram, incluindo 87

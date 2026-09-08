@@ -10,7 +10,7 @@ The [main evolution plan](../../EVOLUTION_PLAN_CODEX.md) governs their interacti
 | Milestone | Specification | Implementation status |
 |---|---|---|
 | GX-CAP-0 | [Boundaries/contracts](SPEC-GX-CAP-0.md) | Enforcement and contract checkpoint |
-| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | CAP-1A admission implemented; persistent/public capability pending |
+| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | Admission and record codec implemented; paged store/publication pending |
 | GX-CAP-2 | [Catalog sessions and workspace scopes](SPEC-GX-CAP-2.md) | Not certified; contract routing only |
 | GX-CAP-3 | [Temporal system time](SPEC-GX-CAP-3.md) | Not certified; contract routing only |
 | GX-CAP-4 | [Valid time, bitemporal queries and graph diff](SPEC-GX-CAP-4.md) | Not certified; contract routing only |

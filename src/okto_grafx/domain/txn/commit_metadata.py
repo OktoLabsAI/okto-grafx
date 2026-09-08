@@ -1,7 +1,7 @@
 """Bounded, immutable commit metadata admission (GX-CAP-1A).
 
-Canonical bytes are a private admission/equality representation, NOT a durable
-page or WAL format. No public begin option is exposed until publication/recovery
+Canonical bytes also define the nested v1 body in COMMIT_CATALOG_V1.md. No page,
+WAL type, activation or public begin option is exposed until publication/recovery
 and lookup can persist these values atomically with a logical commit.
 """
 
@@ -13,7 +13,10 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Mapping, TypeAlias, cast
 
-from okto_grafx.domain.errors import GrafxConfigurationError, GrafxTransactionBudgetExceeded
+from okto_grafx.domain.errors import (
+    GrafxConfigurationError, GrafxCorruptionDetected, GrafxSchemaVersionMismatch,
+    GrafxTransactionBudgetExceeded,
+)
 
 MetadataValue: TypeAlias = (
     bool | int | float | str | None | tuple["MetadataValue", ...] | Mapping[str, "MetadataValue"]
@@ -21,6 +24,12 @@ MetadataValue: TypeAlias = (
 _U32 = struct.Struct("<I")
 _INT = struct.Struct("<q")
 _DOUBLE = struct.Struct("<d")
+MAX_METADATA_BYTES = 65_536
+_LIMIT_RANGES = (
+    ("max_bytes", 14, MAX_METADATA_BYTES), ("max_attributes", 0, 256),
+    ("max_key_bytes", 1, 1_024), ("max_string_bytes", 1, 16_384),
+    ("max_depth", 0, 16), ("max_values", 1, 4_096),
+)
 
 
 def _invalid(field: str, reason: str) -> GrafxConfigurationError:
@@ -47,11 +56,7 @@ class MetadataLimits:
     max_values: int = 256
 
     def __post_init__(self) -> None:
-        for name, low, high in (
-            ("max_bytes", 14, 65_536), ("max_attributes", 0, 256),
-            ("max_key_bytes", 1, 1_024), ("max_string_bytes", 1, 16_384),
-            ("max_depth", 0, 16), ("max_values", 1, 4_096),
-        ):
+        for name, low, high in _LIMIT_RANGES:
             value = getattr(self, name)
             if type(value) is not int or not low <= value <= high:
                 raise _invalid(name, "invalid_limit")
@@ -205,7 +210,7 @@ class CommitMetadata:
 
     @property
     def canonical_bytes(self) -> bytes:
-        """Private admission bytes, not an on-disk encoding compatibility promise."""
+        """Canonical admission bytes and commit-catalog nested metadata body v1."""
         return self._canonical
 
     def __eq__(self, other: object) -> bool:
@@ -218,3 +223,136 @@ class CommitMetadata:
 
     def __repr__(self) -> str:
         return f"CommitMetadata(encoded_bytes={len(self._canonical)}, attributes={len(self.attributes)})"
+
+
+def _corrupt(field: str, offset: int, reason: str) -> GrafxCorruptionDetected:
+    return GrafxCorruptionDetected(
+        "Invalid encoded commit metadata.", component="commit_metadata",
+        field=field, offset=offset, reason=reason,
+    )
+
+
+class _MetadataReader:
+    """Closed bounded decoder; no pickle, object hooks or implicit scalar coercion."""
+
+    __slots__ = ("raw", "offset", "limits", "values")
+
+    def __init__(self, raw: bytes, limits: MetadataLimits) -> None:
+        self.raw = raw
+        self.offset = 5
+        self.limits = limits
+        self.values = 0
+
+    def take(self, count: int, field: str) -> bytes:
+        if count > len(self.raw) - self.offset:
+            raise _corrupt(field, self.offset, "truncated")
+        start = self.offset
+        self.offset += count
+        return self.raw[start:self.offset]
+
+    def count(self, field: str) -> int:
+        return int.from_bytes(self.take(4, field), "little")
+
+    def text(self, *, key: bool = False) -> str:
+        size = self.count("string_length")
+        ceiling = self.limits.max_key_bytes if key else self.limits.max_string_bytes
+        if size > ceiling:
+            raise _corrupt("key" if key else "string", self.offset, "format_limit")
+        offset = self.offset
+        raw = self.take(size, "string")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _corrupt("string", offset, "invalid_utf8") from None
+
+    def optional_field(self) -> str | None:
+        tag = self.take(1, "field_tag")
+        if tag == b"n":
+            return None
+        if tag == b"s":
+            return self.text()
+        raise _corrupt("field_tag", self.offset - 1, "expected_optional_text")
+
+    def value(self, depth: int = 0) -> object:
+        self.values += 1
+        if self.values > self.limits.max_values:
+            raise _corrupt("values", self.offset, "format_limit")
+        tag = self.take(1, "value_tag")
+        if tag == b"n":
+            return None
+        if tag == b"f":
+            return False
+        if tag == b"t":
+            return True
+        if tag == b"i":
+            return int.from_bytes(self.take(8, "integer"), "little", signed=True)
+        if tag == b"d":
+            real = float(_DOUBLE.unpack(self.take(8, "float"))[0])
+            if not isfinite(real):
+                raise _corrupt("float", self.offset - 8, "nonfinite_float")
+            return real
+        if tag == b"s":
+            return self.text()
+        if tag not in (b"a", b"m"):
+            raise _corrupt("value_tag", self.offset - 1, "unknown_tag")
+        if depth > self.limits.max_depth:
+            raise _corrupt("depth", self.offset - 1, "format_limit")
+        count = self.count("container_count")
+        if count > self.limits.max_values - self.values:
+            raise _corrupt("values", self.offset, "format_limit")
+        # Each child takes at least one byte (maps need more). Refuse a forged
+        # count before allocating a list or entering a potentially long loop.
+        if count > len(self.raw) - self.offset:
+            raise _corrupt("container_count", self.offset, "truncated")
+        if tag == b"a":
+            return [self.value(depth + 1) for _ in range(count)]
+        if count > self.limits.max_attributes:
+            raise _corrupt("attributes", self.offset, "format_limit")
+        result: dict[str, object] = {}
+        previous: str | None = None
+        for _ in range(count):
+            if self.take(1, "key_tag") != b"s":
+                raise _corrupt("key_tag", self.offset - 1, "expected_string")
+            key = self.text(key=True)
+            if previous is not None and key <= previous:
+                raise _corrupt("key_order", self.offset, "not_strictly_increasing")
+            previous = key
+            result[key] = self.value(depth + 1)
+        return result
+
+
+def decode_commit_metadata(raw: bytes) -> CommitMetadata:
+    """Decode the complete v1 body using format ceilings, never local write defaults.
+
+    This validates values, not physical authority, a checksum or publication.
+    The enclosing journal/page/recovery layer must supply those separate proofs.
+    """
+    if type(raw) is not bytes:
+        raise _invalid("encoded_metadata", "expected_bytes")
+    if len(raw) < 5 or len(raw) > MAX_METADATA_BYTES:
+        raise _corrupt("size", 0, "format_limit")
+    if raw[:4] != b"GXCM":
+        raise _corrupt("magic", 0, "invalid_magic")
+    if raw[4] != 1:
+        raise GrafxSchemaVersionMismatch(
+            "Unsupported commit metadata encoding version.",
+            component="commit_metadata", field="version", version=raw[4],
+        )
+    limits = MetadataLimits(**{name: high for name, _low, high in _LIMIT_RANGES})
+    reader = _MetadataReader(raw, limits)
+    actor, origin, correlation, reason = (reader.optional_field() for _ in range(4))
+    attributes = reader.value()
+    if type(attributes) is not dict:
+        raise _corrupt("attributes", reader.offset, "expected_map")
+    if reader.offset != len(raw):
+        raise _corrupt("trailing", reader.offset, "trailing_bytes")
+    try:
+        metadata = CommitMetadata(
+            actor=actor, origin=origin, correlation_id=correlation, reason=reason,
+            attributes=cast(dict[str, object], attributes), limits=limits,
+        )
+    except (GrafxConfigurationError, GrafxTransactionBudgetExceeded):
+        raise _corrupt("metadata", 0, "invalid_value") from None
+    if metadata.canonical_bytes != raw:
+        raise _corrupt("metadata", 0, "noncanonical_encoding")
+    return metadata

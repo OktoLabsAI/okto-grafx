@@ -1,6 +1,7 @@
 # SPEC-GX-CAP-1 — Commit identity and provenance
 
 Status: CAP-1A domain admission implemented and validated; persistent/public capability not certified.
+CAP-1B record codec is also implemented; paged store/publication/recovery wiring is pending.
 Date: 2026-09-08. Branch: feature/gx-cap-1, based on c310675.
 Dependencies: M1 typed API; GX-CAP-0.
 
@@ -102,8 +103,10 @@ MetadataLimits are immutable and caller-configurable within hard admission bound
 The internal canonical admission representation is tagged and length-delimited,
 with a five-byte discriminator, four optional fields, then the attributes map.
 It permits deterministic byte-budget accounting without calling an external
-serializer. It is **not** a frozen on-disk format or WAL extension; no durable
-reader/decoder is introduced before the persistent crash protocol is specified.
+serializer. At CAP-1A this was not a frozen on-disk format or WAL extension. The
+subsequent CAP-1B [record/recovery contract](../architecture/COMMIT_CATALOG_V1.md)
+selects it as the nested metadata v1 body and adds a strict bounded decoder. No
+paged store, WAL grammar or activation is enabled before complete replay support.
 
 Invalid types/encoding/shape/identity/time/limits use GrafxConfigurationError;
 exhaustion of metadata admission budgets uses
@@ -165,3 +168,27 @@ Only after the persistent catalog/replay/lookup is usable may the facade export
 CommitId/CommitMetadata and accept metadata at begin. CAP-1C still owes metrics,
 verify, logical transfer and the complete concurrent/crash/release conformance.
 The full GX-CAP-1 remains **in progress**, not complete.
+
+### CAP-1B record codec checkpoint — 2026-09-08
+
+Implemented typed CommitCatalogEntry/CommitKind, checksummed record encoding,
+bounded nested metadata decoding, expected store/sequence validation and explicit
+unknown-format refusal. The format contract and required crash matrix are in
+[COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md). They distinguish a
+verified record value from evidence of durable publication.
+
+Final command:
+
+```text
+python -m pytest tests/txn/test_commit_catalog_record.py
+  tests/txn/test_commit_provenance_values.py tests/test_import_boundary.py
+  tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**379 passed in 7.82 s**, including 3,000 bounded mutated inputs and the maximum
+65,596-byte record. Strict mypy passes identity/metadata/catalog modules; Ruff/diff
+pass. This extends CAP-1A's admission contract; it is not a rerun or replacement of
+that checkpoint's 985-test transaction group. Paged directory/record storage,
+required-capability/WAL discrimination, commit/recovery integration, lookup/verify,
+metrics and transfer are still required. No public export, live mutation or deploy.
