@@ -57,6 +57,7 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
         "enum",
         "functools",
         "hashlib",
+        "heapq",
         "itertools",
         "math",
         "struct",
@@ -70,6 +71,10 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
 ``bisect`` is an algorithm over a list the caller already holds -- no clock, no randomness,
 no device, no platform -- and the WALs LSN index rests on it (D5 item 1); it is pure in
 exactly the sense ``math`` and ``itertools`` are.
+
+``heapq`` has the same boundary: deterministic heap algorithms over caller-owned
+lists. It supplies no locks, clock, process state or I/O. HNSW and ordered query
+frontiers use heappush/heappop without changing vector scores or tie-breaking.
 
 ``types.MappingProxyType`` gives derived domain lookup tables an immutable, O(1) view without
 introducing I/O, time, randomness or a dependency on a mechanism layer.  The module is therefore
@@ -367,7 +372,10 @@ def test_the_gate_actually_sees_the_pure_core() -> None:
 def test_the_allowlist_excludes_the_modules_the_contract_forbids() -> None:
     # G2b and A5: randomness in the domain comes from domain.rand.SplitMix64, never from
     # random or from uuid4; time comes from the Clock port, never from time.
-    for module in ("random", "uuid", "time", "os", "sys", "pathlib", "threading", "numpy"):
+    for module in (
+        "random", "uuid", "time", "os", "sys", "pathlib", "threading", "numpy",
+        "_thread", "contextvars", "weakref", "inspect",
+    ):
         assert module not in ALLOWED_STDLIB_MODULES
 
 
@@ -417,6 +425,9 @@ VIOLATING_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("from os import fsync", DOMAIN_MODULE, "from os import fsync\n"),
     ("import sys", DOMAIN_MODULE, "import sys\n"),
     ("import threading", DOMAIN_MODULE, "import threading\n"),
+    ("heapq is not a prefix wildcard", DOMAIN_MODULE, "import heapq_network\n"),
+    ("heap algorithms do not admit thread locks", ENGINE_MODULE,
+     "from heapq import heappop\nfrom threading import Lock\n"),
     ("import time", DOMAIN_MODULE, "import time\n"),
     ("engine imports time", TXN_MANAGER_MODULE, "import time\n"),
     (
@@ -599,6 +610,8 @@ ACCEPTED_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("zlib", DOMAIN_MODULE, "import zlib\n"),
     ("hashlib", DOMAIN_MODULE, "from hashlib import sha256\n"),
     ("math", DOMAIN_MODULE, "from math import isfinite\n"),
+    ("domain heap algorithms", DOMAIN_MODULE, "from heapq import heappop, heappush\n"),
+    ("engine heap algorithms", ENGINE_MODULE, "from heapq import heappop, heappush\n"),
     (
         "exact commit diagnostic timer",
         TXN_MANAGER_MODULE,

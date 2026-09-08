@@ -51,6 +51,7 @@ Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 | Preparação local de proveniência | Core `e1e9d08` elimina varreduras repetidas, mantendo fallback para colisão de ID; 24 testes passaram. Exercitado pela consolidação autorizada no PID 2124; preservado no novo PID 34048. |
 | Latência completa fria / custo completo de escrita | Uma spec real: commit MCP 22,981 s, 5 nós/10 arestas; entrega Global 131,489 s, sem retry/erro. Priorizar atribuição desse custo completo; ganhos nativos isolados não encerram a frente. |
 | Corpus reservado | 20 specs pendentes, 20 consolidadas, zero em progresso; apenas uma consumida nesta autorização. Demais pendentes idênticas. Não consolidar outras, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
+| Dívida de arquitetura já registrada | Criação de locks do query engine movida para a composição da API; classificação de `heapq` e enum público reconciliada com testes negativos. 610 testes passam; 5 falham no gate por 5 ocorrências restantes em 4 módulos. Correção parcial, fonte apenas: `docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`. |
 | Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |
 
 Checkpoint finito concluído: certificação fechada de auxiliares conhecidos e

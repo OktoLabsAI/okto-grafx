@@ -52,7 +52,6 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
-from _thread import LockType
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from heapq import heappop, heappush
@@ -60,7 +59,6 @@ from types import MappingProxyType
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from math import isnan
-from threading import Lock
 from typing import cast
 
 from okto_grafx.domain.errors import (
@@ -532,7 +530,7 @@ class _OwnedPlanDoor:
     """
 
     clone: Callable[[], PlanNode]
-    _lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
+    _lock: AbstractContextManager[object] = field(repr=False, compare=False)
     _materialised: PlanNode | None = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -3221,6 +3219,7 @@ class QueryEngine:
         schema_artifact_section: Callable[..., object] | None = None,
         custom_index_preparer: Callable[..., CatalogIndexDefinition] | None = None,
         endpoint_locator_guard: AbstractContextManager[object] | None = None,
+        compiled_predicate_guard: AbstractContextManager[object] | None = None,
         max_statement_writes: int | None = None,
         max_result_rows: int | None = None,
         max_intermediate_rows: int | None = None,
@@ -3265,7 +3264,9 @@ class QueryEngine:
         self._compiled_predicates: dict[int, _CompiledPredicate] = {}
         # Guards only the lookup, publication and eviction of compiled predicates: never held
         # while compiling, evaluating a row or doing I/O.
-        self._compiled_predicates_lock = Lock()
+        self._compiled_predicates_lock = (
+            self._endpoint_guard if compiled_predicate_guard is None else compiled_predicate_guard
+        )
         self._endpoint_memo: dict[int, _EndpointTxnMemo] = {}
         self._endpoint_budget = _EndpointLocatorBudget(
             max_bytes=_ENDPOINT_LOCATOR_MAX_BYTES,

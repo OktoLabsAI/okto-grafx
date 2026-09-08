@@ -777,3 +777,15 @@ pending items are unchanged. Board/Global healthy; overall at_risk remains due t
 historical policy DLQ, with some stale diagnostics/runtime-budget gaps still visible.
 No new consolidation or end-to-end delivery benchmark. See that report's deployment
 section for exact artifact hash and evidence.
+
+### Existing architecture debt — 2026-09-08
+
+Query locks now come from API composition, preserving per-result lazy-plan
+single execution and independent predicate-cache publication guards. `heapq` was
+classified alongside existing deterministic list algorithms; thread/context/weakref/
+introspection mechanisms remain forbidden. The public-value checker was synchronized
+with the existing exact IndexLayout enum, retaining rejection of foreign enums.
+Combined slice: 610 passed, 5 failed, all failures in the remaining architecture
+debt (five occurrences across four modules plus the aggregate assertion). No skipped
+gate, performance threshold, live consolidation or deployment was introduced.
+Details: `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.

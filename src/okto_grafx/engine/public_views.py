@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
@@ -2526,7 +2527,10 @@ def _query_plan_view(
         raise _malformed_plan_error(failure) from failure
 
 
-def _query_owned_plan_door(value: object, memo: _OwnedPlanViewMemo) -> object:
+def _query_owned_plan_door(
+    value: object, memo: _OwnedPlanViewMemo,
+    guard_factory: Callable[[], AbstractContextManager[object]],
+) -> object:
     """Seal one proven internal root's clone recipe into a door for exactly one result.
 
     The door defers the clone until the result's plan is actually read, so a caller that only
@@ -2537,7 +2541,7 @@ def _query_owned_plan_door(value: object, memo: _OwnedPlanViewMemo) -> object:
     from okto_grafx.engine.query_engine import _OwnedPlanDoor
 
     try:
-        return _OwnedPlanDoor(_query_owned_plan_recipe(value, memo))
+        return _OwnedPlanDoor(_query_owned_plan_recipe(value, memo), guard_factory())
     except GrafxPlanError:
         raise
     except Exception as failure:  # noqa: BLE001 - malformed collaborator output is a plan error
@@ -3000,6 +3004,7 @@ def _query_result_view(
     max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     internally_owned_plan: bool = False,
     plan_memo: _OwnedPlanViewMemo | None = None,
+    plan_guard_factory: Callable[[], AbstractContextManager[object]] | None = None,
 ) -> QueryResult:
     """Rebuild one result and normalize every malformed collaborator shape as a plan error."""
     try:
@@ -3008,6 +3013,7 @@ def _query_result_view(
             max_string_characters=max_string_characters,
             internally_owned_plan=internally_owned_plan,
             plan_memo=plan_memo,
+            plan_guard_factory=plan_guard_factory,
         )
     except GrafxPlanError:
         raise
@@ -3027,6 +3033,7 @@ def _query_result_snapshot(
     max_string_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     internally_owned_plan: bool = False,
     plan_memo: _OwnedPlanViewMemo | None = None,
+    plan_guard_factory: Callable[[], AbstractContextManager[object]] | None = None,
 ) -> QueryResult:
     """Rebuild one fully materialised query result outside the page-access section."""
     # Local import avoids making the query engine depend on the public-view module that rebuilds
@@ -3106,7 +3113,13 @@ def _query_result_snapshot(
     elif internally_owned_plan and plan_memo is not None:
         # A root the exact engine proved it owns is sealed behind a door: the result carries the
         # compiled recipe and builds its own independent tree only if someone reads the plan.
-        plan = _query_owned_plan_door(raw_plan, plan_memo)
+        # A manually assembled serial engine without a guard factory retains
+        # eager detachment. Only the composition can create a synchronized door.
+        plan = (
+            _query_owned_plan_door(raw_plan, plan_memo, plan_guard_factory)
+            if plan_guard_factory is not None else
+            _query_plan_view(raw_plan, internally_owned=True, memo=plan_memo)
+        )
     else:
         # Everything else keeps the eager hostile rebuild: the tree is validated and detached
         # here, before the result exists, and no collaborator callable is ever kept.

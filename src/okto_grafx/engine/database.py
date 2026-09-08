@@ -34,7 +34,7 @@ from __future__ import annotations
 import struct
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
@@ -1520,6 +1520,7 @@ class Database:
         "_catalog",
         "_catalog_view_memo",
         "_plan_view_memo",
+        "_plan_guard_factory",
         "_heap",
         "_wal",
         "_transactions",
@@ -1591,6 +1592,7 @@ class Database:
         recovery: object = None,
         vectors: object = None,
         queries: object = None,
+        plan_guard_factory: Callable[[], AbstractContextManager[object]] | None = None,
         verifier_factory: Callable[[], object] | None = None,
         recovery_report: object = None,
         attached_indexes: Sequence[str] = (),
@@ -1624,6 +1626,7 @@ class Database:
         self._plan_view_memo: OrderedDict[
             int, tuple[PlanNode, PlanNode]
         ] = OrderedDict()
+        self._plan_guard_factory = plan_guard_factory
         self._heap: HeapStore = heap
         self._wal: WalManager = wal
         self._transactions: TransactionManager = transactions
@@ -2262,6 +2265,7 @@ class Database:
                     max_string_characters=self._max_query_value_characters,
                     internally_owned_plan=_engine_owns_prepared_plan(engine, plan),
                     plan_memo=self._plan_view_memo,
+                    plan_guard_factory=self._plan_guard_factory,
                 )
                 if metadata.plan is None:
                     raise GrafxConfigurationError(
@@ -2441,6 +2445,7 @@ class Database:
                     )
                 ),
                 plan_memo=self._plan_view_memo,
+                plan_guard_factory=self._plan_guard_factory,
             )
 
     def _run_many(

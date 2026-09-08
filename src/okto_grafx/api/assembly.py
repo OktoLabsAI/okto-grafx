@@ -557,6 +557,7 @@ def assemble_database(
             # Separate from BufferPool's lock: endpoint memo accounting is atomic, while the
             # heap walk it enables never holds this guard across page I/O.
             endpoint_locator_guard=threading.RLock(),
+            compiled_predicate_guard=threading.Lock(),
             max_statement_writes=config.max_statement_writes,
             max_result_rows=config.max_result_rows,
             max_intermediate_rows=config.max_intermediate_rows,
@@ -646,6 +647,7 @@ def assemble_database(
         recovery=recovery,
         vectors=vectors,
         queries=queries,
+        plan_guard_factory=threading.Lock,
         verifier_factory=_verifier_factory(pool, metrics, heap, catalog, indexes),
         recovery_report=report,
         attached_indexes=attached,
