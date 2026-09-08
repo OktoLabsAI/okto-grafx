@@ -18,6 +18,18 @@ complexity cliff on an already selected path.
 
 Branch: `feature/v0.0.4`
 
+Current integration queue (2026-09-07): the two-hop bounded-output correction is
+implemented/tested in Community `7559ba7`, awaiting accumulated deployment. The
+already selected write/provenance investigation found source-reference equality
+scans (953 Entity rows / 203 Decision rows for one live read-only answer). A
+Community helper for the existing native exact hash index is proven in isolation:
+1002 scanned rows become 3 seek candidates with identical active-lineage output,
+plus snapshot/update/reopen and writer-fence tests. It is not wired to bootstrap
+or enabled in production yet. Required next steps are strict known-auxiliary-index
+certification, bootstrap integration and one accumulated quality/deploy checkpoint;
+see Community `docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`. This addresses the existing
+source-lookup complexity path, not a new engine format or exploratory timing gate.
+
 Base: `ea4b5ff` (`0.0.3`)
 
 Package version: `0.0.4`

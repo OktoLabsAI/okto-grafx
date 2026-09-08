@@ -12,7 +12,28 @@
 > `docs/PERFORMANCE_ROUND_0_0_4.md`. Itens específicos do Pulse permanecem na camada Community;
 > o Core continua agnóstico ao backend de grafo.
 
-## Estado de execução — 2026-09-06
+## Resumo vigente — 2026-09-07
+
+Este resumo prevalece sobre os checkpoints cronológicos abaixo; eles ficam
+preservados como evidência, não como novas filas ou dependências ativas do Claude.
+Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
+
+| Frente atual | Estado / próxima ação necessária |
+| --- | --- |
+| Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |
+| Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a0b3c9f`; carregados no Pulse PID 31060, 500/2779 nós pela UI e ledger cognitivo preservado. |
+| Two-hop: montagem limitada ao resultado | Community `7559ba7`, 25 testes; aguardando deploy acumulado. Consultas por layout continuam residuais, não foram declaradas eliminadas. |
+| Identidade/proveniência por source ref | Índice exato Community em validação isolada: 1002 scans → 3 candidatos, mesmo resultado. Integrar certificação do inventário e bootstrap antes de ativar no board. |
+| Latência completa fria / custo completo de escrita | Não encerrados por medições isoladas. Priorizar o acesso por source ref já identificado no caminho de escrita; não consumir specs nem repetir benchmarks marginais. |
+| Corpus reservado | 21 specs pendentes, zero em progresso; não consolidar, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
+| Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |
+
+Próxima sequência finita: certificar índices auxiliares conhecidos sem aceitar
+extras arbitrários → conectar bootstrap idempotente → regressão proporcional e
+deploy acumulado. Detalhes do acesso por source ref no Community:
+`docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`.
+
+## Histórico de execução — checkpoint iniciado em 2026-09-06
 
 - **Rodada 0.0.4, Wave 3 em execução.** Além da Wave 2 concluída até STO-M1, `b8906f6`
   especializou apenas parâmetros escalares de tipos embutidos e tornou a resolução de colunas
