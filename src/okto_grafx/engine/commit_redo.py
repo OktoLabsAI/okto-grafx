@@ -33,7 +33,7 @@ from okto_grafx.engine.buffer_pool import (
     BufferPool,
     apply_page_image,
 )
-from okto_grafx.engine.catalog_store import CATALOG_FILE, read_catalog_page_images
+from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore, read_catalog_page_images
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -365,6 +365,7 @@ class CommitRedo:
         must be introduced by its own complete schema snapshot in this range.
         """
         if not replay.commit_records:
+            self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
             return
         grouped: dict[tuple[int, int], list[tuple[int, bytes]]] = {}
         for _position, prepared in prepared_pages:
@@ -372,6 +373,7 @@ class CommitRedo:
                 record = prepared.record
                 grouped.setdefault((record.epoch, record.txn_id), []).append((prepared.page_index, prepared.image))
         if not grouped:
+            self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
             return
         seen = False
         previous_horizon: int | None = None
@@ -394,6 +396,53 @@ class CommitRedo:
                 )
             previous_horizon = horizon
             seen = True
+
+    def _validate_catalog_without_schema_effects(
+        self, replay: CommittedReplay, checkpoint_lsn: Lsn | None,
+    ) -> None:
+        """Use current pages, never a mutable/stale adopted catalog, for native gaps.
+
+        No schema image exists to repair or establish activation in this range.
+        Reading the canonical catalog through this already-fenced pool is therefore
+        mandatory. This is one schema read per native replay, not a graph/history
+        walk, and creates no persistent or cached authority. Journal publication
+        remains disabled, so post-activation coverage must still refuse explicitly.
+        """
+        if checkpoint_lsn is None:
+            return  # Legacy standalone dispatcher has no native control context.
+        storage = self._pool.storage
+        exists = storage.exists(CATALOG_FILE)
+        empty = not exists or storage.page_count(CATALOG_FILE) == 0
+        if empty:
+            if any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
+                raise GrafxRecoveryRefused(
+                    "Commit-history files have no schema catalog establishing activation.",
+                    field="commit_catalog_activation",
+                )
+        if not exists:
+            return  # Uninitialized/legacy stack; no history may be inferred.
+        if empty and checkpoint_lsn == 0 and not replay.commit_records:
+            return  # Fresh empty file, before bootstrap; no COMMIT is being certified.
+        horizon = CatalogStore(self._pool).read_from_pages().commit_catalog_activation
+        if horizon is None:
+            if any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
+                raise GrafxRecoveryRefused(
+                    "Commit-history files require an activated schema catalog.",
+                    field="commit_catalog_activation",
+                )
+            return
+        if horizon > checkpoint_lsn:
+            raise GrafxRecoveryRefused(
+                "Post-checkpoint activation has no schema snapshot in the selected WAL range.",
+                field="commit_catalog_activation", checkpoint_lsn=checkpoint_lsn,
+                activation_lsn=horizon,
+            )
+        if checkpoint_lsn > horizon or replay.commit_records:
+            raise GrafxRecoveryRefused(
+                "This native replay requires commit-history coverage not enabled by this build.",
+                field="commit_catalog_replay", checkpoint_lsn=checkpoint_lsn,
+                activation_lsn=horizon,
+            )
 
     def _verify_preflight_for(
         self,
@@ -572,6 +621,60 @@ class CommitRedo:
             signature_verified=True,
             contains_index_reset=False,
             prepared_pages=prepared_pages,
+        )
+
+    def _preflight_index_subplan(
+        self, source_replay: CommittedReplay, index_replay: CommittedReplay,
+        preflighted: object, *, allow_unregistered_indexes: bool,
+        passage: object, checkpoint_lsn: Lsn | None = None,
+    ) -> object:
+        """Inherit full catalog validation, then strictly revalidate index dispatch.
+
+        The catalog was proved on the complete range and its pages have now been
+        adopted. Only the exact index complement may use that proof; registry
+        lookups are NOT inherited from the earlier unregistered-index allowance.
+        """
+        source = self._compatible_preflight(
+            source_replay, preflighted,
+            allow_unregistered_indexes=allow_unregistered_indexes,
+            passage=passage, checkpoint_lsn=checkpoint_lsn,
+        )
+        if (
+            source is None
+            or index_replay.last_committed_lsn != source_replay.last_committed_lsn
+            or index_replay.commit_records is not source_replay.commit_records
+            or index_replay.incomplete_effects
+        ):
+            raise GrafxRecoveryRefused("Index replay does not match its complete preflight.", field="preflighted_replay")
+        expected = tuple(record for record in source.effects if record.record_type in _INDEX_EFFECTS)
+        if len(expected) != len(index_replay.effects) or any(
+            actual is not original for actual, original in zip(index_replay.effects, expected)
+        ):
+            raise GrafxRecoveryRefused("Index replay is not the exact index subplan.", field="preflighted_replay")
+        index_effects = index_replay.effects
+        prepared, signature, contains_reset = self._preflight(
+            index_effects, allow_unregistered_indexes=False,
+        )
+        self._require_unchanged_commit_records(source_replay, source.commit_records, source.commit_signature)
+        if (
+            self._compatible_preflight(source_replay, source,
+                allow_unregistered_indexes=allow_unregistered_indexes,
+                passage=passage, checkpoint_lsn=checkpoint_lsn) is None
+            or index_replay.effects is not index_effects
+            or index_replay.commit_records is not source.commit_records
+            or index_replay.last_committed_lsn != source.last_committed_lsn
+            or index_replay.incomplete_effects
+            or self._record_signature(source_replay.effects) != source.record_signature
+        ):
+            raise GrafxRecoveryRefused("Complete replay changed during index preflight.", field="preflighted_replay")
+        return _PreflightedReplay(
+            seal=_PREFLIGHT_SEAL, owner=self, passage=passage, replay=index_replay,
+            effects=index_replay.effects, incomplete_effects=index_replay.incomplete_effects,
+            commit_records=source.commit_records, commit_signature=source.commit_signature,
+            last_committed_lsn=index_replay.last_committed_lsn,
+            checkpoint_lsn=source.checkpoint_lsn, allow_unregistered_indexes=False,
+            allow_page_coalescing=False, record_signature=signature, signature_verified=True,
+            contains_index_reset=contains_reset, prepared_pages=prepared,
         )
 
     def _compatible_preflight(

@@ -960,6 +960,8 @@ def test_replaying_a_page_twice_leaves_the_page_identical(stack: Stack) -> None:
 
 
 def test_a_committed_page_is_put_back_after_the_apply_was_lost(stack: Stack) -> None:
+    # The lost apply is the heap change, not the preexisting catalog bootstrap.
+    stack.pool.flush(CATALOG_FILE)
     image = make_page_image(stack.codec, [b"committed"], page_index=3)
     # The first append also writes the segment header; later batches do not.
     predicted = stack.wal.last_lsn + 2 + (0 if stack.wal.segments() else 1)
@@ -1038,6 +1040,7 @@ def test_a_clean_tail_with_an_effect_but_no_outcome_refuses_without_mutation(
 def test_an_aborted_transaction_contributes_nothing_to_the_redo(stack: Stack) -> None:
     from okto_grafx.domain.txn.records import encode_page_write
 
+    stack.pool.flush(CATALOG_FILE)
     image = make_page_image(stack.codec, [b"aborted"], page_index=6)
     stack.wal.append_many(
         [

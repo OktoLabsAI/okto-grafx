@@ -1548,7 +1548,15 @@ class RecoveryManager:
                 persist_stale=self._policy != POLICY_REFUSE,
                 watermarks=watermarks,
             )
-        index_result = self._redo_engine.apply(index_replay, _checkpoint_lsn=state.checkpoint_lsn)
+        index_preflight = self._redo_engine._preflight_index_subplan(
+            replay, index_replay, full_preflight,
+            allow_unregistered_indexes=touched_catalog, passage=permit,
+            checkpoint_lsn=state.checkpoint_lsn,
+        )
+        index_result = self._redo_engine.apply(
+            index_replay, _preflighted=index_preflight, _passage=permit,
+            _checkpoint_lsn=state.checkpoint_lsn,
+        )
 
         # Make every replayed heap/catalog/index effect visible to the device before certifying
         # derived indexes. If a data flush fails, no fresh header may get ahead of the data it

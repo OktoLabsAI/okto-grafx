@@ -231,3 +231,58 @@ def test_preflight_cannot_be_reused_under_a_different_checkpoint(door: str) -> N
             else:
                 redo.apply(replay, _preflighted=proof, _passage=passage, _checkpoint_lsn=0)
         assert failure.value.details["field"] == "commit_catalog_activation"
+
+
+@pytest.mark.parametrize("horizon,floor,commit,field", [
+    (1000, 0, 0, "commit_catalog_activation"),
+    (1000, 1000, 0, None),
+    (1000, 1000, 2000, "commit_catalog_replay"),
+    (1000, 2000, 0, "commit_catalog_replay"),
+    (None, 1000, 2000, None),
+])
+def test_native_no_schema_range_uses_persisted_activation(horizon: int | None, floor: int, commit: int, field: str | None) -> None:
+    pool, store, images = staged(catalog(horizon), 1000)
+    redo = CommitRedo(pool)
+    redo.apply(committed_replay(records(images, 1000)))
+    pool.flush()
+    old_adopted = store.persisted_image()
+    device = pool.storage
+    assert isinstance(device, MemoryDevice)
+    writes = list(device.write_calls)
+    replay = committed_replay(records((), commit) if commit else ())
+    if field is None:
+        redo.preflight(replay, _checkpoint_lsn=floor)
+    else:
+        with pytest.raises(GrafxRecoveryRefused) as failure:
+            redo.preflight(replay, _checkpoint_lsn=floor)
+        assert failure.value.details["field"] == field
+    assert device.write_calls == writes
+    assert store.persisted_image() == old_adopted
+
+
+def test_no_schema_preflight_does_not_adopt_an_unsaved_activation() -> None:
+    pool, store, _images = staged(catalog(None), 1000)
+    store.catalog.upgrade_index_catalog().enable_commit_catalog(999)
+    assert store.has_unsaved_changes()
+    CommitRedo(pool).preflight(committed_replay(records((), 1000)), _checkpoint_lsn=0)
+    assert store.catalog.commit_catalog_activation == 999 and store.has_unsaved_changes()
+
+
+@pytest.mark.parametrize("catalog_state", ["missing", "empty", "legacy"])
+@pytest.mark.parametrize("journal", ["commits.dir", "commits.dat"])
+def test_orphan_history_never_means_uninitialized_catalog(catalog_state: str, journal: str) -> None:
+    pool, _store, _images = staged(catalog(None), 1000)
+    pool.flush()
+    pool.invalidate("catalog.dat")
+    device = pool.storage
+    assert isinstance(device, MemoryDevice)
+    if catalog_state != "legacy":
+        device.remove("catalog.dat")
+        if catalog_state == "empty":
+            device.create("catalog.dat")
+    device.create(journal)
+    writes = list(device.write_calls)
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        CommitRedo(pool).preflight(committed_replay(()), _checkpoint_lsn=0)
+    assert failure.value.details["field"] == "commit_catalog_activation"
+    assert device.write_calls == writes

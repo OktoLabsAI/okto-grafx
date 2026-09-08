@@ -4357,7 +4357,15 @@ class TransactionManager:
             manager.check_replay_floor(checkpoint, watermarks=watermarks)
         index_result = None
         if not skip_reapply:
-            index_result = self._commit_redo.apply(index_replay, _checkpoint_lsn=checkpoint)
+            index_preflight = self._commit_redo._preflight_index_subplan(
+                replay, index_replay, full_preflight,
+                allow_unregistered_indexes=touched_catalog, passage=redo_passage,
+                checkpoint_lsn=checkpoint,
+            )
+            index_result = self._commit_redo.apply(
+                index_replay, _preflighted=index_preflight, _passage=redo_passage,
+                _checkpoint_lsn=checkpoint,
+            )
             assert page_result is not None
             for result in (page_result, index_result):
                 self._commit_redo.flush(result)

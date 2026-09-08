@@ -1,6 +1,8 @@
 """Complete schema snapshots through the real WAL, fenced recovery and control publication."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from okto_grafx.adapters.storage_memory import MemoryStorageDevice
@@ -87,6 +89,32 @@ def test_native_recovery_rejects_activation_invented_after_checkpoint(stack: Sta
         reopened.recovery().run()
     assert failure.value.details["field"] == "commit_catalog_activation"
     assert stored_bytes(storage) == before
+
+
+def test_native_recovery_will_not_publish_a_post_activation_commit_without_history(stack: Stack) -> None:
+    _value, _images, horizon = append_activation(stack)
+    storage = stack.storage
+    assert isinstance(storage, MemoryStorageDevice)
+    recovered = build_stack(storage, bootstrap=False)
+    recovered.recovery().run()
+    # Model a completed checkpoint of the activation, with its actual data barrier.
+    storage.durable_barrier(CATALOG_FILE)
+    control = CommitStateStore(storage, owner_id="checkpoint-fixture")
+    current = control.read()
+    control.publish(replace(current, checkpoint_lsn=horizon), previous=current)
+    # Durable but unacknowledged next COMMIT: no journal effects. It must not be
+    # published just because the selected suffix contains no schema change.
+    next_lsn = stack.wal.append(WalRecord(WalRecordType.COMMIT,
+        CommitPayload.build(snapshot_lsn=horizon).encode(), descriptor=DESCRIPTOR, epoch=2, txn_id=8))
+    stack.wal.barrier()
+    assert next_lsn > horizon
+    reopened = build_stack(storage, bootstrap=False)
+    before = stored_bytes(storage)
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        reopened.recovery().run()
+    assert failure.value.details["field"] == "commit_catalog_replay"
+    assert stored_bytes(storage) == before
+    assert control.read().last_committed_lsn == horizon
 
 
 @pytest.mark.parametrize("omit", [0, 1])
