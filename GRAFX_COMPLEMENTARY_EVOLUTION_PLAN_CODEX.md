@@ -3,6 +3,17 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / validação semântica de redo / 2026-09-08:** after-images completos
+validam caudas parcialmente aplicadas/rasgadas; lote vincula COMMITs individuais,
+ativação e predecessor de cada append aos overlays WAL anteriores. Limite de
+imagens admitido antes da descompressão. 718 testes agrupados em 22,77 s.
+Sem prova inventada de preimage perdida: publicação viva ainda exige predecessor
+independente. Staging/aplicação/autoridade nativa e APIs continuam pendentes;
+guards de integração não foram removidos. [Evidência](docs/specs/SPEC-GX-CAP-1.md).
+Pulse intocado neste checkpoint; 19 specs restantes reservadas após o teste vivo
+autorizado e documentado separadamente.
+Checkpoint imutável: `aa1b40eff15c3ca26e19602758f3cadbbefd5926`.
+
 **GX-CAP-1B / validação de append / 2026-09-08:** transição entre diretório e
 stream validada contra predecessor íntegro, com recusa de páginas faltantes,
 extras, stamps errados e reescritas históricas com CRC válido. Regra exata de

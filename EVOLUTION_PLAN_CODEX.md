@@ -26,6 +26,16 @@ ledger permaneceram idênticos. Dívidas históricas continuam explícitas.
 [Recibo, limites e identidade do runtime](docs/PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md).
 Este teste não altera o estado incompleto dos slices GX-CAP-1 abaixo.
 
+GX-CAP-1 avançou na validação semântica de redo: after-images completos sobre
+caudas parcialmente aplicadas/rasgadas, cobertura de cada COMMIT e continuidade
+contra overlays WAL anteriores. O limite por COMMIT é admitido antes da
+descompressão. **718 testes em 22,77 s**; sem novos diagnósticos de tipagem nos
+módulos verificados. Não é ainda publicação/recovery integrado: autoridade
+nativa, staging, aplicação e APIs públicas seguem obrigatórios, com os guards
+ativos. [Contrato e evidência](docs/specs/SPEC-GX-CAP-1.md). Pulse e as 19 specs
+reservadas não foram usados neste checkpoint de implementação.
+Checkpoint imutável: `aa1b40eff15c3ca26e19602758f3cadbbefd5926`.
+
 GX-CAP-1 ganhou validação de uma transição completa de append do histórico contra
 uma visão anterior íntegra: diretório/stream, COMMIT/UUID/tempo, páginas exatas e
 preservação de prefixos, inclusive reescritas com CRC válido. 691 testes agrupados

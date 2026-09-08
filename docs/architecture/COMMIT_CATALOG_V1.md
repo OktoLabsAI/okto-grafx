@@ -246,7 +246,59 @@ records. The exact 65,596-byte maximum after a split tail uses at most 154 image
 at page size 512; validating after a maximum old record stays within 156 reads.
 No end-to-end speedup or physical-I/O latency claim is made from these operation counts.
 
-### Remaining complete-capability acceptance matrix
+### Durable after-image and selected-range validation — CAP-1B
+
+Immutable implementation checkpoint: `aa1b40eff15c3ca26e19602758f3cadbbefd5926`.
+
+`validate_redo_images` validates one complete journal append when its physical
+tail may be old, applied or torn. Its caller independently supplies the preceding
+COMMIT and persisted activation horizon and must prove WAL durability/lineage and
+physical authority. The WAL must contain the directory head, last directory page
+and every affected stream fragment. Missing images are never supplied from an
+already-applied target. Covered targets are not read from the page provider.
+
+The first writing COMMIT after activation must have entry_count=1, predecessor
+equal to activation and the immutable stream header in its WAL image set. Later
+appends must not rewrite that header; a missing existing header is a refusal,
+never evidence of empty history. Uncovered older full blocks/header still require
+normal page/role/UUID/coverage checks and `activation < page_lsn <= predecessor`.
+Only partial predecessor tails are reconstructed by truncating the authoritative
+after-images; full older blocks are unchanged. Canonical append validation then
+checks record, count, time and exact bytes against that reconstructed logical view.
+
+This is deliberately **not an independent proof of an unavailable before-image**.
+Durable WAL after-images carry the overwritten prefix's authority. Live publication
+must use `validate_append_images` against an independently proved predecessor;
+redo cannot reconstruct a lost preimage merely from CRCs. No new before-image WAL
+format, sidecar, history copy or reusable authority cache is introduced.
+
+`validate_redo(CommittedReplay, previous_sequence, activation_sequence)` checks
+the selected range's individual epoch-qualified COMMIT boundaries and required
+journal framing before any provider call. All transactions' image counts are
+admitted before any page-image decompression. First post-activation append uses
+the crash-cut validator; later appends use **previously validated WAL overlays**
+as independent predecessor images. This refuses dropped intermediate writing
+COMMITs, missing journal effects and coherent CRC-valid changes to an earlier
+COMMIT's prefix. A range crossing activation must contain its explicit COMMIT.
+Legacy-only/empty ranges create no journal entries. Maintenance COMMITs after
+activation are covered exactly like data COMMITs, not silently exempted.
+
+Storage work is bounded by the previous/current record sizes per transition;
+the attempt-local overlay is linear in selected journal pages, not total retained
+history. The same `ceil(65,596 / C)+3` image limit covers initialization: the extra
+stream header replaces the possible old split-tail allowance. The maximum record
+and immutable older directory-page boundary are tested. The batch returns checked
+record values only, **not an apply permit or a durable receipt**.
+
+The semantic fixtures include 48 page-application subsets, each repeated with
+covered pages torn, and ranges spanning first/maintenance/later COMMITs with raw
+and compressed images, reused transaction IDs across epochs, and checkpoint cuts.
+These are not real-WAL crash executions: the surrounding native preflight must
+still prove control/catalog activation, WAL payload/durability/contiguity, physical
+targets, ordinary heap/index effects, incomplete-effect safety and callback-proof
+revalidation before applying anything. Journal replay/writer guards remain active.
+
+### Remaining complete-capability acceptance matrix (native integration)
 
 | Cut / race | Required outcome |
 |---|---|

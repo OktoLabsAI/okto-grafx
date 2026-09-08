@@ -469,3 +469,57 @@ staging/OCC/publication wiring. Those are existing acceptance requirements, not
 waived by this read-only validator. Journal writing/replay guards remain active;
 public history, metrics/verify, transfer/restore/fork and the complete crash matrix
 remain mandatory. No Pulse operation or additional spec consolidation occurred.
+
+### CAP-1B durable after-image/range validator — 2026-09-08
+
+Immutable implementation checkpoint: `aa1b40eff15c3ca26e19602758f3cadbbefd5926`.
+
+Implemented bounded semantic redo validation without assuming an intact mutable
+predecessor tail. A complete durable journal image set overlays all covered
+targets; immutable older blocks remain physically checked. First append must
+carry the immutable stream header and name activation as its predecessor; later
+missing headers cannot bootstrap empty history. The selected-range validator
+retains epoch-qualified COMMIT ownership and uses earlier validated WAL images as
+the next append's independent predecessor. Gaps, missing effects and coherent
+CRC-valid historical prefix rewrites between COMMITs refuse without applying.
+
+The first crash-cut reconstruction inherits the durable WAL's prefix authority;
+it is not proof of an unavailable preimage. Live publication still requires the
+independent append validator. No authority cache, new persisted format, host-file
+application, native replay allowlist change or writer-guard removal occurred.
+Detailed proof obligations: [COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md).
+
+The transition suite grew from 42 to **69 tests**. New tests cover all 48 small
+page-application subsets, repeated with covered targets torn and repeat validation,
+complete images even when disk has already applied them, immutable missing/future
+blocks, exact maximum record, raw/compressed multi-COMMIT ranges, reused txn IDs
+across epochs, checkpoint/activation cuts, dropped middle COMMITs and coherent
+prefix rewrites. Review exposed two failing cases: excess image counts were not
+admitted until after decoding, and an empty replay accepted bool as watermark.
+Both are corrected; image cardinality now refuses before any page decompression.
+
+Focused suite: **69 passed in 5.83 s**. Final grouped command:
+
+```text
+python -m pytest tests/txn/test_commit_catalog_transition.py
+  tests/txn/test_commit_catalog_store.py tests/txn/test_commit_catalog_record.py
+  tests/txn/test_commit_provenance_values.py tests/txn/test_commit_catalog_activation.py
+  tests/wal/test_commit_catalog_wal_grammar.py tests/wal/test_commit_catalog_batch_sizing.py
+  tests/recovery/test_commit_redo.py tests/recovery/test_replay_decision.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**718 passed in 22.77 s**, overlapping the focused suite. Ruff/diff-check pass.
+Strict mypy on store/tests reports the same four existing imported diagnostics:
+three Catalog and one CommitRedo. Store-only comparison using HEAD `834d6f3`
+shadow source gives identical diagnostics before/after; no whole-engine type-clean
+claim. The batch fixtures are semantic records, not proof of native WAL crash
+recovery or automatic history publication.
+
+Remaining: native control/catalog/physical coverage proof, staging and publication,
+prepared-proof integration, lookup/public metadata, verify/metrics, transfer,
+restore/fork, concurrency and complete journal crash regression. No Pulse operation
+occurred in this implementation checkpoint. The separately authorized real-spec
+run is recorded in `PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md`; **19 pending
+Specs remain reserved** and were not used by these tests.
