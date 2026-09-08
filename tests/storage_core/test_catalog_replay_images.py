@@ -184,16 +184,16 @@ def test_post_checkpoint_activation_needs_its_own_schema_snapshot(floor: int, do
 @pytest.mark.parametrize("floor", [2000, 2500])
 def test_checkpointed_activation_does_not_require_recycled_activation_wal(floor: int) -> None:
     value = catalog(2000)
-    pool, store, images = staged(value, 3000)
+    pool, _store, images = staged(value, 3000)
     replay = committed_replay(records(images, 3000))
     redo = CommitRedo(pool)
-    passage = object()
-    proof = redo.preflight(replay, _checkpoint_lsn=floor, _passage=passage)
-    projected = redo._project_page_preflight(replay, replay, proof,
-        allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=floor)
-    assert projected is not None
-    redo.apply(replay, _preflighted=projected, _passage=passage, _checkpoint_lsn=floor)
-    assert store.read_from_pages().serialize() == value.serialize()
+    prepared, _signature, _reset = redo._preflight(replay.effects, allow_unregistered_indexes=False)
+    assert redo._validate_catalog_transitions(replay, prepared, checkpoint_lsn=floor) == 2000
+    # Schema validity alone no longer certifies an activated writing COMMIT:
+    # the full native door also requires UUID and complete journal coverage.
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        redo.preflight(replay, _checkpoint_lsn=floor)
+    assert failure.value.details["field"] == "commit_catalog_replay"
 
 
 @pytest.mark.parametrize("floor", [True, -1, 1.5, 3000, 4000])
@@ -212,25 +212,25 @@ def test_invalid_or_overlapping_checkpoint_refuses_before_page_decoding(floor: o
 
 @pytest.mark.parametrize("door", ["verify", "ensure", "project", "apply"])
 def test_preflight_cannot_be_reused_under_a_different_checkpoint(door: str) -> None:
-    pool, _store, images = staged(catalog(2000), 3000)
+    pool, _store, images = staged(catalog(None), 3000)
     replay = committed_replay(records(images, 3000))
     redo = CommitRedo(pool)
     passage = object()
     proof = redo.preflight(replay, _checkpoint_lsn=2000, _passage=passage)
     if door == "verify":
         assert redo._verify_preflight_for(replay, proof,
-            allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=0) is None
+            allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=3000) is None
     elif door == "project":
         assert redo._project_page_preflight(replay, replay, proof,
-            allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=0) is None
+            allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=3000) is None
     else:
         with pytest.raises(GrafxRecoveryRefused) as failure:
             if door == "ensure":
                 redo._ensure_preflight(replay, proof,
-                    allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=0)
+                    allow_unregistered_indexes=False, passage=passage, checkpoint_lsn=3000)
             else:
-                redo.apply(replay, _preflighted=proof, _passage=passage, _checkpoint_lsn=0)
-        assert failure.value.details["field"] == "commit_catalog_activation"
+                redo.apply(replay, _preflighted=proof, _passage=passage, _checkpoint_lsn=3000)
+        assert failure.value.details["field"] == "checkpoint_lsn"
 
 
 @pytest.mark.parametrize("horizon,floor,commit,field", [

@@ -28,7 +28,8 @@ pretending arbitrary executable code can be proved by a finite corpus.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.domain.page.layout import CHECKSUM_SIZE, MAX_PAGE_SIZE
@@ -439,10 +440,10 @@ _ClosedProviderSlot = tuple[str, str]
 _MAX_CLOSED_PROVIDER_PROOFS: int = 2
 """Maximum closed-provider slots the shipped adapter can offer (google-crc32c, crc32c)."""
 
-_CLOSED_PROVIDER_CRC_FIRST: dict[_ClosedProviderSlot, bool] = {
+_CLOSED_PROVIDER_CRC_FIRST: Mapping[_ClosedProviderSlot, bool] = MappingProxyType({
     ("google_crc32c", "extend"): True,
     ("crc32c", "crc32c"): False,
-}
+})
 """The complete closed provider list and its fixed argument convention."""
 
 _validated_closed_identities: tuple[

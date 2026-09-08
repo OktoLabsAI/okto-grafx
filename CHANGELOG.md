@@ -9,6 +9,14 @@ including the on-disk format.
 
 ### Added
 
+- Connected internal commit-catalog WAL validation to native recovery/checkpoint page replay.
+  Complete per-COMMIT coverage, database identity, target LSN/content and physical extents are
+  checked before applying any effect; partial valid/unwritten page sets and repeated replay are
+  supported. WAL and journal data barriers precede publication. CRC-invalid targets still fail
+  closed; automatic journal emission and public commit-history APIs remain disabled.
+- Made the closed CRC-provider argument-convention table immutable, preserving its fixed two
+  providers without adding an exception to the storage-core shared-state isolation check.
+
 - Added an explicitly selected, per-database `codec="numpy"` page adapter backed by NumPy from
   `[accel]`. It preserves page format v1 byte-for-byte, uses the pure codec for small directories
   and as the sole authority for invalid-image refusals, and reports both page-codec and effective

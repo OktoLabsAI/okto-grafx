@@ -37,7 +37,7 @@ from okto_grafx.domain.txn.records import (
     decode_page_write,
     decode_page_write_location,
 )
-from okto_grafx.domain.wal.record import WAL_V2_FLAG_COMMIT_CATALOG_V1, WalRecordType
+from okto_grafx.domain.wal.record import WAL_V2_FLAG_COMMIT_CATALOG_V1, WalRecord, WalRecordType
 
 
 _HEAD = Struct("<8sHH16sQQQQq")
@@ -448,6 +448,23 @@ class CommitCatalogStore:
                 field="append_images", limit=maximum, observed=count,
             )
 
+    def _capture_redo_payloads(
+        self, effects: tuple[WalRecord, ...],
+    ) -> dict[tuple[int, int], list[tuple[bytes, int, int]]]:
+        """Admit every append before decompressing any image or reading a provider."""
+        offered: dict[tuple[int, int], list[tuple[bytes, int, int]]] = {}
+        for effect in effects:
+            if effect.record_type != int(WalRecordType.WRITE_PAGE):
+                continue
+            location = decode_page_write_location(effect.payload)
+            journal = location.file in {COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE}
+            if not journal and not (effect.format_version == 2 and effect.flags & WAL_V2_FLAG_COMMIT_CATALOG_V1):
+                continue
+            batch = offered.setdefault((effect.epoch, effect.txn_id), [])
+            self._admit_append_image_count(len(batch) + 1)
+            batch.append((effect.payload, effect.format_version, effect.flags))
+        return offered
+
     def _capture_append_images(
         self, images: tuple[CommitCatalogPageImage, ...], sequence: int,
     ) -> tuple[dict[tuple[str, int], bytes], dict[tuple[str, int], int]]:
@@ -695,19 +712,9 @@ class CommitCatalogStore:
             and not any(lsn == activation_sequence for _epoch, _txn, lsn in commits)
         ):
             raise _corrupt("redo_activation")
-        offered: dict[tuple[int, int], list[tuple[bytes, int, int]]] = {}
         # Admit every transaction's cardinality before decoding any page images.
         # Capture all supplied effect fields/bytes before any provider callback.
-        for effect in replay.effects:
-            if effect.record_type != int(WalRecordType.WRITE_PAGE):
-                continue
-            location = decode_page_write_location(effect.payload)
-            journal = location.file in {COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE}
-            if not journal and not (effect.format_version == 2 and effect.flags & WAL_V2_FLAG_COMMIT_CATALOG_V1):
-                continue
-            batch = offered.setdefault((effect.epoch, effect.txn_id), [])
-            self._admit_append_image_count(len(batch) + 1)
-            batch.append((effect.payload, effect.format_version, effect.flags))
+        offered = self._capture_redo_payloads(replay.effects)
         grouped: dict[tuple[int, int], tuple[CommitCatalogPageImage, ...]] = {}
         for owner, batch in offered.items():
             decoded_images: list[CommitCatalogPageImage] = []
@@ -743,6 +750,94 @@ class CommitCatalogStore:
             results.append(result)
             previous = sequence
         return tuple(results)
+
+    def validate_redo_targets(
+        self, images: tuple[CommitCatalogPageImage, ...], *,
+        previous_sequence: int, sequence: int, activation_sequence: int,
+        file_size: Callable[[str], int],
+        resident_image: Callable[[str, int], bytes | None],
+    ) -> CommitCatalogHead:
+        """Validate physical/cached targets and final extents after semantic WAL validation.
+
+        Call validate_redo first. Covered pages may be absent, unwritten or a
+        proved earlier/later image in that range; a foreign identity or future
+        stamp never becomes an idempotent no-op. CRC-invalid targets refuse
+        before mutation (this is not a blind damaged-page replacement door).
+        The overlay and witnesses last only for this replay, not across fences.
+        """
+        CommitId(self._uuid, sequence)
+        CommitId(self._uuid, activation_sequence)
+        if type(previous_sequence) is not int or not 0 <= previous_sequence < sequence:
+            raise _invalid("previous_sequence")
+        latest: dict[tuple[str, int], bytes] = {}
+        witnesses: dict[tuple[str, int, int], bytes] = {}
+
+        def canonical(page: Page) -> bytes:
+            # Physical publication advances the seqlock without changing content.
+            page.seq = 0
+            return page.to_bytes()
+
+        for image in images:
+            if image.file not in {COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE}:
+                raise _corrupt("append_image")
+            page = Page.from_bytes(image.raw, page_index=image.page_index)
+            key = (image.file, image.page_index, page.page_lsn)
+            raw = canonical(page)
+            if key in witnesses and witnesses[key] != raw:
+                raise _corrupt("redo_target_conflict")
+            witnesses[key] = raw
+            latest[image.file, image.page_index] = image.raw
+        sizes = {file: file_size(file) for file in (COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE)}
+        if any(type(size) is not int or size < 0 or size % self._page_size
+               or size // self._page_size > NO_PAGE for size in sizes.values()):
+            raise _corrupt("physical_extent")
+
+        def check(file: str, index: int, raw: bytes) -> None:
+            if type(raw) is not bytes or len(raw) != self._page_size:
+                raise _corrupt("page_size")
+            if raw == bytes(self._page_size):
+                return  # Allocated but not yet written.
+            page = Page.from_bytes(raw, page_index=index)
+            if page.page_type == PageType.FREE:
+                if page.seq % 2 or canonical(page) != Page(PageType.FREE, page_size=self._page_size).to_bytes():
+                    raise _corrupt("redo_target_free")
+                return
+            if not activation_sequence < page.page_lsn <= sequence:
+                raise _corrupt("redo_target_sequence")
+            kind = _DIRECTORY if file == COMMIT_DIRECTORY_FILE else _STREAM
+            view = CommitCatalogStore(lambda _file, _index: raw, database_uuid=self._uuid, page_size=self._page_size)
+            if index == 0:
+                if view._head(kind).activation_sequence != activation_sequence:
+                    raise _corrupt("activation_sequence")
+            else:
+                block = view._page(file, index, PageType.CATALOG).read_slot(0)
+                if len(block) != _BLOCK.size:
+                    raise _corrupt("block_size")
+                magic, version, actual_kind, uuid, base = _BLOCK.unpack(block)
+                view._discriminator(magic, _BLOCK_MAGIC, version, actual_kind, kind, uuid)
+                stride = self._per_page if kind == _DIRECTORY else self._capacity
+                if base != (index - 1) * stride:
+                    raise _corrupt("block_identity")
+            if page.page_lsn > previous_sequence:
+                if witnesses.get((file, index, page.page_lsn)) != canonical(page):
+                    raise _corrupt("redo_target_conflict")
+
+        projected = dict(sizes)
+        for file, index in latest:
+            if index < sizes[file] // self._page_size:
+                check(file, index, self._read_page(file, index))
+            resident = resident_image(file, index)
+            if resident is not None:
+                check(file, index, resident)
+            projected[file] = max(projected[file], (index + 1) * self._page_size)
+
+        def read(file: str, index: int) -> bytes:
+            raw = latest.get((file, index))
+            return self._read_page(file, index) if raw is None else raw
+
+        return CommitCatalogStore(read, database_uuid=self._uuid, page_size=self._page_size).validate_published_head(
+            sequence=sequence, activation_sequence=activation_sequence, file_size=projected.__getitem__,
+        )
 
     def lookup(self, identity: CommitId, *, read_lsn: int) -> CommitCatalogEntry | None:
         """Exact O(log N) ordinal lookup, bounded to read_lsn and the retained horizon.

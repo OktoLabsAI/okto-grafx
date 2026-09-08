@@ -1327,6 +1327,23 @@ class BufferPool:
                 self._emit_usage(usage)
             return page
 
+    @_guarded
+    def _resident_page_image(self, file: str, page_index: PageIndex) -> bytes | None:
+        """Capture a replay target without admission, eviction, pinning or write-back.
+
+        The native caller owns the participant/COMMIT fence. This is not a
+        freshness certificate: redo validates both this local image and storage.
+        Dirty doomed frames would have independent write-back authority, so refuse.
+        """
+        _require_page_index("page_index", page_index)
+        if any(frame.page.dirty for frame in self._doomed.get((file, page_index), ())):
+            raise GrafxUnsupportedOperation(
+                "Journal replay cannot certify a dirty detached target.",
+                field="redo_target_dirty", file=file, page=page_index,
+            )
+        frame = self._frames.get((file, page_index))
+        return None if frame is None else frame.page.to_bytes()
+
     def read_fresh_page(self, file: str, page_index: PageIndex) -> Page:
         """Read one detached page from the device, bypassing every resident frame.
 

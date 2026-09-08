@@ -162,6 +162,7 @@ from okto_grafx.domain.txn.partitions import (
     validate_partitions_per_table,
 )
 from okto_grafx.domain.txn.records import (
+    COMMIT_CATALOG_PAGE_FILES,
     WalRecord,
     WalRecordLike,
     WalRecordType,
@@ -3943,6 +3944,8 @@ class TransactionManager:
                 # rename, so only names that still exist are durable targets. Foreign images
                 # skipped as already-newer are covered by the canonical inventory below.
                 with self._close_wait_hazard():
+                    barrier_files.update(file for file in COMMIT_CATALOG_PAGE_FILES
+                                         if self._pool.storage.exists(file))
                     modified_files = {
                         file for file, _page_index in self._pool.modified_pages()
                     }

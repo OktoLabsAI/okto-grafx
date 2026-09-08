@@ -35,7 +35,7 @@ from okto_grafx.engine.buffer_pool import (
     apply_page_image,
 )
 from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore, read_catalog_page_images
-from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
+from okto_grafx.engine.commit_catalog_store import CommitCatalogPageImage, CommitCatalogStore
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -168,8 +168,11 @@ class CommitRedo:
             prepared_pages, _signature, _contains_index_reset = self._preflight(
                 replay.effects,
                 allow_unregistered_indexes=False,
+                allow_commit_catalog=_checkpoint_lsn is not None and self._database_uuid is not None,
             )
-            self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
+            self._validate_native_catalog(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
+            if self._record_signature(replay.effects) != _signature:
+                raise GrafxRecoveryRefused("Replay changed during preflight.", field="preflighted_replay")
             self._require_unchanged_commit_records(replay, commit_records, commit_signature)
 
         pages_applied = 0
@@ -315,8 +318,11 @@ class CommitRedo:
         prepared_pages, signature, contains_index_reset = self._preflight(
             replay.effects,
             allow_unregistered_indexes=allow_unregistered_indexes,
+            allow_commit_catalog=_checkpoint_lsn is not None and self._database_uuid is not None,
         )
-        self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
+        self._validate_native_catalog(replay, prepared_pages, checkpoint_lsn=_checkpoint_lsn)
+        if self._record_signature(replay.effects) != signature:
+            raise GrafxRecoveryRefused("Replay changed during preflight.", field="preflighted_replay")
         self._require_unchanged_commit_records(replay, commit_records, commit_signature)
         return _PreflightedReplay(
             seal=_PREFLIGHT_SEAL,
@@ -355,30 +361,63 @@ class CommitRedo:
                 field="checkpoint_lsn", checkpoint_lsn=checkpoint_lsn,
             )
 
+    def _validate_native_catalog(
+        self, replay: CommittedReplay,
+        prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
+        *, checkpoint_lsn: Lsn | None,
+    ) -> None:
+        horizon = self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=checkpoint_lsn)
+        images = tuple(CommitCatalogPageImage(page.file, page.page_index, page.image)
+                       for _position, page in prepared_pages if page.file in COMMIT_CATALOG_PAGE_FILES)
+        if horizon is None:
+            if images or checkpoint_lsn is not None and any(
+                self._pool.storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES
+            ):
+                raise GrafxRecoveryRefused("Journal effects require schema activation.", field="commit_catalog_activation")
+            return
+        # Unqualified historical dispatcher use retains its ordinary-pages-only contract.
+        if checkpoint_lsn is None:
+            return
+        storage = self._pool.storage
+        final_sequence = replay.last_committed_lsn if replay.commit_records else checkpoint_lsn
+        if final_sequence <= horizon:
+            if images or any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
+                raise GrafxRecoveryRefused("History exists before its first tracked COMMIT.", field="commit_catalog_activation")
+            return
+        if self._database_uuid is None:
+            raise GrafxRecoveryRefused("Commit history replay requires database identity.", field="commit_catalog_replay")
+        store = CommitCatalogStore(storage.read_page, database_uuid=self._database_uuid, page_size=self._pool.page_size)
+        if not replay.commit_records:
+            store.validate_published_head(sequence=checkpoint_lsn, activation_sequence=horizon, file_size=storage.file_size)
+            return
+        store.validate_redo(replay, previous_sequence=checkpoint_lsn, activation_sequence=horizon)
+        store.validate_redo_targets(
+            images, previous_sequence=checkpoint_lsn, sequence=final_sequence, activation_sequence=horizon,
+            file_size=lambda file: storage.file_size(file) if storage.exists(file) else 0,
+            resident_image=lambda file, index: cast(bytes | None, self._pool._resident_page_image(file, index)),
+        )
+
     def _validate_catalog_transitions(
         self, replay: CommittedReplay,
         prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
         *, checkpoint_lsn: Lsn | None = None,
-    ) -> None:
+    ) -> int | None:
         """Prove complete schema-catalog snapshots before native replay can mutate.
 
         Legacy hand-composed effect-only plans retain the dispatcher contract;
         actual WAL selectors provide terminal records. Missing physical tails
-        cannot supply a missing catalog image. This does not authorize journal
-        pages. With a caller-proved checkpoint, an activation after that floor
+        cannot supply a missing catalog image. With a caller-proved checkpoint, an activation after that floor
         must be introduced by its own complete schema snapshot in this range.
         """
         if not replay.commit_records:
-            self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
-            return
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
         grouped: dict[tuple[int, int], list[tuple[int, bytes]]] = {}
         for _position, prepared in prepared_pages:
             if prepared.file == CATALOG_FILE:
                 record = prepared.record
                 grouped.setdefault((record.epoch, record.txn_id), []).append((prepared.page_index, prepared.image))
         if not grouped:
-            self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
-            return
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
         seen = False
         previous_horizon: int | None = None
         for terminal in replay.commit_records:
@@ -400,20 +439,20 @@ class CommitRedo:
                 )
             previous_horizon = horizon
             seen = True
+        return previous_horizon
 
     def _validate_catalog_without_schema_effects(
         self, replay: CommittedReplay, checkpoint_lsn: Lsn | None,
-    ) -> None:
+    ) -> int | None:
         """Use current pages, never a mutable/stale adopted catalog, for native gaps.
 
         No schema image exists to repair or establish activation in this range.
         Reading the canonical catalog through this already-fenced pool is therefore
         mandatory. This is one schema read per native replay, not a graph/history
-        walk, and creates no persistent or cached authority. A stable checkpointed
-        head needs the database UUID; new journal effects remain disabled.
+        walk, and creates no persistent or cached authority.
         """
         if checkpoint_lsn is None:
-            return  # Legacy standalone dispatcher has no native control context.
+            return None  # Legacy standalone dispatcher has no native control context.
         storage = self._pool.storage
         exists = storage.exists(CATALOG_FILE)
         empty = not exists or storage.page_count(CATALOG_FILE) == 0
@@ -424,9 +463,9 @@ class CommitRedo:
                     field="commit_catalog_activation",
                 )
         if not exists:
-            return  # Uninitialized/legacy stack; no history may be inferred.
+            return None  # Uninitialized/legacy stack; no history may be inferred.
         if empty and checkpoint_lsn == 0 and not replay.commit_records:
-            return  # Fresh empty file, before bootstrap; no COMMIT is being certified.
+            return None  # Fresh empty file, before bootstrap; no COMMIT is being certified.
         horizon = CatalogStore(self._pool).read_from_pages().commit_catalog_activation
         if horizon is None:
             if any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
@@ -434,26 +473,14 @@ class CommitRedo:
                     "Commit-history files require an activated schema catalog.",
                     field="commit_catalog_activation",
                 )
-            return
+            return None
         if horizon > checkpoint_lsn:
             raise GrafxRecoveryRefused(
                 "Post-checkpoint activation has no schema snapshot in the selected WAL range.",
                 field="commit_catalog_activation", checkpoint_lsn=checkpoint_lsn,
                 activation_lsn=horizon,
             )
-        if not replay.commit_records and checkpoint_lsn > horizon and self._database_uuid is not None:
-            CommitCatalogStore(
-                storage.read_page, database_uuid=self._database_uuid, page_size=self._pool.page_size,
-            ).validate_published_head(
-                sequence=checkpoint_lsn, activation_sequence=horizon, file_size=storage.file_size,
-            )
-            return
-        if checkpoint_lsn > horizon or replay.commit_records:
-            raise GrafxRecoveryRefused(
-                "This native replay requires commit-history coverage not enabled by this build.",
-                field="commit_catalog_replay", checkpoint_lsn=checkpoint_lsn,
-                activation_lsn=horizon,
-            )
+        return horizon
 
     def _verify_preflight_for(
         self,
@@ -525,6 +552,11 @@ class CommitRedo:
         meta_baselines: dict[tuple[str, int], Page | None] | None = None,
     ) -> tuple[bool, frozenset[int]]:
         """Classify one decoded page without granting authority to manager lookalikes."""
+        if file in COMMIT_CATALOG_PAGE_FILES:
+            # Full journal validation is mandatory before this fact is consumed.
+            # Audit history changes no heap/MVCC table watermark; treating it as
+            # unknown would make every journal append scan all indexed tables.
+            return True, frozenset()
         manager = self._index_manager
         if manager is None:
             return False, frozenset()
@@ -807,12 +839,17 @@ class CommitRedo:
         effects: tuple[WalRecord, ...],
         *,
         allow_unregistered_indexes: bool,
+        allow_commit_catalog: bool = False,
     ) -> tuple[
         tuple[tuple[int, _PreparedPageEffect], ...],
         tuple[tuple[object, ...], ...],
         bool,
     ]:
         """Refuse an incomplete or malformed dispatch plan before the first mutation."""
+        if allow_commit_catalog:
+            assert self._database_uuid is not None
+            CommitCatalogStore(self._pool.storage.read_page, database_uuid=self._database_uuid,
+                               page_size=self._pool.page_size)._capture_redo_payloads(effects)
         missing_manager_lsn: Lsn | None = None
         contains_index_reset = False
         simulated_page_counts: dict[str, int] = {}
@@ -857,16 +894,13 @@ class CommitRedo:
                     format_version=record.format_version,
                     flags=record.flags,
                 )
-                if write.file in COMMIT_CATALOG_PAGE_FILES:
-                    # Knowing the required envelope is not yet proof of complete
-                    # journal coverage or authorization to apply individual pages.
-                    # Keep every preceding effect unapplied until the complete
-                    # cross-file replay protocol replaces this integration guard.
+                journal = write.file in COMMIT_CATALOG_PAGE_FILES
+                if journal and not allow_commit_catalog:
                     raise GrafxRecoveryRefused(
                         "Commit catalog replay is not enabled by this build; no effect was applied.",
                         field="commit_catalog_replay", lsn=record.lsn,
                     )
-                if not is_redoable_page_file(write.file):
+                if not journal and not is_redoable_page_file(write.file):
                     raise GrafxRecoveryRefused(
                         f"Committed page record {record.lsn} names non-data file "
                         f"{write.file!r}; no effect was applied.",
