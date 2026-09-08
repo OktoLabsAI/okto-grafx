@@ -7,6 +7,13 @@ conflict rather than silently deviating — a unilateral interface change breaks
 Authority chain: `docs/specs/SPEC-M1.md` and `docs/specs/SPEC-VEC.md` are the requirements;
 this contract is the single agreed realization of them.
 
+Documentation routing update (2026-09-08): the only active backlog is
+[ROADMAP.md](../../ROADMAP.md). Historical `PUNCHLIST.md`, Round 7 and evolution
+plan references below resolve to the [consolidated source archive](../archive/ROADMAP_SOURCES.md).
+New gaps are recorded in the roadmap, not a recreated punch-list. The current
+[performance policy](../PERFORMANCE.md) supersedes historical timing gates only;
+storage, concurrency, recovery and quality invariants are unchanged.
+
 ---
 
 ## 0. Non-negotiables (from the board guidelines and binding decisions D1–D9)
@@ -2762,7 +2769,7 @@ was started before they existed. A standard that rises during the review is not 
 **Everything else is a PUNCH-LIST note, not a rejection** -- and the critic still reports it:
 mutation survivors whose behaviour is correct; unpinned constants; stale docstrings; masked guards
 that behave correctly; message quality; cosmetics; hypotheses that could not be demonstrated. These
-accumulate in `docs/architecture/PUNCHLIST.md` and are worked in W6 integration hardening.
+accumulate in `ROADMAP.md` (historical detail in `docs/archive/ROADMAP_SOURCES.md`) and are worked in W6 integration hardening.
 
 **Round cap: two more rounds per W1 component.** A round that produces only punch-list notes is a
 **SIGN-OFF with punch list**, not a rejection. If a genuine blocker survives two more rounds, the

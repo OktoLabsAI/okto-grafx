@@ -7,6 +7,12 @@ contract wins and this document is wrong.
 
 For the port protocols and how to substitute an adapter, see [PORTS.md](PORTS.md).
 
+For application integration use the [consumer index](README.md), not internal
+component constructors. Current backlog/limitations live only in [ROADMAP](../ROADMAP.md);
+dated component sign-offs and numeric test counts below are historical evidence,
+not the current release verdict. [Performance policy](PERFORMANCE.md) supersedes
+historical D5 timing gates without changing the durability/concurrency contract.
+
 ---
 
 ## 1. The shape and why
@@ -216,7 +222,7 @@ cannot disagree about one invariant.
 
 ```
 mydb/
-  identity.dat     one page: what this database is. A mismatched open is refused, not adapted.
+  grafx.meta       persistent database identity. A mismatched page-size/identity open is refused.
   catalog.dat      schema plus catalog-v2 logical exact-index/generation authority
   heap.dat         page 0 is the table directory; every other page is a slotted data page
   index/           immutable exact generations plus schema-derived vector index files
@@ -427,7 +433,7 @@ incident the design exists to prevent.
 
 | | |
 |---|---|
-| Suite | 7900+ tests, 0 failures, 5 attributed platform skips |
+| Suite | Historical checkpoint: 7900+ tests, 0 failures, 5 attributed platform skips; consult the named current validation receipt, not this count, for release status |
 | Import boundary | A test walks the graph; the engine importing a mechanism fails the build |
 | Fault injection | A device that refuses the *n*-th write, reports full, or fails a barrier |
 | Multi-process | Real OS processes against one database, spawned with `spawn` |
@@ -453,4 +459,4 @@ that made a heap unreadable needed all three to be false at once.
 - [`architecture/ST2_DESCRIPTOR_REVALIDATION.md`](architecture/ST2_DESCRIPTOR_REVALIDATION.md) —
   descriptor identity policy, exact generation whitelist and deployment trade-offs.
 - `docs/architecture/LESSONS.md` — what went wrong here and what it taught.
-- `docs/architecture/PUNCHLIST.md` — the known gaps.
+- [Roadmap](../ROADMAP.md) — current known gaps, corrections and evolution; historical punch-list preserved in its source archive.

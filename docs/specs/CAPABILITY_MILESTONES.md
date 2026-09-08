@@ -1,16 +1,13 @@
 # Complementary capability specification index
 
-These specifications implement GX-CAP-0 routing, not the capabilities themselves.
-Every source requirement remains incorporated in full; the short specifications
-add ownership, prerequisites and refusal/recovery boundaries without replacing the
-[database-first roadmap](../../GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md) or
-[agent-first roadmap](../../AGENT_FIRST_EVOLUTION_PLAN_CODEX.md).
-The [main evolution plan](../../EVOLUTION_PLAN_CODEX.md) governs their interaction.
+These specifications define acceptance, not an independent implementation queue.
+The single [roadmap](../../ROADMAP.md) owns priority/current status. Full former
+requirements remain in the [source archive](../archive/ROADMAP_SOURCES.md).
 
 | Milestone | Specification | Implementation status |
 |---|---|---|
 | GX-CAP-0 | [Boundaries/contracts](SPEC-GX-CAP-0.md) | Enforcement and contract checkpoint |
-| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | Admission and record codec implemented; paged store/publication pending |
+| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | Partial: paged journal validation/replay/checkpoint integrated; automatic emission/public history API not enabled |
 | GX-CAP-2 | [Catalog sessions and workspace scopes](SPEC-GX-CAP-2.md) | Not certified; contract routing only |
 | GX-CAP-3 | [Temporal system time](SPEC-GX-CAP-3.md) | Not certified; contract routing only |
 | GX-CAP-4 | [Valid time, bitemporal queries and graph diff](SPEC-GX-CAP-4.md) | Not certified; contract routing only |
@@ -38,10 +35,11 @@ implementation is done once in the database; the consumer contract remains in th
 agent roadmap. No prompt storage, automatic contradiction winner, unscoped user
 write, implicit distributed transaction or mandatory MCP server is introduced.
 
-## Next implementation boundary
+## Dependency boundary
 
 GX-CAP-1 must prove the physical CommitId mapping, metadata admission/canonical bytes,
 legacy-store boundary and crash protocol before exposing a typed API.
 GX-CAP-2 lifecycle work may begin from its generic contracts, but promotion receipts
 depend on commit identity. Shared format/commit changes remain serialized.
-Current Grafx 0.0.4 performance work is tracked independently and remains open.
+Current status and finite performance residuals are tracked only in
+[ROADMAP.md](../../ROADMAP.md); do not create a separate queue here.

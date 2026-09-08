@@ -21,7 +21,7 @@ pip install -e ".[dev,accel]"
 pytest -q
 ```
 
-The suite is around 7900 tests and takes roughly ten minutes on a free machine. Install `[accel]`
+Suite size and duration change with the selected revision and machine. Install `[accel]`
 even for development: it makes a second implementation of the checksum port reachable, and a port
 with one reachable implementation is an unmeasured surface however green the suite looks.
 
@@ -33,7 +33,31 @@ pytest tests/txn/test_chain_relink_regressions.py -q
 pytest -m "not slow" -q
 ```
 
-## Where code goes
+## Documentation workflow
+
+The [documentation index](docs/README.md) routes consumers; [ROADMAP.md](ROADMAP.md)
+is the only active product backlog, including known limitations and corrections.
+Do not create another next-steps/evolution/version-plan document. Dated experiments
+belong in `docs/reports/`, indexed there and referenced by the corresponding roadmap
+item; specs/ADRs describe acceptance/architecture, not competing execution queues.
+
+For a public change, update the relevant guide, configuration/query/error contract,
+roadmap status and changelog. Regenerate the signature appendix when declarations
+change; do not hand-edit it. New runnable examples need a consumer regression.
+
+```sh
+python tools/generate_api_reference.py --check
+python tools/check_documentation.py
+python -m pytest tests/consumer/test_documentation.py tests/foundation/test_public_adapter_docs.py -q
+```
+
+The archive's content/hash manifest must stay intact. Original paths in historical
+prose are provenance, not current instructions. Performance tables must name build,
+workload and measurement boundary; unknown data stays unknown. Prefer proportional
+focused/grouped checks for documentation changes; engine changes retain their
+relevant quality/packaging/multi-process validation obligations.
+
+## Code ownership
 
 The layering is enforced by a test, not by convention. `tests/test_import_boundary.py` walks the
 import graph and fails the build if `domain/**` or `engine/**` imports `os`, `time`, `socket`,
@@ -116,7 +140,7 @@ pytest tests/smoke -q
 4. Describe the validation you performed. For a correctness change, state the regime you measured in
    and the numbers you measured — a claim nobody can re-run is worse than no claim, and this project
    has a lesson about that (L31).
-5. Record known gaps in `docs/architecture/PUNCHLIST.md` rather than leaving them implied.
+5. Record known gaps in `ROADMAP.md` (historical detail in `docs/archive/ROADMAP_SOURCES.md`) rather than leaving them implied.
 6. Resolve review conversations and wait for the required checks and approvals before merging.
 
 Never commit a database directory, a WAL, metrics output, a quarantine or ledger file, or private
@@ -144,7 +168,7 @@ If you review a change here, the standard is `CONTRACT.md` §14, applied literal
   is reachable by an ordinary caller and its absence produces one of the outcomes above, in which
   case it is blocking and needs a test.
 - Naming, message wording, docstring accuracy, performance, design preference, and anything already
-  in `PUNCHLIST.md` are not grounds for rejection.
+  recorded as nonblocking in [ROADMAP.md](ROADMAP.md) are not grounds for rejection.
 
 A false claim in a comment on a safety argument **is** worth raising, because the next reader will
 rely on it.

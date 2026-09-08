@@ -1,0 +1,46 @@
+# Documentation index
+
+The consumer guides describe source version **0.0.4**. They do not assert PyPI
+publication or that the latest source is installed in a particular application.
+
+## Integrate without reading engine internals
+
+| Question | Read |
+| --- | --- |
+| How do I install, create a graph and reopen it? | [Getting started](GETTING_STARTED.md) |
+| How do I integrate a synchronous library into services, workers or agents? | [Integration](INTEGRATION.md) |
+| Which public methods and return values exist? | [API reference](API_REFERENCE.md) |
+| Which settings exist, what are their defaults and risks? | [Configuration](CONFIGURATION.md) |
+| Which Cypher constructs and value types are supported? | [Query language](QUERY_LANGUAGE.md) |
+| How do indexes, vectors and explicit growth work? | [Indexes and vectors](INDEXES_AND_VECTORS.md) |
+| How do I handle conflicts, uncertain writes, recovery and upgrades? | [Operations](OPERATIONS.md) |
+| How can a script/agent consume structured results? | [CLI](CLI.md) |
+| What has actually been measured? | [Performance](PERFORMANCE.md) |
+| What is missing or planned? | [Roadmap](../ROADMAP.md) |
+
+Recommended reading order: tutorial → integration → configuration → operations;
+then consult the API/query references for the capabilities your application uses.
+
+## Extend or maintain the engine
+
+- [Ports and custom adapters](PORTS.md): trusted in-process extension boundary,
+  ownership and examples. This is not a sandbox or the proposed UDF SPI.
+- [Architecture](ARCHITECTURE.md) and [normative engine contract](architecture/CONTRACT.md).
+- [Capability specifications](specs/CAPABILITY_MILESTONES.md): detailed acceptance
+  contracts; their existence is not evidence that a feature is callable.
+- [Component design record](architecture/COMPONENTS.md), [lessons](architecture/LESSONS.md),
+  [contributing](../CONTRIBUTING.md), [security policy](../SECURITY.md).
+
+## Historical evidence, not competing plans
+
+- [Report index](reports/README.md): dated experiments, implementation checkpoints,
+  Pulse audits and historical comparisons.
+- [Consolidated former plans](archive/ROADMAP_SOURCES.md): eleven complete source
+  documents, including evolution, agent-first, complementary, Round 7 and performance
+  plans. [Preservation manifest](archive/ROADMAP_SOURCES_MANIFEST.json).
+- [Previous README](archive/README_BEFORE_REFACTOR.md): provenance only; superseded.
+
+The **only current queue/status authority is [ROADMAP.md](../ROADMAP.md)**. Reports
+remain reproducible evidence, specs define acceptance, and this index routes readers.
+Historical “next step”, PID, deadline, approval and performance-gate statements do
+not become current instructions by being preserved.

@@ -8,9 +8,9 @@ Dependencies: M1 typed API; GX-CAP-0.
 
 ## Normative scope
 
-[Complementary roadmap](../../GRAFX_COMPLEMENTARY_EVOLUTION_PLAN_CODEX.md), §6; §17 GX-CAP-1.
-[Agent-first roadmap](../../AGENT_FIRST_EVOLUTION_PLAN_CODEX.md) remains incorporated
-in full under the [main plan](../../EVOLUTION_PLAN_CODEX.md) governance rule.
+[Full complementary requirements](../archive/ROADMAP_SOURCES.md#source-grafx-complementary-evolution-plan-codex), §6; §17 GX-CAP-1.
+[Full agent requirements](../archive/ROADMAP_SOURCES.md#source-agent-first-evolution-plan-codex) remains incorporated
+in full under the [roadmap](../../ROADMAP.md) governance rule.
 All requirements, proposed interfaces, gates, non-goals and detailed subphases in
 those source sections apply; this routing specification does not replace them.
 

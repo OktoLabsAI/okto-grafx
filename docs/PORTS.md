@@ -327,6 +327,7 @@ about because it behaves differently from the seven above.
 | Selector | Behaviour |
 |---|---|
 | `checksum="pure"` | The pure-Python reference, always |
+| `checksum="native"` | Require the accepted native provider; missing dependency/refused provider fails explicitly |
 | `checksum="auto"` *(default)* | The native implementation when `google-crc32c` is installed; the reference otherwise |
 
 **`auto` accelerates here and does not for `vector_math`, and the difference is not inconsistency.**
@@ -357,7 +358,7 @@ never published or inherited by another opener.
 checksum implementations. `connect(a, checksum="pure")` followed by `connect(b)` leaves both on
 whatever the second call installed. No digest changes — they are byte-identical by construction —
 but `crc32c_implementation()` reports the installed name, not the requested one. This is recorded in
-`docs/architecture/PUNCHLIST.md`.
+[the operational roadmap](../ROADMAP.md#known-limitations-and-corrective-work).
 
 ---
 
