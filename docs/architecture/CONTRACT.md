@@ -713,8 +713,11 @@ Record types: `1 BEGIN · 2 WRITE_PAGE · 3 COMMIT · 4 ABORT · 5 CHECKPOINT ·
 **Decoder rule:** the decoder accepts every declared supported header version, then applies the
 closed record-type/flags grammar for that version. Round-trip tests per supported version are
 mandatory (TR-4). WAL v1 flags remain opaque and gain no retrospective meaning. In WAL v2, bit
-`0x0001` means REQUIRED, bit `0x0004` means `PAGE_IMAGE_ZLIB1` and bit `0x0008` means
-SKIPPABLE; the only v2 grammar currently emitted is `WRITE_PAGE` with the first two bits set. An
+`0x0001` means REQUIRED, bit `0x0004` means `PAGE_IMAGE_ZLIB1`, bit `0x0008` means
+SKIPPABLE and bit `0x0010` means `COMMIT_CATALOG_V1`. WRITE_PAGE accepts exactly
+`0x0005` (ordinary compressed page), `0x0011` (raw journal page), or `0x0015`
+(compressed journal page). Journal framing is implemented but automatic journal
+emission/replay remain disabled; those targets refuse before any replay effect. An
 unknown v2 type is skippable only with exactly `0x0008`; flags zero are fail-closed so forgetting to
 mark a future required type cannot silently drop it. Unsupported semantics and a known type without
 a v2 grammar are typed schema-version refusals and must not be truncated, appended past or recycled.
@@ -727,8 +730,18 @@ The compressed `WRITE_PAGE` v2 payload retains the v1 clear prefix
 consume exactly one complete stream and must produce exactly the declared length before the normal
 page codec validates the image. Emission requires the persistent catalog-v2 capability
 `wal_record_v2`, activated in a preceding v1-only transaction. A raw batch that would roll to a new
-segment remains entirely v1 so compression cannot change the `SEGMENT_HEADER`/terminal-CSN plan.
+segment keeps ordinary page effects in v1 so compression cannot change the
+`SEGMENT_HEADER`/terminal-CSN plan. Future journal effects must retain their required
+`0x0011` v2 framing even on roll; uncompressed does not mean legacy journal semantics.
 See `WAL_PAGE_COMPRESSION_V1.md`.
+
+Journal WRITE_PAGE targets are exactly `commits.dir` or `commits.dat`; both retain
+the same clear target prefix. Raw journal images follow the prefix directly;
+compressed images reuse the bounded compression grammar above. A journal bit on
+another target is corrupt known semantics; journal targets without the bit are
+typed schema-version refusals, never a legacy fallback. Full-page validation and
+cross-file publication/recovery proof remain necessary beyond this payload codec.
+See [COMMIT_CATALOG_V1](COMMIT_CATALOG_V1.md).
 
 `COMMIT` payload (canonical, versioned): `snapshot_lsn u64 | read_partition_count u32 |
 write_partition_count u32 | read_partitions[u64...] | write_partitions[u64...] | page_touch_count u32 |

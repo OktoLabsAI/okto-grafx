@@ -14,6 +14,14 @@
 
 ## Resumo vigente — 2026-09-08
 
+GX-CAP-1 ganhou a gramática obrigatória do WAL para páginas de histórico: flags
+v2 distintos com/sem compressão, sem fallback para framing legado. O recovery
+reconhece a gramática mas recusa aplicá-la antes de qualquer mutação, até fechar
+a validação/publicação do journal inteiro. Testados leitor antigo simulado,
+read/append/recycle sem alterar o WAL, framing e sizing com roll; grupo final
+de 894 testes em 17,63 s. Não é ainda histórico público utilizável. Evidências e
+limites: [SPEC-GX-CAP-1](docs/specs/SPEC-GX-CAP-1.md).
+
 GX-CAP-1 tem codec, planejador/leitor paginado, binding do LSN e ativação interna
 do horizonte de histórico implementados (ativação: `3d6ef7f822cbe14293f72ee886f91a1fe365485a`). A ativação usa o commit real, inclusive
 roll, e persiste capability obrigatória; ainda não publica os registros de histórico.

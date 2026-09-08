@@ -1,6 +1,6 @@
 # Commit catalog v1 — CAP-1B persistence contract
 
-Status: record codec, private paged planner/reader and internal activation fence implemented;
+Status: record codec, private paged planner/reader, internal activation fence and required WAL framing implemented;
 automatic journal publication/replay and public API NOT enabled. Activated test stores
 refuse subsequent writing commits until publication is wired. Not deployable as a
 public capability. Authority: ADR GX-003 and SPEC-GX-CAP-1.
@@ -82,7 +82,8 @@ carry required grammar discrimination so an already-open older writer/recovery
 cannot interpret new file targets as repairable corruption. Do not register a new
 record type as known until replay can apply or explicitly refuse it safely.
 Catalog required bit 4 (`1 << 4`, `commit_catalog_v1`) is assigned. Required journal
-WAL grammar remains pending; journal targets must not be emitted as legacy effects.
+WAL framing is implemented below; automatic journal emission remains pending and
+journal targets must not be emitted as legacy effects.
 
 ### Internal activation fence implemented
 
@@ -111,13 +112,50 @@ activated fixtures, including a participant that began before foreign activation
 The guard rechecks current catalog authority under the existing commit fence; it
 does not authorize a second-OCC shortcut. This is deliberately NOT a public API or
 an instruction to activate production. Non-activated stores retain normal behavior.
-Both fresh data and maintenance publication still need journal staging, required
-WAL grammar, coverage checks and replay before this guard can be replaced.
+Both fresh data and maintenance publication still need journal staging, emission
+using the required WAL grammar, coverage checks and replay before this guard can be replaced.
 
 The independent horizon will distinguish a legal empty tracked interval (durable
 control still at activation) from missing history after later commits. Missing files
 must never silently redefine the beginning of the tracked interval. Initialization
 and partial-file crash classification remain part of publication/recovery work.
+
+### Required journal WAL framing implemented
+
+`WRITE_PAGE`, format_version 2, uses required flag `COMMIT_CATALOG_V1=0x0010`
+together with REQUIRED `0x0001`. Exactly three WRITE_PAGE-v2 flag combinations
+are understood: ordinary compressed page `0x0005`, raw journal `0x0011`, and
+compressed journal `0x0015`. No new record type or global format bump is needed.
+Unknown/reserved/skippable mixtures remain upgrade refusals, never skipped writes.
+
+Journal targets are exactly `commits.dir` and `commits.dat`. Raw pages use the
+legacy clear target-prefix layout followed by the raw image, but **not** the
+legacy envelope. Compressed pages retain the clear prefix, u32 uncompressed length
+and bounded single zlib stream. Compression refusal/non-benefit returns raw v2
+`0x0011`, never v1. The segment-roll plan likewise must preserve this required
+marker; its fixed-width flags do not change image count or raw batch size.
+
+A required journal bit on another target is invalid known semantics (corruption).
+A journal target with legacy or ordinary-compression framing is an unsupported
+schema/grammar refusal. V1 flags remain opaque for ordinary targets. The generic
+raw payload helper is not emission authorization; the envelope-aware encoder owns
+the required flags. Common target names now live in `domain/txn/records.py` and
+the private store imports them instead of maintaining a second spelling.
+
+The current CommitRedo preflight explicitly refuses journal effects with field
+`commit_catalog_replay` before **any** effect in the batch is applied. Knowing the
+bytes is not proof of journal coverage. The generic redo target allowlist remains
+closed to these two files. This temporary guard is replaced only by complete
+cross-file replay validation, not removed merely to make an append test pass.
+The transaction activation guard also remains in force. These private codecs
+must not be treated as a usable public history feature or deployed to Pulse.
+
+Tests exercise exact flags, round trips with compression on/off/unprofitable,
+target/grammar confusion and an old compression-only semantic decoder in the
+real WalManager. Old read/append/recycle doors refuse with unchanged WAL bytes.
+This is an injected legacy semantic rule, not execution of an old binary. The
+required-grammar size-only roll planner still appends no journal WAL; dedicated
+framing fixtures append only to isolated in-memory WALs, without a database commit.
 
 After activation, the existing commit protocol must incorporate the full record,
 directory and tail/head effects as ordinary full-page WAL images. No independently

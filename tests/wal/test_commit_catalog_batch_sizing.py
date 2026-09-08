@@ -1,8 +1,7 @@
 """Actual WAL size/roll planner with journal images; no journal WAL is appended.
 
-These are size-only legacy envelopes: enabling required journal grammar remains
-an integration prerequisite. This suite must not manufacture an apparently usable
-catalog WAL before its format discrimination and replay are implemented.
+These use required journal grammar, but remain size-only previews: replay and
+automatic publication are still integration prerequisites. No append is performed.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from okto_grafx.adapters.storage_memory import MemoryStorageDevice
 from okto_grafx.domain.model.value import Timestamp
 from okto_grafx.domain.txn.commit_identity import CommitId
 from okto_grafx.domain.txn.commit_metadata import CommitMetadata
-from okto_grafx.domain.txn.records import encode_page_write
+from okto_grafx.domain.txn.records import encode_page_write_record
 from okto_grafx.domain.wal.commit import CommitPayload
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.engine.commit_catalog_store import CommitCatalogPlan, CommitCatalogStore
@@ -23,12 +22,13 @@ from okto_grafx.engine.wal_manager import WalManager
 
 
 def size_envelopes(plan: CommitCatalogPlan) -> tuple[WalRecord, ...]:
-    pages = tuple(
-        WalRecord(
+    pages: list[WalRecord] = []
+    for image in plan.images:
+        encoded = encode_page_write_record(image.file, image.page_index, image.raw, compress=False)
+        pages.append(WalRecord(
             int(WalRecordType.WRITE_PAGE), epoch=1, txn_id=9,
-            payload=encode_page_write(image.file, image.page_index, image.raw),
-        ) for image in plan.images
-    )
+            payload=encoded.payload, format_version=encoded.format_version, flags=encoded.flags,
+        ))
     return (*pages, WalRecord(
         int(WalRecordType.COMMIT), epoch=1, txn_id=9,
         payload=CommitPayload.build(

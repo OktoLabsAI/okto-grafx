@@ -30,10 +30,9 @@ from okto_grafx.domain.txn.commit_catalog import (
     decode_commit_catalog_entry,
 )
 from okto_grafx.domain.txn.commit_identity import CommitId, assign_commit_time
+from okto_grafx.domain.txn.records import COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE
 
 
-COMMIT_DIRECTORY_FILE = "commits.dir"
-COMMIT_STREAM_FILE = "commits.dat"
 _HEAD = Struct("<8sHH16sQQQQq")
 _BLOCK = Struct("<8sHH16sQ")
 _ITEM = Struct("<QQIIq")

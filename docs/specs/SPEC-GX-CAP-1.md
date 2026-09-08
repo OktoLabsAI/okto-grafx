@@ -1,8 +1,8 @@
 # SPEC-GX-CAP-1 — Commit identity and provenance
 
 Status: CAP-1A domain admission implemented and validated; persistent/public capability not certified.
-CAP-1B record codec, private paged image planner/reader and internal activation fence
-are implemented; automatic journal publication/recovery and public wiring are pending.
+CAP-1B record codec, private paged image planner/reader, internal activation fence and
+required WAL framing are implemented; automatic publication/recovery and public wiring are pending.
 Date: 2026-09-08. Branch: feature/gx-cap-1, based on c310675.
 Dependencies: M1 typed API; GX-CAP-0.
 
@@ -333,3 +333,46 @@ staging before second OCC, including maintenance; full redo/coverage validation;
 public lookup and legacy boundary; metrics/verify, transfer/restore/fork and the
 complete concurrency/crash gates. Existing OCC, WAL/durability and multi-reader/
 writer premises were not relaxed. No Pulse operation or extra spec was consumed.
+
+### CAP-1B required journal WAL grammar — 2026-09-08
+
+Implemented required flag `COMMIT_CATALOG_V1=0x0010`: raw journal pages use exact
+v2 flags `0x0011`, compressed journal pages use `0x0015`. Existing compressed
+ordinary pages retain `0x0005`. The journal marker survives unprofitable/disabled
+compression and the raw segment-roll sizing path. The file names are fixed and
+centrally defined. Journal/ordinary-target confusion refuses with typed errors;
+ordinary v1 flags do not acquire retrospective meaning.
+
+Decoding the grammar is not replay authorization. CommitRedo explicitly refuses
+journal effects during full preflight, before even an earlier valid heap image
+can move. Native redo target allowlists and automatic writing remain closed until
+cross-file coverage/replay/staging are implemented. No user-facing activation.
+
+The tests initially failed collection because the new grammar constants did not
+exist. Focused framing/planner/redo suites: **144 passed in 0.52 s**. Final group:
+
+```text
+python -m pytest tests/wal tests/recovery/test_commit_redo.py
+  tests/recovery/test_recovery_manager.py
+  tests/recovery/test_catalog_commit_state_coactivation.py
+  tests/txn/test_commit_catalog_activation.py tests/txn/test_commit_catalog_store.py
+  tests/api/test_wal_page_compression.py tests/test_import_boundary.py
+  tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**894 passed in 17.63 s** (overlapping, not added to 144). The framing suite has
+95 cases, including all flag values 0..63 and the old decoder rule on real
+WalManager read/append/recycle doors with unchanged log bytes. Four new dispatcher
+tests cover both journal files with/without compression and a valid ordinary
+prefix, proving refusal before mutation. The two real size/roll-planner cases
+now use required v2 envelopes; they still perform no journal append.
+
+Ruff and diff-check pass. Strict mypy diagnostics on the six checked modules are
+identical with/without the change: four preexisting errors, three in imported
+Catalog and one in CommitRedo's error-details forwarding. Comparison uses HEAD
+`b032fef` shadow source for CommitRedo; no new type errors are concealed. This is
+not a type-clean whole-engine claim. Old-binary execution, publication/crash and
+complete concurrent history guarantees remain outstanding; injected legacy
+semantics and replay refusal are prerequisites, not substitutes for those gates.
+Pulse was not changed and no reserved spec was consumed.

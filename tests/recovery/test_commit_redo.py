@@ -17,8 +17,39 @@ from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.engine import commit_redo as commit_redo_module
 from okto_grafx.engine.buffer_pool import MAX_REDO_GAP_PAGES
 from okto_grafx.engine.commit_redo import CommitRedo, is_redoable_page_file
+from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
 
 from .conftest import DESCRIPTOR, build_stack, make_page_image
+
+
+@pytest.mark.parametrize("file", ["commits.dir", "commits.dat"])
+@pytest.mark.parametrize("compress", [False, True])
+def test_required_journal_refuses_before_valid_prefix_moves_until_replay_is_wired(
+    file: str, compress: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_read(file: str, index: int) -> bytes:
+        pytest.fail("Initialization must not read storage.")
+
+    store = CommitCatalogStore(no_read, database_uuid=bytes(16), page_size=512)
+    image = next(image for image in store.plan_initialize(activation_sequence=1).images if image.file == file)
+    encoded = encode_page_write_record(file, 0, image.raw, compress=compress)
+    effect = WalRecord(
+        WalRecordType.WRITE_PAGE, encoded.payload, lsn=2, epoch=1, txn_id=7,
+        format_version=encoded.format_version, flags=encoded.flags,
+    )
+    calls: list[str] = []
+
+    def apply_page(_pool: object, file: str, page_index: int, raw: bytes) -> bool:
+        calls.append(file)
+        return True
+
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", apply_page)
+    pool = _PoolDouble()
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        CommitRedo(pool).apply(CommittedReplay(effects=(_page_record(), effect), last_committed_lsn=3))  # type: ignore[arg-type]
+    assert failure.value.details["field"] == "commit_catalog_replay"
+    assert pool.codec.decode_calls == 1  # The ordinary prefix was really validated.
+    assert calls == [] and pool.flush_calls == []
 
 
 @dataclass(frozen=True)

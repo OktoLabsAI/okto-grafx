@@ -22,7 +22,9 @@ from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
-from okto_grafx.domain.txn.records import decode_page_write, is_redoable_page_file
+from okto_grafx.domain.txn.records import (
+    COMMIT_CATALOG_PAGE_FILES, decode_page_write, is_redoable_page_file,
+)
 from okto_grafx.domain.wal.record import WalRecord, WalRecordType
 from okto_grafx.engine.buffer_pool import (
     MAX_REDO_GAP_PAGES,
@@ -618,6 +620,15 @@ class CommitRedo:
                     format_version=record.format_version,
                     flags=record.flags,
                 )
+                if write.file in COMMIT_CATALOG_PAGE_FILES:
+                    # Knowing the required envelope is not yet proof of complete
+                    # journal coverage or authorization to apply individual pages.
+                    # Keep every preceding effect unapplied until the complete
+                    # cross-file replay protocol replaces this integration guard.
+                    raise GrafxRecoveryRefused(
+                        "Commit catalog replay is not enabled by this build; no effect was applied.",
+                        field="commit_catalog_replay", lsn=record.lsn,
+                    )
                 if not is_redoable_page_file(write.file):
                     raise GrafxRecoveryRefused(
                         f"Committed page record {record.lsn} names non-data file "

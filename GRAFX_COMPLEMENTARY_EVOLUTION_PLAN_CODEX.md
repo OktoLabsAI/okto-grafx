@@ -3,6 +3,14 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / gramática WAL / 2026-09-08:** framing obrigatório do journal
+implementado em v2 (`0x0011` raw, `0x0015` comprimido). Semântica antiga simulada
+recusa leitura, append e recycle sem alterar bytes; preflight do recovery recusa
+o journal antes de aplicar qualquer prefixo. Alvos de redo e publicação automática
+continuam fechados até integração completa. Grupo de 894 testes em 17,63 s, sem
+novos erros de tipagem nos módulos verificados. Evidência, restrições e próximos
+requisitos: [`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md). Pulse/specs intocados.
+
 **GX-CAP-1B / ativação interna / 2026-09-08:** catálogo v2 agora persiste o
 horizonte do COMMIT de ativação com capability obrigatória. A preparação privada
 usa WAL v1, ajusta o horizonte no roll e recupera o mesmo resultado após falha
