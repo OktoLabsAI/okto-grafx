@@ -888,3 +888,14 @@ transaction: 1.896 s profiled for the same five authored candidates, 5 nodes /
 production health/relational/MCP boundaries prevent comparison with the 22.981 s
 live commit. No new micro-optimization selected or reserved spec consumed.
 Profile and limitations: `GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.
+
+Full-write attribution now has production phase observations prepared in Core
+`0a38312`: health admission, graph dispatch, cognitive append, audit/outbox staging
+and non-deferred finalization. The helper adds no retries/tasks/shields, preserves
+result/error/cancellation identity, excludes payloads and does not equate staging
+with relational durability. Deferred restaging emits no new graph phase. Final
+combined consolidation/cancellation/connectivity/provenance slice: 38 passed in
+15.37 s; Ruff/diff pass. Source only until accumulated deployment, no reserved
+spec consumed or native protocol change. This supplies evidence for the existing
+22.981 s attribution task, not a new performance gate or a speedup claim. Contract
+and measurement boundaries: Core `docs/KG_CONSOLIDATION_PHASE_TIMING.md`.

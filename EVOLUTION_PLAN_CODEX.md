@@ -72,6 +72,16 @@ SQLite/outbox e MCP; **não substitui os 22,981 s do commit real**. Nenhuma outr
 spec foi consumida nem micro-otimização selecionada a partir desse perfil.
 Detalhes e limites: `docs/GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.
 
+Para fechar a atribuição no próximo benchmark autorizado, Core **`0a38312`**
+acrescenta observações neutras por fase à consolidação real: admissão Health,
+dispatch do grafo, append cognitivo, staging audit/outbox e finalização não
+diferida. Sem payloads, retry adicional, mudanças de task/lock/shield ou acoplamento
+Grafx. Retorno de staging não é rotulado como durabilidade; retry relacional não
+registra nova escrita no grafo. 38 testes/15,37 s, Ruff/diff verdes. Fonte preparada
+para deploy acumulado, sem reiniciar o Pulse PID 15940 nem consumir outra spec.
+Isso não é ganho de latência nem novo gate; é atribuição do custo completo já
+pendente. Contrato Core: `docs/KG_CONSOLIDATION_PHASE_TIMING.md`.
+
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |
