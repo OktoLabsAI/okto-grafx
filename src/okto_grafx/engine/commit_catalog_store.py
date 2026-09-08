@@ -23,6 +23,7 @@ from okto_grafx.domain.ids import NO_PAGE, PROVISIONAL_CSN
 from okto_grafx.domain.model.value import Timestamp
 from okto_grafx.domain.page import FileHeader, FileKind, Page, PageType
 from okto_grafx.domain.page.layout import validate_page_size
+from okto_grafx.domain.recovery.decision import CommittedReplay, validate_commit_boundaries
 from okto_grafx.domain.txn.commit_catalog import (
     MAX_COMMIT_RECORD_BYTES,
     CommitCatalogEntry,
@@ -33,7 +34,10 @@ from okto_grafx.domain.txn.commit_identity import CommitId, assign_commit_time
 from okto_grafx.domain.txn.records import (
     COMMIT_DIRECTORY_FILE as COMMIT_DIRECTORY_FILE,
     COMMIT_STREAM_FILE as COMMIT_STREAM_FILE,
+    decode_page_write,
+    decode_page_write_location,
 )
+from okto_grafx.domain.wal.record import WAL_V2_FLAG_COMMIT_CATALOG_V1, WalRecordType
 
 
 _HEAD = Struct("<8sHH16sQQQQq")
@@ -436,30 +440,21 @@ class CommitCatalogStore:
         images.append(self._header_image(_DIRECTORY, new_head))
         return CommitCatalogPlan(new_head, tuple(images))
 
-    def validate_append_images(
-        self, images: tuple[CommitCatalogPageImage, ...], *,
-        previous_sequence: int, sequence: int, activation_sequence: int,
-    ) -> CommitCatalogEntry:
-        """Validate one complete stamped append against a proved predecessor view.
-
-        The provider MUST represent the predecessor, not a partially applied or
-        newer head. Recovery must establish that view before using this validator;
-        this method neither reconstructs it nor grants physical authority. No
-        image is applied. Caller-owned fields are captured before provider calls.
-        Work is bounded by the old/new last record sizes, never retained history.
-        """
-        for value in (previous_sequence, sequence, activation_sequence):
-            CommitId(self._uuid, value)
-        if not activation_sequence <= previous_sequence < sequence:
-            raise _invalid("append_sequence")
-        if type(images) is not tuple:
-            raise _invalid("append_images")
+    def _admit_append_image_count(self, count: int) -> None:
         maximum = (MAX_COMMIT_RECORD_BYTES + self._capacity - 1) // self._capacity + 3
-        if len(images) > maximum:
+        if count > maximum:
             raise GrafxTransactionBudgetExceeded(
                 "Commit catalog append image count exceeds its bounded format.",
-                field="append_images", limit=maximum, observed=len(images),
+                field="append_images", limit=maximum, observed=count,
             )
+
+    def _capture_append_images(
+        self, images: tuple[CommitCatalogPageImage, ...], sequence: int,
+    ) -> tuple[dict[tuple[str, int], bytes], dict[tuple[str, int], int]]:
+        """Bound and detach after-images before any provider can run callbacks."""
+        if type(images) is not tuple:
+            raise _invalid("append_images")
+        self._admit_append_image_count(len(images))
         if len(images) < 3:
             raise _corrupt("append_images")
         incoming: dict[tuple[str, int], bytes] = {}
@@ -480,6 +475,25 @@ class CommitCatalogStore:
                 raise _corrupt("append_page_stamp")
             incoming[location] = image.raw
             sequences[location] = page.seq
+        return incoming, sequences
+
+    def validate_append_images(
+        self, images: tuple[CommitCatalogPageImage, ...], *,
+        previous_sequence: int, sequence: int, activation_sequence: int,
+    ) -> CommitCatalogEntry:
+        """Validate one complete stamped append against a proved predecessor view.
+
+        The provider MUST represent the predecessor, not a partially applied or
+        newer head. Recovery must establish that view before using this validator;
+        this method neither reconstructs it nor grants physical authority. No
+        image is applied. Caller-owned fields are captured before provider calls.
+        Work is bounded by the old/new last record sizes, never retained history.
+        """
+        for value in (previous_sequence, sequence, activation_sequence):
+            CommitId(self._uuid, value)
+        if not activation_sequence <= previous_sequence < sequence:
+            raise _invalid("append_sequence")
+        incoming, sequences = self._capture_append_images(images, sequence)
 
         predecessor_pages: dict[tuple[str, int], bytes] = {}
 
@@ -539,6 +553,196 @@ class CommitCatalogStore:
             if canonical.to_bytes() != incoming[location]:
                 raise _corrupt("append_prefix")
         return record
+
+    def validate_redo_images(
+        self, images: tuple[CommitCatalogPageImage, ...], *,
+        previous_sequence: int, sequence: int, activation_sequence: int,
+    ) -> CommitCatalogEntry:
+        """Validate complete durable after-images despite a partially applied live tail.
+
+        The caller must prove WAL COMMIT lineage/barrier, activation and physical
+        authority. Covered targets are NEVER read from the device. Only immutable
+        full prefix blocks and the existing stream header may come from storage.
+        First append must carry the stream header itself; absence is not bootstrap.
+        Reconstructed prefixes inherit WAL authority, not an independent before-
+        image proof. Live publication must still use validate_append_images.
+        This returns a checked record value only and does not apply or acknowledge.
+        """
+        for value in (previous_sequence, sequence, activation_sequence):
+            CommitId(self._uuid, value)
+        if not activation_sequence <= previous_sequence < sequence:
+            raise _invalid("append_sequence")
+        incoming, _sequences = self._capture_append_images(images, sequence)
+        directory_head = (COMMIT_DIRECTORY_FILE, 0)
+        stream_head = (COMMIT_STREAM_FILE, 0)
+        if directory_head not in incoming:
+            raise _corrupt("redo_head")
+        saved: dict[tuple[str, int], bytes] = {}
+
+        def read(file: str, index: int) -> bytes:
+            key = (file, index)
+            if key in incoming:
+                return incoming[key]
+            if key not in saved:
+                raw = self._read_page(file, index)
+                if type(raw) is not bytes or len(raw) != self._page_size:
+                    raise _corrupt("page_size")
+                page = Page.from_bytes(raw, page_index=index)
+                if not activation_sequence < page.page_lsn <= previous_sequence:
+                    raise _corrupt("redo_prefix_stamp")
+                saved[key] = raw
+            return saved[key]
+
+        after = CommitCatalogStore(read, database_uuid=self._uuid, page_size=self._page_size)
+        head = after._head(_DIRECTORY)
+        if head.entry_count < 1 or head.last_sequence != sequence or head.activation_sequence != activation_sequence:
+            raise _corrupt("redo_coverage")
+        first = head.entry_count == 1
+        if first != (previous_sequence == activation_sequence) or first != (stream_head in incoming):
+            raise _corrupt("redo_initialization")
+        tail_directory = (COMMIT_DIRECTORY_FILE, 1 + (head.entry_count - 1) // self._per_page)
+        if tail_directory not in incoming:
+            raise _corrupt("redo_directory")
+        # Validates the immutable header's role, UUID and activation horizon. A
+        # missing existing file is never synthesized from the latest head.
+        after.read_head()
+        current = after._item(head.entry_count - 1, head)
+        locations = {directory_head, tail_directory}
+        locations.update(
+            (COMMIT_STREAM_FILE, 1 + index)
+            for index in range(current.offset // self._capacity, (head.stream_bytes - 1) // self._capacity + 1)
+        )
+        if first:
+            locations.add(stream_head)
+        if set(incoming) != locations:
+            raise _corrupt("redo_locations")
+        if first:
+            if current.offset:
+                raise _corrupt("redo_offset")
+            previous = CommitCatalogHead(activation_sequence, 0, 0, activation_sequence, 0)
+        else:
+            prior = after._item(head.entry_count - 2, head)
+            after._adjacent(prior, current)
+            if prior.sequence != previous_sequence:
+                raise _corrupt("redo_previous_commit")
+            previous = CommitCatalogHead(
+                activation_sequence, head.entry_count - 1, current.offset,
+                previous_sequence, prior.ordered,
+            )
+        after._validate_head(previous)
+
+        # Full older blocks never change. Only the two partial tails need a
+        # virtual predecessor encoding, obtained by removing this WAL append.
+        virtual: dict[tuple[str, int], bytes] = {
+            directory_head: after._header_image(_DIRECTORY, previous).raw,
+            stream_head: read(*stream_head),
+        }
+        for kind, extent, stride, width in (
+            (_DIRECTORY, previous.entry_count, self._per_page, _ITEM.size),
+            (_STREAM, previous.stream_bytes, self._capacity, 1),
+        ):
+            used = extent % stride
+            if used:
+                base = extent - used
+                index = 1 + base // stride
+                body = after._block(kind, index, head)[:used * width]
+                old = after._block_image(kind, base, body)
+                virtual[old.file, old.page_index] = old.raw
+
+        def before_read(file: str, index: int) -> bytes:
+            raw = virtual.get((file, index))
+            return read(file, index) if raw is None else raw
+
+        before = CommitCatalogStore(before_read, database_uuid=self._uuid, page_size=self._page_size)
+        append_images = tuple(
+            CommitCatalogPageImage(file, index, raw)
+            for (file, index), raw in incoming.items() if (file, index) != stream_head
+        )
+        return before.validate_append_images(
+            append_images, previous_sequence=previous_sequence, sequence=sequence,
+            activation_sequence=activation_sequence,
+        )
+
+    def validate_redo(
+        self, replay: CommittedReplay, *, previous_sequence: int, activation_sequence: int,
+    ) -> tuple[CommitCatalogEntry, ...]:
+        """Check every writing COMMIT in an already proved WAL range without applying.
+
+        Only the first append needs after-image reconstruction. Thereafter each
+        validated WAL overlay is the predecessor for the next append, so prefix,
+        count and clock continuity are checked against independent earlier WAL
+        images. The local overlay lasts only for this selected range, not as a
+        physical-authority cache. Ordinary effects still require native preflight.
+        """
+        if not isinstance(replay, CommittedReplay):
+            raise _invalid("replay")
+        CommitId(self._uuid, activation_sequence)
+        if type(previous_sequence) is not int or not 0 <= previous_sequence < PROVISIONAL_CSN:
+            raise _invalid("previous_sequence")
+        if type(replay.last_committed_lsn) is not int or not 0 <= replay.last_committed_lsn < PROVISIONAL_CSN:
+            raise _corrupt("redo_commit_boundaries")
+        validate_commit_boundaries(replay)
+        if not replay.commit_records:
+            if replay.effects or replay.last_committed_lsn not in {0, previous_sequence}:
+                raise _corrupt("redo_commit_boundaries")
+            return ()
+        commits = tuple((record.epoch, record.txn_id, record.lsn) for record in replay.commit_records)
+        if commits[0][2] <= previous_sequence:
+            raise _corrupt("redo_commit_boundaries")
+        if (
+            previous_sequence < activation_sequence
+            and any(lsn > activation_sequence for _epoch, _txn, lsn in commits)
+            and not any(lsn == activation_sequence for _epoch, _txn, lsn in commits)
+        ):
+            raise _corrupt("redo_activation")
+        offered: dict[tuple[int, int], list[tuple[bytes, int, int]]] = {}
+        # Admit every transaction's cardinality before decoding any page images.
+        # Capture all supplied effect fields/bytes before any provider callback.
+        for effect in replay.effects:
+            if effect.record_type != int(WalRecordType.WRITE_PAGE):
+                continue
+            location = decode_page_write_location(effect.payload)
+            journal = location.file in {COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE}
+            if not journal and not (effect.format_version == 2 and effect.flags & WAL_V2_FLAG_COMMIT_CATALOG_V1):
+                continue
+            batch = offered.setdefault((effect.epoch, effect.txn_id), [])
+            self._admit_append_image_count(len(batch) + 1)
+            batch.append((effect.payload, effect.format_version, effect.flags))
+        grouped: dict[tuple[int, int], tuple[CommitCatalogPageImage, ...]] = {}
+        for owner, batch in offered.items():
+            decoded_images: list[CommitCatalogPageImage] = []
+            for payload, version, flags in batch:
+                decoded = decode_page_write(payload, format_version=version, flags=flags)
+                if len(decoded.image) != self._page_size:
+                    raise _corrupt("page_size")
+                decoded_images.append(CommitCatalogPageImage(decoded.file, decoded.page_index, decoded.image))
+            grouped[owner] = tuple(decoded_images)
+        overlay: dict[tuple[str, int], bytes] = {}
+
+        def read(file: str, index: int) -> bytes:
+            raw = overlay.get((file, index))
+            return self._read_page(file, index) if raw is None else raw
+
+        view = CommitCatalogStore(read, database_uuid=self._uuid, page_size=self._page_size)
+        results: list[CommitCatalogEntry] = []
+        previous = previous_sequence
+        for epoch, txn, sequence in commits:
+            images = tuple(grouped.get((epoch, txn), ()))
+            if sequence <= activation_sequence:
+                if images:
+                    raise _corrupt("redo_before_activation")
+                previous = sequence
+                continue
+            if not images:
+                raise _corrupt("redo_missing_commit")
+            if not results:
+                result = view.validate_redo_images(images, previous_sequence=previous, sequence=sequence, activation_sequence=activation_sequence)
+            else:
+                result = view.validate_append_images(images, previous_sequence=previous, sequence=sequence, activation_sequence=activation_sequence)
+            overlay.update({(image.file, image.page_index): image.raw for image in images})
+            results.append(result)
+            previous = sequence
+        return tuple(results)
 
     def lookup(self, identity: CommitId, *, read_lsn: int) -> CommitCatalogEntry | None:
         """Exact O(log N) ordinal lookup, bounded to read_lsn and the retained horizon.
