@@ -285,6 +285,8 @@ multi-reader/writer/OCC/WAL durability protocol occurred.
 
 ### CAP-1B internal activation horizon — 2026-09-08
 
+Immutable implementation checkpoint: `3d6ef7f822cbe14293f72ee886f91a1fe365485a`.
+
 Implemented the one-way required catalog bit and conditional activation LSN, plus
 a dedicated private activation transaction using the normal commit protocol. The
 catalog body is rebound to the final COMMIT LSN including segment roll; activation

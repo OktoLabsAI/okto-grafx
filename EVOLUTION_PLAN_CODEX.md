@@ -15,7 +15,7 @@
 ## Resumo vigente — 2026-09-08
 
 GX-CAP-1 tem codec, planejador/leitor paginado, binding do LSN e ativação interna
-do horizonte de histórico implementados. A ativação usa o commit real, inclusive
+do horizonte de histórico implementados (ativação: `3d6ef7f822cbe14293f72ee886f91a1fe365485a`). A ativação usa o commit real, inclusive
 roll, e persiste capability obrigatória; ainda não publica os registros de histórico.
 Enquanto o staging/replay do journal não estiver integrado, bancos ativados apenas
 em fixtures recusam novas escritas explicitamente. Não é uma feature pública pronta.

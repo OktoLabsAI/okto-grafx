@@ -86,6 +86,8 @@ WAL grammar remains pending; journal targets must not be emitted as legacy effec
 
 ### Internal activation fence implemented
 
+Immutable implementation checkpoint: `3d6ef7f822cbe14293f72ee886f91a1fe365485a`.
+
 Catalog v2 adds one conditional `u64 activation_commit_lsn` immediately after its
 16-byte v2 extension (absolute offset 44), before table/space/index bodies. It is
 present exactly when required capability bit 4 is set. Range: exact integer

@@ -12,6 +12,7 @@ staging/replay do journal e os demais gates permanecem obrigatórios. 1.195 test
 agrupados em 118,97 s; 50 focados após correção adicional de limpeza de contexto.
 Ruff verde e nenhum novo erro nos dois módulos com dívida de tipagem preexistente.
 Detalhes: [`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md). Pulse e specs preservados.
+Checkpoint imutável: `3d6ef7f822cbe14293f72ee886f91a1fe365485a`.
 
 **GX-CAP-1B / binding do LSN final / 2026-09-08:** preparação limitada por tentativa
 e ajuste da identidade ao COMMIT LSN implementados, sem reler storage ou relógio
