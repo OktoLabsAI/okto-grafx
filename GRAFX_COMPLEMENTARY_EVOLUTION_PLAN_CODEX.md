@@ -3,6 +3,16 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / catálogo no preflight nativo / 2026-09-08:** snapshots completos de
+`catalog.dat` validados por COMMIT antes da aplicação; horizonte observado não
+pode desaparecer nem mudar. WAL/recovery reais exercitados com aplicação parcial,
+páginas rasgadas, repetição e imagens ausentes mesmo sobre disco já aplicado.
+1.347 testes em 50,30 s; 117 focados após simplificação da fixture. Sem novo erro
+de tipagem; nove diagnósticos anteriores seguem explícitos. Ainda falta vincular
+a ativação ao controle durável e integrar publicação/replay do journal, staging
+e APIs. [Evidência](docs/specs/SPEC-GX-CAP-1.md). Pulse/19 specs preservados.
+Checkpoint imutável: `f1534b0490a3466a6a4ca4af541975f5f54b1f0a`.
+
 **GX-CAP-1B / validação semântica de redo / 2026-09-08:** after-images completos
 validam caudas parcialmente aplicadas/rasgadas; lote vincula COMMITs individuais,
 ativação e predecessor de cada append aos overlays WAL anteriores. Limite de

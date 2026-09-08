@@ -523,3 +523,62 @@ restore/fork, concurrency and complete journal crash regression. No Pulse operat
 occurred in this implementation checkpoint. The separately authorized real-spec
 run is recorded in `PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md`; **19 pending
 Specs remain reserved** and were not used by these tests.
+
+### CAP-1B complete schema-catalog native preflight — 2026-09-08
+
+Immutable implementation checkpoint: `f1534b0490a3466a6a4ca4af541975f5f54b1f0a`.
+
+Native redo now checks complete `catalog.dat` snapshots per owning COMMIT before
+any page apply, using only WAL after-images. It validates header/chain/released
+pages, exact payload coverage and stamps, then one-way activation continuity.
+Both standalone preflight and uncached apply use the check; existing proof-bound
+recovery/checkpoint projections retain it. No current physical catalog is adopted
+or consulted as a substitute for incomplete WAL coverage. Detailed contract and
+remaining authority limits: [COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md).
+
+Tests added: **26** parser/dispatcher cases and **12** real WalManager/fenced
+RecoveryManager cases. They include multi-page/shrinking catalogs, seven malformed
+image sets at both entry points before apply, valid legacy/activation/later-schema
+ranges, horizon removal/retargeting/future refusal, and idempotent torn-header repair.
+Real native tests cover all four application subsets for the two-page activation,
+with applied pages intact or torn, durable control publication, repeat recovery,
+and byte-identical refusal for missing WAL header/chain even on fully applied disk.
+
+The first group found three failures sharing an old fixture that called `save()`
+before WAL and omitted the header from its record set. It also guessed terminal
+LSN without the segment-header slot. The fixture now uses detached `stage()`, the
+real raw-batch planner and expected-terminal append, and asserts the physical
+catalog remains empty before recovery. Its adoption/save/missing-store assertions
+remain intact; production checks were not weakened. A transient fixture-only
+FrozenInstanceError was corrected by replacing immutable WalRecords.
+
+Grouped validation:
+
+```text
+python -m pytest tests/recovery
+  tests/storage_core/test_catalog_replay_images.py
+  tests/storage_core/test_catalog_store.py tests/storage_core/test_catalog_v2.py
+  tests/txn/test_commit_catalog_transition.py tests/txn/test_commit_catalog_store.py
+  tests/txn/test_commit_catalog_record.py tests/txn/test_commit_provenance_values.py
+  tests/txn/test_commit_catalog_activation.py
+  tests/wal/test_commit_catalog_wal_grammar.py tests/wal/test_commit_catalog_batch_sizing.py
+  tests/api/test_m0b_catalog_repair_from_log.py tests/api/test_checkpoint_and_reclamation.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**1,347 passed in 50.30 s**. After removing redundant fixture preview stamping,
+the recovery-manager and both new suites passed **117 tests in 1.02 s** (overlap,
+not an additional group total). Ruff/diff-check pass. Strict mypy on both changed
+production modules and both new suites reports nine existing diagnostics: three
+Catalog, five CatalogStore bootstrap typing, one CommitRedo error-details forwarding.
+Using `--shadow-file` with HEAD `413d8d8` for both production modules reproduces
+the same nine diagnostics with only line offsets changed. No type-clean engine
+claim; the expanded check scope includes five previously unreported baseline errors.
+
+Still required: activation relative to independent durable control and physical
+coverage, journal staging/publication and guarded native application, public APIs,
+metrics/verify, transfer/restore/fork and complete concurrency/crash regression.
+No journal-target allowlist or writer guard was removed. Both OCCs, multi-reader/
+writer semantics and durability remain unchanged. Pulse was not restarted or
+modified; **19 pending specs remain reserved**. Full CAP-1 is not complete.

@@ -26,6 +26,18 @@ ledger permaneceram idênticos. Dívidas históricas continuam explícitas.
 [Recibo, limites e identidade do runtime](docs/PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md).
 Este teste não altera o estado incompleto dos slices GX-CAP-1 abaixo.
 
+GX-CAP-1 agora valida snapshots completos de `catalog.dat` no preflight nativo,
+antes de qualquer aplicação de página: cadeia/cabeçalho, COMMIT e continuidade
+do horizonte de ativação. Recovery real testado com todas as combinações de
+aplicação das duas páginas de ativação, páginas rasgadas e repetição; WAL sem
+cobertura completa recusa sem alterar arquivos, mesmo com o catálogo já aplicado.
+**1.347 testes em 50,30 s**, mais 117 focados após simplificação de fixture
+(sobrepostos, não somáveis). Ruff verde; nove erros de tipagem preexistentes,
+confirmados por comparação com HEAD anterior. A ligação ao controle durável,
+staging/publicação e APIs do journal continuam pendentes e seus guards ativos.
+[Evidência e limites](docs/specs/SPEC-GX-CAP-1.md). Pulse e 19 specs preservados.
+Checkpoint imutável: `f1534b0490a3466a6a4ca4af541975f5f54b1f0a`.
+
 GX-CAP-1 avançou na validação semântica de redo: after-images completos sobre
 caudas parcialmente aplicadas/rasgadas, cobertura de cada COMMIT e continuidade
 contra overlays WAL anteriores. O limite por COMMIT é admitido antes da

@@ -491,3 +491,39 @@ the size-only test envelopes are not a supported journal WAL grammar. All produc
 allowlists, capability bits, activation and public API remained unchanged at that
 prepared-binding checkpoint. The later internal activation section above assigns
 the catalog bit/horizon without yet registering journal WAL effects.
+
+## Complete schema-catalog snapshots in native preflight — CAP-1B
+
+Implementation checkpoint: `f1534b0490a3466a6a4ca4af541975f5f54b1f0a`.
+
+`CatalogStore.stage` already emits the complete new chain, released FREE pages and
+header zero on every schema change. `read_catalog_page_images` now checks this
+contract directly from detached WAL images, with no host reads or adoption. It
+requires unique bounded addresses, correct size/checksum/stamps at the owning
+COMMIT, one valid META header, an entirely supplied acyclic CATALOG chain with
+exact payload coverage, and only empty FREE pages outside that chain. Catalog
+deserialization retains required-capability and schema checks. An already-applied
+disk image cannot substitute for a missing WAL image.
+
+Native `CommitRedo.preflight` and the uncached `apply` path call this check for
+every epoch-qualified COMMIT with schema effects. Once an activation horizon is
+observed it cannot disappear or change; legacy-to-active snapshots must name their
+own terminal COMMIT, and a horizon cannot be in the future. The existing private
+preflight/projection checks retain this validation before recovery/checkpoint
+page application. Hand-composed effect-only dispatcher plans retain their existing
+contract, but cannot establish this native COMMIT-qualified proof.
+
+The first selected snapshot may already be active with an earlier horizon. This
+check alone does **not** establish activation against the prior durable control,
+validate journal coverage for ordinary commits, or admit `commits.dir/dat` into
+redo. Those existing integration obligations remain. Cost is linear in supplied
+schema images and selected COMMITs, only when schema images exist; no full history
+scan, physical authority cache, WAL format or OCC ordering change was introduced.
+
+Evidence: 26 focused parser/dispatcher cases and 12 real WAL/recovery cases, plus
+the grouped recovery/catalog/commit-history regression reported in
+[SPEC-GX-CAP-1](../specs/SPEC-GX-CAP-1.md). Real recovery covers all four two-page
+application subsets, normal/torn covered pages, repeat recovery and exact durable
+control publication. Missing header/chain refuses byte-identically even after full
+physical application. This is schema-activation recovery evidence, not the still
+required automatic journal-publication crash matrix or a full-capability release.
