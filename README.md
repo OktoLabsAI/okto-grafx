@@ -4,8 +4,8 @@ Embedded, local-first graph database for Python, with concurrent readers and wri
 snapshot isolation, WAL-backed durability, verification and fail-closed recovery.
 No database server is required. The core has no third-party runtime dependencies.
 
-**Source version: 0.0.4, pre-alpha.** This describes the checked-out source, not a
-claim that 0.0.4 is already published on PyPI. API and persistent-format compatibility
+**Source version: 0.0.5 development, pre-alpha.** This describes the checked-out source, not a
+claim that 0.0.5 is already published on PyPI. API and persistent-format compatibility
 must be checked before upgrading; see [operations](docs/OPERATIONS.md).
 
 ## Install and start
@@ -50,6 +50,7 @@ context exit commits, and an exceptional exit rolls back. See
 | Query/transaction budgets, optional spill, acceleration and metrics | [All configuration fields](docs/CONFIGURATION.md) |
 | Verification, evidence ledger/quarantine, recovery/checkpoint, manual vacuum and WAL compression | [Operations](docs/OPERATIONS.md) |
 | Bounded physical backup and verified offline replacement restore (0.0.5 development) | [Backup and restore](docs/BACKUP_RESTORE.md) |
+| Cooperative read cancellation/deadlines and quiescent orphan-index inventory/removal (0.0.5 development) | [Read control and cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | Embedded Python, machine-readable CLI, configurable ports/adapters | [API](docs/API_REFERENCE.md), [CLI](docs/CLI.md), [ports](docs/PORTS.md) |
 
 Concurrent transactions do not imply lock-free commits: publication has an exclusive

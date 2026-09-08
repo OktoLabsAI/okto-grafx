@@ -2,6 +2,9 @@
 
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md)
 
+For cooperative read cancellation/deadlines and explicit orphan-index reclamation,
+see [read control and index cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md).
+
 ## Deployment and ownership
 
 Open one explicit application-owned local directory. The persistent identity is
@@ -250,6 +253,8 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 | `GrafxBufferBudgetExceeded` | ✅ | The working set exceeded the budget |
 | `GrafxTransactionBudgetExceeded` | ❌ | An enabled statement, transaction or final WAL-batch limit was exceeded before partial persistence |
 | `GrafxQueryBudgetExceeded` | ❌ | An enabled row, traversal or logical query-memory limit was exceeded before statement release |
+| `GrafxQueryCancelled` | ❌ | A caller signal was observed by a read; owned cursor/autocommit resources are released |
+| `GrafxQueryDeadlineExceeded` | ❌ | A cooperative read deadline expired; retry only with an explicitly chosen new budget |
 | `GrafxSchemaVersionMismatch` | ❌ | This build cannot read this database |
 | `GrafxPortNotConfigured` | ❌ | An incomplete registry, naming every missing slot |
 | `GrafxTransactionStateError` | ❌ | The transaction is not in a state that allows this |

@@ -2,6 +2,9 @@
 
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md) · [Maintenance](OPERATIONS.md)
 
+0.0.5 development adds [quiescent orphan-file inventory and cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md#orphan-index-inventory-and-removal).
+This does not retire catalog-owned STALE/BUILDING generations or change query access paths.
+
 ## Choosing an access path
 
 Hash exact indexes accelerate equality/compound equality, not general ordering.

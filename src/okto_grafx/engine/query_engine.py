@@ -142,6 +142,7 @@ from okto_grafx.domain.ports.query_spill import (
     QuerySpillWorkspace,
 )
 from okto_grafx.domain.query.memory import LogicalMemoryBudget
+from okto_grafx.domain.query.control import _ReadControl
 from okto_grafx.domain.txn.context import (
     SIZING_ENDPOINT,
     PendingRowRef,
@@ -1244,6 +1245,7 @@ class _Context:
     # tables and spaces from the same picture the planner did -- a row materialised for a table
     # whose vector space exists only in the working copy cannot ask the live catalog for it.
     catalog: Catalog | None = None
+    read_control: _ReadControl | None = None
     result_node: PlanNode | None = None
     union_coercions: tuple[bool, ...] = ()
     intermediate_rows: dict[int, int] = field(default_factory=dict)
@@ -1518,6 +1520,8 @@ class _Context:
 
     def count(self, name: str, amount: int = 1) -> None:
         """Add to one statistic of this statement."""
+        if self.read_control is not None:
+            self.read_control.step()
         self.statistics[name] = self.statistics.get(name, 0) + amount
 
     def admit_intermediate(self, node: PlanNode) -> None:
@@ -1540,6 +1544,8 @@ class _Context:
 
     def admit_traversal_expansion(self) -> None:
         """Charge one candidate edge before traversal performs work derived from it."""
+        if self.read_control is not None:
+            self.read_control.step()
         limit = self.engine._max_traversal_expansions
         if limit is None:
             return
@@ -1557,6 +1563,8 @@ class _Context:
 
     def admit_traversal_path(self) -> None:
         """Charge one visible path before retaining it in a frontier or returning it."""
+        if self.read_control is not None:
+            self.read_control.step()
         limit = self.engine._max_traversal_paths
         if limit is None:
             return
@@ -3548,9 +3556,13 @@ class QueryEngine:
         text: str,
         txn: object,
         parameters: Mapping[str, object] | None = None,
+        *,
+        read_control: _ReadControl | None = None,
     ) -> QueryResult:
         """Run one statement inside a transaction and return its rows."""
-        return self._execute_parsed(self.parse(text), txn, parameters, cache_text=text)
+        return self._execute_parsed(
+            self.parse(text), txn, parameters, cache_text=text, read_control=read_control
+        )
 
     def create_index(
         self,
@@ -3584,6 +3596,7 @@ class QueryEngine:
         parameters: Mapping[str, object] | None = None,
         *,
         cache_text: str | None = None,
+        read_control: _ReadControl | None = None,
     ) -> QueryResult:
         """Run a parsed statement while still planning against current transaction state.
 
@@ -3591,6 +3604,13 @@ class QueryEngine:
         is intentionally repeated: earlier items can dirty tables, and their indexes must then be
         withheld so later items retain read-your-own-writes correctness.
         """
+        if read_control is not None:
+            mode = getattr(txn, "mode", None)
+            if getattr(mode, "value", mode) != "read":
+                raise GrafxUnsupportedOperation(
+                    "Execution control requires a read-only transaction.", field="mode"
+                )
+            read_control.check()
         working = self._working.get(getattr(txn, "txn_id", None))
         if working is not None and not self._txn_stages_catalog(txn):
             working = None
@@ -3607,13 +3627,18 @@ class QueryEngine:
         )
         started = self._reading()
         try:
+            if read_control is not None:
+                read_control.check()
             result = self._run(
                 plan,
                 txn,
                 self._bind_parameters(plan, parameters),
                 catalog=working,
                 index_authority=authority,
+                read_control=read_control,
             )
+            if read_control is not None:
+                read_control.check()
         except GrafxError as failure:
             self._count_error(failure)
             raise
@@ -3627,6 +3652,8 @@ class QueryEngine:
         text: str,
         txn: object,
         parameters: Mapping[str, object] | None = None,
+        *,
+        read_control: _ReadControl | None = None,
     ) -> _QueryResultCursor:
         """Open a pull-driven cursor for one read statement under ``txn``'s snapshot.
 
@@ -3692,6 +3719,7 @@ class QueryEngine:
                 timestamp_values={},
                 case_types=case_types,
                 catalog=working,
+                read_control=read_control,
                 result_node=root.child,
                 union_coercions=_bound_union_columns(plan, bound),
                 index_authority=authority,
@@ -4083,6 +4111,7 @@ class QueryEngine:
         parameters: dict[str, Value],
         catalog: Catalog | None = None,
         index_authority: _IndexAuthorityProjection | None = None,
+        read_control: _ReadControl | None = None,
     ) -> QueryResult:
         """Walk the plan and produce the result."""
         root = plan.root
@@ -4110,6 +4139,7 @@ class QueryEngine:
             timestamp_values={},
             case_types=case_types,
             catalog=catalog,
+            read_control=read_control,
             result_node=root.child if root.columns else None,
             union_coercions=_bound_union_columns(plan, parameters),
             index_authority=index_authority,
@@ -4150,9 +4180,26 @@ class QueryEngine:
                 value=node.label,
             )
         rows = handler(self, node, context)
+        if context.read_control is not None:
+            rows = self._controlled_rows(rows, context.read_control)
         if self._max_intermediate_rows is None or node is context.result_node:
             return rows
         return self._admit_intermediate_rows(node, context, rows)
+
+    def _controlled_rows(self, rows: Iterator[_Row], control: _ReadControl) -> Iterator[_Row]:
+        """Check every operator stream, closing nested spill/scan iterators on refusal."""
+        failure: BaseException | None = None
+        try:
+            control.check()
+            for row in rows:
+                control.step()
+                yield row
+            control.check()
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            _close_iterator(rows, failure)
 
     def _spill_workspace(
         self, operator: str

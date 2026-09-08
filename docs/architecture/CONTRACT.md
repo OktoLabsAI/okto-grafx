@@ -149,11 +149,18 @@ Concrete classes (`code`, `retryable`) — **exact names, en-US messages**:
 | `GrafxIndexError` | `index_error` | False |
 | `GrafxQueryError` | `query_error` | False |
 | `GrafxQueryBudgetExceeded` | `query_budget_exceeded` | False |
+| `GrafxQueryCancelled` | `query_cancelled` | False |
+| `GrafxQueryDeadlineExceeded` | `query_deadline_exceeded` | False |
 | `GrafxVectorValidationError` | `vector_validation` | False |
 | `GrafxEmbeddingSpaceMismatch` | `embedding_space_mismatch` | False |
 | `GrafxSpaceRetired` | `space_retired` | False |
 | `GrafxConfigurationError` | `configuration_error` | False |
 | `GrafxUnsupportedOperation` | `unsupported_operation` | False |
+
+Read-only execution controls additionally raise `GrafxQueryCancelled`
+(`query_cancelled`) and `GrafxQueryDeadlineExceeded` (`query_deadline_exceeded`),
+both non-retryable subclasses of `GrafxQueryError`. Checks are cooperative and do
+not interrupt durable commit publication. See [read-control semantics](../READ_CONTROL_AND_INDEX_CLEANUP.md).
 
 `GrafxQueryError` gets subclasses `GrafxQueryBudgetExceeded` (`query_budget_exceeded`),
 `GrafxParseError` (`parse_error`) and `GrafxPlanError` (`plan_error`).

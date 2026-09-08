@@ -18,6 +18,7 @@ reopen completed work, authorize production data changes or imply release approv
 - [Proposed next round after the 0.0.5 checkpoint](#proposed-next-round-after-the-005-checkpoint)
 - [Next proposed round after N1–N4 closure](#next-proposed-round-after-n1n4-closure)
 - [Known limitations and corrective work](#known-limitations-and-corrective-work)
+- [Operational checkpoint after R1–R4](#operational-checkpoint-after-r1r4)
 - [Remaining performance work](#remaining-performance-work)
 - [Next iteration assessment: feature/v0.0.5](#next-iteration-assessment-featurev005)
 - [Database capabilities and dependencies](#database-capabilities-and-dependencies)
@@ -178,18 +179,39 @@ FTS (GX-CAP-5), general logical export/import (OPS-2), larger hash directories a
 immutable-index orphan reclamation remain visible below but are not additional
 requirements for this proposed four-item round.
 
+## Operational checkpoint after R1–R4
+
+The operator approved items **1–2 only**, with completed tests, commit and push
+before considering 3–4. Work stays on `feature/v0.0.5`; no release, global Pulse
+installation or production data changes are authorized by this checkpoint.
+
+| Order / ID | Scope / status |
+| --- | --- |
+| 1 / OPS-5 | Implemented checkpoint, locally tested: explicit quiescent orphan-index census, dry run and removal; preserve every catalog state and retained-WAL dependency. No online GC or catalog-generation retirement. |
+| 2 / OPS-8 | Implemented checkpoint, locally tested: cooperative cancellation/deadlines on materialized reads and cursors, typed errors and resource cleanup. No write/commit interruption or preemptive I/O deadline. |
+| 3 / OPS-2 | Not started; next checkpoint decision: versioned logical schema/data/vector export/import with verified fresh-store promotion. |
+| 4 / GX-CAP-5 | Not started; next checkpoint decision: native full-text search, following the existing capability specification. |
+
+[API contracts and limits](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). Existing multi-reader/
+multi-writer, OCC, WAL/durability and recovery guarantees remain required. This
+round adds disk-hygiene and responsiveness controls, not a measured throughput claim.
+Grouped regression, final API/query coverage, explicit closure of every observed
+failure, 114 Pulse adapter passes and final installed-wheel acceptance are recorded
+in the [checkpoint report](docs/reports/V005_OPS5_OPS8_CHECKPOINT.md). Items 3–4 remain
+unstarted pending the operator's next checkpoint decision.
+
 ## Known limitations and corrective work
 
 | ID / legacy mapping | Status and impact | Required work / acceptance |
 | --- | --- | --- |
 | OPS-1 / §8.1 | R4 implemented and locally validated: bounded physical backup/restore | Checked manifest, bounded checkpoint-fenced memory capture, verified no-replace publication and offline same-UUID replacement. No no-pause/streaming hot backup, generic custom-storage backup or independently writable fork. [Contract](docs/BACKUP_RESTORE.md). |
 | OPS-2 / §8.2 | Partial: physical scan primitives and consumer-owned logical transfer exist; no general versioned export/import product | Versioned schema/types/nodes/parallel edges/vectors, resumability, compatibility and identity remapping; reject unsupported formats before partial promotion. |
-| OPS-3 / P1.4, §8.3 | Partial: quiescent vacuum plus validated R3 overflow reuse | Eligible exclusively owned overflow pages are retired through WAL, then reused by ordinary overflow allocations. O(1)-memory discovery is amortized O(heap pages) per participant/reclaim floor, not an indexed constant-time allocator. Quiescence remains an operator assertion; truncation, online vacuum and immutable-index orphan cleanup remain unimplemented. |
+| OPS-3 / P1.4, §8.3 | Partial: quiescent vacuum plus validated R3 overflow reuse | Eligible exclusively owned overflow pages are retired through WAL, then reused by ordinary overflow allocations. O(1)-memory discovery is amortized O(heap pages) per participant/reclaim floor, not an indexed constant-time allocator. Quiescence remains an operator assertion; truncation and online vacuum remain unimplemented. Orphan-index cleanup is tracked separately under OPS-5. |
 | OPS-4 / P1.8 | Open limitation: buffer and query budgets are not process RSS caps | Account/measure all retained engine state, vector memory, concurrent handles and temporary encodings. Preserve deterministic refusal; publish a realistic peak-memory envelope, not an RSS promise derived from nominal page bytes. |
-| OPS-5 / P1.12 | Partial: explicit growth/rebuild exists | Hash directories cap at 4,096 buckets; skew/overflow and retained immutable orphan generations remain. Define bounded reclamation and larger-scale indexing without in-place generation replacement. |
+| OPS-5 / P1.12 | Partial: explicit growth/rebuild and quiescent orphan cleanup exist | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement, 4,096-bucket cap and skew/overflow remain. [Contract](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
 | OPS-6 / P1.11 | Open limitation: physical conflicts and exclusive publication | Remove only proven redundant publication/page work. Disjoint logical rows may still conflict; do not promise linear writer scaling or replace multiwriter with an application-wide single-writer premise. |
 | OPS-7 / P2.6, P2.9 | Implemented bounded DX/isolation checkpoint in 0.0.5 | Typed `Unpack[ConnectOptions]` plus per-connection checksum selection, including custom registries. Standalone low-level installers retain their legacy default outside database operations. No checksum algorithm or persisted byte semantics changed. [R2 evidence](docs/reports/V005_R1_R2_CHECKPOINT.md). |
-| OPS-8 / §8.5 | Partial: Query/cursor API exists | Reusable `Query` is not a durable prepared plan or HTTP token. General prepared statements/plan-cache invalidation, deadlines/cancellation and broader streaming need explicit semantics. |
+| OPS-8 / §8.5 | Partial: reusable Query/cursor and cooperative read cancellation/deadlines exist | `Query` is not a durable prepared plan or HTTP token. Broader streaming/prepared APIs remain; controls do not preempt blocking calls, run watchdog cleanup or interrupt commits. [Contract](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
 | OPS-9 / P1.16 | Deferred configuration capability | Expose HNSW construction knobs only with persistent identity/defaults, cold/incremental parity expectations and a controlled 8,192×384 recall profile. `vector_ef_search` already configures runtime beam; it is not construction tuning. |
 | OPS-10 / P2.8 | Acceptance obligation | Exercise supported Python versions/platforms, wheels/sdists, optional accelerators, version refusal and upgrade fixtures. A local Windows run is not a claim that every matrix row passed. |
 | OPS-11 / query gaps | Open subset boundary | No full Cypher compatibility, arbitrary UNION/OPTIONAL combinations, general CALL/procedures or arbitrary schema ALTER/DROP contract. Extend through explicit query specs, budgets, null/ordering/error and read/write overlay tests. |

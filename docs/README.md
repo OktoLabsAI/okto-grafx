@@ -16,6 +16,7 @@ publication or that the latest source is installed in a particular application.
 | Which Cypher constructs and value types are supported? | [Query language](QUERY_LANGUAGE.md) |
 | How do indexes, vectors and explicit growth work? | [Indexes and vectors](INDEXES_AND_VECTORS.md) |
 | How do I handle conflicts, uncertain writes, recovery and upgrades? | [Operations](OPERATIONS.md) |
+| How can I cancel reads or safely reclaim orphan index files? | [Read control and index cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | How can a script/agent consume structured results? | [CLI](CLI.md) |
 | What has actually been measured? | [Performance](PERFORMANCE.md) |
 | What is missing or planned? | [Roadmap](../ROADMAP.md) |

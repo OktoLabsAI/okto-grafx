@@ -25,6 +25,7 @@ DTO_SOURCES = {
     "engine/query_engine.py": {"QueryResult"},
     "engine/vector_engine.py": {"VectorHit", "VectorSearchResult"},
     "engine/public_views.py": None,
+    "engine/index_cleanup.py": None,
     "domain/txn/context.py": {"Snapshot", "CommitReport"},
     "domain/txn/snapshot.py": {"Snapshot"},
     "domain/txn/commit_identity.py": {"CommitId", "CommitTime"},

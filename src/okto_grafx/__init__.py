@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from okto_grafx.api import ConnectOptions, connect
 from okto_grafx.domain.model import Timestamp, VectorValue
+from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.txn.commit_identity import CommitId
 from okto_grafx.domain.txn.commit_metadata import CommitMetadata, MetadataLimits
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry, CommitKind
@@ -46,6 +47,7 @@ from okto_grafx.runtime.config import DatabaseConfig
 from okto_grafx.runtime.registry import PortRegistry
 
 __all__ = [
+    "CancellationToken",
     "CommitCatalogEntry",
     "CommitHistoryPage",
     "CommitId",

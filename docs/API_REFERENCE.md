@@ -85,6 +85,14 @@ bounded observations or inventories with no mutable storage/lease/WAL capability
 Some full inventories and explicit memory estimates still cost proportional work;
 avoid repeatedly collecting them in every query request.
 
+## Read execution control and orphan cleanup
+
+`Database.execute`, read `Transaction.execute` and `Query.cursor` accept optional
+`timeout_seconds` and a public `CancellationToken`. Defaults preserve uncontrolled
+execution; write transactions refuse the options. `Maintenance.cleanup_indexes`
+provides an independently revalidated dry-run/removal census under explicit
+whole-store quiescence. See [contracts, examples, errors and limits](READ_CONTROL_AND_INDEX_CLEANUP.md).
+
 <!-- GENERATED PUBLIC REFERENCE: do not edit below -->
 
 ## Complete facade signatures
@@ -100,7 +108,7 @@ A canonical read statement that can open independent snapshot-owning cursors.
 #### Query.cursor
 
 ```python
-cursor(*, batch_size: int=DEFAULT_QUERY_CURSOR_BATCH_ROWS) -> QueryCursor
+cursor(*, batch_size: int=DEFAULT_QUERY_CURSOR_BATCH_ROWS, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> QueryCursor
 ```
 
 Open a cursor whose read transaction lives until exhaustion or explicit close.
@@ -196,7 +204,7 @@ Return what the commit reported, or None while the transaction is still open.
 #### Transaction.execute
 
 ```python
-execute(text: str, parameters: Mapping[str, object] | None=None) -> QueryResult
+execute(text: str, parameters: Mapping[str, object] | None=None, *, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> QueryResult
 ```
 
 Run one statement inside this transaction and return its result.
@@ -268,6 +276,14 @@ bloat(table: str | None=None) -> BloatReport
 ```
 
 Return a conservative read-only heap-bloat census.
+
+#### Maintenance.cleanup_indexes
+
+```python
+cleanup_indexes(*, dry_run: bool=True, confirm_quiescent: bool=False, max_files: int=10000, max_wal_records: int=100000) -> IndexCleanupReport
+```
+
+Inventory or reclaim unreferenced native generations with every other handle stopped.
 
 #### Maintenance.vacuum
 
@@ -636,7 +652,7 @@ Open a transaction as a block, committing on a clean exit and rolling back other
 #### Database.execute
 
 ```python
-execute(text: str, parameters: Mapping[str, object] | None=None) -> QueryResult
+execute(text: str, parameters: Mapping[str, object] | None=None, *, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> QueryResult
 ```
 
 Run one statement in its own read transaction and return its result.
@@ -1749,6 +1765,33 @@ index(space_name: str) -> VectorIndexView
 ```
 
 Return the captured vector index of one embedding space.
+
+### IndexCleanupFile fields
+
+Annotation location: `okto_grafx.engine.index_cleanup.IndexCleanupFile`.
+
+One inventoried index artifact and the reason it is retained or removable.
+
+```python
+file: str
+bytes: int
+reason: str
+```
+
+### IndexCleanupReport fields
+
+Annotation location: `okto_grafx.engine.index_cleanup.IndexCleanupReport`.
+
+A bounded census; removed/deferred names describe only this cleanup call.
+
+```python
+dry_run: bool
+files: tuple[IndexCleanupFile, ...]
+candidate_bytes: int
+removed: tuple[str, ...]
+deferred: tuple[str, ...]
+wal_records_examined: int
+```
 
 ### Snapshot fields
 

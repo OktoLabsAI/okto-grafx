@@ -3127,7 +3127,7 @@ class TransactionManager:
 
     @contextmanager
     def quiescent_maintenance_section(
-        self, *, confirm_quiescent: bool
+        self, *, confirm_quiescent: bool, operation: str = "vacuum"
     ) -> Iterator[None]:
         """Serialize this process and enforce vacuum v1's explicit operator assertion.
 
@@ -3139,22 +3139,22 @@ class TransactionManager:
 
         if confirm_quiescent is not True:
             raise GrafxUnsupportedOperation(
-                "MVCC vacuum v1 requires confirm_quiescent=True after every other Grafx "
+                "Quiescent maintenance requires confirm_quiescent=True after every other Grafx "
                 "process has been stopped.",
-                operation="vacuum",
+                operation=operation,
                 field="confirm_quiescent",
                 value=repr(confirm_quiescent),
                 required=True,
             )
         self._require_not_closed("enter quiescent maintenance")
-        self._require_writable("vacuum MVCC history")
+        self._require_writable(operation)
         with self._participant_section():
             self._require_not_closed("enter quiescent maintenance")
             self._require_recovery_complete()
             if self._open:
                 raise GrafxTransactionStateError(
-                    "MVCC vacuum v1 requires this process to have no open user transaction.",
-                    operation="vacuum",
+                    "Quiescent maintenance requires this process to have no open user transaction.",
+                    operation=operation,
                     field="open_transactions",
                     value=len(self._open),
                 )

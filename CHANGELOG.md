@@ -9,6 +9,14 @@ including the on-disk format.
 
 ### Changed
 
+- Added explicit quiescent orphan-index inventory/removal, with catalog/retained-WAL
+  protection, dry-run default, budgets, cache retirement and interruption-safe retry.
+  Catalog-owned STALE/BUILDING generations are not garbage-collected.
+- Added `CancellationToken`, cooperative per-read `timeout_seconds` and typed
+  cancellation/deadline errors for materialized reads and query cursors. Write
+  transactions refuse controls; durable commits remain non-cancellable. See
+  [consumer contracts](docs/READ_CONTROL_AND_INDEX_CLEANUP.md).
+
 - Added ordinary overflow allocation reuse of persisted vacuum FREE pages, guarded
   by the retained-snapshot floor, current durable view and page LSN. Discovery is
   incremental/O(1) memory, without a new mutable free-list format or file truncation.

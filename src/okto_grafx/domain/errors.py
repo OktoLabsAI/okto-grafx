@@ -31,6 +31,8 @@ __all__ = [
     "GrafxIndexError",
     "GrafxQueryError",
     "GrafxQueryBudgetExceeded",
+    "GrafxQueryCancelled",
+    "GrafxQueryDeadlineExceeded",
     "GrafxParseError",
     "GrafxPlanError",
     "GrafxVectorValidationError",
@@ -247,6 +249,18 @@ class GrafxQueryError(GrafxError):
 
     code: str = "query_error"
     retryable: bool = False
+
+
+class GrafxQueryCancelled(GrafxQueryError):
+    """The caller cancelled a read; no automatic retry is requested."""
+
+    code: str = "query_cancelled"
+
+
+class GrafxQueryDeadlineExceeded(GrafxQueryError):
+    """A cooperative read deadline expired; choose a new budget before retrying."""
+
+    code: str = "query_deadline_exceeded"
 
 
 class GrafxQueryBudgetExceeded(GrafxQueryError):

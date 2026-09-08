@@ -13,6 +13,7 @@ from okto_grafx.domain.recovery.report import RecoveryReport
 from okto_grafx.domain.verify.findings import VerificationReport
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.database import Maintenance
+from okto_grafx.engine.index_cleanup import IndexCleanupReport
 from okto_grafx.engine.public_views import (
     BloatReport,
     IndexView,
@@ -33,6 +34,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
         {
             "status",
             "bloat",
+            "cleanup_indexes",
             "vacuum",
             "checkpoint",
             "verify",
@@ -53,6 +55,7 @@ def test_maintenance_surface_and_annotations_are_exact() -> None:
     assert get_type_hints(maintenance_getter)["return"] is Maintenance
     assert get_type_hints(Maintenance.status)["return"] is MaintenanceStatus
     assert get_type_hints(Maintenance.bloat)["return"] is BloatReport
+    assert get_type_hints(Maintenance.cleanup_indexes)["return"] is IndexCleanupReport
     assert get_type_hints(Maintenance.vacuum)["return"] is VacuumReport
     assert get_type_hints(Maintenance.checkpoint)["return"] is RecycleReport
     assert get_type_hints(Maintenance.verify)["return"] is VerificationReport

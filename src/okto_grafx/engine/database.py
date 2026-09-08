@@ -82,6 +82,7 @@ from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.query.ast import Query as QueryStatement
+from okto_grafx.domain.query.control import CancellationToken, _ReadControl, _read_control
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_COLUMN_DEFINITIONS,
@@ -109,6 +110,7 @@ from okto_grafx.domain.verify.findings import VerificationReport, VerificationFi
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
+from okto_grafx.engine.index_cleanup import IndexCleanupReport, _cleanup_indexes
 from okto_grafx.engine.heap_store import HeapStore, _HeapScanPosition
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.public_views import (
@@ -931,13 +933,18 @@ class Query:
         self._parameters = parameters
 
     def cursor(
-        self, *, batch_size: int = DEFAULT_QUERY_CURSOR_BATCH_ROWS
+        self,
+        *,
+        batch_size: int = DEFAULT_QUERY_CURSOR_BATCH_ROWS,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> QueryCursor:
         """Open a cursor whose read transaction lives until exhaustion or explicit close."""
         return self._database._open_query_cursor(
             self._text,
             self._parameters,
             batch_size=_query_cursor_batch_size(batch_size),
+            control=_read_control(self._database._clock, timeout_seconds, cancellation),
         )
 
 
@@ -956,6 +963,7 @@ class QueryCursor:
         "_closed",
         "_database",
         "_raw",
+        "_control",
         "_source_done",
         "_transaction",
         "columns",
@@ -971,10 +979,12 @@ class QueryCursor:
         columns: tuple[str, ...],
         plan: PlanNode,
         batch_size: int,
+        control: _ReadControl | None = None,
     ) -> None:
         self._database = database
         self._transaction = transaction
         self._raw = raw
+        self._control = control
         self._batch_size = batch_size
         self._buffer: tuple[tuple[Value, ...], ...] = ()
         self._buffer_position = 0
@@ -1077,6 +1087,8 @@ class QueryCursor:
         """Make a database close terminal even when this cursor buffered detached rows."""
         try:
             self._database._require_open()
+            if self._control is not None:
+                self._control.check()
         except BaseException as failure:
             try:
                 self._database._close_query_cursor(self)
@@ -1160,7 +1172,12 @@ class Transaction:
         return _public_commit_report(self._report)
 
     def execute(
-        self, text: str, parameters: Mapping[str, object] | None = None
+        self,
+        text: str,
+        parameters: Mapping[str, object] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> QueryResult:
         """Run one statement inside this transaction and return its result.
 
@@ -1170,7 +1187,16 @@ class Transaction:
         """
         self._require_active()
         self._require_batch_idle("execute")
-        return self._database._run_statement(self._context, text, parameters)
+        if (
+            (timeout_seconds is not None or cancellation is not None)
+            and self._context.mode is not TransactionMode.READ
+        ):
+            raise GrafxUnsupportedOperation(
+                "Execution cancellation and deadlines require a read transaction.",
+                operation="execute", field="mode",
+            )
+        control = _read_control(self._database._clock, timeout_seconds, cancellation)
+        return self._database._run_statement(self._context, text, parameters, control=control)
 
     def commit_history(self, *, after: CommitId | None = None, limit: int = 100) -> CommitHistoryPage:
         """Read an ascending bounded history page under this transaction's snapshot."""
@@ -1418,6 +1444,20 @@ class Maintenance:
     def bloat(self, table: str | None = None) -> BloatReport:
         """Return a conservative read-only heap-bloat census."""
         return self._database._bloat(table)
+
+    def cleanup_indexes(
+        self,
+        *,
+        dry_run: bool = True,
+        confirm_quiescent: bool = False,
+        max_files: int = 10000,
+        max_wal_records: int = 100000,
+    ) -> IndexCleanupReport:
+        """Inventory or reclaim unreferenced native generations with every other handle stopped."""
+        return _cleanup_indexes(
+            self._database, dry_run=dry_run, confirm_quiescent=confirm_quiescent,
+            max_files=max_files, max_wal_records=max_wal_records,
+        )
 
     def vacuum(
         self,
@@ -2193,7 +2233,12 @@ class Database:
                 yield txn
 
     def execute(
-        self, text: str, parameters: Mapping[str, object] | None = None
+        self,
+        text: str,
+        parameters: Mapping[str, object] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> QueryResult:
         """Run one statement in its own read transaction and return its result.
 
@@ -2202,6 +2247,7 @@ class Database:
         that has been released.
         """
         self._require_open()
+        control = _read_control(self._clock, timeout_seconds, cancellation)
         with self._public_transition():
             # Close may win after the preliminary guard but before the transition becomes
             # visible. Refuse before retaining the unlocked participant descriptor.
@@ -2209,7 +2255,10 @@ class Database:
             with self._transactions._participant_descriptor_scope():
                 txn = self.begin("read")
                 try:
-                    result = txn.execute(text, parameters)
+                    result = (txn.execute(text, parameters) if control is None else
+                              self._run_statement(txn._context, text, parameters, control=control))
+                    if control is not None:
+                        control.check()
                     txn.commit()
                 except BaseException as failure:
                     if txn.active:
@@ -2229,9 +2278,9 @@ class Database:
     def query(self, text: str, parameters: Mapping[str, object] | None = None) -> Query:
         """Return a reusable canonical read query whose cursors own their snapshots.
 
-        ``execute`` remains the materialised convenience and the only autocommit door for
-        statements that write.  This builder copies text and parameter values immediately, so
-        mutating the caller's containers after this call cannot change a later cursor.
+        ``execute`` remains the materialised read convenience; statements that write require
+        an explicit write transaction. This builder copies text and parameter values immediately,
+        so mutating the caller's containers after this call cannot change a later cursor.
         """
         with self._public_operation("query prepare"):
             self._require_open()
@@ -2248,12 +2297,15 @@ class Database:
         parameters: Mapping[str, object] | None,
         *,
         batch_size: int,
+        control: _ReadControl | None = None,
     ) -> QueryCursor:
         """Open the internal stream and its owning read transaction as one public outcome."""
         self._require_open()
         transaction = self.begin("read")
         raw: object | None = None
         try:
+            if control is not None:
+                control.check()
             with self._public_operation("query cursor open"):
                 self._require_open()
                 engine = self._require_component(
@@ -2278,7 +2330,12 @@ class Database:
                             field="component",
                             value="query_cursor",
                         )
-                    raw = opener(text, transaction._context, parameters)
+                    raw = (
+                        opener(text, transaction._context, parameters) if control is None
+                        else opener(text, transaction._context, parameters, read_control=control)
+                    )
+                    if control is not None:
+                        control.check()
                 # Rebuild metadata after page access, just like the materialised result door.
                 columns = getattr(raw, "columns", None)
                 plan = getattr(raw, "plan", None)
@@ -2310,6 +2367,7 @@ class Database:
                     columns=metadata.columns,
                     plan=metadata.plan,
                     batch_size=batch_size,
+                    control=control,
                 )
         except BaseException as failure:
             if raw is not None:
@@ -2344,7 +2402,11 @@ class Database:
                 with self._transactions.page_access_section():
                     self._require_open()
                     transaction._require_active()
+                    if cursor._control is not None:
+                        cursor._control.check()
                     observed = cursor._raw.fetch(limit)
+                    if cursor._control is not None:
+                        cursor._control.check()
                 if type(observed) is not tuple or len(observed) != 2:
                     raise GrafxConfigurationError(
                         "The query cursor collaborator returned a malformed batch.",
@@ -2362,6 +2424,8 @@ class Database:
                     QueryResult(columns=cursor.columns, rows=raw_rows),  # type: ignore[arg-type]
                     max_string_characters=self._max_query_value_characters,
                 )
+                if cursor._control is not None:
+                    cursor._control.check()
             if raw_exhausted:
                 self._settle_query_cursor(cursor)
             return detached.rows, raw_exhausted
@@ -2433,6 +2497,8 @@ class Database:
         context: TransactionContext,
         text: str,
         parameters: Mapping[str, object] | None = None,
+        *,
+        control: _ReadControl | None = None,
     ) -> QueryResult:
         """Run one statement for a context already validated by the public Transaction."""
         with self._public_operation("query"):
@@ -2458,13 +2524,16 @@ class Database:
                 # therefore neither miss a context that may have acquired a schema journal nor
                 # release storage while the statement is installing one.
                 self._public_contexts.setdefault(context.txn_id, context)
-                raw_result = engine.execute(  # type: ignore[attr-defined]
-                    statement, context, detached_parameters
-                )
+                if control is not None:
+                    control.check()
+                    raw_result = engine.execute(statement, context, detached_parameters, read_control=control)  # type: ignore[attr-defined]
+                    control.check()
+                else:
+                    raw_result = engine.execute(statement, context, detached_parameters)  # type: ignore[attr-defined]
             # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
             # after leaving page access, while _public_operation still translates ordinary host
             # failures and deliberately lets process-control signals pass unchanged.
-            return _query_result_view(
+            result = _query_result_view(
                 raw_result,
                 max_string_characters=self._max_query_value_characters,
                 internally_owned_plan=(
@@ -2477,6 +2546,9 @@ class Database:
                 plan_memo=self._plan_view_memo,
                 plan_guard_factory=self._plan_guard_factory,
             )
+            if control is not None:
+                control.check()
+            return result
 
     def _run_many(
         self,
