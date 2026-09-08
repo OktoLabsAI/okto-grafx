@@ -3,6 +3,14 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / intervalos sem schema e subplano de índices / 2026-09-08:** catálogo
+vigente lido das páginas, sem adotar estado mutável, para identificar a obrigação
+de histórico. Índices recebem prova exata do lote completo e validação estrita
+pós-schema, com reconferência após callbacks. 1.039 testes em 54,03 s; publicação
+do journal ainda fechada, cobertura física/UUID e restante da integração pendentes.
+[Evidência e custo](docs/specs/SPEC-GX-CAP-1.md). Pulse/19 specs intocados.
+Checkpoint: `23d7acada70a45342fd3cbb7196f74266a98b9f4`.
+
 **GX-CAP-1B / vínculo ao checkpoint / 2026-09-08:** recovery e checkpoint passam
 seu limite durável ao preflight; ativação posterior exige snapshot no seu próprio
 COMMIT. Provas não podem ser reutilizadas sob outro limite, inclusive nas portas

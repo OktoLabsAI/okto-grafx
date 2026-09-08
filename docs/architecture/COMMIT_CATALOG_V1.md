@@ -557,3 +557,38 @@ journal integration. No-schema intervals still need the independently current
 catalog, journal coverage/UUID and physical-target validation before native journal
 replay can be enabled. Automatic staging/publication and public capability APIs
 remain disabled. Complete required acceptance matrix above remains in scope.
+
+### No-schema native ranges and exact index-subplan inheritance
+
+Implementation checkpoint: `23d7acada70a45342fd3cbb7196f74266a98b9f4`.
+
+Checkpoint-qualified preflight without schema images now reads the canonical
+catalog through `CatalogStore.read_from_pages()` on its fenced pool. It neither
+trusts the mutable catalog adopted by another caller nor replaces that object.
+An activation after the replay floor still requires WAL schema effects. Orphan
+`commits.dir/dat` files beside a missing, empty or legacy catalog refuse rather
+than silently classify the database as uninitialized. A genuinely fresh empty
+file with no history, no COMMITs and floor zero remains allowed.
+
+An active catalog at exactly its checkpoint with no later COMMIT remains the
+supported activated-but-uninitialized state. Post-activation coverage is explicitly
+refused by the existing integration guard; this build does not infer an empty
+history from missing journal files or certify an untracked subsequent COMMIT.
+This closes detection for no-schema ranges, not physical journal verification
+or complete coverage across all schema-changing intervals.
+
+Recovery and checkpoint now preflight the exact index complement of the original
+full replay after page application/catalog adoption. Full-proof ownership,
+passage, checkpoint, terminal tuple/watermark and every index effect identity must
+match. Index registry/generation checks run strictly, even if the full preflight
+temporarily allowed unregistered indexes. Whole/subplan identities and signatures
+are rechecked after callbacks before the proof is marked verified. Dropping,
+duplicating or substituting effects cannot reuse the full catalog verdict.
+
+This avoids rereading the newly applied schema as if the index-only subplan were
+an independent WAL range lacking its activation. No public bypass flag, reusable
+authority cache or standalone durable writer was introduced. Cost: one pooled
+schema decode per full native no-schema preflight, plus bounded existence probes;
+an exact index complement and signature checks are linear in the selected range.
+There is no graph/history scan or end-to-end performance claim. Complete journal
+physical/UUID/coverage validation, native application and publication remain pending.

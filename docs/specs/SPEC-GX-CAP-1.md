@@ -631,3 +631,58 @@ catalog for no-schema ranges, journal physical/UUID/coverage checks, guarded nat
 application and automatic staging/publication, then public APIs and the remaining
 verify/metrics/transfer/restore/fork/concurrency/crash requirements. The journal
 allowlist and writer guards remain closed. Pulse and 19 reserved specs untouched.
+
+### CAP-1B no-schema native replay and strict index subplans — 2026-09-08
+
+Implementation checkpoint: `23d7acada70a45342fd3cbb7196f74266a98b9f4`.
+
+Native ranges without schema effects now inspect current canonical catalog pages,
+without adopting or trusting the caller's mutable catalog. Missing activation
+coverage and orphan history files refuse. A durable post-activation COMMIT lacking
+supported history cannot be published merely because its WAL suffix has no DDL.
+An empty interval exactly at activation remains allowed. The guard still refuses
+unsupported post-activation history; actual journal validation/application is not
+enabled by this slice.
+
+The first integration run exposed index-only replay misclassified as a standalone
+range without the activation schema already applied by its sibling. Implemented
+exact index-subplan proof inheritance, with strict index lookup/generation
+preflight after catalog adoption. It does not inherit the former temporary
+unregistered-index allowance. Five new adversarial tests then reproduced callback
+substitution of full/subplan effects, COMMIT tuples or watermarks; post-callback
+identity/signature revalidation closes all five before index dispatch.
+
+Added **26 tests**: twelve persisted/no-schema/orphan-catalog cases, thirteen
+index-subplan identity/strictness/callback cases and one real-WAL refusal proving
+that an unacknowledged subsequent COMMIT cannot advance control without history.
+The first grouped run had two failures in older heap/ABORT fixtures that discarded
+their unflushed initial catalog bootstrap. Those fixtures now persist that baseline
+before the tested WAL operation; recovery does not turn a pristine missing header
+into an authoritative legacy catalog. Existing assertions remain. Focused closure:
+**249 passed in 3.21 s**.
+
+Final grouped command:
+
+```text
+python -m pytest tests/recovery tests/storage_core/test_catalog_replay_images.py
+  tests/txn/test_commit_catalog_activation.py tests/txn/test_commit_catalog_transition.py
+  tests/api/test_checkpoint_and_reclamation.py tests/api/test_checkpoint_watermark_scope.py
+  tests/api/test_checkpoint_meta_root_proof.py tests/api/test_m0b_checkpoint_lineage.py
+  tests/api/test_m0b_catalog_repair_from_log.py tests/api/test_auto_checkpoint.py
+  tests/api/test_recovery_floor_photo_reuse.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**1,039 passed in 54.03 s**; focused totals overlap. Ruff/diff-check pass. Strict
+mypy on the three production modules retains the same **69** diagnostics against
+HEAD `b1ade66` shadow sources. The three exercised test modules retain **18**
+existing/imported diagnostics against the old dispatcher test source; one newly
+introduced tuple-arity annotation was corrected. Comparisons normalize only line
+offsets. No type-clean engine or performance improvement is claimed.
+
+Physical journal UUID/coverage checks and native application remain next, then
+automatic staging/publication and the existing public API, verify/metrics,
+transfer/restore/fork/concurrency/crash requirements. Cost and precise limitations:
+[COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md). No OCC/durability or
+multi-reader/writer premise changed. Pulse and 19 reserved specs remain untouched.

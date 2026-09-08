@@ -26,6 +26,17 @@ ledger permaneceram idênticos. Dívidas históricas continuam explícitas.
 [Recibo, limites e identidade do runtime](docs/PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md).
 Este teste não altera o estado incompleto dos slices GX-CAP-1 abaixo.
 
+GX-CAP-1 cobre agora o replay sem efeitos de schema: consulta não destrutiva ao
+catálogo das páginas, recusa de ativação sem cobertura e de arquivos de histórico
+órfãos. O subplano de índices herda a prova do lote completo, mas refaz a validação
+estrita do registry após adoção do schema; substituições durante callbacks recusam.
+**1.039 testes em 54,03 s**, Ruff verde e nenhuma regressão de tipagem nas
+comparações antes/depois. O custo adicional é leitura do schema por preflight
+nativo sem schema, não varredura do grafo/histórico; não é ganho de performance.
+A aplicação/publicação do journal permanece desabilitada até integrar cobertura
+física e os demais requisitos. [Evidência](docs/specs/SPEC-GX-CAP-1.md).
+Pulse e 19 specs preservados. Checkpoint: `23d7acada70a45342fd3cbb7196f74266a98b9f4`.
+
 GX-CAP-1 vinculou o replay nativo ao checkpoint fornecido pelo controle durável:
 ativação posterior ao checkpoint exige seu próprio snapshot/COMMIT no intervalo;
 um snapshot posterior não pode inventá-la. A prova privada conserva esse limite
