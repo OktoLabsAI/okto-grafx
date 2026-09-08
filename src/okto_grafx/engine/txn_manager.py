@@ -134,6 +134,7 @@ from okto_grafx.domain.model.schema import (
     TableDef,
     _encode_tuple_with_proof,
     _proved_tuple_payload,
+    TupleEncodingProofs,
 )
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.page import HEADER_PAGE_INDEX, Page
@@ -702,6 +703,7 @@ class TransactionManager:
         "_catalog",
         "_coordinator",
         "_commit_state_store",
+        "_tuple_encoding_proofs",
         "_commit_redo",
         "_clock",
         "_metrics",
@@ -782,6 +784,7 @@ class TransactionManager:
         control_format_version: int = 1,
         control_file_nonce: int = 0,
         control_read_if_exists: ControlRecordReader | None = None,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
         process_identity_provider: Callable[[], object] | None = None,
         catalog_changes_are_wal_logged: bool = False,
     ) -> None:
@@ -819,6 +822,7 @@ class TransactionManager:
                 value=type(writable).__name__,
             )
         self._writable: bool = writable
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._wal: Any = wal
         self._pool: BufferPool = pool
         self._heap: Any = heap
@@ -3184,6 +3188,7 @@ class TransactionManager:
                 page_staging_capability=self._page_staging_capability,
                 max_transaction_rows=self._max_transaction_rows,
                 max_transaction_bytes=self._max_transaction_bytes,
+                tuple_encoding_proofs=self._tuple_encoding_proofs,
             )
             self._require_not_closed("begin a transaction")
             self._open[transaction.txn_id] = transaction
@@ -6626,6 +6631,7 @@ class TransactionManager:
             epoch=_NO_EPOCH,
             owner=self,
             page_staging_capability=self._page_staging_capability,
+            tuple_encoding_proofs=self._tuple_encoding_proofs,
         )
         self._next_txn_id += 1
         # The context is intentionally not present in ``_open``; use the same unforgeable
@@ -6965,9 +6971,11 @@ class TransactionManager:
                 )
             self._refuse_unstored_endpoints(txn, intent, position)
             proof = intent._encoding_proof
-            if _proved_tuple_payload(intent.table, intent.values, proof) is None:
+            if _proved_tuple_payload(
+                intent.table, intent.values, proof, protocol=self._tuple_encoding_proofs
+            ) is None:
                 _payload, proof = _encode_tuple_with_proof(
-                    intent.table, intent.values
+                    intent.table, intent.values, protocol=self._tuple_encoding_proofs
                 )
                 intent = replace(intent, _encoding_proof=proof)
             validated.append(intent)

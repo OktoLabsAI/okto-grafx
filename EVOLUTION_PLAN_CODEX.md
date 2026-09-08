@@ -51,7 +51,7 @@ Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 | Preparação local de proveniência | Core `e1e9d08` elimina varreduras repetidas, mantendo fallback para colisão de ID; 24 testes passaram. Exercitado pela consolidação autorizada no PID 2124; preservado no novo PID 34048. |
 | Latência completa fria / custo completo de escrita | Uma spec real: commit MCP 22,981 s, 5 nós/10 arestas; entrega Global 131,489 s, sem retry/erro. Priorizar atribuição desse custo completo; ganhos nativos isolados não encerram a frente. |
 | Corpus reservado | 20 specs pendentes, 20 consolidadas, zero em progresso; apenas uma consumida nesta autorização. Demais pendentes idênticas. Não consolidar outras, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
-| Dívida de arquitetura já registrada | Locks do query engine, inspeção do recovery, leitura combinada de control records e ambos os contextos de índices fornecidos pela composição externa. Caminhos otimizados confirmados via API pública; contratos públicos e assinatura de IndexStore.commit inalterados. Checkpoint autoridade física: 549 testes passam e 2 falham no gate. Restam somente 2 ocorrências em schema.py (registro sincronizado/weak de provas de encoding). Overrides customizados de commit preservados com validação escalar, sem autorização implícita do batch nativo. Correção parcial, fonte apenas: `docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`. |
+| Dívida de arquitetura já registrada | Gate estático fechado: zero das nove ocorrências originais. Locks, inspeção do recovery, seleção de leitura combinada, contextos de índices e registro weak/sincronizado de provas de encoding fornecidos pela composição externa. Registro de provas por participante; codificação única nativa preservada. Bateria agrupada: 958/958, sem falhas ou skips; Ruff/diff-check passam. Contratos públicos, WAL/OCC, durabilidade e multi-reader/writer preservados. Fonte apenas, não encerramento do plano completo: `docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`. |
 | Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |
 
 Checkpoint finito concluído: certificação fechada de auxiliares conhecidos e
@@ -97,8 +97,9 @@ idêntico; 701 testes passaram. **Ganho de memória, não de tempo demonstrado**
 sem reiniciar Pulse ou consumir outra spec. Detalhes e limites em
 `docs/VERIFICATION_RETAINED_HISTORY_0_0_4.md`. A atribuição dos 131,489 s da entrega
 real permanece pendente. As nove ocorrências estáticas registradas nesse momento
-foram reduzidas a duas nos checkpoints posteriores descritos em
-`docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`; o gate ainda não está fechado.
+foram encerradas nos checkpoints posteriores descritos em
+`docs/ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`; gate de arquitetura com zero
+ocorrências, incluído na bateria agrupada de 958 testes aprovados.
 
 ## Histórico de execução — checkpoint iniciado em 2026-09-06
 

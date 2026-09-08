@@ -834,3 +834,15 @@ Public commits still prepare live native batches. Final grouped result **549 pas
 architecture assertion remain. Existing hot-batch structural/effect/failure tests stay
 enabled. Source-only; no new speedup claim, threshold, deployment or spec consumption.
 Details: physical live-commit checkpoint in `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.
+
+Architecture gate closed: schema's proof registry/guard are now allocated in runtime
+per participant and shared explicitly across query/transaction/context/heap. Domain
+retains opaque minting, exact identity/immutability/retention-budget/revocation rules;
+no global registry or authority bundle was added. Native CREATE/UPDATE still encode
+each final row once; canonical fallback and legacy overrides retain their checks.
+Proof copy/forgery/foreign-participant/GC/concurrency/guard tests plus grouped query,
+txn, heap, index contexts/hot batches, public boundaries and full import gate:
+**958 passed in 16.01 s, zero failures/skips**. All nine original static findings
+are closed without new waivers. This closes that gate, not the overall evolution
+or full-write performance objective. Source-only, no new spec consumed or deployment.
+Final checkpoint: `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.

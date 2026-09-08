@@ -29,6 +29,7 @@ from okto_grafx.domain.model.schema import (
     ENDPOINT_COLUMN_COUNT,
     _forget_tuple_encoding_proof,
     _proved_tuple_payload,
+    TupleEncodingProofs,
     encode_tuple,
 )
 from okto_grafx.domain.txn.partitions import page_partition
@@ -258,6 +259,7 @@ class TransactionContext:
         "_max_transaction_bytes",
         "_staged_payload_bytes",
         "_retained_tuple_encoding_bytes",
+        "_tuple_encoding_proofs",
         "_staging_marks",
         "_next_pending_token",
         "_pending_row_refs",
@@ -277,6 +279,7 @@ class TransactionContext:
         page_staging_capability: object,
         max_transaction_rows: int | None = None,
         max_transaction_bytes: int | None = None,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
     ) -> None:
         """Open a transaction bound to the manager that created it.
 
@@ -312,6 +315,7 @@ class TransactionContext:
         )
         self._staged_payload_bytes: int = 0
         self._retained_tuple_encoding_bytes: int = 0
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._staging_marks: list[
             tuple[
                 tuple[int, int, int],
@@ -798,7 +802,7 @@ class TransactionContext:
         discarded_intents = tuple(self.row_intents[rows:])
         del self.row_intents[rows:]
         for intent in discarded_intents:
-            _forget_tuple_encoding_proof(intent._encoding_proof)
+            _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
         remaining_insert_ids = {
             id(intent.reference)
             for intent in self.row_intents
@@ -951,7 +955,7 @@ class TransactionContext:
             return 0
         sized = _sizing_values(values)
         payload = (
-            _proved_tuple_payload(table, values, encoding_proof)
+            _proved_tuple_payload(table, values, encoding_proof, protocol=self._tuple_encoding_proofs)
             if sized is values
             else None
         )
@@ -966,13 +970,13 @@ class TransactionContext:
         encoding_proof: object,
     ) -> object:
         """Retain a proved payload only while this transaction's private cache has room."""
-        payload = _proved_tuple_payload(table, values, encoding_proof)
+        payload = _proved_tuple_payload(table, values, encoding_proof, protocol=self._tuple_encoding_proofs)
         if payload is None:
-            _forget_tuple_encoding_proof(encoding_proof)
+            _forget_tuple_encoding_proof(encoding_proof, protocol=self._tuple_encoding_proofs)
             return None
         observed = self._retained_tuple_encoding_bytes + len(payload)
         if observed > _MAX_RETAINED_TUPLE_ENCODING_BYTES:
-            _forget_tuple_encoding_proof(encoding_proof)
+            _forget_tuple_encoding_proof(encoding_proof, protocol=self._tuple_encoding_proofs)
             return None
         self._retained_tuple_encoding_bytes = observed
         return encoding_proof
@@ -1107,7 +1111,7 @@ class TransactionContext:
         """Move the transaction to its committed end state."""
         self._require_active()
         for intent in self.row_intents:
-            _forget_tuple_encoding_proof(intent._encoding_proof)
+            _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
         self._retained_tuple_encoding_bytes = 0
         self._state = TransactionState.COMMITTED
         self._commit_csn = csn
@@ -1116,7 +1120,7 @@ class TransactionContext:
         """Move the transaction to its rolled-back end state and drop everything it staged."""
         self._require_active()
         for intent in self.row_intents:
-            _forget_tuple_encoding_proof(intent._encoding_proof)
+            _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
         self._retained_tuple_encoding_bytes = 0
         self._state = TransactionState.ABORTED
         self.read_partitions.clear()

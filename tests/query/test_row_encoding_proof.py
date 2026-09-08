@@ -90,7 +90,8 @@ def test_a_replaced_equal_tuple_cannot_reuse_an_old_proof(
         transaction.commit()
         assert calls == [1]
         assert _proved_tuple_payload(
-            intent.table, intent.values, intent._encoding_proof
+            intent.table, intent.values, intent._encoding_proof,
+            protocol=transaction._context._tuple_encoding_proofs,
         ) is None
     finally:
         database.close()

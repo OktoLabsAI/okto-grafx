@@ -110,6 +110,7 @@ from okto_grafx.runtime.config import (
 from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
 from okto_grafx.runtime.capability_probe import port_has_attribute
 from okto_grafx.runtime.scoped_value import ContextLocalValue
+from okto_grafx.runtime.tuple_encoding_proofs import new_tuple_encoding_proofs
 
 __all__ = [
     "LABEL_DIGEST_BYTES",
@@ -376,7 +377,8 @@ def assemble_database(
         quarantine = QuarantineStore(storage, clock, metrics)
         ledger = LedgerStore(storage, clock, metrics, quarantine=quarantine)
         catalog = CatalogStore(pool)
-        heap = HeapStore(pool, catalog)
+        tuple_encoding_proofs = new_tuple_encoding_proofs()
+        heap = HeapStore(pool, catalog, tuple_encoding_proofs=tuple_encoding_proofs)
         indexes = IndexManager(
             pool,
             heap,
@@ -542,6 +544,7 @@ def assemble_database(
             control_format_version=identity.format_version,
             control_file_nonce=_new_control_file_nonce(),
             control_read_if_exists=read_control_if_exists,
+            tuple_encoding_proofs=tuple_encoding_proofs,
             process_identity_provider=os.getpid,
             catalog_changes_are_wal_logged=True,
         )
@@ -569,6 +572,7 @@ def assemble_database(
             # heap walk it enables never holds this guard across page I/O.
             endpoint_locator_guard=threading.RLock(),
             compiled_predicate_guard=threading.Lock(),
+            tuple_encoding_proofs=tuple_encoding_proofs,
             max_statement_writes=config.max_statement_writes,
             max_result_rows=config.max_result_rows,
             max_intermediate_rows=config.max_intermediate_rows,

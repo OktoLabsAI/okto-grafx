@@ -61,6 +61,7 @@ from okto_grafx.domain.model.schema import (
     TARGET_COLUMN,
     TableDef,
     _proved_tuple_payload,
+    TupleEncodingProofs,
     decode_relationship_endpoints,
     decode_tuple,
     decode_tuple_landing,
@@ -171,7 +172,8 @@ what section 3 already means by it for an Lsn and an Epoch.
 
 
 def _write_payload(
-    table: TableDef, values: Sequence[Value], encoding_proof: object
+    table: TableDef, values: Sequence[Value], encoding_proof: object,
+    protocol: TupleEncodingProofs | None = None,
 ) -> bytes:
     """Return proved bytes for this exact row, or run the canonical encoder.
 
@@ -179,7 +181,7 @@ def _write_payload(
     intent, a revoked proof and every custom/caller-authored object all miss closed and are
     validated by :func:`encode_tuple` before a page is pinned or changed.
     """
-    payload = _proved_tuple_payload(table, values, encoding_proof)
+    payload = _proved_tuple_payload(table, values, encoding_proof, protocol=protocol)
     return encode_tuple(table, values) if payload is None else payload
 
 
@@ -636,10 +638,12 @@ class HeapStore:
         "_extent_slots_epoch",
         "_bootstrapped_epoch",
         "_extent_proof_seal",
+        "_tuple_encoding_proofs",
     )
 
     def __init__(
-        self, pool: BufferPool, catalog: CatalogStore, *, file: str = HEAP_FILE
+        self, pool: BufferPool, catalog: CatalogStore, *, file: str = HEAP_FILE,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
     ) -> None:
         """Bind the heap to a buffer pool, the catalog that names its tables, and its file."""
         if pool.capacity_pages < MINIMUM_FRAMES:
@@ -652,6 +656,7 @@ class HeapStore:
             )
         self._pool: BufferPool = pool
         self._catalog: CatalogStore = catalog
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._file: str = file
         # The resolved tail of each table, so an append stays O(1) after the first walk. It is a
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
@@ -1514,7 +1519,7 @@ class HeapStore:
         """
         _require_commit_number("xmin", xmin)
         _require_record_id(record_id)
-        payload = _write_payload(table, values, _encoding_proof)
+        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
         extent_epoch = self._derived_read_epoch()
         extent, _ = self._observe_record_id_extent(table, record_id)
         extent_proof = self._new_extent_proof(extent, derived_epoch=extent_epoch)
@@ -1595,7 +1600,7 @@ class HeapStore:
                 record_id=record_id,
                 durable_floor=durable_floor,
             )
-        payload = _write_payload(table, values, _encoding_proof)
+        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
         header = RecordHeader(
             record_id=record_id,
             xmin=xmin,
@@ -1654,7 +1659,7 @@ class HeapStore:
                 record_id=record_id,
                 next_record_id=floor,
             )
-        payload = _write_payload(table, values, _encoding_proof)
+        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
         extent = self._create_extent(table, next_record_id=floor)
         extent_proof = self._new_extent_proof(extent)
         header = RecordHeader(
@@ -1772,7 +1777,7 @@ class HeapStore:
         # The tuple is encoded before anything is pinned: a row that does not match its schema
         # must not reach a page, and it must not hold a pin while it finds that out.
         accepted_values = values if type(values) is tuple else tuple(values)
-        payload = _write_payload(table, accepted_values, _encoding_proof)
+        payload = _write_payload(table, accepted_values, _encoding_proof, self._tuple_encoding_proofs)
         with self._pool.pinned(self._file, ref.page) as old_page:
             self._require_table_page(old_page, table)
             if ref.slot < FIRST_RECORD_SLOT:

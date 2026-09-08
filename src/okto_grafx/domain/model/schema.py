@@ -13,12 +13,11 @@ reader detect that the bytes were written under a different schema before it dec
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from math import isfinite
-from threading import Lock
 from types import MappingProxyType
-from weakref import WeakKeyDictionary
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.ids import RecordId
@@ -659,10 +658,23 @@ def encode_tuple(table: TableDef, values: Sequence[Value]) -> bytes:
     return bytes(encoded)
 
 
-def _tuple_encoding_proof_protocol():
+@dataclass(frozen=True, slots=True)
+class TupleEncodingProofs:
+    """Private composed protocol; opaque proofs belong to their minting registry."""
+
+    encode: Callable[[TableDef, Sequence[Value]], tuple[bytes, object | None]]
+    payload: Callable[[TableDef, Sequence[Value], object], bytes | None]
+    forget: Callable[[object], None]
+
+
+def _tuple_encoding_proof_protocol(
+    entries: MutableMapping[object, tuple[object, object, bytes]],
+    guard: AbstractContextManager[object],
+) -> TupleEncodingProofs:
     """Build the private proof that lets one exact immutable row reuse its encoding.
 
-    The registry, proof type and lock live only in this closure.  A proof never authenticates an
+    The registry and guard are injected by composition; the opaque proof type lives
+    only in this closure. A proof never authenticates an
     ``id()`` by itself: its registry entry retains the exact table, values tuple and bytes object
     produced by :func:`encode_tuple`.  A copied/replaced intent, another tuple with equal values,
     or a caller-authored object therefore misses and must take the canonical encoder again.
@@ -673,9 +685,6 @@ def _tuple_encoding_proof_protocol():
 
     class Proof:
         __slots__ = ("__weakref__",)
-
-    entries: WeakKeyDictionary[object, tuple[object, object, bytes]] = WeakKeyDictionary()
-    guard = Lock()
 
     def proof_safe(value: object) -> bool:
         """Return whether normal Python code cannot mutate this encoded value in place."""
@@ -722,14 +731,30 @@ def _tuple_encoding_proof_protocol():
         with guard:
             entries.pop(proof, None)
 
-    return encode_with_proof, proved_payload, forget
+    return TupleEncodingProofs(encode_with_proof, proved_payload, forget)
 
 
-(
-    _encode_tuple_with_proof,
-    _proved_tuple_payload,
-    _forget_tuple_encoding_proof,
-) = _tuple_encoding_proof_protocol()
+def _encode_tuple_with_proof(
+    table: TableDef, values: Sequence[Value], *, protocol: TupleEncodingProofs | None = None
+) -> tuple[bytes, object | None]:
+    """Encode canonically; retain a proof only with an explicitly composed protocol."""
+    return (encode_tuple(table, values), None) if protocol is None else protocol.encode(table, values)
+
+
+def _proved_tuple_payload(
+    table: TableDef, values: Sequence[Value], proof: object,
+    *, protocol: TupleEncodingProofs | None = None,
+) -> bytes | None:
+    """Resolve only through the participant's own proof registry."""
+    return None if protocol is None else protocol.payload(table, values, proof)
+
+
+def _forget_tuple_encoding_proof(
+    proof: object, *, protocol: TupleEncodingProofs | None = None
+) -> None:
+    """Revoke a local proof; another participant's proof is never recognized here."""
+    if protocol is not None:
+        protocol.forget(proof)
 
 
 def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:

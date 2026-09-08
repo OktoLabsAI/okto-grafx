@@ -2,9 +2,9 @@
 
 2026-09-08, `feature/v0.0.4`. This addresses the nine findings already recorded
 in `RETAINED_METRIC_SAMPLING_0_0_4.md`; it is not a new performance acceptance gate.
-The complete architecture gate remains **failing**. The checkpoints below reduce
-the original nine occurrences to two in schema.py; both index context channels
-now receive their mechanism from the outer composition.
+The complete static architecture gate now **passes with zero occurrences**.
+The final tuple-proof checkpoint below closes the original nine findings, without
+new waivers. This closes that gate only, not the entire evolution/performance plan.
 
 ## Corrected engine synchronization placement
 
@@ -281,3 +281,56 @@ encoding proof registry (two occurrences: threading and weakref). The gate is no
 waived or complete. Public connect/Pulse configuration, persisted format, OCC/WAL,
 multi-reader/writer and durability policy are unchanged. Source-only; no Pulse
 restart/install, live consolidation, reset/rebuild/redrive or benchmark-spec consumption.
+
+## Tuple-encoding proof composition — gate closed, 2026-09-08
+
+Removed threading/weakref mechanism creation from schema.py. Runtime now allocates
+a synchronized WeakKeyDictionary through `new_tuple_encoding_proofs()` for each
+database participant. API assembly shares that protocol with QueryEngine,
+TransactionManager (which passes it into its transaction contexts), and HeapStore.
+There is no process-global proof registry or mechanism-setting mutation. The mapping
+and guard are implementation dependencies supplied by the trusted composition,
+not user-configurable runtime knobs or a new mandatory StorageDevice/PortRegistry slot.
+
+The domain factory still owns the private Proof class, the exact immutable-value
+admission rules, canonical encoding before proof publication, exact table/values
+identity checks, and revocation. A copied Proof, an unregistered instance of its
+class, a caller object, another table/value tuple, or a proof minted by another
+participant cannot authorize reuse. Unknown/mutable nested values remain on the
+canonical path. Foreign registries cannot revoke the original proof. The registry
+retains exact table/values/payload references while its proof lives; weak keys drop
+the entry on GC, and existing transaction budget/rollback/commit revocation remains.
+Registry operations alone hold the guard; canonical encoding and heap I/O do not.
+
+Manual internal compositions wanting one-encode reuse now create one protocol in
+their outer layer and pass the **same** `tuple_encoding_proofs` to their query,
+transaction manager and heap. TransactionManager wires TransactionContext itself.
+Omitted protocol means canonical encoding/no proof; it does not discover a global
+registry or accept a caller-supplied proof by shape. The old private helper names
+remain with an optional explicit `protocol` argument for internal compatibility.
+Public connect/Pulse settings, canonical encode_tuple behavior and durable bytes
+are unchanged. The internal protocol is not returned as public graph/result data.
+
+Evidence:
+
+- Initial one-encode tests plus full import gate: **215 passed in 6.34 s**.
+- Strengthened proof checks (including the existing post-commit assertion now
+  querying the actual participant registry), forged/copy/deepcopy/unregistered
+  proofs, participant isolation, GC retention, malformed rows, guard scope,
+  concurrent encoding and omitted-protocol/mutable fallbacks: **15 passed in 0.99 s**.
+- Grouped row-proof, pending relationship overlays, transaction quotas/intents/
+  commit protocol, heap writes, both index context channels and live hot batches,
+  public collaborator/query/operation boundaries, and **the full unmodified import
+  gate**: **958 passed in 16.01 s**, no failures or skips. Strict markers and the
+  60-second per-test thread timeout remain enabled. Ruff and diff checks pass.
+- Existing native public CREATE and UPDATE assertions still count **one** canonical
+  encode per final row. Exhausting the private retention budget still costs two,
+  not a bypass; a legacy overridden heap door still re-encodes and receives its
+  original call contract. DELETE intent accounting and pending-endpoint validation
+  were not relaxed.
+
+All nine original static findings are closed; the frozen architecture contract and
+the remaining mechanism import prohibitions were not relaxed. This is not proof
+that every evolution requirement is complete, nor a new real-spec latency result.
+Source-only until accumulated deployment: Pulse remains on installed a82d3bf,
+with no restart, graph mutation, recovery/redrive or consumption of reserved specs.

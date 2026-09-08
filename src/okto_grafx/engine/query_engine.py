@@ -118,6 +118,7 @@ from okto_grafx.domain.model.schema import (
     TableDef,
     _UNMATERIALIZED_COLUMN,
     _encode_tuple_with_proof,
+    TupleEncodingProofs,
     _is_unmaterialized_column,
     encode_tuple,
 )
@@ -3203,6 +3204,7 @@ class QueryEngine:
         "_statement_authority_memo",
         "_compiled_predicates",
         "_compiled_predicates_lock",
+        "_tuple_encoding_proofs",
     )
 
     def __init__(
@@ -3220,6 +3222,7 @@ class QueryEngine:
         custom_index_preparer: Callable[..., CatalogIndexDefinition] | None = None,
         endpoint_locator_guard: AbstractContextManager[object] | None = None,
         compiled_predicate_guard: AbstractContextManager[object] | None = None,
+        tuple_encoding_proofs: TupleEncodingProofs | None = None,
         max_statement_writes: int | None = None,
         max_result_rows: int | None = None,
         max_intermediate_rows: int | None = None,
@@ -3232,6 +3235,7 @@ class QueryEngine:
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
+        self._tuple_encoding_proofs = tuple_encoding_proofs
         self._heap = heap
         self._pool = pool
         # Tables whose primary-key index could not be created. Reported rather than
@@ -14093,7 +14097,9 @@ def _materialise_row_with_proof(
     # and every column the caller actually wrote is checked here exactly as before.
     validatable = _validatable_row(table, materialised)
     if validatable is materialised:
-        _payload, encoding_proof = _encode_tuple_with_proof(table, materialised)
+        _payload, encoding_proof = _encode_tuple_with_proof(
+            table, materialised, protocol=engine._tuple_encoding_proofs
+        )
         return materialised, encoding_proof
     encode_tuple(table, validatable)
     return materialised, None
