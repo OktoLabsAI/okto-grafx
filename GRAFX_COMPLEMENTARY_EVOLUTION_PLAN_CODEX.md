@@ -8,7 +8,9 @@ especificações por milestone e enforcement de fronteiras de source/wheel em
 `feature/gx-cap-0` (base `61fc44d`). Registro de testes e limite do checkpoint:
 [`docs/specs/SPEC-GX-CAP-0.md`](docs/specs/SPEC-GX-CAP-0.md).
 As demais capacidades continuam não certificadas; os contratos não as anunciam
-como disponíveis. O plano agent-first continua obrigatório por decisão do plano
+como implementadas. Checkpoint imutável `eb25eccbd42d16a1a3ddf06292f2d69b4eaaedc6`,
+296 testes agrupados verdes em 14,98 s. Nenhuma nova feature foi instalada no Pulse.
+O plano agent-first continua obrigatório por decisão do plano
 principal, independentemente da declaração histórica de substituição abaixo.
 **Documento-base obrigatório:** `EVOLUTION_PLAN_CODEX.md`
 **Natureza:** roadmap complementar; não substitui, não reabre e não duplica o plano técnico existente

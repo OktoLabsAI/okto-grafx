@@ -14,7 +14,7 @@
 
 ## Resumo vigente — 2026-09-08
 
-Marco complementar GX-CAP-0 iniciado em branch própria `feature/gx-cap-0`,
+Marco complementar GX-CAP-0 entregue em branch própria `feature/gx-cap-0`,
 base `61fc44d`, sem alterar o Pulse instalado ou consumir novas specs.
 Seis ADRs fixam ownership database-first, temporalidade, CommitId, catálogos,
 FTS/hybrid e trust de extensões; há estratégia de capability manifest e specs
@@ -23,6 +23,8 @@ originais continuam incorporados na íntegra; contratos não equivalem a feature
 implementadas. Corrigido o seletor do wheel, que também aceitaria pacotes irmãos
 `okto_grafx_agent`/`okto_grafx_mcp`, e adicionado gate de imports para todo o core.
 Evidência e escopo: [SPEC-GX-CAP-0](docs/specs/SPEC-GX-CAP-0.md).
+Checkpoint imutável `eb25eccbd42d16a1a3ddf06292f2d69b4eaaedc6`; 296 testes
+agrupados passaram em 14,98 s, incluindo o wheel real com sentinelas.
 Performance fria, fan-out residual e atribuição completa da escrita permanecem
 abertos; nenhum novo gate temporal foi criado e as 20 specs seguem reservadas.
 
@@ -3763,7 +3765,7 @@ começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidên
 
 | Marco | Estado | Evidência integrada | Validação registrada |
 |---|---|---|---|
-| GX-CAP-0 — contratos database-first e isolamento de wheels | dez entregas implementadas e validadas localmente; não é release das próximas capabilities | branch `feature/gx-cap-0`, base `61fc44d`; seis ADRs e `docs/specs/SPEC-GX-CAP-0.md`; SHA do checkpoint registrado após commit | 296 testes agrupados em 14,98 s, incluindo wheel real com cinco pacotes-sentinela, seletor legado discriminado, fronteiras de imports e recusa de capabilities; Ruff/diff limpos, 22 documentos com links verificados. Sem mudança de runtime/formato, novas specs consumidas ou alegação de ganho de performance; revisão Codex solo, não auditoria independente |
+| GX-CAP-0 — contratos database-first e isolamento de wheels | dez entregas implementadas e validadas localmente; não é release das próximas capabilities | branch `feature/gx-cap-0`, checkpoint `eb25eccbd42d16a1a3ddf06292f2d69b4eaaedc6`, base `61fc44d`; seis ADRs e `docs/specs/SPEC-GX-CAP-0.md` | 296 testes agrupados em 14,98 s, incluindo wheel real com cinco pacotes-sentinela, seletor legado discriminado, fronteiras de imports e recusa de capabilities; Ruff/diff limpos, 22 documentos com links verificados. Sem mudança de runtime/formato, novas specs consumidas ou alegação de ganho de performance; revisão Codex solo, não auditoria independente |
 | M-PULSE-0 | concluído | `main@5b7551b40dba2facb28c46770f166ab3ac9daecc` | suites query/API do marco: 1.398 passes e 1 skip; chunks globais: 3.841 + 1.205 + 2.021 passes, 10 skips; Ruff limpo; nove mutantes mortos; revisão cruzada sem blocker |
 | M-PULSE-1A — identidade pendente | concluído | `main@d487ac9312229e0376ad8e65625213af111d9c9c` | regressões de `PendingRowRef`, redução de intents, prevalidation e bloqueios passaram; Ruff e `git diff --check` limpos após rebase |
 | M-PULSE-1A — overlay de nós | concluído | `main@3f354d9b4973086421500654fe74982606767df3` + hardening `main@aef1df734582cd04097fcc0393ecda587ee5409f` | `tests/query`, `tests/txn` e `tests/api` com exit 0; 51 regressões focadas pós-auditoria com exit 0; Ruff limpo; revisão independente encontrou dois casos, ambos reproduzidos e fechados antes do merge |

@@ -86,6 +86,9 @@ persisting milestones must define them before code.
 
 ## Execution evidence
 
+Immutable implementation/contract checkpoint: `eb25eccbd42d16a1a3ddf06292f2d69b4eaaedc6`.
+This follow-up only attaches its identity to the execution record.
+
 Final grouped command:
 
 ```text
