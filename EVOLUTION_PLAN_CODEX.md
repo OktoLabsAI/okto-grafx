@@ -93,6 +93,15 @@ comprovada usa o retry já limitado. Corrupção estável e sinais de processo n
 são mascarados. 973 testes/61,99 s passaram; sem consumir spec ou reiniciar
 runtime neste checkpoint. Detalhes: `docs/UNSTAGED_WRITE_PREFLIGHT_0_0_4.md`.
 
+**Identidade instalada mais recente:** Grafx **0.0.4@fa8f188** com accel,
+Pulse **0.3.3 PID 4212**, Core **0a38312** com tempos por fase e Community
+`7158383`. Wheel isolado: 22 testes/6,80 s; hashes dos módulos alterados conferidos.
+Reinício único após saída confirmada do PID 15940. Ledger completo de 40 itens
+e cinco vínculos canônicos idênticos; 20 pendentes preservadas. Board/Global
+healthy, métricas disponíveis, 2.965 nós, fila zero; dívida histórica continua
+visível. Este registro prevalece sobre identidades/PIDs anteriores deste resumo.
+Deploy e limites: `docs/UNSTAGED_WRITE_PREFLIGHT_0_0_4.md`.
+
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |

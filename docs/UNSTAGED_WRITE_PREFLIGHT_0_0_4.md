@@ -87,5 +87,31 @@ different fresh private copy and made no graph writes.
 Harness: `.grafx-tmp/compare_unstaged_writer_landings.py`.
 Evidence: `.grafx-tmp/unstaged-writer-landings-20260908.json`.
 SHA-256: `DF5DC19452C2F12F7DF57E8191908B6ADA7DBF14D660903715BEF3AEBAA27E36`.
-The source change is not yet installed. Twenty pending specs remain reserved;
-no live event, consolidation, redrive, rebuild or reset was issued.
+Twenty pending specs remain reserved; no live event, consolidation, redrive,
+rebuild or reset was issued.
+
+## Accumulated deployment
+
+Installed **Grafx 0.0.4@fa8f188**, wheel SHA-256
+`86E0329E66297B641B797E7F834AD23059B9D29C966CD43CAE4934723AA001D3`.
+The isolated wheel passed 22 focused tests in 6.80 s, with its import path
+checked and repository pythonpath injection disabled. After verified graceful
+shutdown of Pulse PID 15940 (owning terminal exit 1, PID absent and ports free),
+the wheel replaced the Python 3.13 user installation. Changed installed module
+hashes match source; NumPy 2.5.2 and google-crc32c 1.8.0 remain installed.
+
+Pulse **0.3.3 PID 4212** serves 8100/8101, with Community `7158383`, Core
+`0a38312` (including phase observations), and native Grafx from installed
+site-packages, not native-source injection. HTTP root returned 200. The five
+canonical Alternative/Decision rows and the complete 40-item cognitive ledger
+are identical before/after: 20 pending, 20 consolidated, zero in progress,
+failed or skipped. No new consolidation or delivery replay was used.
+
+The initial cold Health response exposed unavailable metrics while refreshing;
+the next response reported Board/Global healthy, metrics available, 2,965 nodes
+and queue zero. Overall remains at_risk from the historical policy DLQ. Historical
+DLQ and canonical debt were not reset or hidden. No end-to-end performance claim
+is derived from these readiness checks. No main merge or PyPI publication.
+
+Sanitized deployment evidence: `.grafx-tmp/deploy-fa8f188-live-evidence.json`,
+SHA-256 `98FAA5C2CE13F703CF169E6C5E692E1C161301C526895FF8E0DED21CE054F9AB`.

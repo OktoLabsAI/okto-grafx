@@ -910,3 +910,11 @@ failed materialization now performs that same post-proof and retries only a
 proven transition under the existing bound. Stable corruption still raises.
 Final index/query/concurrency/import-boundary group: 973 passed in 61.99 s.
 No live mutation or new timing gate. `UNSTAGED_WRITE_PREFLIGHT_0_0_4.md`.
+
+Accumulated deployment completed: Grafx 0.0.4@fa8f188 installed with accel,
+22 isolated-wheel tests passed in 6.80 s, changed module hashes matched. Pulse
+0.3.3 PID 4212 loads Core 0a38312 phase observations after verified shutdown of
+PID 15940. Five canonical rows and the complete 40-item ledger remain identical;
+20 pending specs reserved. Follow-up Health: Board/Global healthy, metrics
+available, 2,965 nodes, queue zero; historical debt still visible. No further
+consolidation, main merge, PyPI publication or full-delivery timing claim.
