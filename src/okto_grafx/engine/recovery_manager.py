@@ -118,9 +118,13 @@ from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.commit_redo import CommitRedo
 from okto_grafx.engine.commit_state_store import CommitStateStore
 from okto_grafx.engine.coordination import COMMIT_SECTION
+from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.engine.ledger_store import LedgerStore
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.quarantine import QuarantineStore, is_protected
+
+_CANONICAL_REPLAY_FLOOR = IndexManager.check_replay_floor
+_CANONICAL_WATERMARK_PHOTO = IndexManager.table_watermark_photo
 
 __all__ = [
     "MAX_LEDGER_BODY_BYTES",
@@ -734,13 +738,35 @@ class RecoveryManager:
         preflighted, preflight_touched_catalog = self._preflight_committed_replay(
             replay, permit
         )
+        replay_floor_watermarks = None
         if manager is not None and not state_was_damaged:
             # The checkpoint is the replay floor. An index already behind it cannot be completed
             # from the retained WAL suffix and must be marked stale BEFORE replay; otherwise the
             # final mark_built_through would certify a permanently missing historical entry.
             # Even the in-memory verdict follows preflight so a byte-identical refusal has no
             # state transition to unwind.
-            manager.check_replay_floor(state.checkpoint_lsn, persist_stale=False)
+            if (
+                type(self) is RecoveryManager
+                and type(manager) is IndexManager
+                and IndexManager.check_replay_floor is _CANONICAL_REPLAY_FLOOR
+                and IndexManager.table_watermark_photo is _CANONICAL_WATERMARK_PHOTO
+                and RecoveryManager._repair_ledger is _CANONICAL_LEDGER_REPAIR
+                and type(self._ledger) is LedgerStore
+                and self._ledger.damage is None
+                and not plan.damaged
+                and self._policy != POLICY_REFUSE
+            ):
+                # The two pre-redo floor checks share one heap picture only in this closed
+                # clean-log/healthy-ledger interval. No page replay, catalog adoption or
+                # external commit can intervene under this permit. Both index-header checks
+                # still run; redo and post-section open take their own fresh photographs.
+                replay_floor_watermarks = manager.table_watermark_photo()
+                manager.check_replay_floor(
+                    state.checkpoint_lsn, persist_stale=False,
+                    watermarks=replay_floor_watermarks,
+                )
+            else:
+                manager.check_replay_floor(state.checkpoint_lsn, persist_stale=False)
         outcome = OUTCOME_CLEAN
         entries_created = 0
         if plan.damaged:
@@ -775,7 +801,13 @@ class RecoveryManager:
         ):
             # Only after the policy has accepted mutation may the conservative verdict become a
             # durable stale bit. The refuse policy promises byte-for-byte non-interference.
-            manager.check_replay_floor(state.checkpoint_lsn, persist_stale=True)
+            if replay_floor_watermarks is None:
+                manager.check_replay_floor(state.checkpoint_lsn, persist_stale=True)
+            else:
+                manager.check_replay_floor(
+                    state.checkpoint_lsn, persist_stale=True,
+                    watermarks=replay_floor_watermarks,
+                )
         replayed = self._redo(
             plan,
             findings,
@@ -1984,6 +2016,9 @@ class RecoveryManager:
 
 
 _CATALOG_FILE: str = "catalog.dat"
+
+
+_CANONICAL_LEDGER_REPAIR = RecoveryManager._repair_ledger
 
 
 def _carried_body(body: bytes, entry_name: str, detail: str) -> tuple[bytes, str]:

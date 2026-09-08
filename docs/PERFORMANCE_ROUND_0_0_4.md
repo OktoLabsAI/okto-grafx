@@ -865,3 +865,12 @@ and 7.518 s full verification. This excludes production routing/fence costs and
 does not measure a dirty live-event checkpoint or explain all 131.489 s.
 No additional spec or live mutation. Evidence, limits and finite follow-up:
 `GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.
+
+Writable-open follow-up: the two clean pre-redo replay-floor checks now share
+one complete heap-watermark picture under the same commit permit. Both fresh
+index-header checks remain; damaged/refuse/custom paths, post-redo and final
+admission keep their original independent observations. Private Global fixture:
+44 → 33 table walks, 2.835 → 2.409 s connect, 2,261 identical digest IDs. One
+sequential sample, not a full-Pulse speedup claim. Final grouped quality slice:
+756 passed in 20.87 s, Ruff/diff clean. Source only; no spec consumed or runtime
+replacement. Details: `RECOVERY_FLOOR_PHOTO_0_0_4.md`.

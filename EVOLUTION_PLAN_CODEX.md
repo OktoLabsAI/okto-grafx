@@ -52,6 +52,14 @@ de flush em cópia quiescente: 11,946 s, incluindo reabertura 4,304 s e verifica
 Sem nova spec, alteração instalada ou relaxamento de garantias. Evidência e
 próximo foco dentro da investigação vigente: `docs/GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.
 
+Reabertura: removida uma varredura repetida dos watermarks do heap entre as duas
+verificações pré-redo, somente no intervalo nativo de WAL limpo/ledger saudável
+sob o mesmo permit. Headers de índices continuam frescos a cada verificação;
+pós-redo e admissão final permanecem independentes. Cópia Global: 44 → 33 walks,
+2,835 → 2,409 s de connect, 2.261 IDs idênticos; não é ganho total do Pulse.
+756 testes agrupados passaram. Fonte apenas, aguardando deploy acumulado, sem
+nova spec: `docs/RECOVERY_FLOOR_PHOTO_0_0_4.md`.
+
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |
