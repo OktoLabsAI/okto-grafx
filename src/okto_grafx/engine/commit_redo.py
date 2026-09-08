@@ -33,6 +33,7 @@ from okto_grafx.engine.buffer_pool import (
     BufferPool,
     apply_page_image,
 )
+from okto_grafx.engine.catalog_store import CATALOG_FILE, read_catalog_page_images
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -160,6 +161,7 @@ class CommitRedo:
                 replay.effects,
                 allow_unregistered_indexes=False,
             )
+            self._validate_catalog_transitions(replay, prepared_pages)
             self._require_unchanged_commit_records(replay, commit_records, commit_signature)
 
         pages_applied = 0
@@ -304,6 +306,7 @@ class CommitRedo:
             replay.effects,
             allow_unregistered_indexes=allow_unregistered_indexes,
         )
+        self._validate_catalog_transitions(replay, prepared_pages)
         self._require_unchanged_commit_records(replay, commit_records, commit_signature)
         return _PreflightedReplay(
             seal=_PREFLIGHT_SEAL,
@@ -322,6 +325,46 @@ class CommitRedo:
             contains_index_reset=contains_index_reset,
             prepared_pages=prepared_pages,
         )
+
+    def _validate_catalog_transitions(
+        self, replay: CommittedReplay,
+        prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
+    ) -> None:
+        """Prove complete schema-catalog snapshots before native replay can mutate.
+
+        Legacy hand-composed effect-only plans retain the dispatcher contract;
+        actual WAL selectors provide terminal records. Missing physical tails
+        cannot supply a missing catalog image. This does not authorize journal
+        pages or establish activation relative to the prior durable control.
+        """
+        if not replay.commit_records:
+            return
+        grouped: dict[tuple[int, int], list[tuple[int, bytes]]] = {}
+        for _position, prepared in prepared_pages:
+            if prepared.file == CATALOG_FILE:
+                record = prepared.record
+                grouped.setdefault((record.epoch, record.txn_id), []).append((prepared.page_index, prepared.image))
+        if not grouped:
+            return
+        seen = False
+        previous_horizon: int | None = None
+        for terminal in replay.commit_records:
+            images = grouped.get((terminal.epoch, terminal.txn_id))
+            if images is None:
+                continue
+            catalog = read_catalog_page_images(tuple(images), page_size=self._pool.page_size, sequence=terminal.lsn)
+            horizon = catalog.commit_catalog_activation
+            if (
+                horizon is not None and horizon > terminal.lsn
+                or seen and previous_horizon is not None and horizon != previous_horizon
+                or seen and previous_horizon is None and horizon is not None and horizon != terminal.lsn
+            ):
+                raise GrafxRecoveryRefused(
+                    "Catalog replay changes or invents the commit-history activation horizon.",
+                    field="commit_catalog_activation", lsn=terminal.lsn,
+                )
+            previous_horizon = horizon
+            seen = True
 
     def _verify_preflight_for(
         self,
