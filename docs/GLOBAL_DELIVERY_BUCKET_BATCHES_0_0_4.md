@@ -82,11 +82,14 @@ One 256-key native identity-count batch on the retained Global fixture returned
 the structural 75% reduction in bucket pins is directly observed. This does not
 measure total commit/delivery or prove a corresponding application speedup.
 
-Crucially, the profiled outgoing Global query still resolves scalar destinations.
+At this primitive checkpoint, the profiled outgoing Global query still resolved scalar destinations.
 This checkpoint removes repetition in the existing batch primitive; bounded
 destination batching for that full scalar-projection query remains the next
 integration step, with snapshot, overlay, result-order and refusal tests required.
 The 4.778 s query is **not** claimed fixed by this primitive alone.
+
+Subsequent implementation of the bounded destination integration and its separate
+unchanged-query measurements are in `GLOBAL_DESTINATION_BATCHING_0_0_4.md`.
 
 ## Deployment and preserved state
 

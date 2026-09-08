@@ -7337,6 +7337,35 @@ class IndexManager:
 
         return index._stable_view(read_lsn, confirm)
 
+    def validated_identity_landings_many(
+        self, index: IndexStore, keys: Sequence[bytes], snapshot: SnapshotLike,
+    ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
+        """Return vector-free identity witnesses under one whole-batch fence.
+
+        Like scalar landings, every candidate payload (including history) is
+        validated. The caller must keep vector proof markers out of row values.
+        No prefix escapes before the post-certificate; retries rebuild all groups.
+        """
+        definition = index.definition
+        if definition.key_derivation != RECORD_ID_KEY_DERIVATION:
+            raise GrafxIndexError(
+                f"Index {definition.name!r} derives its key from columns and cannot validate "
+                "identity landings.",
+                field="key_derivation", value=definition.key_derivation,
+                index=definition.name, file=index.file,
+            )
+        read_lsn = index._require_exact_read_lsn(snapshot)
+        wanted = tuple(index._require_key(key) for key in keys)
+        distinct = tuple(dict.fromkeys(wanted))
+        if not distinct:
+            return ()
+        return index._stable_view(
+            read_lsn,
+            lambda certificate: self._validated_version_groups(
+                index, wanted, distinct, snapshot, certificate, landing=True,
+            ),
+        )
+
     def validated_versions_many(
         self,
         index: IndexStore,
@@ -7472,17 +7501,20 @@ class IndexManager:
         distinct: Sequence[bytes],
         snapshot: SnapshotLike,
         certificate: _IndexReadCertificate,
+        *,
+        landing: bool = False,
     ) -> tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...]:
         """Validate already-canonical keys inside the caller's exact-read certificate."""
         # Even an all-cached answer must attach the companion heap view to this exact durable
         # generation.  The caller may skip payload decodes, never the storage-view fence.
         self._prepare_heap_view(index.file, certificate)
         definition = index.definition
+        read = self._heap.read_landing if landing else self._heap.read
         answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
         for wanted, candidates in index._candidate_groups_unchecked(distinct):
             accepted: list[tuple[RecordRef, HeapVersion]] = []
             for entry in candidates:
-                version = self._heap.read(entry.ref)
+                version = read(entry.ref)
                 if version.table_id != definition.table_id:
                     raise GrafxCorruptionDetected(
                         f"Index {definition.name!r} points at a row of table "

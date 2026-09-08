@@ -354,6 +354,8 @@ _OWNER_LANDING_VECTOR_COMPONENT_BYTES: int = 32
 _VECTOR_FREE_CANONICAL_READ = HeapStore.read
 _VECTOR_FREE_CANONICAL_DECODE = HeapStore._decode_version
 _VECTOR_FREE_CANONICAL_VALIDATED = IndexManager.validated_versions
+_BATCH_LANDING_CANONICAL_SCALAR = IndexManager.validated_identity_landings
+_BATCH_LANDING_CANONICAL_MANY = IndexManager.validated_identity_landings_many
 """Shape tariff of one retained landing (KGRUN-M4).
 
 Each constant dominates the CPython footprint of the object it meters: a scalar cell is one
@@ -2414,6 +2416,82 @@ class _OwnerLandingView:
             if lease_open:
                 with self._guard:
                     self._leave_locked()
+
+    def landings_many(
+        self, identities: Sequence[int], context: _Context, index: object,
+    ) -> tuple[tuple[object, HeapVersion] | None, ...]:
+        """Batch READ-only misses in the existing bounded vector-free payload memo.
+
+        Repeated destinations retain the same scalar cache benefit. Full rows
+        never consume these entries; quota exhaustion declines retention, not
+        validation. No partial batch is retained before all identity checks pass.
+        """
+        with self._guard:
+            if self._retired:
+                raise GrafxTransactionStateError(
+                    "A transaction-local landing view was retired before its query finished.",
+                    field="owner_landing_view", table=self._table.name,
+                    table_id=self._table.table_id,
+                )
+            answers = {}
+            for identity in identities:
+                key = (identity, "vector_free")
+                cached = self._cache.get(key)
+                if cached is not None:
+                    answers[identity] = cached[0]
+                    del self._cache[key]
+                    self._cache[key] = cached
+            self._active += 1
+        try:
+            missing = tuple(identity for identity in dict.fromkeys(identities)
+                            if identity not in answers)
+            if missing:
+                groups = self._engine._indexes.validated_identity_landings_many(
+                    index, tuple(record_id_key(identity) for identity in missing), context.snapshot,
+                )
+                if len(groups) != len(missing):
+                    raise GrafxIndexError(
+                        "Identity landing validation returned an invalid result group count.",
+                        field="index_batch", index=index.name,
+                        expected=len(missing), observed=len(groups),
+                    )
+                for identity, group in zip(missing, groups):
+                    if len(group) > 1:
+                        raise GrafxCorruptionDetected(
+                            f"Identity index {index.name!r} resolved record {identity} of "
+                            f"table {self._table.name!r} to {len(group)} snapshot-visible versions.",
+                            file=index.file, table=self._table.name, table_id=self._table.table_id,
+                            record_id=identity, field="record_id", index=index.name, count=len(group),
+                        )
+                    found = None
+                    if group:
+                        ref, version = group[0]
+                        found = (ref, replace(version, values=tuple(
+                            _UNMATERIALIZED_COLUMN if column.type in VECTOR_VALUE_TYPES else value
+                            for column, value in zip(self._table.columns, version.values)
+                        )))
+                    answers[identity] = found
+                with self._guard:
+                    if not self._retired and self._cache_enabled and self._budget is not None:
+                        for identity in missing:
+                            key = (identity, "vector_free")
+                            found = answers[identity]
+                            charge = _owner_landing_result_bytes(self._table, found)
+                            if key in self._cache or charge is None:
+                                continue
+                            charge += 128
+                            if self._reserve_evicting_locked(self._budget, charge):
+                                try:
+                                    self._cache[key] = (found, charge)
+                                except BaseException:
+                                    self._budget.release(bytes_=charge, entries=1)
+                                    raise
+                                self._cache_bytes += charge
+                                self._cache_entries += 1
+            return tuple(answers[identity] for identity in identities)
+        finally:
+            with self._guard:
+                self._leave_locked()
 
     def counts_many(
         self, identities: Sequence[int], context: _Context, index: object,
@@ -6559,6 +6637,102 @@ def _planned_table_for_variable(root: PlanNode, variable: str) -> TableDef | Non
     return None
 
 
+_BATCH_LANDING_CANONICAL_GET = _OwnerLandingView.get
+
+
+def _admits_batched_landings(
+    engine: QueryEngine, node: TraverseRelationship, context: _Context,
+) -> bool:
+    """Admit bounded prefetch only when the closed consumer must read every hop.
+
+    A streaming LIMIT must never inspect a later endpoint. Nor may batching move
+    a configured quota's refusal across validation. Those shapes, owner writes
+    and specialized scalar witnesses retain the original per-row access path.
+    """
+    manager = engine._indexes
+    if (
+        type(context.txn) is not TransactionContext
+        or context.txn.mode is not TransactionMode.READ
+        or engine._max_intermediate_rows is not None
+        or engine._max_traversal_expansions is not None
+        or engine._max_traversal_paths is not None
+        or engine._query_memory_budget_bytes is not None
+        or node.min_hops != 1 or node.max_hops != 1 or node.target_bound
+        or node.path_variable is not None or node.target_table is None
+        or node.direction is Direction.UNDIRECTED
+        or getattr(getattr(manager, "validated_identity_landings", None), "__func__", None)
+        is not _BATCH_LANDING_CANONICAL_SCALAR
+        or getattr(getattr(manager, "validated_identity_landings_many", None), "__func__", None)
+        is not _BATCH_LANDING_CANONICAL_MANY
+        or getattr(manager._validated_items, "__func__", None)
+        is not _SCALAR_PK_CANONICAL_VALIDATED_ITEMS
+    ):
+        return False
+    consumer = context.result_node
+    blocking = False
+    while consumer is not node:
+        kind = type(consumer)
+        if kind in (AggregateRows, SortRows):
+            blocking = True
+        elif kind in (LimitRows, SkipRows):
+            if blocking:
+                return False
+        elif kind not in (ProjectRows, FilterRows, DistinctRows):
+            return False
+        consumer = consumer.child
+    return blocking
+
+
+def _batched_landing_steps(
+    engine: QueryEngine, context: _Context,
+    steps: Iterator[tuple[object, HeapVersion, TableDef, object]],
+    view_at: Callable[[TableDef], _OwnerLandingView],
+) -> Iterator[tuple[object, HeapVersion, TableDef, object, bool,
+                    tuple[RecordRef, HeapVersion] | None]]:
+    """Resolve at most 64 detached steps, then emit them in their original order.
+
+    New witnesses are proved in one stable view before any row of the batch is
+    available to the blocking consumer. Repeated destinations use the same
+    transaction-local, bounded payload memo as scalar landings.
+    """
+    try:
+        first = next(steps)
+    except StopIteration:
+        return
+    # A missing source/edge must not inspect the destination index eagerly.
+    index = _endpoint_identity_index(engine, context, first[2])
+    if index is None:
+        yield *first, False, None
+        for candidate in steps:
+            yield *candidate, False, None
+        return
+    view = view_at(first[2])
+    if (
+        type(view) is not _OwnerLandingView
+        or getattr(view.get, "__func__", None) is not _BATCH_LANDING_CANONICAL_GET
+    ):
+        yield *first, False, None
+        for candidate in steps:
+            yield *candidate, False, None
+        return
+    frontier = [first]
+    while True:
+        for _ in range(64 - len(frontier)):
+            try:
+                frontier.append(next(steps))
+            except StopIteration:
+                break
+        if not frontier:
+            return
+        landings = view.landings_many(
+            tuple(item[3] for item in frontier), context, index,
+        )
+        for (ref, edge, table, identity), landing in zip(frontier, landings):
+            yield ref, edge, table, identity, True, landing
+        frontier = []
+        landings = ()
+
+
 def _traverse(
     engine: QueryEngine, node: TraverseRelationship, context: _Context
 ) -> Iterator[_Row]:
@@ -6624,13 +6798,18 @@ def _traverse(
         and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
         and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
     )
+    batch_landings = vector_free and _admits_batched_landings(engine, node, context)
 
-    def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
-        """Return one owner-visible node through a single lazy view per landing table."""
+    def view_at(table: TableDef) -> _OwnerLandingView:
         view = landing_views.get(table.table_id)
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
             landing_views[table.table_id] = view
+        return view
+
+    def node_at(table: TableDef, identity: object) -> tuple[object, HeapVersion] | None:
+        """Return one owner-visible node through a single lazy view per landing table."""
+        view = view_at(table)
         return (
             view.get(identity, context, materialize_vectors=False)
             if vector_free else view.get(identity, context)
@@ -6672,12 +6851,20 @@ def _traverse(
             reached: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = []
             for record_id, _table, path in frontier:
                 taken = {edge.ref for edge in path}
-                for ref, version, next_table, next_id in steps(record_id):
+                candidates = steps(record_id)
+                resolved = (
+                    _batched_landing_steps(engine, context, iter(candidates), view_at)
+                    if batch_landings else
+                    ((*candidate, False, None) for candidate in candidates)
+                )
+                for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
                     if charge_expansions:
                         context.admit_traversal_expansion()
                     if ref in taken:
                         continue
-                    if (
+                    if prevalidated:
+                        landing = batch_landing
+                    elif (
                         isinstance(bound_target, RowBinding)
                         and _overlay_identity(bound_target) == next_id
                         and bound_target.table.table_id == next_table.table_id

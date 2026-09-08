@@ -25,9 +25,12 @@ Atribuição posterior em cópias privadas: inventários/metadados do Board abai
 1 s por fase; inventários de arestas Global em 4,778/4,698 s. O perfil encontrou
 repetição de buckets nas resoluções de destino. As APIs nativas em lote passaram
 a percorrer cada bucket solicitado uma vez, mantendo provas de heap/certificado;
-256 identidades: 512 → 128 pins de buckets, respostas idênticas. Integrar o lote
-ao destino escalar da consulta Global continua pendente, sem declarar os 131 s
-resolvidos. Fonte apenas, sem nova spec: `docs/GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md`.
+256 identidades: 512 → 128 pins de buckets, respostas idênticas. A integração
+posterior ao destino escalar mantém lotes de até 64 passos e o memo já limitado:
+consulta de saída 4,771 → 4,464 s, entrada 5,627 → 3,231 s em cópia privada, com
+2.253 resultados idênticos. Não declara os 131 s resolvidos nem um novo run vivo.
+Fonte apenas, sem nova spec: `docs/GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md` e
+`docs/GLOBAL_DESTINATION_BATCHING_0_0_4.md`.
 
 Este resumo prevalece sobre os checkpoints cronológicos abaixo; eles ficam
 preservados como evidência, não como novas filas ou dependências ativas do Claude.

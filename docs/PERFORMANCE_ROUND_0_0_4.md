@@ -759,3 +759,12 @@ This primitive also serves existing PK batches and relationship counts, but the
 profiled scalar-destination Global query still needs bounded batch integration.
 No total-delivery speedup, live deployment or extra consolidation is claimed.
 Details: `GLOBAL_DELIVERY_BUCKET_BATCHES_0_0_4.md`.
+
+The next source checkpoint integrates bounded (64-step) identity landings into
+closed blocking scalar traversals, reusing the existing bounded payload memo for
+duplicate destinations. Unchanged private Global queries returned identical 2,253
+rows/counts: outgoing 4.771 -> 4.464 s, inbound 5.627 -> 3.231 s, with exact-read
+post-certificates reduced from 2,255/2,253 to 38/36. No new timing gate or live
+consolidation; full delivery is still unresolved. Fallbacks preserve streaming
+LIMIT, owner overlays, operational quotas and specialized witnesses. Implementation,
+quality evidence and deployment boundary: `GLOBAL_DESTINATION_BATCHING_0_0_4.md`.
