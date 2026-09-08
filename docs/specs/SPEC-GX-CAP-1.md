@@ -336,6 +336,8 @@ writer premises were not relaxed. No Pulse operation or extra spec was consumed.
 
 ### CAP-1B required journal WAL grammar — 2026-09-08
 
+Immutable implementation checkpoint: `0feec917d0ac8d1cb2bfea6543e20cf7de156ddf`.
+
 Implemented required flag `COMMIT_CATALOG_V1=0x0010`: raw journal pages use exact
 v2 flags `0x0011`, compressed journal pages use `0x0015`. Existing compressed
 ordinary pages retain `0x0005`. The journal marker survives unprofitable/disabled

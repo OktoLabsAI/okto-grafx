@@ -122,6 +122,8 @@ and partial-file crash classification remain part of publication/recovery work.
 
 ### Required journal WAL framing implemented
 
+Immutable implementation checkpoint: `0feec917d0ac8d1cb2bfea6543e20cf7de156ddf`.
+
 `WRITE_PAGE`, format_version 2, uses required flag `COMMIT_CATALOG_V1=0x0010`
 together with REQUIRED `0x0001`. Exactly three WRITE_PAGE-v2 flag combinations
 are understood: ordinary compressed page `0x0005`, raw journal `0x0011`, and

@@ -21,6 +21,7 @@ a validação/publicação do journal inteiro. Testados leitor antigo simulado,
 read/append/recycle sem alterar o WAL, framing e sizing com roll; grupo final
 de 894 testes em 17,63 s. Não é ainda histórico público utilizável. Evidências e
 limites: [SPEC-GX-CAP-1](docs/specs/SPEC-GX-CAP-1.md).
+Checkpoint imutável do framing: `0feec917d0ac8d1cb2bfea6543e20cf7de156ddf`.
 
 GX-CAP-1 tem codec, planejador/leitor paginado, binding do LSN e ativação interna
 do horizonte de histórico implementados (ativação: `3d6ef7f822cbe14293f72ee886f91a1fe365485a`). A ativação usa o commit real, inclusive

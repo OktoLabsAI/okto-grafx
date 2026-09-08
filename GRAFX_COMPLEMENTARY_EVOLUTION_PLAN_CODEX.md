@@ -10,6 +10,7 @@ o journal antes de aplicar qualquer prefixo. Alvos de redo e publicação autom�
 continuam fechados até integração completa. Grupo de 894 testes em 17,63 s, sem
 novos erros de tipagem nos módulos verificados. Evidência, restrições e próximos
 requisitos: [`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md). Pulse/specs intocados.
+Checkpoint imutável: `0feec917d0ac8d1cb2bfea6543e20cf7de156ddf`.
 
 **GX-CAP-1B / ativação interna / 2026-09-08:** catálogo v2 agora persiste o
 horizonte do COMMIT de ativação com capability obrigatória. A preparação privada
