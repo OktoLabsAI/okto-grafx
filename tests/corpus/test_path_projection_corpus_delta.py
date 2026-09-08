@@ -49,6 +49,9 @@ def test_only_path_projection_moves_in_the_frozen_pulse_corpus() -> None:
     assert projected["error"] is None
 
     # The path projection is a raw grammar capability, not one of the 97 extracted callsites.
-    # Therefore the callsite classifications remain byte-for-byte at their previous totals.
-    assert frozen["counts"]["classification:already_supported"] == 82
-    assert frozen["counts"]["classification:generic_gap"] == 13
+    # Later chained OPTIONAL MATCH support admits I64 independently of this raw path probe.
+    scoring = next(entry for entry in frozen["entries"] if entry["id"] == "I64")
+    assert scoring["classification"] == "already_supported"
+    assert scoring["expected"]["error"] is None
+    assert frozen["counts"]["classification:already_supported"] == 83
+    assert frozen["counts"]["classification:generic_gap"] == 12

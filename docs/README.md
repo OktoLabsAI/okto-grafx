@@ -1,6 +1,7 @@
 # Documentation index
 
-The consumer guides describe source version **0.0.4**. They do not assert PyPI
+The consumer guides include source version **0.0.5 development** additions, marked
+with their implementation and acceptance status. They do not assert PyPI
 publication or that the latest source is installed in a particular application.
 
 ## Integrate without reading engine internals
@@ -10,6 +11,7 @@ publication or that the latest source is installed in a particular application.
 | How do I install, create a graph and reopen it? | [Getting started](GETTING_STARTED.md) |
 | How do I integrate a synchronous library into services, workers or agents? | [Integration](INTEGRATION.md) |
 | Which public methods and return values exist? | [API reference](API_REFERENCE.md) |
+| How do I opt into commit provenance and page its history? | [Commit history](COMMIT_HISTORY.md) |
 | Which settings exist, what are their defaults and risks? | [Configuration](CONFIGURATION.md) |
 | Which Cypher constructs and value types are supported? | [Query language](QUERY_LANGUAGE.md) |
 | How do indexes, vectors and explicit growth work? | [Indexes and vectors](INDEXES_AND_VECTORS.md) |

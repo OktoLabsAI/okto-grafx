@@ -256,6 +256,7 @@ class NumpyVectorMath:
             prepared: tuple[numpy.ndarray, float] | None = None
 
             def cosine(values: Sequence[float]) -> float:
+                """Compute cosine similarity using the retained query or candidate norm when available."""
                 nonlocal prepared
                 require_same_length(query, values)
                 if prepared is None:
@@ -276,6 +277,7 @@ class NumpyVectorMath:
         if metric is DistanceMetric.DOT:
 
             def dot(values: Sequence[float]) -> float:
+                """Compute a finite dot product using the prepared query array."""
                 nonlocal left_array
                 require_same_length(query, values)
                 with _quiet():
@@ -288,6 +290,7 @@ class NumpyVectorMath:
             return dot
 
         def euclidean(values: Sequence[float]) -> float:
+            """Score one candidate by negative Euclidean distance with the prepared query."""
             nonlocal left_array
             require_same_length(query, values)
             with _quiet():
@@ -317,6 +320,7 @@ class NumpyVectorMath:
         def converted(
             values: Sequence[float],
         ) -> tuple[numpy.ndarray, float, numpy.ndarray]:
+            """Convert the query and candidate while retaining the validated query norm."""
             nonlocal prepared
             require_same_length(query, values)
             if prepared is None:
@@ -333,6 +337,7 @@ class NumpyVectorMath:
             return left, length_query, right
 
         def measured(values: Sequence[float]) -> tuple[float, float]:
+            """Return cosine similarity together with the measured candidate norm."""
             left, length_query, right = converted(values)
             with _quiet():
                 right_norm = _require_finite(
@@ -344,6 +349,7 @@ class NumpyVectorMath:
             return score, right_norm
 
         def cosine(values: Sequence[float], right_norm: float) -> float:
+            """Compute cosine similarity using the retained query or candidate norm when available."""
             left, length_query, right = converted(values)
             with _quiet():
                 return self._cosine_with_norm_from_arrays(

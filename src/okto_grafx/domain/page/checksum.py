@@ -621,6 +621,7 @@ def _closed_provider_checked(
     crc_first = _CLOSED_PROVIDER_CRC_FIRST[_closed_slot(identity)]
 
     def checked(data: bytes, crc: int) -> int:
+        """Call the selected CRC backend and validate its bounded result."""
         try:
             observed = (
                 raw_function(crc, data)  # type: ignore[operator]

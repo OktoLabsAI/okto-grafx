@@ -1,9 +1,14 @@
 # SPEC-GX-CAP-1 — Commit identity and provenance
 
-Status: CAP-1A domain admission implemented and validated; persistent/public capability not certified.
+Status: domain admission and bounded persistent/public N4 capability implemented and locally validated.
 CAP-1B record codec, private paged image planner/reader, internal activation fence and
-required WAL framing are implemented; automatic publication/recovery and public wiring are pending.
-Date: 2026-09-08. Branch: feature/gx-cap-1, based on c310675.
+required WAL framing and native publication/recovery are implemented. Development public
+activation, metadata/retry, snapshot lookup/paging, verifier/metrics and coordinated
+logical-transfer mapping hooks are connected; [acceptance evidence and limits](../reports/V005_N3_N4_ACCEPTANCE.md)
+record the full regression and corrective reruns. No release/platform certification is implied.
+See the [consumer contract](../COMMIT_HISTORY.md). Historical private-only statuses below
+describe their original checkpoints, not the current development facade.
+Date: 2026-09-08. Current integration: feature/v0.0.5; historical checkpoints below retain their original branches.
 Dependencies: M1 typed API; GX-CAP-0.
 
 ## Normative scope

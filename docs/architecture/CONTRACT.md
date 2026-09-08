@@ -1465,6 +1465,8 @@ refusal leaves the transaction exactly as it entered the statement.
 
 M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_write_conflicts_total` · `oktografx_commit_retries_total` ·
+`oktografx_commits_with_metadata_total` · `oktografx_commit_metadata_bytes_total` ·
+`oktografx_commit_id_high_watermark_count` ·
 `oktografx_active_transactions`{mode=read|write} ·
 `oktografx_commit_window_duration_seconds`{window=writer_lease|commit_section,interval=wait|hold} ·
 `oktografx_commit_phase_duration_seconds`{phase=other|occ|materialize|build_records|append|barrier|apply|flush|index|publish} ·

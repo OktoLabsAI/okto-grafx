@@ -504,10 +504,12 @@ class OrderedIndex(IndexStore):
 
     @property
     def built_through_lsn(self) -> Lsn:
+        """Return the applied-through sequence of the proved ordered-index generation."""
         return self._read_certificate().selection.descriptor.applied_through_lsn
 
     @property
     def reconciled_through_lsn(self) -> Lsn:
+        """Return the reconciled-through sequence of the proved ordered-index generation."""
         return self._read_certificate().selection.descriptor.reconciled_through_lsn
 
     def check_freshness(
@@ -794,6 +796,7 @@ class OrderedIndex(IndexStore):
         """Return every reachable entry in deterministic ascending physical identity order."""
 
         def materialize(descriptor: OrderedRootDescriptor) -> tuple[IndexEntry, ...]:
+            """Materialize bounded ordered candidates from the selected root descriptor."""
             return tuple(
                 reversed(
                     tuple(
@@ -1064,6 +1067,7 @@ class OrderedIndex(IndexStore):
         read_lsn = _required_read_lsn(snapshot)
 
         def materialize(descriptor: OrderedRootDescriptor) -> tuple[IndexEntry, ...]:
+            """Materialize bounded ordered candidates from the selected root descriptor."""
             return tuple(
                 walk_ordered_desc(
                     descriptor.root_page,
@@ -1107,6 +1111,7 @@ class OrderedIndex(IndexStore):
         def materialize(
             descriptor: OrderedRootDescriptor,
         ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+            """Materialize bounded ordered candidates from the selected root descriptor."""
             self._prepare_ordered_heap_view(heap, descriptor)
             selected: list[tuple[RecordRef, HeapVersion]] = []
             candidates = walk_ordered_desc(
@@ -1219,6 +1224,7 @@ class OrderedIndex(IndexStore):
             )
             for entry in candidates:
                 def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+                    """Return visibility under the owning transaction snapshot."""
                     return snapshot.visible(xmin, xmax)
 
                 if materialized_positions is not None and type(heap) is HeapStore:

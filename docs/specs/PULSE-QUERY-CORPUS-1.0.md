@@ -30,7 +30,7 @@ its `src/` is byte-identical to `36c2fc6` — the delta is documentation and one
 confirmed with `git diff 36c2fc6 befaf1e -- src/` rather than taken on trust. Pinning the
 final head therefore changes no entry.
 
-Sources are read from one in-memory `git archive` of each pinned SHA, never from a working
+HEAD must equal the pin. Sources are read from one in-memory `git archive` of each pinned SHA, never from a working
 tree. Those worktrees belong to other agents and move; a corpus read from a checkout would
 quietly describe whatever happened to be checked out when it ran. Reading the immutable tree
 at the commit is what makes regeneration reproducible from any clone, and batching it in one
@@ -72,10 +72,17 @@ This keeps an unsupported family useful: closing the language gap must change th
 ## Counts at `pulse-1`
 
 `97` entries, digest
-`b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc`.
+`50d2dfc6edc1942440f5adea93bf383879bd8a9e972ce1f8db3e2c3fcdfbe634`.
 
-The engine currently classifies 82 entries as `already_supported` and 13 as `generic_gap`;
+The engine currently classifies 83 entries as `already_supported` and 12 as `generic_gap`;
 the duplicate and declared fragment remain separate classifications.
+
+September 8, 2026 reconciliation: existing chained OPTIONAL MATCH support admits
+the I64 scoring-input query. One still-unsupported wider optional chain now reports
+its more specific refusal. The pinned Pulse sources, 97 entries, raw-contract
+admission boundaries and expected row/column shapes are unchanged. These counts
+describe parsing/planning of historical templates, not runtime certification of
+every query or the current Pulse adapter.
 
 **Internal families** — 68 closed families over the audited originators, 47 read and
 21 write, identified `I01`..`I68`. Each records every origin that supports it. 66 are

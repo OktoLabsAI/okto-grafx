@@ -886,6 +886,40 @@ class IndexStore:
         # diagnostic count across that boundary.
         self._invalidate_tombstone_backlog()
         header = self._read_header(proved_present=proved_present)
+        return self._finish_open(header)
+
+    def _open_existing(self, *, proved_present: bool) -> IndexHeader:
+        """Combine native creation-shape and open checks in one admission observation.
+
+        The file extent and pinned header are local to this call, never retained as
+        authority. Registration still performs its independent freshness and heap-view
+        certificates afterwards. Custom public admission hooks keep the canonical path.
+        """
+        present = _page_count_if_present(
+            self._pool.storage, self.file, proved_present=proved_present
+        )
+        header = None
+        if present:
+            with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
+                if (
+                    not page.is_pristine()
+                    and page.page_type == int(PageType.META)
+                    and page.slot_count > INDEX_HEADER_SLOT
+                ):
+                    header = self._decode_header_page(page)
+        if header is None:
+            raise GrafxIndexError(
+                f"Index {self.name!r} has no complete existing file to register without "
+                "creating or repairing one.",
+                field="file", file=self.file, index=self.name,
+            )
+        self._invalidate_tombstone_backlog()
+        return self._finish_open(header, page_count=present)
+
+    def _finish_open(
+        self, header: IndexHeader, *, page_count: int | None = None
+    ) -> IndexHeader:
+        """Finish one header admission; an optional extent belongs only to that call."""
         definition = self._definition
         if header.digest != self._definition_digest:
             raise GrafxIndexError(
@@ -918,11 +952,12 @@ class IndexStore:
                 observed=header.artifact_nonce,
             )
         wanted = 1 + header.bucket_count
-        if self._pool.storage.page_count(self.file) < wanted:
+        present = self._pool.storage.page_count(self.file) if page_count is None else page_count
+        if present < wanted:
             raise GrafxCorruptionDetected(
                 f"Index {definition.name!r} declares {header.bucket_count} buckets, which needs "
                 f"{wanted} pages; the file holds "
-                f"{self._pool.storage.page_count(self.file)}.",
+                f"{present}.",
                 file=self.file,
                 field="bucket_count",
                 value=header.bucket_count,
@@ -4269,6 +4304,11 @@ def primary_key_index(
     )
 
 
+_NATIVE_ADMISSION_HOOKS = (
+    IndexStore.exists, IndexStore.is_created, IndexStore.open, IndexStore._read_header
+)
+
+
 class IndexManager:
     """The registry of the indexes of one database, and the door callers use (SPEC-M1 FR-12).
 
@@ -4465,7 +4505,12 @@ class IndexManager:
             nonce = self._artifact_nonce()
         index._set_creation_nonce(nonce)
         header: IndexHeader
-        if existing_only:
+        if existing_only and (
+            type(index).exists, type(index).is_created,
+            type(index).open, type(index)._read_header,
+        ) == _NATIVE_ADMISSION_HOOKS:
+            header = index._open_existing(proved_present=proved_present)
+        elif existing_only:
             # A read-only composition may inspect an existing accelerator, but it must never
             # repair a zero-length/torn one as a side effect of opening the database. ``create``
             # deliberately repairs that shape, so the strict route proves the structure first
@@ -5805,6 +5850,7 @@ class IndexManager:
         """
 
         def belongs_to_requested_table(index: IndexStore) -> bool:
+            """Check that this index describes the requested table and schema."""
             definition = index.definition
             if definition.table_id != table_id or (
                 table_name is not None and definition.table_name != table_name
@@ -7409,6 +7455,7 @@ class IndexManager:
             return ()
 
         def confirm(certificate: _IndexReadCertificate) -> tuple[int, ...]:
+            """Validate candidate groups against the selected index and heap view."""
             self._prepare_heap_view(index.file, certificate)
             answers: dict[bytes, int] = {}
             for wanted, candidates in index._candidate_groups_unchecked(distinct):
@@ -7559,6 +7606,7 @@ class IndexManager:
             bool,
             tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...],
         ]:
+            """Validate candidate groups against the selected index and heap view."""
             reusable = (
                 type(generation) is _IndexReadCertificate
                 and certificate == generation

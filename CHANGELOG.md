@@ -9,6 +9,13 @@ including the on-disk format.
 
 ### Changed
 
+- Connected opt-in durable commit history: explicit activation, immutable metadata
+  capture at begin and retry, qualified snapshot lookup/paging, public journal
+  verification and content-free metadata metrics. Logical-transfer hooks record
+  source-to-target references atomically; fresh logical forks and offline physical
+  restore have distinct identity contracts. These are 0.0.5 development APIs;
+  local regression/integration evidence is recorded separately from release.
+
 - Started the 0.0.5 development line for the six selected performance workstreams;
   package and public runtime versions are now 0.0.5. No release is implied.
 - Expanded prepared-plan retention to the existing 256-statement working set,
@@ -27,8 +34,24 @@ including the on-disk format.
   frames so a pinned old snapshot cannot follow a new reference into a stale page.
 - Writable startup performs one final fenced index admission instead of two;
   independent recovery baseline checks and catalog/identity validation remain.
+- Native existing-only index registration combines creation-shape and open
+  checks in one extent/header observation. Fresh per-index and companion-heap
+  certificates remain independent; overridden public admission hooks retain
+  their canonical path. No format, OCC or checkpoint protocol change.
+- Parameter map validation bypasses dynamic container checks for exact built-in
+  scalar leaves; nested map collision checks, custom types and per-bind validation
+  remain intact. The matching Pulse Community adapter applies the same bounded
+  scalar conversion shortcut without changing Core or adding a batch API.
 
 ### Added
+
+- Quiescent vacuum retirement of horizon-eligible overflow history, with complete
+  chain ownership/coverage checks and WAL-logged FREE pages. Added overflow page
+  counters to vacuum reports; no truncation or automatic reuse is claimed.
+- Internal CAP-1 writer publication after private activation: journal images join
+  physical OCC, raw/compressed required WAL framing and segment-roll rebinding.
+  Includes first-file initialization and identity-floor commits. Public metadata,
+  history, metrics and transfer remain pending; no public capability activation yet.
 
 - `ConnectOptions` and typed `connect` keywords for all configuration fields,
   including selector literals and a separately typed custom `registry` argument.

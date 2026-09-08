@@ -596,6 +596,8 @@ class HeapVacuumTablePlan:
     reclaimed_slot_bytes: int
     relinked_versions: int
     skipped_overflow_versions: int
+    eligible_overflow_versions: int = 0
+    reclaimed_overflow_pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1204,12 +1206,13 @@ class HeapStore:
         *,
         max_versions: int | None = None,
     ) -> HeapVacuumPlan:
-        """Build copy-on-write images that reclaim eligible inline MVCC versions.
+        """Build copy-on-write images that reclaim horizon-eligible MVCC versions.
 
         The plan never mutates a resident frame.  Candidate discovery is header-only; a second
         deterministic pass rewrites retained chain links, frees selected slots, compacts each
-        touched page, and emits full page images for the ordinary WAL path.  Overflow versions
-        are counted but retained by vacuum v1.
+        touched page, and emits full page images for the ordinary WAL path. Overflow chains
+        are released only after a database-wide exclusive-ownership proof. Released pages
+        are marked FREE, not truncated or offered to an online allocator.
         """
 
         if (
@@ -1262,6 +1265,7 @@ class HeapStore:
         pages_by_table: dict[int, tuple[PageIndex, ...]] = {}
         reclaimed_bytes_by_table: dict[int, int] = {}
         selected_by_table: dict[int, int] = {}
+        overflow_eligible: dict[int, int] = {}
         remaining = max_versions
         for table in ordered:
             pages = self.pages_of(table)
@@ -1276,9 +1280,9 @@ class HeapStore:
                 ):
                     continue
                 if header.has_overflow:
-                    skipped += 1
-                    continue
-                eligible += 1
+                    overflow_eligible[table.table_id] = overflow_eligible.get(table.table_id, 0) + 1
+                else:
+                    eligible += 1
                 if remaining is None or remaining > 0:
                     selected[ref] = header
                     selected_table[ref] = table.table_id
@@ -1288,11 +1292,14 @@ class HeapStore:
                     )
                     if remaining is not None:
                         remaining -= 1
+                elif header.has_overflow:
+                    skipped += 1
             eligible_by_table[table.table_id] = eligible
             skipped_by_table[table.table_id] = skipped
 
+        overflow_images, overflow_counts = self._plan_overflow_reclaim(selected)
         relinked_by_table: dict[int, int] = {}
-        page_images: list[tuple[PageIndex, bytes]] = []
+        page_images: list[tuple[PageIndex, bytes]] = list(overflow_images)
         found: set[RecordRef] = set()
         for table in ordered:
             for page_index in pages_by_table[table.table_id]:
@@ -1398,6 +1405,8 @@ class HeapStore:
                 reclaimed_slot_bytes=reclaimed_bytes_by_table.get(table.table_id, 0),
                 relinked_versions=relinked_by_table.get(table.table_id, 0),
                 skipped_overflow_versions=skipped_by_table[table.table_id],
+                eligible_overflow_versions=overflow_eligible.get(table.table_id, 0),
+                reclaimed_overflow_pages=overflow_counts.get(table.table_id, 0),
             )
             for table in ordered
         )
@@ -1406,8 +1415,73 @@ class HeapStore:
             page_images=tuple(sorted(page_images)),
             tables=table_plans,
             complete=sum(plan.reclaimed_versions for plan in table_plans)
-            == sum(plan.eligible_inline_versions for plan in table_plans),
+            == sum(plan.eligible_inline_versions + plan.eligible_overflow_versions for plan in table_plans),
         )
+
+    def _plan_overflow_reclaim(
+        self, selected: Mapping[RecordRef, RecordHeader]
+    ) -> tuple[tuple[tuple[PageIndex, bytes], ...], dict[int, int]]:
+        """Prove unique ownership before releasing any selected overflow chain.
+
+        The caller holds the existing quiescent maintenance window. Inspect all
+        tables, including unselected ones: a corrupt retained record must never
+        lose its payload because a selected record aliases the same chain.
+        No resident page is changed and no payload is materialized here.
+        """
+        wanted = {ref for ref, header in selected.items() if header.has_overflow}
+        if not wanted:
+            return (), {}
+        owners: set[PageIndex] = set()
+        images: list[tuple[PageIndex, bytes]] = []
+        counts: dict[int, int] = {}
+        found: set[RecordRef] = set()
+        extent = self._pool.storage.page_count(self._file)
+        capacity = self._pool.page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE
+        for table in self._catalog.catalog.tables():
+            for ref, header, content in self._walk(table):
+                if not header.has_overflow:
+                    continue
+                assert content is not None
+                page_index = decode_overflow_pointer(content, RECORD_HEADER_SIZE)
+                remaining = header.payload_len
+                releasing = ref in wanted
+                if releasing:
+                    if header != selected[ref]:
+                        raise GrafxTransactionStateError(
+                            "Overflow reclaim candidate changed.", field="vacuum_candidate"
+                        )
+                    found.add(ref)
+                while page_index != NO_PAGE:
+                    if not 0 < page_index < extent or page_index in owners:
+                        raise GrafxCorruptionDetected(
+                            "Overflow reclaim found an invalid, cyclic or shared chain.",
+                            file=self._file, page=page_index, field="overflow_ownership",
+                        )
+                    owners.add(page_index)
+                    page = self._pool.read_fresh_page(self._file, page_index)
+                    if (page.page_type != int(PageType.OVERFLOW) or page.slot_count != 1
+                            or len(page.read_slot(0)) != min(remaining, capacity) or remaining <= 0):
+                        raise GrafxCorruptionDetected(
+                            "Overflow reclaim requires complete, well-formed payload coverage.",
+                            file=self._file, page=page_index, field="overflow_payload",
+                        )
+                    remaining -= len(page.read_slot(0))
+                    if releasing:
+                        blank = Page(int(PageType.FREE), page_size=self._pool.page_size,
+                                     page_index=page_index, page_lsn=page.page_lsn, seq=page.seq)
+                        images.append((page_index, self._pool.codec.encode_page(blank)))
+                        counts[table.table_id] = counts.get(table.table_id, 0) + 1
+                    page_index = page.next_page
+                if remaining:
+                    raise GrafxCorruptionDetected(
+                        "Overflow reclaim found an incomplete payload.",
+                        file=self._file, field="overflow_payload",
+                    )
+        if found != wanted:
+            raise GrafxTransactionStateError(
+                "Overflow reclaim candidates disappeared.", field="vacuum_candidate"
+            )
+        return tuple(images), counts
 
     def allocate_record_id(self, table: TableDef) -> RecordId:
         """Take the next row identity of this table and record that it is spent.
@@ -1846,6 +1920,7 @@ class HeapStore:
         high_water: Lsn = NO_LSN
 
         def observe(record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Validate record lifetime coordinates and accumulate the committed high watermark."""
             nonlocal high_water
             if is_committed_csn(xmin):
                 high_water = max(high_water, xmin)
@@ -2025,6 +2100,7 @@ class HeapStore:
         """
 
         def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Return visibility under the owning transaction snapshot."""
             return snapshot.visible(xmin, xmax)
 
         for ref, header, content in self._walk(table, accept=visible):

@@ -162,10 +162,19 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
     # resolved: an __all__ that names something the module does not define is a broken promise
     # to `from okto_grafx import *`, and it is exported code that no import ever exercises.
     assert okto_grafx.__all__ == [
+        "CommitCatalogEntry",
+        "CommitHistoryPage",
+        "CommitId",
+        "CommitImport",
+        "CommitKind",
+        "CommitMapping",
+        "CommitMetadata",
+        "ConnectOptions",
         "Database",
         "DatabaseConfig",
         "DatabaseIdentity",
         "ExecuteManyReport",
+        "MetadataLimits",
         "PortRegistry",
         "Query",
         "QueryCursor",
@@ -178,6 +187,7 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "VectorValue",
         "__version__",
         "connect",
+        "prepare_commit_import",
     ]
     assert okto_grafx.__all__ == sorted(okto_grafx.__all__), "__all__ is not sorted"
     assert len(set(okto_grafx.__all__)) == len(okto_grafx.__all__), "__all__ repeats a name"

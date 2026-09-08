@@ -2380,7 +2380,7 @@ def test_the_server_header_does_not_disclose_the_build(publisher: OpenMetricsPub
     answer = _raw(publisher, b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
     header = next(line for line in answer.splitlines() if line.lower().startswith("server:"))
     assert header == "Server: okto-grafx"
-    assert "Python" not in answer
+    assert "Python" not in answer.split("\r\n\r\n", 1)[0]
     assert "/1.0" not in header
 
 

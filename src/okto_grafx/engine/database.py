@@ -35,8 +35,8 @@ import struct
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Self, TypeVar
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -98,8 +98,14 @@ from okto_grafx.domain.txn.context import (
 )
 from okto_grafx.domain.txn.partitions import page_partition, partition_key
 from okto_grafx.domain.txn.snapshot import Snapshot
+from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.txn.commit_metadata import CommitMetadata, capture_commit_metadata, decode_commit_metadata
+from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry
+from okto_grafx.domain.txn.commit_history import CommitHistoryPage
+from okto_grafx.engine.commit_history_reader import observe_commit_catalog
+from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
 from okto_grafx.domain.vector.filter import RecordIdFilter
-from okto_grafx.domain.verify.findings import VerificationReport
+from okto_grafx.domain.verify.findings import VerificationReport, VerificationFinding, FindingKind, FindingLocation
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
@@ -175,6 +181,8 @@ from okto_grafx.engine.query_engine import QueryEngine, QueryResult
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorSearchResult
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
+
+_HistoryResult = TypeVar("_HistoryResult")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from okto_grafx.engine.wal_manager import WalManager
@@ -1164,6 +1172,16 @@ class Transaction:
         self._require_batch_idle("execute")
         return self._database._run_statement(self._context, text, parameters)
 
+    def commit_history(self, *, after: CommitId | None = None, limit: int = 100) -> CommitHistoryPage:
+        """Read an ascending bounded history page under this transaction's snapshot."""
+        self._require_active()
+        return self._database._commit_history(self._context, after=after, limit=limit)
+
+    def lookup_commit(self, identity: CommitId) -> CommitCatalogEntry | None:
+        """Look up a qualified commit visible here; None does not certify legacy absence."""
+        self._require_active()
+        return self._database._lookup_commit(self._context, identity)
+
     def executemany(
         self,
         text: str,
@@ -2061,7 +2079,7 @@ class Database:
 
     # --- transactions -------------------------------------------------------------------------
 
-    def begin(self, mode: str = "write") -> Transaction:
+    def begin(self, mode: str = "write", *, metadata: CommitMetadata | None = None) -> Transaction:
         """Open a transaction in ``"read"`` or ``"write"`` mode (SPEC-M1 FR-2).
 
         A reader sees the consistent snapshot of the instant it opened for its whole life, even
@@ -2071,13 +2089,18 @@ class Database:
         """
         self._require_open()
         parsed = TransactionMode.parse(mode)
+        captured = capture_commit_metadata(metadata)
+        if captured is not None and parsed is not TransactionMode.WRITE:
+            raise GrafxConfigurationError("Read transactions cannot publish metadata.", field="metadata")
+        admitted = None if captured is None else decode_commit_metadata(captured)
         if parsed is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
         with self._public_transition():
             # Seal the check/transition race: close may publish after the preliminary guard but
             # before this process-wide facade boundary increments its settlement count.
             self._require_open()
-            context = self._transactions.begin(parsed.value)
+            context = (self._transactions.begin(parsed.value) if admitted is None
+                       else self._transactions.begin(parsed.value, metadata=admitted))
             return self._public_transaction(context)
 
     def retry(self, transaction: Transaction) -> Transaction:
@@ -2149,7 +2172,7 @@ class Database:
             return self._public_transaction(successor)
 
     @contextmanager
-    def transaction(self, mode: str = "write") -> Iterator[Transaction]:
+    def transaction(self, mode: str = "write", *, metadata: CommitMetadata | None = None) -> Iterator[Transaction]:
         """Open a transaction as a block, committing on a clean exit and rolling back otherwise.
 
         The lexical boundary also retains this participant section's unlocked descriptor. Its
@@ -2157,8 +2180,13 @@ class Database:
         one-statement transaction avoids repeated open/close calls without retaining the lock or
         weakening another process's admission.
         """
+        captured = capture_commit_metadata(metadata)
+        parsed = TransactionMode.parse(mode)
+        if captured is not None and parsed is not TransactionMode.WRITE:
+            raise GrafxConfigurationError("Read transactions cannot publish metadata.", field="metadata")
+        admitted = None if captured is None else decode_commit_metadata(captured)
         with self._transactions._participant_descriptor_scope(revalidate_identity=True):
-            txn = self.begin(mode)
+            txn = self.begin(parsed.value, metadata=admitted)
             with txn:
                 yield txn
 
@@ -3098,7 +3126,37 @@ class Database:
             with self._transactions.page_access_section(fresh_read_view=True):
                 verifier = factory()  # type: ignore[operator]
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
+                if wanted_scope != "indexes" and self._catalog.catalog.commit_catalog_activation is not None:
+                    report = self._verify_commit_history(report)
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def _verify_commit_history(self, report: VerificationReport) -> VerificationReport:
+        """Include logical history in public verification, with no repair side effect."""
+        files = ("commits.dir", "commits.dat")
+        try:
+            with self.begin("read") as transaction:
+                def check(store: CommitCatalogStore) -> tuple[int, int]:
+                    """Verify complete history and count the physically checked journal pages."""
+                    head = store.verify()
+                    pages = sum(self._storage.file_size(file) // self._pool.page_size for file in files)
+                    return head.entry_count, pages
+
+                records, pages = self._observe_history(transaction._context, check, (0, 0))
+            return replace(
+                report, records_checked=report.records_checked + records,
+                pages_checked=report.pages_checked + pages,
+                files_checked=tuple(dict.fromkeys((*report.files_checked, *files))),
+            )
+        except GrafxError as failure:
+            # Never certify a partial/moving/unreadable history as a clean empty
+            # result. Keep metadata and raw exception payloads out of diagnostics.
+            finding = VerificationFinding(
+                kind=FindingKind.CATALOG_UNREADABLE,
+                location=FindingLocation(file="commits.dir"),
+                detail="Commit history verification refused; journal publication or integrity could not be proved.",
+            )
+            del failure
+            return replace(report, findings=(*report.findings, finding))
 
     def _bloat(self, table: str | None = None) -> BloatReport:
         """Measure heap bloat at the existing recyclable horizon without changing state.
@@ -3336,11 +3394,18 @@ class Database:
                             item.skipped_overflow_versions,
                             field="skipped_overflow_versions",
                         ),
+                        eligible_overflow_versions=_builtin_int(
+                            item.eligible_overflow_versions, field="eligible_overflow_versions"
+                        ),
+                        reclaimed_overflow_pages=_builtin_int(
+                            item.reclaimed_overflow_pages, field="reclaimed_overflow_pages"
+                        ),
                     )
                     for item in plan.tables
                 )
 
                 def total(field: str) -> int:
+                    """Sum one validated integer field across the selected table reports."""
                     return sum(
                         _builtin_int(getattr(item, field), field=field)
                         for item in table_reports
@@ -3363,6 +3428,7 @@ class Database:
                     reclaimed_slot_bytes=total("reclaimed_slot_bytes"),
                     relinked_versions=total("relinked_versions"),
                     skipped_overflow_versions=total("skipped_overflow_versions"),
+                    reclaimed_overflow_pages=total("reclaimed_overflow_pages"),
                     indexes_reconciled=len(index_reports),
                     index_entries_removed=sum(
                         _builtin_int(report.removed, field="index_entries_removed")
@@ -3400,6 +3466,95 @@ class Database:
 
             self._refresh_index_inventory()
             return None
+
+    def enable_commit_history(self) -> None:
+        """Activate one-way durable provenance after ensure_identity_indexes().
+
+        The activation commit establishes untracked legacy history, not an
+        invented record. Subsequent writing commits publish qualified history.
+        This is opt-in and adds journal IO/storage; it cannot be disabled.
+        """
+        with self._public_operation("enable_commit_history"):
+            self._require_writable("enable commit history")
+            with self.begin("write") as transaction:
+                self._transactions.prepare_commit_catalog_activation(transaction._context)
+
+    def commit_history(self, *, after: CommitId | None = None, limit: int = 100) -> CommitHistoryPage:
+        """Read a bounded history page in a new snapshot; use a read transaction for paging."""
+        self._require_open()
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise GrafxConfigurationError("History limit must be 1..1000.", field="limit")
+        after = None if after is None else self._history_identity(after)
+        with self.begin("read") as transaction:
+            return transaction.commit_history(after=after, limit=limit)
+
+    def lookup_commit(self, identity: CommitId) -> CommitCatalogEntry | None:
+        """Return a durable entry visible in a new snapshot, or None in the tracked interval."""
+        self._require_open()
+        identity = self._history_identity(identity)
+        with self.begin("read") as transaction:
+            return transaction.lookup_commit(identity)
+
+    def _history_identity(self, identity: CommitId) -> CommitId:
+        if type(identity) is not CommitId:
+            raise GrafxConfigurationError("Expected a qualified CommitId.", field="identity")
+        captured = CommitId(identity.database_uuid, identity.sequence)
+        if captured.database_uuid != self._identity.database_uuid:
+            raise GrafxConfigurationError("Commit belongs to another database.", field="database_uuid")
+        return captured
+
+    def _observe_history(
+        self, context: TransactionContext,
+        operation: Callable[[CommitCatalogStore], _HistoryResult], empty: _HistoryResult,
+    ) -> _HistoryResult:
+        with self._transactions.page_access_section(transaction=context, allow_writeback=False):
+            self._transactions._require_current_active(context)
+            source = self._catalog.catalog
+            activation = source.commit_catalog_activation
+            if activation is None or context.snapshot.read_lsn < activation:
+                raise GrafxUnsupportedOperation(
+                    "Commit history is not enabled in this snapshot.", field="commit_catalog",
+                    remedy="enable_commit_history",
+                )
+
+            def read(file: str, index: int) -> bytes:
+                """Read a fresh detached page without retaining a journal authority cache."""
+                return self._pool.codec.encode_page(self._pool.read_fresh_page(file, index))
+
+            return observe_commit_catalog(
+                database_uuid=self._identity.database_uuid, page_size=self._pool.page_size,
+                activation=activation, read_page=read, file_size=self._storage.file_size,
+                exists=self._storage.exists,
+                published=lambda: self._transactions._published_state_in_section().last_committed_lsn,
+                operation=operation, empty=empty, minimum_sequence=context.snapshot.read_lsn,
+            )
+
+    def _commit_history(self, context: TransactionContext, *, after: CommitId | None, limit: int) -> CommitHistoryPage:
+        with self._public_operation("commit_history"):
+            if type(limit) is not int or not 1 <= limit <= 1000:
+                raise GrafxConfigurationError("History limit must be 1..1000.", field="limit")
+            sequence = 0 if after is None else self._history_identity(after).sequence
+            read_lsn = context.snapshot.read_lsn
+
+            def collect(store: CommitCatalogStore) -> tuple[CommitCatalogEntry, ...]:
+                """Collect a bounded ascending history page within the owning snapshot."""
+                return store.history(after=sequence, read_lsn=read_lsn, limit=limit + 1)
+
+            empty_entries: tuple[CommitCatalogEntry, ...] = ()
+            entries = self._observe_history(context, collect, empty_entries)
+            activation = self._catalog.catalog.commit_catalog_activation
+            assert activation is not None
+            return CommitHistoryPage(
+                self._identity.database_uuid, activation,
+                read_lsn, entries[:limit], len(entries) > limit,
+            )
+
+    def _lookup_commit(self, context: TransactionContext, identity: CommitId) -> CommitCatalogEntry | None:
+        with self._public_operation("lookup_commit"):
+            captured = self._history_identity(identity)
+            return self._observe_history(
+                context, lambda store: store.lookup(captured, read_lsn=context.snapshot.read_lsn), None,
+            )
 
     def enable_wal_page_compression(self) -> None:
         """Persist the compatibility fence before emitting compressed WAL page images.

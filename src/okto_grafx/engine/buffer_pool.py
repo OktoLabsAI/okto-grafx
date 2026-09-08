@@ -1624,6 +1624,7 @@ class BufferPool:
         prospective: PageIndex | None = None
 
         def prospective_index() -> PageIndex:
+            """Resolve the next physical allocation index without inventing an absent extent."""
             nonlocal prospective
             if prospective is None:
                 try:
@@ -2703,6 +2704,7 @@ class BufferPool:
         )
 
         def target_index() -> PageIndex:
+            """Resolve and retain this operation's requested page index once."""
             nonlocal resolved_page_index
             if resolved_page_index is None:
                 assert callable(page_index)

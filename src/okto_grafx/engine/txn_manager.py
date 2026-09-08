@@ -167,7 +167,6 @@ from okto_grafx.domain.txn.records import (
     WalRecordLike,
     WalRecordType,
     decode_page_write_location,
-    encode_page_write,
     encode_page_write_record,
     is_redoable_page_file,
 )
@@ -179,6 +178,10 @@ from okto_grafx.engine.commit_state_store import (
     CommitStateStore,
 )
 from okto_grafx.engine.commit_redo import CommitRedo
+from okto_grafx.engine.commit_catalog_store import CommitCatalogStore, PreparedCommitCatalogAppend
+from okto_grafx.domain.model.value import Timestamp
+from okto_grafx.domain.txn.commit_catalog import CommitKind
+from okto_grafx.domain.txn.commit_metadata import CommitMetadata, capture_commit_metadata
 from okto_grafx.engine.heap_store import FIRST_RECORD_ID, HeapStore, HeapVacuumPlan
 from okto_grafx.engine.index_manager import IndexManager, IndexStore
 from okto_grafx.engine.wal_manager import WalManager
@@ -722,6 +725,10 @@ class TransactionManager:
         "_identity_leases",
         "_index_catalog_activation_plans",
         "_commit_catalog_activation_plans",
+        "_database_uuid",
+        "_journal_attempt",
+        "_maintenance_txns",
+        "_commit_metadata",
         "_identity_process",
         "_identity_process_invalid",
         "_process_identity_provider",
@@ -896,6 +903,10 @@ class TransactionManager:
             TxnId, _IndexCatalogActivationPlan
         ] = {}
         self._commit_catalog_activation_plans: dict[TxnId, tuple[bytes, Csn]] = {}
+        self._database_uuid = database_uuid
+        self._journal_attempt: tuple[int, PreparedCommitCatalogAppend, dict[tuple[str, int], bytes]] | None = None
+        self._maintenance_txns: set[int] = set()
+        self._commit_metadata: dict[int, bytes] = {}
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
         )
@@ -1218,6 +1229,7 @@ class TransactionManager:
                 field="activation_transaction",
                 txn_id=txn.txn_id,
             )
+        self._maintenance_txns.add(int(txn.txn_id))
 
     def prepare_identity_index_activation(self, txn: TransactionContext) -> bool:
         """Stage one explicit, atomic catalog-v2 identity-index activation.
@@ -1373,12 +1385,11 @@ class TransactionManager:
                 return True
 
     def prepare_commit_catalog_activation(self, txn: TransactionContext) -> bool:
-        """Internal activation-only vertical slice; no public entry point yet.
+        """Stage the dedicated one-way activation used by enable_commit_history.
 
         Publish the horizon in legacy-compatible catalog page WAL before journal
-        effects. Until journal staging/replay is connected, later writes refuse
-        explicitly rather than create untracked commits. Used only by temporary
-        integration fixtures until the complete capability is certified.
+        effects. Only subsequent writing commits acquire journal records; the
+        activation itself identifies the untracked legacy boundary.
         """
         operation = "prepare commit catalog activation"
         self._require_fresh_index_catalog_transaction(txn, operation=operation, purpose=operation)
@@ -1403,7 +1414,7 @@ class TransactionManager:
                 return True
 
     def _require_commit_catalog_writer_ready(self, *, refresh: bool = False) -> None:
-        """Fail closed during this internal activation-only integration checkpoint."""
+        """Require a qualified writer identity for the internal publication capability."""
         if refresh:
             # A transaction may have begun before a foreign activation. After
             # first OCC and authority adoption, test the CURRENT catalog, not the
@@ -1414,11 +1425,76 @@ class TransactionManager:
                 isinstance(source, Catalog)
                 and source.requires_capability(COMMIT_CATALOG_V1_CAPABILITY)
             )
-        if self._commit_catalog_capable:
+        if self._commit_catalog_capable and self._database_uuid is None:
             raise GrafxUnsupportedOperation(
-                "Commit catalog write publication is not enabled by this build yet.",
+                "Commit catalog publication requires a qualified database identity.",
                 field="commit_catalog_publication", capability=COMMIT_CATALOG_V1_CAPABILITY,
             )
+
+    def _prepare_journal(self, txn: TransactionContext, current: int) -> frozenset[tuple[str, int]]:
+        """Capture journal pages from current durable authority before physical OCC.
+
+        This is attempt-local derived work, not caller pre-staging. The original
+        snapshot interests remain unchanged and the physical delta uses the same
+        current materialization baseline as heap pages. Maintenance floor commits
+        enter from their already serialized, current-snapshot publication path.
+        """
+        self._journal_attempt = None
+        if not self._commit_catalog_capable:
+            return frozenset()
+        assert self._database_uuid is not None
+        source = self._catalog.catalog
+        activation = source.commit_catalog_activation
+        if activation is None:
+            raise GrafxTransactionStateError("Missing commit catalog activation.", field="commit_catalog_activation")
+        initial: dict[tuple[str, int], bytes] = {}
+
+        def read(file: str, index: int) -> bytes:
+            """Read one page from this operation's selected journal view."""
+            if (file, index) in initial:
+                return initial[file, index]
+            return self._pool.codec.encode_page(self._pool.read_fresh_page(file, index))
+
+        store = CommitCatalogStore(read, database_uuid=self._database_uuid, page_size=self._pool.page_size)
+        present = [self._pool.storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES]
+        if current == activation and not any(present):
+            initial.update({(item.file, item.page_index): item.raw
+                            for item in store.plan_initialize(activation_sequence=activation).images})
+        else:
+            store.validate_published_head(
+                activation_sequence=activation, sequence=current,
+                file_size=self._pool.storage.file_size,
+            )
+        observed = self._clock.wall()
+        if type(observed) not in (float, int):
+            raise GrafxConfigurationError("Commit time must be numeric.", field="clock.wall")
+        try:
+            timestamp = Timestamp(int(observed * 1_000_000))
+        except (ValueError, OverflowError, TypeError) as failure:
+            raise GrafxConfigurationError("Commit time is not representable.", field="clock.wall") from failure
+        prepared = store.prepare_append(
+            expected_last_sequence=current,
+            observed_at=timestamp,
+            metadata_bytes=self._commit_metadata.get(int(txn.txn_id)),
+            kind=(CommitKind.DATA if txn.txn_id in self._open and txn.txn_id not in self._maintenance_txns
+                  else CommitKind.MAINTENANCE),
+        )
+        locations = frozenset((item.file, item.page_index) for item in prepared.bind(current + 1).images)
+        initial_only = {key: raw for key, raw in initial.items() if key not in locations}
+        locations = locations | initial_only.keys()
+        limit = txn._max_transaction_bytes
+        if limit is not None:
+            txn.validate_budgets()
+            observed = txn._staged_payload_bytes + len(locations) * self._pool.page_size
+            if observed > limit:
+                raise GrafxTransactionBudgetExceeded(
+                    "Commit journal images exceed the transaction byte budget.",
+                    field="max_transaction_bytes", limit=limit, observed=observed,
+                )
+        self._journal_attempt = (int(txn.txn_id), prepared, initial_only)
+        for file, index in locations:
+            txn.note_write(page_partition(file, index))
+        return locations
 
     def _rebind_commit_catalog_activation(self, txn: TransactionContext, sequence: int) -> bool:
         original = self._commit_catalog_activation_plans.get(txn.txn_id)
@@ -2098,6 +2174,7 @@ class TransactionManager:
         runtime_definitions: list[IndexDefinition] = []
 
         def allocate() -> int:
+            """Allocate one detached page or generation inside the current bounded plan."""
             nonce = self._index_manager._allocate_detached_generation_nonce(occupied)
             # Allocation is discovery rather than reservation.  Remembering the result in this
             # plan is therefore mandatory: two planned shadows must never be offered one nonce.
@@ -3152,7 +3229,7 @@ class TransactionManager:
 
     # --- life of a transaction ----------------------------------------------------------------
 
-    def begin(self, mode: str) -> TransactionContext:
+    def begin(self, mode: str, *, metadata: CommitMetadata | None = None) -> TransactionContext:
         """Open a transaction in ``"read"`` or ``"write"`` mode and fix the view it reads under.
 
         The order of the three steps is the answer to carried finding CF-2 and is not
@@ -3172,11 +3249,15 @@ class TransactionManager:
         """
         self._require_not_closed("begin a transaction")
         parsed = TransactionMode.parse(mode)
+        captured = capture_commit_metadata(metadata)
+        if captured is not None and parsed is not TransactionMode.WRITE:
+            raise GrafxConfigurationError("Read transactions cannot publish metadata.", field="metadata")
         if parsed is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
         with self._participant_section():
             self._require_not_closed("begin a transaction")
-            txn, open_now = self._begin_in_section(parsed)
+            txn, open_now = (self._begin_in_section(parsed) if captured is None
+                             else self._begin_in_section(parsed, metadata=captured))
         self._ensure_begin_publishable(txn)
         # A91: the metrics sink is host code and is called with nothing of this component held.
         self._publish_gauge(parsed.value, open_now)
@@ -3187,7 +3268,7 @@ class TransactionManager:
         return txn
 
     def _begin_in_section(
-        self, mode: TransactionMode
+        self, mode: TransactionMode, *, metadata: bytes | None = None
     ) -> tuple[TransactionContext, int]:
         """Open and register one transaction while the participant section is held.
 
@@ -3247,6 +3328,13 @@ class TransactionManager:
             # somebody else committed: no error, no missing file, just fewer rows than exist.
             own_view = read_lsn == self._own_published_lsn
             catalog_may_have_changed = self._establish_read_view(view, own=own_view)
+            if metadata is not None:
+                self._require_commit_catalog_writer_ready(refresh=True)
+            if metadata is not None and not self._commit_catalog_capable:
+                raise GrafxUnsupportedOperation(
+                    "Commit metadata requires explicit commit history activation.",
+                    field="commit_catalog", remedy="enable_commit_history",
+                )
             if catalog_may_have_changed:
                 self._synchronize_read_index_authority(read_lsn)
             if self._heap_reclaim_capable:
@@ -3265,6 +3353,8 @@ class TransactionManager:
             )
             self._require_not_closed("begin a transaction")
             self._open[transaction.txn_id] = transaction
+            if metadata is not None:
+                self._commit_metadata[int(transaction.txn_id)] = metadata
             self._mode_counts[mode.value] += 1
             counted = True
             self._next_txn_id += 1
@@ -3272,6 +3362,7 @@ class TransactionManager:
         except BaseException as failure:
             if transaction is not None:
                 self._open.pop(transaction.txn_id, None)
+                self._commit_metadata.pop(int(transaction.txn_id), None)
             if counted and self._mode_counts[mode.value] > 0:
                 self._mode_counts[mode.value] -= 1
             # CE-2: the participant registration is never withdrawn by a failed begin -- it
@@ -3390,6 +3481,7 @@ class TransactionManager:
                     conflicts=txn.conflicts,
                 )
             carried = txn.conflicts
+            metadata = self._commit_metadata.get(int(txn.txn_id))
             mode = txn.mode
             finished_mode, open_now, cleanup_failure = self._rollback_active_in_section(
                 txn
@@ -3398,7 +3490,8 @@ class TransactionManager:
                 settlement_failure = cleanup_failure
             else:
                 try:
-                    successor, _successor_count = self._begin_in_section(mode)
+                    successor, _successor_count = (self._begin_in_section(mode) if metadata is None
+                                                   else self._begin_in_section(mode, metadata=metadata))
                     successor.adopt_conflicts(carried)
                 except BaseException as failure:
                     # The old context is already ABORTED. _begin_in_section has withdrawn any
@@ -3491,6 +3584,10 @@ class TransactionManager:
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._open.pop(txn.txn_id, None)
         self._commit_catalog_activation_plans.pop(txn.txn_id, None)
+        self._maintenance_txns.discard(int(txn.txn_id))
+        self._commit_metadata.pop(int(txn.txn_id), None)
+        if self._journal_attempt is not None and self._journal_attempt[0] == int(txn.txn_id):
+            self._journal_attempt = None
         mode = txn.mode.value
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
@@ -4468,6 +4565,9 @@ class TransactionManager:
                         self._identity_leases.clear()
                         self._index_catalog_activation_plans.clear()
                         self._commit_catalog_activation_plans.clear()
+                        self._maintenance_txns.clear()
+                        self._commit_metadata.clear()
+                        self._journal_attempt = None
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -4558,6 +4658,8 @@ class TransactionManager:
         already says it must, at the commit section of step 3.
         """
         retried = txn.conflicts > 0
+        metadata_bytes = self._commit_metadata.get(int(txn.txn_id))
+        journaled_commit = False
         conflict: tuple[int, ...] | None = None
         committed: Csn = NO_CSN
         mode = txn.mode.value
@@ -4809,6 +4911,8 @@ class TransactionManager:
                             with self._close_wait_hazard():
                                 rows = self._write_rows(txn, identities)
                             materialized_pages = self._declare_page_interest(txn, rows)
+                            materialized_pages = materialized_pages | self._prepare_journal(txn, current)
+                            journaled_commit = self._journal_attempt is not None
                             materialized_interest = self._materialized_page_delta(
                                 txn,
                                 snapshot_interest=snapshot_interest,
@@ -5105,6 +5209,15 @@ class TransactionManager:
             )
         if retried:
             self._increment_metric(COMMIT_RETRIES_TOTAL)
+        if journaled_commit:
+            try:
+                if self._metrics.enabled:
+                    self._metrics.set_gauge("oktografx_commit_id_high_watermark_count", float(committed))
+                    if metadata_bytes is not None:
+                        self._metrics.increment("oktografx_commits_with_metadata_total")
+                        self._metrics.increment("oktografx_commit_metadata_bytes_total", float(len(metadata_bytes)))
+            except BaseException:  # noqa: BLE001 - telemetry cannot change a durable outcome
+                pass
         self._publish_gauge(mode, open_now)
         return CommitReport(csn=committed, durable=True, wrote=True)
 
@@ -5626,6 +5739,17 @@ class TransactionManager:
         predicted = (
             base + len(staged) + len(txn.pending_records) + index_record_count + 1
         )
+        journal = self._journal_attempt
+        if self._commit_catalog_capable and (journal is None or journal[0] != int(txn.txn_id)):
+            raise GrafxTransactionStateError("Journal was not prepared before physical validation.", field="commit_catalog_publication")
+        if journal is not None and journal[0] == int(txn.txn_id):
+            predicted += journal[1].image_count + len(journal[2])
+            journal_images = dict(journal[2])
+            journal_images.update({(item.file, item.page_index): item.raw
+                                   for item in journal[1].bind(predicted).images})
+            staged = sorted(set(staged) | journal_images.keys())
+        else:
+            journal_images = {}
         if predicted >= PROVISIONAL_CSN:
             raise GrafxTransactionStateError(
                 "The write-ahead log has exhausted its usable commit-number space; the maximum "
@@ -5661,7 +5785,7 @@ class TransactionManager:
             contains_index_reset=contains_index_reset,
         )
         for file, page_index in staged:
-            image = txn.page_images.get((file, page_index))
+            image = journal_images.get((file, page_index), txn.page_images.get((file, page_index)))
             stamps = page_stamps.get(page_index, ()) if file == self._heap_file else ()
             if image is None:
                 # Materialised in this process: the resident frame is the authority and was
@@ -5678,12 +5802,13 @@ class TransactionManager:
                     stamps,
                 )
             images.append((file, page_index, stamped))
+            encoded = encode_page_write_record(file, page_index, stamped, compress=False)
             records.append(
                 WalRecord(
                     record_type=int(WalRecordType.WRITE_PAGE),
                     epoch=epoch,
                     txn_id=txn.txn_id,
-                    payload=encode_page_write(file, page_index, stamped),
+                    payload=encoded.payload, format_version=encoded.format_version, flags=encoded.flags,
                     descriptor=self._descriptor,
                 )
             )
@@ -5784,8 +5909,15 @@ class TransactionManager:
         )
         self._materialized = None
         rebound_activation = self._rebind_commit_catalog_activation(txn, new_csn)
+        journal = self._journal_attempt
+        journal_images = (dict(journal[2]) | {(item.file, item.page_index): item.raw
+                           for item in journal[1].bind(new_csn).images}
+                          if journal is not None and journal[0] == int(txn.txn_id) else {})
         for file, page_index, image in images:
             page = reusable.get((file, page_index))
+            if (file, page_index) in journal_images:
+                image = journal_images[file, page_index]
+                page = None
             if rebound_activation and file == self._file_ids.catalog_file:
                 image = txn.page_images[(file, page_index)]
                 page = None  # Catalog body changed, not only its generic page stamp.
@@ -5807,12 +5939,13 @@ class TransactionManager:
                 self._stamp_page(page, file, page_index, new_csn, stamps)
                 corrected = self._pool.codec.encode_page(page)
             corrected_images.append((file, page_index, corrected))
+            encoded = encode_page_write_record(file, page_index, corrected, compress=False)
             corrected_records.append(
                 WalRecord(
                     record_type=int(WalRecordType.WRITE_PAGE),
                     epoch=epoch,
                     txn_id=txn.txn_id,
-                    payload=encode_page_write(file, page_index, corrected),
+                    payload=encoded.payload, format_version=encoded.format_version, flags=encoded.flags,
                     descriptor=self._descriptor,
                 )
             )
@@ -6769,6 +6902,7 @@ class TransactionManager:
         committed: Csn = NO_CSN
         epoch = lease.epoch
         try:
+            self._prepare_journal(reservation, previous.last_committed_lsn)
             if trace is not None:
                 trace.phase("build_records")
             with self._close_wait_hazard():
@@ -8057,6 +8191,10 @@ class TransactionManager:
         final outcome non-retryable.
         """
         descriptor_failure = self._drain_transaction_descriptor_scope(txn.txn_id)
+        self._maintenance_txns.discard(int(txn.txn_id))
+        self._commit_metadata.pop(int(txn.txn_id), None)
+        if self._journal_attempt is not None and self._journal_attempt[0] == int(txn.txn_id):
+            self._journal_attempt = None
         self._open.pop(txn.txn_id, None)
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._commit_catalog_activation_plans.pop(txn.txn_id, None)

@@ -217,6 +217,7 @@ _ERROR_CODE = LabelSpec(
             "lease_timeout",
             "lease_stolen",
             "stale_epoch",
+            "snapshot_reclaimed",
             "corruption_detected",
             "device_full",
             "durability_barrier_failed",
@@ -274,6 +275,18 @@ METRIC_CATALOG: tuple[MetricDescriptor, ...] = (
         name="oktografx_commit_retries_total",
         kind=MetricKind.COUNTER,
         description="Commit attempts retried after a write conflict.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commits_with_metadata_total", kind=MetricKind.COUNTER,
+        description="Locally acknowledged writing commits carrying provenance metadata.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_metadata_bytes_total", kind=MetricKind.COUNTER,
+        description="Canonical metadata bytes in locally acknowledged writing commits.",
+    ),
+    MetricDescriptor(
+        name="oktografx_commit_id_high_watermark_count", kind=MetricKind.GAUGE,
+        description="Last locally acknowledged tracked commit sequence; qualified by this store.",
     ),
     MetricDescriptor(
         name="oktografx_active_transactions",

@@ -66,7 +66,7 @@ def open_database(
     )
 
 
-def prepared_database() -> tuple[
+def prepared_database(*, overflow: bool = False) -> tuple[
     MemoryStorageDevice,
     FaultInjectingStorageDevice,
     Database,
@@ -89,6 +89,8 @@ def prepared_database() -> tuple[
             "MATCH (p:Person {id: 1}) SET p.name = 'middle'",
             "MATCH (p:Person {id: 1}) SET p.name = 'current'",
         ):
+            if overflow:
+                statement = statement.replace("'old'", repr("old" * 600)).replace("'middle'", repr("middle" * 250))
             with setup.begin("write") as writer:
                 writer.execute(statement)
     return memory, fault, open_database(fault, namespace=memory)
@@ -102,8 +104,8 @@ def only(
     return selected[0]
 
 
-def survey_points() -> tuple[tuple[str, WritePoint, str], ...]:
-    memory, fault, database = prepared_database()
+def survey_points(*, overflow: bool = False) -> tuple[tuple[str, WritePoint, str], ...]:
+    memory, fault, database = prepared_database(overflow=overflow)
     try:
         points = fault.enumerate_write_points(
             lambda _device: database.maintenance.vacuum(confirm_quiescent=True)
@@ -161,12 +163,14 @@ def vacuum_crash_points() -> tuple[tuple[str, WritePoint, str], ...]:
     return survey_points()
 
 
+@pytest.mark.parametrize("overflow", [False, True])
 def test_vacuum_crash_windows_recover_to_complete_pre_or_post_state(
-    vacuum_crash_points: tuple[tuple[str, WritePoint, str], ...],
+    overflow: bool,
 ) -> None:
+    vacuum_crash_points = survey_points(overflow=overflow)
     outcomes: dict[str, int] = {}
     for phase, point, moment in vacuum_crash_points:
-        memory, fault, crashed = prepared_database()
+        memory, fault, crashed = prepared_database(overflow=overflow)
         try:
             fault.clear_trail()
             fault.crash_at(point.call_index, moment=moment)

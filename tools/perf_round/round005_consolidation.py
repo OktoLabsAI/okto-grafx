@@ -45,6 +45,7 @@ async def exercise(root: Path) -> dict:
     measured_sources = [Path(__file__).resolve(), Path(primitives.__file__),
                         grafx_root / "src/okto_grafx/api/assembly.py",
                         grafx_root / "src/okto_grafx/engine/query_engine.py",
+                        grafx_root / "src/okto_grafx/engine/index_manager.py",
                         grafx_root / "src/okto_grafx/engine/ordered_index.py"]
     report["source_sha256"] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in measured_sources}
     report["consolidation_phases"] = []

@@ -187,6 +187,52 @@ def test_established_index_header_paths_use_page_count_without_exists(
     assert candidate.create().digest == candidate.definition.digest()
 
 
+def test_existing_admission_uses_one_extent_observation(database, monkeypatch):
+    candidate = HashIndex(exact_definition(database.table, name="one_admission"),
+                          database.pool, database.metrics)
+    expected = candidate.create()
+    calls = []
+    original = database.device.page_count
+
+    def count(file):
+        calls.append(file)
+        return original(file)
+
+    monkeypatch.setattr(database.device, "page_count", count)
+    assert candidate._open_existing(proved_present=True) == expected
+    assert calls == [candidate.file]
+
+
+def test_existing_admission_preserves_overridden_public_hook(database):
+    calls = []
+
+    class CustomHashIndex(HashIndex):
+        def open(self, *, proved_present=False):
+            calls.append("open")
+            return super().open(proved_present=proved_present)
+
+    candidate = CustomHashIndex(exact_definition(database.table, name="custom_admission"),
+                                database.pool, database.metrics)
+    candidate.create()
+    calls.clear()
+    database.manager.register(candidate, existing_only=True, persist_stale=False)
+    assert calls == ["open"]
+
+
+def test_existing_admission_refuses_short_bucket_extent_without_writes(database, monkeypatch):
+    candidate = HashIndex(exact_definition(database.table, name="short_admission"),
+                          database.pool, database.metrics)
+    candidate.create()
+    before = list(database.device.write_calls)
+    original = database.device.page_count
+    monkeypatch.setattr(database.device, "page_count",
+                        lambda file: 1 if file == candidate.file else original(file))
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        database.manager.register(candidate, existing_only=True, persist_stale=False)
+    assert refused.value.details["field"] == "bucket_count"
+    assert database.device.write_calls == before
+
+
 def test_registering_a_store_that_does_not_answer_the_contract_is_refused(
     database: Database, person_table: TableDef
 ) -> None:

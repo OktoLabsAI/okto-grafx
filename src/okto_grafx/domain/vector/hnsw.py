@@ -531,6 +531,7 @@ class HnswGraph:
             measured, cached = self._prepare_cosine_with_norm(query)
 
             def cosine(node: int) -> float:
+                """Compute cosine similarity using the retained query or candidate norm when available."""
                 stored = self._values[node]
                 retained = self._norms.get(node)
                 if retained is not None and retained[0] is stored:

@@ -993,6 +993,7 @@ class Catalog:
         error_type = GrafxCorruptionDetected if stored else GrafxConfigurationError
 
         def refuse(message: str, *, field: str, **details: object) -> NoReturn:
+            """Report invalid persisted state through the owning error taxonomy."""
             raise error_type(message, field=field, **details)
 
         automatic: dict[str, list[object]] = {}

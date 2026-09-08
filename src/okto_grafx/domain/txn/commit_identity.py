@@ -95,3 +95,5 @@ def assign_commit_time(observed_at: Timestamp, previous_ordered_at: Timestamp | 
             raise _invalid("ordered_at")
         ordered = max(ordered, previous.micros + 1)
     return CommitTime(observed, Timestamp(ordered), ordered != observed.micros)
+
+__all__ = ["CommitId","CommitTime","assign_commit_time"]

@@ -684,6 +684,7 @@ def _tuple_encoding_proof_protocol(
     """
 
     class Proof:
+        """Opaque weak-referenceable token identifying one tuple encoding proof."""
         __slots__ = ("__weakref__",)
 
     def proof_safe(value: object) -> bool:
@@ -703,6 +704,7 @@ def _tuple_encoding_proof_protocol(
     def encode_with_proof(
         table: TableDef, values: Sequence[Value]
     ) -> tuple[bytes, object | None]:
+        """Encode the tuple and issue a proof only for stable exact values."""
         payload = encode_tuple(table, values)
         if type(values) is not tuple or not all(proof_safe(value) for value in values):
             return payload, None
@@ -714,6 +716,7 @@ def _tuple_encoding_proof_protocol(
     def proved_payload(
         table: TableDef, values: Sequence[Value], proof: object
     ) -> bytes | None:
+        """Return bytes only when the proof still names this exact table and value tuple."""
         if type(proof) is not Proof:
             return None
         with guard:
@@ -726,6 +729,7 @@ def _tuple_encoding_proof_protocol(
         return None
 
     def forget(proof: object) -> None:
+        """Withdraw the owned tuple encoding proof if it remains registered."""
         if type(proof) is not Proof:
             return
         with guard:

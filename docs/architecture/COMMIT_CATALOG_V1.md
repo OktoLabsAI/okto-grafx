@@ -1,9 +1,15 @@
 # Commit catalog v1 — CAP-1B persistence contract
 
-Status: record codec, private paged planner/reader, internal activation fence and required WAL framing implemented;
-automatic journal publication/replay and public API NOT enabled. Activated test stores
-refuse subsequent writing commits until publication is wired. Not deployable as a
-public capability. Authority: ADR GX-003 and SPEC-GX-CAP-1.
+Status: record codec, private paged planner/reader, activation fence, required WAL framing,
+native journal publication and replay implemented on feature/v0.0.5. Development public
+activation, metadata, snapshot lookup/paging, verifier/metrics and logical-transfer
+mapping hooks are connected and locally validated. See
+[acceptance evidence and limits](../reports/V005_N3_N4_ACCEPTANCE.md) and the
+[consumer contract](../COMMIT_HISTORY.md). Earlier sections below
+retain chronological checkpoint history; the current integration supersedes their
+temporary writer guard. Requirements and platform/deployment limits remain explicit
+in the acceptance report.
+Authority: ADR GX-003 and SPEC-GX-CAP-1.
 Date: 2026-09-08.
 
 ## Storage and ordering decision

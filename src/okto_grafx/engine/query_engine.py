@@ -1057,10 +1057,12 @@ class _RevisionList(list[object]):
         self.rewrite_revision += 1
 
     def append(self, value: object) -> None:
+        """Append one value and advance the append revision."""
         super().append(value)
         self._appended()
 
     def extend(self, values: object) -> None:
+        """Extend the tracked list and account for any partial append."""
         before = len(self)
         try:
             super().extend(values)  # type: ignore[arg-type]
@@ -1069,6 +1071,7 @@ class _RevisionList(list[object]):
                 self._appended()
 
     def insert(self, index: int, value: object) -> None:
+        """Insert a value and invalidate retained rewrite-dependent state."""
         super().insert(index, value)
         self._rewritten()
 
@@ -1090,24 +1093,29 @@ class _RevisionList(list[object]):
         return self
 
     def pop(self, index: int = -1) -> object:
+        """Remove and return one value while advancing the rewrite revision."""
         value = super().pop(index)
         self._rewritten()
         return value
 
     def remove(self, value: object) -> None:
+        """Remove the requested value and advance the rewrite revision."""
         super().remove(value)
         self._rewritten()
 
     def clear(self) -> None:
+        """Clear nonempty tracked contents and invalidate the previous revision."""
         if self:
             super().clear()
             self._rewritten()
 
     def reverse(self) -> None:
+        """Reverse tracked contents and advance the rewrite revision."""
         super().reverse()
         self._rewritten()
 
     def sort(self, *args: object, **kwargs: object) -> None:
+        """Sort tracked contents and invalidate reuse even after a partial failure."""
         try:
             super().sort(*args, **kwargs)  # type: ignore[arg-type]
         finally:
@@ -1144,6 +1152,7 @@ class _PrimaryKeyFoldState:
     mutable_key_owners: dict[object, Value] = field(default_factory=dict)
 
     def reset(self, rewrite_revision: int) -> None:
+        """Reset the fold cursor and all outcomes for a new rewrite generation."""
         self.cursor = 0
         self.rewrite_revision = rewrite_revision
         self.generation += 1
@@ -2865,6 +2874,7 @@ def _closed_statement_tables(
         bound: dict[str, set[str]] = {}
 
         def add_table(name: str) -> TableDef | None:
+            """Resolve a known table name into the operation-local selection."""
             if type(name) is not str:
                 return None
             try:
@@ -2875,6 +2885,7 @@ def _closed_statement_tables(
             return table
 
         def visit(pattern: PatternPath) -> bool:
+            """Visit the selected structure while enforcing its coverage and shape checks."""
             if (
                 type(pattern) is not PatternPath
                 or type(pattern.nodes) is not tuple
@@ -3021,6 +3032,7 @@ class _IndexAuthorityProjection:
         *,
         planning_indexes: tuple[object, ...] | None = None,
     ) -> _IndexAuthorityProjection:
+        """Build an operation-local projection of named index authority."""
         grouped: dict[str, list[object]] = {}
         for index in indexes:
             definition = getattr(index, "definition", None)
@@ -5903,6 +5915,7 @@ def _index_seek(
         dict[object, tuple[Value, ...] | None],
         list[tuple[object, tuple[Value, ...]]],
     ]:
+        """Lazily capture the transaction's logical row overlay for this scan."""
         nonlocal logical_overlay
         if logical_overlay is None:
             logical_overlay = _transaction_row_view(
@@ -6863,6 +6876,7 @@ def _traverse(
     batch_landings = vector_free and _admits_batched_landings(engine, node, context)
 
     def view_at(table: TableDef) -> _OwnerLandingView:
+        """Reuse one endpoint landing view per table within this operation."""
         view = landing_views.get(table.table_id)
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
@@ -7573,6 +7587,7 @@ def _node_multi_key_seek(
     allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
 
     def small_table() -> Iterator[_Row]:
+        """Yield the canonical fallback when a table extent is available."""
         if extent is not None:
             yield from engine._rows(node.fallback, context)
 
@@ -7758,6 +7773,7 @@ def _ordered_node_merge(
     failure: BaseException | None = None
 
     def next_admitted(ordinal: int) -> _OrderedMergeCandidate | None:
+        """Return the next candidate satisfying this ordered branch's row constraints."""
         iterator = iterators[ordinal]
         table = node.tables[ordinal]
         for key, ref, version in iterator:
@@ -7877,6 +7893,7 @@ def _relationship_incident_seek(
         table: TableDef,
         positions: tuple[int, ...],
     ) -> object | None:
+        """Return the named exact index only when its table and columns match."""
         store = authority.named(name)
         definition = getattr(store, "definition", None)
         if (
@@ -7939,6 +7956,7 @@ def _relationship_incident_seek(
         table: TableDef,
         position: int,
     ) -> tuple[tuple[bytes, Value], ...] | None:
+        """Deduplicate supported exact-probe values by their canonical encoded keys."""
         unique: dict[bytes, Value] = {}
         for value in values:
             if value is None:
@@ -8027,6 +8045,7 @@ def _relationship_incident_seek(
         store: object,
         keys: tuple[bytes, ...],
     ) -> tuple[tuple[tuple[object, HeapVersion], ...], ...]:
+        """Validate batch cardinality before aligning groups with requested keys."""
         batches = tuple(many(store, keys, context.snapshot))
         if len(batches) != len(keys):
             raise GrafxIndexError(
@@ -8045,6 +8064,7 @@ def _relationship_incident_seek(
         table: TableDef,
         position: int,
     ) -> dict[RecordId, tuple[object, HeapVersion]]:
+        """Resolve grouped identity probes into validated visible node landings."""
         keys = tuple(key for key, _value in keyed)
         groups = _memoized_primary_key_groups(
             engine,
@@ -8104,6 +8124,7 @@ def _relationship_incident_seek(
         )
 
     def edge_keys(record_ids: Collection[RecordId], position: int) -> tuple[bytes, ...]:
+        """Encode endpoint identities for the selected relationship index position."""
         return tuple(
             index_key(
                 (record_id, None) if position == 0 else (None, record_id),
@@ -8225,6 +8246,7 @@ def _relationship_incident_seek(
         definitive: bool,
         record_id: RecordId,
     ) -> tuple[object, HeapVersion] | None:
+        """Use the captured endpoint landing or perform the canonical identity lookup."""
         found = cached.get(record_id)
         if found is not None or definitive:
             return found
@@ -8350,6 +8372,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
     coalesce_types = context.coalesce_types
 
     def key_of(node: Expression) -> tuple:
+        """Build a closed expression key without invoking caller value hooks."""
         known = keys.get(id(node))
         if known is not None:
             return known
@@ -8417,6 +8440,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
     def shared(
         node: Expression, function: Callable[..., object]
     ) -> Callable[..., object]:
+        """Memoize only subexpressions whose dependencies can be proved reusable."""
         kind = type(node)
         if kind is Literal or kind is Parameter or kind is Variable:
             return function
@@ -8431,6 +8455,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             slot = slot_of[key] = len(slot_of)
 
         def memoized(row: _Row, ctx: _Context, memo: list[object]) -> object:
+            """Reuse a subexpression only when its observed property dependencies permit it."""
             value = memo[slot]
             if value is _COMPILED_MISS:
                 reads_before = memo[-1]
@@ -8445,6 +8470,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         return memoized
 
     def compile_node(node: Expression) -> Callable[..., object]:
+        """Compile one expression and track whether its evaluation is fully instrumented."""
         fallbacks_before = fallbacks
         function = compile_kind(node)
         # Instrumented only when neither this node nor anything compiled below it fell back.
@@ -8452,23 +8478,27 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         return function
 
     def compile_kind(node: Expression) -> Callable[..., object]:
+        """Compile supported expression kinds or retain canonical evaluation semantics."""
         kind = type(node)
         if kind is Literal:
             constant = node.value
 
             def literal(row: _Row, ctx: _Context, memo: object) -> object:
+                """Return the captured literal without consulting row or parameter state."""
                 return constant
 
             return literal
         if kind is Parameter:
 
             def parameter(row: _Row, ctx: _Context, memo: object) -> object:
+                """Resolve the parameter through the canonical parameter evaluator."""
                 return _evaluate_parameter(node, row, ctx, None)
 
             return parameter
         if kind is Variable:
 
             def variable(row: _Row, ctx: _Context, memo: object) -> object:
+                """Read the named variable from the current row bindings."""
                 return _read_variable(node, row, None)
 
             return variable
@@ -8477,6 +8507,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             key = node.key
 
             def prop(row: _Row, ctx: _Context, memo: object) -> object:
+                """Read a property while preserving null and non-row mapping semantics."""
                 value = subject(row, ctx, memo)
                 if value is None:
                     return None
@@ -8494,6 +8525,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             negated = bool(node.negated)
 
             def null_check(row: _Row, ctx: _Context, memo: object) -> object:
+                """Apply the selected null predicate to the evaluated operand."""
                 value = operand(row, ctx, memo)
                 return (value is not None) if negated else (value is None)
 
@@ -8502,6 +8534,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             operand = shared(node.operand, compile_node(node.operand))
 
             def negation(row: _Row, ctx: _Context, memo: object) -> object:
+                """Negate a truth value while preserving unknown results."""
                 truth = _truth(operand(row, ctx, memo))
                 return None if truth is None else (not truth)
 
@@ -8514,6 +8547,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "AND":
 
                     def conjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Apply three-valued AND with its canonical short-circuit behavior."""
                         left_truth = _truth(left(row, ctx, memo))
                         if left_truth is False:
                             return False
@@ -8528,6 +8562,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "OR":
 
                     def disjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Apply three-valued OR with its canonical short-circuit behavior."""
                         left_truth = _truth(left(row, ctx, memo))
                         if left_truth is True:
                             return True
@@ -8542,6 +8577,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "XOR":
 
                     def exclusive(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Apply three-valued XOR to the evaluated operands."""
                         left_value = left(row, ctx, memo)
                         right_value = right(row, ctx, memo)
                         left_truth, right_truth = (
@@ -8556,6 +8592,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "=":
 
                     def equality(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Compare non-null operands using canonical query equality."""
                         left_value = left(row, ctx, memo)
                         right_value = right(row, ctx, memo)
                         if left_value is None or right_value is None:
@@ -8566,6 +8603,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "<>":
 
                     def inequality(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Negate canonical equality without turning unknown into true."""
                         left_value = left(row, ctx, memo)
                         right_value = right(row, ctx, memo)
                         if left_value is None or right_value is None:
@@ -8575,6 +8613,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                     return inequality
 
                 def ordering(row: _Row, ctx: _Context, memo: object) -> object:
+                    """Compare the evaluated operands using the query ordering rules."""
                     return _ordered(
                         operator, left(row, ctx, memo), right(row, ctx, memo)
                     )
@@ -8592,6 +8631,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             )
 
             def coalesce(row: _Row, ctx: _Context, memo: object) -> object:
+                """Evaluate the selected arguments under canonical coalesce semantics."""
                 values = tuple(argument(row, ctx, memo) for argument in arguments)
                 return _coalesce_selected(node, values, ctx)
 
@@ -8601,6 +8641,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         fallbacks += 1
 
         def canonical(row: _Row, ctx: _Context, memo: object) -> object:
+            """Evaluate unsupported expression forms through the canonical query walker."""
             return _evaluate(node, row, ctx)
 
         return canonical
@@ -8623,6 +8664,7 @@ def _predicate_admitter(
     compiled: _CompiledPredicate | None = None
 
     def admits(row: _Row) -> bool:
+        """Evaluate the prepared predicate with the query's three-valued truth semantics."""
         nonlocal compiled
         if row.computed is None:
             if compiled is None:
@@ -9600,6 +9642,7 @@ def _spill_path_value(value: _PathValue) -> Value:
     """Encode one capability-free path DTO without collapsing its nominal validation."""
 
     def identity(item: _PathIdentity) -> Value:
+        """Expose the path identity as its canonical offset and table pair."""
         return (item.offset, item.table)
 
     nodes: tuple[Value, ...] = tuple(
@@ -10406,6 +10449,7 @@ def _batched_relationship_count(
     }
 
     def visible(table: TableDef, index: object, identities: Sequence[int]) -> tuple[bool, ...]:
+        """Return visibility under the owning transaction snapshot."""
         counts = views[table.table_id].counts_many(identities, context, index)
         if len(counts) != len(identities):
             raise GrafxIndexError(
@@ -10424,6 +10468,7 @@ def _batched_relationship_count(
         return tuple(count == 1 for count in counts)
 
     def count_frontier(frontier: list[tuple[int, int]]) -> int:
+        """Count visible endpoint pairs while preserving source-first short circuiting."""
         from_visible = visible(scan.from_table, from_index, [pair[0] for pair in frontier])
         # Preserve the scalar short circuit: a missing source never probes its target.
         targets = [pair[1] for pair, present in zip(frontier, from_visible) if present]
@@ -10781,6 +10826,7 @@ class _SpilledAggregateState:
         self._closed = False
 
     def add(self, entries: tuple[Value, ...], ordinal: int) -> None:
+        """Accumulate the selected values under this operation's ownership and budget checks."""
         if len(entries) != len(self._node.aggregations):
             raise GrafxCorruptionDetected(
                 "A temporary aggregate row disagrees with the plan arity.",
@@ -10893,6 +10939,7 @@ class _SpilledAggregateState:
         return payload
 
     def close(self) -> None:
+        """Release retained aggregate workspace allocations idempotently."""
         if self._closed:
             return
         for amount in self._extra:
@@ -13316,6 +13363,7 @@ def _primary_key_seek_candidates(
     selected: list[tuple[object, _PrimaryKeyOutcome]] = []
 
     def add(state: _PrimaryKeyFoldState, *, exclude: set[object]) -> bool:
+        """Collect current key owners while refusing ambiguous legacy ownership."""
         for owner, _observed in _primary_key_state_owners(state, key):
             if owner in exclude:
                 continue
@@ -14916,6 +14964,11 @@ def _validate_parameter_map_value(
     value: object, *, parameter: str, seen: set[int]
 ) -> None:
     """Validate every nested map carried by one referenced parameter."""
+    # Endpoint batches carry hundreds of scalar IDs per layout. Exact built-in
+    # leaves cannot contain map collisions; avoid dynamic Mapping checks for each
+    # one. Subclasses/custom containers still take the complete recursive path.
+    if value is None or type(value) in (str, int, float, bool):
+        return
     if not isinstance(value, (Mapping, list, tuple)):
         return
     marker = id(value)

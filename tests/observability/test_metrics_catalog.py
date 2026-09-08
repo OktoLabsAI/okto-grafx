@@ -48,6 +48,9 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
         "oktografx_lease_wait_seconds",
         "oktografx_write_conflicts_total",
         "oktografx_commit_retries_total",
+        "oktografx_commits_with_metadata_total",
+        "oktografx_commit_metadata_bytes_total",
+        "oktografx_commit_id_high_watermark_count",
         "oktografx_active_transactions",
         "oktografx_commit_window_duration_seconds",
         "oktografx_commit_phase_duration_seconds",
@@ -103,6 +106,18 @@ EXPECTED_METRIC_NAMES: frozenset[str] = frozenset(
 """Transcribed from CONTRACT.md section 9 with the renames of amendment A1 applied."""
 
 EXPECTED_METRICS: dict[str, tuple[str, str]] = {
+    "oktografx_commits_with_metadata_total": (
+        "counter",
+        "Locally acknowledged writing commits carrying provenance metadata.",
+    ),
+    "oktografx_commit_metadata_bytes_total": (
+        "counter",
+        "Canonical metadata bytes in locally acknowledged writing commits.",
+    ),
+    "oktografx_commit_id_high_watermark_count": (
+        "gauge",
+        "Last locally acknowledged tracked commit sequence; qualified by this store.",
+    ),
     "oktografx_lease_wait_seconds": (
         "histogram",
         "Time a writer waited for the coordination lease, by outcome.",
@@ -376,7 +391,7 @@ def test_the_catalog_holds_exactly_the_metrics_the_contract_freezes() -> None:
         "missing": sorted(EXPECTED_METRIC_NAMES - names),
         "unexpected": sorted(names - EXPECTED_METRIC_NAMES),
     }
-    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 48
+    assert len(METRIC_CATALOG) == len(EXPECTED_METRIC_NAMES) == 51
 
 
 def test_the_catalog_matches_section_nine_of_the_contract_itself() -> None:

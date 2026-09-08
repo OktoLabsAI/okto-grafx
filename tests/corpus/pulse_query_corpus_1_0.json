@@ -1671,10 +1671,10 @@
     "class:fragment": 1,
     "class:read": 75,
     "class:write": 21,
-    "classification:already_supported": 82,
+    "classification:already_supported": 83,
     "classification:duplicate_text": 1,
     "classification:fragment": 1,
-    "classification:generic_gap": 13,
+    "classification:generic_gap": 12,
     "reachability:preventive": 2,
     "reachability:runtime_current": 66,
     "surface:internal_family": 68,
@@ -5121,9 +5121,9 @@
           "receiver": "conn"
         }
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'OPTIONAL' (line 1, column 31). [code=parse_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "reachability": "runtime_current",
       "expected": {
         "kind": "rows",
@@ -5203,12 +5203,7 @@
         "order_by": null,
         "limit": null,
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "parse_error",
-          "code": "parse_error",
-          "type": "GrafxParseError",
-          "message": "Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'OPTIONAL' (line 1, column 31). [code=parse_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -6719,7 +6714,7 @@
       ],
       "classification": "generic_gap",
       "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'OPTIONAL' (line 11, column 1). [code=parse_error retryable=False]",
+      "parse_error": "GrafxParseError: A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop (line 22, column 1). [code=parse_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6784,7 +6779,7 @@
           "phase": "parse_error",
           "code": "parse_error",
           "type": "GrafxParseError",
-          "message": "Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'OPTIONAL' (line 11, column 1). [code=parse_error retryable=False]"
+          "message": "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop (line 22, column 1). [code=parse_error retryable=False]"
         }
       }
     },
@@ -7723,5 +7718,5 @@
       }
     }
   ],
-  "digest": "b29334edf6e7c1e6b9419a4f3add84ede4baad94fdeaecb0c679261a78f241cc"
+  "digest": "50d2dfc6edc1942440f5adea93bf383879bd8a9e972ce1f8db3e2c3fcdfbe634"
 }

@@ -59,17 +59,20 @@ service, routed executor and HTTP route. Authorization/route authority are fixtu
 replacements and result caching is bypassed. Browser checks use the actual Pulse
 API client and GraphCanvas with fixture controls, **not the full live application**.
 [Conditions, assertions, all six dispositions and reproduction](reports/V005_NATIVE_PERFORMANCE_CHECKPOINT.md#bounded-follow-up-and-disposition-of-the-six-selected-items).
+Latest HTTP/native observations are from the [N1–N2 checkpoint](reports/V005_N1_N2_CHECKPOINT.md);
+browser and churn rows retain their earlier named experiment. Background Pulse
+was running; these observations do not establish a causal speedup.
 
 | Operation | Latest measured result | Scope |
 | --- | ---: | --- |
-| New handle open | 2,718 ms | Full schema, separate from HTTP; OS cache not flushed |
-| First HTTP 500-node page on new handle | 428.332 ms | Exact nodes/incident edges, no failed layout |
-| Warm first / next 500-node HTTP pages | 221.157 / 220.581 ms | Two distinct pages, JSON included |
+| New handle open | 2,808.201 ms | Full schema, separate from HTTP; OS cache not flushed |
+| First HTTP 500-node page on new handle | 488.462 ms | Exact nodes/incident edges, no failed layout |
+| Warm first / next 500-node HTTP pages | 264.038 / 314.126 ms | Two distinct pages, JSON included |
 | Warm browser reset | 269.7 ms HTTP/JSON + 67.6 ms to second frame | Real renderer; not ForceAtlas2 convergence |
 | Next-500 browser request | 309.4 ms HTTP/JSON + 367.2 ms to second frame | 1,000 accumulated nodes rendered |
-| Global digest / link writes | 30.430–36.846 / 26.024–35.283 ms | Four synthetic digests with 384-dimensional vectors |
-| Global inventory dispatch | 26.571 ms | Four digests, three actual inventory queries; test event-loop startup included |
-| Explicit Global verify-all / checkpoint | 838.249 / 188.709 ms | Separate maintenance; not full outbox ACK |
+| Global digest / link writes | 27.552–43.988 / 19.980–39.985 ms | Four synthetic digests with 384-dimensional vectors |
+| Global inventory dispatch | 23.567 ms | Four digests, three actual inventory queries; test event-loop startup included |
+| Explicit Global verify-all / checkpoint | 716.379 / 171.577 ms | Separate maintenance; not full outbox ACK |
 | Churn RSS, four handles plus pinned reader | 54,210,560 bytes | Small 64-row fixture after 12 update/delete cycles; not full Pulse RSS |
 
 Exact page candidate counts were 128/500/500 at graph sizes 128/512/1,100.
@@ -84,22 +87,29 @@ Different bounded workloads from the 1,100-node fixture above. Windows/Python
 3.13.1, fresh temporary stores, stub embeddings, no production specs or UI run.
 The consolidation uses real Community composition, SQLite, Grafx and the outbox
 worker, including verification before ACK. [Full evidence and limits](reports/V005_FOUR_ITEM_FOLLOWUP.md).
+Consolidation rows use the latest [N1 run](reports/V005_N1_N2_CHECKPOINT.md);
+the projection and 128-node rows retain their separate earlier measurements.
 
 | Operation | Latest measured result | Scope |
 | --- | ---: | --- |
 | Ordered projected page | 20.247 ms | Warm median; 128 of 256 rows, two tables, 384d vectors and 12,000-character payloads |
 | Writable full-schema open | 2,521.420 ms | 128-node Pulse fixture; independent of HTTP |
 | Warm 128-node HTTP page | 118.435 ms | 127 edges, zero failed layouts; fixture authority, real graph IO |
-| Reconcile four synthetic candidates | 3,508.247 ms | Includes cold independent-reader admission/checkpoint |
-| Consolidation commit, four nodes / four edges | 1,404.860 ms | Graph dispatch is 790.214 ms of this total |
-| SQLite commit | 1.226 ms | After graph/audit staging |
-| Immediate outbox tick through ACK | 2,509.933 ms | Application 1,330.514 ms and flush/reopen/verification 1,133.135 ms are nested portions |
+| Reconcile four synthetic candidates | 4,476.345 ms | Includes cold independent-reader admission/checkpoint |
+| Consolidation commit, four nodes / four edges | 1,621.423 ms | Graph dispatch is 975.800 ms of this total |
+| SQLite commit | 1.225 ms | After graph/audit staging |
+| Immediate outbox tick through ACK | 2,908.809 ms | Application 1,479.183 ms and flush/reopen/verification 1,381.832 ms are nested portions |
 
 Four references and digests were verified, one event ACKed, and a second worker
 tick was empty. Setup and periodic scheduling wait are excluded. These are not
 comparable to the older live ACK duration or a claim that first-reader admission,
 production backlog or all write latency is solved. Timing tables show latest
 measurements only; regression checks have no performance thresholds.
+
+The separate [N4 public publication sample](reports/V005_N3_N4_ACCEPTANCE.md) measured
+**24.233 ms median** per journaled single-row update (512-byte pages, 16 measured
+iterations). This opt-in development capability adds durable provenance; the
+measurement is neither a Pulse timing nor a performance improvement claim.
 
 ## Native/component evidence in the 0.0.4 development line
 

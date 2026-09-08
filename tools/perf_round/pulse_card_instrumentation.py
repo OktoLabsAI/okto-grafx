@@ -452,7 +452,7 @@ class PulseCardInstrumentation:
 
         @functools.wraps(original_visible_identity)
         def visible_identity(
-            engine: Any, context: Any, table: Any, record_id: int
+            engine: Any, context: Any, table: Any, record_id: int, **kwargs: Any
         ) -> Any:
             state: dict[str, Any] | None = None
             stack: list[dict[str, Any]] | None = None
@@ -472,7 +472,7 @@ class PulseCardInstrumentation:
             self._bump("heap_lookup_calls")
             self._bump("endpoint_lookup_calls")
             try:
-                result = original_visible_identity(engine, context, table, record_id)
+                result = original_visible_identity(engine, context, table, record_id, **kwargs)
             except BaseException:
                 self._bump("heap_lookup_failed")
                 self._bump("endpoint_lookup_failed")

@@ -9,6 +9,9 @@ Private artifact/consumer-repository paths may not be available in this checkout
 - [Documentation refactor and validation](DOCUMENTATION_REFACTOR_2026_09_08.md)
 - [0.0.5 native performance checkpoint](V005_NATIVE_PERFORMANCE_CHECKPOINT.md)
 - [0.0.5 four-item follow-up: projected pages, admission, complete synthetic Pulse ACK and typed options](V005_FOUR_ITEM_FOLLOWUP.md)
+- [0.0.5 N1–N2 checkpoint: existing-index admission and scalar parameter preparation](V005_N1_N2_CHECKPOINT.md)
+- [0.0.5 N3 overflow retirement and N4 native publication progress](V005_N3_N4_PROGRESS.md)
+- [0.0.5 N3/N4 implementation and regression closure](V005_N3_N4_ACCEPTANCE.md)
 
 - [Architecture boundary debt: query synchronization and pure algorithms](ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md)
 - [Bounded relationship census with exact endpoint validation](BATCHED_RELATIONSHIP_COUNT_0_0_4.md)

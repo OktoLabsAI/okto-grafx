@@ -76,8 +76,12 @@ def main():
               "source_sha256": {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
                                 for p in (Path(__file__).resolve(), source / "src/okto_grafx/engine/query_engine.py",
                                           source / "src/okto_grafx/api/assembly.py",
+                                          source / "src/okto_grafx/engine/index_manager.py",
                                           source / "src/okto_grafx/engine/ordered_index.py",
                                           source / "src/okto_grafx/engine/heap_store.py")}}
+    adapter_source = Path(os.environ["OKTO_PULSE_COMMUNITY_REPO"]) / (
+        "src/okto_pulse/community/adapters/grafx_graph_transaction.py")
+    report["source_sha256"][str(adapter_source)] = hashlib.sha256(adapter_source.read_bytes()).hexdigest()
     process = psutil.Process()
     report["rss_start_bytes"] = process.memory_info().rss
     with tempfile.TemporaryDirectory(prefix="grafx-v005-pulse-") as raw:
@@ -173,6 +177,16 @@ def main():
                                                 node_types_by_id={n: "Decision" for n in expected[:500]})
                 profile.disable()
                 report["kg_profile"] = profile_top(profile)
+                # Keep preparation attribution separate from nested execution time.
+                # A public batch API is not justified merely by a fan-out count.
+                report["kg_dispatch_profile"] = [
+                    {"function": f"{Path(key[0]).name}:{key[1]}:{key[2]}",
+                     "calls": value[1], "self_ms": round(value[2] * 1000, 3),
+                     "cumulative_ms": round(value[3] * 1000, 3)}
+                    for key, value in pstats.Stats(profile).stats.items()
+                    if key[2] in {"_prepare", "_grafx_query_parameters", "_bind_parameters",
+                                  "parse", "plan", "_prepared_plan_key", "_clone_bound_plan"}
+                ]
                 from okto_grafx.engine import query_engine
                 with (patch.object(query_engine, "parse_text", wraps=query_engine.parse_text) as parse,
                       patch.object(query_engine, "build_plan", wraps=query_engine.build_plan) as plan):

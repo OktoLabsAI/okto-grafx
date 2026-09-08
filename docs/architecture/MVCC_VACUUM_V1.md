@@ -14,7 +14,7 @@ The first mutating pass uses two durable transactions:
 
 1. publish catalog-v2 required capability `heap_reclaim_v1`;
 2. in one ordinary WAL-before-data commit, advance the heap-wide retained-snapshot floor, free
-   eligible inline version slots, relink retained version chains, and reconcile every ACTIVE
+   eligible version slots and owned overflow payloads, relink retained version chains, and reconcile every ACTIVE
    index at the same horizon.
 
 Catalog v2 and its identity-index authority must already be active. The capability transaction
@@ -44,8 +44,10 @@ closed.
 ## Eligibility and physical effects
 
 A version is eligible only when both birth and end are committed, `xmin <= xmax`, and
-`xmax <= horizon`. Vacuum v1 reclaims inline versions only. Overflow-backed versions and their
-pages remain untouched; the report names them as skipped. Provisional or structurally implausible
+`xmax <= horizon`. The 0.0.5 extension also retires overflow-backed versions. Before emitting
+any retirement image, it checks all reachable overflow chains across all catalog tables for
+exclusive ownership, acyclicity, page kind/slots and exact payload length. This includes
+unselected tables and retained versions. Provisional or structurally implausible
 lifetimes are retained and remain verifier concerns.
 
 Reclamation uses `Page.free_slot()` followed by in-page compaction. Slot directory entries,
@@ -64,7 +66,7 @@ authoritative generation was built against the heap state current at its publica
 therefore keeps reconciliation records stamped with the vacuum horizon; stamping them with the
 later commit CSN would incorrectly claim reconciliation of versions between those two values.
 
-`max_versions`, when supplied, limits only inline heap versions selected in deterministic
+`max_versions`, when supplied, limits heap versions selected in deterministic
 table/page/slot order. Reconciliation may remove more index tombstones because every ACTIVE index
 of a selected table must be safe before any selected slot disappears. `complete` reports whether
 all eligible inline versions were selected; skipped overflow history is reported separately.

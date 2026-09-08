@@ -58,6 +58,7 @@ def read_catalog_page_images(
     It returns data, not physical authority or permission to replay the images.
     """
     def refuse(field: str) -> GrafxCorruptionDetected:
+        """Construct a located corruption error for an invalid catalog image set."""
         return GrafxCorruptionDetected("Invalid complete catalog page-image set.", file=CATALOG_FILE, field=field)
 
     if type(sequence) is not int or not 0 < sequence < PROVISIONAL_CSN:

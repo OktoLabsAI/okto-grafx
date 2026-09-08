@@ -184,14 +184,20 @@ Grafx process and handle**, including an older binary, for the whole call; reade
 treated as proof of safety. The first call publishes the required `heap_reclaim_v1` capability,
 so older builds fail closed, then one WAL-before-data commit atomically advances a durable global
 snapshot floor, reconciles ACTIVE indexes, relinks retained chains and removes eligible inline
-versions. Use `max_versions` to bound removed heap versions per pass; index reconciliation is not
+and overflow-backed versions. Overflow chains are retired only after checking complete payload
+coverage and exclusive ownership across every table, including unselected/retained records.
+Use `max_versions` to bound removed heap versions per pass; ownership scans and index reconciliation are not
 part of that quota. A table filter still advances a heap-global floor and is therefore an
 availability choice for the whole database.
 
-The immutable `VacuumReport` distinguishes heap data pages rewritten, tuple-slot bytes removed,
-chain relinks, index entries removed and overflow versions skipped. `complete` means all eligible
-**inline** versions in the selected tables were handled by that pass; overflow history remains.
-Vacuum v1 does not truncate files, reclaim overflow pages or reuse page, slot or `RecordRef`
+The immutable `VacuumReport` distinguishes pages rewritten, tuple-slot bytes removed,
+chain relinks, index entries removed and `reclaimed_overflow_pages`. Table reports include
+`eligible_overflow_versions`; `skipped_overflow_versions` counts eligible overflow versions not
+selected under the pass quota. `complete` covers eligible inline **and overflow** versions in
+the selected tables. Retired overflow pages are WAL-logged as empty FREE pages, not silently
+removed from disk. The ownership pass is foreground O(total reachable overflow pages), not a
+new cost on ordinary queries/commits; `max_versions` is not an IO or total plan-memory limit.
+Vacuum does not truncate files or automatically reuse released pages, slots or `RecordRef`
 identities. Restart application processes after the maintenance window so their first transaction
 adopts the new capability, floor and index authority. See
 [`docs/architecture/MVCC_VACUUM_V1.md`](architecture/MVCC_VACUUM_V1.md).

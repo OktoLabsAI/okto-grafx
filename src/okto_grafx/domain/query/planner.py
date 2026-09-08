@@ -3980,6 +3980,7 @@ class _Planner:
                 terms.append(current)
 
         def property_is(expression: Expression, column: str) -> bool:
+            """Recognize an exact property access on the selected query variable."""
             return (
                 isinstance(expression, Property)
                 and isinstance(expression.subject, Variable)

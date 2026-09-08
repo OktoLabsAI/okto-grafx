@@ -1,4 +1,5 @@
 """Static keyword contract for connect; DatabaseConfig remains runtime authority."""
+from __future__ import annotations
 from typing import Literal, TypedDict
 
 
@@ -44,3 +45,5 @@ class ConnectOptions(TypedDict, total=False):
     descriptor_revalidation: Literal["strict", "generation"]
     max_query_value_characters: int
     query_memory_budget_bytes: int | None
+
+__all__ = ["ConnectOptions"]

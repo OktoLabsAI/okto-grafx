@@ -10,7 +10,7 @@ import pytest
 from okto_grafx import connect
 from okto_grafx.domain.errors import (
     GrafxConfigurationError, GrafxCorruptionDetected, GrafxSchemaVersionMismatch,
-    GrafxTransactionStateError, GrafxUnsupportedOperation,
+    GrafxTransactionStateError,
     GrafxTransactionBudgetExceeded,
 )
 from okto_grafx.domain.ids import PROVISIONAL_CSN
@@ -83,11 +83,13 @@ def test_activation_horizon_is_the_real_wal_commit_and_survives_reopen(tmp_path:
     with connect(root, page_size=512) as database:
         assert database._catalog.catalog.commit_catalog_activation == horizon
         before = database._wal.last_lsn
-        with pytest.raises(GrafxUnsupportedOperation) as failure:
-            with database.begin("write") as txn:
-                txn.execute("CREATE NODE TABLE Forbidden(id INT64, PRIMARY KEY(id))")
-        assert failure.value.details["field"] == "commit_catalog_publication"
-        assert database._wal.last_lsn == before
+        with database.begin("write") as txn:
+            txn.execute("CREATE NODE TABLE Tracked(id INT64, PRIMARY KEY(id))")
+        assert database._wal.last_lsn > before
+        from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
+        history = CommitCatalogStore(database._storage.read_page,
+                                     database_uuid=database._transactions._database_uuid, page_size=512)
+        assert history.verify().last_sequence == database._wal.last_lsn
 
 
 def test_rollback_discards_activation_without_file_or_wal_effect(tmp_path: Path) -> None:
@@ -153,16 +155,16 @@ def test_same_handle_and_already_open_foreign_writer_cannot_create_untracked_com
             pending.execute("CREATE (:Item {id: 1})")
             activate(first)
             before = first._wal.last_lsn
-            with pytest.raises(GrafxUnsupportedOperation) as failure:
-                pending.commit()
-            assert failure.value.details["field"] == "commit_catalog_publication"
-            pending.rollback()
-            with pytest.raises(GrafxUnsupportedOperation):
-                with first.begin("write") as txn:
-                    txn.execute("CREATE (:Item {id: 2})")
-            assert first._wal.last_lsn == before
+            pending.commit()
+            with first.begin("write") as txn:
+                txn.execute("CREATE (:Item {id: 2})")
+            assert first._wal.last_lsn > before
             with first.begin("read") as reader:
-                assert reader.execute("MATCH (i:Item) RETURN i.id").rows == ()
+                assert set(reader.execute("MATCH (i:Item) RETURN i.id").rows) == {(1,), (2,)}
+            from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
+            history = CommitCatalogStore(first._storage.read_page,
+                                         database_uuid=first._transactions._database_uuid, page_size=512)
+            assert history.verify().last_sequence == first._wal.last_lsn
 
 
 def test_activation_cannot_silently_discard_work_added_after_preparation(tmp_path: Path) -> None:

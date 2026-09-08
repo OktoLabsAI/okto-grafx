@@ -25,6 +25,11 @@ from __future__ import annotations
 
 from okto_grafx.api import ConnectOptions, connect
 from okto_grafx.domain.model import Timestamp, VectorValue
+from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.txn.commit_metadata import CommitMetadata, MetadataLimits
+from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry, CommitKind
+from okto_grafx.domain.txn.commit_history import CommitHistoryPage
+from okto_grafx.domain.txn.commit_transfer import CommitImport, CommitMapping, prepare_commit_import
 from okto_grafx.engine.database import (
     Database,
     DatabaseIdentity,
@@ -41,11 +46,19 @@ from okto_grafx.runtime.config import DatabaseConfig
 from okto_grafx.runtime.registry import PortRegistry
 
 __all__ = [
+    "CommitCatalogEntry",
+    "CommitHistoryPage",
+    "CommitId",
+    "CommitImport",
+    "CommitKind",
+    "CommitMapping",
+    "CommitMetadata",
     "ConnectOptions",
     "Database",
     "DatabaseConfig",
     "DatabaseIdentity",
     "ExecuteManyReport",
+    "MetadataLimits",
     "PortRegistry",
     "Query",
     "QueryCursor",
@@ -58,6 +71,7 @@ __all__ = [
     "VectorValue",
     "__version__",
     "connect",
+    "prepare_commit_import",
 ]
 
 __version__: str = "0.0.5"

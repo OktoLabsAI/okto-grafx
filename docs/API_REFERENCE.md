@@ -4,6 +4,10 @@
 
 ## Entry points and supported imports
 
+Opt-in durable commit provenance on the 0.0.5 development branch is described in
+[commit history](COMMIT_HISTORY.md), including activation, metadata, qualified
+lookup, snapshot pagination, verification, cost and transfer/restore limitations.
+
 ```python
 from okto_grafx import (
     connect, DatabaseConfig, Database, Transaction, Query, QueryCursor, QueryResult,
@@ -192,6 +196,22 @@ execute(text: str, parameters: Mapping[str, object] | None=None) -> QueryResult
 ```
 
 Run one statement inside this transaction and return its result.
+
+#### Transaction.commit_history
+
+```python
+commit_history(*, after: CommitId | None=None, limit: int=100) -> CommitHistoryPage
+```
+
+Read an ascending bounded history page under this transaction's snapshot.
+
+#### Transaction.lookup_commit
+
+```python
+lookup_commit(identity: CommitId) -> CommitCatalogEntry | None
+```
+
+Look up a qualified commit visible here; None does not certify legacy absence.
 
 #### Transaction.executemany
 
@@ -588,7 +608,7 @@ Return immutable diagnostics for the composed query engine.
 #### Database.begin
 
 ```python
-begin(mode: str='write') -> Transaction
+begin(mode: str='write', *, metadata: CommitMetadata | None=None) -> Transaction
 ```
 
 Open a transaction in `"read"` or `"write"` mode (SPEC-M1 FR-2).
@@ -604,7 +624,7 @@ Open the successor of a transaction optimistic validation refused (BR-6).
 #### Database.transaction
 
 ```python
-transaction(mode: str='write') -> Iterator[Transaction]
+transaction(mode: str='write', *, metadata: CommitMetadata | None=None) -> Iterator[Transaction]
 ```
 
 Open a transaction as a block, committing on a clean exit and rolling back otherwise.
@@ -688,6 +708,30 @@ ensure_identity_indexes() -> None
 ```
 
 Persist and activate every exact access path required by endpoint identities.
+
+#### Database.enable_commit_history
+
+```python
+enable_commit_history() -> None
+```
+
+Activate one-way durable provenance after ensure_identity_indexes().
+
+#### Database.commit_history
+
+```python
+commit_history(*, after: CommitId | None=None, limit: int=100) -> CommitHistoryPage
+```
+
+Read a bounded history page in a new snapshot; use a read transaction for paging.
+
+#### Database.lookup_commit
+
+```python
+lookup_commit(identity: CommitId) -> CommitCatalogEntry | None
+```
+
+Return a durable entry visible in a new snapshot, or None in the tracked interval.
 
 #### Database.enable_wal_page_compression
 
@@ -1133,6 +1177,8 @@ reclaimed_versions: int
 reclaimed_slot_bytes: int
 relinked_versions: int
 skipped_overflow_versions: int
+eligible_overflow_versions: int
+reclaimed_overflow_pages: int
 ```
 
 ### VacuumReport fields
@@ -1156,6 +1202,7 @@ relinked_versions: int
 skipped_overflow_versions: int
 indexes_reconciled: int
 index_entries_removed: int
+reclaimed_overflow_pages: int
 ```
 
 ### MetricsSnapshotView fields
@@ -1716,6 +1763,155 @@ visible(xmin: Csn, xmax: Csn) -> bool
 ```
 
 Return True when a version created at xmin and ended at xmax belongs to this view.
+
+### CommitId fields
+
+Annotation location: `okto_grafx.domain.txn.commit_identity.CommitId`.
+
+Store-qualified, non-sentinel logical commit reference with store-local ordering.
+
+```python
+database_uuid: bytes
+sequence: int
+```
+
+#### CommitId.to_token
+
+```python
+to_token() -> str
+```
+
+Canonical bounded transport spelling, independent of Python repr/pickle.
+
+#### CommitId.parse
+
+```python
+parse(token: str) -> CommitId
+```
+
+Refuse alternate spellings instead of ambiguously normalizing an identity.
+
+### CommitTime fields
+
+Annotation location: `okto_grafx.domain.txn.commit_identity.CommitTime`.
+
+Immutable observed/ordered instants; never a clock or lease authority.
+
+```python
+observed_at: Timestamp
+ordered_at: Timestamp
+clock_adjusted: bool
+```
+
+### MetadataLimits fields
+
+Annotation location: `okto_grafx.domain.txn.commit_metadata.MetadataLimits`.
+
+Configurable admission limits inside fixed hard ceilings, independent of I/O.
+
+```python
+max_bytes: int
+max_attributes: int
+max_key_bytes: int
+max_string_bytes: int
+max_depth: int
+max_values: int
+```
+
+### CommitMetadata fields
+
+Annotation location: `okto_grafx.domain.txn.commit_metadata.CommitMetadata`.
+
+A fully detached canonical value; repr deliberately contains no supplied data.
+
+```python
+actor: str | None
+origin: str | None
+correlation_id: str | None
+reason: str | None
+attributes: Mapping[str, MetadataValue]
+```
+
+#### CommitMetadata.canonical_bytes
+
+```python
+canonical_bytes: bytes  # read-only property
+```
+
+Canonical admission bytes and commit-catalog nested metadata body v1.
+
+### CommitCatalogEntry fields
+
+Annotation location: `okto_grafx.domain.txn.commit_catalog.CommitCatalogEntry`.
+
+Immutable verified value of one record, not a store handle or physical proof.
+
+```python
+identity: CommitId
+timing: CommitTime
+metadata_bytes: bytes | None
+kind: CommitKind
+```
+
+#### CommitCatalogEntry.metadata
+
+```python
+metadata: CommitMetadata | None  # read-only property
+```
+
+The decoded immutable metadata; bytes/keys/content are absent from repr.
+
+#### CommitCatalogEntry.encode
+
+```python
+encode() -> bytes
+```
+
+Encode captured and revalidated values, not unchecked mutable host slots.
+
+### CommitHistoryPage fields
+
+Annotation location: `okto_grafx.domain.txn.commit_history.CommitHistoryPage`.
+
+Ascending commits; history at/below activation is explicitly untracked.
+
+```python
+database_uuid: bytes
+activation_sequence: int
+read_sequence: int
+entries: tuple[CommitCatalogEntry, ...]
+has_more: bool
+```
+
+### CommitMapping fields
+
+Annotation location: `okto_grafx.domain.txn.commit_transfer.CommitMapping`.
+
+Qualified source-to-target logical import mapping, not a durability receipt.
+
+```python
+source: CommitId
+target: CommitId
+```
+
+### CommitImport fields
+
+Annotation location: `okto_grafx.domain.txn.commit_transfer.CommitImport`.
+
+Metadata to pass to target.begin; mapping is recovered from the target entry.
+
+```python
+source: CommitId
+metadata: CommitMetadata
+```
+
+#### CommitImport.mapping
+
+```python
+mapping(target: CommitCatalogEntry) -> CommitMapping
+```
+
+Validate a returned/decoded target record's atomically persisted source link.
 
 ### RecordRef fields
 

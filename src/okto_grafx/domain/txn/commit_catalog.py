@@ -146,3 +146,5 @@ def decode_commit_catalog_entry(
         metadata_bytes=raw[_HEADER.size:-_CHECKSUM.size] if present else None,
         kind=CommitKind.MAINTENANCE if flags & _MAINTENANCE else CommitKind.DATA,
     )
+
+__all__ = ["CommitKind","CommitCatalogEntry","decode_commit_catalog_entry","MAX_COMMIT_RECORD_BYTES"]

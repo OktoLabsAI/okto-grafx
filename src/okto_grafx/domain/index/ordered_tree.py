@@ -346,6 +346,7 @@ def _append_packed_pages(
     count = 0
 
     def publish() -> None:
+        """Publish the completed subtree summary and reset the current leaf accumulator."""
         nonlocal current, first, last, count
         if current is None or first is None or last is None:
             return
@@ -629,6 +630,7 @@ def mutate_ordered_tree(
     new_pages: list[Page] = []
 
     def allocate(page_type: PageType) -> Page:
+        """Allocate one detached page or generation inside the current bounded plan."""
         page_index = start_page + len(new_pages)
         if page_index >= NO_PAGE:
             raise GrafxIndexError(
@@ -641,6 +643,7 @@ def mutate_ordered_tree(
         return page
 
     def pack_leaf(entries: Iterable[IndexEntry]) -> tuple[_CowNode, ...]:
+        """Pack ordered entries into detached copy-on-write leaf pages."""
         result: list[_CowNode] = []
         current: Page | None = None
         maximum: tuple[bytes, int] | None = None
@@ -665,6 +668,7 @@ def mutate_ordered_tree(
         return tuple(result)
 
     def pack_internal(nodes: Iterable[_CowNode]) -> tuple[_CowNode, ...]:
+        """Pack subtree pointers into detached copy-on-write internal pages."""
         result: list[_CowNode] = []
         current: Page | None = None
         maximum: tuple[bytes, int] | None = None
@@ -696,6 +700,7 @@ def mutate_ordered_tree(
         page_index: PageIndex,
         batch: tuple[tuple[int, IndexChange], ...],
     ) -> _CowResult:
+        """Apply the selected changes to one validated ordered leaf."""
         try:
             current = decode_ordered_leaf(pages[page_index])
         except KeyError as failure:
@@ -751,6 +756,7 @@ def mutate_ordered_tree(
         depth: int,
         batch: tuple[tuple[int, IndexChange], ...],
     ) -> _CowResult:
+        """Visit the selected structure while enforcing its coverage and shape checks."""
         if depth == 1:
             return apply_leaf(page_index, batch)
         try:
@@ -897,6 +903,7 @@ def verify_ordered_tree(
     internal_pages = 0
 
     def visit(page_index: PageIndex, depth: int) -> _Subtree:
+        """Visit the selected structure while enforcing its coverage and shape checks."""
         nonlocal leaf_pages, internal_pages
         if page_index in visiting or page_index in visited:
             raise GrafxCorruptionDetected(
@@ -1019,6 +1026,7 @@ def walk_ordered_desc(
     emitted = 0
 
     def descend(page_index: PageIndex, depth: int, ceiling: bytes | None) -> Iterator[IndexEntry]:
+        """Traverse ordered child pointers with cycle and page-structure checks."""
         nonlocal emitted
         if page_index in visiting:
             raise GrafxCorruptionDetected(
@@ -1105,6 +1113,7 @@ def seek_ordered_exact(
     visiting: set[PageIndex] = set()
 
     def descend(page_index: PageIndex, depth: int) -> tuple[IndexEntry, ...]:
+        """Traverse ordered child pointers with cycle and page-structure checks."""
         if page_index in visiting:
             raise GrafxCorruptionDetected(
                 "An ordered seek encountered a child cycle.",

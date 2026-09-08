@@ -21,3 +21,5 @@ class ScopedValue(Protocol):
     def bind(self, value: object) -> AbstractContextManager[None]:
         """Temporarily bind a value, restoring the exact previous binding on exit."""
         ...
+
+__all__ = ["ScopedValue"]
