@@ -3,6 +3,15 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / armazenamento paginado / 2026-09-08:** implementados o planejador
+privado de imagens de páginas, append limitado à cauda, lookup binário por identidade
+e verificação completa da cobertura anunciada. 59 testes específicos; grupo final
+de 606 testes em 14,79 s. O contrato de páginas e os limites de evidência estão em
+[`COMMIT_CATALOG_V1`](docs/architecture/COMMIT_CATALOG_V1.md) e
+[`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md). Ainda **não** é uma capability ativa:
+staging transacional/WAL, recovery, autoridade física, API e demais gates continuam
+obrigatórios. Nenhuma instalação ou consolidação adicional no Pulse.
+
 **GX-CAP-1B / 2026-09-08:** codec do registro persistente e decoder dos metadados
 implementados/validados na mesma branch `feature/gx-cap-1`: 379 testes verdes,
 incluindo 3.000 entradas modificadas; tipagem estrita/Ruff verdes. O contrato

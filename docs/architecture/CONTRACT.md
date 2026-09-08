@@ -641,7 +641,7 @@ intermediate `meta=v2/complete=v1` state is resumable by a writer and read-only 
 | off | type | field |
 |---|---|---|
 | 0 | u32 | `checksum` — CRC-32C over bytes[4:page_size] |
-| 4 | u16 | `page_type` 0 free · 1 meta · 2 heap · 3 catalog · 4 index_hash · 5 index_hnsw · 6 overflow · 7 control_slot · 8 control_header |
+| 4 | u16 | `page_type` 0 free · 1 meta · 2 heap · 3 catalog · 4 index_hash · 5 index_hnsw · 6 overflow · 7 control_slot · 8 control_header · 9 index_ordered_root · 10 index_ordered_internal · 11 index_ordered_leaf |
 | 6 | u16 | `flags` |
 | 8 | u64 | `page_lsn` — LSN of the last WAL record applied to this page (redo idempotence) |
 | 16 | u32 | `seq` — even = stable, odd = being written (torn-read detection helper) |

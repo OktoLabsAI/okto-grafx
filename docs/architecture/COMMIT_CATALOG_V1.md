@@ -1,7 +1,8 @@
 # Commit catalog v1 — CAP-1B persistence contract
 
-Status: record codec implemented and validated; activation, paged store and transactional
-wiring NOT enabled. Authority: ADR GX-003 and SPEC-GX-CAP-1. Date: 2026-09-08.
+Status: record codec and private paged image planner/reader implemented and validated;
+activation and transactional wiring NOT enabled. Authority: ADR GX-003 and SPEC-GX-CAP-1.
+Date: 2026-09-08.
 
 ## Storage and ordering decision
 
@@ -9,9 +10,9 @@ The logical catalog must outlive WAL recycling. It cannot be a scan of the retai
 WAL or an in-memory list rewritten on every commit. The selected layout has a
 paged append-only record stream and an ordinal directory of fixed-width entries
 for binary-search lookup by CommitId. Variable-sized records may span pages; an
-empty metadata commit must not reserve the maximum 64 KiB payload. Directory/page
-headers and their exact encoding remain to be specified before enabling the store.
-No file or format capability is registered by this record-codec checkpoint.
+empty metadata commit must not reserve the maximum 64 KiB payload. The private page
+layout below is implemented in `engine/commit_catalog_store.py`. No file target or
+format capability is registered until the complete replay/activation integration.
 
 CommitId.sequence maps to the final writing COMMIT LSN, including segment-roll
 retargeting, not the speculative LSN before WAL planning. The existing forward-
@@ -77,7 +78,7 @@ required capability/fence before incompatible journal effects. The WAL must also
 carry required grammar discrimination so an already-open older writer/recovery
 cannot interpret new file targets as repairable corruption. Do not register a new
 record type as known until replay can apply or explicitly refuse it safely.
-Exact bit/record assignments and page encodings are pending the integration slice.
+Exact capability bit/required WAL record assignments remain pending the integration slice.
 
 After activation, the existing commit protocol must incorporate the full record,
 directory and tail/head effects as ordinary full-page WAL images. No independently
@@ -138,3 +139,89 @@ Strict mypy passes all three provenance domain modules; Ruff and diff-check pass
 No WAL/page/capability registration, migration, public API, live Pulse operation or
 extra spec consolidation was performed. This is not a full transactional regression
 or the integrated crash matrix above; the latter remains a prerequisite to activation.
+
+## Paged image planner and reader — CAP-1B storage checkpoint
+
+Implementation: `engine/commit_catalog_store.py`. This is **not a separate durable
+writer**: a callable supplies complete page bytes from a caller-proved stable view;
+planning returns detached immutable full-page images and performs no allocation,
+write, barrier, lease acquisition or acknowledgement. Reopening through the real
+StorageDevice port is tested using test-only materialization, not offered as an
+alternative production publication protocol.
+
+### Files and exact page encoding
+
+Selected internal names are `commits.dir` and `commits.dat`; both remain refused by
+the current redo-target allowlist. They are not interchangeable with `catalog.dat`.
+All pages use the existing checksummed slotted layout, exactly two live slots, even
+sequence, zero flags/reserved and NO_PAGE next link. There is no new PageType enum.
+
+Page zero is META. Slot zero is the exact standard FileHeader v1, kind CATALOG,
+configured page size, NO_PAGE root and zero chained-payload length. Slot one is a
+68-byte little-endian header, struct `<8sHH16sQQQQq>`:
+
+| Offset | Field |
+|---|---|
+| 0 | 8-byte magic `GXCMHEAD` |
+| 8 | u16 version = 1 |
+| 10 | u16 role: 1 directory, 2 stream |
+| 12 | database UUID, 16 bytes |
+| 28 | u64 activation COMMIT sequence; positive and non-provisional |
+| 36 | u64 entry_count |
+| 44 | u64 stream_bytes |
+| 52 | u64 last_sequence |
+| 60 | i64 last_ordered_micros |
+
+The directory header describes current coverage. Its empty state has count/bytes
+zero, last_sequence equal to activation, ordered time zero. The stream header is
+immutable and always has these empty counters: its job is qualified file identity
+and matching activation horizon, not a second independently published head.
+
+Pages 1 onward are CATALOG. Slot zero is the 36-byte descriptor
+`<8sHH16sQ>`: `GXCMBLK\0`, version 1, role, UUID, logical base. Slot one is the
+payload. For page size P, stream capacity C=P−76 bytes; directory capacity
+D=floor(C/32) entries. Stream page index is 1+floor(byte_offset/C), and its base is
+(index−1)×C. Directory index is 1+floor(ordinal/D), base (index−1)×D. Ordinals are
+zero-based and are not CommitIds. Every non-tail block is full; tail length is
+determined exactly by the directory head. No linked chains or arbitrary traversal
+offsets are trusted from a fragment.
+
+Each directory entry is 32 bytes, `<QQIIq>`: sequence u64, stream offset u64,
+record length u32, zero reserved u32, ordered timestamp i64. Entries are contiguous
+in stream bytes, strictly increasing in sequence and ordered time. Record length
+is 60..65,596; first offset is zero and the final entry matches all head counters.
+Records retain their own envelope CRC and qualified identity/time checks after
+fragments are joined. Page checksums alone do not validate the nested record.
+
+Append rewrites only the stream tail/new fragments, the directory tail/new block,
+and directory head. No 64 KiB reservation for absent metadata; no historical list
+copy. At 512-byte pages, the maximum record needs at most 152 stream images plus
+one directory image and one head image (the extra stream image covers a used tail).
+Address exhaustion while appending is a transaction budget error, not corruption;
+an already-persisted impossible extent is corruption. Plans carry neutral page
+stamps: existing private staging/WAL must assign final page LSN and sequence stamps.
+
+### Read and verification scope
+
+Exact lookup binary-searches fixed ordinals and filters the qualified identity by
+read_lsn. It checks each visited directory page, search ordering bounds, referenced
+fragments and envelope. It does not certify all unvisited history: full `verify`
+streams every advertised entry, checks cross-page adjacency and decodes every
+record using bounded memory. It does not yet inspect unreferenced physical pages,
+prove WAL correspondence or check the head against authoritative control state.
+Those are mandatory engine-integration checks, not optional trust in this parser.
+
+The surrounding engine must establish and revalidate physical authority around
+reads. Lookup's None means no entry in the tracked interval/snapshot, not proof of
+nonexistence before activation. The public result must disclose that legacy horizon.
+Append-only prefixes allow old read_lsn filtering using a current stable physical
+view; a reader must never combine an old captured head with concurrently changing
+tail images without the existing drift/proof protocol. No view certificate/cache,
+retry policy or concurrency-mode change is introduced here.
+
+Initialization is an image plan only. Activation must prove unused/appropriately
+recovered file targets before staging it; it must never blindly overwrite existing
+files. Reapplication of a complete image set is byte-idempotent, but this is not
+yet a claim of transactional/crash recovery. Future wiring must incorporate these
+images in private staging, both OCC passes, WAL segment-roll retargeting, full-image
+redo, control publication, required-grammar refusal, backup/restore and verify.

@@ -1,7 +1,8 @@
 # SPEC-GX-CAP-1 — Commit identity and provenance
 
 Status: CAP-1A domain admission implemented and validated; persistent/public capability not certified.
-CAP-1B record codec is also implemented; paged store/publication/recovery wiring is pending.
+CAP-1B record codec and private paged image planner/reader are implemented;
+activation/publication/recovery wiring is pending.
 Date: 2026-09-08. Branch: feature/gx-cap-1, based on c310675.
 Dependencies: M1 typed API; GX-CAP-0.
 
@@ -194,3 +195,52 @@ pass. This extends CAP-1A's admission contract; it is not a rerun or replacement
 that checkpoint's 985-test transaction group. Paged directory/record storage,
 required-capability/WAL discrimination, commit/recovery integration, lookup/verify,
 metrics and transfer are still required. No public export, live mutation or deploy.
+
+### CAP-1B paged image planning/read checkpoint — 2026-09-08
+
+Implemented `engine/commit_catalog_store.py`: arithmetic-addressed directory and
+variable-length record stream; bounded append image plans; exact snapshot-filtered
+binary lookup; full advertised-history verifier with bounded memory. The exact
+headers/slots/bounds are in [COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md).
+Initialization/append are private image plans, not writes or independent durable
+acknowledgements. Existing WAL target/capability allowlists are deliberately unchanged.
+
+The tests were added first and failed import before implementation. The specific
+suite is **59 passed in 6.48 s**. It checks four supported page sizes, absent and
+maximum metadata, cross-page records, zero mutation while planning, detached input,
+prefix preservation, qualified snapshots, real-device close/reopen, repeated image
+application, missing images at every position of a large append, and CRC-valid
+header/directory/fragment corruption. Unknown page versions refuse as schema mismatch.
+Address exhaustion in a healthy append is a budget error; impossible persisted
+coverage remains corruption. An erased mandatory slot is also corruption, unlike
+an ordinary freed slot in the general-purpose slotted-page API.
+
+Operation evidence: in the 1,000-commit/512-byte fixture, each small append produces
+at most 4 full-page images and at most 8 page reads. Exact seek uses at most
+ceil(log2(1000))+8 reads. These are executable operation-count bounds, not throughput
+or live Pulse speedup claims. Maximum record size is 65,596 bytes; no maximum-size
+allocation is charged to an absent-metadata record.
+
+Final grouped command:
+
+```text
+python -m pytest tests/txn/test_commit_catalog_store.py
+  tests/txn/test_commit_catalog_record.py tests/txn/test_commit_provenance_values.py
+  tests/storage_core/test_page_layout.py tests/storage_core/test_slotted_page.py
+  tests/storage_core/test_page_codec.py tests/index/test_ordered_format_discrimination.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**606 passed in 14.79 s**; strict mypy passes the new store and its tests; Ruff and
+diff-check pass. The first broader group found an existing stale enum expectation:
+ordered pages 9/10/11 were introduced by `f3a24ee6fcfc987bdf91d39d96ac4c8e1605b2bc`,
+but the general page-layout test/contract table still stopped at 8. Both now name
+the actual exact values; no new page type or weakened parser was introduced.
+
+Full GX-CAP-1 remains incomplete. Next work is transaction/private staging, final
+COMMIT-LSN retargeting, required-format discrimination, replay/control publication
+and physically proved lookup. The integrated crash/multiprocess matrix, old-reader
+refusal, restore/import identities, metrics and public facade remain required.
+The page planner's replay test is byte-idempotence, **not** that integrated gate.
+Pulse was not restarted/upgraded; the 20 reserved pending specs were not consumed.
