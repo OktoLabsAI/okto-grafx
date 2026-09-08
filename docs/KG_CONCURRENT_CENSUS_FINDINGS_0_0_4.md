@@ -69,6 +69,44 @@ No graph reset, recovery job, redrive or spec consolidation was initiated.
 Cognitive ledger hash remained
 `4AFF1AB6EE6C6E621C6598148154A04298500B8DA92EBF0F5E90AD081B2217F4`.
 
+## Aligned cold-load attribution and audited latest source heads
+
+On 2026-09-07, one instrumented restart (PID 1792) aligned ORM statement timing,
+read phases and a 35-second GIL-only stack capture with the first KG opening.
+The full cognitive revision ORM read took 2.374 s elapsed / 1.156 s thread CPU;
+977 stack samples had zero errors. Within the source-audit Health worker,
+JSON-encoding leaves included 93 canonical latest-selector validations and 64
+historical DTO constructions. This identifies redundant work across two layers
+without equating sampled stacks with CPU percentages or all graph latency.
+
+Graph node/edge phases ended at approximately 13.157/22.096 s after trace start;
+stats completed at 22.168 s. Independent native admission was also material.
+Pool-admission timing alone did not distinguish board/global or reader/writer
+participants and is not used to blame a particular lane.
+
+Core `64ff2b2` and Community `a0b3c9f` add an optional backend-neutral audited-head
+read. It validates all historical raw mappings with the unchanged canonical
+selector, constructs only selected DTOs, and preserves final consumer checks.
+No history is omitted, no stored digest trusted, no cache/authority shortcut,
+no Grafx-specific Core code. Full enumeration remains available. This removes
+N-H duplicate canonical serializations, 5134 with the current 5424/290 ledger.
+Read-only four-arm comparison preserved every final digest; full digest cost
+was 11.876/9.695 s for full history and 7.561/7.255 s for audited heads. OS cache
+and concurrent work are uncontrolled, so no global/UI speedup is claimed.
+
+107 Core tests passed; Community adapter suite had 42 passes plus one erroneous
+test edit, subsequently corrected with five affected tests passing in 11.78 s.
+These overlapping slices verify digest parity, complete historical corruption
+refusal, mutable DTO boundaries, legacy fallback and exact work counts. Details:
+Community `docs/KG_HEALTH_COGNITIVE_ENUMERATION_COST.md` and Core
+`docs/KG_AUDITED_LATEST_COGNITIVE_READER.md`.
+
+The host rebooted at 21:19:53 local time during the final focused-test interval.
+The process/listener absence was verified before starting a replacement; the
+cause is unknown. The diagnostic wrappers are not part of production code.
+The 21 reserved pending specs remain untouched. Full first-load latency remains
+an open CONC-CPU-1 concern, not a new moving acceptance gate.
+
 ## Attribution follow-up after suffix-verification deployment
 
 The browser's retained resource timing supplied the missing concurrent stats

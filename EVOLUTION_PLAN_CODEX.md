@@ -4902,3 +4902,33 @@ Nenhuma validação foi removida, nenhum knob de concorrência alterado, nenhum
 restart/replay ou consolidação adicional disparado. Continua o alvo existente
 CONC-CPU-1, sem novo critério de aceitação. Evidências e limites em
 `docs/KG_CONCURRENT_CENSUS_FINDINGS_0_0_4.md`.
+
+### Auditoria cognitiva sem DTOs históricos redundantes — 2026-09-07
+
+Uma captura alinhada à primeira abertura do KG confirmou duas passagens de hash
+no histórico cognitivo durante os probes de Health. Implementada capacidade
+opcional neutra no Core (`LatestVerifiedCognitiveSourceReader`) e suporte no
+adapter SQLAlchemy Community: auditar todas as revisões com o validador canônico
+existente, construir DTOs apenas dos heads e manter a revalidação no consumidor.
+`enumerate` completo continua disponível; falha no caminho otimizado não provoca
+fallback que esconda corrupção. Sem cache de autoridade/hash, MAX-only, alteração
+de WAL/OCC ou consumo das specs reservadas. Continua O(histórico), não O(heads).
+
+Paridade somente leitura: 5.424 registros auditados, 290 finais, mesmo digest nos
+quatro braços. Removidas 5.134 construções/hashes redundantes adicionais. Tempo
+incluindo digest: 11,876/9,695 s no caminho completo e 7,561/7,255 s no novo caminho;
+cache e concorrência não controlados, sem afirmar ganho end-to-end. Core: 107
+testes passaram. Detalhes e validação adversarial no Community
+`docs/KG_HEALTH_COGNITIVE_ENUMERATION_COST.md` e contrato no Core
+`docs/KG_AUDITED_LATEST_COGNITIVE_READER.md`. CONC-CPU-1 continua aberto para
+latência da carga completa; nenhuma nova barra de performance foi criada.
+
+Checkpoint carregado após reinício do host: Pulse 0.3.3 PID 31060, Community
+`a0b3c9f` + Core `64ff2b2`, Grafx por fonte 0.0.4. Processos/portas anteriores
+ausentes antes do startup. UI exibiu 500 / 2.779 nós, sem loading; tempos retidos
+no browser: grafo 6,666 s e stats 6,754 s na primeira abertura pós-restart, sem
+alegar A/B controlado. Stats autenticado HTTP 200 em 3,042 s. Cinco testes
+Community corrigidos passaram em 11,78 s; conjunto anterior 42 passes e um erro
+no teste corrigido, com sobreposição. API cognitiva: 21 pendentes / 0 em progresso
+/ 19 consolidados / 0 falhos; ledger SHA256 preservado. Sem wheel global/PyPI,
+consolidação, redrive, rebuild ou reset. Documentação detalha os limites.
