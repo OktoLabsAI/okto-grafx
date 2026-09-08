@@ -9,6 +9,7 @@ incluindo 3.000 entradas modificadas; tipagem estrita/Ruff verdes. O contrato
 `docs/architecture/COMMIT_CATALOG_V1.md` define encoding e gates de crash, mas o
 storage paginado, ativação e integração commit/recovery continuam pendentes.
 Nenhum formato foi ativado no Pulse; nenhuma spec adicional foi consolidada.
+Checkpoint imutável: `817fc8a9020fab12f9483ab7dec6d1411d66afcd`.
 
 **GX-CAP-1 / 2026-09-08:** primeiro slice de domínio implementado em
 `feature/gx-cap-1`: CommitId qualificado, admissão limitada/imutável de metadados

@@ -112,6 +112,8 @@ the present record-codec implementation.
 
 ## Record-codec checkpoint — 2026-09-08
 
+Immutable checkpoint: `817fc8a9020fab12f9483ab7dec6d1411d66afcd`.
+
 `domain/txn/commit_catalog.py` now validates/encodes/decodes the envelope and
 optional directory identity expectations. `commit_metadata.py` supplies the bounded
 nested decoder, returns detached immutable values and checks canonical re-encoding.

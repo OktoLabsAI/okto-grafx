@@ -171,6 +171,8 @@ The full GX-CAP-1 remains **in progress**, not complete.
 
 ### CAP-1B record codec checkpoint — 2026-09-08
 
+Immutable implementation checkpoint: `817fc8a9020fab12f9483ab7dec6d1411d66afcd`.
+
 Implemented typed CommitCatalogEntry/CommitKind, checksummed record encoding,
 bounded nested metadata decoding, expected store/sequence validation and explicit
 unknown-format refusal. The format contract and required crash matrix are in

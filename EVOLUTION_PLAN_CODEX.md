@@ -15,6 +15,7 @@
 ## Resumo vigente — 2026-09-08
 
 GX-CAP-1 avançou para o codec do catálogo de commits: envelope com CRC-32C,
+checkpoint `817fc8a9020fab12f9483ab7dec6d1411d66afcd`,
 identidade/tempo/tipo de commit, decodificação limitada dos metadados e recusa
 de versões desconhecidas. 379 testes passaram em 7,82 s, incluindo 3.000 entradas
 mutadas e o limite exato de tamanho; mypy estrito/Ruff verdes. Contrato de formato
@@ -3783,7 +3784,7 @@ começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidên
 
 | Marco | Estado | Evidência integrada | Validação registrada |
 |---|---|---|---|
-| GX-CAP-1 / CAP-1B — codec de registro | implementado/validado; storage e publicação ainda pendentes | branch `feature/gx-cap-1`; `commit_catalog.py` e decoder em `commit_metadata.py`; contrato `COMMIT_CATALOG_V1.md` | 379 testes em 7,82 s; 3.000 mutações, CRC válido com conteúdo semanticamente inválido, limites exatos, identidade estrangeira e formatos desconhecidos; mypy estrito/Ruff verdes. Sem novo WAL/page type, capability ativa, API pública, operação no Pulse ou promessa de recuperação ainda não implementada |
+| GX-CAP-1 / CAP-1B — codec de registro | implementado/validado; storage e publicação ainda pendentes | branch `feature/gx-cap-1`, checkpoint `817fc8a9020fab12f9483ab7dec6d1411d66afcd`; `commit_catalog.py` e decoder em `commit_metadata.py`; contrato `COMMIT_CATALOG_V1.md` | 379 testes em 7,82 s; 3.000 mutações, CRC válido com conteúdo semanticamente inválido, limites exatos, identidade estrangeira e formatos desconhecidos; mypy estrito/Ruff verdes. Sem novo WAL/page type, capability ativa, API pública, operação no Pulse ou promessa de recuperação ainda não implementada |
 | GX-CAP-1 / CAP-1A — admissão de proveniência | primeiro slice implementado; marco completo em andamento | branch `feature/gx-cap-1`, checkpoint `474335962eeae20a937d6a444bcc3f7b2c2f110f`, base `c310675`; domínio `commit_identity.py`/`commit_metadata.py`; `docs/specs/SPEC-GX-CAP-1.md` | 87 testes específicos, incluídos nos 985 testes transacionais/API/imports em 114,31 s; mypy estrito e Ruff verdes. Valores internos, sem export público, WAL/formato/persistência ou alterações no Pulse. Catálogo durável, recovery, consulta, métricas e logical transfer permanecem requisitos do marco |
 | GX-CAP-0 — contratos database-first e isolamento de wheels | dez entregas implementadas e validadas localmente; não é release das próximas capabilities | branch `feature/gx-cap-0`, checkpoint `eb25eccbd42d16a1a3ddf06292f2d69b4eaaedc6`, base `61fc44d`; seis ADRs e `docs/specs/SPEC-GX-CAP-0.md` | 296 testes agrupados em 14,98 s, incluindo wheel real com cinco pacotes-sentinela, seletor legado discriminado, fronteiras de imports e recusa de capabilities; Ruff/diff limpos, 22 documentos com links verificados. Sem mudança de runtime/formato, novas specs consumidas ou alegação de ganho de performance; revisão Codex solo, não auditoria independente |
 | M-PULSE-0 | concluído | `main@5b7551b40dba2facb28c46770f166ab3ac9daecc` | suites query/API do marco: 1.398 passes e 1 skip; chunks globais: 3.841 + 1.205 + 2.021 passes, 10 skips; Ruff limpo; nove mutantes mortos; revisão cruzada sem blocker |
