@@ -229,6 +229,15 @@ Pulse Community lane, maintained in the Pulse repository rather than Grafx:
     the existing `max_rows` frontier never reaches, changing error/admission behavior. Keep the
     current exact result order, parallel-edge multiplicity, visibility filters and null hop2
     extension as the oracle for this already selected residual, not as a new feature target.
+    **Bounded output follow-up (2026-09-07):** Community now retains only the
+    remaining result prefix when assembling second-hop tuples/answer rows. Full
+    adjacency reads and every visibility check still run, including late failures;
+    the center/layout frontier does not expand or shrink. A 10,000-neighbour,
+    50-result synthetic comparison preserved output and reduced temporary callback
+    peak allocations from about 1.9 MB to 13 KB, excluding the preallocated input.
+    Twenty-five focused/real-Grafx tests passed. This bounds the discarded output
+    tail, not total adjacency memory or native fan-out. Details/deploy boundary:
+    Community `docs/GRAFX_RELATED_CONTEXT_FILTERS.md`.
 
 ### Wave 2 — medium changes after Wave 1 re-profile
 

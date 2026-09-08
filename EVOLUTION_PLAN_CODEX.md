@@ -4932,3 +4932,21 @@ Community corrigidos passaram em 11,78 s; conjunto anterior 42 passes e um erro
 no teste corrigido, com sobreposição. API cognitiva: 21 pendentes / 0 em progresso
 / 19 consolidados / 0 falhos; ledger SHA256 preservado. Sem wheel global/PyPI,
 consolidação, redrive, rebuild ou reset. Documentação detalha os limites.
+
+### Two-hop: limitar montagem de saídas descartadas — 2026-09-07
+
+O residual já selecionado do item 11 revelou montagem desnecessária de todas as
+saídas do segundo salto antes de aplicar `max_rows`. O adapter Community passa
+a reter somente o prefixo que cabe no resultado, sem interromper leitura/decoding
+da adjacência ou a avaliação de visibilidade dos demais vizinhos. Erro tardio
+continua recusando; ordem, multiplicidade, extensão nula e fronteira de consultas
+permanecem iguais. Nenhuma mudança no Core ou protocolo nativo.
+
+25 testes focais/Grafx real passaram em 25,56 s. Comparação sintética de 10 mil
+vizinhos e limite 50: pico de alocação da montagem ~1,9 MB → ~13 KB, mesmos
+resultados; inventário de entrada excluído da medição. Não é memória total nem
+ganho end-to-end; consultas por layout e cache completo ainda dependem do grau.
+Fonte preparada para deploy acumulado: PID 31060 ainda não carrega esta alteração.
+As 21 specs seguem preservadas. Evidência e limites em Community
+`docs/GRAFX_RELATED_CONTEXT_FILTERS.md` e no plano finito
+`docs/PERFORMANCE_ROUND_0_0_4.md`.
