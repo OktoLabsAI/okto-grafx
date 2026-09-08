@@ -2,6 +2,14 @@
 
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
+
+**Execução 2026-09-08:** GX-CAP-0 ganhou seis ADRs, estratégia de manifest,
+especificações por milestone e enforcement de fronteiras de source/wheel em
+`feature/gx-cap-0` (base `61fc44d`). Registro de testes e limite do checkpoint:
+[`docs/specs/SPEC-GX-CAP-0.md`](docs/specs/SPEC-GX-CAP-0.md).
+As demais capacidades continuam não certificadas; os contratos não as anunciam
+como disponíveis. O plano agent-first continua obrigatório por decisão do plano
+principal, independentemente da declaração histórica de substituição abaixo.
 **Documento-base obrigatório:** `EVOLUTION_PLAN_CODEX.md`
 **Natureza:** roadmap complementar; não substitui, não reabre e não duplica o plano técnico existente
 **Objetivo de consumo:** orientar o desenvolvimento pelo Codex com escopo, contratos, dependências, milestones, gates e decisões explícitas

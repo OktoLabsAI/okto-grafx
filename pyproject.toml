@@ -90,7 +90,9 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["okto_grafx*"]
+# Optional product wheels (okto_grafx_agent, workspace, MCP, etc.) are siblings,
+# never part of this distribution even if their sources share a staging root.
+include = ["okto_grafx", "okto_grafx.*"]
 
 [tool.setuptools.package-data]
 okto_grafx = ["py.typed"]
