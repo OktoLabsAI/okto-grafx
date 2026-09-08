@@ -11,6 +11,7 @@ de 606 testes em 14,79 s. O contrato de páginas e os limites de evidência est�
 [`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md). Ainda **não** é uma capability ativa:
 staging transacional/WAL, recovery, autoridade física, API e demais gates continuam
 obrigatórios. Nenhuma instalação ou consolidação adicional no Pulse.
+Checkpoint imutável: `d5c3ed1aaab9edf1ebd99752fc7cf3d4b6125043`.
 
 **GX-CAP-1B / 2026-09-08:** codec do registro persistente e decoder dos metadados
 implementados/validados na mesma branch `feature/gx-cap-1`: 379 testes verdes,

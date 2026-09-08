@@ -142,6 +142,8 @@ or the integrated crash matrix above; the latter remains a prerequisite to activ
 
 ## Paged image planner and reader — CAP-1B storage checkpoint
 
+Immutable implementation checkpoint: `d5c3ed1aaab9edf1ebd99752fc7cf3d4b6125043`.
+
 Implementation: `engine/commit_catalog_store.py`. This is **not a separate durable
 writer**: a callable supplies complete page bytes from a caller-proved stable view;
 planning returns detached immutable full-page images and performs no allocation,

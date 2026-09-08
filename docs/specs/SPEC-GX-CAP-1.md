@@ -198,6 +198,8 @@ metrics and transfer are still required. No public export, live mutation or depl
 
 ### CAP-1B paged image planning/read checkpoint — 2026-09-08
 
+Immutable implementation checkpoint: `d5c3ed1aaab9edf1ebd99752fc7cf3d4b6125043`.
+
 Implemented `engine/commit_catalog_store.py`: arithmetic-addressed directory and
 variable-length record stream; bounded append image plans; exact snapshot-filtered
 binary lookup; full advertised-history verifier with bounded memory. The exact
