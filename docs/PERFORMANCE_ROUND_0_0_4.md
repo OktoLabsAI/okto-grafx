@@ -718,3 +718,17 @@ observation, not end-to-end write acceleration or a new timing gate. Tests prove
 linear healthy-history visits and identical corruption findings. Details, safety,
 test counts and deployment status: `VERIFICATION_VERSION_SUFFIXES_0_0_4.md`.
 No live consolidation or backlog processing was used; the 21 reserved specs remain.
+
+### Installed single-spec checkpoint — September 7 local / September 8 UTC
+
+Following explicit authorization, installed Grafx `0.0.4@2db169d` into Pulse 0.3.3
+and restarted PID 2124 with Core `e1e9d08` and Community `a5a5c3c` code. Exactly one
+Done spec was cognitively consolidated: 5 Alternative nodes, 5 judgement edges
+and 5 automatic provenance edges. The complete commit call took 22.981 s;
+Global delivery took 131.489 s from event creation to ACK, zero retries/errors.
+Canonical node/pair readback, natural retrieval and relational audit agree.
+The ledger now has 20 pending and 20 consolidated; remaining pending items are
+unchanged. Full write/delivery remains the material performance front, not closed
+by private subsecond transaction samples. Evidence and limitations:
+`PULSE_SINGLE_SPEC_INSTALLED_0_0_4.md`. No further spec consumption is authorized
+by this checkpoint itself; historical unrelated debt remains recorded.

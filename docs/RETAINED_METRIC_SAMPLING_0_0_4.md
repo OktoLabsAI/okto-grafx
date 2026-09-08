@@ -93,5 +93,8 @@ recovery_manager. They require a separate architecture correction/reconciliation
 without undoing concurrency or silently broadening the purity gate.
 
 The operator subsequently authorized deploying the latest Grafx and measuring
-one real spec consolidation. Installation/runtime evidence follows separately;
-this document does not yet claim that live run completed.
+one real spec consolidation. That run completed with installed Grafx `2db169d`:
+5 nodes/10 edges, full Pulse commit 22.981 s and downstream delivery 131.489 s,
+without retry. Twenty specs remain reserved. This is not an attributable live
+speedup from telemetry sampling. Installation, receipts, verification and timing
+boundaries: `PULSE_SINGLE_SPEC_INSTALLED_0_0_4.md`.

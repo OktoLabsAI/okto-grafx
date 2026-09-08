@@ -21,12 +21,12 @@ Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |
-| Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a5a5c3c`; carregados no Pulse PID 23228, 500/2779 nós pela UI e ledger cognitivo preservado. |
+| Saúde cognitiva: histórico integral com DTOs só dos heads | Core `64ff2b2`, Community `a5a5c3c`; deploy preservado no atual Pulse PID 2124. O checkpoint anterior validou 500/2779 nós pela UI. |
 | Two-hop: montagem limitada ao resultado | Community `7559ba7`, 25 testes; deploy acumulado concluído. Consultas por layout continuam residuais, não foram declaradas eliminadas. |
 | Identidade/proveniência por source ref | Bootstrap e certificação estrita integrados em Community `a5a5c3c`; 11 índices ativos. No board, Entity: 953 scans → 1 candidato; Decision: 203 → 1, resultados idênticos. |
-| Preparação local de proveniência | Core elimina varreduras repetidas da lista de arestas por candidato, mantendo fallback correto para colisão de ID; 24 testes passaram. Aguarda deploy acumulado, sem consolidação ao vivo. |
-| Latência completa fria / custo completo de escrita | Não encerrados por medições isoladas. O acesso por source ref está entregue; o custo integral de escrita e manutenção dos índices ainda requer benchmark reservado, sem consumir specs nesta etapa. |
-| Corpus reservado | 21 specs pendentes, zero em progresso; não consolidar, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
+| Preparação local de proveniência | Core `e1e9d08` elimina varreduras repetidas, mantendo fallback para colisão de ID; 24 testes passaram. Carregado no PID 2124 e exercitado pela consolidação autorizada de uma spec. |
+| Latência completa fria / custo completo de escrita | Uma spec real: commit MCP 22,981 s, 5 nós/10 arestas; entrega Global 131,489 s, sem retry/erro. Priorizar atribuição desse custo completo; ganhos nativos isolados não encerram a frente. |
+| Corpus reservado | 20 specs pendentes, 20 consolidadas, zero em progresso; apenas uma consumida nesta autorização. Demais pendentes idênticas. Não consolidar outras, redrive/rebuild/reset ou repetir os sete reparos concluídos. |
 | Planos complementares / agent-first | Continuam no escopo global referenciado neste documento; não confundir o fechamento de uma fatia 0.0.4 com a entrega desses planos. |
 
 Checkpoint finito concluído: certificação fechada de auxiliares conhecidos e
@@ -34,9 +34,9 @@ gerações físicas → bootstrap idempotente → regressão proporcional → de
 acumulado. Cópia quiescente preservada antes do DDL; verificação nativa integral
 limpa (14.850 páginas, 8.739 registros, zero achados). A UI retornou grafo e totais
 com HTTP 200 e zero tabelas de arestas com falha. Os índices acrescentam
-5.873.664 bytes; não foi elevado o orçamento de buffer. Nenhuma consolidação,
-redrive/rebuild/reset ou repetição dos sete reparos foi iniciada. O runtime usa
-fontes, não uma nova instalação global/publicação. Detalhes, testes, limites das
+5.873.664 bytes; não foi elevado o orçamento de buffer. Nesse checkpoint de índices,
+nenhuma consolidação, redrive/rebuild/reset ou repetição dos sete reparos foi iniciada.
+O deploy então usava fontes; a instalação posterior está registrada abaixo. Detalhes, testes, limites das
 medições e recuperação automática de admissão no Community:
 `docs/GRAFX_SOURCE_REFERENCE_INDEXES.md`. Permanecem as frentes já registradas de
 latência fria/custo integral de escrita e os planos globais, sem criar novos gates.
@@ -53,9 +53,15 @@ O custo quadrático da telemetria foi corrigido por amostragem amortizada; a
 consulta explícita de memória permanece atualizada. 223 testes focados passaram;
 a bateria adicional revelou 7 falhas estáticas de arquitetura já reproduzíveis no
 HEAD anterior (9 ocorrências em seis módulos), ainda pendentes e não dispensadas.
-Detalhes: `docs/RETAINED_METRIC_SAMPLING_0_0_4.md`. O usuário autorizou em seguida
-instalar o Grafx mais recente e consolidar somente **uma** spec para medir o caso
-real; se concluída, as demais **20** devem continuar reservadas.
+Detalhes: `docs/RETAINED_METRIC_SAMPLING_0_0_4.md`. A autorização posterior de
+instalar o Grafx mais recente e consolidar somente **uma** spec foi executada:
+Grafx **0.0.4@2db169d** instalado no Python 3.13 do usuário, com accel presente;
+Pulse 0.3.3 reiniciado no PID 2124, usando fontes Core/Community e o wheel Grafx.
+Sessão `kgses_43a75608efd34f80`: commit confirmado, leitura dos cinco nós e dez
+relações, busca natural e ACK Global `evt_07f41318afbf4fa7` sem retry. Ledger fechado
+com **20** pendentes preservadas. Saúde final de board/discovery retornou healthy,
+mas há snapshots diagnósticos stale e dívidas históricas não tratadas. Evidências,
+tempos reais e limitações: `docs/PULSE_SINGLE_SPEC_INSTALLED_0_0_4.md`.
 
 ## Histórico de execução — checkpoint iniciado em 2026-09-06
 
