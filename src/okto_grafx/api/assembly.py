@@ -383,6 +383,7 @@ def assemble_database(
             metrics,
             artifact_nonce=_new_control_file_nonce,
             projection_context=ContextLocalValue("okto_grafx_commit_index_projection"),
+            live_commit_context=ContextLocalValue("okto_grafx_live_commit_authority"),
         )
         vectors = VectorEngine(
             catalog=catalog,

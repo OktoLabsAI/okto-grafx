@@ -2,8 +2,9 @@
 
 2026-09-08, `feature/v0.0.4`. This addresses the nine findings already recorded
 in `RETAINED_METRIC_SAMPLING_0_0_4.md`; it is not a new performance acceptance gate.
-The complete architecture gate remains **failing**. Query, recovery and control-I/O
-checkpoints below reduce the original nine occurrences to three in two modules.
+The complete architecture gate remains **failing**. The checkpoints below reduce
+the original nine occurrences to two in schema.py; both index context channels
+now receive their mechanism from the outer composition.
 
 ## Corrected engine synchronization placement
 
@@ -230,3 +231,53 @@ plus the aggregate failing assertion. This is a verified implementation step tow
 separating the remaining mechanisms, not an all-green gate or new performance claim.
 No WAL/OCC/durability/reader-writer guarantee, persisted format or Pulse Core changed.
 Source-only; installed Pulse and the twenty reserved specs were not touched.
+
+## Physical live-commit context checkpoint — 2026-09-08
+
+Removed the remaining ContextVar import/global from IndexManager/IndexStore.
+API assembly now supplies two distinct ContextLocalValue instances per manager:
+one for commit selection and one for physical live-commit authority. IndexManager
+still mints the sealed manager/transaction authority only through its fenced private
+door, after the surrounding TransactionManager's WAL/fencing protocol. The payload
+is revoked before context reset and also after failed bind/entry. Context copies
+retain the same revoked payload, not a fresh grant.
+
+The unchanged native IndexStore commit is selected by an exact bound MethodType,
+bound receiver, and captured canonical function identity. That selection calls the
+private native body with the **context transport**, not a detached authority value.
+The store reads the current execution-context value and checks the active seal,
+the manager's exact transport identity, the exact transaction and selected store.
+Passing the transport into another thread therefore finds no scope and cannot
+enable a hot batch. No ordinary shared manager/store flag replaces context isolation.
+
+`IndexStore.commit(txn, csn)` keeps its original signature. Store overrides, including
+callables spoofing method metadata, are invoked once with their original two arguments
+and keep full scalar checks. Calling `super().commit` from such an override does not
+implicitly inherit the native hot-batch privilege. This is an explicit optimization
+fallback for customized commit implementations, not deletion of their functionality;
+their invocation and resulting entries are tested. OrderedIndex's distinct COW commit
+also remains on its existing method/signature. Existing physical-hook fallbacks and
+hot-bucket bounds are unchanged. Manager commit overrides still execute inside their
+injected lexical scope; nested and exceptional overrides restore/revoke it correctly.
+
+Manual low-level IndexManager compositions wanting the physical hot-batch optimization
+now supply `live_commit_context=ContextLocalValue(...)` in their outer composition.
+Omitting it preserves scalar application. The native test fixture explicitly injects
+it so the existing threshold, bucket-preflight-count, byte/effect-equivalence,
+failure-prefix/retry and staging-preservation tests continue exercising the accelerator,
+not a silently disabled path. Public composition injects it automatically; public
+commit tests observe actual native preparation and read all eight written rows back.
+
+Evidence: initial unchanged hot/projection slice **34 passed in 0.57 s**; additional
+transport/revocation/customization/public cases **43 passed in 0.52 s**; final grouped
+hot/context/detached/speculative/index-wiring/commit-protocol/identity/multiprocess/
+read-only/public-boundary/import gate **549 passed, 2 failed in 21.97 s**. The only
+failures are schema.py and the aggregate zero-budget assertion. Ruff/diff checks pass,
+strict markers and 60-second thread timeouts remain. No new timing-gain claim or
+changed performance threshold; the existing optimized structural checks remain.
+
+Remaining architecture debt is only schema.py's synchronized weak-lifetime tuple
+encoding proof registry (two occurrences: threading and weakref). The gate is not
+waived or complete. Public connect/Pulse configuration, persisted format, OCC/WAL,
+multi-reader/writer and durability policy are unchanged. Source-only; no Pulse
+restart/install, live consolidation, reset/rebuild/redrive or benchmark-spec consumption.

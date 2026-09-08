@@ -35,6 +35,7 @@ from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import HashIndex, IndexManager, ProximityIndex
+from okto_grafx.runtime.scoped_value import ContextLocalValue
 
 SMALL_PAGE_SIZE: int = 512
 """A small page keeps the fixtures fast and makes a bucket chain grow in a few inserts."""
@@ -457,7 +458,10 @@ class Database:
         )
         self.catalog.catalog.add_table(self.table)
         self.catalog.save()
-        self.manager = IndexManager(self.pool, self.heap, self.metrics)
+        self.manager = IndexManager(
+            self.pool, self.heap, self.metrics,
+            live_commit_context=ContextLocalValue("test-live-commit"),
+        )
         self.exact = HashIndex(exact_definition(self.table), self.pool, self.metrics)
         self.manager.register(self.exact)
         self.proximity = ProximityIndex(

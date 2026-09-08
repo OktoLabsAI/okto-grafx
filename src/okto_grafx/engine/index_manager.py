@@ -55,8 +55,8 @@ import hashlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from types import MethodType
 from typing import NamedTuple, TypeVar
 
 from okto_grafx.domain.ports.scoped_value import ScopedValue
@@ -205,11 +205,6 @@ _LIVE_COMMIT_HOT_BUCKET_MIN_EFFECTS: int = 2
 
 _LIVE_COMMIT_AUTHORITY_SEAL: object = object()
 """Module-private proof installed only by the transaction manager's fenced commit door."""
-
-_LIVE_COMMIT_AUTHORITY: ContextVar[object | None] = ContextVar(
-    "okto_grafx_live_commit_authority", default=None
-)
-"""Call-local authority whose mutable scope is revoked before its context is reset."""
 
 _COMMIT_INDEX_PROJECTION_SEAL: object = object()
 """Module-private proof for one post-rebase index selection inside COMMIT_SECTION."""
@@ -1817,7 +1812,27 @@ class IndexStore:
         return 0 if staged is None else len(staged.changes)
 
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
+        """Apply staged changes with full scalar validation and the original port signature.
+
+        The native manager's closed fast path supplies its execution-local
+        transport through a separate private door. A custom commit override
+        calling super() continues to use this ordinary two-argument contract.
+        """
+        return self._commit_with_context(txn, csn)
+
+    def _commit_with_context(
+        self,
+        txn: StagingTransaction,
+        csn: Csn,
+        *,
+        _live_context: ScopedValue | None = None,
+    ) -> int:
         """Apply everything this transaction staged, at the log position the commit received.
+
+        Ordinary callers pass only txn/csn and retain scalar validation. The
+        native manager may additionally pass its private execution-local transport;
+        the current thread/task must still hold an active sealed scope for this
+        exact store/transaction. Passing a captured scope value is insufficient.
 
         The stamps inside the entries are the ones the caller declared when it staged them, and
         this method does not rewrite them. That is deliberate and it is what keeps the live path
@@ -1872,11 +1887,12 @@ class IndexStore:
                 value=len(resets),
             )
         reset = resets[0] if resets else None
-        authority = _LIVE_COMMIT_AUTHORITY.get()
+        authority = None if _live_context is None else _live_context.get()
         live_hot = bool(
             isinstance(authority, _LiveCommitAuthority)
             and authority.active
             and authority.seal is _LIVE_COMMIT_AUTHORITY_SEAL
+            and authority.manager._live_commit_context is _live_context
             and authority.txn is txn
             and authority.store is self
         )
@@ -4052,6 +4068,12 @@ _CANONICAL_LIVE_HOT_HOOKS = tuple(
     getattr(IndexStore, name) for name in _LIVE_HOT_HOOK_NAMES
 )
 
+_CANONICAL_INDEX_STORE_COMMIT = IndexStore.commit
+"""Only the unchanged native commit accepts an injected execution-context transport."""
+
+_CANONICAL_INDEX_CONTEXT_COMMIT = IndexStore._commit_with_context
+"""The private native body; the ordinary commit port keeps its two-argument signature."""
+
 
 _TableIdentity = tuple[int, str]
 
@@ -4258,6 +4280,7 @@ class IndexManager:
         "_registry_revision",
         "_definition_match",
         "_projection_context",
+        "_live_commit_context",
     )
 
     def __init__(
@@ -4268,26 +4291,33 @@ class IndexManager:
         *,
         artifact_nonce: Callable[[], int] | None = None,
         projection_context: ScopedValue | None = None,
+        live_commit_context: ScopedValue | None = None,
     ) -> None:
         """Build the registry over the pool and heap of one database.
 
-        Public assembly supplies a context-local projection transport. Omitting
-        it in a manual composition retains fresh canonical index selection;
-        this class never replaces it with unsynchronized manager-local state.
+        Public assembly supplies separate context-local projection and live-commit
+        transports. Omitting them in a manual composition retains fresh canonical
+        selection and scalar physical application. Neither is replaced by
+        unsynchronized manager-local state.
         """
         self._pool: BufferPool = pool
         self._heap: HeapStore = heap
         self._metrics: MetricsSink = metrics
-        if projection_context is not None and any(
-            not callable(getattr(projection_context, name, None))
-            for name in ("get", "bind")
+        for field_name, transport in (
+            ("projection_context", projection_context),
+            ("live_commit_context", live_commit_context),
         ):
-            raise GrafxConfigurationError(
-                "A commit projection context must supply get and bind operations.",
-                field="projection_context",
-                value=type(projection_context).__name__,
-            )
+            if transport is not None and any(
+                not callable(getattr(transport, name, None))
+                for name in ("get", "bind")
+            ):
+                raise GrafxConfigurationError(
+                    "A commit context must supply get and bind operations.",
+                    field=field_name,
+                    value=type(transport).__name__,
+                )
         self._projection_context = projection_context
+        self._live_commit_context = live_commit_context
         self._indexes: dict[str, IndexStore] = {}
         self._index_keys_by_table: dict[tuple[int, str], set[str]] = {}
         self._published_lsn: Lsn = NO_LSN
@@ -6570,23 +6600,29 @@ class IndexManager:
 
         The surrounding transaction manager already holds its participant section, writer lease
         and cross-process ``COMMIT_SECTION``. A context-local seal carries only that authority
-        through ordinary/custom ``commit`` overrides; it cannot leak to a direct low-level call
+        through ordinary/custom manager ``commit`` overrides; it cannot leak to a direct low-level call
         in another thread or survive success/failure.
         """
+        if self._live_commit_context is None:
+            return self.commit(txn, csn)
         authority = _LiveCommitAuthority(
             seal=_LIVE_COMMIT_AUTHORITY_SEAL,
             manager=self,
             txn=txn,
         )
-        token = _LIVE_COMMIT_AUTHORITY.set(authority)
         try:
-            return self.commit(txn, csn)
+            with self._live_commit_context.bind(authority):
+                try:
+                    return self.commit(txn, csn)
+                finally:
+                    # Revoke before the host restores its token. Context copies
+                    # retain this object, not a still-valid independent permit.
+                    authority.active = False
+                    authority.store = None
         finally:
-            # Context copies retain this same scope object. Revoke it before resetting the
-            # current context so no delayed task can inherit a still-valid capability.
+            # A failed bind/entry can also retain the object: fail closed there.
             authority.active = False
             authority.store = None
-            _LIVE_COMMIT_AUTHORITY.reset(token)
 
     def commit(self, txn: StagingTransaction, csn: Csn) -> int:
         """Apply, on every index, what this transaction staged, and return how many changes moved.
@@ -6611,7 +6647,9 @@ class IndexManager:
         staged_tables = {
             index.definition.table_id for index in indexes if observations[index]
         }
-        authority = _LIVE_COMMIT_AUTHORITY.get()
+        authority = (
+            None if self._live_commit_context is None else self._live_commit_context.get()
+        )
         authorised_scope = (
             authority
             if (
@@ -6628,7 +6666,22 @@ class IndexManager:
             if authorised_scope is not None:
                 authorised_scope.store = index
             try:
-                moved = index.commit(txn, csn)
+                commit = index.commit
+                if (
+                    authorised_scope is not None
+                    and type(commit) is MethodType
+                    and commit.__self__ is index
+                    and commit.__func__ is _CANONICAL_INDEX_STORE_COMMIT
+                ):
+                    # Pass the transport, not the authority value: a call in a
+                    # different execution context cannot borrow this scope.
+                    moved = _CANONICAL_INDEX_CONTEXT_COMMIT(
+                        index, txn, csn, _live_context=self._live_commit_context
+                    )
+                else:
+                    # Preserve custom store overrides and their existing two-arg
+                    # contract. They keep scalar validation, not ambient authority.
+                    moved = commit(txn, csn)
             finally:
                 if authorised_scope is not None:
                     authorised_scope.store = None

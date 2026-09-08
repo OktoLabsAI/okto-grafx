@@ -822,3 +822,15 @@ public-boundary grouped run: **538 passed, 3 failed in 23.06 s**. This partial s
 does not reduce the import-gate count: the separate live physical commit authority
 still uses ContextVar inside IndexManager/IndexStore and remains pending alongside
 the schema proof registry. No new benchmark, live consolidation or deployment.
+
+Physical authority follow-up: the second index context is now injected too. The native
+store receives the transport only via an exactly identified canonical commit/private
+body and still checks its current execution context, seal, manager transport, txn and
+store. Direct calls, omitted transport and custom store commits retain scalar checks;
+custom invocation/two-argument signature/effects are preserved. Manager overrides,
+nested/copy-context revocation and failing transport are tested; no shared plain flag.
+Public commits still prepare live native batches. Final grouped result **549 passed,
+2 failed in 21.97 s**; only schema.py's two proof-registry mechanisms and the aggregate
+architecture assertion remain. Existing hot-batch structural/effect/failure tests stay
+enabled. Source-only; no new speedup claim, threshold, deployment or spec consumption.
+Details: physical live-commit checkpoint in `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.
