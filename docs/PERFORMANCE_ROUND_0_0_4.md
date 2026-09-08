@@ -48,6 +48,16 @@ own repeated O(C*E+C²) edge scans on ordinary batches, preserving re-indexing o
 generated-ID collisions; 24 tests passed. Awaiting accumulated deployment.
 See `docs/SOURCE_REFERENCE_WRITE_COST_0_0_4.md` for all boundaries and evidence.
 
+Retained telemetry follow-up: automatic full-memory walks are now amortized over
+topology reports proportional to retained page equivalents; explicit Database.pool
+diagnostics remain fresh and nominal admission is unchanged. The focused slice
+passed 223 tests. Additional API/architecture checks had 255 passes and 7 static
+gate failures reproduced from unchanged HEAD sources, not introduced by this
+buffer change and not waived. Private real-schema writes/reopen/full verification
+passed; details and sampling limitations in `docs/RETAINED_METRIC_SAMPLING_0_0_4.md`.
+The operator now authorizes one real spec consolidation after installing the
+latest Grafx; the remaining 20 specs must stay reserved if that one closes.
+
 Base: `ea4b5ff` (`0.0.3`)
 
 Package version: `0.0.4`

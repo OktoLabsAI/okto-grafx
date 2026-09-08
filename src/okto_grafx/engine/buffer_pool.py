@@ -554,6 +554,7 @@ class BufferPool:
         "_metrics",
         "_metrics_enabled",
         "_metrics_defer",
+        "_retained_sample_countdown",
         "_budget_bytes",
         "_db_label",
         "_guard",
@@ -603,6 +604,7 @@ class BufferPool:
         self._metrics: MetricsSink = metrics
         metrics_enabled = metrics.enabled
         self._metrics_enabled: bool = metrics_enabled
+        self._retained_sample_countdown: int = 0
         self._metrics_defer: Callable[[], AbstractContextManager[object]] | None = (
             metrics_defer if metrics_enabled else None
         )
@@ -1251,7 +1253,7 @@ class BufferPool:
             try:
                 page = self._read_page(file, page_index)
             except BaseException:
-                usage: tuple[float, float] | None = None
+                usage: tuple[float, float | None] | None = None
                 with self._guard:
                     if self._loads.get(key) is load:
                         del self._loads[key]
@@ -1271,7 +1273,7 @@ class BufferPool:
                         pass
                 raise
 
-            usage: tuple[float, float] | None = None
+            usage: tuple[float, float | None] | None = None
             retry = False
             with self._guard:
                 current = self._loads.get(key)
@@ -2993,28 +2995,43 @@ class BufferPool:
                 del self._abandoned[file]
         self._refresh_dirty_candidate(key)
 
-    def _usage_reading(self) -> tuple[float, float] | None:
-        """Capture callback-free usage under the guard, or None when telemetry is disabled."""
+    def _usage_reading(self) -> tuple[float, float | None] | None:
+        """Capture nominal usage and, when due, a fresh retained-memory sample.
+
+        A full retained-object walk for every new frame makes cold admission
+        quadratic with metrics enabled. Amortize that diagnostic over topology
+        reports proportional to its last retained size in page equivalents.
+        No clock/host callback or cached authority enters this decision. Explicit
+        retained_bytes_estimate() remains an unconditional current-state walk.
+        """
 
         if not self._metrics_active():
             return None
-        return (float(self.used_bytes()), float(self._retained_bytes_estimate()))
+        used = self.used_bytes()
+        if self._retained_sample_countdown > 0:
+            self._retained_sample_countdown -= 1
+            # Do not re-emit a cached estimate as though it were freshly sampled.
+            return (float(used), None)
+        retained = self._retained_bytes_estimate()
+        self._retained_sample_countdown = max(1, retained // self._page_size) - 1
+        return (float(used), float(retained))
 
     def _metrics_active(self) -> bool:
         """Honor a sink switched off after assembly without enabling an unsafe late opt-in."""
 
         return self._metrics_enabled and self._metrics.enabled
 
-    def _emit_usage(self, reading: tuple[float, float]) -> None:
+    def _emit_usage(self, reading: tuple[float, float | None]) -> None:
         """Emit a previously captured usage pair; callers hold no pool guard."""
 
         used, retained = reading
         self._metrics.set_gauge(BUFFER_BUDGET_USED_BYTES, used, self._labels)
-        self._metrics.set_gauge(
-            BUFFER_RETAINED_ESTIMATE_BYTES,
-            retained,
-            self._retained_labels,
-        )
+        if retained is not None:
+            self._metrics.set_gauge(
+                BUFFER_RETAINED_ESTIMATE_BYTES,
+                retained,
+                self._retained_labels,
+            )
 
     def _report_usage(self) -> None:
         """Publish the resident bytes of this database under its own label."""

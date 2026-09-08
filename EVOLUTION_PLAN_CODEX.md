@@ -49,6 +49,14 @@ um custo quadrático do estimador de memória quando métricas estão habilitada
 não foi atribuído ao runtime do Pulse nem corrigido mediante omissão de checks.
 Evidência e limites em `docs/SOURCE_REFERENCE_WRITE_COST_0_0_4.md`.
 
+O custo quadrático da telemetria foi corrigido por amostragem amortizada; a
+consulta explícita de memória permanece atualizada. 223 testes focados passaram;
+a bateria adicional revelou 7 falhas estáticas de arquitetura já reproduzíveis no
+HEAD anterior (9 ocorrências em seis módulos), ainda pendentes e não dispensadas.
+Detalhes: `docs/RETAINED_METRIC_SAMPLING_0_0_4.md`. O usuário autorizou em seguida
+instalar o Grafx mais recente e consolidar somente **uma** spec para medir o caso
+real; se concluída, as demais **20** devem continuar reservadas.
+
 ## Histórico de execução — checkpoint iniciado em 2026-09-06
 
 - **Rodada 0.0.4, Wave 3 em execução.** Além da Wave 2 concluída até STO-M1, `b8906f6`

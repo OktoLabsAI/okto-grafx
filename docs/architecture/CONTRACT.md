@@ -1465,8 +1465,15 @@ directories and buffer bookkeeping are included; allocator arenas, interpreter-s
 variations, collaborators, arbitrary read-view tokens and temporary values owned only by an
 executing call stack are excluded. The gauge is an estimate
 of retained Python memory, not process RSS and not the eviction/admission budget. It is sampled
-on reported residency-topology changes; the immutable `Database.pool` health view recomputes the
-current estimate, so routine unpins do not acquire an O(resident frames) telemetry cost.
+on residency-topology reports. From 0.0.4, after each automatic sample it waits
+`max(1, last_estimate_bytes // page_size)` such reports before sampling again.
+The first report samples immediately. Nominal used-byte reporting is unchanged;
+skipped retained estimates are not re-emitted as fresh observations. The gauge
+is a sampled trend, not a peak or a wall-time-bounded current reading, and can lag
+growth/shrink or remain unchanged while idle. The immutable `Database.pool`
+health view always recomputes the current estimate, independently of that cadence.
+Routine unpins and each individual cold admission therefore do not require a
+whole-pool retained-memory walk. Sampling never controls admission or eviction.
 Descriptor-cache counters are cumulative per local-device lifetime and deliberately carry no
 file/path label. The adapter snapshots their deltas under its own guard and emits afterward; when
 a pool storage call nests that operation, the existing contained-metrics boundary drains the

@@ -528,11 +528,24 @@ Batch 39 additionally retains one raw page-zero image per accessed `IndexStore`:
 
 The same value is exposed as
 `oktografx_buffer_retained_estimate_bytes{db,estimator="python-v2"}` and in the immutable
-`Database.pool` view. The gauge is sampled when the pool reports a residency-topology change;
-reading `Database.pool` recomputes the current diagnostic, including slot-directory changes made
-since that sample. This avoids turning each ordinary page release into a whole-pool telemetry
-walk. Changing the formula requires a new estimator value so historical series do not silently
-change meaning.
+`Database.pool` view. Since 0.0.4 the gauge is amortized over residency-topology
+reports: after a fresh sample, the next sample is due after
+`max(1, last_retained_estimate_bytes // page_size)` reports. The first topology
+report samples immediately. Skipped estimates are not re-emitted as fresh values;
+the nominal `oktografx_buffer_budget_used_bytes` gauge still follows every report.
+There is no timer, background worker or cross-pool state. The formula/estimator
+label is unchanged; only automatic sampling cadence changes.
+
+Reading `Database.pool` unconditionally recomputes the current diagnostic,
+including slot-directory changes since the last sample, without consuming the
+automatic sampling cadence. Use this explicit view for a current inspection.
+The exported retained gauge is appropriate for sampled trends, not exact current
+memory, peak-memory alerts or admission decisions. It may lag a sudden shrink or
+remain at its last sample while the workload is idle; no wall-time freshness bound
+is promised. This avoids a whole-pool walk on every cold page admission (quadratic
+aggregate diagnostic work while filling a cache) as well as on ordinary releases.
+Changing the formula requires a new estimator value so historical series do not
+silently change meaning. See `RETAINED_METRIC_SAMPLING_0_0_4.md` for evidence.
 
 The local descriptor cache now exposes cumulative `hits`, `misses` and capacity-driven LRU
 `evictions` through the immutable `Database.storage` view and the three unlabelled
