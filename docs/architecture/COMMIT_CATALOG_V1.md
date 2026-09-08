@@ -592,3 +592,40 @@ schema decode per full native no-schema preflight, plus bounded existence probes
 an exact index complement and signature checks are linear in the selected range.
 There is no graph/history scan or end-to-end performance claim. Complete journal
 physical/UUID/coverage validation, native application and publication remain pending.
+
+### Qualified published-head verification at an idle replay checkpoint
+
+Implementation checkpoint: `55e68f2125711308f1640a3d77c74ddaa6b61ff7`.
+
+`CommitCatalogStore.validate_published_head(sequence, activation_sequence, file_size)`
+validates an already-stable nonempty physical history, not a partially applied
+append. Coordinates are admitted before provider calls. Both file sizes must be
+whole pages and match exactly the head's arithmetic directory/stream extents;
+missing, truncated or trailing physical pages cannot become an empty history.
+The method reads both qualified headers, first/last directory blocks, and all
+fragments of the final record. Existing role/UUID/CRC/layout/content checks remain.
+
+The directory head/tail and final record fragments must carry the published
+COMMIT sequence. The immutable stream header carries the first tracked COMMIT;
+the first directory page is stamped by its final entry. Visited pages must lie
+strictly after activation and no later than publication. Adjacent first/last
+directory blocks have exact continuity; separated visited boundaries must remain
+strictly ordered. No record or timestamp is synthesized.
+
+Read bounds are independent of total history: at most six provider reads for a
+small final record in the tested layouts; large-record bound is
+`ceil(MAX_COMMIT_RECORD_BYTES / (page_size - 76)) + 5`. Sizes use two fixed probes.
+Only visited stamps are retained within the operation; this is not a reusable
+authority cache. A bounded endpoint check does **not** certify every unvisited
+historical record or detect every interior hole/corruption. Full verification
+and the normal physical descriptor/fence protocol remain distinct obligations.
+
+RecoveryManager and TransactionManager now pass the composition-supplied database
+UUID to CommitRedo. For a no-schema, empty WAL range with checkpoint after the
+activation horizon, native preflight may recognize this qualified physical head
+instead of refusing all already-published history. An absent UUID keeps the guard;
+a foreign UUID fails identity validation. This accepts no journal page effects,
+applies no new pages and does not manufacture publication authority from the input
+UUID or integer. Required journal WAL effects remain refused until full native
+crash-cut/physical-target integration. Automatic emission and public APIs remain
+disabled; schema-changing interval coverage and full verify integration remain.

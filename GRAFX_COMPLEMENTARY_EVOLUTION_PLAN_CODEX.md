@@ -3,6 +3,14 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / histórico físico checkpointado / 2026-09-08:** validação limitada
+de identidade, tamanhos físicos, limites do diretório, stamps e registro final.
+Replay nativo vazio pode reconhecer histórico publicado com UUID correto; sem
+UUID ou com divergência recusa. 1.102 testes agrupados, 42 focados finais. Não
+certifica o histórico inteiro nem habilita replay parcial/publicação do journal.
+[Evidência e limites](docs/specs/SPEC-GX-CAP-1.md). Pulse/19 specs intocados.
+Checkpoint: `55e68f2125711308f1640a3d77c74ddaa6b61ff7`.
+
 **GX-CAP-1B / intervalos sem schema e subplano de índices / 2026-09-08:** catálogo
 vigente lido das páginas, sem adotar estado mutável, para identificar a obrigação
 de histórico. Índices recebem prova exata do lote completo e validação estrita

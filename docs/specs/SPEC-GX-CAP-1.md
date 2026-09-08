@@ -686,3 +686,51 @@ automatic staging/publication and the existing public API, verify/metrics,
 transfer/restore/fork/concurrency/crash requirements. Cost and precise limitations:
 [COMMIT_CATALOG_V1](../architecture/COMMIT_CATALOG_V1.md). No OCC/durability or
 multi-reader/writer premise changed. Pulse and 19 reserved specs remain untouched.
+
+### CAP-1B qualified physical published head — 2026-09-08
+
+Implementation checkpoint: `55e68f2125711308f1640a3d77c74ddaa6b61ff7`.
+
+Implemented bounded validation of the already-published journal head against an
+independently supplied UUID, activation and checkpoint: exact whole-page file
+extents, headers, first/last directory boundaries, required page stamps and the
+complete final record. Native idle preflight uses it only for an empty replay
+after activation, with the UUID passed by RecoveryManager/TransactionManager's
+composition. No journal effects are admitted or applied, and no new history is
+published. [Precise scope and bounds](../architecture/COMMIT_CATALOG_V1.md).
+
+New suite has **42 cases**: 512/8192-byte pages, 1/8/14/128 entries and small/large
+final metadata, ten physical-size faults, nine boundary/content faults (including
+CRC-valid page with corrupted nested record CRC and cross-directory clock order),
+four pre-provider coordinate refusals and three native idle-preflight UUID cases.
+Physical materialization is test setup, not automatic native journal publication.
+The positive native test validates detached checkpoint context against real memory
+storage/pool; it is not a complete public startup/WAL/crash execution.
+
+Initial fixture issues (relative imports in an unpackaged test directory, required
+BufferPool label, strict import reexports) were corrected. The nested CRC test
+flips an existing record-CRC byte without changing block length. Final focused
+result: **42 passed in 7.37 s**. Grouped validation:
+
+```text
+python -m pytest tests/txn/test_commit_catalog_physical.py
+  tests/txn/test_commit_catalog_store.py tests/txn/test_commit_catalog_transition.py
+  tests/txn/test_commit_catalog_activation.py tests/recovery
+  tests/storage_core/test_catalog_replay_images.py
+  tests/api/test_checkpoint_and_reclamation.py tests/api/test_m0b_catalog_repair_from_log.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**1,102 passed in 61.70 s**. Focused suite after test-import cleanup overlaps this
+group. Ruff/diff-check pass. Strict mypy on four production modules versus HEAD
+`420e9de` shadow sources reports identical **69** existing diagnostics, normalized
+only by line offsets. New test module has only eight imported Catalog/Store
+baseline diagnostics after import correction; none in its own code. No global
+type-clean, full-history integrity or latency/speedup claim.
+
+Remaining: complete native journal-target/crash-cut coverage and application,
+automatic staging/publication, full verify/metrics and public APIs, then existing
+transfer/restore/fork/concurrency/crash acceptance. This bounded head verifier is
+not a substitute for the full historical scan. All original multi-reader/writer,
+OCC and durability premises remain. Pulse and 19 pending specs were untouched.

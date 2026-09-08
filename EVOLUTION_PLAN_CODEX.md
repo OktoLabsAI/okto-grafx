@@ -26,6 +26,16 @@ ledger permaneceram idênticos. Dívidas históricas continuam explícitas.
 [Recibo, limites e identidade do runtime](docs/PULSE_SINGLE_SPEC_LATEST_PERFORMANCE_0_0_4.md).
 Este teste não altera o estado incompleto dos slices GX-CAP-1 abaixo.
 
+GX-CAP-1 reconhece agora histórico físico já publicado em replay vazio após o
+checkpoint, somente com UUID do banco fornecido pela composição: tamanhos exatos,
+cabeçalhos, limites do diretório, stamps e registro final validados. Leituras
+limitadas ao schema e às extremidades do histórico, sem varredura de todos os
+commits. **1.102 testes em 61,70 s**; 42 focados finais em 7,37 s (sobrepostos),
+Ruff verde e mesmos 69 diagnósticos de tipagem anteriores. Não é verificação
+integral do histórico nem replay de journal parcialmente aplicado; emissão,
+aplicação pendente e API pública continuam fechadas. [Evidência](docs/specs/SPEC-GX-CAP-1.md).
+Pulse e 19 specs preservados. Checkpoint: `55e68f2125711308f1640a3d77c74ddaa6b61ff7`.
+
 GX-CAP-1 cobre agora o replay sem efeitos de schema: consulta não destrutiva ao
 catálogo das páginas, recusa de ativação sem cobertura e de arquivos de histórico
 órfãos. O subplano de índices herda a prova do lote completo, mas refaz a validação
