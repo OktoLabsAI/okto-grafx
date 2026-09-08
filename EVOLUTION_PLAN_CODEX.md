@@ -21,6 +21,7 @@ em 21,47 s; limites de leituras e registro máximo medidos sem varrer o históri
 Ainda não reconstrói a visão anterior após aplicação parcial nem habilita o
 journal automaticamente. [Evidência e limites](docs/specs/SPEC-GX-CAP-1.md).
 Pulse instalado e as specs reservadas permanecem intocados.
+Checkpoint imutável: `19633b93d102d7a8d12c37147a8eea3e98d9a939`.
 
 GX-CAP-1 avançou na ligação do replay aos COMMITs individuais: preservação de
 epoch/transaction ID/LSN nos subplanos de recovery e checkpoint, validação de

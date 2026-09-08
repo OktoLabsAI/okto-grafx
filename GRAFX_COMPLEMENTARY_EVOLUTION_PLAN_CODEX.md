@@ -9,6 +9,7 @@ extras, stamps errados e reescritas históricas com CRC válido. Regra exata de
 tempo lógico e registro máximo incluídos. 691 testes agrupados em 21,47 s;
 reconstrução da visão após crash, staging/publicação e replay completos ainda
 pendentes. [Contrato e evidência](docs/specs/SPEC-GX-CAP-1.md). Pulse/specs intocados.
+Checkpoint imutável: `19633b93d102d7a8d12c37147a8eea3e98d9a939`.
 
 **GX-CAP-1B / vínculo COMMIT–replay / 2026-09-08:** os COMMITs individuais agora
 acompanham os efeitos no selector e nos subplanos de recovery/checkpoint. Preflight

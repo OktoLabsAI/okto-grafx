@@ -424,6 +424,8 @@ remaining CAP-1 deliverables are still required. Pulse and reserved specs untouc
 
 ### CAP-1B append transition validator — 2026-09-08
 
+Immutable implementation checkpoint: `19633b93d102d7a8d12c37147a8eea3e98d9a939`.
+
 Added `CommitCatalogStore.validate_append_images`: bounded/read-only validation
 of an exact stamped image set against an independently supplied predecessor view.
 It verifies previous/current/activation coordinates, one-entry advancement,

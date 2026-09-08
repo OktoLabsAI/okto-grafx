@@ -203,6 +203,8 @@ remain in force until those conditions are implemented and tested.
 
 ### Canonical append transition validation
 
+Immutable implementation checkpoint: `19633b93d102d7a8d12c37147a8eea3e98d9a939`.
+
 `CommitCatalogStore.validate_append_images` now checks one complete, stamped
 append against an independently established **predecessor** page view. Inputs
 name previous COMMIT, new COMMIT and activation LSN; the predecessor head must
