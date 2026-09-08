@@ -855,3 +855,13 @@ remain reserved. Follow-up health: Board/Discovery healthy, metrics available,
 2,965 nodes, queue zero; historical policy DLQ keeps overall at_risk. No new
 consolidation, reset/rebuild/redrive or full-write timing claim. Deployment evidence
 and wheel hash are in `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.
+
+Further write attribution, not a new gate: a candidate avoiding vector construction
+for coverage-dead history passed 747 tests and identical full reports, but one
+private comparison showed 7.422 s current / 7.951 s candidate. It was withdrawn,
+not deployed or repeatedly tuned. The actual Community flush lifecycle on a
+separate quiescent copy took 11.946 s, including 4.304 s fresh writable reopening
+and 7.518 s full verification. This excludes production routing/fence costs and
+does not measure a dirty live-event checkpoint or explain all 131.489 s.
+No additional spec or live mutation. Evidence, limits and finite follow-up:
+`GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.

@@ -44,6 +44,14 @@ Este resumo prevalece sobre os checkpoints cronológicos abaixo; eles ficam
 preservados como evidência, não como novas filas ou dependências ativas do Claude.
 Codex prossegue sozinho. Nenhum gate de ganho marginal foi reintroduzido.
 
+Atribuição posterior do custo de escrita: candidato de não materialização de
+vetores históricos retirado, apesar de 747 testes verdes, por ausência de ganho
+de tempo demonstrado (7,422 → 7,951 s em uma amostra privada). Fluxo Community
+de flush em cópia quiescente: 11,946 s, incluindo reabertura 4,304 s e verificação
+7,518 s. Não mede checkpoint sujo nem resolve os 131,489 s da entrega real.
+Sem nova spec, alteração instalada ou relaxamento de garantias. Evidência e
+próximo foco dentro da investigação vigente: `docs/GLOBAL_WRITE_ATTRIBUTION_0_0_4.md`.
+
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |
