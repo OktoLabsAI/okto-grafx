@@ -1200,6 +1200,8 @@ class IndexStore:
         into a refusal of its own. What certifies the traversal is unchanged: the fresh post-read
         of :meth:`finish_exact_read`. A foreign page-0 transition between two lookups is seen
         there, costs one of the bounded retries, and the retry re-proves from the device.
+        Materialization refusals also complete that post-proof: a mixed-generation
+        error cannot be attributed to a stable view before its generation is checked.
         """
         rebuild_required_lsn = required_lsn
         required_lsn = self._required_table_position(required_lsn)
@@ -2655,7 +2657,18 @@ class IndexStore:
                 ):
                     continue
                 raise
-            result = operation(certificate)
+            try:
+                result = operation(certificate)
+            except GrafxError:
+                # A carried pre-certificate may meet a freshly published bucket
+                # while companion heap frames still name the prior generation.
+                # In that mixed view even a slot refusal is not yet a stable
+                # verdict. Complete the same post-proof before propagating it;
+                # a changed generation retries within the existing bound. A
+                # stable failure retains its exact original exception/traceback.
+                if self.finish_exact_read(certificate, required_lsn):
+                    raise
+                continue
             if self.finish_exact_read(certificate, required_lsn):
                 return result
         raise GrafxIndexError(

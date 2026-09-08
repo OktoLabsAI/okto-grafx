@@ -82,6 +82,17 @@ para deploy acumulado, sem reiniciar o Pulse PID 15940 nem consumir outra spec.
 Isso não é ganho de latência nem novo gate; é atribuição do custo completo já
 pendente. Contrato Core: `docs/KG_CONSOLIDATION_PHASE_TIMING.md`.
 
+Preflight Global: consultas fechadas antes de qualquer staging de um writer
+nativo agora admitem o lote de destinos já existente. DML/DDL, quotas e hooks
+continuam no caminho anterior. Cópia privada: 2.253 linhas idênticas, 2.255 → 38
+visões de índice, 3,624 → 2,979 s em um par sequencial (não é ganho end-to-end).
+O teste concorrente revelou erro também na base: falha de materialização com
+certificado carregado impedia o pós-check de detectar geração estrangeira.
+Corrigido: erro Grafx só é propagado como estável após pós-prova; transição
+comprovada usa o retry já limitado. Corrupção estável e sinais de processo não
+são mascarados. 973 testes/61,99 s passaram; sem consumir spec ou reiniciar
+runtime neste checkpoint. Detalhes: `docs/UNSTAGED_WRITE_PREFLIGHT_0_0_4.md`.
+
 | Frente atual | Estado / próxima ação necessária |
 | --- | --- |
 | Wave 0–3, ordered cursor OIX-0–3 e matrizes documentadas | Implementações/checkpoints registrados no plano finito; não repetir todo o histórico a cada ajuste. |

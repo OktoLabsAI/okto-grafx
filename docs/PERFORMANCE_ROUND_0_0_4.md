@@ -899,3 +899,14 @@ combined consolidation/cancellation/connectivity/provenance slice: 38 passed in
 spec consumed or native protocol change. This supplies evidence for the existing
 22.981 s attribution task, not a new performance gate or a speedup claim. Contract
 and measurement boundaries: Core `docs/KG_CONSOLIDATION_PHASE_TIMING.md`.
+
+Global preflight follow-up: native unstaged WRITE contexts can use the existing
+bounded landing batches for the already-eligible closed read-only plan. Staged
+owners, streaming shapes, quotas and custom witnesses retain their old paths.
+Exact private preflight: 2,253 identical rows, 2,255 → 38 index views, 3.624 →
+2.979 s in one sequential pair (not a whole-delivery claim). Concurrent validation
+exposed a baseline mixed-generation slot refusal bypassing the post-certificate;
+failed materialization now performs that same post-proof and retries only a
+proven transition under the existing bound. Stable corruption still raises.
+Final index/query/concurrency/import-boundary group: 973 passed in 61.99 s.
+No live mutation or new timing gate. `UNSTAGED_WRITE_PREFLIGHT_0_0_4.md`.

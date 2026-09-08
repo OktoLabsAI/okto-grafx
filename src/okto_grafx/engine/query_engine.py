@@ -2419,7 +2419,7 @@ class _OwnerLandingView:
     def landings_many(
         self, identities: Sequence[int], context: _Context, index: object,
     ) -> tuple[tuple[object, HeapVersion] | None, ...]:
-        """Batch READ-only misses in the existing bounded vector-free payload memo.
+        """Batch unstaged snapshot misses in the bounded vector-free payload memo.
 
         Repeated destinations retain the same scalar cache benefit. Full rows
         never consume these entries; quota exhaustion declines retention, not
@@ -6651,13 +6651,20 @@ def _admits_batched_landings(
     """Admit bounded prefetch only when the closed consumer must read every hop.
 
     A streaming LIMIT must never inspect a later endpoint. Nor may batching move
-    a configured quota's refusal across validation. Those shapes, owner writes
+    a configured quota's refusal across validation. Those shapes, staged owner writes
     and specialized scalar witnesses retain the original per-row access path.
+    An exact native WRITE context with ``wrote == False`` has no row intents,
+    WAL records, physical images or write partitions. Its closed read-only
+    preflight can use the same bounded snapshot batches; eligibility is tested
+    again for each statement, never carried into subsequent staged work.
     """
     manager = engine._indexes
     if (
         type(context.txn) is not TransactionContext
-        or context.txn.mode is not TransactionMode.READ
+        or (
+            context.txn.mode is not TransactionMode.READ
+            and (context.txn.mode is not TransactionMode.WRITE or context.txn.wrote)
+        )
         or engine._max_intermediate_rows is not None
         or engine._max_traversal_expansions is not None
         or engine._max_traversal_paths is not None
