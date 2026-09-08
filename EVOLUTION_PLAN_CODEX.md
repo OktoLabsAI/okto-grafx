@@ -20,6 +20,7 @@ ownership e assinatura capturada antes de callbacks de decodificação. 826 test
 agrupados em 37,45 s; sem novo I/O ou mudança de WAL/OCC. A publicação/replay do
 journal permanece desabilitada até fechar sua cobertura entre arquivos. Evidência:
 [SPEC-GX-CAP-1](docs/specs/SPEC-GX-CAP-1.md). Pulse e specs continuam preservados.
+Checkpoint imutável: `18d53f72442d3620eb84afd1bd61e2326107bfcd`.
 
 GX-CAP-1 ganhou a gramática obrigatória do WAL para páginas de histórico: flags
 v2 distintos com/sem compressão, sem fallback para framing legado. O recovery

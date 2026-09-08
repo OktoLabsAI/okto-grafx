@@ -170,6 +170,8 @@ fence. No extra global writer mode or relaxed descriptor proof is introduced.
 
 ### Individual COMMIT boundaries now retained by replay
 
+Immutable implementation checkpoint: `18d53f72442d3620eb84afd1bd61e2326107bfcd`.
+
 The existing selector previously flattened durable effects and retained only
 the greatest COMMIT LSN. That is insufficient to prove which transaction owns
 each journal entry when replay spans several commits. It now retains the exact

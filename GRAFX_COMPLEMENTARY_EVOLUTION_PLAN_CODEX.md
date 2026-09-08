@@ -9,6 +9,7 @@ valida ownership/ordem/watermark e recusa mutação durante callbacks antes de
 aplicar páginas. 826 testes agrupados em 37,45 s. É pré-requisito para a cobertura
 do journal, não sua publicação/replay completos; proteções de integração continuam
 ativas. [Evidência e limites](docs/specs/SPEC-GX-CAP-1.md). Pulse/specs intocados.
+Checkpoint imutável: `18d53f72442d3620eb84afd1bd61e2326107bfcd`.
 
 **GX-CAP-1B / gramática WAL / 2026-09-08:** framing obrigatório do journal
 implementado em v2 (`0x0011` raw, `0x0015` comprimido). Semântica antiga simulada

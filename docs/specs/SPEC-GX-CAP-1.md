@@ -381,6 +381,8 @@ Pulse was not changed and no reserved spec was consumed.
 
 ### CAP-1B replay COMMIT boundaries — 2026-09-08
 
+Immutable implementation checkpoint: `18d53f72442d3620eb84afd1bd61e2326107bfcd`.
+
 The selector now retains individual COMMIT envelopes (not just the maximum LSN)
 and both native startup recovery/checkpoint splits preserve them. Preflight
 validates transaction ownership, forward/unique boundaries, complete/incomplete
