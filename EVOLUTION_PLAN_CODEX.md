@@ -14,14 +14,17 @@
 
 ## Resumo vigente — 2026-09-08
 
-GX-CAP-1 avançou para o codec do catálogo de commits: envelope com CRC-32C,
-checkpoint `817fc8a9020fab12f9483ab7dec6d1411d66afcd`,
-identidade/tempo/tipo de commit, decodificação limitada dos metadados e recusa
-de versões desconhecidas. 379 testes passaram em 7,82 s, incluindo 3.000 entradas
-mutadas e o limite exato de tamanho; mypy estrito/Ruff verdes. Contrato de formato
-e matriz de crash obrigatória: `docs/architecture/COMMIT_CATALOG_V1.md`.
-O storage paginado e a integração commit/recovery continuam pendentes; nenhum
-formato foi ativado, nenhuma API nova foi exposta e o Pulse não foi alterado.
+GX-CAP-1 tem codec, planejador/leitor paginado, binding do LSN e ativação interna
+do horizonte de histórico implementados. A ativação usa o commit real, inclusive
+roll, e persiste capability obrigatória; ainda não publica os registros de histórico.
+Enquanto o staging/replay do journal não estiver integrado, bancos ativados apenas
+em fixtures recusam novas escritas explicitamente. Não é uma feature pública pronta.
+Regressão agrupada: 1.195 testes em 118,97 s; após ajuste de limpeza terminal,
+50 testes focados em 3,43 s. Ruff verde; teste novo com mypy estrito verde, sem
+aumento dos 49 erros preexistentes nos dois módulos legados alterados.
+Evidência, limites e próximos requisitos: [SPEC-GX-CAP-1](docs/specs/SPEC-GX-CAP-1.md).
+Publicação/recovery, lookup público/verify, métricas e transferência lógica seguem
+obrigatórios. Pulse instalado e as 20 specs reservadas permanecem intocados.
 
 GX-CAP-1 começou em `feature/gx-cap-1`, sobre `c310675`. O primeiro slice
 foi registrado em `474335962eeae20a937d6a444bcc3f7b2c2f110f` e

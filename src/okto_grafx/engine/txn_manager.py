@@ -87,6 +87,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
     CATALOG_LEGACY_FORMAT_VERSION,
+    COMMIT_CATALOG_V1_CAPABILITY,
     HEAP_RECLAIM_V1_CAPABILITY,
     WAL_RECORD_V2_CAPABILITY,
     Catalog,
@@ -713,11 +714,13 @@ class TransactionManager:
         "_index_authority_sync_required",
         "_heap_reclaim_capable",
         "_wal_record_v2_capable",
+        "_commit_catalog_capable",
         "_catalog_changes_are_wal_logged",
         "_partitions_per_table",
         "_identity_lease_size",
         "_identity_leases",
         "_index_catalog_activation_plans",
+        "_commit_catalog_activation_plans",
         "_identity_process",
         "_identity_process_invalid",
         "_process_identity_provider",
@@ -891,6 +894,7 @@ class TransactionManager:
         self._index_catalog_activation_plans: dict[
             TxnId, _IndexCatalogActivationPlan
         ] = {}
+        self._commit_catalog_activation_plans: dict[TxnId, tuple[bytes, Csn]] = {}
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
         )
@@ -1366,6 +1370,70 @@ class TransactionManager:
                         image,
                     )
                 return True
+
+    def prepare_commit_catalog_activation(self, txn: TransactionContext) -> bool:
+        """Internal activation-only vertical slice; no public entry point yet.
+
+        Publish the horizon in legacy-compatible catalog page WAL before journal
+        effects. Until journal staging/replay is connected, later writes refuse
+        explicitly rather than create untracked commits. Used only by temporary
+        integration fixtures until the complete capability is certified.
+        """
+        operation = "prepare commit catalog activation"
+        self._require_fresh_index_catalog_transaction(txn, operation=operation, purpose=operation)
+        with self._participant_section():
+            self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog) or source.format_version != CATALOG_FORMAT_VERSION:
+                    raise GrafxUnsupportedOperation(
+                        "Commit catalog activation requires the identity-index catalog first.",
+                        field="format_version", remedy="maintenance.ensure_identity_indexes",
+                    )
+                if source.requires_capability(COMMIT_CATALOG_V1_CAPABILITY):
+                    return False
+                candidate = source.copy().enable_commit_catalog(1)
+                image = candidate.serialize()
+                for page_index, page_image in self._catalog.stage(candidate):
+                    self._stage_page_image(txn, self._file_ids.catalog_file, page_index, page_image)
+                self._commit_catalog_activation_plans[txn.txn_id] = (image, 1)
+                return True
+
+    def _require_commit_catalog_writer_ready(self, *, refresh: bool = False) -> None:
+        """Fail closed during this internal activation-only integration checkpoint."""
+        if refresh:
+            # A transaction may have begun before a foreign activation. After
+            # first OCC and authority adoption, test the CURRENT catalog, not the
+            # capability cached at begin. This is an existing proved view, not a
+            # new physical-authority shortcut or a whole-catalog serialization.
+            source = getattr(self._catalog, "catalog", None)
+            self._commit_catalog_capable = bool(
+                isinstance(source, Catalog)
+                and source.requires_capability(COMMIT_CATALOG_V1_CAPABILITY)
+            )
+        if self._commit_catalog_capable:
+            raise GrafxUnsupportedOperation(
+                "Commit catalog write publication is not enabled by this build yet.",
+                field="commit_catalog_publication", capability=COMMIT_CATALOG_V1_CAPABILITY,
+            )
+
+    def _rebind_commit_catalog_activation(self, txn: TransactionContext, sequence: int) -> bool:
+        original = self._commit_catalog_activation_plans.get(txn.txn_id)
+        if original is None:
+            return False
+        candidate = Catalog.deserialize(original[0])
+        candidate._retarget_commit_catalog_activation(1, sequence)
+        rebound = self._catalog.stage(candidate)
+        old_locations = {key for key in txn.page_images if key[0] == self._file_ids.catalog_file}
+        new_locations = {(self._file_ids.catalog_file, index) for index, _ in rebound}
+        if old_locations != new_locations:
+            raise GrafxTransactionStateError("Activation retarget changed page cardinality.", field="commit_catalog_activation")
+        for index, image in rebound:
+            self._stage_page_image(txn, self._file_ids.catalog_file, index, image)
+        self._commit_catalog_activation_plans[txn.txn_id] = (original[0], sequence)
+        return True
 
     def prepare_vacuum(
         self,
@@ -2718,6 +2786,10 @@ class TransactionManager:
             and source.format_version == CATALOG_FORMAT_VERSION
             and source.requires_capability(WAL_RECORD_V2_CAPABILITY)
         )
+        self._commit_catalog_capable = bool(
+            isinstance(source, Catalog)
+            and source.requires_capability(COMMIT_CATALOG_V1_CAPABILITY)
+        )
 
     def _synchronize_committed_indexes(
         self,
@@ -3417,6 +3489,7 @@ class TransactionManager:
         )
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._open.pop(txn.txn_id, None)
+        self._commit_catalog_activation_plans.pop(txn.txn_id, None)
         mode = txn.mode.value
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
@@ -4352,6 +4425,7 @@ class TransactionManager:
                                 self._index_catalog_activation_plans.pop(
                                     txn.txn_id, None
                                 )
+                                self._commit_catalog_activation_plans.pop(txn.txn_id, None)
                                 failure = _accumulate_failure(
                                     failure,
                                     self._drain_transaction_descriptor_scope(
@@ -4376,6 +4450,7 @@ class TransactionManager:
                         self._participant_pin = None
                         self._identity_leases.clear()
                         self._index_catalog_activation_plans.clear()
+                        self._commit_catalog_activation_plans.clear()
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -4501,6 +4576,7 @@ class TransactionManager:
             self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
+            self._require_commit_catalog_writer_ready()
             activation_plan = self._index_catalog_activation_plans.get(txn.txn_id)
             if activation_plan is not None:
                 self._validate_index_catalog_activation_plan(txn, activation_plan)
@@ -4589,6 +4665,12 @@ class TransactionManager:
                                     index_authority_may_have_changed
                                 ),
                             )
+                        # A v1 durable control fence cannot contain this v2-only
+                        # capability. Preserve legacy physical-only transactions'
+                        # pre-barrier catalog-read/unsaved-value contract.
+                        self._require_commit_catalog_writer_ready(
+                            refresh=durable.format_version >= COMMIT_STATE_FORMAT_VERSION,
+                        )
                         manager = self._index_manager
                         projection_scope = getattr(
                             manager, "_commit_index_projection_scope", None
@@ -4769,7 +4851,7 @@ class TransactionManager:
                                 if commit_trace is not None:
                                     commit_trace.increment(COMMIT_RETARGETS_TOTAL)
                             self._materialized = None
-                            if not raw_batch_rolls:
+                            if not raw_batch_rolls and txn.txn_id not in self._commit_catalog_activation_plans:
                                 records = self._compress_page_records(records, images)
                             self._validate_wal_batch_budget(txn, records)
                             if commit_trace is not None and (
@@ -5114,6 +5196,19 @@ class TransactionManager:
         # provenance hook below: a malformed pending identity must not reach any collaborator,
         # and certainly must not be mistaken for a physical RecordRef by the heap.
         self._validate_row_intents(txn)
+        activation = self._commit_catalog_activation_plans.get(txn.txn_id)
+        if activation is not None:
+            expected_catalog = Catalog.deserialize(activation[0])
+            expected_catalog._retarget_commit_catalog_activation(1, activation[1])
+            expected_images = {
+                (self._file_ids.catalog_file, index): image
+                for index, image in self._catalog.stage(expected_catalog)
+            }
+            if txn.row_intents or txn.pending_records or txn.page_images != expected_images:
+                raise GrafxConfigurationError(
+                    "Commit catalog activation requires an unchanged dedicated transaction.",
+                    field="commit_catalog_activation",
+                )
         unproved = txn.unproved_page_images()
         if unproved:
             raise GrafxConfigurationError(
@@ -5461,6 +5556,7 @@ class TransactionManager:
         CSN, while the live frames stay provisional until durability is established.
         """
         base = _require_lsn("last_lsn", self._wal.last_lsn)
+        self._require_commit_catalog_writer_ready()
         page_stamps = self._group_page_stamps(rows)
         staged = list(txn.staged_pages())
         # Preserve the pre-TXN-4 deterministic page order; the grouping map follows row order.
@@ -5520,6 +5616,7 @@ class TransactionManager:
                 field="last_lsn",
                 value=base,
             )
+        self._rebind_commit_catalog_activation(txn, predicted)
         if uses_canonical_index_staging:
             # Count and staging run in this same COMMIT_SECTION against the same immutable
             # catalog authority.  Carry that one-shot observation into the verifier instead of
@@ -5669,8 +5766,12 @@ class TransactionManager:
             else self._group_page_stamps(rows)
         )
         self._materialized = None
+        rebound_activation = self._rebind_commit_catalog_activation(txn, new_csn)
         for file, page_index, image in images:
             page = reusable.get((file, page_index))
+            if rebound_activation and file == self._file_ids.catalog_file:
+                image = txn.page_images[(file, page_index)]
+                page = None  # Catalog body changed, not only its generic page stamp.
             stamps = page_stamps.get(page_index, ()) if file == self._heap_file else ()
             if page is None:
                 # Not produced by _build_records in this attempt (a caller-built batch):
@@ -7941,6 +8042,7 @@ class TransactionManager:
         descriptor_failure = self._drain_transaction_descriptor_scope(txn.txn_id)
         self._open.pop(txn.txn_id, None)
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
+        self._commit_catalog_activation_plans.pop(txn.txn_id, None)
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
         return self._mode_counts[mode], descriptor_failure

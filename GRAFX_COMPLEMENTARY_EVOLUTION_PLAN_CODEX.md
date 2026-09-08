@@ -3,6 +3,16 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1B / ativação interna / 2026-09-08:** catálogo v2 agora persiste o
+horizonte do COMMIT de ativação com capability obrigatória. A preparação privada
+usa WAL v1, ajusta o horizonte no roll e recupera o mesmo resultado após falha
+pós-durabilidade. Não existe ainda publicação automática dos registros; bancos
+experimentais ativados recusam novas escritas até essa integração. API pública,
+staging/replay do journal e os demais gates permanecem obrigatórios. 1.195 testes
+agrupados em 118,97 s; 50 focados após correção adicional de limpeza de contexto.
+Ruff verde e nenhum novo erro nos dois módulos com dívida de tipagem preexistente.
+Detalhes: [`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md). Pulse e specs preservados.
+
 **GX-CAP-1B / binding do LSN final / 2026-09-08:** preparação limitada por tentativa
 e ajuste da identidade ao COMMIT LSN implementados, sem reler storage ou relógio
 durante o ajuste. A preparação exige cobertura igual ao controle durável informado.

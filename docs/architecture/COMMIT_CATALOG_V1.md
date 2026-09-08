@@ -1,7 +1,9 @@
 # Commit catalog v1 — CAP-1B persistence contract
 
-Status: record codec and private paged image planner/reader implemented and validated;
-activation and transactional wiring NOT enabled. Authority: ADR GX-003 and SPEC-GX-CAP-1.
+Status: record codec, private paged planner/reader and internal activation fence implemented;
+automatic journal publication/replay and public API NOT enabled. Activated test stores
+refuse subsequent writing commits until publication is wired. Not deployable as a
+public capability. Authority: ADR GX-003 and SPEC-GX-CAP-1.
 Date: 2026-09-08.
 
 ## Storage and ordering decision
@@ -11,8 +13,9 @@ WAL or an in-memory list rewritten on every commit. The selected layout has a
 paged append-only record stream and an ordinal directory of fixed-width entries
 for binary-search lookup by CommitId. Variable-sized records may span pages; an
 empty metadata commit must not reserve the maximum 64 KiB payload. The private page
-layout below is implemented in `engine/commit_catalog_store.py`. No file target or
-format capability is registered until the complete replay/activation integration.
+layout below is implemented in `engine/commit_catalog_store.py`. Journal file targets
+remain unregistered. Catalog capability bit 4 now guards the independently persisted
+activation horizon; it does not enable automatic journal emission.
 
 CommitId.sequence maps to the final writing COMMIT LSN, including segment-roll
 retargeting, not the speculative LSN before WAL planning. The existing forward-
@@ -78,7 +81,41 @@ required capability/fence before incompatible journal effects. The WAL must also
 carry required grammar discrimination so an already-open older writer/recovery
 cannot interpret new file targets as repairable corruption. Do not register a new
 record type as known until replay can apply or explicitly refuse it safely.
-Exact capability bit/required WAL record assignments remain pending the integration slice.
+Catalog required bit 4 (`1 << 4`, `commit_catalog_v1`) is assigned. Required journal
+WAL grammar remains pending; journal targets must not be emitted as legacy effects.
+
+### Internal activation fence implemented
+
+Catalog v2 adds one conditional `u64 activation_commit_lsn` immediately after its
+16-byte v2 extension (absolute offset 44), before table/space/index bodies. It is
+present exactly when required capability bit 4 is set. Range: exact integer
+1..PROVISIONAL_CSN-1; the existing whole-catalog CRC covers it. Without the bit,
+the existing v1/v2 bytes are unchanged. Unknown required bits are refused before
+interpreting this field. Detached copy/round-trip preserve the horizon; reactivation
+at the same horizon is idempotent, replacing a published horizon is refused.
+
+The private TransactionManager preparation requires a fresh dedicated write and an
+already-v2 identity catalog. It stages catalog pages only. The placeholder is
+rebound to the final COMMIT LSN during batch construction and segment-roll sizing;
+both catalog body and page stamp change, with unchanged page cardinality. Activation
+uses uncompressed v1 WAL even when compression was enabled earlier. It creates no
+`commits.dir`/`commits.dat`. Extra work added to the dedicated transaction is refused,
+not discarded. Retry before append retains a verifiable rebound plan; rollback,
+terminal abort and close discard the plan. After the durability barrier, existing
+full-page recovery restores the same horizon without a second COMMIT.
+
+Until automatic publication is integrated, a temporary guard refuses writing on
+activated fixtures, including a participant that began before foreign activation.
+The guard rechecks current catalog authority under the existing commit fence; it
+does not authorize a second-OCC shortcut. This is deliberately NOT a public API or
+an instruction to activate production. Non-activated stores retain normal behavior.
+Both fresh data and maintenance publication still need journal staging, required
+WAL grammar, coverage checks and replay before this guard can be replaced.
+
+The independent horizon will distinguish a legal empty tracked interval (durable
+control still at activation) from missing history after later commits. Missing files
+must never silently redefine the beginning of the tracked interval. Initialization
+and partial-file crash classification remain part of publication/recovery work.
 
 After activation, the existing commit protocol must incorporate the full record,
 directory and tail/head effects as ordinary full-page WAL images. No independently
@@ -277,4 +314,6 @@ caller timestamp mutation, stale/future head relative to control, pre-I/O admiss
 clock overflow and history-independent capture. The actual WalManager size/roll
 planner converges in both roll/no-roll cases without appending catalog records:
 the size-only test envelopes are not a supported journal WAL grammar. All production
-allowlists, capability bits, activation and public API remain unchanged.
+allowlists, capability bits, activation and public API remained unchanged at that
+prepared-binding checkpoint. The later internal activation section above assigns
+the catalog bit/horizon without yet registering journal WAL effects.

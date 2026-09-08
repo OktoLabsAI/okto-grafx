@@ -790,6 +790,16 @@ class EmbeddingSpaceDef:
 `Catalog` exposes `tables()`, `table(name)`, `spaces()`, `space(name)`, `next_table_id()`,
 `next_space_id()` and is itself persisted through `catalog.dat` as normal WAL-covered pages.
 
+Internal CAP-1B catalog-v2 extension: required capability bit 4 (`commit_catalog_v1`)
+adds a checksummed u64 activation COMMIT LSN at byte offset 44, immediately after
+the ordinary v2 extension, before schema bodies. It is absent when the capability
+is absent; legacy bytes are unchanged. The horizon is 1..PROVISIONAL_CSN-1 and
+unknown required capabilities refuse before body interpretation. The private
+activation transaction remains v1 WAL and does not create journal files. Automatic
+journal publication/replay and public APIs are not yet enabled; subsequent writes
+on experimentally activated stores explicitly refuse. Exact format, remaining
+integration requirements and evidence: [COMMIT_CATALOG_V1](COMMIT_CATALOG_V1.md).
+
 ---
 
 ## 8. Engine interfaces (FROZEN — cross-component contracts)

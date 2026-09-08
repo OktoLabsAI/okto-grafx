@@ -44,7 +44,8 @@ def _entry(metadata: CommitMetadata | None = None, *, maintenance: bool = False)
 def _resign(raw: bytes, offset: int, patch: bytes) -> bytes:
     body = bytearray(raw[:-4])
     body[offset:offset + len(patch)] = patch
-    return bytes(body) + struct.pack("<I", crc32c(body))
+    frozen = bytes(body)
+    return frozen + struct.pack("<I", crc32c(frozen))
 
 
 @pytest.mark.parametrize("metadata", [CommitMetadata(), CommitMetadata(actor="worker"),
@@ -207,7 +208,7 @@ def test_bounded_mutation_corpus_never_accepts_noncanonical_data() -> None:
         position = rng.randrange(len(candidate) - 4)
         candidate[position] ^= 1 << rng.randrange(8)
         if iteration % 2:
-            candidate[-4:] = struct.pack("<I", crc32c(candidate[:-4]))
+            candidate[-4:] = struct.pack("<I", crc32c(bytes(candidate[:-4])))
         try:
             decoded_record = decode_commit_catalog_entry(
                 bytes(candidate), expected_store_uuid=STORE, expected_sequence=17,

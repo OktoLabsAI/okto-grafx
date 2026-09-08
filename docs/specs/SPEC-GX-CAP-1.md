@@ -1,8 +1,8 @@
 # SPEC-GX-CAP-1 — Commit identity and provenance
 
 Status: CAP-1A domain admission implemented and validated; persistent/public capability not certified.
-CAP-1B record codec and private paged image planner/reader are implemented;
-activation/publication/recovery wiring is pending.
+CAP-1B record codec, private paged image planner/reader and internal activation fence
+are implemented; automatic journal publication/recovery and public wiring are pending.
 Date: 2026-09-08. Branch: feature/gx-cap-1, based on c310675.
 Dependencies: M1 typed API; GX-CAP-0.
 
@@ -282,3 +282,52 @@ Ruff/diff-check pass. The store-specific suite is now 71 tests (including its pr
 and is not a full engine regression or the outstanding integrated crash matrix.
 No Pulse operation, additional consolidation, deployment, release or change to the
 multi-reader/writer/OCC/WAL durability protocol occurred.
+
+### CAP-1B internal activation horizon — 2026-09-08
+
+Implemented the one-way required catalog bit and conditional activation LSN, plus
+a dedicated private activation transaction using the normal commit protocol. The
+catalog body is rebound to the final COMMIT LSN including segment roll; activation
+always emits legacy v1 WAL, even with compression previously enabled. It creates
+no journal files. Rollback/terminal cleanup discard its plan; pre-append retry keeps
+the plan consistent with rebound staged bytes. A post-barrier apply failure recovers
+exactly the original activation COMMIT and horizon on reopen.
+
+This is an internal prerequisite, **not complete GX-CAP-1**. A temporary guard
+refuses subsequent writing commits on activated fixtures until automatic journal
+publication/replay is connected. It also refuses an already-open foreign writer
+after current authority adoption. Non-activated databases remain writable. There
+is no public activation method, metadata begin option or installed Pulse feature.
+
+Grouped regression command:
+
+```text
+python -m pytest tests/txn tests/storage_core/test_catalog_v2.py
+  tests/storage_core/test_catalog_store.py tests/storage_core/test_catalog_copy.py
+  tests/storage_core/test_catalog.py tests/api/test_wal_page_compression.py
+  tests/recovery/test_catalog_commit_state_coactivation.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**1,195 passed in 118.97 s**. Review then found a duplicate cleanup in `_forget`
+and a missing one in terminal context abort. A new test failed before that fix;
+activation plus terminal-close suites then passed **50 tests in 3.43 s**. The new
+activation suite contains 19 cases. These results overlap, not 1,245 distinct tests.
+
+Earlier failing integration tests drove fixes for stale foreign capability state,
+legacy physical-only transactions' pre-barrier catalog reads, and rebound-plan
+validation on pre-append retry. Record corruption helpers now pass immutable bytes
+to CRC, respecting both native and pure implementations. No production CRC change.
+Ruff/diff-check pass. Strict mypy passes the new activation test with local `src`
+on MYPYPATH; Catalog/TransactionManager retain 49 existing errors, with identical
+normalized diagnostics versus HEAD `aac08b9` using mypy shadow files. This is not
+a claim of a type-clean engine.
+
+The old-reader case tests the old known-capability mask's refusal ordering, not an
+old executable or full multiprocess crash matrix. Remaining mandatory work: initial
+empty journal vs missing-history classification; required WAL grammar; journal
+staging before second OCC, including maintenance; full redo/coverage validation;
+public lookup and legacy boundary; metrics/verify, transfer/restore/fork and the
+complete concurrency/crash gates. Existing OCC, WAL/durability and multi-reader/
+writer premises were not relaxed. No Pulse operation or extra spec was consumed.
