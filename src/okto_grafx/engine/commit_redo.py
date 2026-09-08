@@ -24,6 +24,7 @@ from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.recovery.decision import (
     CommittedReplay, committed_replay, validate_commit_boundaries,
 )
+from okto_grafx.domain.txn.commit_identity import CommitId
 from okto_grafx.domain.txn.records import (
     COMMIT_CATALOG_PAGE_FILES, decode_page_write, is_redoable_page_file,
 )
@@ -34,6 +35,7 @@ from okto_grafx.engine.buffer_pool import (
     apply_page_image,
 )
 from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore, read_catalog_page_images
+from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -112,14 +114,16 @@ _PREFLIGHT_SEAL: object = object()
 class CommitRedo:
     """Replay committed page and logical-index effects through their idempotent doors."""
 
-    __slots__ = ("_pool", "_index_manager")
+    __slots__ = ("_pool", "_index_manager", "_database_uuid")
 
     def __init__(
-        self, pool: BufferPool, index_manager: IndexManager | None = None
+        self, pool: BufferPool, index_manager: IndexManager | None = None,
+        *, database_uuid: bytes | None = None,
     ) -> None:
         """Bind the pool and, when this database has indexes, its index registry."""
         self._pool = pool
         self._index_manager = index_manager
+        self._database_uuid = None if database_uuid is None else CommitId(database_uuid, 1).database_uuid
 
     def replay(self, records: Iterable[WalRecord]) -> CommitRedoResult:
         """Select committed effects from WAL-order ``records`` and apply them without flushing."""
@@ -405,8 +409,8 @@ class CommitRedo:
         No schema image exists to repair or establish activation in this range.
         Reading the canonical catalog through this already-fenced pool is therefore
         mandatory. This is one schema read per native replay, not a graph/history
-        walk, and creates no persistent or cached authority. Journal publication
-        remains disabled, so post-activation coverage must still refuse explicitly.
+        walk, and creates no persistent or cached authority. A stable checkpointed
+        head needs the database UUID; new journal effects remain disabled.
         """
         if checkpoint_lsn is None:
             return  # Legacy standalone dispatcher has no native control context.
@@ -437,6 +441,13 @@ class CommitRedo:
                 field="commit_catalog_activation", checkpoint_lsn=checkpoint_lsn,
                 activation_lsn=horizon,
             )
+        if not replay.commit_records and checkpoint_lsn > horizon and self._database_uuid is not None:
+            CommitCatalogStore(
+                storage.read_page, database_uuid=self._database_uuid, page_size=self._pool.page_size,
+            ).validate_published_head(
+                sequence=checkpoint_lsn, activation_sequence=horizon, file_size=storage.file_size,
+            )
+            return
         if checkpoint_lsn > horizon or replay.commit_records:
             raise GrafxRecoveryRefused(
                 "This native replay requires commit-history coverage not enabled by this build.",

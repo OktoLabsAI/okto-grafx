@@ -839,7 +839,7 @@ class TransactionManager:
             file_nonce=control_file_nonce,
             control_read_if_exists=control_read_if_exists,
         )
-        self._commit_redo = CommitRedo(pool, index_manager)
+        self._commit_redo = CommitRedo(pool, index_manager, database_uuid=database_uuid)
         self._clock: Clock = clock
         self._metrics: MetricsSink = metrics
         self._active_commit_trace: _CommitTrace | None = None

@@ -525,7 +525,7 @@ class RecoveryManager:
                 control_read_if_exists=control_read_if_exists,
             )
         )
-        self._redo_engine = CommitRedo(pool, index_manager)  # type: ignore[arg-type]
+        self._redo_engine = CommitRedo(pool, index_manager, database_uuid=database_uuid)  # type: ignore[arg-type]
         if self._metrics.enabled:
             for declared in RECOVERY_METRICS:
                 self._metrics.register(declared)

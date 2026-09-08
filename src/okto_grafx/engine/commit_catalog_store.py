@@ -21,7 +21,7 @@ from okto_grafx.domain.errors import (
 )
 from okto_grafx.domain.ids import NO_PAGE, PROVISIONAL_CSN
 from okto_grafx.domain.model.value import Timestamp
-from okto_grafx.domain.page import FileHeader, FileKind, Page, PageType
+from okto_grafx.domain.page import FileHeader, FileKind, Page, PageHeader, PageType
 from okto_grafx.domain.page.layout import validate_page_size
 from okto_grafx.domain.recovery.decision import CommittedReplay, validate_commit_boundaries
 from okto_grafx.domain.txn.commit_catalog import (
@@ -776,6 +776,72 @@ class CommitCatalogStore:
             else:
                 hi, upper = middle, item.sequence
         return None
+
+    def validate_published_head(
+        self, *, sequence: int, activation_sequence: int,
+        file_size: Callable[[str], int],
+    ) -> CommitCatalogHead:
+        """Check a stable nonempty physical head against caller-proved publication.
+
+        Exact file extents, identity, first directory boundary and the complete
+        last record are checked with bounded reads. This is NOT a full historical
+        verification, a crash-cut validator, an apply permit or physical authority.
+        Missing history is never interpreted as the empty activation state.
+        """
+        CommitId(self._uuid, sequence)
+        CommitId(self._uuid, activation_sequence)
+        if sequence <= activation_sequence:
+            raise _invalid("published_sequence")
+        sizes = {file: file_size(file) for file in (COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE)}
+        if any(type(size) is not int or size < 2 * self._page_size
+               or size % self._page_size or size // self._page_size > NO_PAGE for size in sizes.values()):
+            raise _corrupt("physical_extent")
+        stamps: dict[tuple[str, int], int] = {}
+
+        def read(file: str, index: int) -> bytes:
+            raw = self._read_page(file, index)
+            if type(raw) is not bytes or len(raw) != self._page_size:
+                raise _corrupt("page_size")
+            # The downstream _page performs the full CRC/layout validation.
+            stamp = PageHeader.decode(raw).page_lsn
+            if not activation_sequence < stamp <= sequence:
+                raise _corrupt("published_page_sequence")
+            stamps[file, index] = stamp
+            return raw
+
+        view = CommitCatalogStore(read, database_uuid=self._uuid, page_size=self._page_size)
+        head = view.read_head()
+        if head.activation_sequence != activation_sequence or head.last_sequence != sequence or not head.entry_count:
+            raise _corrupt("published_coverage")
+        last_directory = 1 + (head.entry_count - 1) // self._per_page
+        stream_pages = (head.stream_bytes + self._capacity - 1) // self._capacity
+        if sizes != {
+            COMMIT_DIRECTORY_FILE: (1 + last_directory) * self._page_size,
+            COMMIT_STREAM_FILE: (1 + stream_pages) * self._page_size,
+        }:
+            raise _corrupt("physical_extent")
+        first_items = view._directory_page(1, head)
+        last_items = first_items if last_directory == 1 else view._directory_page(last_directory, head)
+        if last_directory == 2:
+            view._adjacent(first_items[-1], last_items[0])
+        elif last_directory > 2 and (
+            first_items[-1].sequence >= last_items[0].sequence
+            or first_items[-1].ordered >= last_items[0].ordered
+            or first_items[-1].offset + first_items[-1].size >= last_items[0].offset
+        ):
+            raise _corrupt("directory_order")
+        tail = last_items[-1]
+        view._record(tail, head)
+        if (
+            stamps[COMMIT_DIRECTORY_FILE, 0] != sequence
+            or stamps[COMMIT_STREAM_FILE, 0] != first_items[0].sequence
+            or stamps[COMMIT_DIRECTORY_FILE, 1] != first_items[-1].sequence
+            or stamps[COMMIT_DIRECTORY_FILE, last_directory] != sequence
+            or any(stamp != sequence for (file, index), stamp in stamps.items()
+                   if file == COMMIT_STREAM_FILE and index > 0)
+        ):
+            raise _corrupt("published_page_sequence")
+        return head
 
     def _items(self, head: CommitCatalogHead) -> Iterator[_DirectoryItem]:
         for index in range(1, 1 + (head.entry_count + self._per_page - 1) // self._per_page):
