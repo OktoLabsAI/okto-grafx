@@ -7,6 +7,48 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Changed
+
+- Started the 0.0.5 development line for the six selected performance workstreams;
+  package and public runtime versions are now 0.0.5. No release is implied.
+- Expanded prepared-plan retention to the existing 256-statement working set,
+  with a 32 MiB conservative admission tariff and a 16,384-character per-text
+  retention ceiling. Capacity misses execute normally; runtime authority remains fenced.
+- Numeric `IN` parameters now reuse bounded, statement-local membership keys with
+  the existing float-normalized query equality, preserving nulls, signed zero,
+  large-integer rounding and NaN non-matches. Unsupported/custom values keep the walk.
+- Unstaged native writers may reuse scalar primary-key preflight values under fresh
+  per-read certificates; write statements and staged transactions retain their old path.
+- Top-k heaps use standard-library heap operations with unchanged ordering,
+  stable ties, retained-row limits and validation semantics.
+- Ordered multi-table pages now materialize only proven demanded columns, while
+  validating full payloads, overflow chains and index keys. Fresh pre/post root
+  certificates remain mandatory; foreign roots refresh clean companion heap
+  frames so a pinned old snapshot cannot follow a new reference into a stale page.
+- Writable startup performs one final fenced index admission instead of two;
+  independent recovery baseline checks and catalog/identity validation remain.
+
+### Added
+
+- `ConnectOptions` and typed `connect` keywords for all configuration fields,
+  including selector literals and a separately typed custom `registry` argument.
+  No new defaults, runtime dependencies or persisted formats.
+- Isolated full Pulse consolidation harness covering Community composition,
+  real SQLite, graph writes, outbox flush/reopen verification, durable ACK and
+  an idempotent empty second worker tick; no production specs consumed.
+
+### Validation
+
+- Closed the six bounded 0.0.5 performance actions with reproducible native,
+  real Pulse route/renderer, Global inventory/write, pinned-snapshot churn/RSS
+  and independent-reader/writer fixtures. Documented remaining physical growth,
+  non-linear thread throughput and unmeasured full production ACK attribution
+  without introducing timing gates or claiming those broader limits are fixed.
+- Candidate wheel passes isolated stdlib-only installation and durable reopen
+  smoke. No production Pulse installation or PyPI publication is implied.
+
+## [0.0.4] - 2026-09-08
+
 ### Added
 
 - Reorganized documentation around consumer integration: tutorial, synchronous/async

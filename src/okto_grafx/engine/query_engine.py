@@ -54,7 +54,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from heapq import heappop, heappush
+from heapq import heappop, heappush, heapreplace
 from types import MappingProxyType
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -301,7 +301,12 @@ _STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES: int = _PARSE_CACHE_MAX_ENTRIES
 # carries two of at most 500.  Beyond the ceiling the linear comparison stays the answer: the
 # memo is an accelerator over the same _freeze keys, never a second semantics.
 _IN_LIST_MEMO_MAX_TOTAL_ELEMENTS: int = 4_096
-_PLAN_CACHE_MAX_ENTRIES: int = 128
+_PLAN_CACHE_MAX_ENTRIES: int = 256
+# Optional retention limits, not query admission or process RSS guarantees. A layout-sized
+# working set must not cyclically thrash a smaller plan cache than the parsed statements.
+# Large texts still execute canonically, but do not retain AST/plan/authority graphs.
+_PREPARED_MAX_TEXT_CHARS: int = 16_384
+_PLAN_CACHE_MAX_BYTES: int = 32 * 1024 * 1024
 _PREPARED_PLAN_VERSION: int = 1
 _COMPILED_PREDICATE_MAX_ENTRIES: int = 256
 """Ceiling of the engine-local compiled WHERE predicates (EXEC-CSE).
@@ -309,7 +314,7 @@ _COMPILED_PREDICATE_MAX_ENTRIES: int = 256
 A compiled predicate is a tree of closures derived from one plan expression -- no row, no
 value, no snapshot, nothing a later statement could reuse as authority -- kept by the identity
 of the expression object of a cached plan, so a plan executed again never compiles again.  The
-oldest entry leaves when the ceiling is reached; the plan cache itself holds 128 plans.
+oldest entry leaves when the ceiling is reached; the plan cache itself holds at most 256 plans.
 """
 
 # An endpoint locator is derived, transaction-local acceleration.  These two ceilings are its
@@ -1197,10 +1202,9 @@ class _PrimaryKeyStatementMemo:
 class _InListMemo:
     """Hashed picture of one detached IN parameter list, built at most once per statement.
 
-    Only an exact tuple whose elements are exact ``str``, exact ``bytes`` or ``None`` is
-    memoised: for those kinds ``_equal`` is nothing but ``_freeze`` key equality, so a set of
-    the same keys answers exactly what the linear walk answers.  Numbers stay on the walk
-    because ``1 = 1.0`` crosses Python types, and every other kind stays there too.  ``values``
+    Exact strings/bytes use their existing frozen keys; exact int64/float numbers use
+    the float-normalized equality of ``_equal`` (including its large-integer rounding).
+    NaN never contributes a hit, and booleans/custom values keep the walk. ``values``
     is the detached parameter object itself: an evaluation that meets a different object proves
     the memo stale instead of trusting the name.
     """
@@ -1208,6 +1212,7 @@ class _InListMemo:
     values: tuple[Value, ...]
     keys: frozenset[object]
     has_null: bool
+    has_numbers: bool = False
 
 
 @dataclass(slots=True)
@@ -3199,7 +3204,10 @@ class QueryEngine:
         "_automatic_index_bucket_count",
         "_prepared_guard",
         "_parse_cache",
+        "_parsed_statement_texts",
         "_plan_cache",
+        "_plan_cache_bytes",
+        "_plan_cache_charges",
         "_owned_prepared_plans",
         "_statement_authority_memo",
         "_compiled_predicates",
@@ -3335,7 +3343,10 @@ class QueryEngine:
         # families under the same deliberately short, non-I/O critical sections.
         self._prepared_guard = self._endpoint_guard
         self._parse_cache: OrderedDict[str, Statement] = OrderedDict()
+        self._parsed_statement_texts: dict[int, str] = {}
         self._plan_cache: OrderedDict[_PreparedPlanKey, PlannedQuery] = OrderedDict()
+        self._plan_cache_bytes = 0
+        self._plan_cache_charges: dict[_PreparedPlanKey, int] = {}
         # Public result detachment may take its fast path only for a root retained here by this
         # exact engine. Counts handle one immutable plan admitted under more than one key.
         self._owned_prepared_plans: dict[int, tuple[PlanNode, int]] = {}
@@ -3368,12 +3379,17 @@ class QueryEngine:
         except GrafxError as failure:
             self._count_error(failure)
             raise
+        if len(text) > _PREPARED_MAX_TEXT_CHARS:
+            self._observe(PHASE_PARSE, started)
+            return statement
         with self._prepared_guard:
             existing = self._parse_cache.get(text)
             if existing is None:
                 self._parse_cache[text] = statement
+                self._parsed_statement_texts[id(statement)] = text
                 if len(self._parse_cache) > _PARSE_CACHE_MAX_ENTRIES:
                     _text, evicted = self._parse_cache.popitem(last=False)
+                    self._parsed_statement_texts.pop(id(evicted), None)
                     # The memo is keyed by the identity of a retained statement; a statement
                     # the parse cache no longer retains leaves the memo with it.
                     self._statement_authority_memo.pop(id(evicted), None)
@@ -3897,6 +3913,9 @@ class QueryEngine:
         """Retain one freshly proved projection for exactly this statement, bounded."""
         key = id(statement)
         with self._prepared_guard:
+            text = self._parsed_statement_texts.get(key)
+            if text is None or self._parse_cache.get(text) is not statement:
+                return
             self._statement_authority_memo[key] = _StatementAuthorityMemo(
                 statement=statement,
                 catalog=catalog,
@@ -3966,20 +3985,35 @@ class QueryEngine:
         self, key: _PreparedPlanKey, plan: PlannedQuery
     ) -> PlannedQuery:
         """Publish one immutable prepared plan, preserving a concurrent winner."""
+        # Conservative admission tariff for source-derived objects, catalog bytes and index
+        # definitions. Repeated catalog images are deliberately charged per key; this is not
+        # an RSS estimator. Capacity misses must never refuse execution or discard authority.
+        charge = (
+            4_096 + 128 * len(key.text) + len(key.catalog_image)
+            + 1_024 * len(key.index_picture) + 128 * len(key.dirty_tables)
+        )
+        if charge > _PLAN_CACHE_MAX_BYTES:
+            return plan
         with self._prepared_guard:
             existing = self._plan_cache.get(key)
             if existing is not None:
                 self._plan_cache.move_to_end(key)
                 return existing
             self._plan_cache[key] = plan
+            self._plan_cache_charges[key] = charge
+            self._plan_cache_bytes += charge
             marker = id(plan.root)
             owned = self._owned_prepared_plans.get(marker)
             if owned is None or owned[0] is not plan.root:
                 self._owned_prepared_plans[marker] = (plan.root, 1)
             else:
                 self._owned_prepared_plans[marker] = (owned[0], owned[1] + 1)
-            if len(self._plan_cache) > _PLAN_CACHE_MAX_ENTRIES:
+            while (
+                len(self._plan_cache) > _PLAN_CACHE_MAX_ENTRIES
+                or self._plan_cache_bytes > _PLAN_CACHE_MAX_BYTES
+            ):
                 _old_key, old_plan = self._plan_cache.popitem(last=False)
+                self._plan_cache_bytes -= self._plan_cache_charges.pop(_old_key)
                 old_marker = id(old_plan.root)
                 old_owned = self._owned_prepared_plans.get(old_marker)
                 if old_owned is not None and old_owned[0] is old_plan.root:
@@ -6053,10 +6087,18 @@ def _scalar_primary_key_group(
 
     A one-key batch validates the same candidate sequence as the scalar exact
     door. Reuse still opens a fresh stable index/heap view on every statement;
-    only bucket traversal and payload materialization may be reused. Writer
-    statements and specialized scalar collaborators keep their existing door.
+    only bucket traversal and payload materialization may be reused. An unstaged
+    native writer's read-only preflight has the same snapshot contract; writing
+    statements, staged owners and specialized scalar collaborators keep their door.
     """
-    if type(context.txn) is not TransactionContext or context.txn.mode is not TransactionMode.READ:
+    if type(context.txn) is not TransactionContext:
+        return None
+    if context.txn.mode is not TransactionMode.READ and (
+        context.txn.mode is not TransactionMode.WRITE
+        or context.txn.wrote
+        or context.result_node is None
+        or _plan_writes(context.result_node)
+    ):
         return None
     many = getattr(manager, "validated_versions_many", None)
     definition = getattr(store, "definition", None)
@@ -6276,7 +6318,8 @@ def _closed_node_scan_projections(
 
     Projection is declined unless the entire physical path is a linear combination of filters,
     result projection, ordering, DISTINCT and a window over exactly one NodeScan/AllNodesScan
-    driven by SingleRow. Every expression is walked: direct properties of the scan variable are
+    driven by SingleRow, or one certified OrderedNodeMerge. Ordered key columns are retained
+    for heap revalidation even when not returned. Every expression is walked: properties are
     retained, while a bare occurrence of that variable declines the optimization because it may
     expose or inspect the complete entity. Expressions over other computed aliases do not need
     stored columns. This makes the proof intentionally narrower than the query language.
@@ -6307,7 +6350,14 @@ def _closed_node_scan_projections(
             break
         planned = planned.child  # type: ignore[attr-defined]
 
-    if type(planned) is NodeScan:
+    required_properties: set[str] = set()
+    if type(planned) is OrderedNodeMerge:
+        variable = planned.variable
+        tables = planned.tables
+        required_properties.update((planned.timestamp_column, planned.string_column))
+        if planned.predicate is not None:
+            expressions.append(planned.predicate)
+    elif type(planned) is NodeScan:
         if type(planned.child) is not SingleRow:
             return {}
         variable = planned.variable
@@ -6320,7 +6370,7 @@ def _closed_node_scan_projections(
     else:
         return {}
 
-    property_names: set[str] = set()
+    property_names: set[str] = required_properties
     pending = list(expressions)
     while pending:
         expression = pending.pop()
@@ -7732,12 +7782,24 @@ def _ordered_node_merge(
         for table, store, upper_key in zip(
             node.tables, stores, upper_keys, strict=True
         ):
-            iterator = store.iter_visible_desc(  # type: ignore[attr-defined]
-                engine.heap,
-                table,
-                context.snapshot,
-                upper_key=upper_key,
-            )
+            from okto_grafx.domain.index import SnapshotLike
+            from okto_grafx.engine.ordered_index import OrderedIndex, _NATIVE_ORDERED_DESC
+
+            positions = context.node_scan_projections.get(id(node), {}).get(table.table_id)
+            if (positions is not None and type(store) is OrderedIndex
+                    and getattr(store.iter_visible_desc, "__func__", None) is _NATIVE_ORDERED_DESC):
+                iterator = store._iter_visible_desc(
+                    engine.heap, table, cast(SnapshotLike, context.snapshot), upper_key=upper_key,
+                    materialized_positions=positions,
+                )
+                context.count("ordered_projected_tables")
+            else:
+                iterator = store.iter_visible_desc(  # type: ignore[attr-defined]
+                    engine.heap,
+                    table,
+                    context.snapshot,
+                    upper_key=upper_key,
+                )
             iterators.append(iter(iterator))
 
         queue: list[_OrderedMergeCandidate] = []
@@ -11384,50 +11446,17 @@ class _TopCandidate:
 
 def _top_heap_push(heap: list[_TopCandidate], candidate: _TopCandidate) -> None:
     """Push one candidate while preserving the local worst-first binary heap."""
-    position = len(heap)
-    heap.append(candidate)
-    while position:
-        parent = (position - 1) // 2
-        incumbent = heap[parent]
-        if not candidate < incumbent:
-            break
-        heap[position] = incumbent
-        position = parent
-    heap[position] = candidate
+    heappush(heap, candidate)
 
 
 def _top_heap_replace(heap: list[_TopCandidate], candidate: _TopCandidate) -> None:
     """Replace the worst candidate and restore the binary heap in O(log K)."""
-    heap[0] = candidate
-    _top_heap_sift_down(heap, 0)
+    heapreplace(heap, candidate)
 
 
 def _top_heap_pop(heap: list[_TopCandidate]) -> _TopCandidate:
     """Remove and return the worst candidate in O(log K)."""
-    tail = heap.pop()
-    if not heap:
-        return tail
-    result = heap[0]
-    heap[0] = tail
-    _top_heap_sift_down(heap, 0)
-    return result
-
-
-def _top_heap_sift_down(heap: list[_TopCandidate], position: int) -> None:
-    """Move one rootward candidate down to its binary-heap position."""
-    length = len(heap)
-    candidate = heap[position]
-    while True:
-        left = position * 2 + 1
-        if left >= length:
-            break
-        right = left + 1
-        child = right if right < length and heap[right] < heap[left] else left
-        if not heap[child] < candidate:
-            break
-        heap[position] = heap[child]
-        position = child
-    heap[position] = candidate
+    return heappop(heap)
 
 
 def _top_rows(
@@ -14748,7 +14777,7 @@ def _in_list_memo(name: str, value: object, context: _Context) -> _InListMemo | 
 
 
 def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
-    """Hash one detached list of strings, bytes and nulls, or decline to the linear walk.
+    """Hash supported detached scalars, or decline to the unchanged linear walk.
 
     Declining is silent and final for the statement: an exact list (not the detached tuple the
     facade hands over), any element of another kind, or a list that would carry the statement
@@ -14760,29 +14789,44 @@ def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
         return None
     keys: set[object] = set()
     has_null = False
+    has_numbers = False
     for element in value:
         kind = type(element)
         if element is None:
             has_null = True
         elif kind is str or kind is bytes:
             keys.add(_freeze(element))
+        elif kind is float or (kind is int and INT64_MIN <= element <= INT64_MAX):
+            has_numbers = True
+            number = float(element)
+            # Python set membership can match an identical NaN object; query equality cannot.
+            if not isnan(number):
+                keys.add(("in_numeric", number))
         else:
             return None
     context.in_list_memo_elements += len(value)
-    return _InListMemo(values=value, keys=frozenset(keys), has_null=has_null)
+    return _InListMemo(
+        values=value, keys=frozenset(keys), has_null=has_null, has_numbers=has_numbers,
+    )
 
 
 def _memo_membership(left: object, memo: _InListMemo) -> object:
     """Answer IN over a hashed list exactly as the linear walk over the same list would.
 
-    Only an exact ``str`` or ``bytes`` on the left consults the set: against a list of those
-    kinds ``_equal`` is ``_freeze`` key equality and nothing else.  Every other left value --
-    a binding, a list, a map, a number, a boolean -- takes the walk over the same detached
-    list, so the memo never decides a comparison it did not build for.
+    Exact text/bytes retain frozen-key equality. Supported numeric probes use the same
+    float normalization as the canonical comparison, not Python's int/float set equality.
+    Other values retain the walk, including custom conversion/comparison behavior.
     """
     if left is None:
         return None
     kind = type(left)
+    if memo.has_numbers and (
+        kind is float or (kind is int and INT64_MIN <= cast(int, left) <= INT64_MAX)
+    ):
+        number = float(cast(int | float, left))
+        if not isnan(number) and ("in_numeric", number) in memo.keys:
+            return True
+        return None if memo.has_null else False
     if kind is not str and kind is not bytes:
         return _membership(left, memo.values)
     if _freeze(left) in memo.keys:

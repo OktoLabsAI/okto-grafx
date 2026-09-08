@@ -1,8 +1,8 @@
 # Okto Grafx roadmap
 
 **Single active product backlog — reconciled September 8, 2026.**
-Baseline: source `0.0.4`, checkpoint `485ea074bf2b9e174200b44bb74c7adb54c1ecab`
-on `feature/gx-cap-1`; latest recorded Pulse measurement is a different build,
+Baseline: published `0.0.4`, tag `v0.0.4`, main merge
+`425362a44c4b8224cb43b33f0f7f65458c4ee193`; latest recorded Pulse measurement is a different build,
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
 
 This roadmap includes **new capabilities, corrective work, known limitations,
@@ -14,8 +14,11 @@ reopen completed work, authorize production data changes or imply release approv
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
+- [Approved four-item follow-up](#approved-four-item-follow-up)
+- [Proposed next round after the 0.0.5 checkpoint](#proposed-next-round-after-the-005-checkpoint)
 - [Known limitations and corrective work](#known-limitations-and-corrective-work)
 - [Remaining performance work](#remaining-performance-work)
+- [Next iteration assessment: feature/v0.0.5](#next-iteration-assessment-featurev005)
 - [Database capabilities and dependencies](#database-capabilities-and-dependencies)
 - [Optional agent product](#optional-agent-product)
 - [Completed foundations](#completed-foundations)
@@ -35,8 +38,8 @@ reopen completed work, authorize production data changes or imply release approv
    semantic/durability failures are blockers, historical timing ratios are not.
 4. One active status here; specs define contracts and reports supply evidence.
    A specification, internal codec or passing isolated test is not a shipped API.
-5. No release date or next version is promised by a row below. Publishing 0.0.4
-   remains a joint operator action. Later feature/version allocation is explicit.
+5. No release date or complete version scope is promised by a row below. Version
+   0.0.4 was published with the operator; later release approval remains explicit.
 
 | Status | Meaning |
 | --- | --- |
@@ -51,11 +54,52 @@ reopen completed work, authorize production data changes or imply release approv
 
 | ID | Status | Deliverable / exit condition |
 | --- | --- | --- |
-| REL-004 | Pending joint release | Finish documentation validation and agreed release review; confirm candidate/branch, then PR/merge/tag/build/install checks and PyPI publication with the operator. No upload is implied here. |
+| REL-004 | Published September 8, 2026 | [PR #2](https://github.com/OktoLabsAI/okto-grafx/pull/2) merged; tag `v0.0.4` points to `425362a`. Wheel/sdist built from the tag, Twine validation, 149 package-file parity checks, isolated consumer smoke and public PyPI install smoke passed; remote SHA-256 values matched. [PyPI 0.0.4](https://pypi.org/project/okto-grafx/0.0.4/). GitHub Actions could not start because of account billing; local evidence does not certify the remote/platform matrix. |
 | DOC-1 | Implemented in this documentation refactor | One README entry point, public API/configuration/query/operations references, measured-performance table, one roadmap and a preserved source archive. Links, examples, API/config field coverage and preservation hashes are checked; [validation receipt](docs/reports/DOCUMENTATION_REFACTOR_2026_09_08.md). |
 | CAP-1B | Implemented checkpoint | `6b5163e`: native journal preflight is connected to page application/checkpoint; UUID, activation/COMMIT coverage, target/resident LSN and file extents validated. 2,433 tests / 77.27 s recorded; no new typing diagnostics in the isolated comparison. This is recovery correctness, not a latency benchmark. |
 | GX-CAP-1 remainder | Partial; no automatic emission/public history API | Complete writer journal staging/publication, public lookup/verification, metrics and logical-transfer semantics before exposing generic commit provenance. See [spec](docs/specs/SPEC-GX-CAP-1.md). Do not install/activate unfinished capability paths in Pulse. |
 | PULSE-BENCH | Reserved workload | Latest recorded authorized run consumed one spec; 19 remain reserved. Do not consolidate more, redrive, rebuild or reset data to improve this document. New live runs need a deliberate workload decision. |
+
+## Approved four-item follow-up
+
+Approved after the six bounded 0.0.5 actions below. This is a finite follow-up,
+not a reopening of their acceptance criteria. Work remains on `feature/v0.0.5`.
+
+| Item | Status | Delivery / acceptance |
+| --- | --- | --- |
+| 1. Ordered-page projection | Implemented checkpoint | Materializes only demanded columns; validates omitted payloads, index keys, both certificates and original snapshots. Fixed foreign-root/stale-heap reference failure. Latest 128-row wide projected page: 20.247 ms. |
+| 2. Open/reopen admission | Implemented checkpoint | Removed duplicate index admission inside the startup artifact section; retained gap recovery, catalog refresh, existing-only recovery baseline, identity checks and fenced creation. Latest full-schema + 128-node writable open: 2,521.420 ms. |
+| 3. Full synthetic Pulse consolidation | Implemented checkpoint; production scope remains separate | Real Community/SQLite/Grafx/primitives/outbox/ACK passed: four nodes, four edges, four refs/digests, one ACK, empty second tick. Commit 1,404.860 ms; worker through ACK 2,509.933 ms. Dominant residual cost is first independent-reader joins/checkpoint, not SQLite; no reserved specs consumed or guarantees removed. |
+| 4. Typed connection configuration | Implemented checkpoint | All 35 config keywords and selector literals exported through `ConnectOptions`; positive/negative static consumers, runtime errors, docs, custom registry signature and isolated installed-wheel export validated. |
+
+[Full evidence, failure disposition, boundaries and reproduction](docs/reports/V005_FOUR_ITEM_FOLLOWUP.md).
+The grouped run had 4,198 passes, five investigated failures and one skip; the
+corrected affected/adjacent set passed all 138 tests. Four failures were invalid
+physical-page fixtures reproduced on untouched HEAD; their corruption refusal is
+now retained as a separate negative test. No performance gate or release action
+was added. Further cold-reader/open work must preserve independent participants
+and include checkpoint cost, not move it outside the timing boundary.
+
+## Proposed next round after the 0.0.5 checkpoint
+
+Proposed September 8, 2026 at the operator's request for the next set. **Not yet
+selected for implementation.** The previous six-plus-four bounded actions remain
+closed; these are residual product slices, not additional gates on that delivery.
+No version bump, new branch, production workload or release is implied.
+
+| Order / existing IDs | Bounded proposed delivery | Effort / expected value | Precedence and acceptance boundary |
+| --- | --- | --- | --- |
+| N1 / PERF-COLD, PERF-WRITE | Reduce demonstrated repeated work in independent-reader admission and first-join checkpoint. The full consolidation profile identifies four reader opens and one checkpoint, not SQLite commit, as the dominant reconciliation cost. | Medium to large / highest measured latency opportunity in the small cold workload; percentage unknown | Reuse the existing full synthetic consolidation. Separate native admission/checkpoint changes from Community participant lifetime. Preserve independent lanes and fresh identity/recovery checks; moving checkpoint into warmup is not a speedup. Verify cold/warm and concurrent-reader/writer behavior. |
+| N2 / BATCH-REL-1, PERF-COLD | Reduce remaining per-layout preparation/dispatch in a KG page. Existing filtering already reduces 69 layouts to 13; do not repeat that implementation. Share only bounded derived work that still preserves each layout's result and error. | Medium / conditional warm-page benefit, smaller than N1 for the cold fixture | After N1, use the fixed first/next-page workload. Exact nodes/edges, multiplicity, totals, snapshot boundaries, corruption refusal and independent error diagnostics must remain. No authority bundle; no public batch API unless measured residual dispatch justifies it. Stop if that overhead is marginal. |
+| N3 / OPS-3, PERF-MEM | Extend foreground vacuum to reclaim horizon-eligible overflow history safely. The existing churn fixture demonstrates retained disk growth; it does not justify an online vacuum or a file-shrinking claim. | Large / high long-lived-store and disk-growth value, not an immediate UI speedup | Reuse pinned-reader/churn fixtures. Deliver only overflow lifetime/reclamation with WAL/crash/reopen proofs and refusal when quiescence is absent. File truncation, online reclamation and immutable-index orphan cleanup remain separate scopes. |
+| N4 / GX-CAP-1 remainder | Complete native durable commit provenance: writer publication, public qualified lookup/metadata, verification/metrics and the transfer semantics required by the existing spec. | Large / high integration/recovery foundation value; may add write overhead, not a performance optimization | Separate capability checkpoint after the performance slices. Reuse the implemented journal/recovery foundation. Require atomic metadata/COMMIT behavior, replay idempotency, bounded lookup and concurrency/crash coverage; measure added commit cost. No temporal-history, FTS or attached-catalog scope bundled into this item. |
+
+Recommendation: select N1–N2 as the next performance checkpoint; then take N3 and
+N4 as separate, explicit deliveries. Keep snapshot/WAL/durability tests as blockers,
+group regressions after cohesive changes and impose no timing percentage floor.
+Evidence: [four-item follow-up](docs/reports/V005_FOUR_ITEM_FOLLOWUP.md),
+[lifetime and page workload](docs/reports/V005_NATIVE_PERFORMANCE_CHECKPOINT.md),
+[CAP-1 contract](docs/specs/SPEC-GX-CAP-1.md).
 
 ## Known limitations and corrective work
 
@@ -67,7 +111,7 @@ reopen completed work, authorize production data changes or imply release approv
 | OPS-4 / P1.8 | Open limitation: buffer and query budgets are not process RSS caps | Account/measure all retained engine state, vector memory, concurrent handles and temporary encodings. Preserve deterministic refusal; publish a realistic peak-memory envelope, not an RSS promise derived from nominal page bytes. |
 | OPS-5 / P1.12 | Partial: explicit growth/rebuild exists | Hash directories cap at 4,096 buckets; skew/overflow and retained immutable orphan generations remain. Define bounded reclamation and larger-scale indexing without in-place generation replacement. |
 | OPS-6 / P1.11 | Open limitation: physical conflicts and exclusive publication | Remove only proven redundant publication/page work. Disjoint logical rows may still conflict; do not promise linear writer scaling or replace multiwriter with an application-wide single-writer premise. |
-| OPS-7 / P2.6, P2.9 | Open DX/operational constraints | `connect(**options)` lacks fully explicit keyword autocomplete; checksum selection is process-global. Improve discoverability/isolation where justified, without silently changing provider or byte semantics. |
+| OPS-7 / P2.6, P2.9 | Partial DX improvement in 0.0.5 | `connect(**options)` declares validated `Unpack[ConnectOptions]` keyword/static contracts; evidence above. Checksum selection is still process-global. No provider or byte semantics changed. |
 | OPS-8 / §8.5 | Partial: Query/cursor API exists | Reusable `Query` is not a durable prepared plan or HTTP token. General prepared statements/plan-cache invalidation, deadlines/cancellation and broader streaming need explicit semantics. |
 | OPS-9 / P1.16 | Deferred configuration capability | Expose HNSW construction knobs only with persistent identity/defaults, cold/incremental parity expectations and a controlled 8,192×384 recall profile. `vector_ef_search` already configures runtime beam; it is not construction tuning. |
 | OPS-10 / P2.8 | Acceptance obligation | Exercise supported Python versions/platforms, wheels/sdists, optional accelerators, version refusal and upgrade fixtures. A local Windows run is not a claim that every matrix row passed. |
@@ -96,6 +140,87 @@ Completed Wave 0–3, OIX-0–3, source-reference seeks, query-expression reuse,
 vector-free relationship landings, grouped endpoint/count checks, bucket batching,
 recovery-floor reuse and telemetry sampling stay completed within their recorded
 scope. Negative experiments are not silently put back into this queue.
+
+## Next iteration assessment: feature/v0.0.5
+
+Assessment opened September 8, 2026 at the operator's request. Local branch
+`feature/v0.0.5` starts at the released main merge `425362a`. This section orders
+existing backlog items; it is not another independent plan. The operator subsequently
+selected performance items 1–6 for delivery 0.0.5; the bounded implementation and
+follow-up validation are now complete as recorded below,
+and package/source versions are bumped to 0.0.5. Product-capability rows below remain
+unselected. No live Pulse mutation is implied. Effort is relative: small
+means a localized change, medium crosses a few components, large changes persisted
+or concurrent protocols. Potential impact is a hypothesis, not a measured speedup.
+
+### Performance: recommended execution order
+
+| Order / existing IDs | Concrete opportunity and evidence | Effort / potential impact | Bounded first action and stop condition |
+| --- | --- | --- | --- |
+| 1 / PERF-COLD, BATCH-REL-1 | KG first page, next 500 nodes and relationship statement fan-out. Latest-source UI latency is unknown; existing 64-step destination batches already remove much per-identity certification overhead, so repeating that implementation is not new work. [Batch evidence](docs/reports/GLOBAL_DESTINATION_BATCHING_0_0_4.md). | Small assessment; medium implementation / potentially high visible latency benefit | One fixed read-only workload, first/next page, cold/warm and one independent writer; separate open, query/layout, transport and render costs. Select the dominant repeated work only. Preserve exact nodes/edges, multiplicity, totals and independent errors. No new public batch API unless remaining overhead justifies it. |
+| 2 / PERF-WRITE | Attribute native commit versus admission, SQLite/outbox, verification and scheduling. Latest full calls are 10.726 s commit and 54.952 s Global ACK, while a different private native workload measured 51–57 ms; these are not comparable A/B samples. [Measurement boundaries](docs/PERFORMANCE.md). | Small attribution; implementation depends on result / potentially high end-to-end benefit | Validate phase-observation capture first. Use a fixed synthetic representative write before any newly authorized real spec. Remove repeated generic engine work only where measured; consumer scheduling/relational costs stay in Pulse, not Grafx Core. Do not consume all reserved specs or keep repeating runs without a discriminating question. |
+| 3 / PERF-SCALE, OPS-5 | Avoid whole-graph work for selective lookups and bounded pages; inspect skew, relationship fan-out and index growth. Ordered cursor work is already implemented; hash directories still cap at 4,096 buckets and completeness fallbacks can remain O(N). | Medium to large / high at larger N if an affected access path dominates | Fixed selective queries at three declared sizes, with operation/page counts and identical semantics. Identify the actual scan/overflow path before choosing an index change. Full graph enumeration and verification remain proportional to data; no universal O(1) promise or removal of corruption detection. |
+| 4 / PERF-MEM, OPS-3/4/5 | Reduce retained state and growth under updates/deletes: multiple handles, immutable index generations, overflow history. Vacuum v1 does not reclaim overflow or shrink files. [Current maintenance limits](docs/OPERATIONS.md#maintenance-backup-and-upgrades). | Medium diagnosis; large reclamation work / high long-lived-store value | A bounded churn workload with peak RSS, disk growth and a pinned reader. Separate cache/accounting fixes from physical reclamation. Reclamation requires snapshot/lifetime and crash proofs; it is not a quick online-vacuum toggle. |
+| 5 / CONC-CPU-1, OPS-6 | Reduce demonstrated CPU/decode/expression or publication contention after legitimate I/O parallelism. Independent readers already exist; more handles do not remove the GIL or exclusive durable publication. | Medium; large for native/process changes / conditional | Reuse the same fixtures with 1/2/4 participants and identify wait versus CPU. Prefer bounded local hot-path work. Native kernels, processes or publication redesign are selected only if that cost dominates; retain both OCC checks and multiwriter semantics. |
+| 6 / OPS-8, BATCH-REL-1 | Reusable prepared execution and bounded shared statement preparation, beyond existing expression reuse. A reusable public Query is not a persisted prepared plan. | Medium / conditional, lower priority until preparation is material | Count parse/plan/catalog preparation in the chosen KG workload. Cache only derived immutable preparation with explicit schema/snapshot/config invalidation and budgets. Do not cache authority or silently combine independent statement failures. |
+
+Orders 1–2 form the first checkpoint: one bounded attribution pass per workload,
+then the demonstrated high-impact localized fixes and one grouped regression.
+No percentage floor or repeated marginal timing gate. If the dominant cost is
+outside Grafx, record that fact and route the integration change appropriately;
+do not invent an engine rewrite to keep the queue busy. Orders 3–6 were handled
+after that checkpoint; the outcomes below are not six new mandatory rewrites.
+
+### 0.0.5 implementation checkpoint — September 8, 2026
+
+The six selected **bounded 0.0.5 actions are complete**, including their follow-up
+measurements and dispositions below. This does not close the broader PERF/OPS
+backlog. Four bounded engine changes are implemented and tested: layout-sized plan retention with admission
+limits, numeric IN membership, unstaged-writer scalar PK reuse and standard-library
+top-k heaps. [Evidence and latest synthetic measurements](docs/reports/V005_NATIVE_PERFORMANCE_CHECKPOINT.md).
+Version/package metadata is 0.0.5; no on-disk format, public configuration, WAL/OCC
+protocol or automatic commit-history capability was changed.
+
+| Selected item | 0.0.5 bounded outcome | Explicit remaining product/consumer work, not silently included |
+| --- | --- | --- |
+| 1 / KG loading | Closed: exact route/service/adapter fixture at 128/512/1,100 nodes; 13 of 69 layouts selected; real Pulse API client + GraphCanvas loaded 500/1,000/1,100 nodes and terminated pagination | Full authenticated production KnowledgeGraphPage/SQLite overhead and latest-source Ladybug parity are not measured by fixture controls. No redundant layout implementation |
+| 2 / Write/Global delivery | Closed for the selected fixed synthetic write: fresh-certified preflight reuse; native phases, actual Global vector writes, Core dispatch and integrity inventories measured; phase/fence/cancellation capture tests pass | Historical full production commit/54.952 s ACK still lacks graph-versus-SQLite/scheduling attribution. Not claimed solved; requires a separate consumer receipt after deployment, not another native timing floor |
+| 3 / Scale | Closed bounded experiment: numeric IN no longer walks each list for every numeric match; three native sizes plus Pulse sizes and 128-edge hub; ordered page examines 500 candidates at both 512 and 1,100 nodes | Whole enumeration remains O(N); 4,096-bucket limit not reached, so no speculative format/sharding rewrite. Wider skew/index growth remains PERF-SCALE/OPS-5 |
+| 4 / Retained memory | Closed cache slice and lifetime experiment: text/byte admission and owner release; 12 update/delete/overflow cycles with 1/2/4 handles plus pinned reader, measured RSS, exact old/current answers and clean reopen | Heap growth remains real; no overflow reclamation or file shrink. Physical reclamation/index history remains OPS-3/4/5 with its crash/snapshot prerequisites |
+| 5 / CPU/concurrency | Closed attribution: actual page shape at 1/2/4 independent handles, including two writers; correct reads/durable updates; wall/thread CPU/non-CPU recorded | More threads did not yield linear scaling. Non-CPU includes GIL/OS/I/O, not proven lock-only wait. Native kernels/processes/publication redesign remain OPS-6 |
+| 6 / Preparation | Closed: 160-shape cyclic cache regression fixed within limits; real warm KG cycle built zero parses/plans, with 16 retained plans | Preparation is not the dominant warm KG cost. Durable public prepared-plan APIs remain OPS-8; no authority cache added |
+
+Validation: 2,841 grouped query/API/import/documentation tests passed in 306.28 s;
+113 consumer integration tests in 28.45 s; final focused 137 tests in 5.04 s overlap
+that coverage and include the final writer OCC/read-partition cases. Follow-up:
+92 additional/overlapping Community tests in 61.82 s, 39 Core phase/fence/inventory
+tests in 4.75 s, browser fixture and isolated 0.0.5 wheel smoke all passed. The final
+focused/documentation slice passed 149 tests in 9.43 s (overlapping prior coverage).
+Strict mypy
+retains the identical 254 baseline diagnostics in query_engine.py after normalized
+line offsets; no new diagnostics, not a type-clean-engine claim. No live Pulse
+restart, production deployment, spec consolidation, backfill, commit/push or release
+occurred. Isolated UI listeners were stopped. The linked report preserves exact
+measurement boundaries and every remaining limitation; closure is of the six
+bounded actions, not a promise to finish every referenced OPS milestone in 0.0.5.
+
+### Product evolution: proximity versus value
+
+| Recommended position / existing IDs | Next usable capability | Effort / value / dependency |
+| --- | --- | --- |
+| Small independent DX improvement / OPS-7 | Typed keyword discoverability for connect options, matching the documented configuration and runtime validation; preserve custom-adapter consumption. | Small to medium / immediate integration usability, no expected throughput gain. Keep checksum-provider isolation as a separate deeper item; autocomplete does not solve process-global selection. |
+| First substantial capability / GX-CAP-1 remainder | Complete durable commit identity/provenance: automatic writer staging/publication, qualified lookup, public metadata/history doors, verification/metrics and specified transfer/restore/fork semantics. | Large remaining integration / high foundation value. Internal admission, paged lookup and qualified replay already exist, not a finished public capability. Adds write/retention cost that must be measured. It is not itself a speedup or full temporal history. [Remaining contract](docs/specs/SPEC-GX-CAP-1.md). |
+| Operational evolution / OPS-1, OPS-2 | Consistent backup/restore into a new directory and versioned logical export/import. | Large / high recoverability and integration value. No generic hot backup API exists today. Identity/retention and provenance must align with CAP-1; copying live files is not a shortcut. Finish one usable contract before combining both products. |
+| Next search capability / GX-CAP-5 | Native FTS with transactional postings, explicit analyzers/versioning, BM25 and typed bounded search. | Large / high new retrieval value, not an optimization of every graph query. Its direct prerequisites are existing index lifecycle/budgets/planner and CAP-0; it is not technically blocked on all temporal milestones. Shared format/WAL integration still follows controlled sequencing. [FTS spec](docs/specs/SPEC-GX-CAP-5.md). |
+| After commit provenance / GX-CAP-2, GX-CAP-3 | Attached catalog sessions and opt-in system-time history. | Large each / strategic multi-store/temporal value. CAP-1 first; one-store writes remain the rule. Neither is required to fix current KG loading. |
+| Later dependent capabilities / GX-CAP-4/6/7/8/9/10, AGENT | Bitemporal/hybrid retrieval, extension SPI, Arrow/exchange, graph algorithms, schema evolution and optional agent packages. | Medium to large individual slices / valuable but not all immediate. Respect declared dependencies: hybrid needs FTS, Arrow/external scans currently depend on CAP-7 and existing streaming/bulk. Do not advertise them as small already-enabled follow-ups. |
+
+Recommendation: close the first performance checkpoint, take a bounded DX slice
+where independent, then finish CAP-1 as the next substantial evolution. Backup
+and FTS remain the strongest subsequent product candidates, not automatic scope
+for this branch. Existing multi-read/write, durability, consistency and fail-closed
+constraints apply throughout. Group commit, indexed-only DETACH DELETE, authority
+bundles and sharding remain in their existing rejected/deferred dispositions.
 
 ## Database capabilities and dependencies
 

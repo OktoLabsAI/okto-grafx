@@ -161,8 +161,9 @@ def test_reopen_adopts_listed_indexes_without_rechecking_each_name(
     with connect(root) as reopened:
         assert len(reopened.indexes.indexes()) >= 8
 
-    assert len(index_exists_calls) == 8
-    assert len(set(index_exists_calls)) == 8
+    # The directory inventory proves names; the final fenced admission still
+    # opens/validates their bytes without per-name existence probes.
+    assert index_exists_calls == []
 
 
 def test_close_leaves_a_caller_supplied_registry_alone(tmp_path: Path) -> None:

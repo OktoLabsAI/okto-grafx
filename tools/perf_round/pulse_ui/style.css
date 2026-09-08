@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+body { margin: 0; font-family: system-ui, sans-serif; background: #f8fafc; color: #172033; }
+header { padding: 12px 20px; }
+h1 { font-size: 18px; font-weight: 600; }
+button { border: 1px solid #64748b; border-radius: 4px; padding: 4px 12px; background: white; }
+button:disabled { opacity: .4; }

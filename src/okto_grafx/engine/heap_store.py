@@ -1914,6 +1914,29 @@ class HeapStore:
             table, RecordHeader._from_peek(fields), content
         )
 
+    def _read_if_projected(
+        self,
+        ref: RecordRef,
+        accept: Callable[[RecordId, Csn, Csn], bool],
+        materialized_positions: frozenset[int],
+    ) -> HeapVersion | None:
+        """Validate the full accepted payload, allocating only proven required columns.
+
+        Specialized header-read hooks retain their canonical behavior. Visibility,
+        overflow traversal and schema validation are identical to ``read_if``.
+        """
+        if getattr(self.read_if, "__func__", None) is not _NATIVE_HEAP_READ_IF:
+            return self.read_if(ref, accept)
+        table_id, content = self._read_slot(ref)
+        table = self._catalog.catalog.table_by_id(table_id)
+        fields = RecordHeader.peek(content)
+        if not accept(fields[4], fields[5], fields[6]):
+            return None
+        return self._decode_version_with_header(
+            table, RecordHeader._from_peek(fields), content,
+            materialized_positions=materialized_positions,
+        )
+
     def _revalidate_visible_ref(
         self,
         table: TableDef,
@@ -3370,3 +3393,6 @@ class HeapStore:
 
     def __repr__(self) -> str:
         return f"HeapStore(file={self._file!r}, inline_capacity={self.inline_capacity})"
+
+
+_NATIVE_HEAP_READ_IF = HeapStore.read_if

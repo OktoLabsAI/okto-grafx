@@ -103,7 +103,7 @@ def test_null_in_the_list_keeps_a_miss_unknown(database: object) -> None:
     )
 
 
-def test_numbers_keep_the_linear_walk_and_its_cross_type_equality(
+def test_numbers_reuse_the_memo_and_keep_canonical_cross_type_equality(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     builds: list[object] = []
@@ -119,11 +119,11 @@ def test_numbers_keep_the_linear_walk_and_its_cross_type_equality(
         database, "MATCH (n:T) WHERE n.n IN $ns RETURN n.id", {"ns": [1.0, 2, "3", 4.5]}
     )
     assert rows == ["t-001", "t-002"]
-    assert builds == [None]
-    # An all-integer list against a DOUBLE column: 1 = 1.0 holds only on the walk.
+    assert len(builds) == 1 and builds[0] is not None
+    # An all-integer list against a DOUBLE column retains 1 = 1.0.
     rows = _ids(database, "MATCH (n:T) WHERE n.d IN $ns RETURN n.id", {"ns": [1, 2]})
     assert rows == ["t-001", "t-002"]
-    assert builds == [None, None]
+    assert len(builds) == 2 and all(memo is not None for memo in builds)
 
 
 def test_memo_is_built_once_per_parameter_per_statement(
@@ -265,7 +265,7 @@ def test_pulse_incident_scan_answers_through_the_memo(
 # --- door level: build, decline, staleness, ceiling, exact parity ----------------------------
 
 
-def test_build_accepts_only_detached_string_bytes_null_tuples() -> None:
+def test_build_accepts_only_supported_detached_scalar_tuples() -> None:
     context = _context()
     memo = _build_in_list_memo(("a", b"b", None, "a"), context)
     assert memo is not None
@@ -273,7 +273,7 @@ def test_build_accepts_only_detached_string_bytes_null_tuples() -> None:
     assert len(memo.keys) == 2
     assert context.in_list_memo_elements == 4
     assert _build_in_list_memo(["a"], _context()) is None
-    assert _build_in_list_memo((1, 1.0, "1"), _context()) is None
+    assert _build_in_list_memo((1, 1.0, "1"), _context()) is not None
     assert _build_in_list_memo((True,), _context()) is None
     assert _build_in_list_memo(("a", bytearray(b"b")), _context()) is None
     assert _build_in_list_memo(("a", ("b",)), _context()) is None

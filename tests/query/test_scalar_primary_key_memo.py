@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import okto_grafx
-from okto_grafx.errors import GrafxCorruptionDetected
+from okto_grafx.errors import GrafxCorruptionDetected, GrafxWriteConflict
 from okto_grafx.engine import query_engine as qe
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import HashIndex, IndexManager
@@ -56,9 +56,10 @@ def observe(monkeypatch):
 
 
 @pytest.mark.parametrize("key", ["0", "missing"])
-def test_repeated_hit_and_miss_keep_a_fresh_certificate(graph, monkeypatch, key):
+@pytest.mark.parametrize("mode", ["read", "write"])
+def test_repeated_hit_and_miss_keep_a_fresh_certificate(graph, monkeypatch, key, mode):
     counts = observe(monkeypatch)
-    with graph.begin("read") as tx:
+    with graph.begin(mode) as tx:
         first = tx.execute(QUERY, {"id": key})
         second = tx.execute(QUERY, {"id": key})
         assert first.rows == second.rows
@@ -82,9 +83,10 @@ def test_changed_local_authority_revalidates_the_key(graph, monkeypatch, change)
     assert counts["keys"] == 2
 
 
-def test_foreign_writer_keeps_old_reader_and_new_transaction_sees_commit(graph):
+@pytest.mark.parametrize("mode", ["read", "write"])
+def test_foreign_writer_keeps_old_reader_and_new_transaction_sees_commit(graph, mode):
     with okto_grafx.connect(graph.path, page_size=8192) as writer:
-        with graph.begin("read") as reader:
+        with graph.begin(mode) as reader:
             first = reader.execute(QUERY, {"id": "0"}).rows
             with writer.begin("write") as tx:
                 tx.execute("MATCH (n:A {id:'0'}) SET n.title='updated'")
@@ -95,14 +97,46 @@ def test_foreign_writer_keeps_old_reader_and_new_transaction_sees_commit(graph):
         assert graph.execute(QUERY, {"id": "missing"}).rows[0][1] == "inserted"
 
 
-def test_writer_uses_canonical_door_and_observes_its_own_changes(graph, monkeypatch):
+def test_writer_preflight_reuses_but_staging_returns_to_canonical_door(graph, monkeypatch):
     counts = observe(monkeypatch)
     with graph.begin("write") as tx:
         tx.execute(QUERY, {"id": "0"})
+        assert counts["keys"] == 1
+        counts.clear()
         tx.execute("MATCH (n:A {id:'0'}) SET n.id='changed', n.title='owned'")
         assert tx.execute(QUERY, {"id": "0"}).rows == ()
         assert tx.execute(QUERY, {"id": "changed"}).rows[0][1] == "owned"
     assert counts["keys"] == 0
+
+
+def test_writer_preflight_records_same_read_partitions_as_scalar_oracle(graph, monkeypatch):
+    def run():
+        with graph.begin("write") as tx:
+            results = [tx.execute(QUERY, {"id": key}).rows for key in ("0", "missing", "0")]
+            assert not tx._context.wrote
+            return results, set(tx._context.read_partitions)
+
+    candidate = run()
+    monkeypatch.setattr(qe, "_scalar_primary_key_group", lambda *_args: None)
+    assert run() == candidate
+
+
+def test_warmed_preflight_does_not_hide_foreign_write_conflict(graph):
+    writer = graph.begin("write")
+    try:
+        before = writer.execute(QUERY, {"id": "0"}).rows
+        assert writer.execute(QUERY, {"id": "0"}).rows == before
+        with okto_grafx.connect(graph.path, page_size=8192) as other:
+            with other.begin("write") as tx:
+                tx.execute("MATCH (n:A {id:'0'}) SET n.title='winner'")
+        assert writer.execute(QUERY, {"id": "0"}).rows == before
+        writer.execute("MATCH (n:A {id:'0'}) SET n.title='must not publish'")
+        with pytest.raises(GrafxWriteConflict):
+            writer.commit()
+    finally:
+        if writer.active:
+            writer.rollback()
+    assert graph.execute(QUERY, {"id": "0"}).rows[0][1] == "winner"
 
 
 @pytest.mark.parametrize("owner,name", [
@@ -161,8 +195,9 @@ def test_candidate_equals_scalar_oracle_for_order_duplicates_and_full_vectors(gr
     assert sum(len(result.rows) for result in candidate) == 3
 
 
-def test_warm_cache_does_not_hide_a_failed_post_certificate(graph, monkeypatch):
-    with graph.begin("read") as tx:
+@pytest.mark.parametrize("mode", ["read", "write"])
+def test_warm_cache_does_not_hide_a_failed_post_certificate(graph, monkeypatch, mode):
+    with graph.begin(mode) as tx:
         tx.execute(QUERY, {"id": "0"})
 
         def refuse(*_args, **_kwargs):
@@ -178,8 +213,9 @@ def test_warm_cache_does_not_hide_a_failed_post_certificate(graph, monkeypatch):
     assert graph._queries._owner_budget._used_entries == 0
 
 
-def test_warm_cache_cannot_hide_a_specialized_slot_refusal(graph, monkeypatch):
-    with graph.begin("read") as tx:
+@pytest.mark.parametrize("mode", ["read", "write"])
+def test_warm_cache_cannot_hide_a_specialized_slot_refusal(graph, monkeypatch, mode):
+    with graph.begin(mode) as tx:
         tx.execute(QUERY, {"id": "0"})
 
         def refuse(*_args, **_kwargs):

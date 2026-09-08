@@ -549,13 +549,16 @@ def assemble_database(
             catalog_changes_are_wal_logged=True,
         )
         # A writable open may create a missing accelerator only under the same artifact section
-        # as DDL attach and commit publication.  That section first adopts existing files and
-        # rebases the durable catalog, then holds COMMIT_SECTION through create/legacy-nonce
-        # upgrade.  Read-only open performs only the non-mutating existing-file adoption.
+        # as DDL attach and commit publication. That section first completes any committed gap
+        # and rebases the durable catalog, then holds COMMIT_SECTION through adoption/create/
+        # legacy-nonce upgrade. The single sync below already reopens every v2 artifact; a
+        # second existing-only sync in this same section repeated that complete admission.
+        # Recovery's own existing-only baseline callbacks remain unchanged. Read-only open
+        # performs only the non-mutating existing-file adoption.
         if config.read_only:
             sync_indexes(existing_only=True)
         else:
-            with transactions.schema_artifact_section(sync_if=lambda: True):
+            with transactions.schema_artifact_section():
                 sync_indexes(existing_only=False)
         queries = QueryEngine(
             catalog=catalog,

@@ -4,7 +4,8 @@
 
 Updated September 8, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
-Current source is 0.0.4 with CAP-1 recovery work; latest live measurement used
+Current development source is 0.0.5; published baseline is 0.0.4 with CAP-1 recovery work.
+The latest live measurement used
 `0.0.4@fa8f188`, not that later recovery checkpoint. No new live benchmark or
 spec consolidation was performed for this documentation refactor.
 
@@ -32,6 +33,73 @@ The earlier sample (5 nodes/10 edges) took 22.981 s / 131.489 s. Specs and runti
 states differ: the observed reductions are **not an isolated engine speedup**.
 Do not add overlapping timing boundaries. Historical policy DLQ/canonical debt
 and stale diagnostic snapshots mean this is not an all-green operational audit.
+
+## Native synthetic checkpoint in the 0.0.5 development line
+
+Fresh local stores, one two-column node table, Windows/Python 3.13.1; latest warm
+read observations only. This is not the Pulse UI, a relationship-heavy KG or a
+comparison against Ladybug. [Full workload, source hashes and validation](reports/V005_NATIVE_PERFORMANCE_CHECKPOINT.md).
+
+| Operation | Latest measured result | Scope |
+| --- | ---: | --- |
+| Selective first 500-node page | 31.516 ms | 2,048-node table, explicit numeric ID list |
+| Selective next 500-node page | 31.067 ms | Same table, next non-overlapping ID list |
+| Unindexed ordered range page | 38.900 ms | Still scans all 2,048 rows |
+| Twenty unstaged-writer PK preflight reads | 25.901 ms | Repeated same key; tracemalloc enabled |
+| Stage / commit eleven nodes | 18.013 / 41.878 ms | Separate native phases, tracemalloc enabled; no edges/vector index |
+| Python traced write-phase peak | 197,341 bytes | Not peak process RSS or a memory guarantee |
+
+The component workloads below are different experiments and are not superseded
+by this narrower fixture. Full authenticated production UI latency remains unmeasured.
+
+## Pulse consumer fixture in the 0.0.5 development line
+
+Fresh full Pulse schema, 1,100 synthetic Decision nodes, 128 hub edges; actual
+service, routed executor and HTTP route. Authorization/route authority are fixture
+replacements and result caching is bypassed. Browser checks use the actual Pulse
+API client and GraphCanvas with fixture controls, **not the full live application**.
+[Conditions, assertions, all six dispositions and reproduction](reports/V005_NATIVE_PERFORMANCE_CHECKPOINT.md#bounded-follow-up-and-disposition-of-the-six-selected-items).
+
+| Operation | Latest measured result | Scope |
+| --- | ---: | --- |
+| New handle open | 2,718 ms | Full schema, separate from HTTP; OS cache not flushed |
+| First HTTP 500-node page on new handle | 428.332 ms | Exact nodes/incident edges, no failed layout |
+| Warm first / next 500-node HTTP pages | 221.157 / 220.581 ms | Two distinct pages, JSON included |
+| Warm browser reset | 269.7 ms HTTP/JSON + 67.6 ms to second frame | Real renderer; not ForceAtlas2 convergence |
+| Next-500 browser request | 309.4 ms HTTP/JSON + 367.2 ms to second frame | 1,000 accumulated nodes rendered |
+| Global digest / link writes | 30.430–36.846 / 26.024–35.283 ms | Four synthetic digests with 384-dimensional vectors |
+| Global inventory dispatch | 26.571 ms | Four digests, three actual inventory queries; test event-loop startup included |
+| Explicit Global verify-all / checkpoint | 838.249 / 188.709 ms | Separate maintenance; not full outbox ACK |
+| Churn RSS, four handles plus pinned reader | 54,210,560 bytes | Small 64-row fixture after 12 update/delete cycles; not full Pulse RSS |
+
+Exact page candidate counts were 128/500/500 at graph sizes 128/512/1,100.
+The real warm KG cycle rebuilt zero parses/plans. Two concurrent writers and two
+readers retained correct results, but thread throughput did not scale linearly.
+Overflow heap growth, complete production SQLite/ACK timing and larger-scale index
+limits are not claimed resolved by this bounded release work.
+
+## Latest four-item 0.0.5 follow-up
+
+Different bounded workloads from the 1,100-node fixture above. Windows/Python
+3.13.1, fresh temporary stores, stub embeddings, no production specs or UI run.
+The consolidation uses real Community composition, SQLite, Grafx and the outbox
+worker, including verification before ACK. [Full evidence and limits](reports/V005_FOUR_ITEM_FOLLOWUP.md).
+
+| Operation | Latest measured result | Scope |
+| --- | ---: | --- |
+| Ordered projected page | 20.247 ms | Warm median; 128 of 256 rows, two tables, 384d vectors and 12,000-character payloads |
+| Writable full-schema open | 2,521.420 ms | 128-node Pulse fixture; independent of HTTP |
+| Warm 128-node HTTP page | 118.435 ms | 127 edges, zero failed layouts; fixture authority, real graph IO |
+| Reconcile four synthetic candidates | 3,508.247 ms | Includes cold independent-reader admission/checkpoint |
+| Consolidation commit, four nodes / four edges | 1,404.860 ms | Graph dispatch is 790.214 ms of this total |
+| SQLite commit | 1.226 ms | After graph/audit staging |
+| Immediate outbox tick through ACK | 2,509.933 ms | Application 1,330.514 ms and flush/reopen/verification 1,133.135 ms are nested portions |
+
+Four references and digests were verified, one event ACKed, and a second worker
+tick was empty. Setup and periodic scheduling wait are excluded. These are not
+comparable to the older live ACK duration or a claim that first-reader admission,
+production backlog or all write latency is solved. Timing tables show latest
+measurements only; regression checks have no performance thresholds.
 
 ## Native/component evidence in the 0.0.4 development line
 

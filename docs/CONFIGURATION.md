@@ -14,6 +14,31 @@ noted otherwise, operational options are selected at open and apply to that hand
 `connect` also accepts `pathlib.Path`; `DatabaseConfig.path` itself is a string.
 Unknown keywords and the removed `vector_recall_target` refuse with a typed error.
 
+## Typed connection options (0.0.5)
+
+`connect` exposes all 35 configuration keywords through `Unpack[ConnectOptions]`.
+Editors/type checkers supporting PEP 692 can suggest keyword names, reject typos
+and check selector literals. For reusable dictionaries:
+
+```python
+from okto_grafx import ConnectOptions, connect
+
+options: ConnectOptions = {
+    "buffer_budget_bytes": 128 * 1024 * 1024,
+    "descriptor_revalidation": "strict",
+    "max_result_rows": 1000,
+}
+with connect("./graph", **options) as db:
+    print(db.execute("RETURN 1").rows)
+```
+
+Every key is optional; omitted keys retain the defaults below. `ConnectOptions`
+is a typing contract, not a validating constructor or another source of defaults.
+For dynamic/untrusted JSON, validate it at your application boundary and retain
+Grafx's runtime validation: annotations do not prove ranges, persisted identity or
+provider availability. `registry=PortRegistry(...)` remains a separate keyword;
+custom provider registration and runtime configuration errors are unchanged.
+
 ## Defaults and effect
 
 | Option | Default | Notes |
@@ -102,6 +127,17 @@ caller-owned resources. See [ports](PORTS.md).
   selection can affect other databases' CPU cost, though accepted digests are identical.
 
 ## Detailed descriptor, metrics and budget contracts
+
+In the 0.0.5 development line, optional internal preparation retains at most 256
+parsed statements and 256 plans per engine. Texts exceeding 16,384 characters are
+not retained in the parse/plan/statement-authority caches. Plans additionally use
+a 32 MiB conservative admission tariff (source-derived objects, catalog images,
+index definitions and dirty-table keys), not a measured heap-size or RSS bound.
+These are internal acceleration limits, not new `connect` options. Exceeding one
+executes the query normally without retaining that plan; it does not reject a statement
+or waive schema/index/snapshot validation. Independent handles have independent
+caches. Compiled predicates, row caches, buffers and caller-owned results are
+separate retained state, so this tariff is not the whole database's memory budget.
 
 `descriptor_revalidation="strict"` is the safe default: on every cached hit, the local adapter
 proves that the logical name still names the physical file held by its descriptor. The opt-in

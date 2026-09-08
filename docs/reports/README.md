@@ -7,6 +7,8 @@ measurement conditions, source paths, limitations and checkpoint history.
 Private artifact/consumer-repository paths may not be available in this checkout.
 
 - [Documentation refactor and validation](DOCUMENTATION_REFACTOR_2026_09_08.md)
+- [0.0.5 native performance checkpoint](V005_NATIVE_PERFORMANCE_CHECKPOINT.md)
+- [0.0.5 four-item follow-up: projected pages, admission, complete synthetic Pulse ACK and typed options](V005_FOUR_ITEM_FOLLOWUP.md)
 
 - [Architecture boundary debt: query synchronization and pure algorithms](ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md)
 - [Bounded relationship census with exact endpoint validation](BATCHED_RELATIONSHIP_COUNT_0_0_4.md)

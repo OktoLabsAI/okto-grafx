@@ -15,6 +15,7 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "api/options.py": {"ConnectOptions"},
     "engine/database.py": {
         "DatabaseIdentity",
         "ExecuteManyReport",
