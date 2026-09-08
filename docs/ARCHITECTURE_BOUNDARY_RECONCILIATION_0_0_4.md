@@ -185,3 +185,48 @@ Remaining occurrences: schema.py thread lock/weak-key proof registry (two), and
 index_manager.py context-local commit authority/projection (one). No gate waiver.
 Source-only; Pulse stays on installed a82d3bf and all twenty benchmark specs remain
 reserved. No live consolidation, migration, graph reset, redrive or restart.
+
+## Commit selection context checkpoint — 2026-09-08
+
+Separated the attempt-local index-selection channel from the physical live-commit
+authority channel. The former no longer creates a module-global ContextVar in
+IndexManager. API assembly injects an independent `runtime.scoped_value.ContextLocalValue`
+per manager through the pure `domain.ports.scoped_value.ScopedValue` protocol.
+No mandatory PortRegistry slot or public connect/Pulse setting was added.
+
+The runtime transport only gets/binds a value with ContextVar token restoration.
+The engine still creates/seals the projection, matches manager and exact transaction,
+checks registry/schema/detached-claim drift, and revokes the payload before transport
+reset. Context copies retain the same payload identity and therefore observe its
+revocation. Failures in bind, context entry, body (including BaseException), or exit
+cannot leave an active retained projection. Two threads/tasks cannot see one another's
+binding; identically named but separately constructed slots remain independent.
+Even an intentionally shared transport does not bypass manager identity checks.
+
+Manual low-level IndexManager compositions may omit `projection_context`, in which
+case they retain canonical fresh index selection. To keep the optimization they
+must supply ContextLocalValue in their outer composition. Public assembly always
+supplies it. The structural cost test explicitly checks both paths: **three** table
+selection calls with the transport (unchanged optimized expectation), **four** without.
+Its initial regression failed because the old manual fixture omitted the newly
+explicit mechanism; injection restored the original three-call assertion and the
+four-call fallback is now tested separately, not substituted for the optimized claim.
+
+New tests cover nested scopes, copied-context revocation, two concurrent threads
+on one manager, concurrent async tasks on one thread, cross-manager refusal, malformed
+transport, registry drift, failures at each transport boundary, and actual public
+commit reuse plus persisted row readback. Initial focused slice: 12 passed in 0.31 s;
+the subsequent async case and fallback parameter are included in the grouped run.
+Grouped scope/live-hot/detached-generation/speculative-registration/commit-protocol/
+index-wiring/identity-activation/multiprocess-fence/read-only-adoption/public-boundary/
+import-gate run: **538 passed, 3 failed in 23.06 s**. Ruff/diff checks pass; strict
+markers and per-test 60-second thread timeout remain enabled.
+
+**The import-gate count has not decreased in this checkpoint.** IndexManager still
+uses ContextVar for the separate physical live-commit authority, shared with IndexStore;
+that channel was not weakened or replaced with ordinary mutable instance state.
+The remaining debt is still three occurrences across schema.py and index_manager.py,
+plus the aggregate failing assertion. This is a verified implementation step toward
+separating the remaining mechanisms, not an all-green gate or new performance claim.
+No WAL/OCC/durability/reader-writer guarantee, persisted format or Pulse Core changed.
+Source-only; installed Pulse and the twenty reserved specs were not touched.

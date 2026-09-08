@@ -54,11 +54,12 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import NamedTuple, TypeVar
 
+from okto_grafx.domain.ports.scoped_value import ScopedValue
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -212,11 +213,6 @@ _LIVE_COMMIT_AUTHORITY: ContextVar[object | None] = ContextVar(
 
 _COMMIT_INDEX_PROJECTION_SEAL: object = object()
 """Module-private proof for one post-rebase index selection inside COMMIT_SECTION."""
-
-_COMMIT_INDEX_PROJECTION: ContextVar[object | None] = ContextVar(
-    "okto_grafx_commit_index_projection", default=None
-)
-"""Attempt-local immutable index selection; never retained across commit-section exit."""
 
 _LIVE_HOT_HOOK_NAMES: tuple[str, ...] = (
     "_apply_change",
@@ -4261,6 +4257,7 @@ class IndexManager:
         "_schema_new_table_observed",
         "_registry_revision",
         "_definition_match",
+        "_projection_context",
     )
 
     def __init__(
@@ -4270,11 +4267,27 @@ class IndexManager:
         metrics: MetricsSink,
         *,
         artifact_nonce: Callable[[], int] | None = None,
+        projection_context: ScopedValue | None = None,
     ) -> None:
-        """Build the registry over the pool and heap of one database."""
+        """Build the registry over the pool and heap of one database.
+
+        Public assembly supplies a context-local projection transport. Omitting
+        it in a manual composition retains fresh canonical index selection;
+        this class never replaces it with unsynchronized manager-local state.
+        """
         self._pool: BufferPool = pool
         self._heap: HeapStore = heap
         self._metrics: MetricsSink = metrics
+        if projection_context is not None and any(
+            not callable(getattr(projection_context, name, None))
+            for name in ("get", "bind")
+        ):
+            raise GrafxConfigurationError(
+                "A commit projection context must supply get and bind operations.",
+                field="projection_context",
+                value=type(projection_context).__name__,
+            )
+        self._projection_context = projection_context
         self._indexes: dict[str, IndexStore] = {}
         self._index_keys_by_table: dict[tuple[int, str], set[str]] = {}
         self._published_lsn: Lsn = NO_LSN
@@ -5402,7 +5415,9 @@ class IndexManager:
         self, txn: StagingTransaction
     ) -> _CommitIndexProjection | None:
         """Return this call's valid projection, or None outside its exact transaction scope."""
-        projection = _COMMIT_INDEX_PROJECTION.get()
+        projection = (
+            None if self._projection_context is None else self._projection_context.get()
+        )
         if not (
             isinstance(projection, _CommitIndexProjection)
             and projection.active
@@ -5541,12 +5556,26 @@ class IndexManager:
                 if index in self._detached_speculative_indexes
             ),
         )
-        token = _COMMIT_INDEX_PROJECTION.set(projection)
+        # A manual composition with no context transport keeps canonical fresh
+        # selection. Public assembly provides a context-local slot, never a plain
+        # mutable manager field that another writer could observe as authority.
         try:
-            yield projection
+            scope = (
+                nullcontext()
+                if self._projection_context is None
+                else self._projection_context.bind(projection)
+            )
+            with scope:
+                try:
+                    yield projection
+                finally:
+                    # Revoke before resetting transport; delayed context copies
+                    # must not retain active authority after this scope exits.
+                    projection.active = False
         finally:
+            # Even a malformed host transport that fails while binding may have
+            # retained the payload. It must never keep a usable authority.
             projection.active = False
-            _COMMIT_INDEX_PROJECTION.reset(token)
 
     def _validate_commit_index_projection(
         self, projection: _CommitIndexProjection

@@ -16,6 +16,7 @@ from okto_grafx.domain.index import (
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.engine.index_manager import HashIndex, IndexManager
+from okto_grafx.runtime.scoped_value import ContextLocalValue
 from txn_support import Stack, build_stack
 
 
@@ -204,8 +205,9 @@ def test_canonical_manager_counts_index_records_once_per_row_version(
     assert calls == 1, "the first quota count is carried into staging verification"
 
 
+@pytest.mark.parametrize("with_projection_context", [True, False])
 def test_canonical_manager_resolves_active_indexes_once_per_written_row(
-    database_root: Path, monkeypatch: pytest.MonkeyPatch
+    database_root: Path, monkeypatch: pytest.MonkeyPatch, with_projection_context: bool
 ) -> None:
     """Quota prediction and staging share one immutable table-local index projection."""
     stack = build_stack(database_root)
@@ -214,7 +216,12 @@ def test_canonical_manager_resolves_active_indexes_once_per_written_row(
     stack.catalog.save()
     stack.pool.flush(stack.catalog.file)
     stack.pool.flush(stack.heap.file)
-    indexes = IndexManager(stack.pool, stack.heap, stack.metrics)
+    indexes = IndexManager(
+        stack.pool, stack.heap, stack.metrics,
+        projection_context=(
+            ContextLocalValue("commit-projection") if with_projection_context else None
+        ),
+    )
     indexes.register(
         HashIndex(
             IndexDefinition(
@@ -246,7 +253,9 @@ def test_canonical_manager_resolves_active_indexes_once_per_written_row(
 
     # Two other commit-protocol validations resolve table authority independently. The row-level
     # quota/staging pair contributes only one call; before LV-3 the same commit contributed three.
-    assert calls == 3
+    # Public composition provides the transport and preserves exactly three calls.
+    # A manual pure composition without it repeats one canonical authority lookup.
+    assert calls == (3 if with_projection_context else 4)
 
 
 def test_insert_passes_the_resolved_unsigned_identity_to_quota_and_staging(

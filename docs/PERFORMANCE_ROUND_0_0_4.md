@@ -811,3 +811,14 @@ tests in 0.28 s** in a separate invocation to avoid existing conftest import col
 Only schema.py (two mechanisms), index_manager.py (one), and the aggregate gate still
 fail. Source-only, no new speedup claim or spec consumption. Full evidence and manual
 composition guidance are in `ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md`.
+
+Commit-selection context follow-up: API assembly now injects an independent
+ContextLocalValue into IndexManager through a pure ScopedValue protocol. The engine
+retains seals, exact manager/transaction checks, drift validation and revocation
+before reset, including binding/entry/exit failures and copied contexts. Public
+commit reuse and the optimized three-selection count are preserved; manual omitted
+transport uses a tested four-selection canonical fallback. Thread/task/nesting and
+public-boundary grouped run: **538 passed, 3 failed in 23.06 s**. This partial step
+does not reduce the import-gate count: the separate live physical commit authority
+still uses ContextVar inside IndexManager/IndexStore and remains pending alongside
+the schema proof registry. No new benchmark, live consolidation or deployment.

@@ -109,6 +109,7 @@ from okto_grafx.runtime.config import (
 )
 from okto_grafx.runtime.registry import PortRegistry, _snapshot_port_registry
 from okto_grafx.runtime.capability_probe import port_has_attribute
+from okto_grafx.runtime.scoped_value import ContextLocalValue
 
 __all__ = [
     "LABEL_DIGEST_BYTES",
@@ -377,7 +378,11 @@ def assemble_database(
         catalog = CatalogStore(pool)
         heap = HeapStore(pool, catalog)
         indexes = IndexManager(
-            pool, heap, metrics, artifact_nonce=_new_control_file_nonce
+            pool,
+            heap,
+            metrics,
+            artifact_nonce=_new_control_file_nonce,
+            projection_context=ContextLocalValue("okto_grafx_commit_index_projection"),
         )
         vectors = VectorEngine(
             catalog=catalog,
