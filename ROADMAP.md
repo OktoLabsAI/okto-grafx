@@ -136,10 +136,11 @@ No new live spec was consumed; deployment and release remain separate.
 
 ## Next proposed round after N1–N4 closure
 
-Proposed September 8, 2026 when committing the completed checkpoint. These four
-items are **not yet selected for implementation** and do not reopen N1–N4 or the
-earlier six-plus-four deliveries. No new branch/version, production run or release
-is implied. Gains below are hypotheses, not measured speedup promises.
+Proposed September 8, 2026 when committing the completed checkpoint. The operator
+subsequently approved **R1–R2 only before a checkpoint**. Their bounded implementation
+and local validation are complete; R3–R4 are not started. These items do not reopen
+N1–N4 or the earlier six-plus-four deliveries. No new branch/version, production run
+or release is implied. Gains below are hypotheses, not measured speedup promises.
 
 | Order / existing IDs | Bounded next delivery | Effort / expected benefit | Precedence and stop condition |
 | --- | --- | --- | --- |
@@ -148,8 +149,17 @@ is implied. Gains below are hypotheses, not measured speedup promises.
 | R3 / OPS-3, PERF-MEM | Reuse the overflow pages already retired as FREE by N3 so eligible space can serve subsequent overflow allocations. Start with the existing quiescent maintenance contract and an explicit persisted reuse protocol. | Large / potentially high reduction in growth under update/delete churn; not a file-shrinking or immediate UI-speed claim | Depends on N3, now delivered. Require ownership, reclaimed-snapshot floor, stale-reference/ABA, WAL/crash/reopen and allocation-quota proofs. No online vacuum, truncation or immutable-index orphan cleanup bundled in this slice |
 | R4 / OPS-1 | Deliver a consistent physical backup and restore into a new directory, with a checked manifest, identity/provenance preservation, interruption handling and verify/reopen before success. | Large / high operational recoverability value; no throughput claim | Uses completed CAP-1 identity semantics; does not require R3. Prove the snapshot/WAL retention boundary with concurrent writers and refuse unsafe/incomplete promotion. No logical export engine, automatic repair of authoritative corruption or independently writable same-UUID fork |
 
-Recommendation: approve R1–R2 first and take one checkpoint before starting the
-persisted lifecycle changes in R3–R4. Use existing isolated fixtures, focused
+**R1–R2 checkpoint:** exact-string ASCII identifier validation now removes repeated
+Python per-character dispatch in cold catalog/index admission. Required file
+identity checks and checkpoint phases remain; cold IO is not claimed solved.
+Connections now retain a validated, execution-local checksum selection independent
+of other handles, including custom registries and nested/threaded operations.
+Grouped regression: 5,953 passes and one platform skip; complementary public-surface
+and documentation group: 1,402 passes; Pulse adapter group: 105 passes. Full synthetic
+consolidation and isolated wheel smoke passed. [Evidence and limits](docs/reports/V005_R1_R2_CHECKPOINT.md).
+
+Stop here for the operator checkpoint before starting the persisted lifecycle
+changes in R3–R4. Use existing isolated fixtures, focused
 semantic tests and grouped regressions; do not consume the 19 reserved specs.
 FTS (GX-CAP-5), general logical export/import (OPS-2), larger hash directories and
 immutable-index orphan reclamation remain visible below but are not additional
@@ -165,7 +175,7 @@ requirements for this proposed four-item round.
 | OPS-4 / P1.8 | Open limitation: buffer and query budgets are not process RSS caps | Account/measure all retained engine state, vector memory, concurrent handles and temporary encodings. Preserve deterministic refusal; publish a realistic peak-memory envelope, not an RSS promise derived from nominal page bytes. |
 | OPS-5 / P1.12 | Partial: explicit growth/rebuild exists | Hash directories cap at 4,096 buckets; skew/overflow and retained immutable orphan generations remain. Define bounded reclamation and larger-scale indexing without in-place generation replacement. |
 | OPS-6 / P1.11 | Open limitation: physical conflicts and exclusive publication | Remove only proven redundant publication/page work. Disjoint logical rows may still conflict; do not promise linear writer scaling or replace multiwriter with an application-wide single-writer premise. |
-| OPS-7 / P2.6, P2.9 | Partial DX improvement in 0.0.5 | `connect(**options)` declares validated `Unpack[ConnectOptions]` keyword/static contracts; evidence above. Checksum selection is still process-global. No provider or byte semantics changed. |
+| OPS-7 / P2.6, P2.9 | Implemented bounded DX/isolation checkpoint in 0.0.5 | Typed `Unpack[ConnectOptions]` plus per-connection checksum selection, including custom registries. Standalone low-level installers retain their legacy default outside database operations. No checksum algorithm or persisted byte semantics changed. [R2 evidence](docs/reports/V005_R1_R2_CHECKPOINT.md). |
 | OPS-8 / §8.5 | Partial: Query/cursor API exists | Reusable `Query` is not a durable prepared plan or HTTP token. General prepared statements/plan-cache invalidation, deadlines/cancellation and broader streaming need explicit semantics. |
 | OPS-9 / P1.16 | Deferred configuration capability | Expose HNSW construction knobs only with persistent identity/defaults, cold/incremental parity expectations and a controlled 8,192×384 recall profile. `vector_ef_search` already configures runtime beam; it is not construction tuning. |
 | OPS-10 / P2.8 | Acceptance obligation | Exercise supported Python versions/platforms, wheels/sdists, optional accelerators, version refusal and upgrade fixtures. A local Windows run is not a claim that every matrix row passed. |

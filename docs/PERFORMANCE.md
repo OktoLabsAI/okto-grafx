@@ -87,7 +87,8 @@ Different bounded workloads from the 1,100-node fixture above. Windows/Python
 3.13.1, fresh temporary stores, stub embeddings, no production specs or UI run.
 The consolidation uses real Community composition, SQLite, Grafx and the outbox
 worker, including verification before ACK. [Full evidence and limits](reports/V005_FOUR_ITEM_FOLLOWUP.md).
-Consolidation rows use the latest [N1 run](reports/V005_N1_N2_CHECKPOINT.md);
+Consolidation rows use the latest [R1–R2 run](reports/V005_R1_R2_CHECKPOINT.md),
+recorded while the same host also ran regression tests;
 the projection and 128-node rows retain their separate earlier measurements.
 
 | Operation | Latest measured result | Scope |
@@ -95,10 +96,11 @@ the projection and 128-node rows retain their separate earlier measurements.
 | Ordered projected page | 20.247 ms | Warm median; 128 of 256 rows, two tables, 384d vectors and 12,000-character payloads |
 | Writable full-schema open | 2,521.420 ms | 128-node Pulse fixture; independent of HTTP |
 | Warm 128-node HTTP page | 118.435 ms | 127 edges, zero failed layouts; fixture authority, real graph IO |
-| Reconcile four synthetic candidates | 4,476.345 ms | Includes cold independent-reader admission/checkpoint |
-| Consolidation commit, four nodes / four edges | 1,621.423 ms | Graph dispatch is 975.800 ms of this total |
-| SQLite commit | 1.225 ms | After graph/audit staging |
-| Immediate outbox tick through ACK | 2,908.809 ms | Application 1,479.183 ms and flush/reopen/verification 1,381.832 ms are nested portions |
+| Reconcile four synthetic candidates | 3,791.805 ms | Includes cold independent-reader admission/checkpoint |
+| Consolidation commit, four nodes / four edges | 1,680.525 ms | Graph dispatch is 935.872 ms of this total |
+| SQLite commit | 1.519 ms | After graph/audit staging |
+| Immediate outbox tick through ACK | 2,618.327 ms | Includes application, flush/reopen and verification |
+| Exact-ASCII identifier admission, 10,000 names | 2.615 ms | Median of seven component repetitions; no IO or latency threshold |
 
 Four references and digests were verified, one event ACKed, and a second worker
 tick was empty. Setup and periodic scheduling wait are excluded. These are not

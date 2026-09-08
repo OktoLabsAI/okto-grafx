@@ -827,7 +827,7 @@ Return immutable restore-receipt names without exposing the quarantine store.
 close() -> None
 ```
 
-Release everything this database opened, and never corrupt anything doing it (FR-1).
+Release owned resources under this database's checksum selection (FR-1).
 
 ## Result and observation type fields
 

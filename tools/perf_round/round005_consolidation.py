@@ -81,7 +81,7 @@ async def exercise(root: Path) -> dict:
             try:
                 return profile.runcall(find_matches, *args, **kwargs)
             finally:
-                report["reconcile_profile"] = profile_top(profile)
+                report["reconcile_profile"] = profile_top(profile, limit=80)
         primitives._find_existing_graph_matches = profiled_matches
     board_id, spec_id = str(uuid.uuid4()), str(uuid.uuid4())
     agent = "system:layer1_worker"

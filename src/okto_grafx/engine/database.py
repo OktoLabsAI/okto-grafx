@@ -1539,6 +1539,7 @@ class Database:
         "_catalog_view_memo",
         "_plan_view_memo",
         "_plan_guard_factory",
+        "_checksum_scope",
         "_heap",
         "_wal",
         "_transactions",
@@ -1645,6 +1646,7 @@ class Database:
             int, tuple[PlanNode, PlanNode]
         ] = OrderedDict()
         self._plan_guard_factory = plan_guard_factory
+        self._checksum_scope: Callable[[], AbstractContextManager[object]] = nullcontext
         self._heap: HeapStore = heap
         self._wal: WalManager = wal
         self._transactions: TransactionManager = transactions
@@ -4252,6 +4254,18 @@ class Database:
     # --- lifecycle ----------------------------------------------------------------------------
 
     def close(self) -> None:
+        """Release owned resources under this database's checksum selection (FR-1).
+
+        Abort open transactions before releasing lower dependencies. If transaction/schema
+        cleanup cannot complete, preserve the safe leak for a later retry. Closing twice after
+        successful release is a no-op; concurrent/reentrant close may be terminal but incomplete
+        until ``close_complete`` becomes true. An unobserved terminal release failure is raised
+        once on the next explicit close without repeating resource release.
+        """
+        with self._checksum_scope():
+            self._close_in_checksum_scope()
+
+    def _close_in_checksum_scope(self) -> None:
         """Release everything this database opened, and never corrupt anything doing it (FR-1).
 
         Transaction close and every tracked QueryEngine schema journal must first prove complete.
@@ -4535,7 +4549,7 @@ class Database:
         transition = getattr(self._metrics, "transition", None)
         boundary = transition() if callable(transition) else nullcontext()
         try:
-            with boundary:
+            with self._checksum_scope(), boundary:
                 yield
         finally:
             if self._closed and not self._close_released:

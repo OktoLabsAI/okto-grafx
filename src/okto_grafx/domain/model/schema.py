@@ -106,6 +106,10 @@ STORAGE_DTYPES: tuple[str, ...] = ("float32", "float64")
 
 def is_identifier(name: object) -> bool:
     """Return True when the name is a usable ASCII identifier for a schema object."""
+    if type(name) is str:
+        # On ASCII, Python's identifier predicate is exactly [A-Za-z_][A-Za-z0-9_]*.
+        # Keep the existing subclass path and its hooks; no schema/authority cache.
+        return len(name) <= MAX_IDENTIFIER_LENGTH and name.isascii() and name.isidentifier()
     if not isinstance(name, str) or not name:
         return False
     if len(name) > MAX_IDENTIFIER_LENGTH:

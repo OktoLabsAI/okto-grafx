@@ -9,6 +9,12 @@ including the on-disk format.
 
 ### Changed
 
+- Reduced cold catalog identifier-validation CPU with an equivalent exact-ASCII
+  built-in predicate; retained subclass behavior and all IO/authority checks.
+- Isolated checksum selection per connection and execution context, including
+  nested calls, threads, custom registries and cleanup. Standalone installers
+  retain their compatibility default; CRC-32C bytes and durability are unchanged.
+
 - Connected opt-in durable commit history: explicit activation, immutable metadata
   capture at begin and retry, qualified snapshot lookup/paging, public journal
   verification and content-free metadata metrics. Logical-transfer hooks record

@@ -62,7 +62,7 @@ participants cannot hold one section each and wait for the other. Proved by
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, is_dataclass, replace
 from time import perf_counter_ns
 from types import TracebackType
@@ -729,6 +729,7 @@ class TransactionManager:
         "_journal_attempt",
         "_maintenance_txns",
         "_commit_metadata",
+        "_checksum_scope",
         "_identity_process",
         "_identity_process_invalid",
         "_process_identity_provider",
@@ -907,6 +908,7 @@ class TransactionManager:
         self._journal_attempt: tuple[int, PreparedCommitCatalogAppend, dict[tuple[str, int], bytes]] | None = None
         self._maintenance_txns: set[int] = set()
         self._commit_metadata: dict[int, bytes] = {}
+        self._checksum_scope: Callable[[], AbstractContextManager[object]] = nullcontext
         self._commit_lock_timeout: float = _require_timeout(
             "commit_lock_timeout", commit_lock_timeout
         )
@@ -8063,7 +8065,7 @@ class TransactionManager:
         # and a callback that asks Database.close() while this thread is trying to enter must
         # request terminal state without recursively releasing dependencies. The adapter lowers
         # its deferral depth before draining the FIFO, after the real section has been released.
-        with deferred:
+        with self._checksum_scope(), deferred:
             with self._coordinator_section(
                 self._participant_section_name,
                 timeout=self._commit_lock_timeout,

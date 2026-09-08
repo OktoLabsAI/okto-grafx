@@ -33,6 +33,7 @@ from types import MappingProxyType
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.domain.page.layout import CHECKSUM_SIZE, MAX_PAGE_SIZE
+from okto_grafx.domain.ports.scoped_value import ScopedValue
 
 __all__ = [
     "CRC32C_POLYNOMIAL",
@@ -365,6 +366,27 @@ _implementation_state: tuple[Callable[[bytes, int], int], str] = (
 )
 """Atomically published checksum function and the name that describes that same function."""
 
+_execution_scope: ScopedValue | None = None
+"""Outer-composition context transport; the standalone installer remains the fallback."""
+
+
+class _ChecksumSelection:
+    """Mutable only while selecting a validated provider, never retained by a database."""
+
+    def __init__(self) -> None:
+        self.state: tuple[Callable[[bytes, int], int], str] = (crc32c_reference, PURE_IMPLEMENTATION_NAME)
+
+
+def _current_implementation() -> tuple[Callable[[bytes, int], int], str]:
+    scope = _execution_scope
+    current = None if scope is None else scope.get()
+    if type(current) is _ChecksumSelection:
+        return current.state
+    if current is not None:
+        # Only the runtime composition binds these validated immutable pairs.
+        return current  # type: ignore[return-value]
+    return _implementation_state
+
 
 def crc32c_implementation() -> str:
     """Return the name of the implementation :func:`crc32c` is currently calling.
@@ -372,7 +394,7 @@ def crc32c_implementation() -> str:
     A database that reports what computed its checksums is a database whose numbers can be
     reproduced. It is the same disclosure the vector adapters make through ``name``.
     """
-    return _implementation_state[1]
+    return _current_implementation()[1]
 
 
 def install_crc32c(function: Callable[[bytes, int], int], *, name: str) -> str:
@@ -388,7 +410,8 @@ def install_crc32c(function: Callable[[bytes, int], int], *, name: str) -> str:
     what was installed before is still installed. Half-accepting an accelerator would be worse
     than rejecting it, because the inputs it got right are exactly the ones a smoke test uses.
 
-    This is the only process-wide state in the domain, and it is defensible for one reason that
+    This standalone default does not override database-owned execution scopes. It remains
+    process-wide for low-level callers, and is defensible for one reason that
     the installer above ENFORCES rather than assumes: every accepted implementation returns the
     same value as every other, so what is installed can change how long a checksum takes and can
     change nothing else. If that ever stopped being true this door would be a defect, which is
@@ -656,6 +679,11 @@ def _closed_provider_checked(
 def _publish_implementation(function: Callable[[bytes, int], int], name: str) -> str:
     """Atomically publish a validated function/name pair and return the replaced name."""
     global _implementation_state
+    current = None if _execution_scope is None else _execution_scope.get()
+    if type(current) is _ChecksumSelection:
+        replaced = current.state[1]
+        current.state = (function, name)
+        return replaced
     replaced = _implementation_state[1]
     _implementation_state = (function, name)
     return replaced
@@ -672,5 +700,5 @@ def crc32c(data: bytes, crc: int = CRC32C_INITIAL) -> int:
     trust boundary: those packages are corpus-validated and then run without the Python oracle,
     which keeps ``checksum='native'`` an honest acceleration.
     """
-    implementation = _implementation_state[0]
+    implementation = _current_implementation()[0]
     return implementation(data, _require_seed(crc))

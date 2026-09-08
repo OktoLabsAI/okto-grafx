@@ -38,13 +38,13 @@ def timed(operation):
                     "process_cpu_ms": round((time.process_time() - cpu) * 1000, 3)}
 
 
-def profile_top(profile):
+def profile_top(profile, limit=25):
     stats = pstats.Stats(profile)
     return [{"function": f"{Path(key[0]).name}:{key[1]}:{key[2]}",
              "calls": value[1], "self_ms": round(value[2] * 1000, 3),
              "cumulative_ms": round(value[3] * 1000, 3)}
             for key, value in sorted(stats.stats.items(), key=lambda item: item[1][3],
-                                     reverse=True)[:25]]
+                                     reverse=True)[:limit]]
 
 
 def main():

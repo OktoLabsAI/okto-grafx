@@ -75,7 +75,7 @@ custom provider registration and runtime configuration errors are unchanged.
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
 | `codec` | `"pure"` | `"pure"` binds the byte-contract oracle; `"numpy"` explicitly selects the NumPy-backed, byte-identical dense-directory codec and requires `[accel]` |
 | `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
-| `checksum` | `"auto"` | `"auto"` detects an accepted accelerator, `"pure"` selects the reference, `"native"` requires the native provider; selection is process-global |
+| `checksum` | `"auto"` | `"auto"` detects an accepted accelerator, `"pure"` selects the reference, `"native"` requires the native provider; 0.0.5 connections capture an isolated per-database selection |
 | `vector_exact_scan_threshold` | `4096` | Nonnegative candidate threshold for exact-vs-approximate selection; zero permits ANN whenever its other eligibility conditions hold. Inspect the returned regime, not just table size |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
 | `read_only` | `False` | No replay/repair; requires checkpoint-complete state and may refuse after a newer acknowledged commit. Distinct from `db.execute()`'s read transaction |
@@ -123,8 +123,28 @@ caller-owned resources. See [ports](PORTS.md).
   abort/close/crash; never use internal row IDs as a gap-free business sequence.
 - Size new indexes when cardinality is known. Oversizing eager buckets consumes
   memory/disk and slows full scans; unknown growth uses explicit maintenance.
-- Keep all handles' checksum policy coherent: the last process-global provider
-  selection can affect other databases' CPU cost, though accepted digests are identical.
+- Each 0.0.5 connection retains its selected checksum provider. Opening another
+  database or changing the standalone installer cannot change that handle's policy.
+
+### Checksum isolation in 0.0.5
+
+`connect` / `open_database`, including a custom `PortRegistry`, capture a validated
+provider during construction. Public operations, transactions, checkpoint and close
+bind that immutable selection using execution-local transport; nested calls and
+threads restore their previous selection even on exceptions. No global operation
+lock is introduced. Native provider proof memoization remains bounded and shared,
+but the selected provider is not shared mutable configuration.
+
+`pure`, `auto` and `native` retain their admission rules: explicit native absence
+refuses before opening the store; auto may fall back to pure. Injected providers
+retain per-call reference verification. The checksum algorithm, persisted bytes,
+WAL grammar and disk format are unchanged, so a store written with pure can be
+reopened with native/auto. This isolates CPU/provider policy, not different algorithms.
+
+The low-level `install_crc32c` / `install_checksum` compatibility doors still set
+the standalone default used by domain utilities outside a database operation.
+Manually assembled low-level components do not implicitly acquire a database scope.
+Installers invoked by a callback cannot replace its active database's selection.
 
 ## Detailed descriptor, metrics and budget contracts
 

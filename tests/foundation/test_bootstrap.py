@@ -301,7 +301,7 @@ def test_a_huge_finite_section_timeout_is_supported_without_numeric_overflow() -
     database.close()
 
 
-def test_custom_registry_does_not_disable_the_process_global_checksum_selector(
+def test_custom_registry_does_not_disable_the_explicit_checksum_selector(
     complete_registry: PortRegistry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     observed: list[str] = []

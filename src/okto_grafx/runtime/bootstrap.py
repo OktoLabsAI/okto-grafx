@@ -473,10 +473,11 @@ def build_vector_math(context: PortContext) -> object:
 def install_checksum(config: DatabaseConfig) -> str:
     """Install the CRC-32C implementation this configuration selects, and return its name.
 
-    This is not a port. The checksum is installed process-wide because every component that
+    This compatibility installer selects the standalone default; connection/bootstrap
+    callers capture it in an isolated execution scope instead. Every component that
     computes one must compute the SAME one -- a page written by the pool and verified by the
-    verifier is one answer, not two -- and a value injected per database would let two open
-    databases in one process disagree about what a byte range hashes to.
+    verifier is one answer, not two. Per-database selection captures only providers
+    admitted by this same validator; it never permits a different checksum algorithm.
 
     Installing is safe in a way that binding a vector math adapter is not, and that is why
     ``"auto"`` accelerates here and does not there. The native path is a closed provider list,
@@ -683,7 +684,15 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
     attempt from publishing over the same names.
     """
     config = _require_database_config(config)
-    install_checksum(config)
+    from okto_grafx.runtime.checksum_scope import capture_checksum, checksum_scope
+
+    state = capture_checksum(lambda: install_checksum(config))
+    with checksum_scope(state):
+        return _build_default_registry(config)
+
+
+def _build_default_registry(config: DatabaseConfig) -> PortRegistry:
+    """Build ports inside the caller's already-selected checksum scope."""
     registry = PortRegistry()
     built: dict[str, object] = {}
     try:
@@ -764,14 +773,27 @@ def open_database(
     second release here would make neither observable on its own (A67).
     """
     config = _require_database_config(config)
+    from functools import partial
+    from okto_grafx.runtime.checksum_scope import capture_checksum, checksum_scope
+
+    state = capture_checksum(lambda: install_checksum(config))
+    with checksum_scope(state):
+        database = _open_database_selected(config, registry=registry)
+        database._checksum_scope = partial(checksum_scope, state)
+        database._transactions._checksum_scope = database._checksum_scope
+        return database
+
+
+def _open_database_selected(
+    config: DatabaseConfig, *, registry: PortRegistry | None
+) -> Database:
+    """Complete open and failure cleanup using one captured checksum provider."""
     owns_ports = registry is None
     if registry is None:
-        ports = build_default_registry(config)
+        ports = _build_default_registry(config)
     else:
         ports = _require_port_registry(registry)
-        # CRC-32C is deliberately process-global rather than a port. A custom port registry
-        # replaces the seven adapters, not this explicit configuration choice.
-        install_checksum(config)
+        # A custom registry does not replace the explicit per-database checksum choice.
     ports.require_complete()
     database = _assemble_database(config, ports, owns_ports=owns_ports)
     if (
