@@ -3,6 +3,13 @@
 **Data:** 2026-08-26
 **Status:** proposta para refinamento e execução incremental
 
+**GX-CAP-1 / 2026-09-08:** primeiro slice de domínio implementado em
+`feature/gx-cap-1`: CommitId qualificado, admissão limitada/imutável de metadados
+e cálculo puro de tempo lógico. 985 testes agrupados passaram, incluindo 87
+específicos; tipagem estrita/Ruff verdes. A capability persistente e pública
+continua pendente, sem mudança no Pulse ou novas specs consolidadas.
+Registro: [`SPEC-GX-CAP-1`](docs/specs/SPEC-GX-CAP-1.md).
+
 **Execução 2026-09-08:** GX-CAP-0 ganhou seis ADRs, estratégia de manifest,
 especificações por milestone e enforcement de fronteiras de source/wheel em
 `feature/gx-cap-0` (base `61fc44d`). Registro de testes e limite do checkpoint:

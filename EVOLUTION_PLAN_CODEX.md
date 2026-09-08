@@ -14,6 +14,15 @@
 
 ## Resumo vigente — 2026-09-08
 
+GX-CAP-1 começou em `feature/gx-cap-1`, sobre `c310675`. O primeiro slice
+implementa identidade qualificada pelo store, metadados profundamente imutáveis
+com admissão limitada e tempo lógico monotônico. 87 testes específicos e a
+regressão agrupada de 985 testes passaram; mypy estrito/Ruff/diff verdes.
+Não há ainda API pública ou persistência de metadados: catálogo de commits,
+publicação/recovery, lookup/verify, métricas e transferência lógica seguem
+obrigatórios. Sem operação no Pulse ou consumo de outra spec.
+Escopo, limites e evidência: [SPEC-GX-CAP-1](docs/specs/SPEC-GX-CAP-1.md).
+
 Marco complementar GX-CAP-0 entregue em branch própria `feature/gx-cap-0`,
 base `61fc44d`, sem alterar o Pulse instalado ou consumir novas specs.
 Seis ADRs fixam ownership database-first, temporalidade, CommitId, catálogos,
@@ -3765,6 +3774,7 @@ começar sob seus roadmaps versionados; a matriz CE-3 temporal tornou-se evidên
 
 | Marco | Estado | Evidência integrada | Validação registrada |
 |---|---|---|---|
+| GX-CAP-1 / CAP-1A — admissão de proveniência | primeiro slice implementado; marco completo em andamento | branch `feature/gx-cap-1`, base `c310675`; domínio `commit_identity.py`/`commit_metadata.py`; `docs/specs/SPEC-GX-CAP-1.md` | 87 testes específicos, incluídos nos 985 testes transacionais/API/imports em 114,31 s; mypy estrito e Ruff verdes. Valores internos, sem export público, WAL/formato/persistência ou alterações no Pulse. Catálogo durável, recovery, consulta, métricas e logical transfer permanecem requisitos do marco |
 | GX-CAP-0 — contratos database-first e isolamento de wheels | dez entregas implementadas e validadas localmente; não é release das próximas capabilities | branch `feature/gx-cap-0`, checkpoint `eb25eccbd42d16a1a3ddf06292f2d69b4eaaedc6`, base `61fc44d`; seis ADRs e `docs/specs/SPEC-GX-CAP-0.md` | 296 testes agrupados em 14,98 s, incluindo wheel real com cinco pacotes-sentinela, seletor legado discriminado, fronteiras de imports e recusa de capabilities; Ruff/diff limpos, 22 documentos com links verificados. Sem mudança de runtime/formato, novas specs consumidas ou alegação de ganho de performance; revisão Codex solo, não auditoria independente |
 | M-PULSE-0 | concluído | `main@5b7551b40dba2facb28c46770f166ab3ac9daecc` | suites query/API do marco: 1.398 passes e 1 skip; chunks globais: 3.841 + 1.205 + 2.021 passes, 10 skips; Ruff limpo; nove mutantes mortos; revisão cruzada sem blocker |
 | M-PULSE-1A — identidade pendente | concluído | `main@d487ac9312229e0376ad8e65625213af111d9c9c` | regressões de `PendingRowRef`, redução de intents, prevalidation e bloqueios passaram; Ruff e `git diff --check` limpos após rebase |
