@@ -8,6 +8,10 @@ Opt-in durable commit provenance on the 0.0.5 development branch is described in
 [commit history](COMMIT_HISTORY.md), including activation, metadata, qualified
 lookup, snapshot pagination, verification, cost and transfer/restore limitations.
 
+`from okto_grafx.backup import create_backup, restore_backup, BackupReport` exposes
+the bounded physical backup/offline replacement workflow. See [backup and restore](BACKUP_RESTORE.md)
+for signatures, all parameters, result fields, concurrency and failure guarantees.
+
 ```python
 from okto_grafx import (
     connect, DatabaseConfig, Database, Transaction, Query, QueryCursor, QueryResult,

@@ -145,3 +145,8 @@ The tests cover a logical transfer into a fresh target and a checkpointed, close
 physical copy reopened read-only with identical history. Manual OS-level copying
 cannot be detected globally by this embedded library; it is not an authorized
 way to create independent writers for one UUID.
+
+The 0.0.5 [physical backup API](BACKUP_RESTORE.md) now provides a bounded, consistent
+checkpoint cut and verified offline replacement restore. It preserves journal and
+qualified commit identities; destination verification is outside the source fence.
+It does not replace the logical-fork mapping contract above.

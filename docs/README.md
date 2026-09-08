@@ -25,6 +25,9 @@ then consult the API/query references for the capabilities your application uses
 
 ## Extend or maintain the engine
 
+[Physical backup and restore](BACKUP_RESTORE.md) covers the bounded local API,
+checkpoint fence, manifests, integrity checks and offline replacement obligations.
+
 - [Ports and custom adapters](PORTS.md): trusted in-process extension boundary,
   ownership and examples. This is not a sandbox or the proposed UDF SPI.
 - [Architecture](ARCHITECTURE.md) and [normative engine contract](architecture/CONTRACT.md).

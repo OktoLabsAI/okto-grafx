@@ -641,6 +641,7 @@ class HeapStore:
         "_bootstrapped_epoch",
         "_extent_proof_seal",
         "_tuple_encoding_proofs",
+        "_overflow_reuse_cursor",
     )
 
     def __init__(
@@ -660,6 +661,7 @@ class HeapStore:
         self._catalog: CatalogStore = catalog
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._file: str = file
+        self._overflow_reuse_cursor: tuple[int, int, int] | None = None
         # The resolved tail of each table, so an append stays O(1) after the first walk. It is a
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
         # start and another process read (A40.3).
@@ -1212,7 +1214,7 @@ class HeapStore:
         deterministic pass rewrites retained chain links, frees selected slots, compacts each
         touched page, and emits full page images for the ordinary WAL path. Overflow chains
         are released only after a database-wide exclusive-ownership proof. Released pages
-        are marked FREE, not truncated or offered to an online allocator.
+        are marked FREE for subsequent guarded reuse, never truncated by this plan.
         """
 
         if (
@@ -2629,8 +2631,10 @@ class HeapStore:
         if RECORD_HEADER_SIZE + len(payload) <= self.inline_capacity:
             content = header.encode() + payload
         else:
+            capacity = self._pool.page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE
             chain = write_chain(
-                self._pool, self._file, payload, page_type=int(PageType.OVERFLOW)
+                self._pool, self._file, payload, page_type=int(PageType.OVERFLOW),
+                reuse=self._retired_overflow_candidates((len(payload) + capacity - 1) // capacity),
             )
             overflowed = replace(header, flags=header.flags | RECORD_FLAG_HAS_OVERFLOW)
             content = overflowed.encode() + encode_overflow_pointer(chain[0])
@@ -2644,6 +2648,61 @@ class HeapStore:
             cursor.extent = settled_extent
             cursor.derived_epoch = self._derived_read_epoch()
         return reference
+
+    def _retired_overflow_candidates(self, count: int) -> tuple[PageIndex, ...]:
+        """Consume advisory candidates under the caller's ordinary commit fence.
+
+        Authority remains the current page image, not this cursor: only empty, terminal FREE
+        pages with a committed page LSN in a heap with a durable reclaim floor qualify.
+        Vacuum proved that no retained version owns those pages before publishing FREE and
+        the snapshot floor in the same WAL transaction. Unwritten/abandoned allocations with
+        LSN zero do not qualify. No mutable free-list head can escape before COMMIT.
+
+        Scan a fixed physical extent at most once per floor per participant, retaining O(1)
+        advisory state. A new vacuum floor restarts discovery; ordinary commits do not. A
+        failed attempt may burn a local candidate until that restart, but cannot create reuse
+        authority. The chain writer preserves page LSN/sequence and normal WAL/OCC/quota paths.
+        """
+        if HEAP_RECLAIM_V1_CAPABILITY not in self._catalog.catalog.required_capabilities():
+            return ()
+        floor = self.reclaim_floor()
+        if floor == NO_LSN:
+            return ()
+        token = self._pool.read_view_token()
+        horizon = getattr(token, "last_committed_lsn", None)
+        if type(horizon) is not int:
+            # Unqualified manual compositions have no current durable publication proof.
+            # They may append normally but cannot opt into persisted physical reuse.
+            return ()
+        cursor = self._overflow_reuse_cursor
+        if cursor is None or cursor[0] != floor:
+            cursor = (floor, 1, self._pool.storage.page_count(self._file))
+        _, position, stop = cursor
+        selected: list[int] = []
+        while position < stop and len(selected) < count:
+            candidate = position
+            position += 1
+            # Advance even on refusal. The cursor is never a promise that a page is free.
+            self._overflow_reuse_cursor = (floor, position, stop)
+            with self._pool.pinned(self._file, candidate) as page:
+                if page.page_type != int(PageType.FREE):
+                    continue
+                if (page.slot_count != 0 or page.next_page != NO_PAGE
+                        or page.flags != 0 or page.header().reserved != 0):
+                    raise GrafxCorruptionDetected(
+                        "Overflow reuse found a malformed FREE page.",
+                        file=self._file, page=candidate, field="overflow_reuse",
+                    )
+                if page.page_lsn > horizon:
+                    raise GrafxCorruptionDetected(
+                        "Overflow reuse found a FREE page beyond the current committed view.",
+                        file=self._file, page=candidate, field="overflow_reuse_lsn",
+                        page_lsn=page.page_lsn, committed_lsn=horizon,
+                    )
+                if is_committed_csn(page.page_lsn):
+                    selected.append(candidate)
+        self._overflow_reuse_cursor = (floor, position, stop)
+        return tuple(selected)
 
     def _chain_limit(self) -> int:
         """Return the most hops any chain in this file can take before it must be a cycle.

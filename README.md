@@ -49,6 +49,7 @@ context exit commits, and an exceptional exit rolls back. See
 | Exact and approximate vector search with declared space, metric and precision | [Indexes and vectors](docs/INDEXES_AND_VECTORS.md) |
 | Query/transaction budgets, optional spill, acceleration and metrics | [All configuration fields](docs/CONFIGURATION.md) |
 | Verification, evidence ledger/quarantine, recovery/checkpoint, manual vacuum and WAL compression | [Operations](docs/OPERATIONS.md) |
+| Bounded physical backup and verified offline replacement restore (0.0.5 development) | [Backup and restore](docs/BACKUP_RESTORE.md) |
 | Embedded Python, machine-readable CLI, configurable ports/adapters | [API](docs/API_REFERENCE.md), [CLI](docs/CLI.md), [ports](docs/PORTS.md) |
 
 Concurrent transactions do not imply lock-free commits: publication has an exclusive
@@ -57,7 +58,7 @@ time out. Recovery repairs only states that the WAL and durable identity prove s
 it does not silently rebuild or discard damaged authoritative data.
 
 There is no native async/HTTP/MCP server, SQLAlchemy backend, public time-travel API
-or general hot-backup/restore API in this release surface. Proposed capabilities
+or no-pause streaming hot-backup API in this release surface. Proposed capabilities
 are explicitly separated in the [roadmap](ROADMAP.md).
 
 ## Current measured performance

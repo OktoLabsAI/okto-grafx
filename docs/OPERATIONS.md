@@ -140,7 +140,13 @@ were an application-approved write.
 | `inspect_index(name)` | Materializes an entry inventory; do not put unbounded inspection on a hot request. |
 | `read_quarantine(name)` / `quarantine_receipts(name)` | Checksum-verified preserved bytes / receipt names; not a restore command. |
 
-For a filesystem backup, stop **all** participants, close handles successfully and
+The 0.0.5 development line provides `okto_grafx.backup.create_backup` and
+`restore_backup`: [full contract, budgets and examples](BACKUP_RESTORE.md).
+Capture uses the existing checkpoint fence; writers wait for checkpoint/capture,
+not destination IO or verification. Restore requires an offline-original assertion
+and a new destination, preserving UUID/commit provenance rather than creating a fork.
+
+For a manual filesystem backup, stop **all** participants, close handles successfully and
 copy the complete directory as one quiescent artifact. Preserve hashes, Grafx
 version/configuration and identity. Verify/reopen a separate restored copy before
 relying on it. Copying only `heap.dat`, an open live directory or selected WAL
@@ -197,7 +203,11 @@ selected under the pass quota. `complete` covers eligible inline **and overflow*
 the selected tables. Retired overflow pages are WAL-logged as empty FREE pages, not silently
 removed from disk. The ownership pass is foreground O(total reachable overflow pages), not a
 new cost on ordinary queries/commits; `max_versions` is not an IO or total plan-memory limit.
-Vacuum does not truncate files or automatically reuse released pages, slots or `RecordRef`
+Subsequent overflow writes reuse eligible persisted FREE pages under normal commit
+fences, with current-page revalidation. Discovery uses O(1) advisory cursor memory
+and scans a fixed heap extent incrementally per participant/reclaim floor. It is
+amortized discovery, not a persistent O(1) free-page index. No file truncation occurs.
+Vacuum never reassigns slots or `RecordRef`
 identities. Restart application processes after the maintenance window so their first transaction
 adopts the new capability, floor and index authority. See
 [`docs/architecture/MVCC_VACUUM_V1.md`](architecture/MVCC_VACUUM_V1.md).

@@ -36,6 +36,14 @@ and stale diagnostic snapshots mean this is not an all-green operational audit.
 
 ## Native synthetic checkpoint in the 0.0.5 development line
 
+R3 storage-growth acceptance (September 8, isolated 512-byte-page fixture): a
+4,200-character replacement after quiescent overflow retirement appended **0 heap
+pages**, including after reopen. This measures reused capacity, not latency or file
+shrinking. Discovery still amortizes a heap-extent scan per participant/reclaim floor;
+no new UI or commit-throughput claim is made for R3/R4. Backup/restore is an
+operational feature with a bounded checkpoint/capture publication pause, not a
+performance optimization.
+
 Fresh local stores, one two-column node table, Windows/Python 3.13.1; latest warm
 read observations only. This is not the Pulse UI, a relationship-heavy KG or a
 comparison against Ladybug. [Full workload, source hashes and validation](reports/V005_NATIVE_PERFORMANCE_CHECKPOINT.md).

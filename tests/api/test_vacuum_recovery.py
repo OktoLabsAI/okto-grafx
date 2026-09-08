@@ -201,3 +201,47 @@ def test_vacuum_crash_windows_recover_to_complete_pre_or_post_state(
     assert all(
         count == 1 for phase, count in outcomes.items() if phase != "before_wal_commit"
     )
+
+
+def test_reused_overflow_crash_boundaries_preserve_pre_or_post_commit():
+    """FREE consumption follows the same five WAL/application publication cuts as vacuum."""
+    def prepared():
+        memory, fault, db = prepared_database(overflow=True)
+        db.maintenance.vacuum(confirm_quiescent=True)
+        return memory, fault, db
+
+    def update(db):
+        with db.transaction() as tx:
+            tx.execute("MATCH (p:Person {id:1}) SET p.name=$v", {"v": "new" * 600})
+
+    memory, fault, db = prepared()
+    try:
+        points = fault.enumerate_write_points(lambda _device: update(db))
+        barrier = only(points, lambda p: p.method == "durable_barrier" and str(p.file).startswith("wal/"))
+        append = tuple(p for p in points if p.method == "append_log" and p.call_index < barrier.call_index)[-1]
+        cuts = [
+            (append, "before", "current"),
+            (barrier, "after", "new" * 600),
+            (only(points, lambda p: p.method == "write_page" and p.file == "heap.dat" and p.call_index > barrier.call_index), "after", "new" * 600),
+            (only(points, lambda p: p.method == "write_page" and str(p.file).startswith("index/") and p.call_index > barrier.call_index), "after", "new" * 600),
+            (only(points, lambda p: p.method == "write_page" and p.file == "control/commit.state"), "after", "new" * 600),
+        ]
+    finally:
+        db.close()
+        memory.close()
+    for point, moment, expected in cuts:
+        memory, fault, crashed = prepared()
+        try:
+            fault.clear_trail()
+            fault.crash_at(point.call_index, moment=moment)
+            with pytest.raises(SimulatedCrash):
+                update(crashed)
+            fault.disarm()
+            with open_database(fault, namespace=memory) as recovered:
+                assert recovered.execute("MATCH (p:Person) RETURN p.name").rows == ((expected,),)
+                assert recovered.verify("all").findings == ()
+            with open_database(fault, namespace=memory) as reopened:
+                assert reopened.execute("MATCH (p:Person) RETURN p.name").rows == ((expected,),)
+                assert reopened.verify("all").findings == ()
+        finally:
+            memory.close()

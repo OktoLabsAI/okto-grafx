@@ -9,6 +9,14 @@ including the on-disk format.
 
 ### Changed
 
+- Added ordinary overflow allocation reuse of persisted vacuum FREE pages, guarded
+  by the retained-snapshot floor, current durable view and page LSN. Discovery is
+  incremental/O(1) memory, without a new mutable free-list format or file truncation.
+- Added `okto_grafx.backup.create_backup` / `restore_backup`: bounded local physical
+  capture under checkpoint fences, checked artifacts, verified no-replace publication,
+  and offline same-UUID replacement preserving commit provenance/epoch lineage.
+  This is not a no-pause streaming backup or an independently writable fork.
+
 - Reduced cold catalog identifier-validation CPU with an equivalent exact-ASCII
   built-in predicate; retained subclass behavior and all IO/authority checks.
 - Isolated checksum selection per connection and execution context, including
