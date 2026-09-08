@@ -1475,10 +1475,12 @@ class RecoveryManager:
             )
 
         page_replay = CommittedReplay(
-            effects=page_records, last_committed_lsn=replay.last_committed_lsn
+            effects=page_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
         index_replay = CommittedReplay(
-            effects=index_records, last_committed_lsn=replay.last_committed_lsn
+            effects=index_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
         manager = self._index_manager
         if not preflight_touched_catalog and self._index_sync is not None:

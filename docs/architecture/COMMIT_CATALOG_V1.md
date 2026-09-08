@@ -168,6 +168,39 @@ fence. No extra global writer mode or relaxed descriptor proof is introduced.
 
 ## Mandatory crash/concurrency matrix for the integrated capability
 
+### Individual COMMIT boundaries now retained by replay
+
+The existing selector previously flattened durable effects and retained only
+the greatest COMMIT LSN. That is insufficient to prove which transaction owns
+each journal entry when replay spans several commits. It now retains the exact
+individual COMMIT envelopes in `CommittedReplay.commit_records`, including
+effect-free COMMITs, with no additional storage read or record re-encoding.
+Startup and checkpoint page/index subplans carry the same tuple.
+
+When boundaries are supplied, preflight validates forward/unique COMMIT sequence,
+unique `(epoch, txn_id)`, maximum watermark and effect ownership before decoding
+pages. Each selected effect must precede its own terminal; a terminal transaction
+cannot also advertise incomplete effects. The private passage-bound proof includes
+terminal tuple and record signatures. Page projection cannot substitute/drop the
+boundaries while reusing the full proof. Signatures are captured **before** page
+decoding and checked afterwards, preventing a codec callback from mutating the
+terminals between validation and sealing/application.
+
+Validation is O(C+E), temporary key mapping O(C), over the already selected WAL
+range (C COMMITs, E effects), not a scan of all retained logical history. Signature
+checks reuse the existing preflight passage policy; no new physical-authority
+cache, lock, barrier or I/O door is introduced. This does add in-memory lineage
+work; no end-to-end speedup is claimed. Legacy manually composed effect-only
+plans retain their prior contract, but cannot certify journal publication.
+
+This is a prerequisite, not complete journal replay. The integration still needs
+activation/UUID authority, one journal append per post-activation writing COMMIT,
+cross-file count/time/fragment coverage, initialization vs missing-history checks,
+normal staging/OCC and idempotent page replay. Both journal integration guards
+remain in force until those conditions are implemented and tested.
+
+### Remaining complete-capability acceptance matrix
+
 | Cut / race | Required outcome |
 |---|---|
 | Invalid admission / clock overflow | No durable effects or identity allocation |

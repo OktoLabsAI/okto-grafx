@@ -21,7 +21,9 @@ from okto_grafx.domain.ids import Lsn, NO_LSN
 from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
-from okto_grafx.domain.recovery.decision import CommittedReplay, committed_replay
+from okto_grafx.domain.recovery.decision import (
+    CommittedReplay, committed_replay, validate_commit_boundaries,
+)
 from okto_grafx.domain.txn.records import (
     COMMIT_CATALOG_PAGE_FILES, decode_page_write, is_redoable_page_file,
 )
@@ -91,6 +93,8 @@ class _PreflightedReplay:
     replay: CommittedReplay
     effects: tuple[WalRecord, ...]
     incomplete_effects: tuple[WalRecord, ...]
+    commit_records: tuple[WalRecord, ...]
+    commit_signature: tuple[tuple[object, ...], ...]
     last_committed_lsn: Lsn
     allow_unregistered_indexes: bool
     allow_page_coalescing: bool
@@ -149,10 +153,14 @@ class CommitRedo:
         if proof is not None:
             prepared_pages = proof.prepared_pages
         else:
+            validate_commit_boundaries(replay)
+            commit_records = replay.commit_records
+            commit_signature = self._record_signature(commit_records)
             prepared_pages, _signature, _contains_index_reset = self._preflight(
                 replay.effects,
                 allow_unregistered_indexes=False,
             )
+            self._require_unchanged_commit_records(replay, commit_records, commit_signature)
 
         pages_applied = 0
         index_effects = 0
@@ -289,10 +297,14 @@ class CommitRedo:
                 field="allow_unregistered_indexes",
                 value=type(allow_unregistered_indexes).__name__,
             )
+        validate_commit_boundaries(replay)
+        commit_records = replay.commit_records
+        commit_signature = self._record_signature(commit_records)
         prepared_pages, signature, contains_index_reset = self._preflight(
             replay.effects,
             allow_unregistered_indexes=allow_unregistered_indexes,
         )
+        self._require_unchanged_commit_records(replay, commit_records, commit_signature)
         return _PreflightedReplay(
             seal=_PREFLIGHT_SEAL,
             owner=self,
@@ -300,6 +312,8 @@ class CommitRedo:
             replay=replay,
             effects=replay.effects,
             incomplete_effects=replay.incomplete_effects,
+            commit_records=commit_records,
+            commit_signature=commit_signature,
             last_committed_lsn=replay.last_committed_lsn,
             allow_unregistered_indexes=allow_unregistered_indexes,
             allow_page_coalescing=len(prepared_pages) == len(replay.effects),
@@ -448,6 +462,7 @@ class CommitRedo:
         if (
             page_replay.last_committed_lsn != source_replay.last_committed_lsn
             or page_replay.incomplete_effects
+            or page_replay.commit_records is not source_replay.commit_records
             or len(page_replay.effects) != len(source.prepared_pages)
         ):
             return None
@@ -465,6 +480,8 @@ class CommitRedo:
             replay=page_replay,
             effects=page_replay.effects,
             incomplete_effects=page_replay.incomplete_effects,
+            commit_records=page_replay.commit_records,
+            commit_signature=source.commit_signature,
             last_committed_lsn=page_replay.last_committed_lsn,
             allow_unregistered_indexes=False,
             allow_page_coalescing=source.allow_page_coalescing,
@@ -497,12 +514,17 @@ class CommitRedo:
             or preflighted.replay is not replay
             or preflighted.effects is not replay.effects
             or preflighted.incomplete_effects is not replay.incomplete_effects
+            or preflighted.commit_records is not replay.commit_records
             or preflighted.last_committed_lsn != replay.last_committed_lsn
         ):
             return None
         if (
             not preflighted.signature_verified
-            and preflighted.record_signature != self._record_signature(replay.effects)
+            and (
+                preflighted.record_signature != self._record_signature(replay.effects)
+                or any(not isinstance(record.payload, bytes) for record in replay.commit_records)
+                or preflighted.commit_signature != self._record_signature(replay.commit_records)
+            )
         ):
             return None
         return preflighted
@@ -519,6 +541,8 @@ class CommitRedo:
             replay=proof.replay,
             effects=proof.effects,
             incomplete_effects=proof.incomplete_effects,
+            commit_records=proof.commit_records,
+            commit_signature=proof.commit_signature,
             last_committed_lsn=proof.last_committed_lsn,
             allow_unregistered_indexes=proof.allow_unregistered_indexes,
             allow_page_coalescing=proof.allow_page_coalescing,
@@ -527,6 +551,21 @@ class CommitRedo:
             contains_index_reset=proof.contains_index_reset,
             prepared_pages=proof.prepared_pages,
         )
+
+    def _require_unchanged_commit_records(
+        self, replay: CommittedReplay, records: tuple[WalRecord, ...],
+        signature: tuple[tuple[object, ...], ...],
+    ) -> None:
+        """Do not seal callback-mutated terminal values after validating earlier ones."""
+        if (
+            replay.commit_records is not records
+            or any(not isinstance(record.payload, bytes) for record in records)
+            or signature != self._record_signature(records)
+        ):
+            raise GrafxRecoveryRefused(
+                "Replay commit boundaries changed during preflight; no effect was applied.",
+                field="commit_boundaries",
+            )
 
     @staticmethod
     def _record_signature(

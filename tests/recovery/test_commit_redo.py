@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -555,6 +555,82 @@ def test_reapplying_a_compressed_page_effect_is_an_idempotent_no_op(
     )
     assert persisted.page_lsn == 7
     assert persisted.read_slot(0) == b"compressed"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("record_type", int(WalRecordType.ABORT)), ("epoch", 2), ("txn_id", 8),
+    ("lsn", 1), ("lsn", 5),
+])
+def test_invalid_commit_boundary_refuses_before_page_decode(field: str, value: int) -> None:
+    pool = _PoolDouble()
+    terminal = replace(_commit_record(4), **{field: value})
+    replay = CommittedReplay(effects=(_page_record(1),), last_committed_lsn=4, commit_records=(terminal,))
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        CommitRedo(pool).preflight(replay)  # type: ignore[arg-type]
+    assert failure.value.details["field"] == "commit_boundaries"
+    assert pool.codec.decode_calls == 0
+
+
+@pytest.mark.parametrize("mutation", ["replace_tuple", "epoch", "txn_id", "lsn", "payload", "flags", "descriptor"])
+def test_preflight_cannot_borrow_changed_commit_boundaries(mutation: str) -> None:
+    pool = _PoolDouble()
+    redo = CommitRedo(pool)  # type: ignore[arg-type]
+    terminal = _commit_record(4)
+    replay = CommittedReplay(effects=(_page_record(1),), last_committed_lsn=4, commit_records=(terminal,))
+    passage = object()
+    proof = redo.preflight(replay, _passage=passage)
+    if mutation == "replace_tuple":
+        object.__setattr__(replay, "commit_records", (replace(terminal),))
+    else:
+        values = {"epoch": 2, "txn_id": 8, "lsn": 3, "payload": b"changed", "flags": 1, "descriptor": "changed"}
+        object.__setattr__(terminal, mutation, values[mutation])
+    assert redo._verify_preflight_for(replay, proof, allow_unregistered_indexes=False, passage=passage) is None
+    assert pool.codec.decode_calls == 1
+
+
+@pytest.mark.parametrize("door", ["apply", "preflight"])
+@pytest.mark.parametrize("field,value", [("epoch", 2), ("payload", b"changed"), ("payload", None)])
+def test_commit_mutated_during_page_preflight_cannot_be_sealed_or_applied(
+    door: str, field: str, value: object, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _PoolDouble()
+    redo = CommitRedo(pool)  # type: ignore[arg-type]
+    terminal = _commit_record(4)
+    replay = CommittedReplay(effects=(_page_record(1),), last_committed_lsn=4, commit_records=(terminal,))
+    original = _CodecDouble.decode_page
+
+    def mutate(codec: _CodecDouble, image: bytes, *, verify: bool = True) -> Page:
+        page = original(codec, image, verify=verify)
+        object.__setattr__(terminal, field, value)
+        return page
+
+    calls: list[bool] = []
+    monkeypatch.setattr(_CodecDouble, "decode_page", mutate)
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", lambda *_args: calls.append(True) or True)
+    with pytest.raises(GrafxRecoveryRefused) as failure:
+        getattr(redo, door)(replay)
+    assert failure.value.details["field"] == "commit_boundaries"
+    assert pool.codec.decode_calls == 1 and calls == []
+
+
+@pytest.mark.parametrize("same_commits", [True, False])
+def test_page_projection_preserves_exact_commit_boundaries(same_commits: bool) -> None:
+    pool = _PoolDouble()
+    redo = CommitRedo(pool, _IndexManagerDouble([]))  # type: ignore[arg-type]
+    page = _page_record(1)
+    commits = (_commit_record(4),)
+    replay = CommittedReplay(
+        effects=(page, _index_record(IndexOperation.INSERT, 2)),
+        last_committed_lsn=4, commit_records=commits,
+    )
+    pages = CommittedReplay(effects=(page,), last_committed_lsn=4, commit_records=commits if same_commits else ())
+    passage = object()
+    proof = redo.preflight(replay, _passage=passage)
+    projected = redo._project_page_preflight(replay, pages, proof, allow_unregistered_indexes=False, passage=passage)
+    assert (projected is not None) == same_commits
+    if same_commits:
+        assert redo._verify_preflight_for(pages, projected, allow_unregistered_indexes=False, passage=passage) is not None
+    assert pool.codec.decode_calls == 1
 
 
 def test_page_only_redo_coalesces_repeated_locations_at_their_first_position(

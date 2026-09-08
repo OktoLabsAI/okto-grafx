@@ -26,12 +26,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import NoReturn
 
 from okto_grafx.domain.errors import GrafxRecoveryRefused
-from okto_grafx.domain.ids import NO_LSN, Epoch, Lsn, TxnId
+from okto_grafx.domain.ids import NO_LSN, PROVISIONAL_CSN, Epoch, Lsn, TxnId
 from okto_grafx.domain.ledger.classification import refuses_recovery
 from okto_grafx.domain.wal.codec import FailureReason
-from okto_grafx.domain.wal.record import WalRecord, WalRecordType
+from okto_grafx.domain.wal.record import MAX_U64, WalRecord, WalRecordType
 from okto_grafx.domain.wal.replay import ScanFailure, ScanItem
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "committed_replay",
     "plan_recovery",
     "redo_order",
+    "validate_commit_boundaries",
 ]
 
 
@@ -65,11 +67,74 @@ class CommittedReplay:
     image that was already applied would let a later watermark make an uncommitted row visible.
     ``last_committed_lsn`` is independent of either tuple: an empty committed transaction still
     advances the durable commit-state watermark.
+
+    ``commit_records`` retains the individual COMMIT envelopes in WAL order, including
+    empty outcomes. The maximum watermark alone cannot bind commit-history entries
+    to their publishing transactions. These are references to the already selected
+    immutable records, not a second WAL read or a durable publication certificate.
     """
 
     effects: tuple[WalRecord, ...] = field(default_factory=tuple)
     last_committed_lsn: Lsn = NO_LSN
     incomplete_effects: tuple[WalRecord, ...] = field(default_factory=tuple)
+    commit_records: tuple[WalRecord, ...] = field(default_factory=tuple)
+
+
+def validate_commit_boundaries(replay: CommittedReplay) -> None:
+    """Check supplied terminal lineage before effects move; no ports or payload decoding.
+
+    Legacy manually composed effect-only plans retain their existing contract.
+    Their absent terminal tuple is NOT proof of journal lineage: journal replay
+    remains refused until its complete authority/coverage validation is wired.
+    Projection may retain commits with no selected effects (page/index separation).
+    """
+    def refuse() -> NoReturn:
+        raise GrafxRecoveryRefused(
+            "Replay commit boundaries do not match the selected effects and watermark.",
+            field="commit_boundaries",
+        )
+
+    if type(replay.commit_records) is not tuple:
+        refuse()
+    if not replay.commit_records:
+        return
+    if type(replay.last_committed_lsn) is not int:
+        refuse()
+    terminals: dict[tuple[int, int], int] = {}
+    previous = NO_LSN
+    for record in replay.commit_records:
+        if (
+            not isinstance(record, WalRecord)
+            or record.record_type != int(WalRecordType.COMMIT)
+            or not isinstance(record.payload, bytes) or not isinstance(record.descriptor, str)
+            or type(record.lsn) is not int
+            or not previous < record.lsn < PROVISIONAL_CSN
+            or type(record.epoch) is not int or type(record.txn_id) is not int
+            or not 0 <= record.epoch <= MAX_U64 or not 0 <= record.txn_id <= MAX_U64
+        ):
+            refuse()
+        key = (record.epoch, record.txn_id)
+        if key in terminals:
+            refuse()
+        terminals[key] = record.lsn
+        previous = record.lsn
+    if previous != replay.last_committed_lsn:
+        refuse()
+    for record in replay.effects:
+        if not isinstance(record, WalRecord):
+            refuse()
+        if type(record.epoch) is not int or type(record.txn_id) is not int:
+            refuse()
+        terminal = terminals.get((record.epoch, record.txn_id))
+        if terminal is None or type(record.lsn) is not int or not 0 < record.lsn < terminal:
+            refuse()
+    for record in replay.incomplete_effects:
+        if not isinstance(record, WalRecord):
+            refuse()
+        if type(record.epoch) is not int or type(record.txn_id) is not int:
+            refuse()
+        if (record.epoch, record.txn_id) in terminals:
+            refuse()
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +264,7 @@ def committed_replay(records: Iterable[WalRecord]) -> CommittedReplay:
     pending: dict[tuple[Epoch, TxnId], list[WalRecord]] = {}
     terminals: dict[tuple[Epoch, TxnId], WalRecord] = {}
     committed: list[WalRecord] = []
+    commit_records: list[WalRecord] = []
     last_committed_lsn: Lsn = NO_LSN
     for record in records:
         key = (record.epoch, record.txn_id)
@@ -219,6 +285,7 @@ def committed_replay(records: Iterable[WalRecord]) -> CommittedReplay:
         terminals[key] = record
         if record.record_type == int(WalRecordType.COMMIT):
             committed.extend(pending.pop(key, ()))
+            commit_records.append(record)
             last_committed_lsn = max(last_committed_lsn, record.lsn)
             continue
         pending.pop(key, None)
@@ -231,6 +298,7 @@ def committed_replay(records: Iterable[WalRecord]) -> CommittedReplay:
         effects=tuple(committed),
         last_committed_lsn=last_committed_lsn,
         incomplete_effects=tuple(incomplete),
+        commit_records=tuple(commit_records),
     )
 
 

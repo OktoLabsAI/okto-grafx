@@ -14,6 +14,13 @@
 
 ## Resumo vigente — 2026-09-08
 
+GX-CAP-1 avançou na ligação do replay aos COMMITs individuais: preservação de
+epoch/transaction ID/LSN nos subplanos de recovery e checkpoint, validação de
+ownership e assinatura capturada antes de callbacks de decodificação. 826 testes
+agrupados em 37,45 s; sem novo I/O ou mudança de WAL/OCC. A publicação/replay do
+journal permanece desabilitada até fechar sua cobertura entre arquivos. Evidência:
+[SPEC-GX-CAP-1](docs/specs/SPEC-GX-CAP-1.md). Pulse e specs continuam preservados.
+
 GX-CAP-1 ganhou a gramática obrigatória do WAL para páginas de histórico: flags
 v2 distintos com/sem compressão, sem fallback para framing legado. O recovery
 reconhece a gramática mas recusa aplicá-la antes de qualquer mutação, até fechar

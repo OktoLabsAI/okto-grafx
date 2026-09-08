@@ -4267,10 +4267,12 @@ class TransactionManager:
             in (int(WalRecordType.INDEX_WRITE), int(WalRecordType.INDEX_RECONCILE))
         )
         page_replay = CommittedReplay(
-            effects=page_records, last_committed_lsn=replay.last_committed_lsn
+            effects=page_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
         index_replay = CommittedReplay(
-            effects=index_records, last_committed_lsn=replay.last_committed_lsn
+            effects=index_records, last_committed_lsn=replay.last_committed_lsn,
+            commit_records=replay.commit_records,
         )
 
         # A long-lived participant may checkpoint WAL written by another process. Its catalog

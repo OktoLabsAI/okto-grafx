@@ -1023,6 +1023,20 @@ Algorithm (FROZEN):
 7. `recovery_policy="refuse"` raises `GrafxRecoveryRefused` **instead of step 3** and leaves
    everything on disk untouched.
 
+CAP-1B replay lineage: the internal `CommittedReplay.commit_records` tuple retains
+individual COMMIT envelopes, including empty outcomes, in addition to selected
+effects and the maximum watermark. Startup recovery and checkpoint page/index
+subplans preserve the exact tuple. When supplied, boundaries must be forward,
+unique by `(epoch, txn_id)`, end at the advertised watermark, and own every
+selected effect at a strictly earlier LSN; incomplete effects cannot belong to
+those terminal transactions. Preflight captures terminal signatures before
+decoding pages and refuses callback mutation before sealing/applying the plan.
+Passage-bound proof reuse also checks terminal tuple/signature identity. An old
+hand-constructed effect-only plan retains its prior behavior, but is not proof
+of commit-history coverage. Journal replay remains explicitly refused until
+the complete cross-file protocol is integrated; these boundaries alone do not
+certify catalog contents, a WAL barrier or physical authority.
+
 ```python
 class LedgerStore:
     def append(self, entry: LedgerEntry) -> int

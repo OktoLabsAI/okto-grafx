@@ -378,3 +378,44 @@ not a type-clean whole-engine claim. Old-binary execution, publication/crash and
 complete concurrent history guarantees remain outstanding; injected legacy
 semantics and replay refusal are prerequisites, not substitutes for those gates.
 Pulse was not changed and no reserved spec was consumed.
+
+### CAP-1B replay COMMIT boundaries — 2026-09-08
+
+The selector now retains individual COMMIT envelopes (not just the maximum LSN)
+and both native startup recovery/checkpoint splits preserve them. Preflight
+validates transaction ownership, forward/unique boundaries, complete/incomplete
+classification and the advertised watermark before page decoding. The existing
+private proof and its page projection bind the exact terminal tuple/signatures.
+This supplies the missing per-transaction lineage for later journal validation;
+it does not enable journal replay or remove its fail-closed integration guard.
+
+Four initial pure selector tests failed because the field was absent. New tests
+cover interleaved commits, epoch-qualified identities, empty COMMITs, malformed
+boundary sequences/owners, tuple/signature replacement and projection preservation.
+Review also found a callback cut: the terminal signature was first captured after
+page decoding. Four tests reproduced acceptance/application after that mutation.
+The fix captures first and checks again before sealing/applying; six final cases
+cover both doors and changed epoch, payload and invalid payload type.
+
+Final grouped command:
+
+```text
+python -m pytest tests/recovery tests/txn/test_catalog_commit_state_fence.py
+  tests/api/test_checkpoint_and_reclamation.py tests/api/test_wal_page_compression.py
+  tests/test_import_boundary.py tests/test_optional_package_boundary.py
+  -q -o addopts="--strict-markers --timeout=60 --timeout-method=thread"
+```
+
+**826 passed in 37.45 s**, including the existing recovery crash matrix. This
+supersedes the earlier 812-test run; focused selector/dispatcher suites now contain
+82 tests and overlap the group. The existing crash suite is not the unimplemented
+journal publication crash matrix. Ruff/diff-check pass. Strict mypy comparison of
+the selector/dispatcher against HEAD `d75f9dc` shadow sources gives the same four
+preexisting errors (three imported Catalog, one CommitRedo details forwarding),
+with no new diagnostics. It is not a type-clean full engine claim.
+
+No persisted format or transaction ordering was changed by this slice. Additional
+memory/validation is linear in the already selected replay range, with no new host
+I/O or full commit-history scan. Both OCCs, durability and multi-reader/writer
+premises remain intact. Automatic journal publication/replay, public APIs and all
+remaining CAP-1 deliverables are still required. Pulse and reserved specs untouched.
