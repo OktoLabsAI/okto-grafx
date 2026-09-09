@@ -22,8 +22,10 @@ __all__ = ["TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"
 
 FULLTEXT_CAPABILITY = "fulltext_indexes_v1"
 FULLTEXT_STATISTICS_CAPABILITY = "fulltext_statistics_v1"
+FULLTEXT_HISTORY_CAPABILITY = "fulltext_statistics_history_v1"
 PREFIX = "fulltext_v1_"
 STATISTICS_PREFIX = "fulltext_v2_"
+HISTORY_PREFIX = "fulltext_v3_"
 ANALYZERS = ("standard", "keyword", "code_identifier", "whitespace")
 _HEADER = struct.Struct("<BBBBHII")
 _NORMALIZATIONS = ("none", "NFC", "NFKC")
@@ -55,11 +57,16 @@ class TextIndexOptions:
     stopwords: str = "none"
     stemming: str = "none"
     statistics_mode: str = "wal"
+    statistics_history_entries: int = 0
 
     def __post_init__(self) -> None:
         """Capture bounded immutable field weights and exact supported analyzer semantics."""
         if type(self.statistics_mode) is not str or self.statistics_mode not in ("wal", "durable"):
             raise _bad("statistics_mode")
+        if (type(self.statistics_history_entries) is not int
+                or not 0 <= self.statistics_history_entries <= 32
+                or (self.statistics_history_entries and self.statistics_mode != "durable")):
+            raise _bad("statistics_history_entries")
         if type(self.analyzer) is not str or self.analyzer not in ANALYZERS:
             raise _bad("analyzer")
         if type(self.analyzer_version) is not int or self.analyzer_version != 1:
@@ -114,10 +121,12 @@ class TextIndexOptions:
             self.max_document_tokens,
         )
         return (
-            (STATISTICS_PREFIX if self.statistics_mode == "durable" else PREFIX)
+            (HISTORY_PREFIX if self.statistics_history_entries else
+             STATISTICS_PREFIX if self.statistics_mode == "durable" else PREFIX)
             + (
                 raw
                 + struct.pack("<" + "d" * len(self.field_weights), *self.field_weights)
+                + (bytes((self.statistics_history_entries,)) if self.statistics_history_entries else b"")
             ).hex()
         )
 
@@ -126,6 +135,9 @@ def decode_options(derivation: str) -> TextIndexOptions:
     """Decode/validate all analyzer identity bytes; reserved/unknown forms refuse."""
     try:
         raw = bytes.fromhex(derivation[len(PREFIX) :])
+        history = raw[-1] if derivation.startswith(HISTORY_PREFIX) else 0
+        if derivation.startswith(HISTORY_PREFIX):
+            raw = raw[:-1]
         analyzer, fields, normalization, folding, length, characters, tokens = (
             _HEADER.unpack_from(raw)
         )
@@ -139,7 +151,8 @@ def decode_options(derivation: str) -> TextIndexOptions:
             weights,
             _NORMALIZATIONS[normalization],
             _FOLDS[folding],
-            statistics_mode="durable" if derivation.startswith(STATISTICS_PREFIX) else "wal",
+            statistics_mode="durable" if derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX)) else "wal",
+            statistics_history_entries=history,
         )
         if derivation != options.derivation():
             raise ValueError("noncanonical")
@@ -152,12 +165,17 @@ def decode_options(derivation: str) -> TextIndexOptions:
 
 def is_fulltext(derivation: str) -> bool:
     """Recognize the reserved family; decoding still validates the complete identity."""
-    return derivation.startswith((PREFIX, STATISTICS_PREFIX))
+    return derivation.startswith((PREFIX, STATISTICS_PREFIX, HISTORY_PREFIX))
 
 
 def has_durable_statistics(derivation: str) -> bool:
     """Recognize the opt-in derivation requiring native persisted corpus totals."""
-    return derivation.startswith(STATISTICS_PREFIX)
+    return derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX))
+
+
+def has_historical_statistics(derivation: str) -> bool:
+    """Recognize the opt-in bounded historical-summary derivation."""
+    return derivation.startswith(HISTORY_PREFIX)
 
 
 def _fold(text: str, policy: str) -> str:

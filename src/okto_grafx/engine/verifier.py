@@ -575,6 +575,22 @@ class Verifier:
                 )
             )
             return 0, findings
+        # Use the same freshly decoded catalog whose failure is reported above;
+        # a second cached-catalog access must not escape the diagnostic boundary.
+        from okto_grafx.engine.free_page_index import CAPABILITY, census
+        from okto_grafx.engine.heap_store import HeapStore
+        if isinstance(self._heap, HeapStore) and CAPABILITY in catalog.required_capabilities():
+            try:
+                horizon = getattr(self._pool.read_view_token(), "last_committed_lsn", None)
+                if type(horizon) is not int:
+                    raise GrafxCorruptionDetected("Free-page verification lacks a durable view.")
+                census(self._heap, horizon)
+            except GrafxError as failure:
+                findings.append(VerificationFinding(
+                    kind=FindingKind.TABLE_UNREADABLE,
+                    location=FindingLocation(file=self._heap.file, page=0),
+                    detail=f"Free-page index could not be verified: {failure}",
+                ))
         tables = tuple(catalog.tables())
         if extent_slots is not None:
             findings.extend(
@@ -1480,9 +1496,11 @@ class Verifier:
         findings: list[VerificationFinding] = []
         from okto_grafx.domain.index.fulltext import has_durable_statistics, decode_options, field_tokens
         if has_durable_statistics(getattr(definition, "key_derivation", "")):
-            from okto_grafx.engine.fulltext_durable import read_statistics_from_device
+            from okto_grafx.engine.fulltext_durable import read_history_from_device
+            from okto_grafx.domain.txn.snapshot import Snapshot
             try:
-                _, actual_count, actual_totals = read_statistics_from_device(index)
+                series = read_history_from_device(index)
+                _, actual_count, actual_totals = series[-1]
                 options = decode_options(definition.key_derivation)
                 count = 0
                 totals = [0] * len(positions)
@@ -1493,6 +1511,32 @@ class Verifier:
                         totals = [a + len(b) for a, b in zip(totals, fields, strict=True)]
                 if actual_count != count or actual_totals != tuple(totals):
                     raise GrafxCorruptionDetected("Durable text statistics differ from the heap census.")
+                floor = self._heap.reclaim_floor() if len(series) > 1 else 0
+                retained = [record for record in series[:-1] if record[0] >= floor]
+                snapshots = [Snapshot(record[0]) for record in retained]
+                counts = [0] * len(retained)
+                lengths = [[0] * len(positions) for _ in retained]
+                # The shared coverage cache intentionally discards ended payloads.
+                # Stream canonical history once; never mistake that live-only cache
+                # for a complete historical oracle or retain every old document.
+                if retained:
+                    markers = {record[0] for record in series}
+                    earliest = retained[0][0]
+                    latest = series[-1][0]
+                    for _, version in self._heap.scan_all(table):
+                        if any(earliest < stamp <= latest and stamp not in markers
+                               for stamp in (version.xmin, version.xmax)):
+                            raise GrafxCorruptionDetected("Historical text statistics omit a retained heap transition.")
+                        visible = [i for i, snapshot in enumerate(snapshots)
+                                   if snapshot.visible(version.xmin, version.xmax)]
+                        if visible:
+                            sizes = [len(tokens) for tokens in field_tokens(version.values, positions, options)]
+                            for i in visible:
+                                counts[i] += 1
+                                lengths[i] = [a + b for a, b in zip(lengths[i], sizes, strict=True)]
+                for (_, historical_count, historical_totals), count, totals in zip(retained, counts, lengths, strict=True):
+                    if historical_count != count or historical_totals != tuple(totals):
+                        raise GrafxCorruptionDetected("Historical text statistics differ from retained heap visibility.")
             except GrafxError as failure:
                 findings.append(VerificationFinding(
                     kind=FindingKind.INDEX_UNREADABLE,

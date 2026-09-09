@@ -41,6 +41,7 @@ class ConnectOptions(TypedDict, total=False):
     checksum: Literal["auto", "pure", "native"]
     vector_exact_scan_threshold: int
     vector_ef_search: int
+    vector_hnsw_memory_budget_bytes: int | None
     read_only: bool
     descriptor_revalidation: Literal["strict", "generation"]
     max_query_value_characters: int

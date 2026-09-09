@@ -1,5 +1,40 @@
 # Durable FTS corpus statistics — implementation contract
 
+## Approved historical extension (next round item 2)
+
+Before implementation: opt-in `statistics_history_entries=1..32` together with
+`statistics_mode="durable"`; default 0 preserves the v2 derivation and scalar
+bytes. `fulltext_v3_` appends one unsigned capacity byte to the existing analyzer
+identity and requires catalog bit 8, `fulltext_statistics_history_v1`, as well as
+the existing FTS/statistics capabilities. Old builds refuse the unknown bit.
+
+Page 0 slot 2 becomes a fixed-size record: `<8sH6x>` (`GRFXFTH1`, used count)
+followed by `capacity+1` scalar records in the established `<8sB7xQQ4Q>` format.
+Used records are oldest to newest, strictly increasing committed markers;
+unused bytes and reserved fields must be zero. An empty private build has one
+zero-marker empty scalar, replaced (not retained as historical evidence) by its
+first complete build summary. Creation refuses before staging when page 0 cannot
+hold the declared capacity alongside its ordinary headers and three slot entries.
+
+Each complete committed reduction appends its scalar and evicts only the oldest
+when full, in the same page image as the newest marker. No extra WAL effect and
+no partial-commit summary: the existing proved-COMMIT reducer/replay protocol
+remains authoritative and idempotent. A historical scalar covers readers from
+its marker up to, but excluding, the next retained scalar's marker. Consecutive
+retained reductions prove the intervening interval has no omitted FTS effects.
+Latest-only coverage keeps the existing table-high-water check. Readers older
+than the retained interval use the exact WAL/census path, not a guessed total.
+
+Physical backup retains the ring. Logical import/rebuild creates a new summary
+at its own cut, preserving capacity but not source historical statistics. This
+is bounded corpus metadata, not temporal row-history retention or a right to read
+below the heap's reclaimed snapshot floor. Verification reads the device and
+checks every retained scalar whose snapshot is still retained against canonical
+heap visibility; scalars below the reclaim floor remain structurally validated.
+Required tests: interval/gap/eviction oracles, foreign writers, repeated recovery,
+pre/post-publication process death, malformed/future/nonmonotonic and semantic
+tampering, downgrade refusal, backup/transfer, and unchanged default bytes.
+
 Status: approved item 5 implemented and locally validated. See the
 [eight-item acceptance receipt](../reports/V005_EIGHT_ITEM_CHECKPOINT.md).
 This extends the active [roadmap](../../ROADMAP.md), not a second backlog.

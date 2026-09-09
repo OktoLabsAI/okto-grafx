@@ -237,7 +237,7 @@ def _tables(schema: dict) -> tuple[tuple[TableDef, ...], tuple[EmbeddingSpaceDef
             "fulltext",
         }:
             raise _refuse("schema_invalid")
-        if index["layout"] not in ("hash", "ordered"):
+        if index["layout"] not in ("hash", "ordered", "sparse_hash"):
             raise _refuse("unsupported_index_layout")
         if index["fulltext"] is not None:
             TextIndexOptions(

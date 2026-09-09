@@ -1,6 +1,12 @@
 # SPEC-GX-CAP-11 — Database hardening and release
 
 Status: specified / implementation not certified. Date: 2026-09-08.
+
+0.0.5 continuation provides the [compatibility matrix](../V005_COMPATIBILITY.md),
+CI workflow and isolated real-0.0.4-wheel upgrade/refusal checks. This is partial
+hardening evidence, not a release approval or an assertion that unexecuted remote
+OS/Python rows passed. The [receipt](../reports/V005_NEXT_EIGHT_PROGRESS.md) owns
+the local final-regression status.
 Dependencies: Implemented database capability milestones and existing operational baseline.
 
 ## Normative scope

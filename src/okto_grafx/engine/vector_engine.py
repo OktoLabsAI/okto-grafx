@@ -140,6 +140,9 @@ from okto_grafx.engine.index_manager import (
     StagingTransaction,
 )
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
+from okto_grafx.engine.vector_memory import (
+    VectorMemoryUsage, picture_tariff, require_picture_budget, require_reservation, work_tariff,
+)
 
 __all__ = [
     "DEFAULT_INDEX_SEED",
@@ -632,6 +635,10 @@ class VectorHnswIndex(ProximityIndex):
         "_graph_generation",
         "_building",
         "_builder",
+        "_hnsw_memory_budget_bytes",
+        "_memory_peak",
+        "_memory_refusals",
+        "_memory_retirements",
     )
 
     def __init__(
@@ -655,6 +662,7 @@ class VectorHnswIndex(ProximityIndex):
         _compact_vectors: bool = False,
         guard: GraphGuard | None = None,
         refresh: Callable[[str, object], None] | None = None,
+        hnsw_memory_budget_bytes: int | None = None,
     ) -> None:
         """Build the index of one embedding space over one paged store.
 
@@ -662,6 +670,10 @@ class VectorHnswIndex(ProximityIndex):
         without one the index is fit for a single thread only.
         """
         search_width = _require_ef_search(ef_search)
+        self._hnsw_memory_budget_bytes = require_picture_budget(hnsw_memory_budget_bytes)
+        self._memory_peak = 0
+        self._memory_refusals = 0
+        self._memory_retirements = 0
         super().__init__(definition, pool, metrics)  # type: ignore[arg-type]
         self._space_id = space_id
         self._space_name = space_name
@@ -977,6 +989,25 @@ class VectorHnswIndex(ProximityIndex):
         """Return the graph of the current picture, building one when there is none or it is behind."""
         return self.snapshot().graph
 
+    def memory_usage(self) -> VectorMemoryUsage:
+        """Observe this local cache without building it or reading its index pages."""
+        with self._guard:
+            count = 0 if self._snapshot is None else len(self._snapshot.entry_of_node)
+            return VectorMemoryUsage(
+                self._space_name, self._hnsw_memory_budget_bytes, count,
+                0 if self._snapshot is None else picture_tariff(count, self._dimension, self._neighbours),
+                self._memory_peak, self._memory_refusals, self._memory_retirements,
+            )
+
+    def _reserve_picture(self, count: int, *, cold: bool) -> None:
+        """Check a complete picture/work reservation without storage access."""
+        amount = work_tariff(count, self._dimension, self._neighbours, self._ef_construction, cold=cold)
+        with self._guard:
+            self._memory_peak = max(self._memory_peak, amount)
+            if self._hnsw_memory_budget_bytes is not None and amount > self._hnsw_memory_budget_bytes:
+                self._memory_refusals += 1
+        require_reservation(amount, self._hnsw_memory_budget_bytes)
+
     def snapshot(self, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
         """Return one complete picture of the index as of now, building it when needed.
 
@@ -1123,6 +1154,24 @@ class VectorHnswIndex(ProximityIndex):
         rule the ACORN traversal applies to a filtered node. Every refusal on the way in
         propagates, and the caller drops the picture with the frame.
         """
+        self._reserve_picture(0, cold=True)
+        ceiling = self._hnsw_memory_budget_bytes
+        if ceiling is None:
+            captured = self._entry_headers()
+        else:
+            base = work_tariff(0, self._dimension, self._neighbours, self._ef_construction, cold=True)
+            per_entry = work_tariff(1, self._dimension, self._neighbours, self._ef_construction, cold=True) - base
+            max_entries = (ceiling - base) // per_entry
+            try:
+                captured = self._entry_headers(max_entries=max_entries)
+            except GrafxQueryBudgetExceeded as failure:
+                if failure.details.get("resource") != "index_entry_headers":
+                    raise
+                self._reserve_picture(max_entries + 1, cold=True)
+                raise
+        self._reserve_picture(len(captured), cold=True)
+        headers = sorted(captured, key=lambda item: (item.born_csn, item.encoded_ref))
+        del captured
         picture = _GraphSnapshot(
             graph=HnswGraph(
                 self._math,
@@ -1150,10 +1199,7 @@ class VectorHnswIndex(ProximityIndex):
             mark=mark,
         )
         try:
-            for header in sorted(
-                self._entry_headers(),
-                key=lambda item: (item.born_csn, item.encoded_ref),
-            ):
+            for header in headers:
                 if check is not None:
                     check()
                 # The header walk has already validated every persisted image before this first
@@ -1226,6 +1272,7 @@ class VectorHnswIndex(ProximityIndex):
         self, picture: _GraphSnapshot, entry: IndexEntry, identity: tuple[bytes, int]
     ) -> None:
         """Resolve, check and insert one entry that the picture does not hold yet."""
+        self._reserve_picture(len(picture.entry_of_node) + 1, cold=False)
         try:
             resolved = self._resolve(entry.ref)
         except GrafxError as failure:
@@ -1320,6 +1367,15 @@ class VectorHnswIndex(ProximityIndex):
                             born_csn=change.csn,
                         ),
                     )
+                except GrafxQueryBudgetExceeded as failure:
+                    self._retire(picture)
+                    if failure.details.get("resource") != "vector_hnsw_memory":
+                        raise
+                    with self._guard:
+                        self._memory_retirements += 1
+                    # The index mutation is already durable. Refuse the next
+                    # ANN build, never the committed write, for cache pressure.
+                    return False
                 except BaseException:
                     self._retire(picture)
                     raise
@@ -1582,6 +1638,7 @@ class VectorEngine:
         "_guard",
         "_catalog_changes_are_wal_logged",
         "_candidate_filter_seal",
+        "_hnsw_memory_budget_bytes",
     )
 
     def __init__(
@@ -1602,6 +1659,7 @@ class VectorEngine:
         ef_search: int = DEFAULT_EF_SEARCH,
         guard: GraphGuard | None = None,
         catalog_changes_are_wal_logged: bool = False,
+        hnsw_memory_budget_bytes: int | None = None,
     ) -> None:
         """Build the engine over one catalog, one heap and one index registry.
 
@@ -1653,6 +1711,7 @@ class VectorEngine:
             )
         self._catalog_changes_are_wal_logged = catalog_changes_are_wal_logged
         self._candidate_filter_seal = object()
+        self._hnsw_memory_budget_bytes = require_picture_budget(hnsw_memory_budget_bytes)
 
     # --- spaces -------------------------------------------------------------------------------
 
@@ -1878,6 +1937,7 @@ class VectorEngine:
             _compact_vectors=self._math.name == "numpy",
             guard=self._guard,
             refresh=self._refresh_heap_view,
+            hnsw_memory_budget_bytes=self._hnsw_memory_budget_bytes,
         )
         complete_through = (
             registry.published_lsn

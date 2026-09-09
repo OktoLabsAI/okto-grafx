@@ -30,11 +30,14 @@ then consult the API/query references for the capabilities your application uses
 
 ## Extend or maintain the engine
 
+- [Trusted scalar extensions and optional Arrow batches](EXTENSIONS_AND_ARROW.md).
+- [0.0.5 compatibility/upgrade matrix](V005_COMPATIBILITY.md).
+
 [Physical backup and restore](BACKUP_RESTORE.md) covers the bounded local API,
 checkpoint fence, manifests, integrity checks and offline replacement obligations.
 
 - [Ports and custom adapters](PORTS.md): trusted in-process extension boundary,
-  ownership and examples. This is not a sandbox or the proposed UDF SPI.
+  ownership and examples. This is not a sandbox; scalar UDFs have a separate SPI above.
 - [Architecture](ARCHITECTURE.md) and [normative engine contract](architecture/CONTRACT.md).
 - [Capability specifications](specs/CAPABILITY_MILESTONES.md): detailed acceptance
   contracts; their existence is not evidence that a feature is callable.

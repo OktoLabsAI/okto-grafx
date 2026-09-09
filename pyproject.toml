@@ -51,6 +51,7 @@ Changelog = "https://github.com/OktoLabsAI/okto-grafx/blob/main/CHANGELOG.md"
 License = "https://github.com/OktoLabsAI/okto-grafx/blob/main/LICENSE"
 
 [project.optional-dependencies]
+arrow = ["pyarrow>=14"]
 # RECOMMENDED for any real workload. Two accelerators behind ports the engine already
 # declares, and neither one changes an answer:
 #

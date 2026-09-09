@@ -1,6 +1,6 @@
 # Okto Grafx roadmap
 
-**Single active product backlog — reconciled September 8, 2026.**
+**Single active product backlog — reconciled September 9, 2026.**
 Baseline: published `0.0.4`, tag `v0.0.4`, main merge
 `425362a44c4b8224cb43b33f0f7f65458c4ee193`; latest recorded Pulse measurement is a different build,
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
@@ -14,6 +14,7 @@ reopen completed work, authorize production data changes or imply release approv
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
+- [Approved continuation after 3f3819f](#approved-continuation-after-3f3819f)
 - [Search and resumable-transfer follow-up](#search-and-resumable-transfer-follow-up)
 - [Approved four-item follow-up](#approved-four-item-follow-up)
 - [Proposed next round after the 0.0.5 checkpoint](#proposed-next-round-after-the-005-checkpoint)
@@ -65,6 +66,36 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## Search and resumable-transfer follow-up
 
+### Approved continuation after 3f3819f
+
+Approved September 9, 2026, in this order on `feature/v0.0.5`. This is a finite
+implementation round, not deployment, publication or a relaxation of concurrency,
+WAL, OCC, snapshots or fail-closed validation. Internal checkpoints follow 1–2 and
+3–5; all eight are authorized. Feature/failure tests, grouped regression and
+roadmap/capability/configuration/API documentation are required for completion.
+
+| Order | Bounded scope | Status |
+| --- | --- | --- |
+| 1 / OPS-4, PERF-MEM | Explicit HNSW derived-picture construction/cache logical-memory budget and diagnostics, including safe warm-cache retirement after durable writes | Implemented and locally validated; cold admission, warm retirement and grouped regression |
+| 2 / GX-CAP-5 | Bounded retained durable corpus summaries for eligible historical FTS snapshots; exact census when retention cannot prove coverage | Implemented and locally validated; snapshots, retention, interval verification, crash/replay and grouped regression |
+| 3 / OPS-3 | Indexed discovery of already retired overflow FREE pages; revalidate ownership/horizon at allocation, preserve quiescent retirement | Implemented and locally validated; native crash cuts, valid-CRC corruption, backup, capability refusal and verifier corrective regression |
+| 4 / OPS-5 | Opt-in sparse hash-directory allocation, with explicit format/capability, recovery, rebuild and old-reader contracts | Implemented and locally validated; first-head crash cuts, changed directory images, backup/transfer and grouped regression |
+| 5 / OPS-5, PERF-SCALE | Repeated-key overflow access; preserve all visible versions and completeness, not just wider bucket sizing | Implemented and locally validated: bounded exact-image decoded-page memo. Still O(chain pages + candidates), no posting-tree or constant-time claim |
+| 6 / GX-CAP-7 | Trusted explicit extension registry and typed scalar functions first; no mutable storage/WAL access or sandbox claim | Implemented and locally validated: per-handle immutable allowlist and typed scalar query/direct calls |
+| 7 / GX-CAP-8 | Optional Arrow result-batch export, with exact type/ownership/snapshot/budget contracts; after the item 6 foundation | Implemented and locally validated: optional copied scalar batches over native results/cursors |
+| 8 / OPS-10, GX-CAP-11 | Reproducible 0.0.5 compatibility/upgrade/accelerator/platform matrix; report unavailable platform rows, never imply they executed | Implemented workflow and isolated real-wheel upgrade tool; 3 local selector tests and 4 real 0.0.4 upgrade cases passed; unexecuted OS/Python rows remain unmeasured |
+
+Performance value is workload-dependent; no unmeasured percentage is promised.
+Persisted items require their concrete format/recovery contracts before code.
+This round does not include online vacuum, sharding, full temporal history,
+arbitrary UDF procedures, external Arrow scans or production Pulse workloads.
+**Local DoD closed:** 15,904 distinct tests passed and 18 platform skips across full
+grouped coverage plus corrective reruns; no unresolved failures. This is not one
+uninterrupted clean invocation or a remote-platform certification. Documentation
+checks cover links, 36 connect fields, public APIs/DTOs and preserved plans.
+Initial defects, their dispositions and exact acceptance boundaries are
+recorded in the [continuation receipt](docs/reports/V005_NEXT_EIGHT_PROGRESS.md).
+
 ### Approved eight-item continuation after e34a9e7
 
 The operator approved items 1–8 in order. This is a finite continuation on
@@ -97,9 +128,11 @@ Consumer contracts: [FTS](docs/FULL_TEXT_SEARCH.md), [hybrid](docs/HYBRID_SEARCH
 [index sizing](docs/INDEXES_AND_VECTORS.md), [backup](docs/BACKUP_RESTORE.md),
 [application migrations](docs/SCHEMA_MIGRATIONS.md), [configuration](docs/CONFIGURATION.md)
 and generated [API signatures/DTOs](docs/API_REFERENCE.md). Remaining scope is
-explicit: historical durable FTS summaries, sparse/sharded hash directories,
+explicit at that checkpoint: historical durable FTS summaries, sparse/sharded hash directories,
 no-pause/resumable physical backups, arbitrary ALTER/views/derived graphs are not
-part of this delivery. No production installation or release is implied.
+part of that delivery. Historical summaries and sparse allocation were subsequently
+implemented in the [continuation after 3f3819f](#approved-continuation-after-3f3819f).
+No production installation or release is implied.
 
 The operator approved all four candidates after `b16bf1f`, on `feature/v0.0.5`.
 This finite delivery changes no release/version, production data or Pulse installation.
@@ -303,9 +336,9 @@ No additional marginal performance threshold is introduced by this requirement.
 | --- | --- | --- |
 | OPS-1 / §8.1 | R4 plus item 7: bounded physical backup/restore with chunked capture | Checked manifest, checkpoint-fenced disk spool (default) or memory capture, verified no-replace publication and offline same-UUID replacement. No no-pause/resumable hot backup, generic custom-storage backup or independently writable fork. [Contract](docs/BACKUP_RESTORE.md). |
 | OPS-2 / §8.2 | Implemented bounded v1 plus explicit resume extension | Streaming checksummed logical schema/data/vectors, parallel edges, current-ID mappings, FTS declarations, private-workspace crash resumption and verified no-replace promotion. Current state only; no existing-target merge or historical journal copy. [Contract](docs/LOGICAL_TRANSFER.md), [latest acceptance](docs/reports/V005_SEARCH_RESUME_CHECKPOINT.md). |
-| OPS-3 / P1.4, §8.3 | Partial: quiescent vacuum plus validated R3 overflow reuse | Eligible exclusively owned overflow pages are retired through WAL, then reused by ordinary overflow allocations. O(1)-memory discovery is amortized O(heap pages) per participant/reclaim floor, not an indexed constant-time allocator. Quiescence remains an operator assertion; truncation and online vacuum remain unimplemented. Orphan-index cleanup is tracked separately under OPS-5. |
+| OPS-3 / P1.4, §8.3 | Partial: quiescent vacuum, validated overflow reuse and opt-in indexed candidate discovery | Retirement and immutable candidate directories are WAL-published. Default discovery remains amortized O(heap pages); indexed discovery visits candidates/stale entries/directory pages and is not constant time. Quiescence remains an operator assertion; truncation and online vacuum remain unimplemented. [Indexed discovery](docs/OPERATIONS.md#indexed-retired-overflow-discovery-005-development). |
 | OPS-4 / P1.8 | Open limitation: buffer and query budgets are not process RSS caps | Account/measure all retained engine state, vector memory, concurrent handles and temporary encodings. Preserve deterministic refusal; publish a realistic peak-memory envelope, not an RSS promise derived from nominal page bytes. |
-| OPS-5 / P1.12 | Partial: growth/rebuild, quiescent cleanup, explicit 65,536-bucket sizing and bounded skew diagnostics exist | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement, sparse allocation/sharding and repeated-key overflow redesign remain. [Index contract](docs/INDEXES_AND_VECTORS.md), [cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
+| OPS-5 / P1.12 | Partial: growth/rebuild, quiescent cleanup, explicit 65,536-bucket sizing, sparse allocation and bounded skew/repeated-key decoding exist | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement, sharding and a new repeated-key posting layout remain. [Index contract](docs/INDEXES_AND_VECTORS.md), [cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
 | OPS-6 / P1.11 | Open limitation: physical conflicts and exclusive publication | Remove only proven redundant publication/page work. Disjoint logical rows may still conflict; do not promise linear writer scaling or replace multiwriter with an application-wide single-writer premise. |
 | OPS-7 / P2.6, P2.9 | Implemented bounded DX/isolation checkpoint in 0.0.5 | Typed `Unpack[ConnectOptions]` plus per-connection checksum selection, including custom registries. Standalone low-level installers retain their legacy default outside database operations. No checksum algorithm or persisted byte semantics changed. [R2 evidence](docs/reports/V005_R1_R2_CHECKPOINT.md). |
 | OPS-8 / §8.5 | Partial: reusable Query/cursor and cooperative read cancellation/deadlines exist | `Query` is not a durable prepared plan or HTTP token. Broader streaming/prepared APIs remain; controls do not preempt blocking calls, run watchdog cleanup or interrupt commits. [Contract](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
@@ -434,11 +467,11 @@ physical edges do not cross stores. Embedding generation stays outside the engin
 | GX-CAP-4 | Planned | Valid time, bitemporal semantics and graph/version diff; builds on CAP-3. [Spec](docs/specs/SPEC-GX-CAP-4.md). |
 | GX-CAP-5 | Implemented v1 plus single-pass counting and opt-in durable statistics | Native FTS, explicit analyzer/version, weighted BM25 and snapshot/filter/budget/recovery contracts. Pure analysis reuse, bounded WAL deltas and eligible persisted summaries reduce work; old/ineligible census remains linear. Prefix/phrase, relationship FTS and same-name analyzer replacement remain unsupported. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
 | GX-CAP-6 | Implemented bounded v1 plus certified incident expansion and shared controls/memory | Weighted RRF, union/intersection, source explanations, graph boost/filter, explicit missing-source partial policy, indexed BFS and per-phase logical peaks. No embedding provider, cross-table fusion, graph-only candidate expansion or universal recall promise. [Usage](docs/HYBRID_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-6.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
-| GX-CAP-7 | Planned | Trusted in-process extension SPI, scalar/aggregate UDFs and procedures, manifests, quotas and typed failures; no access to mutable WAL/pages. [Spec](docs/specs/SPEC-GX-CAP-7.md). |
-| GX-CAP-8 | Planned | Arrow/batch interoperability, external scans and graph exchange; explicit schemas/ownership/snapshot boundaries, no implicit distributed transaction. [Spec](docs/specs/SPEC-GX-CAP-8.md). |
+| GX-CAP-7 | Partial: trusted scalar SPI implemented | Explicit immutable per-handle registry, typed scalar UDFs/direct calls, NULL/value budgets and typed failures. Aggregate/table/procedure extensions, durable manifests and sandboxing are not implemented. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-7.md). |
+| GX-CAP-8 | Partial: scalar Arrow result export implemented | Explicit types, bounded copied batches over results/cursors and ownership contracts. External scans, nested/entity export and graph exchange remain; no implicit distributed transaction. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |
 | GX-CAP-9 | Planned | Bounded graph projections and optional algorithm package: reachability, components, shortest paths and ranking with declared semantics. [Spec](docs/specs/SPEC-GX-CAP-9.md). |
 | GX-CAP-10 | Partial: additive application migration ledger/checksums/dry-run implemented in the eight-item continuation | Atomic per-version CREATE NODE/REL TABLE and VECTOR SPACE with bounded retries/resumption. Staged column evolution, arbitrary ALTER, logical views and derived/materialized graphs remain; distinct from engine format migration. [Consumer guide](docs/SCHEMA_MIGRATIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-10.md). |
-| GX-CAP-11 | Planned | Cross-capability hardening, compatibility/upgrade/recovery matrices, packaging, operational docs and release acceptance. [Spec](docs/specs/SPEC-GX-CAP-11.md). |
+| GX-CAP-11 | Partial: 0.0.5 compatibility automation and local upgrade evidence implemented | Real-wheel upgrade/refusal, cross-selector reopen and Windows/Ubuntu × Python 3.11–3.13 workflow. Remote matrix runs and release acceptance are not implied. [Current evidence](docs/V005_COMPATIBILITY.md), [spec](docs/specs/SPEC-GX-CAP-11.md). |
 
 Implementation precedence: close release boundary → complete CAP-1 → catalog/
 system-time/FTS foundations → bitemporal/hybrid → extension/interoperability/

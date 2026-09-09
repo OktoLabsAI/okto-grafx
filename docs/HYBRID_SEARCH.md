@@ -132,7 +132,9 @@ logical envelope reserves 1024 bytes per fusion window slot, 64 per allowed ID,
 reservation), vector candidate components and ANN navigation containers. Native
 source limits still apply independently. Engine caches, a cold HNSW picture and its
 construction state, page/decoder buffers, allocator overhead, sorting temporaries
-and caller-owned result retention are not an RSS-capped memory pool. Inspect native
+and caller-owned result retention are not an RSS-capped memory pool. HNSW pictures
+have a separate optional `vector_hnsw_memory_budget_bytes` admission policy; see
+[its independent scope and tariffs](INDEXES_AND_VECTORS.md#hnsw-derived-picture-memory). Inspect native
 cache/vector budgets separately. Source reservations are released between phases.
 
 Cancellation/deadlines share one control across lexical, vector and graph work,

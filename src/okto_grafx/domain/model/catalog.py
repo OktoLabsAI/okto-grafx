@@ -53,6 +53,7 @@ from okto_grafx.domain.index.definition import (
 from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.fulltext import (
     FULLTEXT_CAPABILITY, is_fulltext, FULLTEXT_STATISTICS_CAPABILITY, has_durable_statistics,
+    FULLTEXT_HISTORY_CAPABILITY, has_historical_statistics,
 )
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.index.keys import LARGE_HASH_CAPABILITY, LEGACY_MAX_BUCKET_COUNT
@@ -95,6 +96,12 @@ WAL_RECORD_V2_CAPABILITY: str = "wal_record_v2"
 COMMIT_CATALOG_V1_CAPABILITY: str = "commit_catalog_v1"
 """Required capability guarding the persisted commit-history activation horizon."""
 
+HEAP_FREE_INDEX_CAPABILITY: str = "heap_free_page_index_v1"
+"""Required capability for the heap-header linked retired-page directory."""
+
+SPARSE_HASH_CAPABILITY: str = "sparse_hash_directories_v1"
+"""Required capability for exact sparse-hash bucket directories."""
+
 _PREAMBLE = struct.Struct("<8sHHIIII")
 _V2_EXTENSION = struct.Struct("<QII")
 _INDEX_META = struct.Struct("<BBBBHHQ")
@@ -115,6 +122,9 @@ _COMMIT_CATALOG_V1_BIT = 1 << 4
 _FULLTEXT_V1_BIT = 1 << 5
 _FULLTEXT_STATISTICS_V1_BIT = 1 << 6
 _LARGE_HASH_V1_BIT = 1 << 7
+_FULLTEXT_HISTORY_V1_BIT = 1 << 8
+_HEAP_FREE_INDEX_BIT = 1 << 9
+_SPARSE_HASH_BIT = 1 << 10
 
 
 _KNOWN_CAPABILITY_BITS = (
@@ -126,6 +136,9 @@ _KNOWN_CAPABILITY_BITS = (
     | _FULLTEXT_V1_BIT
     | _FULLTEXT_STATISTICS_V1_BIT
     | _LARGE_HASH_V1_BIT
+    | _FULLTEXT_HISTORY_V1_BIT
+    | _HEAP_FREE_INDEX_BIT
+    | _SPARSE_HASH_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -139,6 +152,9 @@ _CAPABILITY_TO_BIT = MappingProxyType(
         FULLTEXT_CAPABILITY: _FULLTEXT_V1_BIT,
         FULLTEXT_STATISTICS_CAPABILITY: _FULLTEXT_STATISTICS_V1_BIT,
         LARGE_HASH_CAPABILITY: _LARGE_HASH_V1_BIT,
+        FULLTEXT_HISTORY_CAPABILITY: _FULLTEXT_HISTORY_V1_BIT,
+        HEAP_FREE_INDEX_CAPABILITY: _HEAP_FREE_INDEX_BIT,
+        SPARSE_HASH_CAPABILITY: _SPARSE_HASH_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -164,7 +180,7 @@ _STATE_TO_TAG = MappingProxyType(
 )
 _TAG_TO_STATE = MappingProxyType({value: key for key, value in _STATE_TO_TAG.items()})
 _LAYOUT_TO_TAG = MappingProxyType(
-    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1}
+    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1, IndexLayout.SPARSE_HASH: 2}
 )
 _TAG_TO_LAYOUT = MappingProxyType(
     {value: key for key, value in _LAYOUT_TO_TAG.items()}
@@ -503,8 +519,12 @@ class Catalog:
             capabilities.add(FULLTEXT_CAPABILITY)
         if any(has_durable_statistics(d.key_derivation) for d in validated.values()):
             capabilities.add(FULLTEXT_STATISTICS_CAPABILITY)
+        if any(has_historical_statistics(d.key_derivation) for d in validated.values()):
+            capabilities.add(FULLTEXT_HISTORY_CAPABILITY)
         if _large_hash_generations(validated.values()):
             capabilities.add(LARGE_HASH_CAPABILITY)
+        if any(d.layout is IndexLayout.SPARSE_HASH for d in validated.values()):
+            capabilities.add(SPARSE_HASH_CAPABILITY)
         self._required_capabilities = frozenset(capabilities)
         self._install_indexes(validated)
         return self
@@ -521,8 +541,12 @@ class Catalog:
             self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_CAPABILITY))
         if has_durable_statistics(definition.key_derivation):
             self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_STATISTICS_CAPABILITY))
+        if has_historical_statistics(definition.key_derivation):
+            self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_HISTORY_CAPABILITY))
         if _large_hash_generations(validated.values()):
             self._required_capabilities = frozenset((*self._required_capabilities, LARGE_HASH_CAPABILITY))
+        if any(d.layout is IndexLayout.SPARSE_HASH for d in validated.values()):
+            self._required_capabilities = frozenset((*self._required_capabilities, SPARSE_HASH_CAPABILITY))
         if definition.layout is IndexLayout.ORDERED:
             self._required_capabilities = frozenset(
                 (
@@ -533,7 +557,7 @@ class Catalog:
         self._install_indexes(validated)
         return definition
 
-    def enable_heap_reclaim(self) -> Catalog:
+    def enable_heap_reclaim(self, *, index_free_pages: bool = False) -> Catalog:
         """Add the one-way heap-reclaim capability to an already-active v2 catalog.
 
         The capability is published before any heap floor or reclaimed slot.  Older builds then
@@ -545,6 +569,10 @@ class Catalog:
         capabilities = frozenset(
             (*self._required_capabilities, HEAP_RECLAIM_V1_CAPABILITY)
         )
+        if type(index_free_pages) is not bool:
+            raise GrafxConfigurationError("index_free_pages must be a bool.", field="index_free_pages")
+        if index_free_pages:
+            capabilities = frozenset((*capabilities, HEAP_FREE_INDEX_CAPABILITY))
         if capabilities != self._required_capabilities:
             self._required_capabilities = capabilities
             self._invalidate_derived()
@@ -734,8 +762,12 @@ class Catalog:
                 raise GrafxConfigurationError("Full-text indexes require their capability.", field="required_capabilities")
             if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in self._required_capabilities:
                 raise GrafxConfigurationError("Durable text statistics require their capability.", field="required_capabilities")
+            if any(has_historical_statistics(d.key_derivation) for d in indexes) and FULLTEXT_HISTORY_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Historical text statistics require their capability.", field="required_capabilities")
             if _large_hash_generations(indexes) and LARGE_HASH_CAPABILITY not in self._required_capabilities:
                 raise GrafxConfigurationError("Large hash directories require their capability.", field="required_capabilities")
+            if any(d.layout is IndexLayout.SPARSE_HASH for d in indexes) and SPARSE_HASH_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Sparse hash requires its capability.", field="required_capabilities")
             if not capability_bits & _IDENTITY_SECONDARY_INDEXES_V1_BIT:
                 raise GrafxConfigurationError(
                     "Catalog format 2 requires identity_secondary_indexes_v1.",
@@ -933,8 +965,12 @@ class Catalog:
                 raise GrafxCorruptionDetected("Full-text indexes lack their required capability.", field="required_capabilities")
             if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Durable text statistics lack their capability.", field="required_capabilities")
+            if any(has_historical_statistics(d.key_derivation) for d in indexes) and FULLTEXT_HISTORY_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Historical text statistics lack their capability.", field="required_capabilities")
             if _large_hash_generations(indexes) and LARGE_HASH_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Large hash directories lack their capability.", field="required_capabilities")
+            if any(d.layout is IndexLayout.SPARSE_HASH for d in indexes) and SPARSE_HASH_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Sparse hash lacks its capability.", field="required_capabilities")
             if any(
                 definition.layout is IndexLayout.ORDERED for definition in indexes
             ) and (
@@ -1305,6 +1341,12 @@ def _matches_automatic_exact(
 def _encode_capabilities(capabilities: frozenset[str]) -> int:
     """Encode every required capability, refusing one this build cannot uphold."""
 
+    for dependent, required in (
+        (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),
+        (HEAP_FREE_INDEX_CAPABILITY, {HEAP_RECLAIM_V1_CAPABILITY}),
+    ):
+        if dependent in capabilities and not required <= capabilities:
+            raise GrafxConfigurationError("Required capability dependencies are missing.", field="required_capabilities")
     bits = 0
     for capability in capabilities:
         bit = _CAPABILITY_TO_BIT.get(capability)
@@ -1329,9 +1371,16 @@ def _decode_capabilities(bits: int) -> frozenset[str]:
             value=bits,
             unsupported=unknown,
         )
-    return frozenset(
+    capabilities = frozenset(
         capability for capability, bit in _CAPABILITY_TO_BIT.items() if bits & bit
     )
+    for dependent, required in (
+        (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),
+        (HEAP_FREE_INDEX_CAPABILITY, {HEAP_RECLAIM_V1_CAPABILITY}),
+    ):
+        if dependent in capabilities and not required <= capabilities:
+            raise GrafxCorruptionDetected("Required capability dependencies are missing.", field="required_capabilities")
+    return capabilities
 
 
 def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:

@@ -1,5 +1,32 @@
 # Indexes and vector search
 
+## Sparse exact hash indexes and repeated keys
+
+`db.create_index("by_status", "Document", ("status",), layout="sparse_hash",
+bucket_count=128)` opts an explicit property index into compact pointer pages and
+lazy bucket heads. Default `layout="hash"`, automatic indexes, FTS and vectors are
+unchanged. Rebuild/rehash retains the selected layout; physical backup and logical
+transfer preserve its declaration. Older binaries refuse required capability bit
+10. [Format and recovery contract](specs/SPARSE_HASH_DIRECTORIES.md).
+
+Use sparse layout when many buckets would be empty. At 512-byte pages a 65,536-bucket
+empty index uses 571 pages, versus 65,537 for eager hash. The first write to a new
+bucket requires an additional flush/barrier; do not select it expecting every write
+to be faster. Distribution counts only populated chain pages in `pages`, but its
+page-work budget also charges pointer reads, including empty buckets.
+
+Repeated-key native bucket scans retain a lazy, per-index decoded-page memo: at
+most 64 pages and 1 MiB of conservatively charged logical data. Every reuse compares
+the complete current slot images, key, requested reference and decoder identity;
+all page/link checks, pre/post generation certificates and heap visibility checks
+still execute. No on-disk format or consistency option changes. Changed bytes,
+foreign writes and different keys miss the memo. Oversized pages use canonical
+decoding without retention. These are fixed implementation bounds, not RSS limits.
+Warm repeated queries avoid entry decoding but still visit all chain pages and all
+returned candidates. Returning N matches necessarily remains O(N); increasing the
+bucket count cannot split one repeated key. A new posting-tree layout remains a
+distinct future change, not a claim made by this decoding optimization.
+
 ## Cooperative vector read control
 
 `db.search_vectors(reader, space=..., query=..., k=..., timeout_seconds=None,
@@ -209,3 +236,49 @@ can fall back to a scan; proximity-index repair has explicit freshness/rebuild
 semantics. `rebuild_vector_index(space)` derives from valid heap data, not from
 an untrusted external snapshot. For index health use `read_index_status` and
 verification, not only the absence of an exception from a query.
+
+## HNSW derived-picture memory
+
+`connect(path, vector_hnsw_memory_budget_bytes=64 * 1024 * 1024)` opts into a
+positive logical-byte ceiling for **each** derived HNSW picture, including cold
+construction work and warm insertion work. `None` (default) preserves unlimited
+admission. It does not change persisted vector/index bytes, approximate recall,
+the exact/ANN planner threshold, or the chosen arithmetic adapter.
+
+Use `db.vector_memory_usage("space_name")` to obtain an immutable
+`VectorMemoryUsage` with `space`, `limit_bytes`, `cached_entries`,
+`cached_logical_bytes`, `peak_requested_bytes`, `budget_refusals` and
+`warm_retirements`. This observes the local attached index only: it neither builds
+the HNSW graph nor reads device pages or certifies that a cached picture is fresh.
+Counts include retained tombstoned versions. Counters reset with index/handle
+replacement; requested peak includes refused reservations. A missing space/index
+keeps normal typed refusal; a custom collaborator without this observation refuses
+with `GrafxUnsupportedOperation`.
+
+The deterministic tariff uses `N` stored entries, `D` dimensions, `M` neighbours
+(currently 16), and `E` construction beam (currently 200):
+
+- Resident: `4096 + N * (1024 + 32*D + 32*M*34)` logical bytes.
+- Insertion work: resident plus `128*N + 128*E + 64*D`.
+- Cold build: insertion work plus `N * (256 + 64*M*34)` for retained headers,
+  sort slots and transient link-score capacity.
+
+Maximum-height towers are reserved even for short towers, and compact adapters
+receive the same component tariff. This is deliberately conservative, **not RSS**.
+One page decoder, Python allocator overhead, query/search buffers and custom math
+provider allocations are outside the envelope. Distinct spaces, handles and
+simultaneously retained old/replacement pictures have distinct envelopes; adding
+participants can multiply memory. Use process/container limits for an RSS policy.
+
+Header admission refuses before materializing an over-budget header collection
+or resolving vectors. A cold ANN request exceeding the limit raises
+`GrafxQueryBudgetExceeded` with resource `vector_hnsw_memory`, `requested_bytes`
+and `limit_bytes`; no partial cache is published and the caller's reader remains
+usable. No silent switch to a different recall regime occurs. Exact scans do not
+construct HNSW and remain governed by the normal query limits.
+
+If a **durable write** would overgrow a warm picture, that derived cache is retired
+and the write succeeds. The next ANN build may refuse; raise the budget or choose
+an explicit exact-search policy as appropriate. Do not set a tiny budget expecting
+automatic exact fallback or a cap shared by all handles. This policy cannot fail
+or undo a proved COMMIT and never weakens WAL/OCC or reader isolation.

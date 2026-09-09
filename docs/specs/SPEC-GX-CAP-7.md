@@ -1,6 +1,13 @@
 # SPEC-GX-CAP-7 — Extension SPI and UDFs
 
 Status: specified / implementation not certified. Date: 2026-09-08.
+
+0.0.5 continuation: the initial trusted scalar slice is implemented, with feature
+tests and final regression tracked in the [receipt](../reports/V005_NEXT_EIGHT_PROGRESS.md).
+[Consumer contract](../EXTENSIONS_AND_ARROW.md): explicit frozen registry, scalar
+query/direct calls, exact types and bounded values. The remaining deliverables
+below (aggregate/table/procedure providers, manifests, load/unload lifecycle) are
+still roadmap scope, not capabilities shipped by this scalar slice.
 Dependencies: GX-CAP-0; typed values and cursors.
 
 ## Normative scope

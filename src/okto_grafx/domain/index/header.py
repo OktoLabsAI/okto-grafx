@@ -52,6 +52,9 @@ INDEX_HEADER_FORMAT_VERSION: int = 2
 ORDERED_INDEX_HEADER_FORMAT_VERSION: int = 3
 """The header version that carries an explicit ordered-layout discriminator."""
 
+SPARSE_INDEX_HEADER_FORMAT_VERSION: int = 4
+"""Explicit exact sparse-hash layout; unchanged tagged header grammar."""
+
 _HEADER_V1_STRUCT: struct.Struct = struct.Struct("<HBBIIQQ16s")
 _HEADER_STRUCT: struct.Struct = struct.Struct("<HBBIIQQ16sQ")
 _ORDERED_HEADER_STRUCT: struct.Struct = struct.Struct("<HBBB3xIIQQ16sQ")
@@ -65,6 +68,7 @@ ORDERED_INDEX_HEADER_SIZE: int = _ORDERED_HEADER_STRUCT.size
 _LAYOUT_CODES: dict[IndexLayout, int] = {
     IndexLayout.HASH: 1,
     IndexLayout.ORDERED: 2,
+    IndexLayout.SPARSE_HASH: 3,
 }
 _LAYOUT_BY_CODE: dict[int, IndexLayout] = {
     code: layout for layout, code in _LAYOUT_CODES.items()
@@ -146,12 +150,12 @@ class IndexHeader:
                     field=field,
                     value=repr(value),
                 )
-        if self.format_version > ORDERED_INDEX_HEADER_FORMAT_VERSION:
+        if self.format_version > SPARSE_INDEX_HEADER_FORMAT_VERSION:
             raise GrafxSchemaVersionMismatch(
                 "This build cannot encode a future index header format.",
                 field="format_version",
                 value=self.format_version,
-                supported=ORDERED_INDEX_HEADER_FORMAT_VERSION,
+                supported=SPARSE_INDEX_HEADER_FORMAT_VERSION,
             )
         if self.format_version == 0:
             raise GrafxIndexError(
@@ -178,6 +182,9 @@ class IndexHeader:
                     value=self.layout.value,
                     format_version=self.format_version,
                 )
+        elif self.format_version == SPARSE_INDEX_HEADER_FORMAT_VERSION:
+            if self.layout is not IndexLayout.SPARSE_HASH or self.visibility is not IndexVisibility.EXACT:
+                raise GrafxIndexError("Index header format 4 requires exact sparse hash.", field="layout")
         elif self.format_version == ORDERED_INDEX_HEADER_FORMAT_VERSION:
             if self.layout is not IndexLayout.ORDERED:
                 raise GrafxIndexError(
@@ -259,7 +266,7 @@ class IndexHeader:
                 self.reconciled_through_lsn,
                 self.digest,
             )
-        if self.format_version == ORDERED_INDEX_HEADER_FORMAT_VERSION:
+        if self.format_version in (ORDERED_INDEX_HEADER_FORMAT_VERSION, SPARSE_INDEX_HEADER_FORMAT_VERSION):
             return _ORDERED_HEADER_STRUCT.pack(
                 self.format_version,
                 _VISIBILITY_CODES[self.visibility],
@@ -302,9 +309,9 @@ class IndexHeader:
                 value=len(image),
             )
         format_version = struct.unpack_from("<H", image, 0)[0]
-        if format_version > ORDERED_INDEX_HEADER_FORMAT_VERSION:
+        if format_version > SPARSE_INDEX_HEADER_FORMAT_VERSION:
             raise GrafxSchemaVersionMismatch(
-                f"This build reads index format {ORDERED_INDEX_HEADER_FORMAT_VERSION} and "
+                f"This build reads index format {SPARSE_INDEX_HEADER_FORMAT_VERSION} and "
                 "below; the "
                 f"file declares {format_version}.",
                 field="format_version",
@@ -316,7 +323,11 @@ class IndexHeader:
                 field="format_version",
                 value=0,
             )
-        if format_version == ORDERED_INDEX_HEADER_FORMAT_VERSION:
+        if format_version in (ORDERED_INDEX_HEADER_FORMAT_VERSION, SPARSE_INDEX_HEADER_FORMAT_VERSION):
+            if format_version == SPARSE_INDEX_HEADER_FORMAT_VERSION and (
+                len(image) != ORDERED_INDEX_HEADER_SIZE or any(image[5:8])
+            ):
+                raise GrafxCorruptionDetected("Invalid sparse index header framing.", field="index_header")
             if len(image) < ORDERED_INDEX_HEADER_SIZE:
                 raise GrafxCorruptionDetected(
                     f"An ordered index header needs {ORDERED_INDEX_HEADER_SIZE} bytes; got "

@@ -1,5 +1,13 @@
 # Configuration reference
 
+The continuation after `3f3819f` also adds `vacuum(index_free_pages=False)` and
+explicit `create_index(layout="sparse_hash")`; these are operation options, not
+global switches. `connect(extensions=None)` accepts a trusted immutable object
+separately from `DatabaseConfig` and the port `registry`. Scalar descriptor budgets
+and Arrow `batch_rows`/`max_batch_bytes` are documented in
+[Extensions and Arrow](EXTENSIONS_AND_ARROW.md). The repeated-key page memo has
+fixed per-index bounds (64 pages / 1 MiB logical), not an additional setting.
+
 The eight-item continuation adds operation-local `search_vectors(timeout_seconds=,
 cancellation=)` and `HybridSearchOptions.graph_access` (`auto`/`scan`). Hybrid
 `max_memory_bytes` now applies to simultaneous logical source/fusion/graph tariffs,
@@ -17,6 +25,12 @@ eager directories consume disk even when empty. Backup still pauses commit
 publication throughout source capture, including temporary-file I/O.
 
 The connection settings below are distinct from operation-local options.
+The next continuation adds `vector_hnsw_memory_budget_bytes=None` per connection
+and persisted `TextIndexOptions.statistics_history_entries=0` (0..32, positive
+only with durable mode). Both defaults preserve previous behavior. See
+[HNSW memory](INDEXES_AND_VECTORS.md#hnsw-derived-picture-memory) and
+[historical FTS](FULL_TEXT_SEARCH.md#bounded-historical-corpus-totals) for limits,
+costs and when to use them.
 [Full-text search](FULL_TEXT_SEARCH.md#analyzer-and-index-options) documents every
 `TextIndexOptions` field (persisted), `TextSearchLimits` field (per search), BM25
 parameters and cancellation/deadline semantics. [Logical transfer](LOGICAL_TRANSFER.md#limits-and-errors)
@@ -43,7 +57,7 @@ Unknown keywords and the removed `vector_recall_target` refuse with a typed erro
 
 ## Typed connection options (0.0.5)
 
-`connect` exposes all 35 configuration keywords through `Unpack[ConnectOptions]`.
+`connect` exposes all configuration keywords through `Unpack[ConnectOptions]`.
 Editors/type checkers supporting PEP 692 can suggest keyword names, reject typos
 and check selector literals. For reusable dictionaries:
 
@@ -105,6 +119,7 @@ custom provider registration and runtime configuration errors are unchanged.
 | `checksum` | `"auto"` | `"auto"` detects an accepted accelerator, `"pure"` selects the reference, `"native"` requires the native provider; 0.0.5 connections capture an isolated per-database selection |
 | `vector_exact_scan_threshold` | `4096` | Nonnegative candidate threshold for exact-vs-approximate selection; zero permits ANN whenever its other eligibility conditions hold. Inspect the returned regime, not just table size |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
+| `vector_hnsw_memory_budget_bytes` | `None` | Positive integer or `None`; per-derived-picture HNSW logical construction/cache limit. Independent of query budgets; not RSS or an aggregate across pictures/handles. See [vector memory](INDEXES_AND_VECTORS.md#hnsw-derived-picture-memory). |
 | `read_only` | `False` | No replay/repair; requires checkpoint-complete state and may refuse after a newer acknowledged commit. Distinct from `db.execute()`'s read transaction |
 
 ## Types, ranges and persistence

@@ -3191,6 +3191,7 @@ class QueryEngine:
     """
 
     __slots__ = (
+        "_extensions",
         "_catalog",
         "_heap",
         "_pool",
@@ -3263,6 +3264,7 @@ class QueryEngine:
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
+        self._extensions = None
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._heap = heap
         self._pool = pool
@@ -3516,6 +3518,7 @@ class QueryEngine:
                 analysis = analyze(statement)
                 plan = build_plan(
                     statement,
+                    scalar_types=self._scalar_types(statement),
                     catalog=catalog,
                     indexes=self._index_definitions(
                         catalog=catalog,
@@ -3532,6 +3535,12 @@ class QueryEngine:
         self._observe(PHASE_PLAN, started)
         return plan
 
+    def _scalar_types(self, statement: Statement) -> dict[str, ValueType]:
+        """Supply immutable result-type declarations without invoking callbacks."""
+        return {} if self._extensions is None else {
+            fn.name: ValueType[fn.return_type] for fn in self._extensions.scalars
+        }
+
     def planned(self, statement: Statement) -> PlannedQuery:
         """Return the plan together with the analysis it was built from."""
         started = self._reading()
@@ -3541,6 +3550,7 @@ class QueryEngine:
             analysis = analyze(statement)
             plan = build_plan(
                 statement,
+                scalar_types=self._scalar_types(statement),
                 catalog=catalog,
                 indexes=self._index_definitions(catalog=catalog, authority=authority),
                 analysis=analysis,
@@ -16444,6 +16454,12 @@ def _coalesce_selected(
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name == "UDF":
+        registry = context.engine._extensions
+        if registry is None:
+            raise GrafxPlanError("No trusted scalar registry was supplied to connect.", field="udf_name")
+        arguments = tuple(_evaluate(argument, row, context) for argument in expression.arguments)
+        return registry.call_scalar(arguments[0], arguments[1:])
     if name == COALESCE_FUNCTION:
         return _coalesce(expression, row, context)
     if name == STRING_SPLIT_FUNCTION:

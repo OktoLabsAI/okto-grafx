@@ -544,6 +544,7 @@ class IndexStore:
         "_replaying",
         "_table_high_water",
         "_tombstone_backlog_count",
+        "_key_page_memo",
     )
 
     def __init__(
@@ -613,6 +614,7 @@ class IndexStore:
         # walk. Thereafter successful logical changes maintain it in O(1), without adding a byte
         # to the index format or making this diagnostic state an authority for reads.
         self._tombstone_backlog_count: int | None = None
+        self._key_page_memo = None
         if metrics.enabled:
             for descriptor in INDEX_METRICS:
                 metrics.register(descriptor)
@@ -827,6 +829,8 @@ class IndexStore:
         storage = self._pool.storage
         header = FileHeader(kind=FileKind.INDEX, page_size=self._pool.page_size)
         index_header = IndexHeader(
+            format_version=4 if self._definition.layout is IndexLayout.SPARSE_HASH else 2,
+            layout=self._definition.layout,
             visibility=self._definition.visibility,
             table_id=self._definition.table_id,
             bucket_count=self._definition.bucket_count,
@@ -961,7 +965,7 @@ class IndexStore:
                 expected=definition.artifact_nonce,
                 observed=header.artifact_nonce,
             )
-        wanted = 1 + header.bucket_count
+        wanted = self._minimum_pages()
         present = self._pool.storage.page_count(self.file) if page_count is None else page_count
         if present < wanted:
             raise GrafxCorruptionDetected(
@@ -2813,7 +2817,7 @@ class IndexStore:
                 for slot, payload in page.iter_slot_views()
             )
 
-    def _entry_headers(self) -> tuple[_IndexEntryHeader, ...]:
+    def _entry_headers(self, *, max_entries: int | None = None) -> tuple[_IndexEntryHeader, ...]:
         """Materialise every validated entry header in canonical walk order.
 
         This is the build-only middle ground between scalar/ref-only scans and the public full
@@ -2837,6 +2841,11 @@ class IndexStore:
                             versioned,
                         ) = _validated_image(image)
                         _require_decodable_ref(encoded_ref)
+                        if max_entries is not None and len(headers) >= max_entries:
+                            raise GrafxQueryBudgetExceeded(
+                                "Index header materialization budget exceeded.",
+                                resource="index_entry_headers", limit=max_entries,
+                            )
                         headers.append(
                             _IndexEntryHeader(
                                 page=page_index,
@@ -3732,6 +3741,10 @@ class IndexStore:
         """Return the head page of a bucket: buckets follow the header page, in order."""
         return bucket + 1
 
+    def _minimum_pages(self) -> int:
+        """Return the mandatory physical directory extent for this layout."""
+        return 1 + self._definition.bucket_count
+
     def assisted_rehash_pressure(self) -> tuple[int, int]:
         """Return ``(head_entries, overflow_pages)`` without walking bucket chains.
 
@@ -3858,15 +3871,16 @@ class IndexStore:
             with self._pool.pinned(self.file, index) as page:
                 self._require_index_page(page, index)
                 if key is not None and not matching_complete:
-                    for slot, image in page.iter_slot_views():
-                        entry = IndexEntry.decode_if_matches(image, key, ref)
-                        if entry is not None:
-                            if max_matches is not None and len(matches) >= max_matches:
-                                raise GrafxQueryBudgetExceeded(
-                                    "Exact candidate capture budget exceeded.",
-                                    resource="index_candidates",
-                                )
-                            matches.append(entry.located_at(index, slot))
+                    if self._key_page_memo is None:
+                        from okto_grafx.engine.key_page_memo import KeyPageMemo
+                        self._key_page_memo = KeyPageMemo()
+                    for entry in self._key_page_memo.matches(page, key, ref):
+                        if max_matches is not None and len(matches) >= max_matches:
+                            raise GrafxQueryBudgetExceeded(
+                                "Exact candidate capture budget exceeded.",
+                                resource="index_candidates",
+                            )
+                        matches.append(entry)
                     if first_matching_page and matches:
                         # Scalar mutation historically stopped decoding after the first page
                         # with a match, while its preceding chain walk still validated every
@@ -8116,6 +8130,9 @@ class IndexManager:
             index: IndexStore = OrderedIndex(
                 definition, self._pool, self._metrics
             )
+        elif definition.layout is IndexLayout.SPARSE_HASH:
+            from okto_grafx.engine.sparse_hash import SparseHashIndex
+            index = SparseHashIndex(definition, self._pool, self._metrics)
         else:
             index = HashIndex(definition, self._pool, self._metrics)
         index._set_creation_nonce(definition.artifact_nonce)

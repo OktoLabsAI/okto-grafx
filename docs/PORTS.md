@@ -9,6 +9,11 @@ being true.
 This document lists each port, what it abstracts, the adapters that ship with the package, and how
 to substitute your own.
 
+Application scalar callbacks use a separate explicit
+[trusted extension registry](EXTENSIONS_AND_ARROW.md), passed as `extensions=` to
+`connect`. They are not new storage/coordination ports. Arrow is an optional result
+adapter, not a replacement for the query or transaction engine.
+
 - [The registry](#the-registry)
 - [The seven ports](#the-seven-ports)
   - [storage](#storage--storagedevice) · [clock](#clock--clock) ·

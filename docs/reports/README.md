@@ -6,6 +6,8 @@ Dated evidence, not active execution queues. Each report retains its original
 measurement conditions, source paths, limitations and checkpoint history.
 Private artifact/consumer-repository paths may not be available in this checkout.
 
+- [Next eight-item continuation after 3f3819f — local acceptance and corrective regression evidence](V005_NEXT_EIGHT_PROGRESS.md)
+
 - [Documentation refactor and validation](DOCUMENTATION_REFACTOR_2026_09_08.md)
 - [0.0.5 native performance checkpoint](V005_NATIVE_PERFORMANCE_CHECKPOINT.md)
 - [0.0.5 four-item follow-up: projected pages, admission, complete synthetic Pulse ACK and typed options](V005_FOUR_ITEM_FOLLOWUP.md)

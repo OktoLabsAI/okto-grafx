@@ -9,6 +9,23 @@ including the on-disk format.
 
 ### Changed
 
+- Indexed retired-overflow candidate discovery (bit 9) published by quiescent
+  vacuum, plus opt-in sparse hash directories (bit 10/header 4). Default layouts
+  remain unchanged; backup, replay and old-reader refusal contracts are explicit.
+- Bounded exact-image repeated-key page decoding; native chain validation,
+  certificates and heap visibility remain authoritative.
+- Explicit per-connection trusted scalar registry, typed `udf('namespace.name', ...)`
+  and optional `[arrow]` copied scalar result batches. No dynamic plugin loading.
+- Reproducible 0.0.5 platform/accelerator matrix and real-wheel upgrade checks;
+  unexecuted platform rows remain documented rather than counted as passed.
+
+- Next 0.0.5 round: optional per-picture HNSW logical-memory admission and public
+  diagnostics; cache-budget pressure retires warm derived state without failing
+  a durable write. Exact search and default unlimited admission remain unchanged.
+- Optional bounded FTS summary history (1..32 older reductions), capability bit 8;
+  historical corpus lookup preserves exact snapshot scores, with census outside
+  the proved retained interval. Default scalar/legacy bytes remain unchanged.
+
 - Eight-item 0.0.5 continuation: single-pass BM25 term counts; certified incident
   BFS for hybrid evidence; cooperative exact/ANN vector read control; aggregate
   logical hybrid memory accounting and per-phase diagnostics.

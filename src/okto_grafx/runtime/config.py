@@ -293,6 +293,7 @@ class DatabaseConfig:
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
     vector_ef_search: int = DEFAULT_EF_SEARCH
+    vector_hnsw_memory_budget_bytes: int | None = dataclass_field(default=None, kw_only=True)
     read_only: bool = False
     descriptor_revalidation: DescriptorRevalidationMode = "strict"
     max_query_value_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS
@@ -368,6 +369,7 @@ class DatabaseConfig:
             "max_result_rows",
             "max_intermediate_rows",
             "query_memory_budget_bytes",
+            "vector_hnsw_memory_budget_bytes",
             "max_traversal_expansions",
             "max_traversal_paths",
             "max_transaction_rows",

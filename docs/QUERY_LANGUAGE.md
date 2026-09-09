@@ -98,6 +98,7 @@ not Python coercion of arbitrary objects. Unsupported operators/functions refuse
 | `label(binding)` | One matched node/relationship; physical table name; null propagates; not a logical Pulse relationship type mapper |
 | `timestamp(value)` | Timestamp passthrough, null, or ISO-8601 string normalized to UTC; no zone means UTC; numeric epoch arguments refuse |
 | `similarity(n.embedding, $q, space => 'space')` | Planned vector-search extension, not an arbitrary scalar UDF; literal/bound space, declared vector column and supported query shape required |
+| `udf('app.name', value, ...)` | Optional trusted per-connection scalar registry; literal name, positional exact typed scalars, NULL propagation; [SPI and restrictions](EXTENSIONS_AND_ARROW.md) |
 | `similarity_score()` | Zero arguments; only where a similarity operator has supplied a score |
 | `CASE WHEN ... THEN ... ELSE ... END` / simple CASE | Eager written-expression evaluation, first match, absent ELSE null; scalar-family checks and numeric promotion; do not depend on short-circuiting to hide an invalid expression |
 | `list[index]` | One-based positive index, negative from end; null propagates; zero/out-of-range/noninteger refuses. Not map-key bracket access |

@@ -19,6 +19,7 @@ class IndexLayout(str, Enum):
 
     HASH = "hash"
     ORDERED = "ordered"
+    SPARSE_HASH = "sparse_hash"
 
     @classmethod
     def parse(cls, value: object) -> IndexLayout:

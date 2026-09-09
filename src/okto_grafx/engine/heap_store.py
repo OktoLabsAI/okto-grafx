@@ -642,6 +642,7 @@ class HeapStore:
         "_extent_proof_seal",
         "_tuple_encoding_proofs",
         "_overflow_reuse_cursor",
+        "_free_index_cursor",
     )
 
     def __init__(
@@ -662,6 +663,7 @@ class HeapStore:
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._file: str = file
         self._overflow_reuse_cursor: tuple[int, int, int] | None = None
+        self._free_index_cursor: tuple[int, int, int, int] | None = None
         # The resolved tail of each table, so an append stays O(1) after the first walk. It is a
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
         # start and another process read (A40.3).
@@ -2680,6 +2682,11 @@ class HeapStore:
             # Unqualified manual compositions have no current durable publication proof.
             # They may append normally but cannot opt into persisted physical reuse.
             return ()
+        from okto_grafx.engine.free_page_index import CAPABILITY, pop_candidates
+        if CAPABILITY in self._catalog.catalog.required_capabilities():
+            candidates = pop_candidates(self, count, horizon)
+            if candidates is not None:
+                return candidates
         cursor = self._overflow_reuse_cursor
         if cursor is None or cursor[0] != floor:
             cursor = (floor, 1, self._pool.storage.page_count(self._file))

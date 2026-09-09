@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import struct
 
-from okto_grafx.domain.errors import GrafxCorruptionDetected
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.ids import PROVISIONAL_CSN
 from okto_grafx.domain.index.fulltext import decode_options, has_durable_statistics
 from okto_grafx.domain.index.records import IndexChange, IndexOperation, change_of
@@ -16,6 +16,8 @@ from okto_grafx.domain.wal.record import WalRecordType
 _SLOT = 2
 _FORMAT = struct.Struct("<8sB7xQQ4Q")
 _MAGIC = b"GRFXFTS1"
+_HISTORY_HEADER = struct.Struct("<8sH6x")
+_HISTORY_MAGIC = b"GRFXFTH1"
 
 __all__: list[str] = []
 
@@ -26,8 +28,32 @@ if TYPE_CHECKING:
 
 def initial_statistics(derivation: str) -> bytes:
     """Encode the empty private-generation scalar with the declared field width."""
-    fields = len(decode_options(derivation).field_weights)
-    return _FORMAT.pack(_MAGIC, fields, 0, 0, 0, 0, 0, 0)
+    options = decode_options(derivation)
+    fields = len(options.field_weights)
+    empty = _FORMAT.pack(_MAGIC, fields, 0, 0, 0, 0, 0, 0)
+    capacity = options.statistics_history_entries
+    return empty if not capacity else _encode_series([empty], capacity)
+
+
+def require_statistics_capacity(derivation: str, page_size: int) -> None:
+    """Refuse an impossible page-0 reservation before any DDL staging/effects."""
+    from okto_grafx.domain.page.layout import PAGE_HEADER_SIZE, SLOT_ENTRY_SIZE
+    from okto_grafx.domain.page.file_header import FILE_HEADER_SIZE
+    from okto_grafx.domain.index.header import INDEX_HEADER_SIZE
+    required = (PAGE_HEADER_SIZE + 3 * SLOT_ENTRY_SIZE + FILE_HEADER_SIZE
+                + INDEX_HEADER_SIZE + len(initial_statistics(derivation)))
+    if required > page_size:
+        raise GrafxConfigurationError(
+            "The declared FTS statistics history does not fit page 0.",
+            field="statistics_history_entries", required_bytes=required, page_size=page_size,
+        )
+
+
+def _encode_series(records: Sequence[bytes], capacity: int) -> bytes:
+    """Encode oldest-first records in one fixed-size, zero-padded page slot."""
+    selected = records[-(capacity + 1):]
+    return (_HISTORY_HEADER.pack(_HISTORY_MAGIC, len(selected)) + b"".join(selected)
+            + bytes((capacity + 1 - len(selected)) * _FORMAT.size))
 
 
 def read_statistics(store: IndexStore) -> tuple[int, int, tuple[int, ...]]:
@@ -43,16 +69,38 @@ def read_statistics_from_device(store: IndexStore) -> tuple[int, int, tuple[int,
 
 
 def _decode_statistics(store: IndexStore, page: Page) -> tuple[int, int, tuple[int, ...]]:
-    fields = len(decode_options(store.definition.key_derivation).field_weights)
+    """Decode the current scalar, validating every retained historical record too."""
+    return _decode_series(store, page)[-1]
+
+
+def _decode_series(store: IndexStore, page: Page) -> tuple[tuple[int, int, tuple[int, ...]], ...]:
+    """Reject malformed, future, noncanonical or nonmonotonic committed summaries."""
+    options = decode_options(store.definition.key_derivation)
+    fields = len(options.field_weights)
     try:
         header = store._decode_header_page(page)
         raw = page.read_slot(_SLOT)
-        magic, width, mark, count, *lengths = _FORMAT.unpack(raw)
-        if (magic != _MAGIC or width != fields or any(raw[9:16])
-                or mark >= PROVISIONAL_CSN or mark > header.built_through_lsn
-                or any(lengths[fields:]) or (count == 0 and any(lengths))):
-            raise ValueError("invalid scalar coverage/shape")
-        return mark, count, tuple(lengths[:fields])
+        capacity = options.statistics_history_entries
+        if capacity:
+            magic, used = _HISTORY_HEADER.unpack_from(raw)
+            if (magic != _HISTORY_MAGIC or not 1 <= used <= capacity + 1 or any(raw[10:16])
+                    or len(raw) != _HISTORY_HEADER.size + (capacity + 1) * _FORMAT.size
+                    or any(raw[_HISTORY_HEADER.size + used * _FORMAT.size:])):
+                raise ValueError("invalid history envelope")
+            records = [raw[16 + i * _FORMAT.size:16 + (i + 1) * _FORMAT.size] for i in range(used)]
+        else:
+            records = [raw]
+        result = []
+        for record in records:
+            magic, width, mark, count, *lengths = _FORMAT.unpack(record)
+            if (magic != _MAGIC or width != fields or any(record[9:16])
+                    or mark >= PROVISIONAL_CSN or mark > header.built_through_lsn
+                    or any(lengths[fields:]) or (count == 0 and any(lengths))
+                    or (result and mark <= result[-1][0])
+                    or (mark == 0 and (len(records) != 1 or count))):
+                raise ValueError("invalid scalar coverage/shape")
+            result.append((mark, count, tuple(lengths[:fields])))
+        return tuple(result)
     except (ValueError, struct.error) as failure:
         raise GrafxCorruptionDetected("Invalid durable FTS statistics.",
                                      file=store.file, page=0, field="text_statistics") from failure
@@ -93,6 +141,15 @@ def publish_statistics(store: IndexStore, commit_lsn: int, count: int, totals: S
     raw = _FORMAT.pack(_MAGIC, len(totals), commit_lsn, count, *(list(totals) + [0] * (4 - len(totals))))
     with store._pool.pinned(store.file, 0) as page:
         header = store._decode_header_page(page)
+        capacity = decode_options(store.definition.key_derivation).statistics_history_entries
+        if capacity:
+            existing = _decode_series(store, page)
+            if commit_lsn < existing[-1][0]:
+                raise GrafxCorruptionDetected("Historical FTS publication moved backwards.", field="text_statistics")
+            records = [_FORMAT.pack(_MAGIC, len(lengths), mark, docs,
+                                    *(list(lengths) + [0] * (4 - len(lengths))))
+                       for mark, docs, lengths in existing if 0 < mark < commit_lsn]
+            raw = _encode_series([*records, raw], capacity)
         page.update_slot(1, header.advanced_to(commit_lsn).encode())
         page.update_slot(_SLOT, raw)
     store._cache_certificate = None
@@ -136,6 +193,17 @@ def snapshot_statistics(store: IndexStore, read_lsn: int) -> tuple[int, tuple[in
     """Return totals only when their complete committed coverage fits this snapshot."""
     if not has_durable_statistics(store.definition.key_derivation):
         return None
-    mark, count, totals = read_statistics(store)
+    with store._pool.pinned(store.file, 0) as page:
+        series = _decode_series(store, page)
+    for (mark, count, totals), (next_mark, _, _) in zip(series, series[1:]):
+        if mark <= read_lsn < next_mark:
+            return count, totals
+    mark, count, totals = series[-1]
     required = store._required_table_position(read_lsn)
     return (count, totals) if required <= mark <= read_lsn else None
+
+
+def read_history_from_device(store: IndexStore) -> tuple[tuple[int, int, tuple[int, ...]], ...]:
+    """Read the full bounded series independently of warm buffer contents."""
+    raw = store._pool.storage.read_page(store.file, 0)
+    return _decode_series(store, store._pool.codec.decode_page(raw))

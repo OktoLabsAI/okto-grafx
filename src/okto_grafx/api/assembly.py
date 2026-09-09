@@ -404,6 +404,7 @@ def assemble_database(
             indexes=indexes,
             exact_scan_threshold=config.vector_exact_scan_threshold,
             ef_search=config.vector_ef_search,
+            hnsw_memory_budget_bytes=config.vector_hnsw_memory_budget_bytes,
             # Production schema changes use QueryEngine staging and the normal WAL commit.
             # Closing the two legacy direct-save doors is the proof TXN-4 needs to retain a
             # catalog view across a CE-3 interval containing only ordinary DML.
@@ -758,9 +759,12 @@ def _attach_primary_key_indexes(
         if definition.visibility is not IndexVisibility.EXACT:
             continue
         try:
+            from okto_grafx.engine.sparse_hash import SparseHashIndex
             index = (
                 OrderedIndex(definition, pool, metrics)
                 if definition.layout is IndexLayout.ORDERED
+                else SparseHashIndex(definition, pool, metrics)
+                if definition.layout is IndexLayout.SPARSE_HASH
                 else HashIndex(definition, pool, metrics)
             )
             try:

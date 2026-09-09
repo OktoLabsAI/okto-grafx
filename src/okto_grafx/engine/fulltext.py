@@ -79,6 +79,9 @@ def create_text_index(
     with database._public_operation("create_text_index"):
         database._require_open()
         database._require_writable("create full-text index")
+        if selected.statistics_mode == "durable":
+            from okto_grafx.engine.fulltext_durable import require_statistics_capacity
+            require_statistics_capacity(selected.derivation(), database._pool.page_size)
         with database._transactions.page_access_section(fresh_read_view=True):
             definition = database._catalog.catalog.table(table)
             positions = tuple(definition.column_index(column) for column in columns)

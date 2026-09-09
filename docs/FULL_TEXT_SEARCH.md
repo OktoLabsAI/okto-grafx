@@ -93,6 +93,44 @@ Physical backup preserves it; logical export/import rebuilds it from its declara
 It is not a history store, an authorization filter or an upgrade that can be undone
 by removing a capability bit. See [format/recovery contract](specs/FTS_DURABLE_STATISTICS.md).
 
+### Bounded historical corpus totals
+
+For long-lived readers concurrent with writers, explicitly declare
+`TextIndexOptions(statistics_mode="durable", statistics_history_entries=8)`.
+The integer range is 0..32; default 0 preserves the original scalar-only bytes.
+A positive capacity retains up to that many older reductions **plus the current
+one**, in a fixed-size page-0 slot. It requires `fulltext_statistics_history_v1`
+(catalog bit 8) and the `fulltext_v3_` derivation. Every participant must support it.
+The declaration is immutable for an index generation; rebuild preserves it.
+
+Creation refuses if the record cannot fit the database page size. Required page
+bytes are `140 + 64*(capacity+1)` (32-byte page header, three 4-byte slots,
+28-byte file header, 52-byte index header and 16-byte history envelope). The check uses
+the native `PAGE_HEADER_SIZE`, `SLOT_ENTRY_SIZE`, `FILE_HEADER_SIZE` and
+`INDEX_HEADER_SIZE`, plus the 16-byte history envelope and 64-byte scalar records.
+No index or capability is published on this refusal.
+
+Consecutive complete reductions prove the interval from an older marker through
+the commit before the next marker. Reads inside that retained window can report
+`durable_summary`, including gaps with unrelated commits. Older/otherwise
+unproved snapshots still use exact WAL/census; no approximate corpus totals or
+changed BM25 scores. Same-snapshot cache hits still report `snapshot_cache`.
+
+Benefits: bounded avoidance of historical full-corpus statistics scans without
+pinning new row history. Costs: larger page-0 records/copies on affected commits
+and bounded extra verification work. Prefer zero for short-lived readers or when
+warm caches suffice. This is not arbitrary time travel or history retention:
+evicted summaries are not recoverable through this API, and the heap's reclaimed
+snapshot floor still applies. No RSS or whole-query O(1) promise is implied.
+
+Recovery appends only complete proved COMMIT reductions and is idempotent.
+Verification reads the device and checks retained historical totals against
+canonical heap visibility; summaries below the reclaim floor receive structural
+validation only. Physical backup preserves the series. Logical export preserves
+the capacity, but import/rebuild computes destination-generation statistics rather
+than copying source historical markers. Malformed/missing/future/nonmonotonic
+metadata refuses; it is not silently converted to an empty history or fallback.
+
 ## Procedure query
 
 Materialized `Database.execute` and read `Transaction.execute` also accept:
@@ -124,6 +162,7 @@ procedure, not restarted inside it. FTS creation uses the typed API; proposed
 | `analyzer` | `standard` | `standard`, `keyword`, `code_identifier`, `whitespace`; see below. |
 | `analyzer_version` | `1` | Only 1. Unknown versions refuse, never silently map to latest. |
 | `statistics_mode` | `wal` | `wal` retains legacy index bytes and bounded memo/WAL/census statistics; `durable` explicitly activates a required format capability and persists corpus totals. See below. |
+| `statistics_history_entries` | `0` | Integer 0..32; positive values require `durable` and reserve this many historical summaries plus the current one. Page-size fit checked before creation; additional required capability bit 8. |
 | `normalization` | `NFC` | `none`, `NFC`, `NFKC` using the frozen Unicode 3.2 database. NFKC folds compatibility forms and may conflate distinctions; use none/NFC for identifiers where those distinctions matter. |
 | `case_folding` | `unicode` | `none`, `ascii`, `unicode`. Unicode uses a checked-in full case-fold table from Unicode 15.1, not the host Python table. Case folding can expand terms (e.g. ß → ss); choose none for case-sensitive identity. |
 | `locale` | `und` | Only und (locale-independent). No host locale or Turkish-specific folding. |

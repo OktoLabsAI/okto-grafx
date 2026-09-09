@@ -925,15 +925,18 @@ def test_a_table_whose_chain_cannot_be_walked_is_reported_and_the_walk_goes_on(
     assert report.findings_of(FindingKind.TABLE_UNREADABLE)
 
 
-def test_a_catalog_that_cannot_be_read_is_reported_rather_than_raised(stack: Stack) -> None:
+@pytest.mark.parametrize("scope", [SCOPE_RECORDS, SCOPE_ALL])
+def test_a_catalog_that_cannot_be_read_is_reported_rather_than_raised(stack: Stack, scope: str) -> None:
     _populate(stack)
     stack.pool.flush()
     raw = bytearray(stack.storage.read_page(CATALOG_FILE, 1))  # type: ignore[attr-defined]
     raw[80] ^= 0xFF
     stack.storage.write_page(CATALOG_FILE, 1, bytes(raw))  # type: ignore[attr-defined]
     stack.pool.invalidate()
-    report = stack.verifier().verify(SCOPE_RECORDS)
-    assert report.findings_of(FindingKind.CATALOG_UNREADABLE)
+    report = stack.verifier().verify(scope)
+    assert len(report.findings_of(FindingKind.CATALOG_UNREADABLE)) == 1
+    assert not report.findings_of(FindingKind.TABLE_UNREADABLE)
+    assert not report.clean
 
 
 # --- routing C1's four page states (the ask this component made, spent) ---------------------

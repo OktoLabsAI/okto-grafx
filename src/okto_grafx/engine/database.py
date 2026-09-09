@@ -189,6 +189,7 @@ from okto_grafx.engine.public_views import (
 from okto_grafx.engine.query_engine import QueryEngine, QueryResult
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorSearchResult
+from okto_grafx.engine.vector_memory import VectorMemoryUsage
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
 
 _HistoryResult = TypeVar("_HistoryResult")
@@ -1472,6 +1473,7 @@ class Maintenance:
         *,
         confirm_quiescent: bool = False,
         max_versions: int | None = None,
+        index_free_pages: bool = False,
     ) -> VacuumReport:
         """Run explicit foreground MVCC reclamation under the v1 quiescence contract."""
 
@@ -1479,6 +1481,7 @@ class Maintenance:
             table,
             confirm_quiescent=confirm_quiescent,
             max_versions=max_versions,
+            index_free_pages=index_free_pages,
         )
 
     def checkpoint(self) -> RecycleReport:
@@ -2868,6 +2871,23 @@ class Database:
             )
             return ScanPageV1(rows=tuple(rows), next_cursor=next_cursor)
 
+    def vector_memory_usage(self, space: str) -> VectorMemoryUsage:
+        """Observe local HNSW cache tariffs without building or proving freshness.
+
+        The per-picture limit is independent of query memory and is not an RSS or
+        aggregate multi-handle ceiling. No persistent state is changed.
+        """
+        with self._public_operation("vector_memory_usage"):
+            vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
+            index = vectors.index(_require_text("space", space))
+            observe = getattr(index, "memory_usage", None)
+            if not callable(observe):
+                raise GrafxUnsupportedOperation(
+                    "The vector collaborator does not expose memory observations.",
+                    operation="vector_memory_usage",
+                )
+            return observe()
+
     def search_vectors(
         self,
         transaction: Transaction,
@@ -3471,12 +3491,15 @@ class Database:
         *,
         confirm_quiescent: bool,
         max_versions: int | None,
+        index_free_pages: bool = False,
     ) -> VacuumReport:
         """Execute the guarded two-transaction vacuum v1 protocol."""
 
         with self._public_operation("vacuum MVCC history"):
             self._require_open()
             self._require_writable("vacuum MVCC history")
+            if type(index_free_pages) is not bool:
+                raise GrafxConfigurationError("index_free_pages must be a bool.", field="index_free_pages")
             wanted_table = None if table is None else _require_text("table", table)
             wanted_limit = (
                 None
@@ -3507,6 +3530,9 @@ class Database:
                     capability_active = (
                         HEAP_RECLAIM_V1_CAPABILITY in source.required_capabilities()
                     )
+                    from okto_grafx.engine.free_page_index import CAPABILITY
+                    if index_free_pages and CAPABILITY not in source.required_capabilities():
+                        capability_active = False
 
                 capability_activated = False
                 capability_wrote = False
@@ -3515,7 +3541,7 @@ class Database:
                     try:
                         capability_activated = (
                             self._transactions.prepare_heap_reclaim_activation(
-                                activation._context
+                                activation._context, index_free_pages=index_free_pages
                             )
                         )
                         activation_report = activation.commit()

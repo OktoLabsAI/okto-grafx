@@ -111,6 +111,17 @@ execution; write transactions refuse the options. `Maintenance.cleanup_indexes`
 provides an independently revalidated dry-run/removal census under explicit
 whole-store quiescence. See [contracts, examples, errors and limits](READ_CONTROL_AND_INDEX_CLEANUP.md).
 
+## Trusted scalar extensions and Arrow export
+
+Use `from okto_grafx.extensions import ExtensionRegistry, ScalarFunction` and
+`connect(..., extensions=registry)` for the explicit per-handle allowlist.
+`registry.call_scalar(name, arguments_tuple)` supports direct invocation; the query
+door is `udf('namespace.name', ...)`. Registration, value budgets, NULL/type/error
+semantics and trust limits are in [Extensions and Arrow](EXTENSIONS_AND_ARROW.md).
+`from okto_grafx.arrow import to_arrow_batches` provides optional copied scalar
+batches over a materialized result or caller-owned cursor. The same guide defines
+all type mappings, budget tariffs, snapshot and close obligations.
+
 <!-- GENERATED PUBLIC REFERENCE: do not edit below -->
 
 ## Complete facade signatures
@@ -306,7 +317,7 @@ Inventory or reclaim unreferenced native generations with every other handle sto
 #### Maintenance.vacuum
 
 ```python
-vacuum(table: str | None=None, *, confirm_quiescent: bool=False, max_versions: int | None=None) -> VacuumReport
+vacuum(table: str | None=None, *, confirm_quiescent: bool=False, max_versions: int | None=None, index_free_pages: bool=False) -> VacuumReport
 ```
 
 Run explicit foreground MVCC reclamation under the v1 quiescence contract.
@@ -691,6 +702,14 @@ explain(text: str) -> PlanNode
 
 Plan one statement without exposing the mutable query engine.
 
+#### Database.vector_memory_usage
+
+```python
+vector_memory_usage(space: str) -> VectorMemoryUsage
+```
+
+Observe local HNSW cache tariffs without building or proving freshness.
+
 #### Database.search_vectors
 
 ```python
@@ -902,6 +921,14 @@ Release owned resources under this database's checksum selection (FR-1).
 ## Public factory and transfer functions
 
 
+### okto_grafx.arrow.to_arrow_batches
+
+```python
+to_arrow_batches(source: QueryResult | QueryCursor, *, types: tuple[str, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024) -> Iterator[RecordBatch]
+```
+
+Yield copied typed batches; caller owns cursor lifetime and already-emitted batches.
+
 ### okto_grafx.migrations.migrate_schema
 
 ```python
@@ -913,7 +940,7 @@ Validate/apply a complete ordered 1..N plan, atomically per version.
 ### okto_grafx.api.connect
 
 ```python
-connect(path: str | os.PathLike[str], *, registry: PortRegistry | None=None, **options: Unpack[ConnectOptions]) -> Database
+connect(path: str | os.PathLike[str], *, registry: PortRegistry | None=None, extensions: ExtensionRegistry | None=None, **options: Unpack[ConnectOptions]) -> Database
 ```
 
 Open the database at `path`, creating it when it does not exist yet (SPEC-M1 FR-1).
@@ -957,6 +984,63 @@ construct raw engine state. Consume returned instances and documented accessors.
 `Lsn`, `Csn` and record/table IDs are integer aliases, not wall-clock times.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
+
+### ScalarFunction fields
+
+Annotation location: `okto_grafx.domain.query.extensions.ScalarFunction`.
+
+Trusted deterministic scalar callback with exact positional types and NULL propagation.
+
+```python
+name: str
+argument_types: tuple[str, ...]
+return_type: str
+implementation: Callable[..., object]
+max_value_bytes: int
+```
+
+#### ScalarFunction.invoke
+
+```python
+invoke(arguments: tuple[object, ...]) -> object
+```
+
+Call with scalar values only; NULL propagates and callback failures are typed.
+
+### ExtensionRegistry fields
+
+Annotation location: `okto_grafx.domain.query.extensions.ExtensionRegistry`.
+
+Per-handle immutable trusted allowlist; not a sandbox or a plugin loader.
+
+```python
+scalars: tuple[ScalarFunction, ...]
+trusted: bool
+```
+
+#### ExtensionRegistry.call_scalar
+
+```python
+call_scalar(name: str, arguments: tuple[object, ...]) -> object
+```
+
+Invoke only an exact registered name; no module/path or builtin resolution.
+
+### VectorMemoryUsage fields
+
+Annotation location: `okto_grafx.engine.vector_memory.VectorMemoryUsage`.
+
+Local derived-cache observations; no storage read or freshness proof.
+
+```python
+space: str
+limit_bytes: int | None
+cached_entries: int
+cached_logical_bytes: int
+peak_requested_bytes: int
+budget_refusals: int
+warm_retirements: int
+```
 
 ### SchemaMigration fields
 
@@ -1152,6 +1236,7 @@ locale: str
 stopwords: str
 stemming: str
 statistics_mode: str
+statistics_history_entries: int
 ```
 
 #### TextIndexOptions.derivation
@@ -1247,6 +1332,7 @@ vector_math: Literal['auto', 'pure', 'numpy']
 checksum: Literal['auto', 'pure', 'native']
 vector_exact_scan_threshold: int
 vector_ef_search: int
+vector_hnsw_memory_budget_bytes: int | None
 read_only: bool
 descriptor_revalidation: Literal['strict', 'generation']
 max_query_value_characters: int

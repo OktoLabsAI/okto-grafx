@@ -1,0 +1,31 @@
+name: 0.0.5 compatibility
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ['3.11', '3.12', '3.13']
+        profile: [bare, extras]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[dev]"
+      - if: matrix.profile == 'extras'
+        run: python -m pip install -e ".[accel,arrow]"
+      - run: python -m pytest tests/api/test_v005_compatibility.py tests/api/test_vector_memory_budget.py tests/api/test_sparse_hash.py tests/api/test_free_page_index.py tests/api/test_fulltext_history.py tests/api/test_hot_key_pages.py tests/api/test_scalar_extensions.py tests/api/test_arrow_export.py tests/api/test_arrow_missing.py --junitxml=compatibility.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compatibility-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.profile }}
+          path: compatibility.xml
+          if-no-files-found: error

@@ -1,5 +1,9 @@
 # Integration recipes
 
+For host-provided typed scalar functions and optional Arrow result batches, see
+[Extensions and Arrow](EXTENSIONS_AND_ARROW.md). The registry is explicitly
+per connection; cursor ownership and native transaction semantics remain unchanged.
+
 New 0.0.5 development integration recipes: [hybrid retrieval](HYBRID_SEARCH.md),
 [logical transfer and crash resumption](LOGICAL_TRANSFER.md)
 for verified fresh-store copies, and [full-text search](FULL_TEXT_SEARCH.md) for

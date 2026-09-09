@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 from generate_api_reference import MARKER, render  # noqa: E402
 
 CONSUMER_DOCS = (
+    "docs/EXTENSIONS_AND_ARROW.md",
+    "docs/V005_COMPATIBILITY.md",
+    "docs/specs/HEAP_FREE_PAGE_INDEX.md",
+    "docs/specs/SPARSE_HASH_DIRECTORIES.md",
     "README.md",
     "ROADMAP.md",
     "docs/README.md",

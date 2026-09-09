@@ -14,6 +14,13 @@ durable FTS statistics (`fulltext_statistics_v1`, bit 6) and large hash director
 (`large_hash_directories_v1`, bit 7). The latter two are opt-in persisted additions
 in the eight-item 0.0.5 continuation; unchanged defaults retain their prior bytes.
 Unknown required bits raise a typed refusal.
+The following continuation adds opt-in `fulltext_statistics_history_v1` (bit 8),
+requiring bits 5 and 6 as well. Its bounded fixed page-0 series is specified in
+[durable FTS statistics](FTS_DURABLE_STATISTICS.md); capacity zero preserves older bytes.
+Bit 9 (`heap_free_page_index_v1`, requires bit 1) adds immutable
+[retired-page candidate directories](HEAP_FREE_PAGE_INDEX.md). Bit 10
+(`sparse_hash_directories_v1`) admits [sparse exact hash](SPARSE_HASH_DIRECTORIES.md).
+Both are explicit operation opt-ins, and remain required after activation.
 `tests/storage_core/test_catalog_v2.py` and
 `tests/index/test_ordered_format_discrimination.py` exercise unknown/missing bits
 and older-reader discrimination. The subsequent layouts are specified in

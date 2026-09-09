@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 8, 2026. “Current” means the **latest recorded observation for
+Updated September 9, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
 Current development source is 0.0.5; published baseline is 0.0.4 with CAP-1 recovery work.
 The latest live measurement used
@@ -35,6 +35,20 @@ Do not add overlapping timing boundaries. Historical policy DLQ/canonical debt
 and stale diagnostic snapshots mean this is not an all-green operational audit.
 
 ## Native synthetic checkpoint in the 0.0.5 development line
+
+### Continuation after 3f3819f: latest bounded work observations
+
+Windows/Python 3.13.1 source tests, September 9, 2026. Counts, not latency/SLO claims:
+
+| Operation / fixture | Latest measured result |
+| --- | ---: |
+| Empty sparse hash, 65,536 buckets, 512-byte pages | 571 allocated pages |
+| Retired-overflow indexed allocation, 3 selected pages | At most 7 page pins, confined to header/directory/candidates |
+| Warm repeated-key capture, 60 exact entries in one overflow chain | 0 entry decoder calls; all 60 candidate results preserved |
+
+Tests: `test_sparse_hash.py`, `test_free_page_index.py`, `test_hot_key_pages.py`.
+The page memo does not remove page/heap verification or O(result count). Sparse
+first-bucket insertion adds a durability barrier. No Pulse timing was taken here.
 
 ### Eight-item continuation: latest small installed-wheel probe
 

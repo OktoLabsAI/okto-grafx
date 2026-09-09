@@ -40,7 +40,7 @@ def index_distribution(database: Database, name: str, *, max_pages: int, max_ent
     with database._public_operation("index_distribution"), database.begin("read") as reader:
         with database._transactions.page_access_section(transaction=reader._context):
             store = database._indexes.active_index(name)
-            if store.definition.layout is not IndexLayout.HASH:
+            if store.definition.layout not in (IndexLayout.HASH, IndexLayout.SPARSE_HASH):
                 raise GrafxUnsupportedOperation("Distribution describes HASH indexes only.", field="layout")
             pages_work = 0
 
@@ -54,9 +54,11 @@ def index_distribution(database: Database, name: str, *, max_pages: int, max_ent
             def observe(certificate: _IndexReadCertificate) -> IndexDistribution:
                 """Build distribution statistics under one native stable-view attempt."""
                 counts = {}
-                entries = pages = largest_chain = largest_bucket = 0
+                entries = pages = largest_chain = largest_bucket = heads = 0
                 memory = 0
                 for bucket in range(store.definition.bucket_count):
+                    if store.definition.layout is IndexLayout.SPARSE_HASH:
+                        visit()  # pointer-page work, including empty buckets
                     chain_pages = 0
 
                     def visit_chain() -> None:
@@ -68,6 +70,7 @@ def index_distribution(database: Database, name: str, *, max_pages: int, max_ent
                             raise GrafxQueryBudgetExceeded("Distribution memory budget exceeded.", resource="index_distribution")
 
                     chain, _ = store._scan_bucket(bucket, visit=visit_chain)
+                    heads += bool(chain)
                     pages += len(chain)
                     largest_chain = max(largest_chain, len(chain))
                     local = 0
@@ -85,7 +88,7 @@ def index_distribution(database: Database, name: str, *, max_pages: int, max_ent
                     largest_bucket = max(largest_bucket, local)
                 dominant = max(counts.values(), default=0)
                 fraction = dominant / entries if entries else 0.0
-                overflow = pages - store.definition.bucket_count
+                overflow = pages - heads
                 recommendation = ("inspect_key_skew" if entries >= 16 and fraction >= 0.5 else
                                   "consider_growth" if overflow or entries > store.definition.bucket_count * 64 else "balanced")
                 return IndexDistribution(store.definition.bucket_count, entries, pages, overflow,

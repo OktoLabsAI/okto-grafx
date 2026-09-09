@@ -282,4 +282,30 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 | `GrafxConfigurationError` | ❌ | An option, naming the field |
 | `GrafxUnsupportedOperation` | ❌ | Declared not to exist, rather than silently ignored |
 
+## Indexed retired-overflow discovery (0.0.5 development)
+
+`db.maintenance.vacuum(confirm_quiescent=True, index_free_pages=True)` explicitly
+activates `heap_free_page_index_v1` (bit 9) and builds a bounded-page immutable
+directory of already retired overflow candidates. Existing catalog-v2 activation
+and the caller's real quiescence assertion remain prerequisites. Default False
+does not upgrade a store; once active, later vacuum calls maintain the directory.
+Capability publication without a completed directory is recoverable and keeps
+legacy discovery until initialization commits. There is no supported downgrade
+by removing the required bit.
+
+Normal writes traverse candidate IDs rather than scanning every heap page. Each
+candidate still needs current physical FREE/LSN validation under the ordinary
+publication fence; candidates used by another writer are OVERFLOW and skipped.
+The directory/root are immutable during allocation: an interrupted pre-COMMIT
+attempt cannot lose membership. Local cursor state resets on reopen/new reclaim
+floor. Costs are O(requested pages + stale candidates + directory pages), not a
+universal O(k) or O(1) guarantee. No online vacuum, truncation or single-writer
+application premise is introduced.
+
+Use for churn-heavy heaps with reusable overflow space and many cold participants.
+It spends a small fraction of retired pages on the directory and adds an explicit
+whole-heap census to quiescent directory construction/verification. It does not
+benefit heaps with no eligible overflow pages. Physical backup preserves allocator
+metadata; logical transfer uses a fresh heap. See [format and failure boundaries](specs/HEAP_FREE_PAGE_INDEX.md).
+
 ---

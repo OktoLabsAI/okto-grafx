@@ -1290,7 +1290,7 @@ class TransactionManager:
                 )
                 return True
 
-    def prepare_heap_reclaim_activation(self, txn: TransactionContext) -> bool:
+    def prepare_heap_reclaim_activation(self, txn: TransactionContext, *, index_free_pages: bool = False) -> bool:
         """Stage the one-way catalog capability required before physical heap reclaim.
 
         Catalog v2 must already be active.  This keeps its potentially expensive detached index
@@ -1328,10 +1328,12 @@ class TransactionManager:
                         required=CATALOG_FORMAT_VERSION,
                         remedy="maintenance.ensure_identity_indexes",
                     )
-                if HEAP_RECLAIM_V1_CAPABILITY in source.required_capabilities():
+                from okto_grafx.engine.free_page_index import CAPABILITY
+                if (HEAP_RECLAIM_V1_CAPABILITY in source.required_capabilities()
+                        and (not index_free_pages or CAPABILITY in source.required_capabilities())):
                     return False
                 candidate = Catalog.deserialize(source.serialize())
-                candidate.enable_heap_reclaim()
+                candidate.enable_heap_reclaim(index_free_pages=index_free_pages)
                 for page_index, image in self._catalog.stage(candidate):
                     self._stage_page_image(
                         txn,
@@ -1576,10 +1578,17 @@ class TransactionManager:
                     table.reclaimed_versions for table in plan.tables
                 )
                 old_floor = self._heap.reclaim_floor()
-                if reclaimed_versions == 0 and removed_indexes == 0:
+                from okto_grafx.engine.free_page_index import CAPABILITY, INITIALIZED, initialized, plan as plan_free_index
+                indexed_free = CAPABILITY in source.required_capabilities()
+                needs_initialization = indexed_free and not initialized(self._heap)
+                if reclaimed_versions == 0 and removed_indexes == 0 and not needs_initialization:
                     return plan, reports, old_floor, old_floor
 
-                for page_index, image in plan.page_images:
+                images = dict(plan.page_images)
+                free_head = None
+                if indexed_free:
+                    images, free_head = plan_free_index(self._heap, plan.page_images, horizon)
+                for page_index, image in sorted(images.items()):
                     self._stage_page_image(
                         txn,
                         self._heap_file,
@@ -1587,11 +1596,17 @@ class TransactionManager:
                         image,
                     )
                 floor = self._heap.plan_reclaim_floor(horizon)
+                floor_image = floor.image
+                if indexed_free:
+                    header = self._pool.codec.decode_page(floor_image)
+                    header.flags |= INITIALIZED
+                    header.next_page = free_head
+                    floor_image = self._pool.codec.encode_page(header)
                 self._stage_page_image(
                     txn,
                     self._heap_file,
                     floor.page_index,
-                    floor.image,
+                    floor_image,
                 )
                 self._declare_complete_table_reads(
                     txn, {table.table_id: table for table in selected_tables}

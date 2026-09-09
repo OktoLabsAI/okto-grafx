@@ -243,6 +243,11 @@ class IndexDefinition:
         object.__setattr__(
             self, "bucket_count", validate_bucket_count(self.bucket_count)
         )
+        if self.layout is IndexLayout.SPARSE_HASH and (
+            self.visibility is not IndexVisibility.EXACT
+            or self.key_derivation != COLUMN_KEY_DERIVATION
+        ):
+            raise GrafxIndexError("Sparse hash requires an exact property index.", field="layout")
         if is_fulltext(self.key_derivation):
             options = decode_options(self.key_derivation)
             if len(options.field_weights) != len(self.positions) or self.layout is not IndexLayout.HASH or self.visibility is not IndexVisibility.EXACT:
@@ -483,7 +488,7 @@ class IndexDefinition:
         )
         # Preserve every established HASH digest byte-for-byte. Ordered artifacts append their
         # physical layout so no file can be adopted under the other placement contract.
-        if self.layout is IndexLayout.ORDERED:
+        if self.layout is not IndexLayout.HASH:
             fields = (*fields, self.layout.value)
         material = "\n".join(fields)
         return hashlib.blake2b(

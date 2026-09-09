@@ -1,6 +1,11 @@
 # SPEC-GX-CAP-8 — Arrow and external data
 
 Status: specified / implementation not certified. Date: 2026-09-08.
+
+0.0.5 continuation: optional scalar Arrow **export** over native results/cursors is
+implemented; [consumer type/ownership contract](../EXTENSIONS_AND_ARROW.md) and
+[validation receipt](../reports/V005_NEXT_EIGHT_PROGRESS.md). Imports, nested/entity
+columns, external scans, COPY and other adapters below remain roadmap scope.
 Dependencies: GX-CAP-7; streaming cursor and existing bulk ingest.
 
 ## Normative scope
