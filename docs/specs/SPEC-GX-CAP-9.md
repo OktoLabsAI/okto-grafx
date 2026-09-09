@@ -1,8 +1,9 @@
 # SPEC-GX-CAP-9 — Graph projections and algorithms
 
-Status: first read-only slice implemented in 0.0.5 development; broader scope remains planned.
+Status: bounded read-only projections and algorithms implemented in 0.0.5 development; broader scope remains planned.
 Date: 2026-09-09. [Consumer contract](../GRAPH_PROJECTIONS.md),
-[acceptance receipt](../reports/V005_AFTER_69ED311.md).
+[foundation receipt](../reports/V005_AFTER_69ED311.md) and
+[algorithm continuation](../reports/V005_AFTER_7DDE256.md).
 Dependencies: GX-CAP-7; existing traversal/query budgets.
 
 ## Normative scope
@@ -47,8 +48,11 @@ when claiming complexity/performance improvements; no new marginal timing thresh
 
 Execution status: **not implemented by GX-CAP-0**; the continuation after `69ed311`
 adds detached snapshot projection, degrees and weak components through public scans,
-with logical limits, cancellation and an independent reachability oracle. Persisted
-catalog, SCC/PageRank/k-core, weights, mutation/write modes and NetworkX acceptance
+with logical limits, cancellation and an independent reachability oracle. The
+continuation after `7dde256` adds projected batched capture, retained immutable CSR,
+iterative SCC, BFS reachability/shortest paths, bounded unweighted PageRank and
+simple-undirected k-core. Oracles use independent reachability, linear-system and
+peeling implementations. Persisted catalog, weights/personalization, mutation/write modes and NetworkX acceptance
 remain backlog; the independent oracle is not recorded as a NetworkX run.
 No release, new on-disk capability,
 installed Pulse feature, or successful crash matrix is inferred from this document.

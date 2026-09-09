@@ -246,6 +246,48 @@ def test_a_vector_already_in_its_stored_shape_is_carried_through(stack: QuerySta
     assert transaction.row_intents[0].values[2] is stored
 
 
+@pytest.mark.parametrize("stored", [
+    VectorValue((1.0, 0.0, 0.0), 1),
+    VectorValue((1.0, 0.0, 0.0, 0.0), 2),
+    VectorValue((1.0, 0.0, 0.0, 0.0), 1, "float64"),
+])
+def test_encapsulated_vector_cannot_bypass_native_admission(stack: QueryStack, stored: VectorValue) -> None:
+    from okto_grafx.errors import GrafxError
+    failure, transaction = refused(stack, "CREATE (:Chunk {id:1,embedding:$v})", {"v": stored})
+    assert isinstance(failure, GrafxError)
+    assert transaction.row_intents == []
+
+
+def test_encapsulated_vector_cannot_bypass_retirement(stack: QueryStack) -> None:
+    stack.vectors.retire_space("minilm_v2")
+    failure, transaction = refused(stack, "CREATE (:Chunk {id:1,embedding:$v})",
+                                  {"v": VectorValue((1.0, 0.0, 0.0, 0.0), 1)})
+    assert isinstance(failure, GrafxSpaceRetired)
+    assert transaction.row_intents == []
+
+
+def test_encapsulated_vector_obeys_normalized_space() -> None:
+    from okto_grafx import connect
+    with connect(":memory:") as db:
+        with db.begin() as tx:
+            tx.execute("CREATE VECTOR SPACE unit {dimension:2,metric:'cosine',normalized:true}")
+            tx.execute("CREATE NODE TABLE N(id INT64,v VECTOR(unit),PRIMARY KEY(id))")
+        space_id = db.catalog.catalog.space("unit").space_id
+        with db.begin() as tx:
+            with pytest.raises(GrafxVectorValidationError):
+                tx.execute("CREATE (:N {id:1,v:$v})", {"v": VectorValue((2.0, 0.0), space_id)})
+            assert tx.execute("MATCH (n:N) RETURN count(n)").rows == ((0,),)
+
+
+def test_encapsulated_vector_is_rounded_when_not_already_canonical(stack: QueryStack) -> None:
+    import struct
+    stored = VectorValue((0.6, 0.8, 0.0, 0.0), 1)
+    transaction = write(stack, "CREATE (:Chunk {id:1,embedding:$v})", {"v": stored})
+    result = transaction.row_intents[0].values[2]
+    assert result.values == struct.unpack("<4f", struct.pack("<4f", *stored.values))
+    assert result is not stored
+
+
 # --- relationships ------------------------------------------------------------------------------
 
 

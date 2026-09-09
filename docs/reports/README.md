@@ -6,6 +6,8 @@ Dated evidence, not active execution queues. Each report retains its original
 measurement conditions, source paths, limitations and checkpoint history.
 Private artifact/consumer-repository paths may not be available in this checkout.
 
+- [Projection throughput and algorithms after 7dde256 — eight-item acceptance](V005_AFTER_7DDE256.md)
+
 - [Eight-item continuation after 69ed311 — scope, checkpoint and final regression](V005_AFTER_69ED311.md)
 
 - [Next eight-item continuation after 3f3819f — local acceptance and corrective regression evidence](V005_NEXT_EIGHT_PROGRESS.md)

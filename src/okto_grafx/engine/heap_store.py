@@ -30,6 +30,7 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
+    GrafxQueryBudgetExceeded,
 )
 from okto_grafx.domain.ids import (
     NO_CSN,
@@ -2160,6 +2161,9 @@ class HeapStore:
         *,
         limit: int,
         position: _HeapScanPosition | None = None,
+        materialized_positions: frozenset[int] | None = None,
+        max_batch_bytes: int | None = None,
+        check: Callable[[], None] | None = None,
     ) -> tuple[
         tuple[tuple[RecordRef, HeapVersion], ...],
         _HeapScanPosition | None,
@@ -2170,6 +2174,9 @@ class HeapStore:
         between calls.  It decodes at most ``limit`` row payloads.  Headers beyond the boundary
         may be inspected to locate the next visible row, so a non-terminal page never requires an
         empty follow-up call, but that look-ahead does not decode the row's values.
+        Optional materialized positions preserve full skipped-payload validation. A logical
+        byte cap stops before admitting the next row; a first row that cannot fit refuses.
+        The check callback observes read control at page, slot and decode boundaries.
         """
 
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -2225,13 +2232,18 @@ class HeapStore:
                 )
 
         selected: list[tuple[RecordRef, RecordHeader, bytes]] = []
+        charged = 0
         next_position: _HeapScanPosition | None = None
         while index != NO_PAGE:
+            if check is not None:
+                check()
             self._refuse_endless_chain(table, pages_walked, chain_limit)
             with self._pool.pinned(self._file, index) as page:
                 self._require_table_page(page, table)
                 following = page.next_page
                 for slot in page.live_slots():
+                    if check is not None:
+                        check()
                     if slot < max(start_slot, FIRST_RECORD_SLOT):
                         continue
                     view = page.slot_view(slot)
@@ -2249,7 +2261,14 @@ class HeapStore:
                     if not snapshot.visible(xmin, xmax):
                         continue
                     header = RecordHeader._from_peek(fields)
-                    if len(selected) == limit:
+                    row_charge = 0 if max_batch_bytes is None else 512 + 64 * len(table.columns) + 64 * header.payload_len
+                    over_bytes = max_batch_bytes is not None and charged + row_charge > max_batch_bytes
+                    if over_bytes and not selected:
+                        raise GrafxQueryBudgetExceeded(
+                            "A scan row exceeds the logical batch bound.", resource="scan_batch",
+                            requested=row_charge, limit=max_batch_bytes,
+                        )
+                    if len(selected) == limit or over_bytes:
                         next_position = _HeapScanPosition(
                             page=index,
                             slot=slot,
@@ -2257,6 +2276,7 @@ class HeapStore:
                             chain_limit=chain_limit,
                         )
                         break
+                    charged += row_charge
                     selected.append(
                         (RecordRef(page=index, slot=slot), header, bytes(view))
                     )
@@ -2291,11 +2311,16 @@ class HeapStore:
 
         # Decoding can follow overflow chains, so it happens only after every data-page pin above
         # has been released. ``selected`` contains at most ``limit`` payloads.
-        rows = tuple(
-            (ref, self._decode_version_with_header(table, header, content))
-            for ref, header, content in selected
-        )
-        return rows, next_position
+        rows = []
+        for ref, header, content in selected:
+            if check is not None:
+                check()
+            rows.append((ref, self._decode_version_with_header(table, header, content)
+                         if materialized_positions is None else self._decode_version_with_header(
+                             table, header, content, materialized_positions=materialized_positions)))
+        if check is not None:
+            check()
+        return tuple(rows), next_position
 
     def scan_all(self, table: TableDef) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every stored version of the table, visible or not.

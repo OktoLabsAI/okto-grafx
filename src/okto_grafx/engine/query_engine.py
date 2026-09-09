@@ -253,6 +253,7 @@ from okto_grafx.domain.query.tokens import (
     TIMESTAMP_FUNCTION,
 )
 from okto_grafx.domain.vector.filter import CandidateFilter, RecordIdFilter
+from okto_grafx.domain.vector.space import require_space_identity
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
@@ -14306,8 +14307,14 @@ def _stored_value(
     """
     if not column.is_vector or value is None:
         return value  # type: ignore[return-value]
+    space = context.schema().space(str(column.vector_space))
+    stored = value if type(value) is VectorValue else None
     if isinstance(value, VectorValue):
-        return value
+        require_space_identity(space, value.space_ref, origin="stored parameter")
+        if value.dtype != space.storage_dtype:
+            raise GrafxPlanError("Vector parameter precision differs from its target space.",
+                                 field="dtype", value=value.dtype)
+        value = value.values
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise GrafxPlanError(
             f"The column {table.name}.{column.name} stores an embedding, which is written as a "
@@ -14315,9 +14322,10 @@ def _stored_value(
             field="column",
             value=column.name,
         )
-    space = context.schema().space(str(column.vector_space))
     vectors = engine.require_vectors()
     validated = vectors.validate_vector(space, tuple(value))  # type: ignore[attr-defined]
+    if stored is not None and stored.values == tuple(validated):
+        return stored  # Preserve an already-canonical immutable value, after admission.
     return VectorValue(
         values=tuple(validated), space_ref=space.space_id, dtype=space.storage_dtype
     )

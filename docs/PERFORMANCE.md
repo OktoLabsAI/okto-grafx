@@ -36,6 +36,21 @@ and stale diagnostic snapshots mean this is not an all-green operational audit.
 
 ## Native synthetic checkpoint in the 0.0.5 development line
 
+### Continuation after 7dde256: latest capture work observation
+
+Windows/Python 3.13 source tests. These are counts, not latency or UI measurements.
+
+| Operation / fixture | Latest measured result |
+| --- | ---: |
+| Projected topology capture, 20 nodes with 600-character properties and vectors, batch_rows=8 | 3 public scan calls; maximum 8 rows/batch; no omitted vector materialization |
+
+Evidence: `tests/api/test_projected_scan_batches.py`. All omitted source payloads
+remain validated; batching does not eliminate the selected-table census or physical
+integrity I/O. Retained immutable CSR reuses adjacency for repeated algorithms;
+new algorithms add capabilities, not a measured writer-throughput improvement.
+See the [round receipt](reports/V005_AFTER_7DDE256.md). No before/after latency or
+new live Pulse claim is inferred.
+
 ### Continuation after 69ed311: latest bounded work observations
 
 Windows/Python 3.13 source tests, September 9, 2026. These are structural counts,

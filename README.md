@@ -43,9 +43,9 @@ context exit commits, and an exceptional exit rolls back. See
 | Capability | Consumer documentation |
 | --- | --- |
 | Opt-in sparse hash directories, bounded repeated-key decoding and indexed retired-page discovery (0.0.5 development) | [Index layouts](docs/INDEXES_AND_VECTORS.md#sparse-exact-hash-indexes-and-repeated-keys), [operations](docs/OPERATIONS.md) |
-| Explicit trusted typed scalar UDFs and optional Arrow batch import/export (0.0.5 development) | [Extensions and Arrow](docs/EXTENSIONS_AND_ARROW.md), [compatibility evidence](docs/V005_COMPATIBILITY.md) |
+| Explicit trusted typed scalar UDFs and optional scalar/vector Arrow batch import/export (0.0.5 development) | [Extensions and Arrow](docs/EXTENSIONS_AND_ARROW.md), [compatibility evidence](docs/V005_COMPATIBILITY.md) |
 | Bounded prefix search and full-text over relationship properties (0.0.5 development) | [Full-text options and upgrade contract](docs/FULL_TEXT_SEARCH.md#prefix-search-and-relationship-properties) |
-| Read-only snapshot graph projections, degrees and weak components (0.0.5 development) | [Graph projections](docs/GRAPH_PROJECTIONS.md) |
+| Batched projected scans; immutable graph adjacency, degrees, WCC/SCC, paths, PageRank and k-core (0.0.5 development) | [Graph projections](docs/GRAPH_PROJECTIONS.md), [scan contract](docs/INTEGRATION.md#bounded-physical-scans) |
 | Configurable repeated-key cache, batched sparse heads and aggregate HNSW admission (0.0.5 development) | [Memory and maintenance](docs/INDEXES_AND_VECTORS.md#continuation-after-69ed311-bounded-maintenance-and-memory) |
 | Multi-process/multi-thread access, snapshot transactions, optimistic conflicts and writer fencing | [Concurrency and recovery](docs/OPERATIONS.md) |
 | Typed nodes/relationships, parameters, writes, traversal, aggregates, limited OPTIONAL MATCH and UNION | [Supported query language](docs/QUERY_LANGUAGE.md) |

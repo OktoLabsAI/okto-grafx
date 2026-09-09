@@ -782,6 +782,7 @@ class ScanCursorV1:
         "_schema_version",
         "_table_id",
         "_table_name",
+        "_columns",
     )
 
     def __init__(self) -> None:
@@ -800,6 +801,7 @@ class ScanCursorV1:
         table_id: int,
         schema_version: int,
         position: _HeapScanPosition,
+        columns: tuple[str, ...] | None = None,
     ) -> ScanCursorV1:
         cursor = object.__new__(cls)
         object.__setattr__(cursor, "_consumed", False)
@@ -808,6 +810,7 @@ class ScanCursorV1:
         object.__setattr__(cursor, "_table_id", table_id)
         object.__setattr__(cursor, "_schema_version", schema_version)
         object.__setattr__(cursor, "_position", position)
+        object.__setattr__(cursor, "_columns", columns)
         return cursor
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -1242,12 +1245,18 @@ class Transaction:
         *,
         limit: int,
         cursor: ScanCursorV1 | None = None,
+        columns: tuple[str, ...] | None = None,
+        max_batch_bytes: int | None = None,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> ScanPageV1:
         """Read one bounded page of physical rows under this transaction's fixed snapshot.
 
-        Values follow ``TableDef.columns`` exactly. Relationship rows therefore expose ``_from``
-        and ``_to`` in their first two positions and preserve every physical occurrence. The
-        cursor is process-local and valid only for this transaction and table.
+        By default values follow ``TableDef.columns``; relationship endpoints lead the tuple.
+        Explicit ``columns`` selects values in requested order, or identities only when empty.
+        Omitted payloads remain validated. The one-shot cursor binds this transaction, table
+        and exact projection. Optional logical batch bounds and cooperative read controls
+        refuse without returning a partial page; the caller retains its transaction.
         """
 
         self._require_active()
@@ -1261,6 +1270,14 @@ class Transaction:
             )
         table_name = _builtin_text(table, field="table", empty=False)
         page_limit = _require_positive_integer("limit", limit)
+        if columns is not None and (type(columns) is not tuple or len(columns) > 256
+                or any(type(c) is not str or not c for c in columns)
+                or len(set(columns)) != len(columns)):
+            raise GrafxConfigurationError("columns must be a tuple of distinct names or None.", field="columns")
+        if max_batch_bytes is not None:
+            max_batch_bytes = _require_positive_integer("max_batch_bytes", max_batch_bytes)
+            if max_batch_bytes > 2**31 or page_limit > 65536:
+                raise GrafxConfigurationError("Bounded scans allow <=65536 rows and <=2^31 bytes.", field="limit")
         payload = (
             None
             if cursor is None
@@ -1276,6 +1293,8 @@ class Transaction:
             limit=page_limit,
             cursor_payload=payload,
             cursor_owner=self._scan_owner,
+            columns=columns, max_batch_bytes=max_batch_bytes,
+            control=_read_control(self._database._clock, timeout_seconds, cancellation),
         )
 
     def commit(self) -> CommitReport:
@@ -2767,6 +2786,9 @@ class Database:
         limit: int,
         cursor_payload: tuple[int, int, _HeapScanPosition, ScanCursorV1] | None,
         cursor_owner: object,
+        columns: tuple[str, ...] | None = None,
+        max_batch_bytes: int | None = None,
+        control: _ReadControl | None = None,
     ) -> ScanPageV1:
         """Serve the bounded scan door after its public arguments have been canonicalised."""
 
@@ -2790,6 +2812,7 @@ class Database:
                         operation="scan_rows_v1",
                     )
                 table_def = self._catalog.catalog.table(table)
+                positions = None if columns is None else tuple(table_def.column_index(c) for c in columns)
                 position: _HeapScanPosition | None = None
                 if cursor_payload is not None:
                     cursor_table_id, cursor_schema_version, position, cursor_token = (
@@ -2798,6 +2821,7 @@ class Database:
                     if (
                         cursor_table_id != table_def.table_id
                         or cursor_schema_version != table_def.schema_version
+                        or getattr(cursor_token, "_columns", None) != columns
                     ):
                         raise GrafxTransactionStateError(
                             "A scan continuation no longer names the same table definition.",
@@ -2821,12 +2845,14 @@ class Database:
                             value="consumed",
                         )
                     object.__setattr__(cursor_token, "_consumed", True)
+                options = {}
+                if columns is not None or max_batch_bytes is not None or control is not None:
+                    if type(self._heap) is not HeapStore:
+                        raise GrafxUnsupportedOperation("The heap collaborator lacks bounded projected scans.", operation="scan_rows_v1")
+                    options = dict(materialized_positions=None if positions is None else frozenset(positions),
+                                   max_batch_bytes=max_batch_bytes, check=None if control is None else control.check)
                 raw_rows, next_position = self._heap.scan_page(
-                    table_def,
-                    context.snapshot,
-                    limit=limit,
-                    position=position,
-                )
+                    table_def, context.snapshot, limit=limit, position=position, **options)
 
             # Heap values are decoded into owned objects, but maps are mutable and every public
             # door promises detachment. Rebuild all leaves after page access so no frame, store or
@@ -2834,7 +2860,9 @@ class Database:
             active: set[int] = set()
             rows: list[ScanRowV1] = []
             for row_position, (_ref, version) in enumerate(raw_rows):
-                raw_values = version.values
+                if control is not None:
+                    control.check()
+                raw_values = version.values if positions is None else tuple(version.values[p] for p in positions)
                 detached_values = _scan_exact_scalar_values_snapshot(
                     raw_values,
                     max_string_characters=self._max_query_value_characters,
@@ -2868,8 +2896,11 @@ class Database:
                     table_id=table_def.table_id,
                     schema_version=table_def.schema_version,
                     position=next_position,
+                    columns=columns,
                 )
             )
+            if control is not None:
+                control.check()
             return ScanPageV1(rows=tuple(rows), next_cursor=next_cursor)
 
     def vector_total_memory_usage(self) -> VectorTotalMemoryUsage:

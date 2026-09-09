@@ -75,6 +75,13 @@ Graph row projections are backend-specific detached values. Prefer explicit scal
 property projections for stable integrations. Do not assume `uuid.UUID` or
 `datetime.datetime` is automatically accepted in place of Grafx wrappers.
 
+Encapsulated vector write parameters obey the same target-space admission as numeric
+lists: identity, precision, dimension, active state and normalized declaration are
+checked before staging. [Arrow vector interop](EXTENSIONS_AND_ARROW.md#explicit-native-vectors)
+does not bypass those checks. [Detached graph algorithms](GRAPH_PROJECTIONS.md) are
+Python APIs over a captured snapshot, not new Cypher syntax or a relaxation of the
+query-path restrictions above.
+
 `WHERE` retains true predicates; null is not true. `IS NULL`/`IS NOT NULL` test
 null explicitly. Missing properties on polymorphic label-free reads are null;
 incompatible declared property families refuse before streaming. Parameter-map

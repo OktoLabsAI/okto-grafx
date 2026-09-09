@@ -18,7 +18,7 @@ publication or that the latest source is installed in a particular application.
 | How do indexes, vectors and explicit growth work? | [Indexes and vectors](INDEXES_AND_VECTORS.md) |
 | How do I index text and search with BM25, filters and snapshot consistency? | [Native full-text search](FULL_TEXT_SEARCH.md) |
 | How do I combine lexical, vector and bounded graph evidence? | [Hybrid search](HYBRID_SEARCH.md) |
-| How do I capture a graph snapshot and compute degrees/components? | [Graph projections](GRAPH_PROJECTIONS.md) |
+| How do I capture a graph snapshot and compute components, paths, PageRank or k-core? | [Graph projections](GRAPH_PROJECTIONS.md) |
 | How do I export a graph or create a separately writable logical copy? | [Logical export/import](LOGICAL_TRANSFER.md) |
 | How do I handle conflicts, uncertain writes, recovery and upgrades? | [Operations](OPERATIONS.md) |
 | How can I cancel reads or safely reclaim orphan index files? | [Read control and index cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md) |

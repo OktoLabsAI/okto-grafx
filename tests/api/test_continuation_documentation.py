@@ -24,6 +24,11 @@ def test_projection_recipe_and_fulltext_recipe():
         exec(compile(snippets("GRAPH_PROJECTIONS.md")[0], "projection documentation", "exec"), scope)
         assert scope["counts"] == (2,)
         assert scope["components"] == scope["graph"].nodes
+        exec(compile(snippets("GRAPH_PROJECTIONS.md")[1], "algorithm documentation", "exec"), scope)
+        assert scope["strong"] == scope["graph"].nodes
+        assert scope["ranks"].converged
+        assert scope["path"].found
+        assert scope["cores"] == (0,)
     exec(compile(snippets("FULL_TEXT_SEARCH.md")[0], "FTS documentation", "exec"), {})
 
 
@@ -38,3 +43,18 @@ def test_arrow_import_recipe():
         exec(compile(snippets("EXTENSIONS_AND_ARROW.md")[1], "Arrow import documentation", "exec"), scope)
         assert scope["report"].statements == 1
         assert db.execute("MATCH (d:Document) RETURN d.title").rows == (("title",),)
+
+
+@pytest.mark.optional_dependency("pyarrow")
+def test_arrow_vector_recipe():
+    pytest.importorskip("pyarrow")
+    with connect(":memory:") as db:
+        with db.begin() as tx:
+            tx.execute("CREATE VECTOR SPACE emb {dimension:2,metric:'cosine'}")
+            tx.execute("CREATE NODE TABLE Documents(id INT64,v VECTOR(emb),PRIMARY KEY(id))")
+            tx.execute("CREATE NODE TABLE Copies(id INT64,v VECTOR(emb),PRIMARY KEY(id))")
+            tx.execute("CREATE (:Documents {id:1,v:[1.0,0.0]})")
+        scope = {"db": db}
+        exec(compile(snippets("EXTENSIONS_AND_ARROW.md")[3], "Arrow vector documentation", "exec"), scope)
+        assert scope["report"].statements == 1
+        assert db.execute("MATCH (n:Copies) RETURN n.v").rows == db.execute("MATCH (n:Documents) RETURN n.v").rows

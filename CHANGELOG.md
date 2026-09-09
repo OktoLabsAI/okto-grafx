@@ -9,6 +9,15 @@ including the on-disk format.
 
 ### Changed
 
+- Continuation after `7dde256`: column-projected physical scan with byte limits and
+  cooperative controls; batched graph capture with work diagnostics, preserving
+  omitted-payload validation and one-shot cursor/snapshot identity.
+- Immutable reusable bidirectional CSR, iterative SCC, bounded BFS paths,
+  unweighted PageRank with explicit convergence, and simple-undirected k-core.
+- Optional Arrow fixed-size-list vectors with explicit space/dimension/precision
+  and atomic native import. Encapsulated vector parameters now pass target-space
+  identity/dimension/precision/active/normalized checks instead of bypassing admission.
+
 - Continuation after `69ed311`: page-wise sparse maintenance, configurable key-page
   memo/diagnostics, up to 64 absent heads sharing an initialization barrier inside
   one existing durable publication, and opt-in aggregate per-handle HNSW admission.

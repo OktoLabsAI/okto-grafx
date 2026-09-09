@@ -81,9 +81,10 @@ with db.begin("write") as transaction:
 The iterable must yield exact PyArrow `RecordBatch` objects. Fields are named
 parameters in the supplied statement. All batches have the same ordered, unique,
 nonempty field names (at most 256 characters each) and 1..256 columns. `types` is
-an explicit tuple using the scalar names/mappings below. Exact Arrow types are
-required: no int32 widening, dictionary decoding, timezone/unit inference, nested
-types or lossy coercion. Optional `grafx.type` field metadata must agree. NULL is
+an explicit tuple using the scalar names/mappings or `ArrowVectorType` below. Exact
+Arrow types are required: no int32 widening, dictionary decoding, timezone/unit
+inference, arbitrary nested types or lossy coercion. Optional scalar `grafx.type`
+field metadata must agree; vector metadata is mandatory. NULL is
 accepted according to the native target schema; timestamp microseconds, including
 negative values, and UUID bytes retain exact native meanings. Query DDL spells the
 binary property type `BLOB`, whereas this scalar interop type is `BYTES`.
@@ -103,7 +104,8 @@ streaming ingestion. The report is `ExecuteManyReport`, not one result per row.
 | `max_batches` | 4,096 | 1..2^31, including empty batches |
 
 Bool is not an integer option. Before Python scalar conversion, a batch is charged
-256 + 256 per column + 80 per row/column cell + four times `batch.nbytes`. One batch
+256 + 256 per column + 80 per row/column cell + four times `batch.nbytes` (16 times
+when any column is a vector, reserving component-conversion workspace). One batch
 is consumed at a time. This is not RSS, caller-owned Arrow buffers, whole-transaction
 staging memory, or a deadline on arbitrary input producers. The source is neither
 closed nor retried by Grafx. Unsupported/mismatched types are typed unsupported
@@ -126,7 +128,7 @@ with db.query("MATCH (d:Document) RETURN d.id, d.title ORDER BY d.id").cursor() 
 
 `source` is an exact native `QueryResult` or `QueryCursor`. `types` is an explicit
 tuple, one entry per column, including empty/all-NULL results. It uses the scalar
-type names above; nested lists/maps/vectors/entities are refused rather than
+type names above or vector descriptors below; arbitrary lists/maps/entities are refused rather than
 converted to lossy JSON. Mappings: BOOL→bool, INT64→int64, DOUBLE→float64,
 STRING→UTF-8, BYTES→binary, TIMESTAMP→timestamp[us, UTC], UUID→fixed-size binary[16].
 Every field is nullable and carries `grafx.type` metadata. No numeric/string
@@ -147,8 +149,61 @@ uses its existing fixed MVCC snapshot and fetch budget. The caller owns and must
 context-manage/close that cursor on early break or conversion failure; export does
 not transfer or silently close it. Do not concurrently consume one cursor.
 
+### Explicit native vectors
+
+Use `ArrowVectorType(space_ref, dimension, dtype="float32")` as the corresponding
+entry in `types` for both functions. `space_ref` is an exact integer 1..2^32−1,
+`dimension` is 1..16,384 and `dtype` is exactly `float32` or `float64`. No PyArrow
+import is needed to construct the descriptor. The Arrow field is a **fixed-size
+list**, whose child is float32/float64 and whose list size is dimension. Export
+requires exact native `VectorValue` objects, not arbitrary Python lists.
+
+Mandatory field metadata (UTF-8/ASCII byte keys and values) is:
+
+| Field key | Value |
+| --- | --- |
+| grafx.type | VECTOR_F32 or VECTOR_F64, matching dtype |
+| grafx.space_ref | Decimal store-local space ID |
+| grafx.dimension | Decimal dimension |
+| grafx.dtype | float32 or float64 |
+
+All four must match the explicit descriptor on import. Variable-size lists, wrong
+child precision/dimension, missing metadata, NULL components, non-finite values
+and mismatched native space/precision are refused. The whole vector may be NULL
+when the target permits it. Export validates native finite/range rules, preserving
+declared precision: float32 uses native float32 representational rounding, never
+silently changes a float64 vector to float32. The export tariff adds 128 + 32 ×
+dimension per vector cell (including NULL) on top of the fixed 64-byte cell charge.
+
+Native write admission validates target **space identity, dimension, active state,
+precision and normalized declaration** even for already-encapsulated `VectorValue`
+parameters. Arrow import uses that same native door, within the whole-call savepoint;
+a later invalid vector rolls back this import's prior rows, not prior caller writes.
+Target-schema violations are native typed Grafx errors, not partial import reports.
+
+Space IDs are **store-local**, not universal embedding/model identifiers. This
+interop performs no cross-store space mapping; equal numeric IDs in different
+stores do not prove semantic equivalence. Establish matching target definitions
+explicitly, or use [logical graph transfer](LOGICAL_TRANSFER.md) for graph/space
+mapping. Arbitrary nested data, graph entity export, zero-copy and external scans
+remain out of scope.
+
+```python
+from okto_grafx.arrow import ArrowVectorType, to_arrow_batches, import_arrow_batches
+
+# Documents and Copies declare v VECTOR(emb); both use the same store-local space.
+space = db.catalog.catalog.space("emb")
+vector_type = ArrowVectorType(space.space_id, space.dimension, space.storage_dtype)
+source = db.execute("MATCH (d:Documents) RETURN d.id AS id,d.v AS v ORDER BY d.id")
+batches = to_arrow_batches(source, types=("INT64", vector_type))
+with db.begin("write") as transaction:
+    report = import_arrow_batches(transaction, "CREATE (:Copies {id:$id,v:$v})",
+                                  batches, types=("INT64", vector_type))
+```
+
 ## Evidence and known boundaries
 
 The [round receipt](reports/V005_NEXT_EIGHT_PROGRESS.md) records actual tests and
+the [vector/projection continuation](reports/V005_AFTER_7DDE256.md) records this slice;
 the [compatibility matrix](V005_COMPATIBILITY.md) distinguishes local evidence
 from unexecuted platform rows. These APIs are not Pulse deployment evidence.

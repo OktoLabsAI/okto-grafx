@@ -15,6 +15,15 @@ The same continuation adds operation-local Arrow import row/batch bounds,
 and [ProjectionLimits](GRAPH_PROJECTIONS.md#algorithms-and-controls). These operation
 options are not additional connection keys.
 
+The continuation after `7dde256` adds projected physical scan columns, byte caps
+and read controls; projection `batch_rows=256` and `max_batch_bytes=16777216`,
+capture timeout, algorithm direction/depth/output limits, PageRank controls and
+explicit `ArrowVectorType` descriptors. All are **operation-local**; see
+[scan contracts](INTEGRATION.md#bounded-physical-scans),
+[algorithm options](GRAPH_PROJECTIONS.md#algorithms-and-controls) and
+[vector Arrow contracts](EXTENSIONS_AND_ARROW.md#explicit-native-vectors).
+No new connection default, environment variable or durable format is introduced.
+
 The eight-item continuation adds operation-local `search_vectors(timeout_seconds=,
 cancellation=)` and `HybridSearchOptions.graph_access` (`auto`/`scan`). Hybrid
 `max_memory_bytes` now applies to simultaneous logical source/fusion/graph tariffs,

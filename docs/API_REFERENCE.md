@@ -5,9 +5,10 @@
 ## Entry points and supported imports
 
 `from okto_grafx.projections import project_graph, ProjectionLimits` exposes
-[read-only snapshot graph pictures, degrees and weak components](GRAPH_PROJECTIONS.md).
+[read-only snapshot graph pictures, adjacency, degree/WCC/SCC, paths, PageRank and k-core](GRAPH_PROJECTIONS.md).
 `from okto_grafx.arrow import import_arrow_batches, to_arrow_batches` exposes
-[optional typed scalar batch interop](EXTENSIONS_AND_ARROW.md). Import stages one
+[optional typed scalar/vector batch interop](EXTENSIONS_AND_ARROW.md). `ArrowVectorType`
+is imported from the same module. Import stages one
 atomic call inside a caller-owned write transaction; neither function auto-commits.
 Full-text prefix mode and relationship fields use the existing native FTS facade;
 new connection cache/aggregate ANN limits are listed in [configuration](CONFIGURATION.md).
@@ -119,14 +120,14 @@ execution; write transactions refuse the options. `Maintenance.cleanup_indexes`
 provides an independently revalidated dry-run/removal census under explicit
 whole-store quiescence. See [contracts, examples, errors and limits](READ_CONTROL_AND_INDEX_CLEANUP.md).
 
-## Trusted scalar extensions and Arrow export
+## Trusted scalar extensions and Arrow interop
 
 Use `from okto_grafx.extensions import ExtensionRegistry, ScalarFunction` and
 `connect(..., extensions=registry)` for the explicit per-handle allowlist.
 `registry.call_scalar(name, arguments_tuple)` supports direct invocation; the query
 door is `udf('namespace.name', ...)`. Registration, value budgets, NULL/type/error
 semantics and trust limits are in [Extensions and Arrow](EXTENSIONS_AND_ARROW.md).
-`from okto_grafx.arrow import to_arrow_batches` provides optional copied scalar
+`from okto_grafx.arrow import to_arrow_batches` provides optional copied scalar/vector
 batches over a materialized result or caller-owned cursor. The same guide defines
 all type mappings, budget tariffs, snapshot and close obligations.
 
@@ -273,7 +274,7 @@ Stage one updating statement for every parameter mapping, atomically as a batch.
 #### Transaction.scan_rows_v1
 
 ```python
-scan_rows_v1(table: str, *, limit: int, cursor: ScanCursorV1 | None=None) -> ScanPageV1
+scan_rows_v1(table: str, *, limit: int, cursor: ScanCursorV1 | None=None, columns: tuple[str, ...] | None=None, max_batch_bytes: int | None=None, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> ScanPageV1
 ```
 
 Read one bounded page of physical rows under this transaction's fixed snapshot.
@@ -948,15 +949,15 @@ Release owned resources under this database's checksum selection (FR-1).
 ### okto_grafx.arrow.import_arrow_batches
 
 ```python
-import_arrow_batches(transaction: Transaction, statement: str, batches: Iterable[RecordBatch], *, types: tuple[str, ...], max_batch_rows: int=65536, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
+import_arrow_batches(transaction: Transaction, statement: str, batches: Iterable[RecordBatch], *, types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=65536, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
 ```
 
-Atomically stage typed scalar batches as named parameters, without committing.
+Atomically stage typed scalar/vector batches as named parameters, without committing.
 
 ### okto_grafx.arrow.to_arrow_batches
 
 ```python
-to_arrow_batches(source: QueryResult | QueryCursor, *, types: tuple[str, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024) -> Iterator[RecordBatch]
+to_arrow_batches(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024) -> Iterator[RecordBatch]
 ```
 
 Yield copied typed batches; caller owns cursor lifetime and already-emitted batches.
@@ -964,7 +965,7 @@ Yield copied typed batches; caller owns cursor lifetime and already-emitted batc
 ### okto_grafx.projections.project_graph
 
 ```python
-project_graph(database: Database, reader: Transaction | None=None, *, node_tables: tuple[str, ...], relationship_tables: tuple[str, ...]=(), limits: ProjectionLimits=ProjectionLimits(), cancellation: CancellationToken | None=None) -> GraphProjection
+project_graph(database: Database, reader: Transaction | None=None, *, node_tables: tuple[str, ...], relationship_tables: tuple[str, ...]=(), limits: ProjectionLimits=ProjectionLimits(), cancellation: CancellationToken | None=None, timeout_seconds: float | None=None) -> GraphProjection
 ```
 
 Capture selected tables in one read snapshot, preserving parallel edges and loops.
@@ -1036,6 +1037,21 @@ max_nodes: int
 max_edges: int
 max_memory_bytes: int
 max_work: int
+batch_rows: int
+max_batch_bytes: int
+```
+
+### ProjectionDiagnostics fields
+
+Annotation location: `okto_grafx.projections.ProjectionDiagnostics`.
+
+Capture observations, not physical I/O counts or a freshness certificate.
+
+```python
+scan_calls: int
+rows: int
+max_batch_rows: int
+capture_work: int
 ```
 
 ### ProjectionNode fields
@@ -1075,7 +1091,57 @@ nodes: tuple[ProjectionNode, ...]
 edges: tuple[ProjectionEdge, ...]
 limits: ProjectionLimits
 logical_bytes: int
+diagnostics: ProjectionDiagnostics | None
+adjacency: ProjectionAdjacency | None
 ```
+
+#### GraphProjection.with_adjacency
+
+```python
+with_adjacency(*, cancellation: CancellationToken | None=None) -> GraphProjection
+```
+
+Return a new picture with reusable immutable adjacency, charging its memory.
+
+#### GraphProjection.strongly_connected_components
+
+```python
+strongly_connected_components(*, cancellation: CancellationToken | None=None) -> tuple[ProjectionNode, ...]
+```
+
+Return deterministic directed SCC labels without recursion or storage reads.
+
+#### GraphProjection.reachable
+
+```python
+reachable(source: ProjectionNode, *, direction: str='out', max_depth: int | None=None, max_results: int=100000, cancellation: CancellationToken | None=None) -> tuple[ProjectionNode, ...]
+```
+
+Return discovered nodes in BFS order, including source; no silent truncation.
+
+#### GraphProjection.shortest_path
+
+```python
+shortest_path(source: ProjectionNode, target: ProjectionNode, *, direction: str='out', max_depth: int | None=None, max_results: int=100000, cancellation: CancellationToken | None=None) -> ProjectionPath
+```
+
+Return one unweighted shortest path; equal choices follow physical edge order.
+
+#### GraphProjection.pagerank
+
+```python
+pagerank(*, damping: float=0.85, tolerance: float=1e-08, max_iterations: int=100, cancellation: CancellationToken | None=None) -> PageRankResult
+```
+
+Compute bounded unweighted PageRank with explicit convergence and L1 residual.
+
+#### GraphProjection.k_core
+
+```python
+k_core(*, cancellation: CancellationToken | None=None) -> tuple[int, ...]
+```
+
+Return simple-undirected core numbers: parallel edges collapse and loops are ignored.
 
 #### GraphProjection.degrees
 
@@ -1092,6 +1158,57 @@ weakly_connected_components(*, cancellation: CancellationToken | None=None) -> t
 ```
 
 Return each node's component label (minimum table/record identity), including isolates.
+
+### ProjectionPath fields
+
+Annotation location: `okto_grafx.projection_algorithms.ProjectionPath`.
+
+One shortest path within the requested direction/depth, preserving edge identity.
+
+```python
+found: bool
+nodes: tuple[ProjectionNode, ...]
+edges: tuple[ProjectionEdge, ...]
+```
+
+### PageRankResult fields
+
+Annotation location: `okto_grafx.projection_algorithms.PageRankResult`.
+
+Scores aligned with projection nodes and explicit convergence status.
+
+```python
+scores: tuple[float, ...]
+iterations: int
+converged: bool
+residual: float
+```
+
+### ProjectionAdjacency fields
+
+Annotation location: `okto_grafx.projection_algorithms.ProjectionAdjacency`.
+
+Immutable CSR offsets and physical edge positions, in both directions.
+
+```python
+out_offsets: tuple[int, ...]
+out_edges: tuple[int, ...]
+in_offsets: tuple[int, ...]
+in_edges: tuple[int, ...]
+logical_bytes: int
+```
+
+### ArrowVectorType fields
+
+Annotation location: `okto_grafx.arrow.ArrowVectorType`.
+
+Explicit store-local vector identity, dimension and native precision for Arrow.
+
+```python
+space_ref: int
+dimension: int
+dtype: str
+```
 
 ### ScalarFunction fields
 

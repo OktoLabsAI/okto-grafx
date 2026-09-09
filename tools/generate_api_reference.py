@@ -15,7 +15,9 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
-    "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection"},
+    "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection", "ProjectionDiagnostics"},
+    "projection_algorithms.py": {"ProjectionAdjacency", "ProjectionPath", "PageRankResult"},
+    "arrow.py": {"ArrowVectorType"},
     "domain/query/extensions.py": {"ScalarFunction", "ExtensionRegistry"},
     "engine/vector_memory.py": {"VectorMemoryUsage", "VectorTotalMemoryUsage"},
     "engine/key_page_memo.py": {"KeyPageCacheUsage"},

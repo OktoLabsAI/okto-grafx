@@ -3,6 +3,12 @@
 This document is an execution matrix, not a claim of publication or release-wide
 certification. No existing Pulse data participates in these checks.
 
+The continuation after `7dde256` adds only transient projected scans/algorithms and
+explicit Arrow vector interop. No new persistent capability or connection default.
+Malformed encapsulated vector parameters now receive native target-space validation.
+Current Windows source, optional-Arrow and bare-source checks are recorded in the
+[eight-item receipt](reports/V005_AFTER_7DDE256.md); they do not certify other platforms.
+
 | Axis | Local status | Reproduction |
 | --- | --- | --- |
 | Windows / Python 3.13 / explicitly pure selectors | 2 feature-transition tests passed (strict and generation descriptors) | `tests/api/test_v005_compatibility.py` |

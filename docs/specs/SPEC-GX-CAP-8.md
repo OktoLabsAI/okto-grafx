@@ -1,13 +1,16 @@
 # SPEC-GX-CAP-8 — Arrow and external data
 
-Status: specified / implementation not certified. Date: 2026-09-08.
+Status: scalar/vector batch interop implemented in 0.0.5 development; broader external-data scope remains planned. Date: 2026-09-09.
 
 0.0.5 continuation: optional scalar Arrow **export** over native results/cursors is
 implemented; [consumer type/ownership contract](../EXTENSIONS_AND_ARROW.md) and
 [validation receipt](../reports/V005_NEXT_EIGHT_PROGRESS.md). The continuation after
 `69ed311` adds bounded typed batch import through one native executemany savepoint,
 with caller-owned commit and no partial staging on late failure; see the
-[round receipt](../reports/V005_AFTER_69ED311.md). Nested/entity
+[round receipt](../reports/V005_AFTER_69ED311.md). The continuation after `7dde256`
+adds fixed-size-list float32/float64 vectors with mandatory space/dimension/precision
+metadata, native admission and whole-call atomicity; see the
+[acceptance receipt](../reports/V005_AFTER_7DDE256.md). Arbitrary nested/entity
 columns, external scans, COPY and other adapters below remain roadmap scope.
 Dependencies: GX-CAP-7; streaming cursor and existing bulk ingest.
 
