@@ -14,6 +14,7 @@ reopen completed work, authorize production data changes or imply release approv
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
+- [Proposed continuation after 970aa1e](#proposed-continuation-after-970aa1e)
 - [Approved continuation after 7dde256](#approved-continuation-after-7dde256)
 - [Approved continuation after 69ed311](#approved-continuation-after-69ed311)
 - [Approved continuation after 3f3819f](#approved-continuation-after-3f3819f)
@@ -67,6 +68,37 @@ reopen completed work, authorize production data changes or imply release approv
 | PULSE-BENCH | Reserved workload | Latest recorded authorized run consumed one spec; 19 remain reserved. Do not consolidate more, redrive, rebuild or reset data to improve this document. New live runs need a deliberate workload decision. |
 
 ## Search and resumable-transfer follow-up
+
+### Proposed continuation after 970aa1e
+
+Candidate queue recovered after the eight-item delivery was committed and pushed
+as `970aa1e` on `feature/v0.0.5`. **Not yet approved for implementation.** The
+16,046-pass delivery is closed; these are not new acceptance gates for it. First
+three items target demonstrated code-level costs; the others extend existing
+GX-CAP-8/9 scope. Benefits are hypotheses until measured, not promised speedups.
+
+| Order / IDs | Bounded candidate and current evidence | Effort | Benefit / dependency |
+| --- | --- | --- | --- |
+| 1 / PERF-SCALE, GX-CAP-9 | Optional immutable node-identity lookup retained with projection topology. `_bfs` in `projection_algorithms.py` uses `nodes.index` for source/target even when CSR is already retained; capture's `offsets` map is discarded. Reuse a bounded derived lookup and charge path workspace by admitted/discovered state where safe. No durable cache authority. | Small–medium | Remove repeated O(V) identity lookup for local path calls on a prepared picture; one-time O(V) construction remains. Preserve BFS order, quotas and exact paths. |
+| 2 / PERF-SCALE, GX-CAP-9 | Linear bucket-based k-core peeling. `_k_core` uses heap push/pop and retained stale pairs today. Keep simple-undirected deduplication, ignored self-loops and identical core numbers; retain the current implementation as an independent comparison during validation. | Medium | Target O(V+E) peeling after simple-neighbor construction, eliminating heap's logarithmic factor and stale entries; no claim that reading E edges can be avoided. Independent of 1. |
+| 3 / CONC-CPU-1, PERF-MEM, GX-CAP-9 | Explicit opt-in NumPy PageRank execution path through the optional acceleration boundary. `_pagerank` currently distributes ranks in Python for each physical edge/iteration. Keep Python as the default/reference, bound temporary numeric buffers, document finite numeric tolerance and check cancellation between kernels/iterations. Missing selected dependency must refuse, not silently fall back. | Medium | Reduce Python edge-loop overhead on larger projections; benchmark a fixed fixture, not a marginal ratio gate. Preserve multiplicity, dangling behavior and explicit non-convergence. No change to database read/write concurrency. |
+| 4 / GX-CAP-9 | Optional scalar relationship weights captured in the same snapshot via projected scans. `project_graph` retains only endpoints today. Start with explicitly selected numeric columns, finite non-negative weights and an explicit NULL/missing policy; default topology stays unweighted. Charge retained values and preserve physical edge identities. | Medium | Foundation for weighted analysis without subsequent storage reads; a capability, not an automatic performance gain. |
+| 5 / GX-CAP-9 | Bounded non-negative weighted shortest paths (Dijkstra), with distance/path result, direction, deterministic equal-cost ties and clear work/output/memory limits. Existing shortest_path is unweighted BFS. Do not reuse BFS depth semantics without defining hop-constrained behavior; negative weights and Bellman–Ford remain outside this slice. | Medium | Cost-aware routing/dependency analysis; depends on 4 and reuses 1. Default unweighted API remains unchanged. |
+| 6 / GX-CAP-9 | Weighted and personalized PageRank: explicit seed distribution, normalization and dangling-mass policy; node-aligned results, residual/convergence and bounded inputs. `_pagerank` currently hardcodes uniform teleportation and equal outgoing-edge shares. All-zero/unknown-node/invalid weights must have explicit refusal or documented semantics. | Medium | Domain-specific relevance over a captured graph; depends on 4. Python and any selected accelerated path from 3 must agree within the published numeric tolerance. |
+| 7 / GX-CAP-8 | Optional Pandas bridge through the existing typed Arrow boundary. Start with bounded DataFrame-to-batch import and explicitly materialized result-to-DataFrame export; preserve nullable scalar/vector schema and metadata without dtype guessing or silently converting NaN/NULL. Do not claim full-DataFrame export is streaming or zero-copy. | Small–medium | Easier Python analytics integration and less caller conversion code, not an engine throughput promise. Reuse whole-call native import atomicity. Polars remains a separate later slice. |
+| 8 / GX-CAP-8 | Local Parquet batch read/write on the existing Arrow contract: explicit schema/vector metadata, row/byte/batch limits, caller-owned resources and localized failures. Restrict to explicitly permitted local files, no URL resolution; no overwrite by default and no visible partial final file on export failure. Feed import through the existing staging savepoint. | Medium–large | Interop with larger local datasets using bounded batches; no COPY/query external scans, portable graph backup or unbounded transaction promise. Independent of 4–7, reuses current Arrow. |
+
+Evidence: [current algorithms](src/okto_grafx/projection_algorithms.py),
+[capture](src/okto_grafx/projections.py), [Arrow implementation](src/okto_grafx/arrow.py),
+[remaining graph scope](docs/specs/SPEC-GX-CAP-9.md) and
+[remaining interop scope](docs/specs/SPEC-GX-CAP-8.md).
+Recommended order is 1–8, with a checkpoint after 1–4. Every selected item keeps
+feature/failure tests, independent reference checks when applicable, grouped final
+regression, and roadmap/feature/configuration/API documentation in its DoD.
+Algorithms run on detached pictures; none of this promises faster Pulse KG pages
+unless that consumer actually uses the new path. No Pulse installation/data use,
+reserved spec consolidation, release, storage-format change, authority bundle,
+multiwriter weakening or persistent algorithm write-back is part of this proposal.
 
 ### Approved continuation after 7dde256
 
