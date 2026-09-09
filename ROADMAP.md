@@ -28,6 +28,7 @@ reopen completed work, authorize production data changes or imply release approv
 - [Remaining performance work](#remaining-performance-work)
 - [Next iteration assessment: feature/v0.0.5](#next-iteration-assessment-featurev005)
 - [Database capabilities and dependencies](#database-capabilities-and-dependencies)
+- [CAP-2 through CAP-4 opportunity assessment](#cap-2-through-cap-4-opportunity-assessment)
 - [Optional agent product](#optional-agent-product)
 - [Completed foundations](#completed-foundations)
 - [Legacy requirement register](#legacy-requirement-register)
@@ -90,6 +91,8 @@ text ingestion: 48 passed; final interop/examples/isolation: 12 passed. The fina
 wheel matched all 185 source Python files and passed an isolated native consumer
 commit/reopen smoke. No source storage/WAL/OCC change.
 [Implementation evidence and final acceptance status](docs/reports/V005_AFTER_A4DD85A.md).
+
+Implementation and evidence committed and pushed as `65ab659` on `feature/v0.0.5`.
 
 | Order / IDs | Bounded candidate and inspected evidence | Effort | Expected value / dependency |
 | --- | --- | --- | --- |
@@ -647,6 +650,118 @@ system-time/FTS foundations → bitemporal/hybrid → extension/interoperability
 algorithms/schema evolution → combined hardening. Independent design can overlap;
 shared WAL/format changes must be integrated in a controlled sequence, not competing
 branches that independently redefine the protocol.
+
+## CAP-2 through CAP-4 opportunity assessment
+
+Assessed September 9, 2026 against `65ab659`, after the preceding eight-item
+implementation was committed and pushed. **Assessment only: CAP-2/3/4 remain
+Planned.** No new version assignment, implementation approval, release or Pulse
+data operation is implied. This section refines the existing backlog; the linked
+specs, ADRs and preserved source requirements remain authoritative, including
+requirements not repeated here. It does not reopen the preceding delivery's DoD.
+
+### Existing foundations versus missing capability
+
+| Capability | Reusable, implemented foundation | Actual remaining work | Effort / value |
+| --- | --- | --- | --- |
+| GX-CAP-2 | Explicit database handles, read-only admission, transaction lifecycle, store UUIDs, CAP-1 provenance, checksummed logical export and resumable import into a fresh store. | CatalogSession, alias/permission/path policy, pinned catalog selection, deterministic workspace resolver, ownership-safe detach/close, CLI inventory, selected copy into an existing target and durable idempotency receipts. | Large overall; session-only slice medium. High integration value for project/user/reference stores, not an automatic engine speedup. |
+| GX-CAP-3 | Qualified CommitId, monotonic ordered commit time, journal lookup/paging, stable record identities, WAL/OCC/recovery, snapshot reads and bounded maintenance. | Durable opt-in node/edge versions and historical schema, atomic current/history effects, lineage, indexed typed historical reads, timestamp resolution, retention pins/horizons, verification and temporal transfer semantics. | Very large; highest storage/protocol risk of these items. Enables reproducible historical graph queries and auditing; introduces write/storage amplification. |
+| GX-CAP-4 | CAP-1 time/identity values and ordinary typed timestamps. CAP-3 is still missing. | Application validity periods and overlap policy, concurrent enforcement, two-coordinate queries, graph/version/property diff with lineage, full retention policies and later query syntax/CLI. | Large to very large after CAP-3. Enables retroactive corrections and “what was known then about what was valid then”; not a shortcut to faster current-state reads. |
+
+Concrete evidence:
+
+- [Database.begin](src/okto_grafx/engine/database.py) currently accepts mode and
+  commit metadata, not a catalog or temporal query context. There is no public
+  CatalogSession/workspace resolver or temporal query facade in this source tree.
+- [TableDef](src/okto_grafx/domain/model/schema.py) carries schema version and
+  relationship endpoint declarations, but no system/valid-time policy. Endpoint
+  RecordIds are already stable across updates; that helps lineage, but does not
+  retain deleted rows or historical schema by itself.
+- [Commit identities](src/okto_grafx/domain/txn/commit_identity.py) are store-qualified;
+  [journal lookup/history](src/okto_grafx/engine/commit_catalog_store.py) address
+  commits. [CAP-1's consumer contract](docs/COMMIT_HISTORY.md) explicitly excludes
+  graph time travel and does not make correlation metadata an idempotency key.
+- [Logical transfer](docs/LOGICAL_TRANSFER.md) and its
+  [implementation](src/okto_grafx/transfer.py) export current state only; import
+  commits batches in a private fresh-UUID store and publishes the directory.
+  Resumable import can recover a lost publication acknowledgement, but this is
+  **not** a selected, one-transaction merge into an existing target catalog.
+- [Heap reclamation](src/okto_grafx/engine/heap_store.py) has a physical snapshot
+  horizon. Keeping its old MVCC versions or keeping WAL forever would not satisfy
+  the separate durable temporal-history contract.
+
+### Recommended finite implementation order
+
+The order below is a proposal, not an additional authorization. CAP-2 and CAP-3
+are siblings over CAP-1; CAP-3 does **not** depend on completing CAP-2. CAP-4 does
+depend on CAP-3. Existing CAP-1 implementation satisfies the basic provenance
+prerequisite, but copy receipts and temporal storage still need their own design.
+
+| Order | Bounded checkpoint | Required exit evidence |
+| --- | --- | --- |
+| 1 / CAP-2 session | CatalogSession attach/detach/list/use/begin; unique ASCII aliases, reserved main, read-only default, immutable identity binding, explicit handle ownership and one catalog pinned at begin. | Two stores and concurrent participants; default changes cannot reroute active transactions; writes through a read-only attachment refuse before mutation; in-use detach refuses; attach failures release resources; close attempts all owned handles and reports cleanup failures. |
+| 2 / CAP-2 workspace | Optional resolver outside the engine: explicit config, supplied root, bounded allowed-marker search, policy-permitted cwd; user/global opt-in. Canonical-path/root policy, explicit configuration and CLI status/list. | Independent processes resolve the same workspace; denied roots, alias/path/UUID ambiguity, Windows junction/symlink policy and resolution failures refuse. No directory creation on denied resolution; no hidden global store or paths derived from retrieved text. |
+| 3 / CAP-2 copy | Bounded snapshot selection and checksummed package, node/edge identity mapping, explicit conflict policy, one target write transaction, durable receipt bound to source UUID/commit, target, selection hash, policy and idempotency key. | Endpoint closure, concurrent same-key attempts, input-mismatch refusal and crash before/after target COMMIT including lost acknowledgement. Data and receipt share the commit. Oversized atomic copies refuse at declared limits; do not silently batch visible target mutations. |
+| 4 / CAP-3 durable history | Specify physical format/capability/upgrade/replay first; table opt-in, activation boundary, retained schema and lineage; publish node/edge current and history effects atomically. | Create/update/delete/recreate and DETACH DELETE; concurrent writers; cold reopen and repeated recovery at publication/crash cuts; old readers refuse unsupported required capabilities. No invented pre-activation history and no temporal overhead silently enabled for ordinary tables. |
+| 5 / CAP-3 read and maintenance | Typed system-as-of by qualified commit or ordered timestamp, between/versions and historical traversal; entity/commit-range access paths, explicit scan diagnostics, temporal verify, manual bounded resumable retention, reader pins and backup/transfer horizon semantics. | Edge plus both matching-lineage endpoints visible at the selected time; clock ties/regression; wrong-store/future/unavailable coordinates; pinned pruning and vacuum independence; corruption distinct from expired history; reopen/export/import preserves or explicitly maps supported identities/horizons. |
+| 6 / CAP-4 valid time | Explicit valid-time intervals independent of system time, interval typing, configurable overlap rule and indexed concurrent enforcement. | Half-open/unbounded interval boundaries, invalid ranges, retroactive corrections and competing overlapping writers. A backdated business correction must not rewrite what the database previously knew. |
+| 7 / CAP-4 bitemporal and diff | Combine system and valid coordinates; bounded node/relationship/property diff with before/after, endpoints, commit provenance and explicit update versus delete/recreate; complete retention policies. | Two-coordinate fixtures, lineage/PK reuse, empty versus unavailable history, bounded pagination/work, indexed range plans and retention interaction. Specify diff meaning for both coordinates; never compare only current PK values. |
+| 8 / CAP-4 consumption closure | Historical query syntax and CLI after typed contracts stabilize; finish configuration, API/error contracts, examples and operational guidance. | Typed API/CLI/query equivalence for supported operations, documented limitations, executable examples and one grouped regression of integrated capabilities. Earlier checkpoints also require their own docs and focused tests. |
+
+### Decisions to settle within those checkpoints
+
+These are finite contract decisions already implied by the specs, not permission
+to expand into distributed transactions, a new agent product or arbitrary DDL:
+
+- **Session authority:** permissions constrain operations through that session;
+  a Python library is not an OS sandbox for unrelated code/handles. Define
+  canonical-path and store-identity revalidation and ownership explicitly. One
+  store per transaction does not mean one writer per application or a global lock.
+- **Promotion:** specify fail/skip/explicit-merge behavior for PKs, schemas,
+  relationship multiplicity and endpoint mappings. Distinguish partial selection
+  from partial success. Require or explicitly activate CAP-1 before promising
+  commit-backed provenance; never manufacture a commit from an arbitrary LSN.
+  Receipt lookup must be indexed, not a scan of all commit metadata. Define
+  receipt retention/idempotency horizon so pruning cannot turn a retry into a
+  duplicate. Do not confuse artifact checksums with source authentication.
+- **History activation/schema:** define the initial current-state baseline for
+  pre-existing rows and history availability for non-temporal tables/endpoints.
+  Either retain all required endpoint history or reject unsupported mixed-history
+  traversals explicitly; never silently substitute today's endpoints. Retain the
+  schema required to decode historical payloads without requiring arbitrary ALTER
+  implementation as a prerequisite. Define disable/re-enable behavior before
+  exposing any such operation.
+- **Time/access paths:** store-local CommitId is ordering authority; raw wall clock
+  is not. Timestamp resolution selects by monotonic ordered_at. Plan efficient
+  entity history, time containment and commit-range diff paths rather than
+  repeatedly scanning all versions. Full unfiltered output still costs at least
+  the size of the requested result; do not promise universal O(1) queries.
+- **Retention and transport:** keep manual CAP-3 pruning distinct from CAP-4
+  none/keep-last/keep-for/keep-since policies. Publish available horizons and typed
+  expiry errors. Version the logical-transfer contract before claiming history
+  preservation; current-state-only v1 must remain explicit, not silently lose
+  requested history. Writable copies get remapped identities, not cloned authority.
+- **History search:** existing current-state FTS/vector indexes are not certified
+  historical indexes. Declare which temporal operations are supported and refuse
+  unsupported combinations; extending every search/analytics feature is not an
+  implicit extra milestone in this assessment.
+
+Quality closure preserves multi-reader/multiwriter access, both OCC checks,
+fencing, durable WAL order and fail-closed recovery. Run focused feature/failure
+checks per checkpoint and grouped regression per cohesive delivery. Measure
+opt-out overhead, temporal write amplification, retained bytes and query p50/p99
+on fixed bounded synthetic workloads; report the observed cost without a moving
+performance percentage gate or using reserved Pulse specs.
+
+Scope references: [CAP-2 spec](docs/specs/SPEC-GX-CAP-2.md),
+[catalog ADR](docs/architecture/ADR-GX-004-ATTACHED-CATALOGS.md),
+[CAP-3 spec](docs/specs/SPEC-GX-CAP-3.md),
+[CAP-4 spec](docs/specs/SPEC-GX-CAP-4.md),
+[temporal ADR](docs/architecture/ADR-GX-002-TEMPORAL.md) and
+[complete preserved requirements](docs/archive/ROADMAP_SOURCES.md).
+Federated search with per-store independent snapshot tokens and explicit source
+failures remains a later catalog milestone; cross-catalog query grammar, physical
+cross-store edges and distributed commit are not silently included here.
 
 ## Optional agent product
 
