@@ -70,6 +70,8 @@ def test_optional_dependencies_are_the_declared_extras(manifest: dict[str, Any])
     assert extras == {
         "arrow": ["pyarrow>=14"],
         "pandas": ["pyarrow>=14", "pandas>=2"],
+        "polars": ["pyarrow>=14", "polars>=1"],
+        "networkx": ["networkx>=3"],
         "accel": ["numpy>=1.24", "google-crc32c>=1.5"],
         "bench": ["ladybug==0.16.0", "numpy>=1.24"],
         "dev": ["pytest>=8", "pytest-timeout", "ruff==0.15.1", "PyYAML>=6"],

@@ -9,6 +9,13 @@ including the on-disk format.
 
 ### Changed
 
+- Continuation after `a4dd85a`: opt-in immutable PageRank transition preparation and
+  simple topology reuse; bounded deterministic read-only label propagation.
+- Optional NetworkX multigraph export/conformance and bounded Arrow projection/result
+  batches with explicit identity/provenance; metadata-bearing Polars frames.
+- Typed bounded local CSV/JSONL scalar readers and whole-call atomic native import
+  staging, with explicit root, codecs, cancellation and malformed-input contracts.
+
 - Continuation after `970aa1e`: retained immutable identity lookup, discovery-sized
   BFS workspace and linear bucket k-core; explicit NumPy PageRank acceleration.
 - Snapshot-captured non-negative relationship weights, bounded Dijkstra paths and

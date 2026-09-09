@@ -946,6 +946,70 @@ Release owned resources under this database's checksum selection (FR-1).
 ## Public factory and transfer functions
 
 
+### okto_grafx.graph_interop.to_networkx
+
+```python
+to_networkx(graph: GraphProjection, *, max_memory_bytes: int=64 * 1024 * 1024, cancellation: CancellationToken | None=None) -> MultiDiGraph
+```
+
+Copy a detached multigraph with scoped identities and physical edge keys.
+
+### okto_grafx.graph_interop.projection_arrow_batches
+
+```python
+projection_arrow_batches(graph: GraphProjection, *, kind: str='nodes', results: tuple | None=None, result_type: str='DOUBLE', batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, cancellation: CancellationToken | None=None) -> Iterator[RecordBatch]
+```
+
+Export scoped identities/endpoints and optional aligned scalar results in bounded batches.
+
+### okto_grafx.polars.to_polars
+
+```python
+to_polars(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=100000, max_bytes: int=64 * 1024 * 1024) -> PolarsFrame
+```
+
+Materialize an explicitly typed frame and retain its native schema separately.
+
+### okto_grafx.polars.import_polars
+
+```python
+import_polars(transaction: Transaction, statement: str, frame: PolarsFrame, *, types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
+```
+
+Stage one metadata-bearing eager frame atomically, with caller-owned commit.
+
+### okto_grafx.text_import.read_csv_batches
+
+```python
+read_csv_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], delimiter: str=',', null_token: str='\\N', limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> Iterator[tuple[dict[str, object], ...]]
+```
+
+Read header-required UTF-8 CSV with double quotes; close the iterator on early exit.
+
+### okto_grafx.text_import.read_jsonl_batches
+
+```python
+read_jsonl_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> Iterator[tuple[dict[str, object], ...]]
+```
+
+Read one exact scalar object per UTF-8 line; missing and duplicate keys are errors.
+
+### okto_grafx.text_import.import_csv
+
+```python
+import_csv(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], delimiter: str=',', null_token: str='\\N', limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
+```
+
+Atomically stage one complete CSV file; caller owns transaction, commit and retry.
+
+### okto_grafx.text_import.import_jsonl
+
+```python
+import_jsonl(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
+```
+
+Atomically stage one complete JSON Lines file with caller-owned commit/retry.
+
 ### okto_grafx.tabular.to_pandas
 
 ```python
@@ -1135,7 +1199,33 @@ diagnostics: ProjectionDiagnostics | None
 adjacency: ProjectionAdjacency | None
 lookup: ProjectionLookup | None
 weights: tuple[float, ...] | None
+pagerank_preparation: PageRankPreparation | None
+simple_topology: SimpleTopology | None
 ```
+
+#### GraphProjection.with_pagerank
+
+```python
+with_pagerank(*, backend: str='python', weighted: bool=False, cancellation: CancellationToken | None=None) -> GraphProjection
+```
+
+Retain immutable transition data for repeated ranking with different seeds.
+
+#### GraphProjection.with_simple_topology
+
+```python
+with_simple_topology(*, cancellation: CancellationToken | None=None) -> GraphProjection
+```
+
+Retain bounded loop-free undirected neighbors without changing physical edges.
+
+#### GraphProjection.label_propagation
+
+```python
+label_propagation(*, max_iterations: int=100, cancellation: CancellationToken | None=None) -> LabelPropagationResult
+```
+
+Run asynchronous node-order voting; smallest identity wins ties; no storage writes.
 
 #### GraphProjection.with_lookup
 
@@ -1217,6 +1307,46 @@ weakly_connected_components(*, cancellation: CancellationToken | None=None) -> t
 
 Return each node's component label (minimum table/record identity), including isolates.
 
+### PageRankPreparation fields
+
+Annotation location: `okto_grafx.projection_algorithms.PageRankPreparation`.
+
+Immutable transition data for one projection, backend and weight mode; no rank state.
+
+```python
+backend: str
+weighted: bool
+sources: tuple[int, ...]
+targets: tuple[int, ...]
+shares: tuple[float, ...]
+dangling: tuple[int, ...]
+numeric_buffers: tuple[bytes, ...] | None
+logical_bytes: int
+```
+
+### SimpleTopology fields
+
+Annotation location: `okto_grafx.projection_algorithms.SimpleTopology`.
+
+Retained loop-free undirected neighbors; physical projection edges remain unchanged.
+
+```python
+neighbors: tuple[tuple[int, ...], ...]
+logical_bytes: int
+```
+
+### LabelPropagationResult fields
+
+Annotation location: `okto_grafx.projection_algorithms.LabelPropagationResult`.
+
+Labels aligned with nodes; convergence means one whole sweep without changes.
+
+```python
+labels: tuple[ProjectionNode, ...]
+iterations: int
+converged: bool
+```
+
 ### WeightedProjectionPath fields
 
 Annotation location: `okto_grafx.projection_algorithms.WeightedProjectionPath`.
@@ -1278,6 +1408,34 @@ out_edges: tuple[int, ...]
 in_offsets: tuple[int, ...]
 in_edges: tuple[int, ...]
 logical_bytes: int
+```
+
+### PolarsFrame fields
+
+Annotation location: `okto_grafx.polars.PolarsFrame`.
+
+Frame plus explicit Arrow metadata; do not mutate the frame during consumption.
+
+```python
+frame: DataFrame
+arrow_schema: Schema
+```
+
+### TextImportLimits fields
+
+Annotation location: `okto_grafx.text_import.TextImportLimits`.
+
+Local input and logical batch limits; not a process RSS or transaction-size promise.
+
+```python
+batch_rows: int
+max_batch_bytes: int
+max_rows: int
+max_batches: int
+max_file_bytes: int
+max_record_bytes: int
+max_field_bytes: int
+max_work: int
 ```
 
 ### ParquetExportReport fields

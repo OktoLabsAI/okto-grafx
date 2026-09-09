@@ -70,6 +70,8 @@ def test_weighted_projection_recipe():
         scope = {"db": db}
         exec(compile(snippets("GRAPH_PROJECTIONS.md")[2], "weighted documentation", "exec"), scope)
         assert scope["route"].found and scope["personalized"].converged
+        exec(compile(snippets("GRAPH_PROJECTIONS.md")[3], "prepared documentation", "exec"), scope)
+        assert scope["rank_again"].converged and scope["communities"].converged
 
 
 @pytest.mark.optional_dependency("pyarrow")
@@ -84,3 +86,40 @@ def test_tabular_parquet_recipes(tmp_path):
         for code in snippets("TABULAR_AND_PARQUET.md"):
             exec(compile(code, "tabular documentation", "exec"), scope)
         assert db.execute("MATCH (d:Document) RETURN d.id ORDER BY d.id").rows == ((1,), (2,), (3,), (4,))
+
+
+@pytest.mark.optional_dependency("networkx")
+@pytest.mark.optional_dependency("pyarrow")
+def test_graph_exchange_recipes():
+    pytest.importorskip("networkx")
+    pytest.importorskip("pyarrow")
+    from tests.api.test_projection_algorithms import picture
+    scope = {"graph": picture(3, [(0, 1), (1, 2)])}
+    for code in snippets("GRAPH_EXCHANGE.md"):
+        exec(compile(code, "graph exchange documentation", "exec"), scope)
+
+
+@pytest.mark.optional_dependency("polars")
+@pytest.mark.optional_dependency("pyarrow")
+def test_polars_recipe():
+    pytest.importorskip("polars")
+    pytest.importorskip("pyarrow")
+    with connect(":memory:") as db:
+        with db.begin() as tx:
+            tx.execute("CREATE NODE TABLE Document(id INT64,title STRING,PRIMARY KEY(id))")
+        scope = {"db": db}
+        exec(compile(snippets("POLARS_RECIPE.md")[0], "polars documentation", "exec"), scope)
+        assert db.execute("MATCH (n:Document) RETURN n.id").rows == ((5,),)
+
+
+def test_local_text_recipes(tmp_path):
+    (tmp_path / "input.csv").write_text('id,title\n1,CSV\n', encoding="utf-8")
+    (tmp_path / "input.jsonl").write_text('{"id":2,"title":"JSONL"}\n', encoding="utf-8")
+    with connect(":memory:") as db:
+        with db.begin() as tx:
+            tx.execute("CREATE NODE TABLE Document(id INT64,title STRING,PRIMARY KEY(id))")
+        scope = {"db": db, "input_root": tmp_path}
+        for code in snippets("LOCAL_TEXT_IMPORT.md"):
+            exec(compile(code, "local text documentation", "exec"), scope)
+        assert scope["row_count"] == 1
+        assert db.execute("MATCH (n:Document) RETURN n.id ORDER BY n.id").rows == ((1,), (2,))

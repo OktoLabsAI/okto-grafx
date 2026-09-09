@@ -16,7 +16,9 @@ MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
     "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection", "ProjectionDiagnostics"},
-    "projection_algorithms.py": {"ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult"},
+    "projection_algorithms.py": {"ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult", "PageRankPreparation", "SimpleTopology", "LabelPropagationResult"},
+    "polars.py": {"PolarsFrame"},
+    "text_import.py": {"TextImportLimits"},
     "parquet.py": {"ParquetExportReport"},
     "arrow.py": {"ArrowVectorType"},
     "domain/query/extensions.py": {"ScalarFunction", "ExtensionRegistry"},
@@ -61,6 +63,9 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
+    "graph_interop.py": {"to_networkx", "projection_arrow_batches"},
+    "polars.py": {"to_polars", "import_polars"},
+    "text_import.py": {"read_csv_batches", "import_csv", "read_jsonl_batches", "import_jsonl"},
     "tabular.py": {"to_pandas", "import_pandas"},
     "parquet.py": {"read_parquet_batches", "import_parquet", "write_parquet"},
     "arrow.py": {"to_arrow_batches", "import_arrow_batches"},

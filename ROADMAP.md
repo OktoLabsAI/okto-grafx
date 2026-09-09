@@ -14,7 +14,7 @@ reopen completed work, authorize production data changes or imply release approv
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
-- [Candidate continuation after a4dd85a](#candidate-continuation-after-a4dd85a)
+- [Approved continuation after a4dd85a](#approved-continuation-after-a4dd85a)
 - [Approved continuation after 970aa1e](#approved-continuation-after-970aa1e)
 - [Approved continuation after 7dde256](#approved-continuation-after-7dde256)
 - [Approved continuation after 69ed311](#approved-continuation-after-69ed311)
@@ -70,13 +70,26 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## Search and resumable-transfer follow-up
 
-### Candidate continuation after a4dd85a
+### Approved continuation after a4dd85a
 
 The completed eight-item delivery is committed and pushed as `a4dd85a` on
 `feature/v0.0.5`: 16,121 distinct tests passed, 18 attributed skips, no unresolved
-failures. **The following queue is proposed, not started or required to accept
-that delivery.** It reuses PERF-SCALE/MEM and GX-CAP-8/9 requirements; it does not
+failures. **All eight subsequent items are implemented and locally validated:
+16,228 distinct tests passed, 18 attributed skips, no unresolved failures.**
+Acceptance combines grouped regression and the documented corrective reruns; it
+is not a claim that every initial invocation was green. The table preserves the approved pre-implementation evidence,
+not current defects or a reopening of that delivery. It reuses PERF-SCALE/MEM and GX-CAP-8/9 requirements; it does not
 authorize release, production Pulse workloads or changes to concurrency/durability.
+
+Current surface: `with_pagerank`, `with_simple_topology`, `to_networkx`,
+`label_propagation`, `projection_arrow_batches`, `PolarsFrame`/`to_polars`/`import_polars`,
+`TextImportLimits` and CSV/JSONL batch readers plus atomic import facades.
+Checkpoint 1–4: 8 passed; combined new feature/isolation checks: 43 passed;
+eight executable documentation recipes passed. Final algorithm coverage: 30 passed;
+text ingestion: 48 passed; final interop/examples/isolation: 12 passed. The final
+wheel matched all 185 source Python files and passed an isolated native consumer
+commit/reopen smoke. No source storage/WAL/OCC change.
+[Implementation evidence and final acceptance status](docs/reports/V005_AFTER_A4DD85A.md).
 
 | Order / IDs | Bounded candidate and inspected evidence | Effort | Expected value / dependency |
 | --- | --- | --- | --- |
@@ -624,8 +637,8 @@ physical edges do not cross stores. Embedding generation stays outside the engin
 | GX-CAP-5 | Implemented v1 plus bounded prefixes, relationship indexes and durable/history statistics | Native FTS, frozen analyzers, weighted BM25, exact snapshot scores, full lifecycle and required bits 11/12. Pure analysis reuse, bounded WAL deltas and eligible persisted summaries reduce work; old/ineligible census remains linear. Phrase/position search and same-name analyzer replacement remain unsupported. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [latest evidence](docs/reports/V005_AFTER_69ED311.md). |
 | GX-CAP-6 | Implemented bounded v1 plus certified incident expansion and shared controls/memory | Weighted RRF, union/intersection, source explanations, graph boost/filter, explicit missing-source partial policy, indexed BFS and per-phase logical peaks. No embedding provider, cross-table fusion, graph-only candidate expansion or universal recall promise. [Usage](docs/HYBRID_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-6.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
 | GX-CAP-7 | Partial: trusted scalar SPI implemented | Explicit immutable per-handle registry, typed scalar UDFs/direct calls, NULL/value budgets and typed failures. Aggregate/table/procedure extensions, durable manifests and sandboxing are not implemented. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-7.md). |
-| GX-CAP-8 | Partial: scalar/vector Arrow, Pandas and local Parquet implemented | Explicit native vector identity, nullable typed batches, atomic import staging and caller-owned commit; bounded no-overwrite local files. Polars, external scans, arbitrary nested/entity data and graph exchange remain. [Usage](docs/TABULAR_AND_PARQUET.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |
-| GX-CAP-9 | Partial: detached weighted projections, lookup/CSR, degree/WCC/SCC, BFS/Dijkstra, weighted/personalized PageRank and linear k-core implemented | Bounded read-only algorithms, cancellation, explicit NumPy PageRank and independent oracles. Persistent catalog, mutation/write modes and broader algorithm packages remain. [Usage](docs/GRAPH_PROJECTIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-9.md). |
+| GX-CAP-8 | Partial: scalar/vector Arrow, Pandas/Polars, local Parquet/CSV/JSONL and detached graph exchange implemented | Explicit native vector identity, nullable typed batches, atomic import staging and caller-owned commit; bounded local files and NetworkX/projection Arrow exports. External query scans/COPY, arbitrary nested/entity ingestion and graph import remain. [Usage](docs/TABULAR_AND_PARQUET.md), [text](docs/LOCAL_TEXT_IMPORT.md), [exchange](docs/GRAPH_EXCHANGE.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |
+| GX-CAP-9 | Partial: weighted projections, retained lookup/CSR/transitions/simple topology, degree/WCC/SCC, BFS/Dijkstra, PageRank, k-core and label propagation implemented | Bounded read-only algorithms, cancellation, explicit NumPy and independent/NetworkX oracles for declared algorithms. Persistent catalog, mutation/write modes, Louvain and broader algorithm packages remain. [Usage](docs/GRAPH_PROJECTIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-9.md). |
 | GX-CAP-10 | Partial: additive application migration ledger/checksums/dry-run implemented in the eight-item continuation | Atomic per-version CREATE NODE/REL TABLE and VECTOR SPACE with bounded retries/resumption. Staged column evolution, arbitrary ALTER, logical views and derived/materialized graphs remain; distinct from engine format migration. [Consumer guide](docs/SCHEMA_MIGRATIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-10.md). |
 | GX-CAP-11 | Partial: 0.0.5 compatibility automation and local upgrade evidence implemented | Real-wheel upgrade/refusal, cross-selector reopen and Windows/Ubuntu × Python 3.11–3.13 workflow. Remote matrix runs and release acceptance are not implied. [Current evidence](docs/V005_COMPATIBILITY.md), [spec](docs/specs/SPEC-GX-CAP-11.md). |
 

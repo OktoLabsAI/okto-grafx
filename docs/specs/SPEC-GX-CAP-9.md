@@ -6,6 +6,13 @@ Date: 2026-09-09. [Consumer contract](../GRAPH_PROJECTIONS.md),
 [algorithm continuation](../reports/V005_AFTER_7DDE256.md).
 Dependencies: GX-CAP-7; existing traversal/query budgets.
 
+The continuation after `a4dd85a` adds retained PageRank transition preparation,
+simple-undirected topology reuse and deterministic bounded asynchronous label
+propagation. [Usage/charges](../GRAPH_PROJECTIONS.md),
+[NetworkX conformance and graph exchange](../GRAPH_EXCHANGE.md).
+This does not implement Louvain, persistent projection catalogs or mutation/write
+modes. Final grouped acceptance is recorded in the [roadmap](../../ROADMAP.md).
+
 The continuation after `970aa1e` adds retained node identity lookup, local-path
 discovery budgets, bucket k-core, opt-in NumPy PageRank, snapshot numeric weights,
 Dijkstra and weighted/personalized PageRank. [Detailed contracts](../GRAPH_PROJECTIONS.md)
@@ -58,8 +65,10 @@ with logical limits, cancellation and an independent reachability oracle. The
 continuation after `7dde256` adds projected batched capture, retained immutable CSR,
 iterative SCC, BFS reachability/shortest paths, bounded unweighted PageRank and
 simple-undirected k-core. Oracles use independent reachability, linear-system and
-peeling implementations. Persisted catalog, mutation/write modes and NetworkX acceptance
-remain backlog; the independent oracle is not recorded as a NetworkX run.
+peeling implementations. Persisted catalog and mutation/write modes remain backlog.
+NetworkX conformance was subsequently added for the explicitly listed algorithms
+after `a4dd85a`; the original independent-oracle runs are not retroactively labeled
+NetworkX runs.
 No release, new on-disk capability,
 installed Pulse feature, or successful crash matrix is inferred from this document.
 Record immutable code SHA, test commands/results, audit and unresolved debt here when

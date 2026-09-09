@@ -6,6 +6,7 @@ Dated evidence, not active execution queues. Each report retains its original
 measurement conditions, source paths, limitations and checkpoint history.
 Private artifact/consumer-repository paths may not be available in this checkout.
 
+- [Reusable analytics and local ingestion after a4dd85a](V005_AFTER_A4DD85A.md)
 - [Weighted analytics and tabular interop after 970aa1e](V005_AFTER_970AA1E.md)
 - [Projection throughput and algorithms after 7dde256 — eight-item acceptance](V005_AFTER_7DDE256.md)
 

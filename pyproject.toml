@@ -53,6 +53,8 @@ License = "https://github.com/OktoLabsAI/okto-grafx/blob/main/LICENSE"
 [project.optional-dependencies]
 arrow = ["pyarrow>=14"]
 pandas = ["pyarrow>=14", "pandas>=2"]
+polars = ["pyarrow>=14", "polars>=1"]
+networkx = ["networkx>=3"]
 # RECOMMENDED for any real workload. Two accelerators behind ports the engine already
 # declares, and neither one changes an answer:
 #

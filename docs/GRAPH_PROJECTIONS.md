@@ -239,4 +239,57 @@ deadline. No implicit retries or partial pictures/results are returned, except t
 explicit non-converged PageRank result on its iteration cap. Read controls never
 interrupt a durable commit. Algorithms on detached pictures do not hold read leases.
 
-[API signatures and DTOs](API_REFERENCE.md) · [Roadmap](../ROADMAP.md)
+## Reusable analytics and communities (continuation after a4dd85a)
+
+`with_pagerank(backend="python", weighted=False, cancellation=None)` returns a new
+immutable picture with normalized transition shares, dangling identities and physical
+source/target positions. NumPy additionally retains immutable byte buffers, not writable
+arrays. Repeated calls with the same backend/weight mode return the same picture.
+There is one retained mode; explicitly preparing another mode replaces it in the new
+picture. `pagerank` reuses only a matching preparation; a mismatched requested mode
+computes normally, never silently selects the retained mode. Seeds, ranks, damping,
+tolerance and iteration state are not cached. Defaults remain unweighted Python.
+
+Use preparation for repeated ranking of one captured snapshot with different seeds.
+Do not prepare for a single cheap call or when extra retained memory is undesirable.
+Preparation remains O(V+E); it removes repeated setup, not iterative edge processing.
+The retained tariff is 4,096 + 256V + 512E bytes, plus existing lookup/CSR. Construction
+admits the retained charge and 4,096 + 1,024V + 512E workspace, including coexistence
+with an old preparation when replacing it. NumPy import and individual numeric kernels
+remain non-preemptible; checks bracket them. No state grants storage authority.
+
+`with_simple_topology(cancellation=None)` retains loop-free undirected neighbor tuples,
+deduplicated in physical encounter order in expected O(V+E). Original edges/weights
+remain unchanged. `k_core` reuses these neighbors; without them its existing bounded
+set-building path remains. The retained tariff is 4,096 + 256V + 256E with the same
+construction workspace above. Counts use physical E conservatively, not only deduped
+neighbors. Choose retention for repeated analytics; it does not remove peeling work.
+
+`label_propagation(max_iterations=100, cancellation=None)` uses the simple topology
+(building it locally if absent). Initial labels are node identities. Each sweep visits
+nodes in projection order and updates immediately from current neighbor labels; most
+votes wins, with the smallest table/record identity breaking ties. Isolates retain their
+own identity, direction/parallel multiplicity/self-loops/weights do not contribute.
+Output `LabelPropagationResult(labels, iterations, converged)` is aligned with nodes.
+Convergence means a full sweep without changes; an iteration cap returns `converged=False`,
+not a resource exception. Empty input returns zero iterations and convergence. The cap
+is an exact integer 1..1,000,000. Per-sweep work is O(V+simple E), with 4,096 + 1,024V
+workspace beyond the retained picture; cancellation/work limits still refuse. This is
+deterministic asynchronous label propagation, not Louvain, an optimal partition,
+weighted community detection or a write-back operation.
+
+```python
+# `weighted` is the captured graph from the preceding recipe.
+prepared = weighted.with_pagerank(weighted=True).with_simple_topology()
+rank_again = prepared.pagerank(weighted=True)
+communities = prepared.label_propagation(max_iterations=100)
+assert len(communities.labels) == len(prepared.nodes)
+```
+
+Only capture and the `with_*` methods construct supported consumer pictures. Do not
+manually replace topology/weights/derived fields in a dataclass: derived representations
+belong to the original immutable picture and are not independent validation inputs.
+No extra reader lease is acquired. Keeping multiple old pictures or running simultaneous
+algorithms remains caller-owned memory, not a per-process cap.
+
+[Graph exchange](GRAPH_EXCHANGE.md) · [API signatures and DTOs](API_REFERENCE.md) · [Roadmap](../ROADMAP.md)

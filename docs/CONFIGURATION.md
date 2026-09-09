@@ -1,5 +1,17 @@
 # Configuration reference
 
+The continuation after `a4dd85a` adds only operation-local options: opt-in
+`with_pagerank(backend="python", weighted=False)`, `with_simple_topology()` and
+`label_propagation(max_iterations=100)` with existing projection work/memory and
+cancellation controls; see [analytics](GRAPH_PROJECTIONS.md). Optional `networkx`
+and `polars` extras enable [graph exchange](GRAPH_EXCHANGE.md) and
+[typed eager frames](TABULAR_AND_PARQUET.md). Graph export defaults are 64 MiB
+logical NetworkX output or Arrow batches of 256 rows / 16 MiB. The
+[TextImportLimits table](LOCAL_TEXT_IMPORT.md#limits-errors-and-file-policy)
+specifies all eight CSV/JSONL controls; required schema/root and CSV delimiter/NULL
+policy are explicit. No new DatabaseConfig field, environment variable, automatic
+backend selection or format capability is introduced.
+
 The continuation after `970aa1e` adds **operation-local**, not connection, options:
 projection `weight_columns=None`/`default_weight=None`; PageRank `backend="python"`,
 `weighted=False`, `personalization=None`; Dijkstra `max_distance=None` and existing

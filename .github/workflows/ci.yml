@@ -130,7 +130,7 @@ jobs:
           - os: windows-latest
             family: windows
             profile: extras
-            extras: "accel,bench,arrow,pandas"
+            extras: "accel,bench,arrow,pandas,polars,networkx"
           - os: ubuntu-latest
             family: posix
             profile: bare
@@ -138,7 +138,7 @@ jobs:
           - os: ubuntu-latest
             family: posix
             profile: extras
-            extras: "accel,bench,arrow,pandas"
+            extras: "accel,bench,arrow,pandas,polars,networkx"
     steps:
       - uses: actions/checkout@v4
         with:

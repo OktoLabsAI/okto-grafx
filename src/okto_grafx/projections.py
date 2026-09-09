@@ -13,6 +13,7 @@ from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.projection_algorithms import (
     ProjectionLookup, ProjectionAdjacency, ProjectionPath, WeightedProjectionPath, PageRankResult,
     _with_lookup, _with_adjacency, _strong_components, _bfs, _pagerank, _k_core, _weight, _weighted_path,
+    PageRankPreparation, SimpleTopology, LabelPropagationResult, _with_pagerank, _with_simple, _label_propagation,
 )
 
 __all__ = ["ProjectionLimits", "ProjectionDiagnostics", "ProjectionNode", "ProjectionEdge", "GraphProjection", "project_graph"]
@@ -108,6 +109,22 @@ class GraphProjection:
     adjacency: ProjectionAdjacency | None = None
     lookup: ProjectionLookup | None = None
     weights: tuple[float, ...] | None = None
+    pagerank_preparation: PageRankPreparation | None = None
+    simple_topology: SimpleTopology | None = None
+
+    def with_pagerank(self, *, backend: str = "python", weighted: bool = False,
+                      cancellation: CancellationToken | None = None) -> GraphProjection:
+        """Retain immutable transition data for repeated ranking with different seeds."""
+        return _with_pagerank(self, backend, weighted, cancellation)
+
+    def with_simple_topology(self, *, cancellation: CancellationToken | None = None) -> GraphProjection:
+        """Retain bounded loop-free undirected neighbors without changing physical edges."""
+        return _with_simple(self, cancellation)
+
+    def label_propagation(self, *, max_iterations: int = 100,
+                          cancellation: CancellationToken | None = None) -> LabelPropagationResult:
+        """Run asynchronous node-order voting; smallest identity wins ties; no storage writes."""
+        return _label_propagation(self, max_iterations, cancellation)
 
     def with_lookup(self, *, cancellation: CancellationToken | None = None) -> GraphProjection:
         """Retain a bounded immutable identity lookup, without acquiring storage authority."""

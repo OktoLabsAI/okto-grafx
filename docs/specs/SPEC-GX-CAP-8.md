@@ -1,12 +1,20 @@
 # SPEC-GX-CAP-8 — Arrow and external data
 
-Status: scalar/vector Arrow, typed Pandas and local Parquet interop implemented in 0.0.5 development; broader external-data scope remains planned. Date: 2026-09-09.
+Status: scalar/vector Arrow, typed Pandas/Polars, local Parquet/CSV/JSONL and detached graph export implemented in 0.0.5 development; broader external-data scope remains planned. Date: 2026-09-09.
+
+The continuation after `a4dd85a` adds [NetworkX/projection Arrow export](../GRAPH_EXCHANGE.md),
+[metadata-bearing Polars frames](../TABULAR_AND_PARQUET.md) and
+[typed bounded local CSV/JSONL readers/import](../LOCAL_TEXT_IMPORT.md).
+Native staging remains whole-call atomic and caller-committed. No external query
+scans, COPY, arbitrary JSON arrays/nesting, remote sources or graph ingestion.
+Final regression status is tracked in the [roadmap](../../ROADMAP.md).
 
 The continuation after `970aa1e` adds explicit Arrow-backed DataFrames and local
 Parquet batches. [Types, bounds, NULL/NaN, directory trust and publication contract](../TABULAR_AND_PARQUET.md).
 Imports preserve whole-call staging atomicity; no commit or native format change.
 Parquet nullable vectors use tagged list-v1 physical encoding, normalized to the
-existing fixed-size-list API. Polars, CSV/JSON scans, COPY and graph exchange remain.
+existing fixed-size-list API. At that checkpoint Polars, CSV/JSON scans, COPY and
+graph exchange remained; the subsequent bounded additions are described above.
 [Execution receipt](../reports/V005_AFTER_970AA1E.md).
 
 0.0.5 continuation: optional scalar Arrow **export** over native results/cursors is

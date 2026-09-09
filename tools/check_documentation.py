@@ -17,6 +17,9 @@ from generate_api_reference import MARKER, render  # noqa: E402
 CONSUMER_DOCS = (
     "docs/GRAPH_PROJECTIONS.md",
     "docs/TABULAR_AND_PARQUET.md",
+    "docs/GRAPH_EXCHANGE.md",
+    "docs/LOCAL_TEXT_IMPORT.md",
+    "docs/POLARS_RECIPE.md",
     "docs/EXTENSIONS_AND_ARROW.md",
     "docs/V005_COMPATIBILITY.md",
     "docs/specs/HEAP_FREE_PAGE_INDEX.md",
@@ -109,6 +112,7 @@ def check() -> list[str]:
         ("domain/index/fulltext.py", {"TextIndexOptions", "TextSearchLimits"}, "FULL_TEXT_SEARCH.md"),
         ("transfer.py", {"TransferLimits"}, "LOGICAL_TRANSFER.md"),
         ("projections.py", {"ProjectionLimits"}, "GRAPH_PROJECTIONS.md"),
+        ("text_import.py", {"TextImportLimits"}, "LOCAL_TEXT_IMPORT.md"),
     ):
         tree = ast.parse((ROOT / "src/okto_grafx" / module).read_text(encoding="utf-8"))
         expected = {

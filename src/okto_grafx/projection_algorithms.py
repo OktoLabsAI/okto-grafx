@@ -16,7 +16,98 @@ from okto_grafx.errors import GrafxConfigurationError
 if TYPE_CHECKING:
     from okto_grafx.projections import GraphProjection, ProjectionNode, ProjectionEdge
 
-__all__ = ["ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult"]
+__all__ = ["ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult",
+           "PageRankPreparation", "SimpleTopology", "LabelPropagationResult"]
+
+
+@dataclass(frozen=True, slots=True)
+class PageRankPreparation:
+    """Immutable transition data for one projection, backend and weight mode; no rank state."""
+
+    backend: str
+    weighted: bool
+    sources: tuple[int, ...]
+    targets: tuple[int, ...]
+    shares: tuple[float, ...]
+    dangling: tuple[int, ...]
+    numeric_buffers: tuple[bytes, ...] | None
+    logical_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class SimpleTopology:
+    """Retained loop-free undirected neighbors; physical projection edges remain unchanged."""
+
+    neighbors: tuple[tuple[int, ...], ...]
+    logical_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class LabelPropagationResult:
+    """Labels aligned with nodes; convergence means one whole sweep without changes."""
+
+    labels: tuple[ProjectionNode, ...]
+    iterations: int
+    converged: bool
+
+
+def _simple(graph, work):
+    from okto_grafx.projections import _bound
+    if graph.simple_topology is not None:
+        return graph
+    n, m = len(graph.nodes), len(graph.edges)
+    charge = 4096 + 256 * n + 256 * m
+    _bound("projection_memory", graph.logical_bytes + charge + 4096 + 1024 * n + 512 * m,
+           graph.limits.max_memory_bytes)
+    work.step(n)
+    neighbors = [dict() for _ in range(n)]
+    for edge in graph.edges:
+        work.step()
+        if edge.source != edge.target:
+            neighbors[edge.source][edge.target] = None
+            neighbors[edge.target][edge.source] = None
+    # Preserve physical encounter order without a sorting/logarithmic construction cost.
+    for row in neighbors:
+        work.step(1 + len(row))
+    topology = SimpleTopology(tuple(tuple(row) for row in neighbors), charge)
+    return replace(graph, simple_topology=topology, logical_bytes=graph.logical_bytes + charge)
+
+
+def _with_simple(graph, cancellation):
+    return _simple(graph, _control(graph, cancellation))
+
+
+def _label_propagation(graph, max_iterations, cancellation):
+    _positive("max_iterations", max_iterations)
+    if max_iterations > 1_000_000:
+        raise GrafxConfigurationError("max_iterations must be <=1000000.", field="max_iterations")
+    work = _control(graph, cancellation)
+    graph = _simple(graph, work)
+    from okto_grafx.projections import _bound
+    _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * len(graph.nodes), graph.limits.max_memory_bytes)
+    work.step(len(graph.nodes))
+    labels = list(graph.nodes)
+    if not labels:
+        return LabelPropagationResult((), 0, True)
+    for iteration in range(1, max_iterations + 1):
+        changed = False
+        for node, neighbors in enumerate(graph.simple_topology.neighbors):
+            work.step()
+            votes = {}
+            for neighbor in neighbors:
+                work.step()
+                label = labels[neighbor]
+                votes[label] = votes.get(label, 0) + 1
+            if votes:
+                work.step(len(votes))
+                winner = min(votes, key=lambda label: (-votes[label], label))
+                changed |= labels[node] != winner
+                labels[node] = winner
+        if not changed:
+            work.step(len(labels))
+            return LabelPropagationResult(tuple(labels), iteration, True)
+    work.step(len(labels))
+    return LabelPropagationResult(tuple(labels), max_iterations, False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +407,61 @@ def _weighted_path(graph, source, target, direction, max_results, max_distance, 
     return WeightedProjectionPath(False, None, (), ())
 
 
+def _prepare_rank(graph, work, backend, weighted):
+    from okto_grafx.projections import _bound
+    if type(backend) is not str or backend not in ("python", "numpy"):
+        raise GrafxConfigurationError("backend must be python or numpy.", field="backend")
+    if type(weighted) is not bool or (weighted and graph.weights is None):
+        raise GrafxConfigurationError("weighted requires captured weights and must be boolean.", field="weighted")
+    old = graph.pagerank_preparation
+    if old is not None and (old.backend, old.weighted) == (backend, weighted):
+        return graph
+    graph = _adjacent(graph, work)
+    n, m = len(graph.nodes), len(graph.edges)
+    charge = 4096 + 256 * n + 512 * m
+    _bound("projection_memory", graph.logical_bytes + charge + 4096 + 1024 * n + 512 * m,
+           graph.limits.max_memory_bytes)
+    offsets = graph.adjacency.out_offsets
+    work.step(n + m)
+    shares = [0.0] * m
+    dangling = []
+    for node in range(n):
+        work.step()
+        start, end = offsets[node:node + 2]
+        if weighted:
+            entries = graph.adjacency.out_edges[start:end]
+            work.step(3 * len(entries))
+            maximum = max((graph.weights[i] for i in entries), default=0.0)
+            if maximum:
+                total = math.fsum(graph.weights[i] / maximum for i in entries)
+                for i in entries:
+                    shares[i] = graph.weights[i] / maximum / total
+            else:
+                dangling.append(node)
+        elif start == end:
+            dangling.append(node)
+        else:
+            for pos in range(start, end):
+                work.step()
+                shares[graph.adjacency.out_edges[pos]] = 1.0 / (end - start)
+    work.step(m + n)
+    sources = tuple(e.source for e in graph.edges)
+    targets = tuple(e.target for e in graph.edges)
+    shares, dangling = tuple(shares), tuple(dangling)
+    buffers = None
+    if backend == "numpy":
+        from okto_grafx.adapters.numpy_projection import prepare_numpy
+        buffers = prepare_numpy(sources, targets, shares, dangling)
+        work.step(0)
+    prepared = PageRankPreparation(backend, weighted, sources, targets, shares, dangling, buffers, charge)
+    return replace(graph, pagerank_preparation=prepared,
+                   logical_bytes=graph.logical_bytes + charge - (old.logical_bytes if old else 0))
+
+
+def _with_pagerank(graph, backend, weighted, cancellation):
+    return _prepare_rank(graph, _control(graph, cancellation), backend, weighted)
+
+
 def _pagerank(graph, damping, tolerance, max_iterations, cancellation, backend="python",
               weighted=False, personalization=None):
     _positive("max_iterations", max_iterations)
@@ -352,8 +498,11 @@ def _pagerank(graph, damping, tolerance, max_iterations, cancellation, backend="
         total = math.fsum(value / maximum for value in seed)
         seed = [value / maximum / total for value in seed]
     offsets = graph.adjacency.out_offsets
-    shares = None
-    if weighted:
+    prepared = graph.pagerank_preparation
+    if prepared is not None and (prepared.backend, prepared.weighted) == (backend, weighted):
+        shares = prepared.shares if weighted else None
+        dangling = prepared.dangling
+    elif weighted:
         work.step(len(graph.edges))
         shares = [0.0] * len(graph.edges)
         for node in range(n):
@@ -372,6 +521,7 @@ def _pagerank(graph, damping, tolerance, max_iterations, cancellation, backend="
                 outgoing[edge.source] = True
         dangling = tuple(i for i, value in enumerate(outgoing) if not value)
     else:
+        shares = None
         dangling = tuple(i for i in range(n) if offsets[i] == offsets[i + 1])
     if backend == "numpy":
         from okto_grafx.adapters.numpy_projection import pagerank_numpy
@@ -379,6 +529,11 @@ def _pagerank(graph, damping, tolerance, max_iterations, cancellation, backend="
                graph.limits.max_memory_bytes)
         offsets = graph.adjacency.out_offsets
         work.step(n + len(graph.edges))
+        if prepared is not None and (prepared.backend, prepared.weighted) == (backend, weighted):
+            result = pagerank_numpy(n, prepared.sources, prepared.targets, prepared.shares,
+                tuple(seed), dangling, damping, tolerance, max_iterations, work.step,
+                prepared=prepared.numeric_buffers)
+            return PageRankResult(*result)
         result = pagerank_numpy(n, tuple(e.source for e in graph.edges), tuple(e.target for e in graph.edges),
             tuple(shares) if shares is not None else tuple(1.0 / (offsets[e.source + 1] - offsets[e.source]) for e in graph.edges),
             tuple(seed), dangling,
@@ -415,12 +570,15 @@ def _k_core(graph, cancellation):
     _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * len(graph.nodes)
            + 512 * len(graph.edges), graph.limits.max_memory_bytes)
     work.step(len(graph.nodes))
-    neighbors = [set() for _ in graph.nodes]
-    for edge in graph.edges:
-        work.step()
-        if edge.source != edge.target:
-            neighbors[edge.source].add(edge.target)
-            neighbors[edge.target].add(edge.source)
+    if graph.simple_topology is not None:
+        neighbors = graph.simple_topology.neighbors
+    else:
+        neighbors = [set() for _ in graph.nodes]
+        for edge in graph.edges:
+            work.step()
+            if edge.source != edge.target:
+                neighbors[edge.source].add(edge.target)
+                neighbors[edge.target].add(edge.source)
     degrees = [len(row) for row in neighbors]
     bins = [0] * (max(degrees, default=0) + 1)
     for degree in degrees:

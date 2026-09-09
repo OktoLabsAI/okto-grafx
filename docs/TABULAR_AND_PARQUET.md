@@ -159,3 +159,28 @@ Underlying optional APIs: [Arrow Pandas integration](https://arrow.apache.org/do
 and [ParquetFile batch reader](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetFile.html).
 
 [Configuration routing](CONFIGURATION.md) · [Roadmap](../ROADMAP.md)
+## Polars companion (continuation after a4dd85a)
+
+Install `okto-grafx[polars]`. `okto_grafx.polars.to_polars` has the same explicit
+`types`, `batch_rows=256`, `max_batch_bytes=16777216`, `max_rows=100000` and
+`max_bytes=67108864` controls as `to_pandas`; it returns `PolarsFrame(frame,
+arrow_schema)`, not a bare DataFrame. The frozen wrapper holds an eager Polars
+DataFrame and its native Arrow metadata separately because Polars transformations
+need not preserve field metadata. The DataFrame itself is mutable: do not modify
+it concurrently with import or infer new vector identity from its contents.
+
+`import_polars(transaction, statement, frame, types=..., max_batch_rows=256,
+max_batch_bytes=16777216, max_rows=1000000, max_batches=4096)` requires that wrapper,
+validates metadata/types, and stages the entire call with the native Arrow import
+savepoint. It does not commit or retry. Exact float/integer/timestamp/vector dtypes
+are required; safe conversion of Polars large string/binary offsets to native Arrow
+offsets is explicit. UUID binary width is checked by the safe fixed-width cast.
+No LazyFrame, inferred nested/vector semantics, arbitrary numeric coercion or zero-copy
+promise. NULL and scalar NaN remain distinct. Limits are logical charges, not RSS.
+Missing dependency, invalid options/types, native errors and budget refusal follow
+the same categories as Pandas/Arrow. Caller owns source cursors and prior staging.
+
+See upstream [Arrow export](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.to_arrow.html)
+and [Arrow import](https://docs.pola.rs/api/python/stable/reference/api/polars.from_arrow.html).
+An executable Polars example is in [the companion recipe](POLARS_RECIPE.md).
+CSV/JSONL native staging has [its own exact local text contract](LOCAL_TEXT_IMPORT.md).

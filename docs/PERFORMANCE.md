@@ -264,6 +264,25 @@ The separate [N4 public publication sample](reports/V005_N3_N4_ACCEPTANCE.md) me
 iterations). This opt-in development capability adds durable provenance; the
 measurement is neither a Pulse timing nor a performance improvement claim.
 
+## Latest prepared analytics in 0.0.5 development
+
+September 9, 2026, continuation after `a4dd85a`; synthetic detached 5,000-node /
+30,000-edge graph, seed 970, Python 3.13.1 / NumPy 2.5.2. Five calls per operation
+after grouped regressions completed; source capture, CSR and dependency warm-up
+excluded. Preparation is explicit and separately measured, never hidden in a warm-up.
+
+| Current operation/configuration | Latest median | One-time preparation |
+| --- | ---: | ---: |
+| Weighted personalized PageRank, NumPy with retained transitions | 7.645 ms | 39.586 ms |
+| k-core, retained simple-undirected topology | 34.985 ms | 32.199 ms |
+
+All rank results converged and matched unprepared controls within 1e-11; core numbers
+matched exactly. Extra retention is an opt-in tradeoff, not a single-call guarantee.
+Picture logical charges: 48,336,384 bytes for prepared rank, 40,656,384 for simple
+topology; not RSS. No Pulse loading/write latency, database capture/storage cost,
+machine-idle certification or universal speedup is claimed.
+[Samples, current-mode controls and reproduction](reports/V005_AFTER_A4DD85A.md).
+
 ## Native/component evidence in the 0.0.4 development line
 
 These measurements are useful for attribution, not replacements for the latest

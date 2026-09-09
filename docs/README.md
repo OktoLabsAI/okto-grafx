@@ -33,6 +33,8 @@ then consult the API/query references for the capabilities your application uses
 
 - [Trusted scalar extensions and optional Arrow batches](EXTENSIONS_AND_ARROW.md).
 - [Typed Pandas frames and local Parquet files](TABULAR_AND_PARQUET.md).
+- [Typed Polars recipe](POLARS_RECIPE.md), [local CSV/JSONL](LOCAL_TEXT_IMPORT.md),
+  [NetworkX and projection Arrow exchange](GRAPH_EXCHANGE.md).
 - [0.0.5 compatibility/upgrade matrix](V005_COMPATIBILITY.md).
 
 [Physical backup and restore](BACKUP_RESTORE.md) covers the bounded local API,

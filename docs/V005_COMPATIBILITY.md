@@ -65,3 +65,14 @@ capabilities; logical transfer re-creates declared destination indexes. Do not
 manually clear bits or edit headers to force an older binary to open a newer store.
 Current refusal tests mask only the reader's known bitmap and separately exercise
 real older-wheel opens; these are distinct pieces of evidence.
+
+## Continuation after a4dd85a
+
+Prepared analytics, simple topology, label propagation, NetworkX/Arrow graph exchange,
+Polars and CSV/JSONL import introduce **no persisted capability or connection default**.
+Optional CI profiles now include `polars` and `networkx`; the new tests run in both
+bare/extras profiles. Local Windows/Python 3.13.1 checks use NumPy 2.5.2, NetworkX
+3.6.1, Polars 1.44.2 and PyArrow 19.0.1. Polars is in an ignored local test directory,
+not installed into Pulse. Bare-source `-I -S` checks cover missing optional selections.
+These observations do not certify minimum dependency versions or the remote OS/Python
+matrix. [Current acceptance evidence](reports/V005_AFTER_A4DD85A.md).
