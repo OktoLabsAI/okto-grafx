@@ -14,6 +14,7 @@ reopen completed work, authorize production data changes or imply release approv
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
+- [Candidate continuation after a4dd85a](#candidate-continuation-after-a4dd85a)
 - [Approved continuation after 970aa1e](#approved-continuation-after-970aa1e)
 - [Approved continuation after 7dde256](#approved-continuation-after-7dde256)
 - [Approved continuation after 69ed311](#approved-continuation-after-69ed311)
@@ -68,6 +69,40 @@ reopen completed work, authorize production data changes or imply release approv
 | PULSE-BENCH | Reserved workload | Latest recorded authorized run consumed one spec; 19 remain reserved. Do not consolidate more, redrive, rebuild or reset data to improve this document. New live runs need a deliberate workload decision. |
 
 ## Search and resumable-transfer follow-up
+
+### Candidate continuation after a4dd85a
+
+The completed eight-item delivery is committed and pushed as `a4dd85a` on
+`feature/v0.0.5`: 16,121 distinct tests passed, 18 attributed skips, no unresolved
+failures. **The following queue is proposed, not started or required to accept
+that delivery.** It reuses PERF-SCALE/MEM and GX-CAP-8/9 requirements; it does not
+authorize release, production Pulse workloads or changes to concurrency/durability.
+
+| Order / IDs | Bounded candidate and inspected evidence | Effort | Expected value / dependency |
+| --- | --- | --- | --- |
+| 1 / PERF-SCALE, GX-CAP-9 | Explicit reusable PageRank transition preparation owned by the immutable projection. `_pagerank` currently recomputes normalized edge shares/dangling nodes and recreates source/target tuples and NumPy arrays per call, even with retained CSR. Retain only opt-in derived data with complete logical-memory charges, immutable ownership and backend/weight identity; do not retain personalization-specific ranks or storage authority. | Medium | Avoid repeated O(V+E) preparation when ranking one snapshot with multiple seeds. Iteration complexity is unchanged. Measure preparation separately once; stop if the real saving is marginal rather than introduce a cache merely to complete this row. |
+| 2 / PERF-SCALE, GX-CAP-9 | Optional reusable simple-undirected topology. `_k_core` rebuilds neighbor sets and collapses physical parallel edges on every invocation. Retain a bounded immutable representation that algorithms can reuse, while keeping the original directed multigraph untouched. | Medium | Amortize deduplication and allocation for repeated analytics; prerequisite for item 4. Building the picture still scans V+E and k-core still performs peeling. |
+| 3 / GX-CAP-8/9 | Optional NetworkX export and conformance fixtures. The spec explicitly retains graph exchange and NetworkX acceptance as outstanding; current oracles are independent local implementations, not NetworkX runs. Preserve store/table/record identity, directed physical edge keys, parallel edges, loops and captured weights in a bounded MultiDiGraph export; no arbitrary object ingestion or storage writes. | Small–medium | Developer integration and an additional independent oracle. No runtime performance promise; keep dependency lazy/optional. Compare algorithms only under equivalent graph semantics. |
+| 4 / GX-CAP-9 | Bounded read-only label propagation over item 2, one algorithm from the existing second package. Specify simple-undirected/unweighted interpretation, deterministic node order and label ties, isolates, iteration/work/memory caps and explicit convergence status. Do not silently equate this with Louvain/modularity optimization. | Medium | New community discovery capability, not faster database reads/writes. Depends on 2; uses small independently checked fixtures from 3 where update policies agree. No write-back or clustering-quality guarantee. |
+| 5 / GX-CAP-8/9 | Bounded Arrow batch export for detached projection nodes/edges and explicitly supplied aligned algorithm results. Current `to_arrow_batches` accepts native query results/cursors, not GraphProjection. Publish identity/endpoints/weight/result schemas and snapshot provenance; validate alignment and preserve multiplicity without first building a whole DataFrame. | Medium | Bridge analytics results into the existing tabular/Parquet ecosystem with bounded additional output batches. Does not make the projection or already-computed algorithm output streaming/O(1)-memory. |
+| 6 / GX-CAP-8 | Optional explicitly typed Polars bridge over the existing Arrow contract. Current `tabular.py` exposes Pandas only. Preserve NULL versus NaN, vector metadata and exact types through an explicit metadata-bearing contract; reject metadata loss rather than infer vector identity. Whole-call import staging uses the existing native savepoint and caller commit. | Medium | Completes the other named DataFrame integration; no zero-copy or throughput promise without evidence. No LazyFrame query-engine integration or mandatory Polars dependency. |
+| 7 / GX-CAP-8 | Typed bounded local CSV batch reader and atomic native import facade, outside Cypher. Reuse the trusted local-directory policy of Parquet. Declare UTF-8, header/delimiter/quote/NULL rules, exact scalar codecs and file/record/field/row/batch limits before exposing functions. Report malformed row/column; late errors roll back this call only. | Medium–large | Practical local ingestion without user-written parsers; common foundation for 8. No schema inference, globs, URLs, COPY syntax, graph backup or vector/nested data in this initial slice. |
+| 8 / GX-CAP-8 | Typed bounded local JSON Lines reader and atomic native import using 7's file/codec foundation. Require one object per bounded line, explicit columns, duplicate/unknown-key and missing-versus-NULL policy, exact numeric admission and localized errors; reject arbitrary nesting and nonstandard NaN/Infinity tokens. | Medium | Another existing local JSON requirement in a finite format. JSON arrays, remote sources and query external scans remain deferred. Preserve whole-call staging rollback and caller-owned commit. |
+
+Evidence inspected: [PageRank/k-core preparation](src/okto_grafx/projection_algorithms.py),
+[NumPy adapter](src/okto_grafx/adapters/numpy_projection.py),
+[projection surface](src/okto_grafx/projections.py), [Arrow boundary](src/okto_grafx/arrow.py),
+[Pandas bridge](src/okto_grafx/tabular.py), [local-file policy](src/okto_grafx/parquet.py),
+[external-data scope](docs/specs/SPEC-GX-CAP-8.md) and
+[algorithm/NetworkX scope](docs/specs/SPEC-GX-CAP-9.md).
+
+Recommended sequence: 1–8, checkpoint after 1–4. Each implemented slice needs
+feature/failure tests, optional-dependency isolation where relevant, resource and
+ownership contracts, executable usage examples and API/configuration/roadmap updates;
+one grouped final regression covers the batch. These are primarily analytics and
+interoperability improvements, **not evidence of faster Pulse KG loading or writes**.
+No new percentage gate, persisted format, authority cache, mandatory dependency,
+single-writer premise or live-data consumption is included.
 
 ### Approved continuation after 970aa1e
 
