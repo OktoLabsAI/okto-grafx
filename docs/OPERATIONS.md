@@ -1,5 +1,12 @@
 # Operations, concurrency and recovery
 
+[Logical export/import](LOGICAL_TRANSFER.md) creates a separately writable fresh-UUID
+store; [physical restore](BACKUP_RESTORE.md) remains an offline same-UUID replacement.
+Neither copies live participants into a fork. [FTS operations](FULL_TEXT_SEARCH.md#operations-and-compatibility)
+cover the opt-in required capability, verification, generation rebuild, transfer and
+older-reader refusal. Creating an FTS index requires compatible binaries on all
+writers; it is not merely a process-local configuration change.
+
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md)
 
 For cooperative read cancellation/deadlines and explicit orphan-index reclamation,

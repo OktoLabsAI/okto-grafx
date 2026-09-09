@@ -27,6 +27,9 @@ CONSUMER_DOCS = (
     "docs/OPERATIONS.md",
     "docs/CLI.md",
     "docs/PERFORMANCE.md",
+    "docs/FULL_TEXT_SEARCH.md",
+    "docs/LOGICAL_TRANSFER.md",
+    "docs/specs/FULLTEXT_V1_FORMAT.md",
     "docs/reports/README.md",
 )
 
@@ -89,6 +92,19 @@ def check() -> list[str]:
         errors.append(
             f"Config field drift: missing={sorted(fields - documented)}, extra={sorted(documented - fields)}"
         )
+
+    for module, classes, guide in (
+        ("domain/index/fulltext.py", {"TextIndexOptions", "TextSearchLimits"}, "FULL_TEXT_SEARCH.md"),
+        ("transfer.py", {"TransferLimits"}, "LOGICAL_TRANSFER.md"),
+    ):
+        tree = ast.parse((ROOT / "src/okto_grafx" / module).read_text(encoding="utf-8"))
+        expected = {
+            field.target.id for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name in classes
+            for field in cls.body if isinstance(field, ast.AnnAssign) and isinstance(field.target, ast.Name)
+        }
+        found = set(re.findall(r"^\| `([a-z_]+)` \|", (ROOT / "docs" / guide).read_text(encoding="utf-8"), re.M))
+        if expected != found:
+            errors.append(f"{guide}: option drift: missing={sorted(expected - found)}, extra={sorted(found - expected)}")
 
     api = (ROOT / "docs/API_REFERENCE.md").read_text(encoding="utf-8")
     if MARKER not in api or api.split(MARKER, 1)[1] != render().split(MARKER, 1)[1]:

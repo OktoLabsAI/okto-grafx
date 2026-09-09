@@ -15,6 +15,7 @@ Private artifact/consumer-repository paths may not be available in this checkout
 - [0.0.5 R1–R2 checkpoint: cold validation and checksum isolation](V005_R1_R2_CHECKPOINT.md)
 - [0.0.5 R3–R4 checkpoint: persisted overflow reuse and physical backup/restore](V005_R3_R4_CHECKPOINT.md)
 - [0.0.5 operational checkpoint: orphan-index cleanup and cooperative read control](V005_OPS5_OPS8_CHECKPOINT.md)
+- [0.0.5 items 3–4: logical transfer, full-text search and retrospective documentation audit](V005_OPS2_FTS_CHECKPOINT.md)
 
 - [Architecture boundary debt: query synchronization and pure algorithms](ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md)
 - [Bounded relationship census with exact endpoint validation](BATCHED_RELATIONSHIP_COUNT_0_0_4.md)

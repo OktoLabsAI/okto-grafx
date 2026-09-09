@@ -1,5 +1,11 @@
 # Indexes and vector search
 
+For native inverted text indexes, versioned analyzers, BM25, filters and the closed
+search procedure, see [full-text search](FULL_TEXT_SEARCH.md). It uses the existing
+exact HASH generation/WAL lifecycle but emits several postings per row; it is not
+a scalar equality index or a vector/embedding feature. `rebuild_index`/`rehash_index`
+preserve analyzer identity, and `verify('all')` includes posting coverage.
+
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md) · [Maintenance](OPERATIONS.md)
 
 0.0.5 development adds [quiescent orphan-file inventory and cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md#orphan-index-inventory-and-removal).

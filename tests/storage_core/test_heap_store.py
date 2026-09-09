@@ -485,6 +485,9 @@ def test_committed_high_water_observes_stamps_without_materializing_headers(
     monkeypatch.setattr(RecordHeader, "__init__", counted)
 
     assert heap_store.committed_high_water(person_table) == 17
+    assert heap_store.committed_high_water(person_table, through_lsn=15) == 11
+    assert heap_store.committed_high_water(person_table, through_lsn=9) == 5
+    assert heap_store.committed_high_water(person_table, through_lsn=4) == 0
     assert constructions == [], (
         "the watermark needs only the three fields exposed by peek"
     )

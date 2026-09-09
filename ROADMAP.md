@@ -181,31 +181,62 @@ requirements for this proposed four-item round.
 
 ## Operational checkpoint after R1–R4
 
-The operator approved items **1–2 only**, with completed tests, commit and push
-before considering 3–4. Work stays on `feature/v0.0.5`; no release, global Pulse
-installation or production data changes are authorized by this checkpoint.
+Items **1–2 were completed, committed and pushed** at `692cc26`. The operator
+subsequently approved **3–4**, including tests and documentation as part of their
+delivery. Work stays on `feature/v0.0.5`; this continuation does not request a
+release, global Pulse installation or production data changes.
 
 | Order / ID | Scope / status |
 | --- | --- |
 | 1 / OPS-5 | Implemented checkpoint, locally tested: explicit quiescent orphan-index census, dry run and removal; preserve every catalog state and retained-WAL dependency. No online GC or catalog-generation retirement. |
 | 2 / OPS-8 | Implemented checkpoint, locally tested: cooperative cancellation/deadlines on materialized reads and cursors, typed errors and resource cleanup. No write/commit interruption or preemptive I/O deadline. |
-| 3 / OPS-2 | Not started; next checkpoint decision: versioned logical schema/data/vector export/import with verified fresh-store promotion. |
-| 4 / GX-CAP-5 | Not started; next checkpoint decision: native full-text search, following the existing capability specification. |
+| 3 / OPS-2 | Implemented v1; locally validated: streaming versioned schema/data/vector export/import, identity/endpoint remapping and verified fresh-store promotion. [Usage and limitations](docs/LOGICAL_TRANSFER.md). |
+| 4 / GX-CAP-5 | Implemented v1; locally validated: persisted inverted postings, versioned analyzers, weighted BM25, filters, bounded typed/procedure search, update/tombstones, recovery and generation rebuild. [Usage and limitations](docs/FULL_TEXT_SEARCH.md). |
 
 [API contracts and limits](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). Existing multi-reader/
 multi-writer, OCC, WAL/durability and recovery guarantees remain required. This
 round adds disk-hygiene and responsiveness controls, not a measured throughput claim.
 Grouped regression, final API/query coverage, explicit closure of every observed
 failure, 114 Pulse adapter passes and final installed-wheel acceptance are recorded
-in the [checkpoint report](docs/reports/V005_OPS5_OPS8_CHECKPOINT.md). Items 3–4 remain
-unstarted pending the operator's next checkpoint decision.
+in the [checkpoint report](docs/reports/V005_OPS5_OPS8_CHECKPOINT.md). That report
+certifies neither implementation nor acceptance of items 3–4.
+
+Items 3–4 now have their own [implementation, regression, package and documentation
+audit receipt](docs/reports/V005_OPS2_FTS_CHECKPOINT.md). It records the initial failures
+and their corrective runs, including actual historical recovery floors and native
+journal/index-seal interoperability. Final affected transaction/feature regression:
+991 passed. The earlier 5,300-pass and corrective 2,709-pass groups overlap; their
+counts are not an all-green single run or additive unique total. FTS cold/warm and
+transfer observations are in the [performance reference](docs/PERFORMANCE.md).
+No global Pulse deployment or publication is part of this checkpoint.
+
+### Documentation included in the items 3–4 delivery
+
+Documentation is part of the approved implementation, not a separate follow-up
+or an expansion of the feature scope. Update it alongside each implemented
+contract; do not advertise proposed interfaces as callable features.
+
+| Area | Required documentation alongside tested implementation |
+| --- | --- |
+| OPS-2 logical transfer | Public entry points and result types; executable export/import examples; versioned artifact schema and supported values, schema and vectors; source snapshot and identity/endpoint remapping; budgets, resumability or its explicit limitations; validation, failure/retry and fresh-directory promotion. Distinguish logical transfer from same-identity physical restore and state what history/index state is preserved, rebuilt or excluded. |
+| GX-CAP-5 full-text search | Index creation/search/rebuild APIs and supported procedure/query forms; analyzers and their versioned behavior; BM25, field weights, filters and result fields; transactional visibility and freshness; work/memory/time/cancellation limits; persistence, recovery, compatibility/refusal and backup/transfer behavior. Document supported behavior only, keeping deferred capabilities explicit. |
+| Shared public references | Update the [API reference](docs/API_REFERENCE.md), generated signatures/DTOs and [configuration reference](docs/CONFIGURATION.md) for actual additions. Explain defaults, accepted values, tradeoffs and when to use or avoid each new option; distinguish connection settings from per-operation parameters. Update query, index, integration and operations guides where their contracts change. |
+| Discovery and traceability | Link consumer guides from [README](README.md) and the [documentation index](docs/README.md); update this roadmap's status and known limitations with code/test evidence. Keep one active roadmap, not another competing plan. |
+
+Acceptance includes focused feature and failure-path tests, a grouped relevant
+regression, validation of executable examples, and the existing documentation
+link/configuration/API-drift checks. Record commands, results and remaining
+limitations in the delivery evidence; documentation checks do not substitute for
+runtime tests. Publish performance figures only when measured, with their workload
+and conditions, using the latest measurement rather than an unmeasured gain claim.
+No additional marginal performance threshold is introduced by this requirement.
 
 ## Known limitations and corrective work
 
 | ID / legacy mapping | Status and impact | Required work / acceptance |
 | --- | --- | --- |
 | OPS-1 / §8.1 | R4 implemented and locally validated: bounded physical backup/restore | Checked manifest, bounded checkpoint-fenced memory capture, verified no-replace publication and offline same-UUID replacement. No no-pause/streaming hot backup, generic custom-storage backup or independently writable fork. [Contract](docs/BACKUP_RESTORE.md). |
-| OPS-2 / §8.2 | Partial: physical scan primitives and consumer-owned logical transfer exist; no general versioned export/import product | Versioned schema/types/nodes/parallel edges/vectors, resumability, compatibility and identity remapping; reject unsupported formats before partial promotion. |
+| OPS-2 / §8.2 | Implemented bounded v1; locally validated | Streaming checksummed logical schema/data/vectors, parallel edges, current-ID mappings, FTS declarations and verified no-replace promotion. Current state only; retry from a completed artifact, no mid-import resumption, existing-target merge or historical journal copy. [Contract](docs/LOGICAL_TRANSFER.md), [acceptance](docs/reports/V005_OPS2_FTS_CHECKPOINT.md). |
 | OPS-3 / P1.4, §8.3 | Partial: quiescent vacuum plus validated R3 overflow reuse | Eligible exclusively owned overflow pages are retired through WAL, then reused by ordinary overflow allocations. O(1)-memory discovery is amortized O(heap pages) per participant/reclaim floor, not an indexed constant-time allocator. Quiescence remains an operator assertion; truncation and online vacuum remain unimplemented. Orphan-index cleanup is tracked separately under OPS-5. |
 | OPS-4 / P1.8 | Open limitation: buffer and query budgets are not process RSS caps | Account/measure all retained engine state, vector memory, concurrent handles and temporary encodings. Preserve deterministic refusal; publish a realistic peak-memory envelope, not an RSS promise derived from nominal page bytes. |
 | OPS-5 / P1.12 | Partial: explicit growth/rebuild and quiescent orphan cleanup exist | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement, 4,096-bucket cap and skew/overflow remain. [Contract](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
@@ -309,14 +340,15 @@ bounded actions, not a promise to finish every referenced OPS milestone in 0.0.5
 | --- | --- | --- |
 | Small independent DX improvement / OPS-7 | Typed keyword discoverability for connect options, matching the documented configuration and runtime validation; preserve custom-adapter consumption. | Small to medium / immediate integration usability, no expected throughput gain. Keep checksum-provider isolation as a separate deeper item; autocomplete does not solve process-global selection. |
 | First substantial capability / GX-CAP-1 remainder | Delivered as N4: durable writer publication, qualified lookup, metadata/history, verification/metrics and coordinated transfer/restore/fork semantics. | Local development acceptance closed; release/deployment remain separate. Adds measured write/retention cost, not a speedup or full temporal history. [Evidence and limits](docs/reports/V005_N3_N4_ACCEPTANCE.md). |
-| Operational evolution / OPS-1, OPS-2 | R4 bounded physical backup/restore; future streaming/custom-storage backup and versioned logical export/import. | Large / high recoverability and integration value. Bounded checkpoint-fenced local backup is implemented in R4; no no-pause hot backup or general logical export/import. Identity/retention and provenance must align with CAP-1; copying live files is not a shortcut. |
-| Next search capability / GX-CAP-5 | Native FTS with transactional postings, explicit analyzers/versioning, BM25 and typed bounded search. | Large / high new retrieval value, not an optimization of every graph query. Its direct prerequisites are existing index lifecycle/budgets/planner and CAP-0; it is not technically blocked on all temporal milestones. Shared format/WAL integration still follows controlled sequencing. [FTS spec](docs/specs/SPEC-GX-CAP-5.md). |
+| Operational evolution / OPS-1, OPS-2 | R4 bounded physical backup/restore and OPS-2 logical transfer v1. | Implemented and locally validated development APIs. No no-pause physical hot backup, generic custom-storage restore, mid-import resume or journal-history transfer. [Logical contract](docs/LOGICAL_TRANSFER.md). |
+| Delivered search foundation / GX-CAP-5 | Native FTS with transactional postings, explicit analyzers/versioning, BM25 and typed bounded search. | V1 implemented and locally validated; high new retrieval value, not an optimization of every graph query. Cold aggregate statistics and repeated analysis remain bounded performance candidates; hybrid retrieval is a separate capability. [FTS spec](docs/specs/SPEC-GX-CAP-5.md). |
 | After commit provenance / GX-CAP-2, GX-CAP-3 | Attached catalog sessions and opt-in system-time history. | Large each / strategic multi-store/temporal value. CAP-1 first; one-store writes remain the rule. Neither is required to fix current KG loading. |
 | Later dependent capabilities / GX-CAP-4/6/7/8/9/10, AGENT | Bitemporal/hybrid retrieval, extension SPI, Arrow/exchange, graph algorithms, schema evolution and optional agent packages. | Medium to large individual slices / valuable but not all immediate. Respect declared dependencies: hybrid needs FTS, Arrow/external scans currently depend on CAP-7 and existing streaming/bulk. Do not advertise them as small already-enabled follow-ups. |
 
-The selected performance/DX checkpoint and CAP-1 N4 scope are now delivered. Backup
-and FTS remain the strongest subsequent product candidates, not automatic scope
-for this branch. Existing multi-read/write, durability, consistency and fail-closed
+The selected performance/DX checkpoint and CAP-1 N4 scope are delivered. Physical
+backup was subsequently implemented; logical transfer and FTS were explicitly
+approved and are in the items 3–4 acceptance checkpoint above. Existing
+multi-read/write, durability, consistency and fail-closed
 constraints apply throughout. Group commit, indexed-only DETACH DELETE, authority
 bundles and sharding remain in their existing rejected/deferred dispositions.
 
@@ -330,11 +362,11 @@ physical edges do not cross stores. Embedding generation stays outside the engin
 | Milestone | Status | Scope, prerequisites and contract |
 | --- | --- | --- |
 | GX-CAP-0 | Implemented checkpoint | Database-first boundaries, six ADRs, capability manifest, isolated package/import checks. [Spec](docs/specs/SPEC-GX-CAP-0.md). |
-| GX-CAP-1 | Partial | Qualified CommitId, immutable admitted metadata, monotonic logical commit time, native journal/recovery foundation. Finish the public/durable contract before dependents assume it exists. [Spec](docs/specs/SPEC-GX-CAP-1.md). |
+| GX-CAP-1 | Implemented bounded N4 checkpoint | Qualified CommitId, opt-in durable metadata/history, monotonic logical commit time, lookup/pagination, verification and coordinated transfer/restore semantics. Not full temporal row history; logical graph v1 transfer excludes historical journal entries. [Evidence](docs/reports/V005_N3_N4_ACCEPTANCE.md), [usage](docs/COMMIT_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-1.md). |
 | GX-CAP-2 | Planned | Attached CatalogSession, explicit resolution/permissions, workspace scopes, one-store writes, copy/promotion receipts; provenance depends on CAP-1. [Spec](docs/specs/SPEC-GX-CAP-2.md). |
 | GX-CAP-3 | Planned | Opt-in system-time history, historical schema/edges, delete/recreate semantics, retention, indexes and typed time-travel API; CAP-1 first. [Spec](docs/specs/SPEC-GX-CAP-3.md). |
 | GX-CAP-4 | Planned | Valid time, bitemporal semantics and graph/version diff; builds on CAP-3. [Spec](docs/specs/SPEC-GX-CAP-4.md). |
-| GX-CAP-5 | Planned | Native FTS with explicit analyzer/version, term/prefix/phrase semantics, score/freshness/budgets and transactional recovery. [Spec](docs/specs/SPEC-GX-CAP-5.md). |
+| GX-CAP-5 | Implemented v1; locally validated | Native FTS with explicit analyzer/version, analyzed OR terms, weighted BM25, snapshot/filter/budget contracts and transactional recovery. Prefix/phrase syntax, relationship FTS and same-name analyzer replacement remain unsupported, not silently emulated. Cold statistics are O(postings + document text); incremental MVCC aggregates remain a performance opportunity. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [evidence](docs/reports/V005_OPS2_FTS_CHECKPOINT.md). |
 | GX-CAP-6 | Planned | Explainable text/vector/graph retrieval, fusion, bounded expansion and explicit degraded results; requires CAP-5 and vector foundation. [Spec](docs/specs/SPEC-GX-CAP-6.md). |
 | GX-CAP-7 | Planned | Trusted in-process extension SPI, scalar/aggregate UDFs and procedures, manifests, quotas and typed failures; no access to mutable WAL/pages. [Spec](docs/specs/SPEC-GX-CAP-7.md). |
 | GX-CAP-8 | Planned | Arrow/batch interoperability, external scans and graph exchange; explicit schemas/ownership/snapshot boundaries, no implicit distributed transaction. [Spec](docs/specs/SPEC-GX-CAP-8.md). |

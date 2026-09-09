@@ -6261,6 +6261,27 @@ class IndexManager:
                 if table_id not in high_waters:
                     table = self._heap.catalog.catalog.table_by_id(table_id)
                     high_waters[table_id] = self._heap.committed_high_water(table)
+        # A future table write is not evidence of a write AT the checkpoint. Redo
+        # may already have installed future heap stamps; clamping max(stamps) to
+        # the checkpoint invented a missing index interval and poisoned sound
+        # baseline generations before their complete retained WAL was replayed.
+        # Native heaps derive the actual maximum at/below the checkpoint; unknown
+        # collaborators retain the previous conservative refusal.
+        if type(self._heap) is HeapStore and floor:
+            # A generation already covering the floor cannot be falsely shortened by
+            # this comparison. Only ambiguous older generations need a historical walk;
+            # healthy replay/checkpoint paths keep their established scoped photo cost.
+            historical_tables = {
+                index.definition.table_id
+                for index in indexes
+                if high_waters[index.definition.table_id] > floor
+                and index._fresh_certificate().header.built_through_lsn < floor
+            }
+            for table_id in historical_tables:
+                table = self._heap.catalog.catalog.table_by_id(table_id)
+                high_waters[table_id] = self._heap.committed_high_water(
+                    table, through_lsn=floor
+                )
         return tuple(
             index
             for index in indexes
@@ -6525,9 +6546,8 @@ class IndexManager:
             else _active_indexes
         )
         return sum(
-            1
+            index.definition.entry_count_for_record(record_id, values)
             for index in indexes
-            if index.definition.owes_entry_for_record(record_id, values)
         )
 
     def stage_row_insert(
@@ -6557,14 +6577,8 @@ class IndexManager:
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
-                records.append(
-                    index.stage_insert(
-                        txn,
-                        definition.key_for_record(record_id, values),
-                        ref,
-                        csn,
-                    )
-                )
+                for key in definition.entry_keys_for_record(record_id, values):
+                    records.append(index.stage_insert(txn, key, ref, csn))
         return tuple(records)
 
     def stage_row_delete(
@@ -6594,14 +6608,8 @@ class IndexManager:
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
-                records.append(
-                    index.stage_delete(
-                        txn,
-                        definition.key_for_record(record_id, values),
-                        ref,
-                        csn,
-                    )
-                )
+                for key in definition.entry_keys_for_record(record_id, values):
+                    records.append(index.stage_delete(txn, key, ref, csn))
         return tuple(records)
 
     def stage_row_update(
@@ -6635,23 +6643,11 @@ class IndexManager:
             if not owes_old and not owes_new:
                 index.stage_empty_observation(txn)
             elif owes_old:
-                records.append(
-                    index.stage_delete(
-                        txn,
-                        definition.key_for_record(record_id, old_values),
-                        old_ref,
-                        csn,
-                    )
-                )
+                for key in definition.entry_keys_for_record(record_id, old_values):
+                    records.append(index.stage_delete(txn, key, old_ref, csn))
             if owes_new:
-                records.append(
-                    index.stage_insert(
-                        txn,
-                        definition.key_for_record(record_id, new_values),
-                        new_ref,
-                        csn,
-                    )
-                )
+                for key in definition.entry_keys_for_record(record_id, new_values):
+                    records.append(index.stage_insert(txn, key, new_ref, csn))
         return tuple(records)
 
     def _commit_under_write_authority(self, txn: StagingTransaction, csn: Csn) -> int:
@@ -7830,14 +7826,12 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for_record(version.record_id, version.values)
-            if key is None:
-                continue
-            index.stage_insert(txn, key, ref, version.xmin)
-            staged += 1
-            if not is_open_end_csn(version.xmax):
-                index.stage_delete(txn, key, ref, version.xmax)
+            for key in definition.entry_keys_for_record(version.record_id, version.values):
+                index.stage_insert(txn, key, ref, version.xmin)
                 staged += 1
+                if not is_open_end_csn(version.xmax):
+                    index.stage_delete(txn, key, ref, version.xmax)
+                    staged += 1
         return staged
 
     def _allocate_detached_generation_nonce(self, occupied: Collection[int]) -> int:
@@ -8009,8 +8003,7 @@ class IndexManager:
                     )
                 ended_at = version.xmax
 
-            key = definition.entry_key_for_record(version.record_id, version.values)
-            if key is not None:
+            for key in definition.entry_keys_for_record(version.record_id, version.values):
                 yield ref, key, ended_at
 
     def _count_detached_exact_generation_entries(
@@ -8365,8 +8358,7 @@ class IndexManager:
             # never have persisted its reserved birth stamp.
             return ()
         if (
-            definition.entry_key_for_record(version.record_id, version.values)
-            != entry.key
+            not definition.entry_matches(entry.key, version.record_id, version.values)
         ):
             findings.append(
                 IndexFinding(
@@ -8451,10 +8443,8 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for_record(version.record_id, version.values)
-            if key is None:
-                continue
-            if (key, ref) in stored:
+            keys = definition.entry_keys_for_record(version.record_id, version.values)
+            if all((key, ref) in stored for key in keys):
                 continue
             if not is_open_end_csn(version.xmax) and version.xmax <= reconciled:
                 # The entry was released by a reconciliation pass this index has recorded, so its

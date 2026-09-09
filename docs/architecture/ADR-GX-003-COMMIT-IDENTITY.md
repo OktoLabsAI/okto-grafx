@@ -1,6 +1,8 @@
 # ADR GX-003 — Commit identity and bounded generic metadata
 
-Status: accepted semantic contract; GX-CAP-1 encoding/public API pending.
+Status: accepted semantic contract; bounded N4 encoding/native publication/public API
+implemented in 0.0.5 development. See [consumer semantics](../COMMIT_HISTORY.md)
+and [acceptance/remaining limits](../reports/V005_N3_N4_ACCEPTANCE.md).
 Source: complementary plan §6 in full. Precedes temporal publication.
 
 ## Decision
@@ -11,7 +13,9 @@ have no ordering meaning. Gaps are allowed, reuse after durability is forbidden.
 The externally meaningful reference includes store identity. Existing physical
 commit LSN reuse is permitted only after proving uniqueness, monotonicity,
 retention independence, restore/import behavior and crash replay semantics.
-This ADR does not select a new counter or a WAL-byte mapping without that proof.
+The selected, qualified physical mapping and its proofs are recorded in
+[Commit catalog v1](COMMIT_CATALOG_V1.md); this semantic ADR does not allocate
+a second counter.
 
 Allocation/publication uses the existing serialized commit protocol, not a new
 global lock, retained writer lease or single-writer process. Both OCC passes and
@@ -54,4 +58,7 @@ Required GX-CAP-1 gate: multiprocess ordering/uniqueness, old snapshot isolation
 metadata mutation/oversize/invalid-type rejection before I/O, clock tie/regression/
 overflow, all durability/publication crash cuts, repeated recovery, n-1 refusal,
 lookup/verify corruption, export/import mapping, and metrics-on/off parity.
-No new format bit is allocated by this contract-only milestone.
+This original contract did not itself allocate a bit. The subsequent N4 implementation
+uses the documented commit-catalog required capability; it does not imply temporal
+graph queries or unlimited audit retention. OPS-2 graph transfer exports current
+state without history; explicit commit-envelope transfer remains a separate API.

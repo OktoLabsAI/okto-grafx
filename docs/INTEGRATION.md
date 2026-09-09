@@ -1,5 +1,10 @@
 # Integration recipes
 
+New 0.0.5 development integration recipes: [logical transfer](LOGICAL_TRANSFER.md)
+for verified fresh-store copies, and [full-text search](FULL_TEXT_SEARCH.md) for
+native lexical retrieval. Both use ordinary transaction ownership; FTS-specific
+options belong to the database integration layer, not a consumer's domain model.
+
 [Documentation index](README.md) · [Start here](GETTING_STARTED.md) · [Operations](OPERATIONS.md)
 
 This is the synchronous embedded API. Read the operational contract before deploying workers.

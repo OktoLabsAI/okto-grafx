@@ -49,9 +49,9 @@ def counters(monkeypatch: pytest.MonkeyPatch) -> Counter:
     walk = HeapStore.committed_high_water
     advance = IndexStore.advance_built_through
 
-    def counting_walk(self, table):
+    def counting_walk(self, table, **kwargs):
         counts["committed_high_water"] += 1
-        return walk(self, table)
+        return walk(self, table, **kwargs)
 
     def counting_advance(self, lsn):
         counts["advance_built_through"] += 1

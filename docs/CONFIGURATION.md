@@ -1,5 +1,12 @@
 # Configuration reference
 
+The connection settings below are distinct from operation-local options.
+[Full-text search](FULL_TEXT_SEARCH.md#analyzer-and-index-options) documents every
+`TextIndexOptions` field (persisted), `TextSearchLimits` field (per search), BM25
+parameters and cancellation/deadline semantics. [Logical transfer](LOGICAL_TRANSFER.md#limits-and-errors)
+documents every `TransferLimits` field. Neither options class adds a `connect`
+keyword; no existing connection default was changed for these features.
+
 [Documentation index](README.md) · [Operations](OPERATIONS.md)
 
 

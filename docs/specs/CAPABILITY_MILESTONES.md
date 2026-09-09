@@ -7,11 +7,11 @@ requirements remain in the [source archive](../archive/ROADMAP_SOURCES.md).
 | Milestone | Specification | Implementation status |
 |---|---|---|
 | GX-CAP-0 | [Boundaries/contracts](SPEC-GX-CAP-0.md) | Enforcement and contract checkpoint |
-| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | Partial: paged journal validation/replay/checkpoint integrated; automatic emission/public history API not enabled |
+| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | Bounded N4 implemented: opt-in native publication, metadata, snapshot history, verification and transfer hooks; [acceptance and limits](../reports/V005_N3_N4_ACCEPTANCE.md) |
 | GX-CAP-2 | [Catalog sessions and workspace scopes](SPEC-GX-CAP-2.md) | Not certified; contract routing only |
 | GX-CAP-3 | [Temporal system time](SPEC-GX-CAP-3.md) | Not certified; contract routing only |
 | GX-CAP-4 | [Valid time, bitemporal queries and graph diff](SPEC-GX-CAP-4.md) | Not certified; contract routing only |
-| GX-CAP-5 | [Native full-text search](SPEC-GX-CAP-5.md) | Not certified; contract routing only |
+| GX-CAP-5 | [Native full-text search](SPEC-GX-CAP-5.md) | FTS-v1 implemented; [consumer API and limits](../FULL_TEXT_SEARCH.md); [local acceptance](../reports/V005_OPS2_FTS_CHECKPOINT.md) |
 | GX-CAP-6 | [Explainable hybrid retrieval](SPEC-GX-CAP-6.md) | Not certified; contract routing only |
 | GX-CAP-7 | [Extension SPI and UDFs](SPEC-GX-CAP-7.md) | Not certified; contract routing only |
 | GX-CAP-8 | [Arrow and external data](SPEC-GX-CAP-8.md) | Not certified; contract routing only |

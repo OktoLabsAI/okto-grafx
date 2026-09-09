@@ -1,6 +1,7 @@
 # Persisted capability strategy for complementary milestones
 
-Status: GX-CAP-0 contract only; no new format bits or on-disk writes.
+Status: governing GX-CAP-0 strategy, with subsequent implemented capabilities listed
+below. The strategy document itself does not activate or upgrade a store.
 Authority: complementary plan D16, §§6–15, 19.5; existing catalog/recovery contracts.
 
 ## Existing mechanism to extend, not replace
@@ -8,11 +9,14 @@ Authority: complementary plan D16, §§6–15, 19.5; existing catalog/recovery c
 `src/okto_grafx/domain/model/catalog.py` supports legacy catalog v1 and v2 with
 a required-capability bitmap, bounded index metadata and checksum. Current known
 bits cover identity secondary indexes, heap reclamation, WAL-v2 records and
-ordered secondary indexes. Unknown required bits raise a typed refusal.
+ordered secondary indexes, commit catalog v1 (bit 4) and full-text indexes v1 (bit 5).
+Unknown required bits raise a typed refusal.
 `tests/storage_core/test_catalog_v2.py` and
 `tests/index/test_ordered_format_discrimination.py` exercise unknown/missing bits
-and older-reader discrimination. These tests prove existing behavior, not support
-for future temporal, FTS or commit-metadata encodings.
+and older-reader discrimination. The subsequent layouts are specified in
+[Commit catalog v1](../architecture/COMMIT_CATALOG_V1.md) and
+[Full-text v1](FULLTEXT_V1_FORMAT.md). Neither implies support for future temporal
+encodings or unknown analyzer versions.
 
 No second free-form JSON manifest may bypass that admission. Optional package
 installation, Python API availability, enabled runtime policy, index readiness and
@@ -57,5 +61,6 @@ even if its implementation happens to reside in an optional wheel.
 ## GX-CAP-0 limit
 
 Six ADRs and the milestone routing specs define semantics and ownership only.
-GX-CAP-1 must first decide/prove the CommitId physical mapping and legacy boundary.
-No store is upgraded and no experimental API is exported by this milestone.
+GX-CAP-1 subsequently proved the bounded N4 mapping/legacy boundary and exposed
+the [commit history API](../COMMIT_HISTORY.md). No store was upgraded by the
+original GX-CAP-0 documentation milestone; activation remains explicit per feature.

@@ -36,6 +36,27 @@ and stale diagnostic snapshots mean this is not an all-green operational audit.
 
 ## Native synthetic checkpoint in the 0.0.5 development line
 
+### Latest FTS and logical-transfer sample
+
+Fresh local default-config stores, Windows/Python 3.13.1; 200 five-word documents,
+one indexed STRING field, 64 buckets, 20 exact `group3` hits. CRC accelerator 1.8.0
+installed. These are new capability observations, not Pulse latency or a speedup
+comparison. [Reproduction, assertions and limits](reports/V005_OPS2_FTS_CHECKPOINT.md#final-acceptance).
+
+| Operation | Latest measured result |
+| --- | ---: |
+| Native text index build | 458.654 ms |
+| Cold BM25 top-20 | 57.658 ms / 1,220 postings visited |
+| Warm BM25 top-20, median of 20 calls | 3.903 ms / 20 postings visited |
+| One indexed document, complete durable transaction | 44.092 ms |
+| Export 201 documents | 165.526 ms / 13,344 artifact bytes |
+| Import with index rebuild, verification and promotion | 1,554.748 ms |
+
+Cold and warm are cache regimes, not evolution de/para. Cold statistics remain
+linear and are invalidated by writes; no RSS, production SLO or large-graph claim.
+
+### Previous native workloads, latest observations retained
+
 R3 storage-growth acceptance (September 8, isolated 512-byte-page fixture): a
 4,200-character replacement after quiescent overflow retirement appended **0 heap
 pages**, including after reopen. This measures reused capacity, not latency or file

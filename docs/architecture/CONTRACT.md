@@ -14,6 +14,14 @@ New gaps are recorded in the roadmap, not a recreated punch-list. The current
 [performance policy](../PERFORMANCE.md) supersedes historical timing gates only;
 storage, concurrency, recovery and quality invariants are unchanged.
 
+Authorized 0.0.5 extension routing: [FTS-v1](../specs/FULLTEXT_V1_FORMAT.md) adds
+required capability bit 5, index derivation tag 4 and multiple postings per row
+inside the existing exact HASH/index-WAL protocol. Single-key scalar derivations
+retain their original encoding. [Logical transfer](../LOGICAL_TRANSFER.md) is an
+outer composition API using existing native transactions; it introduces no alternate
+page authority, relaxed OCC or independently writable same-UUID clone. Later extension
+specifications govern these added bytes without rewriting historical scalar contracts.
+
 ---
 
 ## 0. Non-negotiables (from the board guidelines and binding decisions D1–D9)

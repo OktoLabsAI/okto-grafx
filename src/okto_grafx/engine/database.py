@@ -31,6 +31,10 @@ detail is exactly the defect A47 was written about.
 
 from __future__ import annotations
 
+from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextSearchResult
+from okto_grafx.engine.fulltext import create_text_index as _create_text_index, search_text as _search_text
+from okto_grafx.domain.query.text_procedure import text_call
+
 import struct
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -1578,6 +1582,7 @@ class Database:
         "_catalog",
         "_catalog_view_memo",
         "_plan_view_memo",
+        "_text_stats_cache",
         "_plan_guard_factory",
         "_checksum_scope",
         "_heap",
@@ -1754,6 +1759,7 @@ class Database:
         # settlement, so Database.close can finish it before storage and the pool disappear. A
         # transaction that never executed a statement needs no entry and no post-close unwind.
         self._public_contexts: dict[int, TransactionContext] = {}
+        self._text_stats_cache: dict = {}
         self._close_releasing: bool = False
         self._close_released: bool = False
         self._close_failure: BaseException | None = None
@@ -2511,6 +2517,9 @@ class Database:
                 parameters,
                 max_string_characters=self._max_query_value_characters,
             )
+            call = text_call(statement, detached_parameters)
+            if call is not None:
+                return self._run_text_procedure(context, call, control)
             with self._transactions.page_access_section(transaction=context):
                 self._require_open()
                 if not context.active:
@@ -2549,6 +2558,25 @@ class Database:
             if control is not None:
                 control.check()
             return result
+
+    def _run_text_procedure(self, context: TransactionContext, call: tuple[object, ...], control: _ReadControl | None) -> QueryResult:
+        """Run the closed FTS read procedure, sharing the calling statement's deadline."""
+        candidate_filter = None
+        if len(call) == 4:
+            if type(call[3]) not in (list, tuple):
+                raise GrafxConfigurationError("record_ids must be a list parameter.", field="record_ids")
+            candidate_filter = RecordIdFilter.of(call[3])
+        found = _search_text(self, Transaction(self, context), index=call[0], query=call[1], k=call[2],
+                             filter=candidate_filter, limits=None, k1=1.2, b=0.75,
+                             timeout_seconds=None, cancellation=None, _control=control)
+        return QueryResult(
+            columns=("record_id", "score", "matched_fields", "matched_terms", "regime", "index_built_through_commit", "snapshot_commit"),
+            rows=tuple((hit.record_id, hit.score, hit.matched_fields, hit.matched_terms, found.regime,
+                        found.index_built_through_commit, found.snapshot_commit) for hit in found.hits),
+            statistics={"postings_visited": found.postings_visited, "candidates": found.candidates,
+                        "corpus_documents": found.corpus_documents, "snapshot_commit": found.snapshot_commit,
+                        "index_built_through_commit": found.index_built_through_commit, "fulltext_exact_index": 1},
+        )
 
     def _run_many(
         self,
@@ -2934,6 +2962,22 @@ class Database:
             )
 
     # --- operator surface ---------------------------------------------------------------------
+
+    def create_text_index(self, name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None = None, bucket_count: int = 64) -> IndexView:
+        """Create a native persisted full-text generation over one to four STRING fields."""
+        return _create_text_index(self, name, table, columns, options=options, bucket_count=bucket_count)
+
+    def search_text(self, reader: Transaction | None = None, *, index: str, query: str, k: int = 20,
+                    filter: RecordIdFilter | None = None, limits: TextSearchLimits | None = None,
+                    k1: float = 1.2, b: float = 0.75, timeout_seconds: float | None = None,
+                    cancellation: CancellationToken | None = None) -> TextSearchResult:
+        """Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot."""
+        if reader is None:
+            with self.begin("read") as owned:
+                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation)
+        if type(reader) is not Transaction:
+            raise GrafxConfigurationError("reader must be a Transaction.", field="reader")
+        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation)
 
     def create_index(
         self,

@@ -15,6 +15,9 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "backup.py": {"BackupReport"},
+    "transfer.py": {"TransferLimits", "TransferReport", "RecordIdMapping"},
+    "domain/index/fulltext.py": {"TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"},
     "api/options.py": {"ConnectOptions"},
     "engine/database.py": {
         "DatabaseIdentity",
@@ -44,6 +47,13 @@ DTO_SOURCES = {
     "domain/model/schema.py": {"TableDef", "ColumnDef", "EmbeddingSpaceDef"},
     "domain/model/value.py": {"Timestamp", "Uuid", "VectorValue"},
     "domain/vector/filter.py": {"RecordIdFilter"},
+}
+
+
+FUNCTION_SOURCES = {
+    "api/__init__.py": {"connect"},
+    "backup.py": {"create_backup", "restore_backup"},
+    "transfer.py": {"export_graph", "import_graph"},
 }
 
 
@@ -91,6 +101,12 @@ def render() -> str:
     for cls in source_tree("engine/database.py").body:
         if isinstance(cls, ast.ClassDef) and cls.name in FACADES:
             result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
+    result.append("\n## Public factory and transfer functions\n\n")
+    for relative, names in FUNCTION_SOURCES.items():
+        module = "okto_grafx." + relative.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+        for node in source_tree(relative).body:
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                result.append(f"\n### {module}.{node.name}\n\n```python\n{node.name}({ast.unparse(node.args)}) -> {ast.unparse(node.returns)}\n```\n\n{description(node)}\n")
     result.append(
         "\n## Result and observation type fields\n\n"
         "DTO module paths below are annotation/import locations, not permission to\n"

@@ -24,6 +24,7 @@ that owns it (A24), and this module only makes it reachable by its supported pat
 from __future__ import annotations
 
 from okto_grafx.api import ConnectOptions, connect
+from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult
 from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.txn.commit_identity import CommitId
@@ -69,6 +70,10 @@ __all__ = [
     "ScanPageV1",
     "ScanRowV1",
     "Timestamp",
+    "TextIndexOptions",
+    "TextSearchLimits",
+    "TextHit",
+    "TextSearchResult",
     "Transaction",
     "VectorValue",
     "__version__",

@@ -1,5 +1,10 @@
 # Query language reference
 
+The closed read-only `CALL grafx.search_text(index, query, k [, record_ids])`
+procedure is supported through materialized `execute`; see [FTS procedure syntax](FULL_TEXT_SEARCH.md#procedure-query).
+This does not enable arbitrary CALL/YIELD, suffix composition, cursor/explain support
+or textual full-text DDL. Use `Database.create_text_index` to create FTS indexes.
+
 [Documentation index](README.md) · [Python API](API_REFERENCE.md)
 
 

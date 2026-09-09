@@ -47,9 +47,12 @@ context exit commits, and an exceptional exit rolls back. See
 | Atomic `executemany`, streaming results and snapshot-bound physical scan cursors | [Integration recipes](docs/INTEGRATION.md) |
 | Automatic PK/endpoint/identity indexes; custom hash/ordered indexes; foreground rebuild/rehash | [Indexes and vectors](docs/INDEXES_AND_VECTORS.md) |
 | Exact and approximate vector search with declared space, metric and precision | [Indexes and vectors](docs/INDEXES_AND_VECTORS.md) |
+| Native full-text indexes, versioned analyzers, weighted BM25 and bounded snapshot search (0.0.5 development) | [Full-text search](docs/FULL_TEXT_SEARCH.md) |
+| Opt-in durable commit provenance, qualified lookup and snapshot-paged history (0.0.5 development) | [Commit history](docs/COMMIT_HISTORY.md) |
 | Query/transaction budgets, optional spill, acceleration and metrics | [All configuration fields](docs/CONFIGURATION.md) |
 | Verification, evidence ledger/quarantine, recovery/checkpoint, manual vacuum and WAL compression | [Operations](docs/OPERATIONS.md) |
 | Bounded physical backup and verified offline replacement restore (0.0.5 development) | [Backup and restore](docs/BACKUP_RESTORE.md) |
+| Streaming versioned logical export/import, fresh identities, endpoint/vector remapping and verified promotion (0.0.5 development) | [Logical transfer](docs/LOGICAL_TRANSFER.md) |
 | Cooperative read cancellation/deadlines and quiescent orphan-index inventory/removal (0.0.5 development) | [Read control and cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | Embedded Python, machine-readable CLI, configurable ports/adapters | [API](docs/API_REFERENCE.md), [CLI](docs/CLI.md), [ports](docs/PORTS.md) |
 

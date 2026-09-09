@@ -1908,7 +1908,7 @@ class HeapStore:
 
     # --- reading ---------------------------------------------------------------------------
 
-    def committed_high_water(self, table: TableDef) -> Lsn:
+    def committed_high_water(self, table: TableDef, *, through_lsn: Lsn | None = None) -> Lsn:
         """Return the highest committed birth or end stamp stored for ``table``.
 
         Index freshness is a property of the table an index covers, not of unrelated commits
@@ -1918,14 +1918,19 @@ class HeapStore:
 
         ``NO_CSN`` means that no committed version or end is present. Provisional stamps are
         abandoned, unpublished attempts and therefore cannot raise the committed watermark.
+        ``through_lsn`` includes only actual stamps at or before that replay ceiling;
+        a later stamp is excluded, never clamped to an invented earlier table write.
         """
+        if through_lsn is not None and (type(through_lsn) is not int or not 0 <= through_lsn < PROVISIONAL_CSN):
+            raise GrafxConfigurationError("Invalid historical watermark ceiling.", field="through_lsn")
         high_water: Lsn = NO_LSN
 
         def observe(record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
             """Validate record lifetime coordinates and accumulate the committed high watermark."""
             nonlocal high_water
             if is_committed_csn(xmin):
-                high_water = max(high_water, xmin)
+                if through_lsn is None or xmin <= through_lsn:
+                    high_water = max(high_water, xmin)
             elif xmin != NO_CSN and not is_provisional_csn(xmin):
                 raise GrafxCorruptionDetected(
                     f"Record {record_id} of table {table.name!r} has invalid birth "
@@ -1938,7 +1943,8 @@ class HeapStore:
                     value=xmin,
                 )
             if is_committed_csn(xmax):
-                high_water = max(high_water, xmax)
+                if through_lsn is None or xmax <= through_lsn:
+                    high_water = max(high_water, xmax)
             elif xmax != NO_CSN and not is_provisional_csn(xmax):
                 raise GrafxCorruptionDetected(
                     f"Record {record_id} of table {table.name!r} has invalid end "

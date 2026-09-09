@@ -9,6 +9,22 @@ including the on-disk format.
 
 ### Changed
 
+- Added bounded versioned logical graph export/import with complete schema/value/vector
+  verification, fresh identity mapping, index reconstruction and no-replace promotion.
+  Current state only; no mid-import continuation or historical-journal copy.
+- Added persisted native FTS-v1: four frozen analyzers, weighted BM25, typed/procedure
+  search, snapshot filters/budgets, transactional postings and generation rebuild.
+  Activation requires a new catalog capability; older builds refuse. Cold statistics
+  remain a documented linear scan, not an unmeasured performance claim.
+- Corrected recovery baseline validation to compare real table stamps at/before the
+  checkpoint instead of inventing a checkpoint-time write from a later heap stamp.
+  Genuinely omitted pre-checkpoint index writes still refuse.
+- Corrected detached index creation/rebuild with commit history enabled: the sealed
+  transaction admits exactly its internally prepared journal's physical interests,
+  while extra caller interests/images/rows remain refused.
+- Audited prior consumer documentation: commit-provenance capability status, backup
+  report DTOs and top-level API signatures now appear in the generated reference.
+
 - Added explicit quiescent orphan-index inventory/removal, with catalog/retained-WAL
   protection, dry-run default, budgets, cache retirement and interruption-safe retry.
   Catalog-owned STALE/BUILDING generations are not garbage-collected.

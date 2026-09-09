@@ -2464,7 +2464,23 @@ class TransactionManager:
         plan = self._index_catalog_activation_plans.get(txn.txn_id)
         if plan is None:
             return
-        self._validate_index_catalog_activation_plan(txn, plan)
+        journal_partitions: frozenset[int] = frozenset()
+        journal = self._journal_attempt
+        if journal is not None and journal[0] == int(txn.txn_id):
+            # The early seal was checked before native journal preparation. That
+            # preparation adds only its exact physical OCC interests, not caller
+            # pages/rows. Derive the permitted delta from the owned immutable plan,
+            # never from whatever the transaction happens to contain now.
+            journal_locations = set(journal[2]) | {
+                (item.file, item.page_index)
+                for item in journal[1].bind(through_lsn + 1).images
+            }
+            journal_partitions = frozenset(
+                page_partition(file, page) for file, page in journal_locations
+            )
+        self._validate_index_catalog_activation_plan(
+            txn, plan, journal_partitions=journal_partitions
+        )
         if plan.state == "built":
             return
         if plan.state == "failed":
@@ -2489,6 +2505,8 @@ class TransactionManager:
     def _validate_index_catalog_activation_plan(
         txn: TransactionContext,
         plan: _IndexCatalogActivationPlan,
+        *,
+        journal_partitions: frozenset[int] = frozenset(),
     ) -> None:
         """Refuse any work added to the private activation transaction after planning.
 
@@ -2508,7 +2526,7 @@ class TransactionManager:
             or txn._effective_row_tables not in (None, frozenset())
             or tuple(sorted(txn.page_images.items())) != plan.page_images
             or frozenset(txn.read_partitions) != plan.read_partitions
-            or frozenset(txn.write_partitions) != plan.write_partitions
+            or frozenset(txn.write_partitions) != plan.write_partitions | journal_partitions
         ):
             raise GrafxTransactionStateError(
                 "A detached index-catalog transaction was modified after its shadow plan was "

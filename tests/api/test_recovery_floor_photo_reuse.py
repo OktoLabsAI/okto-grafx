@@ -25,9 +25,9 @@ def _count_walks(monkeypatch):
     counts = Counter()
     original = HeapStore.committed_high_water
 
-    def count(self, table):
+    def count(self, table, **kwargs):
         counts[table.name] += 1
-        return original(self, table)
+        return original(self, table, **kwargs)
 
     monkeypatch.setattr(HeapStore, "committed_high_water", count)
     return counts

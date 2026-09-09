@@ -64,6 +64,7 @@ ALLOWED_STDLIB_MODULES: frozenset[str] = frozenset(
         "types",
         "typing",
         "zlib",
+        "unicodedata",
     }
 )
 """The only modules the pure core may import. Anything else is mechanism or a dependency.
@@ -83,6 +84,10 @@ pure under the same criterion as ``dataclasses`` and ``collections``.
 ``zlib`` is the deterministic algorithm that defines the durable WRITE_PAGE v2 grammar. It has
 no I/O, time, randomness or platform decision, and keeping bounded inflate beside that grammar
 prevents an adapter from acquiring authority over WAL interpretation.
+
+``unicodedata`` supplies pure normalization/category algorithms. Persisted FTS-v1
+uses only its frozen ``ucd_3_2_0`` database, never the runtime-default Unicode version;
+case folding is supplied by a checked-in Unicode 15.1 table. Neither reads host locale.
 
 ``uuid`` is deliberately absent: ``uuid4`` is unseeded randomness and ``uuid1`` reads the wall
 clock, both of which G2b and amendment A5 keep out of the domain. The identifier type is still

@@ -51,6 +51,7 @@ from okto_grafx.domain.index.definition import (
     automatic_index_definitions,
 )
 from okto_grafx.domain.index.layout import IndexLayout
+from okto_grafx.domain.index.fulltext import FULLTEXT_CAPABILITY, is_fulltext
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import (
     SPACE_STATE_ACTIVE,
@@ -108,6 +109,7 @@ _HEAP_RECLAIM_V1_BIT = 1 << 1
 _WAL_RECORD_V2_BIT = 1 << 2
 _ORDERED_SECONDARY_INDEXES_V1_BIT = 1 << 3
 _COMMIT_CATALOG_V1_BIT = 1 << 4
+_FULLTEXT_V1_BIT = 1 << 5
 
 
 _KNOWN_CAPABILITY_BITS = (
@@ -116,6 +118,7 @@ _KNOWN_CAPABILITY_BITS = (
     | _WAL_RECORD_V2_BIT
     | _ORDERED_SECONDARY_INDEXES_V1_BIT
     | _COMMIT_CATALOG_V1_BIT
+    | _FULLTEXT_V1_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -126,6 +129,7 @@ _CAPABILITY_TO_BIT = MappingProxyType(
             _ORDERED_SECONDARY_INDEXES_V1_BIT
         ),
         COMMIT_CATALOG_V1_CAPABILITY: _COMMIT_CATALOG_V1_BIT,
+        FULLTEXT_CAPABILITY: _FULLTEXT_V1_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -482,6 +486,8 @@ class Catalog:
             for definition in validated.values()
         ):
             capabilities.add(ORDERED_SECONDARY_INDEXES_V1_CAPABILITY)
+        if any(is_fulltext(definition.key_derivation) for definition in validated.values()):
+            capabilities.add(FULLTEXT_CAPABILITY)
         self._required_capabilities = frozenset(capabilities)
         self._install_indexes(validated)
         return self
@@ -494,6 +500,8 @@ class Catalog:
         self._require_index_catalog()
         proposed = (*self.index_definitions(), definition)
         validated = self._validated_index_authority(proposed, stored=False)
+        if is_fulltext(definition.key_derivation):
+            self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_CAPABILITY))
         if definition.layout is IndexLayout.ORDERED:
             self._required_capabilities = frozenset(
                 (
@@ -699,6 +707,8 @@ class Catalog:
             )
             indexes = tuple(validated[key] for key in sorted(validated))
             capability_bits = _encode_capabilities(self._required_capabilities)
+            if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Full-text indexes require their capability.", field="required_capabilities")
             if not capability_bits & _IDENTITY_SECONDARY_INDEXES_V1_BIT:
                 raise GrafxConfigurationError(
                     "Catalog format 2 requires identity_secondary_indexes_v1.",
@@ -892,6 +902,8 @@ class Catalog:
             _require_canonical_order(tables, spaces, indexes)
         catalog._install_loaded(tables, spaces)
         if format_version == CATALOG_FORMAT_VERSION:
+            if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Full-text indexes lack their required capability.", field="required_capabilities")
             if any(
                 definition.layout is IndexLayout.ORDERED for definition in indexes
             ) and (
@@ -1072,6 +1084,10 @@ class Catalog:
                     )
 
             is_identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
+            if is_fulltext(definition.key_derivation) and (
+                table.kind != "node" or any(p >= len(table.columns) or table.columns[p].type is not ValueType.STRING for p in definition.positions)
+            ):
+                refuse("Full-text indexes require declared STRING node fields.", field="positions", index=definition.name)
             if is_identity:
                 if table.kind != "node" or table.name not in endpoints:
                     refuse(
@@ -1306,7 +1322,7 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
         )
     try:
         visibility_tag = _VISIBILITY_TO_TAG[definition.visibility]
-        derivation_tag = _DERIVATION_TO_TAG[definition.key_derivation]
+        derivation_tag = 4 if is_fulltext(definition.key_derivation) else _DERIVATION_TO_TAG[definition.key_derivation]
         layout_tag = _LAYOUT_TO_TAG[definition.layout]
     except KeyError as failure:
         raise GrafxConfigurationError(
@@ -1328,6 +1344,8 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
             definition.expected_cardinality or 0,
         ),
     ]
+    if derivation_tag == 4:
+        parts.append(_encode_text(definition.key_derivation))
     parts.extend(_U32.pack(position) for position in definition.positions)
     parts.extend(
         _INDEX_GENERATION.pack(
@@ -1378,7 +1396,7 @@ def _decode_catalog_index(
             index=name,
         )
     key_derivation = _TAG_TO_DERIVATION.get(derivation_tag)
-    if key_derivation is None:
+    if key_derivation is None and derivation_tag != 4:
         raise GrafxCorruptionDetected(
             f"Index {name!r} declares unknown key-derivation tag {derivation_tag}.",
             field="key_derivation",
@@ -1392,6 +1410,10 @@ def _decode_catalog_index(
             value=automatic,
             index=name,
         )
+    if derivation_tag == 4:
+        key_derivation, offset = _decode_text(raw, offset)
+        if not is_fulltext(key_derivation):
+            raise GrafxCorruptionDetected("Invalid full-text derivation family.", field="key_derivation")
     positions: list[int] = []
     for _ in range(position_count):
         _require(raw, offset, _U32.size, "index position")

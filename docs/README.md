@@ -15,6 +15,8 @@ publication or that the latest source is installed in a particular application.
 | Which settings exist, what are their defaults and risks? | [Configuration](CONFIGURATION.md) |
 | Which Cypher constructs and value types are supported? | [Query language](QUERY_LANGUAGE.md) |
 | How do indexes, vectors and explicit growth work? | [Indexes and vectors](INDEXES_AND_VECTORS.md) |
+| How do I index text and search with BM25, filters and snapshot consistency? | [Native full-text search](FULL_TEXT_SEARCH.md) |
+| How do I export a graph or create a separately writable logical copy? | [Logical export/import](LOGICAL_TRANSFER.md) |
 | How do I handle conflicts, uncertain writes, recovery and upgrades? | [Operations](OPERATIONS.md) |
 | How can I cancel reads or safely reclaim orphan index files? | [Read control and index cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | How can a script/agent consume structured results? | [CLI](CLI.md) |

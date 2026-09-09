@@ -12,6 +12,11 @@ lookup, snapshot pagination, verification, cost and transfer/restore limitations
 the bounded physical backup/offline replacement workflow. See [backup and restore](BACKUP_RESTORE.md)
 for signatures, all parameters, result fields, concurrency and failure guarantees.
 
+`from okto_grafx.transfer import export_graph, import_graph, TransferLimits,
+TransferReport, RecordIdMapping` exposes [versioned logical transfer](LOGICAL_TRANSFER.md).
+`TextIndexOptions`, `TextSearchLimits`, `TextHit` and `TextSearchResult` are root
+exports for `Database.create_text_index` / `search_text`; see [FTS usage](FULL_TEXT_SEARCH.md).
+
 ```python
 from okto_grafx import (
     connect, DatabaseConfig, Database, Transaction, Query, QueryCursor, QueryResult,
@@ -25,7 +30,7 @@ from okto_grafx.domain.model import Uuid
 
 ```python
 connect(path: str | os.PathLike[str], *, registry: PortRegistry | None = None,
-        **options: object) -> Database
+        **options: Unpack[ConnectOptions]) -> Database
 ```
 
 All options are enumerated with defaults, types and effects in
@@ -54,6 +59,8 @@ integrate an application. Frozen views are observations, not mutable engine door
 | `CommitReport` | `csn`, `durable`, `wrote`; may be observable even when commit raises after durability. Follow [outcome handling](OPERATIONS.md#commit-outcomes-and-retries), not automatic retry. |
 | `VectorSearchResult` | `hits`, `regime`, `achieved_k`, `requested_k`, `space`, `filter_cardinality`. `k` is requested, not an unconditional result-count promise. |
 | `VectorHit` | Record ID, score, physical ref and retired flag. ID is not automatically a user PK; ref is not a portable application identifier. |
+| `Database.search_text` / `TextSearchResult` | Native BM25 under a caller-owned reader or autocommit snapshot; complete top-k or typed refusal, versioned analyzer identity, pre-top-k RecordId filter and bounded work. |
+| `TransferReport` | Verified logical artifact/import, source snapshot identity, fresh target UUID and current-record mapping. Not physical restore or historical commit replay. |
 | `VerificationReport` | Scope, findings and examination counts; no findings is not sufficient if nothing was examined. |
 | `RecoveryReport` | Outcome, replay/discard counts, ledger additions, last good LSN and findings; inspect at writable open or explicit recovery. |
 | `Database.closed` / `close_complete` | Admission has closed / lower-layer resource release has completed. They differ during overlapping shutdown; do not replace files merely because admission is closed. |
@@ -681,6 +688,22 @@ search_vectors(transaction: Transaction, *, space: str, query: Sequence[float] |
 
 Search vectors under the fixed snapshot of one active transaction.
 
+#### Database.create_text_index
+
+```python
+create_text_index(name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None=None, bucket_count: int=64) -> IndexView
+```
+
+Create a native persisted full-text generation over one to four STRING fields.
+
+#### Database.search_text
+
+```python
+search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> TextSearchResult
+```
+
+Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot.
+
 #### Database.create_index
 
 ```python
@@ -849,6 +872,49 @@ close() -> None
 
 Release owned resources under this database's checksum selection (FR-1).
 
+## Public factory and transfer functions
+
+
+### okto_grafx.api.connect
+
+```python
+connect(path: str | os.PathLike[str], *, registry: PortRegistry | None=None, **options: Unpack[ConnectOptions]) -> Database
+```
+
+Open the database at `path`, creating it when it does not exist yet (SPEC-M1 FR-1).
+
+### okto_grafx.backup.create_backup
+
+```python
+create_backup(database: Database, destination: str | os.PathLike[str], *, max_bytes: int=_DEFAULT_MAX_BYTES, max_capture_seconds: float=5.0) -> BackupReport
+```
+
+Capture a local checkpoint into a checked, non-database artifact at a new directory.
+
+### okto_grafx.backup.restore_backup
+
+```python
+restore_backup(backup: str | os.PathLike[str], destination: str | os.PathLike[str], *, confirm_original_offline: bool=False, max_bytes: int=_DEFAULT_MAX_BYTES) -> BackupReport
+```
+
+Verify and restore into a NEW directory for offline replacement, never a writable fork.
+
+### okto_grafx.transfer.export_graph
+
+```python
+export_graph(database: Database, destination: str | os.PathLike[str], *, limits: TransferLimits | None=None) -> TransferReport
+```
+
+Stream all current logical schema/rows/vectors from one fixed reader snapshot.
+
+### okto_grafx.transfer.import_graph
+
+```python
+import_graph(source: str | os.PathLike[str], destination: str | os.PathLike[str], *, limits: TransferLimits | None=None) -> TransferReport
+```
+
+Verify a logical artifact and publish a separately writable fresh-UUID database.
+
 ## Result and observation type fields
 
 DTO module paths below are annotation/import locations, not permission to
@@ -856,6 +922,134 @@ construct raw engine state. Consume returned instances and documented accessors.
 `Lsn`, `Csn` and record/table IDs are integer aliases, not wall-clock times.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
+
+### BackupReport fields
+
+Annotation location: `okto_grafx.backup.BackupReport`.
+
+Verified physical cut; bytes count database payload, not manifest or temporary copies.
+
+```python
+destination: str
+database_uuid: str
+checkpoint_lsn: int
+files: int
+bytes: int
+```
+
+### TransferLimits fields
+
+Annotation location: `okto_grafx.transfer.TransferLimits`.
+
+Artifact/work bounds, not a process RSS cap; checked before publication.
+
+```python
+max_bytes: int
+max_rows: int
+max_row_bytes: int
+batch_rows: int
+```
+
+### RecordIdMapping fields
+
+Annotation location: `okto_grafx.transfer.RecordIdMapping`.
+
+One current logical identity remap, qualified by the stable table name.
+
+```python
+table: str
+source_record_id: int
+target_record_id: int
+```
+
+### TransferReport fields
+
+Annotation location: `okto_grafx.transfer.TransferReport`.
+
+Completed artifact/import evidence, not a mapping of historical commits.
+
+```python
+destination: str
+source_database_uuid: str
+source_snapshot_lsn: int
+target_database_uuid: str | None
+tables: int
+rows: int
+bytes: int
+manifest_sha256: str
+record_id_mapping: tuple[RecordIdMapping, ...]
+```
+
+### TextIndexOptions fields
+
+Annotation location: `okto_grafx.domain.index.fulltext.TextIndexOptions`.
+
+Persisted analyzer v1, pinned Unicode rules, locale und and no stop/stem profiles.
+
+```python
+analyzer: str
+analyzer_version: int
+max_token_bytes: int
+max_document_characters: int
+max_document_tokens: int
+field_weights: tuple[float, ...]
+normalization: str
+case_folding: str
+locale: str
+stopwords: str
+stemming: str
+```
+
+#### TextIndexOptions.derivation
+
+```python
+derivation() -> str
+```
+
+Encode the complete durable identity as canonical ASCII hex in catalog v2.
+
+### TextSearchLimits fields
+
+Annotation location: `okto_grafx.domain.index.fulltext.TextSearchLimits`.
+
+Per-search work/memory bounds; page IO remains cooperatively interruptible.
+
+```python
+max_query_tokens: int
+max_postings: int
+max_candidates: int
+max_explanation_bytes: int
+max_memory_bytes: int
+```
+
+### TextHit fields
+
+Annotation location: `okto_grafx.domain.index.fulltext.TextHit`.
+
+One snapshot-visible lexical match; no mutable row payload leaks out.
+
+```python
+record_id: int
+score: float
+matched_fields: tuple[str, ...]
+matched_terms: tuple[str, ...]
+```
+
+### TextSearchResult fields
+
+Annotation location: `okto_grafx.domain.index.fulltext.TextSearchResult`.
+
+Complete bounded BM25 result or a typed refusal, never a partial success.
+
+```python
+hits: tuple[TextHit, ...]
+regime: str
+index_built_through_commit: int
+snapshot_commit: int
+postings_visited: int
+candidates: int
+corpus_documents: int
+```
 
 ### ConnectOptions fields
 
