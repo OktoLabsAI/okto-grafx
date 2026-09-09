@@ -58,3 +58,29 @@ def test_arrow_vector_recipe():
         exec(compile(snippets("EXTENSIONS_AND_ARROW.md")[3], "Arrow vector documentation", "exec"), scope)
         assert scope["report"].statements == 1
         assert db.execute("MATCH (n:Copies) RETURN n.v").rows == db.execute("MATCH (n:Documents) RETURN n.v").rows
+
+
+def test_weighted_projection_recipe():
+    with connect(":memory:") as db:
+        with db.begin() as tx:
+            tx.execute("CREATE NODE TABLE Person(id INT64,PRIMARY KEY(id))")
+            tx.execute("CREATE REL TABLE KNOWS(FROM Person TO Person,cost DOUBLE)")
+            tx.execute("CREATE (:Person {id:1})")
+            tx.execute("MATCH (n:Person) CREATE (n)-[:KNOWS {cost:2.0}]->(n)")
+        scope = {"db": db}
+        exec(compile(snippets("GRAPH_PROJECTIONS.md")[2], "weighted documentation", "exec"), scope)
+        assert scope["route"].found and scope["personalized"].converged
+
+
+@pytest.mark.optional_dependency("pyarrow")
+@pytest.mark.optional_dependency("pandas")
+def test_tabular_parquet_recipes(tmp_path):
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    with connect(":memory:") as db:
+        with db.begin() as tx:
+            tx.execute("CREATE NODE TABLE Document(id INT64,title STRING,PRIMARY KEY(id))")
+        scope = {"db": db, "export_root": tmp_path}
+        for code in snippets("TABULAR_AND_PARQUET.md"):
+            exec(compile(code, "tabular documentation", "exec"), scope)
+        assert db.execute("MATCH (d:Document) RETURN d.id ORDER BY d.id").rows == ((1,), (2,), (3,), (4,))

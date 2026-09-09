@@ -946,6 +946,46 @@ Release owned resources under this database's checksum selection (FR-1).
 ## Public factory and transfer functions
 
 
+### okto_grafx.tabular.to_pandas
+
+```python
+to_pandas(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=100000, max_bytes: int=64 * 1024 * 1024) -> DataFrame
+```
+
+Materialize an explicitly typed Arrow-backed frame; never infer dtypes or close a cursor.
+
+### okto_grafx.tabular.import_pandas
+
+```python
+import_pandas(transaction: Transaction, statement: str, frame: DataFrame, *, types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
+```
+
+Stage one Arrow-backed DataFrame atomically; require explicit dtypes and vector metadata.
+
+### okto_grafx.parquet.read_parquet_batches
+
+```python
+read_parquet_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024, max_row_group_bytes: int=64 * 1024 * 1024) -> Iterator[RecordBatch]
+```
+
+Read typed batches from one permitted local file; close the iterator on early exit.
+
+### okto_grafx.parquet.import_parquet
+
+```python
+import_parquet(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024, max_row_group_bytes: int=64 * 1024 * 1024) -> ExecuteManyReport
+```
+
+Stage one complete local Parquet import atomically; never commit or retry for the caller.
+
+### okto_grafx.parquet.write_parquet
+
+```python
+write_parquet(source: QueryResult | QueryCursor, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024) -> ParquetExportReport
+```
+
+Publish a complete new Parquet file atomically without overwrite; caller owns the cursor.
+
 ### okto_grafx.arrow.import_arrow_batches
 
 ```python
@@ -965,7 +1005,7 @@ Yield copied typed batches; caller owns cursor lifetime and already-emitted batc
 ### okto_grafx.projections.project_graph
 
 ```python
-project_graph(database: Database, reader: Transaction | None=None, *, node_tables: tuple[str, ...], relationship_tables: tuple[str, ...]=(), limits: ProjectionLimits=ProjectionLimits(), cancellation: CancellationToken | None=None, timeout_seconds: float | None=None) -> GraphProjection
+project_graph(database: Database, reader: Transaction | None=None, *, node_tables: tuple[str, ...], relationship_tables: tuple[str, ...]=(), limits: ProjectionLimits=ProjectionLimits(), cancellation: CancellationToken | None=None, timeout_seconds: float | None=None, weight_columns: dict[str, str] | None=None, default_weight: float | None=None) -> GraphProjection
 ```
 
 Capture selected tables in one read snapshot, preserving parallel edges and loops.
@@ -1093,7 +1133,17 @@ limits: ProjectionLimits
 logical_bytes: int
 diagnostics: ProjectionDiagnostics | None
 adjacency: ProjectionAdjacency | None
+lookup: ProjectionLookup | None
+weights: tuple[float, ...] | None
 ```
+
+#### GraphProjection.with_lookup
+
+```python
+with_lookup(*, cancellation: CancellationToken | None=None) -> GraphProjection
+```
+
+Retain a bounded immutable identity lookup, without acquiring storage authority.
 
 #### GraphProjection.with_adjacency
 
@@ -1127,13 +1177,21 @@ shortest_path(source: ProjectionNode, target: ProjectionNode, *, direction: str=
 
 Return one unweighted shortest path; equal choices follow physical edge order.
 
+#### GraphProjection.weighted_shortest_path
+
+```python
+weighted_shortest_path(source: ProjectionNode, target: ProjectionNode, *, direction: str='out', max_results: int=100000, max_distance: float | None=None, cancellation: CancellationToken | None=None) -> WeightedProjectionPath
+```
+
+Find a non-negative minimum-cost path; no hop constraint or implicit weights.
+
 #### GraphProjection.pagerank
 
 ```python
-pagerank(*, damping: float=0.85, tolerance: float=1e-08, max_iterations: int=100, cancellation: CancellationToken | None=None) -> PageRankResult
+pagerank(*, damping: float=0.85, tolerance: float=1e-08, max_iterations: int=100, cancellation: CancellationToken | None=None, backend: str='python', weighted: bool=False, personalization: dict[ProjectionNode, float] | None=None) -> PageRankResult
 ```
 
-Compute bounded unweighted PageRank with explicit convergence and L1 residual.
+Compute bounded optionally weighted/personalized PageRank with explicit convergence.
 
 #### GraphProjection.k_core
 
@@ -1158,6 +1216,30 @@ weakly_connected_components(*, cancellation: CancellationToken | None=None) -> t
 ```
 
 Return each node's component label (minimum table/record identity), including isolates.
+
+### WeightedProjectionPath fields
+
+Annotation location: `okto_grafx.projection_algorithms.WeightedProjectionPath`.
+
+Minimum non-negative cost path, or an explicit unreachable result.
+
+```python
+found: bool
+distance: float | None
+nodes: tuple[ProjectionNode, ...]
+edges: tuple[ProjectionEdge, ...]
+```
+
+### ProjectionLookup fields
+
+Annotation location: `okto_grafx.projection_algorithms.ProjectionLookup`.
+
+Read-only node identity lookup retained by one detached picture.
+
+```python
+positions: Mapping[ProjectionNode, int]
+logical_bytes: int
+```
 
 ### ProjectionPath fields
 
@@ -1196,6 +1278,19 @@ out_edges: tuple[int, ...]
 in_offsets: tuple[int, ...]
 in_edges: tuple[int, ...]
 logical_bytes: int
+```
+
+### ParquetExportReport fields
+
+Annotation location: `okto_grafx.parquet.ParquetExportReport`.
+
+One complete newly published local file; not a database durability receipt.
+
+```python
+path: str
+rows: int
+batches: int
+bytes: int
 ```
 
 ### ArrowVectorType fields

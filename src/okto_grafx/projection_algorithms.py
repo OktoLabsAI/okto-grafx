@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from collections import deque
+from collections.abc import Mapping
+from types import MappingProxyType
 import heapq
 import math
 from typing import TYPE_CHECKING
@@ -14,7 +16,25 @@ from okto_grafx.errors import GrafxConfigurationError
 if TYPE_CHECKING:
     from okto_grafx.projections import GraphProjection, ProjectionNode, ProjectionEdge
 
-__all__ = ["ProjectionAdjacency", "ProjectionPath", "PageRankResult"]
+__all__ = ["ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult"]
+
+
+@dataclass(frozen=True, slots=True)
+class WeightedProjectionPath:
+    """Minimum non-negative cost path, or an explicit unreachable result."""
+
+    found: bool
+    distance: float | None
+    nodes: tuple[ProjectionNode, ...]
+    edges: tuple[ProjectionEdge, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionLookup:
+    """Read-only node identity lookup retained by one detached picture."""
+
+    positions: Mapping[ProjectionNode, int]
+    logical_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,16 +67,38 @@ class ProjectionAdjacency:
     logical_bytes: int
 
 
-def _control(graph, cancellation, *, edge_workspace=0):
+def _control(graph, cancellation, *, edge_workspace=0, node_workspace=None):
     from okto_grafx.projections import _Work, _bound
     work = _Work(graph.limits.max_work, cancellation)
-    _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * len(graph.nodes)
+    count = len(graph.nodes) if node_workspace is None else node_workspace
+    _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * count
            + edge_workspace * len(graph.edges), graph.limits.max_memory_bytes)
     return work
 
 
+def _indexed(graph, work):
+    from okto_grafx.projections import _bound
+    if graph.lookup is not None:
+        return graph
+    charge = 4096 + 256 * len(graph.nodes)
+    _bound("projection_memory", graph.logical_bytes + charge, graph.limits.max_memory_bytes)
+    positions = {}
+    for index, node in enumerate(graph.nodes):
+        work.step()
+        if node in positions:
+            raise GrafxConfigurationError("Projection node identities must be unique.", field="nodes")
+        positions[node] = index
+    return replace(graph, lookup=ProjectionLookup(MappingProxyType(positions), charge),
+                   logical_bytes=graph.logical_bytes + charge)
+
+
+def _with_lookup(graph, cancellation):
+    return _indexed(graph, _control(graph, cancellation, node_workspace=0))
+
+
 def _adjacent(graph, work):
     from okto_grafx.projections import _bound
+    graph = _indexed(graph, work)
     if graph.adjacency is not None:
         return graph
     n, m = len(graph.nodes), len(graph.edges)
@@ -156,22 +198,33 @@ def _positive(name, value, *, zero=False):
         raise GrafxConfigurationError("Invalid bounded algorithm option.", field=name)
 
 
+def _weight(value, field="weight"):
+    try:
+        result = float(value) if type(value) in (int, float) else float("nan")
+    except OverflowError as failure:
+        raise GrafxConfigurationError("Weight exceeds finite numeric range.", field=field) from failure
+    if not math.isfinite(result) or result < 0:
+        raise GrafxConfigurationError("Weight must be finite and non-negative.", field=field)
+    return result
+
+
 def _bfs(graph, source, target, direction, max_depth, max_results, cancellation):
     from okto_grafx.projections import ProjectionNode, _bound
     _direction(direction)
     _positive("max_results", max_results)
     if max_depth is not None:
         _positive("max_depth", max_depth, zero=True)
-    work = _control(graph, cancellation)
-    work.step(len(graph.nodes))
+    work = _control(graph, cancellation, node_workspace=0)
     if type(source) is not ProjectionNode or (target is not None and type(target) is not ProjectionNode):
         raise GrafxConfigurationError("Source and target must be projection node identities.", field="node")
+    graph = _indexed(graph, work)
     try:
-        start = graph.nodes.index(source)
-        end = None if target is None else graph.nodes.index(target)
-    except ValueError as failure:
+        start = graph.lookup.positions[source]
+        end = None if target is None else graph.lookup.positions[target]
+    except KeyError as failure:
         raise GrafxConfigurationError("Node does not belong to this projection.", field="node") from failure
     graph = _adjacent(graph, work)
+    _bound("projection_memory", graph.logical_bytes + 4096 + 1024, graph.limits.max_memory_bytes)
     parents = {start: (start, -1)}
     pending = deque([(start, 0)])
     order = []
@@ -186,6 +239,8 @@ def _bfs(graph, source, target, direction, max_depth, max_results, cancellation)
         for neighbor, edge in _neighbors(graph, node, direction, work):
             if neighbor not in parents:
                 _bound("projection_results", len(parents) + 1, max_results)
+                _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * (len(parents) + 1),
+                       graph.limits.max_memory_bytes)
                 parents[neighbor] = node, edge
                 pending.append((neighbor, depth + 1))
     if target is None:
@@ -205,7 +260,64 @@ def _bfs(graph, source, target, direction, max_depth, max_results, cancellation)
     return ProjectionPath(True, tuple(reversed(nodes)), tuple(reversed(edges)))
 
 
-def _pagerank(graph, damping, tolerance, max_iterations, cancellation):
+def _weighted_path(graph, source, target, direction, max_results, max_distance, cancellation):
+    from okto_grafx.projections import ProjectionNode, _bound
+    _direction(direction)
+    _positive("max_results", max_results)
+    if max_distance is not None:
+        max_distance = _weight(max_distance, "max_distance")
+    if graph.weights is None:
+        raise GrafxConfigurationError("Weighted paths require captured relationship weights.", field="weights")
+    if type(source) is not ProjectionNode or type(target) is not ProjectionNode:
+        raise GrafxConfigurationError("Source and target must be projection node identities.", field="node")
+    work = _control(graph, cancellation, node_workspace=0)
+    graph = _adjacent(graph, work)
+    try:
+        start, end = graph.lookup.positions[source], graph.lookup.positions[target]
+    except KeyError as failure:
+        raise GrafxConfigurationError("Node does not belong to this projection.", field="node") from failure
+    _bound("projection_memory", graph.logical_bytes + 4096 + 1024 + 96, graph.limits.max_memory_bytes)
+    best, parents, settled = {start: 0.0}, {start: (start, -1)}, set()
+    queue, serial = [(0.0, 0, start)], 0
+    while queue:
+        work.step()
+        distance, _serial, node = heapq.heappop(queue)
+        if node in settled or distance != best[node]:
+            continue
+        settled.add(node)
+        if node == end:
+            nodes, edges = [], []
+            current = node
+            while True:
+                work.step()
+                nodes.append(graph.nodes[current])
+                previous, edge = parents[current]
+                if current == start:
+                    break
+                edges.append(graph.edges[edge])
+                current = previous
+            return WeightedProjectionPath(True, distance, tuple(reversed(nodes)), tuple(reversed(edges)))
+        for neighbor, edge in _neighbors(graph, node, direction, work):
+            if neighbor in settled:
+                continue
+            candidate = distance + graph.weights[edge]
+            if not math.isfinite(candidate):
+                raise GrafxConfigurationError("Path distance exceeds finite numeric range.", field="distance")
+            if max_distance is not None and candidate > max_distance:
+                continue
+            if candidate < best.get(neighbor, float("inf")):
+                count = len(best) + (neighbor not in best)
+                _bound("projection_results", count, max_results)
+                _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * count + 96 * (len(queue) + 1),
+                       graph.limits.max_memory_bytes)
+                best[neighbor], parents[neighbor] = candidate, (node, edge)
+                serial += 1
+                heapq.heappush(queue, (candidate, serial, neighbor))
+    return WeightedProjectionPath(False, None, (), ())
+
+
+def _pagerank(graph, damping, tolerance, max_iterations, cancellation, backend="python",
+              weighted=False, personalization=None):
     _positive("max_iterations", max_iterations)
     if max_iterations > 1_000_000:
         raise GrafxConfigurationError("max_iterations must be <=1000000.", field="max_iterations")
@@ -213,9 +325,65 @@ def _pagerank(graph, damping, tolerance, max_iterations, cancellation):
         raise GrafxConfigurationError("damping must be finite and between zero and one.", field="damping")
     if type(tolerance) not in (float, int) or not 0 < tolerance <= 1 or not math.isfinite(tolerance):
         raise GrafxConfigurationError("tolerance must be finite in (0,1].", field="tolerance")
-    work = _control(graph, cancellation)
+    if type(backend) is not str or backend not in ("python", "numpy"):
+        raise GrafxConfigurationError("backend must be python or numpy.", field="backend")
+    if type(weighted) is not bool or (weighted and graph.weights is None):
+        raise GrafxConfigurationError("weighted requires captured weights and must be boolean.", field="weighted")
+    work = _control(graph, cancellation, edge_workspace=512 if backend == "numpy" or weighted else 0)
     graph = _adjacent(graph, work)
     n = len(graph.nodes)
+    from okto_grafx.projections import ProjectionNode, _bound
+    _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * n
+           + (512 * len(graph.edges) if backend == "numpy" or weighted else 0), graph.limits.max_memory_bytes)
+    work.step(n)
+    seed = [1.0 / n] * n if n else []
+    if personalization is not None:
+        if type(personalization) is not dict or not personalization or len(personalization) > n:
+            raise GrafxConfigurationError("personalization must be a nonempty bounded node-weight dictionary.", field="personalization")
+        seed = [0.0] * n
+        for node, value in personalization.items():
+            work.step()
+            if type(node) is not ProjectionNode or node not in graph.lookup.positions:
+                raise GrafxConfigurationError("Personalization node is not in this projection.", field="personalization")
+            seed[graph.lookup.positions[node]] = _weight(value, "personalization")
+        maximum = max(seed)
+        if maximum == 0:
+            raise GrafxConfigurationError("Personalization needs positive total mass.", field="personalization")
+        total = math.fsum(value / maximum for value in seed)
+        seed = [value / maximum / total for value in seed]
+    offsets = graph.adjacency.out_offsets
+    shares = None
+    if weighted:
+        work.step(len(graph.edges))
+        shares = [0.0] * len(graph.edges)
+        for node in range(n):
+            work.step()
+            entries = graph.adjacency.out_edges[offsets[node]:offsets[node + 1]]
+            maximum = max((graph.weights[i] for i in entries), default=0.0)
+            if maximum:
+                total = math.fsum(graph.weights[i] / maximum for i in entries)
+                for i in entries:
+                    work.step()
+                    shares[i] = graph.weights[i] / maximum / total
+        outgoing = [False] * n
+        for index, edge in enumerate(graph.edges):
+            work.step()
+            if shares[index] > 0:
+                outgoing[edge.source] = True
+        dangling = tuple(i for i, value in enumerate(outgoing) if not value)
+    else:
+        dangling = tuple(i for i in range(n) if offsets[i] == offsets[i + 1])
+    if backend == "numpy":
+        from okto_grafx.adapters.numpy_projection import pagerank_numpy
+        _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * n + 512 * len(graph.edges),
+               graph.limits.max_memory_bytes)
+        offsets = graph.adjacency.out_offsets
+        work.step(n + len(graph.edges))
+        result = pagerank_numpy(n, tuple(e.source for e in graph.edges), tuple(e.target for e in graph.edges),
+            tuple(shares) if shares is not None else tuple(1.0 / (offsets[e.source + 1] - offsets[e.source]) for e in graph.edges),
+            tuple(seed), dangling,
+            damping, tolerance, max_iterations, work.step)
+        return PageRankResult(*result)
     if not n:
         return PageRankResult((), 0, True, 0.0)
     work.step(n)
@@ -223,15 +391,15 @@ def _pagerank(graph, damping, tolerance, max_iterations, cancellation):
     offsets = graph.adjacency.out_offsets
     for iteration in range(1, max_iterations + 1):
         work.step(n)
-        dangling = sum(ranks[i] for i in range(n) if offsets[i] == offsets[i + 1])
-        updated = [(1.0 - damping + damping * dangling) / n] * n
+        mass = sum(ranks[i] for i in dangling)
+        updated = [(1.0 - damping + damping * mass) * value for value in seed]
         for node in range(n):
             work.step()
             degree = offsets[node + 1] - offsets[node]
             if degree:
                 share = damping * ranks[node] / degree
-                for target, _edge in _neighbors(graph, node, "out", work):
-                    updated[target] += share
+                for target, edge in _neighbors(graph, node, "out", work):
+                    updated[target] += share if shares is None else damping * ranks[node] * shares[edge]
         work.step(n)
         residual = sum(abs(a - b) for a, b in zip(updated, ranks))
         ranks = updated
@@ -242,7 +410,7 @@ def _pagerank(graph, damping, tolerance, max_iterations, cancellation):
 
 def _k_core(graph, cancellation):
     work = _control(graph, cancellation, edge_workspace=512)
-    # Reserve simultaneous simple-neighbor sets, stale heap pairs and output.
+    # Reserve simultaneous simple-neighbor sets, bucket arrays and output.
     from okto_grafx.projections import _bound
     _bound("projection_memory", graph.logical_bytes + 4096 + 1024 * len(graph.nodes)
            + 512 * len(graph.edges), graph.limits.max_memory_bytes)
@@ -254,20 +422,38 @@ def _k_core(graph, cancellation):
             neighbors[edge.source].add(edge.target)
             neighbors[edge.target].add(edge.source)
     degrees = [len(row) for row in neighbors]
-    queue = [(degree, i) for i, degree in enumerate(degrees)]
-    heapq.heapify(queue)
-    removed = set()
-    result = [0] * len(degrees)
-    while queue:
+    bins = [0] * (max(degrees, default=0) + 1)
+    for degree in degrees:
         work.step()
-        degree, node = heapq.heappop(queue)
-        if node in removed or degree != degrees[node]:
-            continue
-        removed.add(node)
-        result[node] = degree
+        bins[degree] += 1
+    start = 0
+    for degree in range(len(bins)):
+        work.step()
+        size = bins[degree]
+        bins[degree] = start
+        start += size
+    positions, vertices = [0] * len(degrees), [0] * len(degrees)
+    for node, degree in enumerate(degrees):
+        work.step()
+        positions[node] = bins[degree]
+        vertices[positions[node]] = node
+        bins[degree] += 1
+    for degree in range(len(bins) - 1, 0, -1):
+        bins[degree] = bins[degree - 1]
+    bins[0] = 0
+    for offset in range(len(vertices)):
+        work.step()
+        node = vertices[offset]
         for neighbor in neighbors[node]:
             work.step()
-            if neighbor not in removed and degrees[neighbor] > degree:
+            if degrees[neighbor] > degrees[node]:
+                degree = degrees[neighbor]
+                position = positions[neighbor]
+                boundary = bins[degree]
+                other = vertices[boundary]
+                if neighbor != other:
+                    positions[neighbor], positions[other] = boundary, position
+                    vertices[position], vertices[boundary] = other, neighbor
+                bins[degree] += 1
                 degrees[neighbor] -= 1
-                heapq.heappush(queue, (degrees[neighbor], neighbor))
-    return tuple(result)
+    return tuple(degrees)

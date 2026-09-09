@@ -1,5 +1,9 @@
 # Trusted extensions and Arrow import/export
 
+For typed DataFrames and local Parquet files, see [Pandas/Parquet](TABULAR_AND_PARQUET.md).
+Those optional adapters reuse this native batch contract and whole-call savepoint;
+they do not add Cypher external scans or a second graph backup format.
+
 These are opt-in Python integration capabilities in 0.0.5 development. Neither
 changes a database format, enables a server, imports code from a database nor
 weakens WAL, OCC or independent reader/writer rules.

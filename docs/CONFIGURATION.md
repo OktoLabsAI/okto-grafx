@@ -1,5 +1,14 @@
 # Configuration reference
 
+The continuation after `970aa1e` adds **operation-local**, not connection, options:
+projection `weight_columns=None`/`default_weight=None`; PageRank `backend="python"`,
+`weighted=False`, `personalization=None`; Dijkstra `max_distance=None` and existing
+direction/output/cancellation controls. [Algorithm contracts](GRAPH_PROJECTIONS.md)
+explain memory/work charges and the explicit NumPy choice. Optional `pandas` and
+`arrow` extras enable the [Pandas/Parquet APIs](TABULAR_AND_PARQUET.md), whose complete
+row/batch/file/frame defaults and required `types`/`allowed_root` are documented
+there. No environment variable, global backend switch or durable format changes.
+
 The continuation after `3f3819f` also adds `vacuum(index_free_pages=False)` and
 explicit `create_index(layout="sparse_hash")`; these are operation options, not
 global switches. `connect(extensions=None)` accepts a trusted immutable object

@@ -1,6 +1,13 @@
 # SPEC-GX-CAP-8 — Arrow and external data
 
-Status: scalar/vector batch interop implemented in 0.0.5 development; broader external-data scope remains planned. Date: 2026-09-09.
+Status: scalar/vector Arrow, typed Pandas and local Parquet interop implemented in 0.0.5 development; broader external-data scope remains planned. Date: 2026-09-09.
+
+The continuation after `970aa1e` adds explicit Arrow-backed DataFrames and local
+Parquet batches. [Types, bounds, NULL/NaN, directory trust and publication contract](../TABULAR_AND_PARQUET.md).
+Imports preserve whole-call staging atomicity; no commit or native format change.
+Parquet nullable vectors use tagged list-v1 physical encoding, normalized to the
+existing fixed-size-list API. Polars, CSV/JSON scans, COPY and graph exchange remain.
+[Execution receipt](../reports/V005_AFTER_970AA1E.md).
 
 0.0.5 continuation: optional scalar Arrow **export** over native results/cursors is
 implemented; [consumer type/ownership contract](../EXTENSIONS_AND_ARROW.md) and

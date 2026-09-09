@@ -9,6 +9,14 @@ including the on-disk format.
 
 ### Changed
 
+- Continuation after `970aa1e`: retained immutable identity lookup, discovery-sized
+  BFS workspace and linear bucket k-core; explicit NumPy PageRank acceleration.
+- Snapshot-captured non-negative relationship weights, bounded Dijkstra paths and
+  weighted/personalized PageRank, preserving physical multiplicity and read/write rights.
+- Optional typed Arrow-backed Pandas import/export and local Parquet batches with
+  explicit schema/bounds, atomic native import and no-overwrite file publication.
+  Nullable vectors use tagged variable lists on disk and fixed-size lists at the API.
+
 - Continuation after `7dde256`: column-projected physical scan with byte limits and
   cooperative controls; batched graph capture with work diagnostics, preserving
   omitted-payload validation and one-shot cursor/snapshot identity.

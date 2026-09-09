@@ -19,16 +19,19 @@ assert TEST_GRAFX_SHA is not None
 
 @pytest.fixture(scope="module")
 def pinned_grafx_checkout(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Run provenance instruments against a real clean pin, independent of developer edits."""
+    """Run provenance instruments against a clean independent pin, without copying all history."""
     root = tmp_path_factory.mktemp("perf-source") / "grafx"
     subprocess.run(
-        ["git", "clone", "--local", "--no-hardlinks", "--quiet", "--no-checkout",
+        ["git", "clone", "--no-local", "--depth", "1", "--quiet", "--no-checkout",
          str(receipt.PROJECT_ROOT), str(root)], check=True, capture_output=True,
+        timeout=30,
     )
     subprocess.run(
         ["git", "-C", str(root), "checkout", "--detach", "--quiet", TEST_GRAFX_SHA],
         check=True, capture_output=True,
+        timeout=20,
     )
+    assert receipt.git_sha_of(root) == TEST_GRAFX_SHA
     return root
 
 

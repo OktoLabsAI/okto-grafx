@@ -6,6 +6,12 @@ Date: 2026-09-09. [Consumer contract](../GRAPH_PROJECTIONS.md),
 [algorithm continuation](../reports/V005_AFTER_7DDE256.md).
 Dependencies: GX-CAP-7; existing traversal/query budgets.
 
+The continuation after `970aa1e` adds retained node identity lookup, local-path
+discovery budgets, bucket k-core, opt-in NumPy PageRank, snapshot numeric weights,
+Dijkstra and weighted/personalized PageRank. [Detailed contracts](../GRAPH_PROJECTIONS.md)
+and [validation receipt](../reports/V005_AFTER_970AA1E.md). Derived state never
+grants storage authority; multi-read/write, WAL and durability remain unchanged.
+
 ## Normative scope
 
 [Full complementary requirements](../archive/ROADMAP_SOURCES.md#source-grafx-complementary-evolution-plan-codex), §13; §17 GX-CAP-9.
@@ -52,7 +58,7 @@ with logical limits, cancellation and an independent reachability oracle. The
 continuation after `7dde256` adds projected batched capture, retained immutable CSR,
 iterative SCC, BFS reachability/shortest paths, bounded unweighted PageRank and
 simple-undirected k-core. Oracles use independent reachability, linear-system and
-peeling implementations. Persisted catalog, weights/personalization, mutation/write modes and NetworkX acceptance
+peeling implementations. Persisted catalog, mutation/write modes and NetworkX acceptance
 remain backlog; the independent oracle is not recorded as a NetworkX run.
 No release, new on-disk capability,
 installed Pulse feature, or successful crash matrix is inferred from this document.

@@ -36,6 +36,33 @@ and stale diagnostic snapshots mean this is not an all-green operational audit.
 
 ## Native synthetic checkpoint in the 0.0.5 development line
 
+### Continuation after 970aa1e: prepared algorithms
+
+Windows/Python 3.13.1, NumPy 2.5.2; September 9, 2026. One seeded synthetic
+detached picture, 5,000 nodes and 30,000 physical directed edges (seed 970).
+Median of three calls per configuration, after import/CSR/identity preparation and
+NumPy warm-up; preparation, capture, database I/O and UI are excluded. Recorded
+after the grouped regressions finished, without a machine-idle certification.
+
+| Operation / current configuration | Latest measured median |
+| --- | ---: |
+| PageRank, Python backend, tolerance 1e-10 | 389.27 ms |
+| PageRank, explicit NumPy backend, tolerance 1e-10 | 12.69 ms |
+| Simple-undirected bucket k-core | 33.31 ms |
+
+Both PageRank configurations converged in 24 iterations, residual approximately
+7.70e-11; scores agreed within absolute 1e-11. Retained picture charge: 30,732,288
+logical bytes, not measured RSS. Raw samples and limitations are in the
+[round receipt](reports/V005_AFTER_970AA1E.md). Reproduce with
+`PYTHONPATH=src python tools/measure_projection_kernels.py` (set the environment
+variable using your shell's syntax). This is not an isolated before/after release
+comparison, a timing gate, database write throughput or a Pulse KG-page measurement.
+
+Separately, a prepared 10,000-node picture's two-node local BFS passes with
+`max_work=10` and workspace for two discoveries, proving that this operation no
+longer scans every node identity. One-time capture and topology preparation still
+cost O(V+E). See `tests/api/test_projection_acceleration.py`.
+
 ### Continuation after 7dde256: latest capture work observation
 
 Windows/Python 3.13 source tests. These are counts, not latency or UI measurements.

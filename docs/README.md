@@ -32,6 +32,7 @@ then consult the API/query references for the capabilities your application uses
 ## Extend or maintain the engine
 
 - [Trusted scalar extensions and optional Arrow batches](EXTENSIONS_AND_ARROW.md).
+- [Typed Pandas frames and local Parquet files](TABULAR_AND_PARQUET.md).
 - [0.0.5 compatibility/upgrade matrix](V005_COMPATIBILITY.md).
 
 [Physical backup and restore](BACKUP_RESTORE.md) covers the bounded local API,

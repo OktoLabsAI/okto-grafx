@@ -69,6 +69,7 @@ def test_optional_dependencies_are_the_declared_extras(manifest: dict[str, Any])
     extras = manifest["project"]["optional-dependencies"]
     assert extras == {
         "arrow": ["pyarrow>=14"],
+        "pandas": ["pyarrow>=14", "pandas>=2"],
         "accel": ["numpy>=1.24", "google-crc32c>=1.5"],
         "bench": ["ladybug==0.16.0", "numpy>=1.24"],
         "dev": ["pytest>=8", "pytest-timeout", "ruff==0.15.1", "PyYAML>=6"],

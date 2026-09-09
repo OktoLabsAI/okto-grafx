@@ -15,6 +15,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 from generate_api_reference import MARKER, render  # noqa: E402
 
 CONSUMER_DOCS = (
+    "docs/GRAPH_PROJECTIONS.md",
+    "docs/TABULAR_AND_PARQUET.md",
     "docs/EXTENSIONS_AND_ARROW.md",
     "docs/V005_COMPATIBILITY.md",
     "docs/specs/HEAP_FREE_PAGE_INDEX.md",

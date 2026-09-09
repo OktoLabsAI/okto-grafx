@@ -3,6 +3,14 @@
 This document is an execution matrix, not a claim of publication or release-wide
 certification. No existing Pulse data participates in these checks.
 
+The continuation after `970aa1e` adds detached weighted algorithms, opt-in NumPy
+PageRank and optional Pandas/Parquet adapters. Default Python algorithms and Arrow
+APIs remain; no connection field, WAL effect or required format bit is introduced.
+The tagged Parquet vector representation is an optional interop encoding, not a
+native database format. See [contracts](TABULAR_AND_PARQUET.md) and
+[current local evidence](reports/V005_AFTER_970AA1E.md); other platforms and minimum
+dependency versions are not certified by one installed Windows environment.
+
 The continuation after `7dde256` adds only transient projected scans/algorithms and
 explicit Arrow vector interop. No new persistent capability or connection default.
 Malformed encapsulated vector parameters now receive native target-space validation.

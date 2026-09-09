@@ -11,8 +11,8 @@ from okto_grafx.errors import (
 )
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.projection_algorithms import (
-    ProjectionAdjacency, ProjectionPath, PageRankResult,
-    _with_adjacency, _strong_components, _bfs, _pagerank, _k_core,
+    ProjectionLookup, ProjectionAdjacency, ProjectionPath, WeightedProjectionPath, PageRankResult,
+    _with_lookup, _with_adjacency, _strong_components, _bfs, _pagerank, _k_core, _weight, _weighted_path,
 )
 
 __all__ = ["ProjectionLimits", "ProjectionDiagnostics", "ProjectionNode", "ProjectionEdge", "GraphProjection", "project_graph"]
@@ -106,6 +106,12 @@ class GraphProjection:
     logical_bytes: int
     diagnostics: ProjectionDiagnostics | None = None
     adjacency: ProjectionAdjacency | None = None
+    lookup: ProjectionLookup | None = None
+    weights: tuple[float, ...] | None = None
+
+    def with_lookup(self, *, cancellation: CancellationToken | None = None) -> GraphProjection:
+        """Retain a bounded immutable identity lookup, without acquiring storage authority."""
+        return _with_lookup(self, cancellation)
 
     def with_adjacency(self, *, cancellation: CancellationToken | None = None) -> GraphProjection:
         """Return a new picture with reusable immutable adjacency, charging its memory."""
@@ -126,10 +132,17 @@ class GraphProjection:
         """Return one unweighted shortest path; equal choices follow physical edge order."""
         return _bfs(self, source, target, direction, max_depth, max_results, cancellation)
 
+    def weighted_shortest_path(self, source: ProjectionNode, target: ProjectionNode, *, direction: str = "out",
+                               max_results: int = 100_000, max_distance: float | None = None,
+                               cancellation: CancellationToken | None = None) -> WeightedProjectionPath:
+        """Find a non-negative minimum-cost path; no hop constraint or implicit weights."""
+        return _weighted_path(self, source, target, direction, max_results, max_distance, cancellation)
+
     def pagerank(self, *, damping: float = 0.85, tolerance: float = 1e-8, max_iterations: int = 100,
-                 cancellation: CancellationToken | None = None) -> PageRankResult:
-        """Compute bounded unweighted PageRank with explicit convergence and L1 residual."""
-        return _pagerank(self, damping, tolerance, max_iterations, cancellation)
+                 cancellation: CancellationToken | None = None, backend: str = "python",
+                 weighted: bool = False, personalization: dict[ProjectionNode, float] | None = None) -> PageRankResult:
+        """Compute bounded optionally weighted/personalized PageRank with explicit convergence."""
+        return _pagerank(self, damping, tolerance, max_iterations, cancellation, backend, weighted, personalization)
 
     def k_core(self, *, cancellation: CancellationToken | None = None) -> tuple[int, ...]:
         """Return simple-undirected core numbers: parallel edges collapse and loops are ignored."""
@@ -201,11 +214,13 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
                   node_tables: tuple[str, ...], relationship_tables: tuple[str, ...] = (),
                   limits: ProjectionLimits = ProjectionLimits(),
                   cancellation: CancellationToken | None = None,
-                  timeout_seconds: float | None = None) -> GraphProjection:
+                  timeout_seconds: float | None = None,
+                  weight_columns: dict[str, str] | None = None,
+                  default_weight: float | None = None) -> GraphProjection:
     """Capture selected tables in one read snapshot, preserving parallel edges and loops.
 
     Explicit readers must belong to database and remain caller-owned. Without one,
-    a short-lived read transaction is owned here. Properties/weights are not retained.
+    a short-lived read transaction is owned here. Only explicitly selected weights are retained.
     The logical budget includes algorithm workspace, but excludes caller-retained
     results and the separately bounded scan batch workspace. No hidden full-table query.
     """
@@ -221,11 +236,23 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
             raise GrafxConfigurationError("Expected up to 256 distinct table names.", field=field)
     if not node_tables:
         raise GrafxConfigurationError("At least one node table is required.", field="node_tables")
+    if weight_columns is not None:
+        if (type(weight_columns) is not dict or len(weight_columns) != len(relationship_tables)
+                or set(weight_columns) != set(relationship_tables)
+                or any(type(k) is not str or type(v) is not str or not v or len(v) > 256
+                       or v in ("_from", "_to") for k, v in weight_columns.items())):
+            raise GrafxConfigurationError("weight_columns must name a property for every selected relationship table.", field="weight_columns")
+        weight_columns = dict(weight_columns)
+    elif default_weight is not None:
+        raise GrafxConfigurationError("default_weight requires weight_columns.", field="default_weight")
+    if default_weight is not None:
+        default_weight = _weight(default_weight, "default_weight")
     if reader is None:
         with database.begin("read") as owned:
             return project_graph(database, owned, node_tables=node_tables,
                                  relationship_tables=relationship_tables, limits=limits,
-                                 cancellation=cancellation, timeout_seconds=timeout_seconds)
+                                 cancellation=cancellation, timeout_seconds=timeout_seconds,
+                                 weight_columns=weight_columns, default_weight=default_weight)
     if (type(reader) is not Transaction or reader._database is not database
             or not reader.active or reader.mode != "read"):
         raise GrafxTransactionStateError("Projection requires an active read transaction from this handle.")
@@ -239,8 +266,13 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
         elif (table.kind != "rel" or table.from_table not in node_tables
               or table.to_table not in node_tables):
             raise GrafxConfigurationError("Relationship endpoints must both be selected node tables.", table=table.name)
+        if table.kind == "rel" and weight_columns is not None:
+            column = table.columns[table.column_index(weight_columns[table.name])]
+            if column.type.name not in ("INT64", "DOUBLE"):
+                raise GrafxConfigurationError("Weight columns must be INT64 or DOUBLE.", field="weight_columns", table=table.name)
     nodes: list[ProjectionNode] = []
     edges: list[ProjectionEdge] = []
+    weights: list[float] = []
     offsets: dict[ProjectionNode, int] = {}
     # Includes name storage, temporary lookup, tuple assembly and one algorithm's
     # counters/union-find/output. Not an estimate of Python process RSS.
@@ -255,8 +287,10 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
                 control.check()
             remaining = (None if control is None or control._deadline is None else
                          max(1e-12, control._deadline - database._clock.monotonic()))
+            selected_columns = (() if table.kind == "node" else ("_from", "_to") if weight_columns is None
+                                else ("_from", "_to", weight_columns[table.name]))
             page = reader.scan_rows_v1(table.name, limit=limits.batch_rows, cursor=cursor,
-                                      columns=() if table.kind == "node" else ("_from", "_to"),
+                                      columns=selected_columns,
                                       max_batch_bytes=limits.max_batch_bytes, cancellation=cancellation,
                                       timeout_seconds=remaining)
             scan_calls += 1
@@ -268,7 +302,7 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
                     addition = 1024
                 else:
                     _bound("projection_edges", len(edges) + 1, limits.max_edges)
-                    addition = 512
+                    addition = 512 if weight_columns is None else 544
                 _bound("projection_memory", logical_bytes + addition, limits.max_memory_bytes)
                 logical_bytes += addition
                 if table.kind == "node":
@@ -283,6 +317,9 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
                     if source is None or target is None:
                         raise GrafxCorruptionDetected("Projection edge has no visible endpoint.")
                     edges.append(ProjectionEdge(table.name, row.record_id, source, target))
+                    if weight_columns is not None:
+                        value = default_weight if row.values[2] is None else row.values[2]
+                        weights.append(_weight(value))
             cursor = page.next_cursor
             if cursor is None:
                 break
@@ -291,4 +328,5 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
         control.check()
     return GraphProjection(database.identity.database_uuid, reader.snapshot.read_lsn,
                            tuple(nodes), tuple(edges), limits, logical_bytes,
-                           ProjectionDiagnostics(scan_calls, len(nodes) + len(edges), maximum_batch, work.used))
+                           ProjectionDiagnostics(scan_calls, len(nodes) + len(edges), maximum_batch, work.used),
+                           weights=None if weight_columns is None else tuple(weights))

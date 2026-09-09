@@ -16,7 +16,8 @@ MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
     "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection", "ProjectionDiagnostics"},
-    "projection_algorithms.py": {"ProjectionAdjacency", "ProjectionPath", "PageRankResult"},
+    "projection_algorithms.py": {"ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult"},
+    "parquet.py": {"ParquetExportReport"},
     "arrow.py": {"ArrowVectorType"},
     "domain/query/extensions.py": {"ScalarFunction", "ExtensionRegistry"},
     "engine/vector_memory.py": {"VectorMemoryUsage", "VectorTotalMemoryUsage"},
@@ -60,6 +61,8 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
+    "tabular.py": {"to_pandas", "import_pandas"},
+    "parquet.py": {"read_parquet_batches", "import_parquet", "write_parquet"},
     "arrow.py": {"to_arrow_batches", "import_arrow_batches"},
     "projections.py": {"project_graph"},
     "migrations.py": {"migrate_schema"},
