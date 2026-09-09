@@ -162,6 +162,7 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
     # resolved: an __all__ that names something the module does not define is a broken promise
     # to `from okto_grafx import *`, and it is exported code that no import ever exercises.
     assert okto_grafx.__all__ == [
+        "CancellationToken",
         "CommitCatalogEntry",
         "CommitHistoryPage",
         "CommitId",
@@ -174,6 +175,9 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "DatabaseConfig",
         "DatabaseIdentity",
         "ExecuteManyReport",
+        "HybridHit",
+        "HybridSearchOptions",
+        "HybridSearchResult",
         "MetadataLimits",
         "PortRegistry",
         "Query",
@@ -182,6 +186,10 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "ScanCursorV1",
         "ScanPageV1",
         "ScanRowV1",
+        "TextHit",
+        "TextIndexOptions",
+        "TextSearchLimits",
+        "TextSearchResult",
         "Timestamp",
         "Transaction",
         "VectorValue",

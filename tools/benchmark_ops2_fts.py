@@ -50,7 +50,19 @@ def main() -> None:
                     "CREATE (:Doc {id:200, body:'graph durable wal group3 document200'})"
                 )
             result["one_document_transaction_ms"] = (perf_counter() - started) * 1000
-            assert db.search_text(index="text", query="document200").hits
+            started = perf_counter()
+            advanced = db.search_text(index="text", query="document200")
+            result["post_write_search_ms"] = (perf_counter() - started) * 1000
+            assert advanced.hits and advanced.statistics_regime == "wal_delta"
+            result["post_write_postings"] = advanced.postings_visited
+            result["statistics_wal_records"] = advanced.statistics_wal_records
+            db._text_stats_cache.clear()
+            census = db.search_text(index="text", query="document200")
+            assert (
+                census.hits == advanced.hits
+                and census.corpus_documents == advanced.corpus_documents
+            )
+            result["reference_census_postings"] = census.postings_visited
             started = perf_counter()
             exported = export_graph(db, root / "artifact")
             result["export_ms"] = (perf_counter() - started) * 1000

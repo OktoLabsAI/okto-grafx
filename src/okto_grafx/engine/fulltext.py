@@ -22,8 +22,8 @@ from okto_grafx.domain.index.fulltext import (
     TextSearchResult,
     analyze,
     decode_options,
-    field_tokens,
     is_fulltext,
+    TextAnalysisMemo,
 )
 from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.entry import IndexEntry
@@ -35,6 +35,7 @@ from okto_grafx.domain.query.control import (
 )
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.index_manager import _IndexReadCertificate
+from okto_grafx.engine.fulltext_stats import advance_statistics
 
 if TYPE_CHECKING:
     from okto_grafx.engine.database import Database, Transaction
@@ -195,13 +196,17 @@ def search_text(
             table = database._catalog.catalog.table_by_id(definition.table_id)
             visited = 0
             memory = 0 if allowed is None else len(allowed) * 64
+            analysis = TextAnalysisMemo(min(1_048_576, budget.max_memory_bytes // 4))
 
             def check(charge: int = 0, *, posting: bool = False) -> None:
                 """Charge attempted work, including certificate retries, before more work."""
                 nonlocal visited, memory
                 visited += int(posting)
                 memory += charge
-                if visited > budget.max_postings or memory > budget.max_memory_bytes:
+                if (
+                    visited > budget.max_postings
+                    or memory + analysis.retained_bytes > budget.max_memory_bytes
+                ):
                     raise GrafxQueryBudgetExceeded(
                         "Full-text search work/memory budget exceeded.",
                         resource="text_search",
@@ -226,6 +231,17 @@ def search_text(
                 database._indexes._prepare_heap_view(store.file, certificate)
                 cache_key = (store.file, certificate, snapshot.read_lsn)
                 cached = database._text_stats_cache.get(cache_key)
+                statistics_regime = (
+                    "snapshot_cache" if cached is not None else "full_census"
+                )
+                wal_records = 0
+                if cached is None:
+                    incremental = advance_statistics(
+                        database, store, snapshot.read_lsn, budget, check
+                    )
+                    if incremental is not None:
+                        cached, wal_records = incremental
+                        statistics_regime = "wal_delta"
                 if cached is None:
                     count = 0
                     totals = [0] * len(definition.positions)
@@ -242,7 +258,7 @@ def search_text(
                                 )
                             if not snapshot.visible(version.xmin, version.xmax):
                                 continue
-                            fields = field_tokens(
+                            fields = analysis.fields(
                                 version.values, definition.positions, options
                             )
                             expected = b"\x00" + struct.pack(
@@ -277,7 +293,7 @@ def search_text(
                             )
                         if not snapshot.visible(version.xmin, version.xmax):
                             continue
-                        fields = field_tokens(
+                        fields = analysis.fields(
                             version.values, definition.positions, options
                         )
                         if not any(term in f for f in fields):
@@ -376,6 +392,8 @@ def search_text(
                         visited,
                         len(matches),
                         count,
+                        statistics_regime,
+                        wal_records,
                     ),
                     cache_key,
                     cached,

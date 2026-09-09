@@ -1,6 +1,7 @@
 # Integration recipes
 
-New 0.0.5 development integration recipes: [logical transfer](LOGICAL_TRANSFER.md)
+New 0.0.5 development integration recipes: [hybrid retrieval](HYBRID_SEARCH.md),
+[logical transfer and crash resumption](LOGICAL_TRANSFER.md)
 for verified fresh-store copies, and [full-text search](FULL_TEXT_SEARCH.md) for
 native lexical retrieval. Both use ordinary transaction ownership; FTS-specific
 options belong to the database integration layer, not a consumer's domain model.

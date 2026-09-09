@@ -118,7 +118,8 @@ def test_limit_validation(kwargs):
         TransferLimits(**kwargs)
 
 
-def test_all_value_types_and_retired_space(tmp_path):
+@pytest.mark.parametrize("resumable", [False, True])
+def test_all_value_types_and_retired_space(tmp_path, monkeypatch, resumable):
     from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
     from okto_grafx.domain.model.value import Timestamp, Uuid, ValueType, VectorValue
     from okto_grafx.domain.ports.vectormath import DistanceMetric
@@ -168,7 +169,20 @@ def test_all_value_types_and_retired_space(tmp_path):
                     tx._context, db._catalog.file, page, image
                 )
         export_graph(db, tmp_path / "artifact")
-    import_graph(tmp_path / "artifact", tmp_path / "target")
+    options = {}
+    if resumable:
+        import okto_grafx.transfer_resume as resume
+
+        options["resume_directory"] = tmp_path / "work"
+        with monkeypatch.context() as scoped:
+
+            def interrupt(*args):
+                raise OSError("before publication")
+
+            scoped.setattr(resume, "_promote", interrupt)
+            with pytest.raises(OSError, match="before publication"):
+                import_graph(tmp_path / "artifact", tmp_path / "target", **options)
+    import_graph(tmp_path / "artifact", tmp_path / "target", **options)
     with connect(tmp_path / "target") as db, db.begin("read") as tx:
         page = tx.scan_rows_v1("Mixed", limit=10)
         assert len(page.rows) == 1 and page.rows[0].record_id != 90

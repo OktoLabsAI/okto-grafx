@@ -32,6 +32,8 @@ detail is exactly the defect A47 was written about.
 from __future__ import annotations
 
 from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextSearchResult
+from okto_grafx.domain.query.hybrid import HybridSearchOptions, HybridSearchResult
+from okto_grafx.engine.hybrid import search_hybrid as _search_hybrid
 from okto_grafx.engine.fulltext import create_text_index as _create_text_index, search_text as _search_text
 from okto_grafx.domain.query.text_procedure import text_call
 
@@ -2575,7 +2577,10 @@ class Database:
                         found.index_built_through_commit, found.snapshot_commit) for hit in found.hits),
             statistics={"postings_visited": found.postings_visited, "candidates": found.candidates,
                         "corpus_documents": found.corpus_documents, "snapshot_commit": found.snapshot_commit,
-                        "index_built_through_commit": found.index_built_through_commit, "fulltext_exact_index": 1},
+                        "index_built_through_commit": found.index_built_through_commit, "fulltext_exact_index": 1,
+                        "statistics_wal_records": found.statistics_wal_records,
+                        "statistics_from_wal_delta": int(found.statistics_regime == 'wal_delta'),
+                        "statistics_from_snapshot_cache": int(found.statistics_regime == 'snapshot_cache')},
         )
 
     def _run_many(
@@ -2962,6 +2967,26 @@ class Database:
             )
 
     # --- operator surface ---------------------------------------------------------------------
+
+    def search_hybrid(self, reader: Transaction | None = None, *, table: str,
+                      index: str | None, query: str, space: str | None,
+                      vector: Sequence[float], k: int = 20,
+                      options: HybridSearchOptions | None = None,
+                      filter: RecordIdFilter | None = None,
+                      text_limits: TextSearchLimits | None = None,
+                      timeout_seconds: float | None = None,
+                      cancellation: CancellationToken | None = None) -> HybridSearchResult:
+        """Fuse text/vector candidate windows with RRF-v1 and optional bounded graph evidence."""
+        if reader is None:
+            with self.begin("read") as owned:
+                return self.search_hybrid(owned, table=table, index=index, query=query,
+                    space=space, vector=vector, k=k, options=options, filter=filter,
+                    text_limits=text_limits, timeout_seconds=timeout_seconds, cancellation=cancellation)
+        if type(reader) is not Transaction:
+            raise GrafxConfigurationError("Expected Transaction reader.", field="reader")
+        return _search_hybrid(self, reader, table=table, index=index, query=query,
+            space=space, vector=vector, k=k, options=options, filter=filter,
+            text_limits=text_limits, timeout_seconds=timeout_seconds, cancellation=cancellation)
 
     def create_text_index(self, name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None = None, bucket_count: int = 64) -> IndexView:
         """Create a native persisted full-text generation over one to four STRING fields."""

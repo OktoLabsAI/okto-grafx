@@ -135,6 +135,7 @@ from okto_grafx.domain.page import (
 )
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.txn.context import RowIntent, TransactionContext
+from okto_grafx.domain.index.fulltext import TextAnalysisMemo, is_fulltext
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
@@ -6516,6 +6517,19 @@ class IndexManager:
 
     # --- staging ----------------------------------------------------------------------------
 
+    @staticmethod
+    def _row_keys(txn: StagingTransaction | None, definition: IndexDefinition,
+                  record_id: object, values: Sequence[object]) -> tuple[bytes, ...]:
+        """Share bounded pure text analysis within the transaction, never authority."""
+        if type(txn) is TransactionContext and is_fulltext(definition.key_derivation):
+            if txn._text_analysis_memo is None:
+                limit = txn._max_transaction_bytes
+                txn._text_analysis_memo = TextAnalysisMemo(
+                    min(1_048_576, limit // 8) if limit is not None else 1_048_576
+                )
+            return txn._text_analysis_memo.keys(values, definition.positions, definition.key_derivation)
+        return definition.entry_keys_for_record(record_id, values)
+
     def row_entry_count(
         self,
         table_id: int,
@@ -6546,7 +6560,9 @@ class IndexManager:
             else _active_indexes
         )
         return sum(
-            index.definition.entry_count_for_record(record_id, values)
+            (len(self._row_keys(txn, index.definition, record_id, values))
+             if is_fulltext(index.definition.key_derivation)
+             else index.definition.entry_count_for_record(record_id, values))
             for index in indexes
         )
 
@@ -6577,7 +6593,7 @@ class IndexManager:
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
-                for key in definition.entry_keys_for_record(record_id, values):
+                for key in self._row_keys(txn, definition, record_id, values):
                     records.append(index.stage_insert(txn, key, ref, csn))
         return tuple(records)
 
@@ -6608,7 +6624,7 @@ class IndexManager:
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
-                for key in definition.entry_keys_for_record(record_id, values):
+                for key in self._row_keys(txn, definition, record_id, values):
                     records.append(index.stage_delete(txn, key, ref, csn))
         return tuple(records)
 
@@ -6643,10 +6659,10 @@ class IndexManager:
             if not owes_old and not owes_new:
                 index.stage_empty_observation(txn)
             elif owes_old:
-                for key in definition.entry_keys_for_record(record_id, old_values):
+                for key in self._row_keys(txn, definition, record_id, old_values):
                     records.append(index.stage_delete(txn, key, old_ref, csn))
             if owes_new:
-                for key in definition.entry_keys_for_record(record_id, new_values):
+                for key in self._row_keys(txn, definition, record_id, new_values):
                     records.append(index.stage_insert(txn, key, new_ref, csn))
         return tuple(records)
 
@@ -8295,6 +8311,7 @@ class IndexManager:
     def _verify_entries(self, index: IndexStore) -> tuple[IndexFinding, ...]:
         """Check every stored entry against the heap version it points at."""
         findings: list[IndexFinding] = []
+        analysis = TextAnalysisMemo()
         entries: tuple[IndexEntry, ...]
         try:
             entries = index.walk()
@@ -8328,11 +8345,12 @@ class IndexManager:
                     )
                 )
                 continue
-            findings.extend(self._compare(index, entry, version))
+            findings.extend(self._compare(index, entry, version, analysis=analysis))
         return tuple(findings)
 
     def _compare(
-        self, index: IndexStore, entry: IndexEntry, version: HeapVersion
+        self, index: IndexStore, entry: IndexEntry, version: HeapVersion,
+        *, analysis: TextAnalysisMemo | None = None,
     ) -> tuple[IndexFinding, ...]:
         """Compare one entry against the heap version it points at."""
         definition = index.definition
@@ -8358,7 +8376,9 @@ class IndexManager:
             # never have persisted its reserved birth stamp.
             return ()
         if (
-            not definition.entry_matches(entry.key, version.record_id, version.values)
+            not (entry.key in analysis.keys(version.values, definition.positions, definition.key_derivation)
+                 if analysis is not None and is_fulltext(definition.key_derivation)
+                 else definition.entry_matches(entry.key, version.record_id, version.values))
         ):
             findings.append(
                 IndexFinding(

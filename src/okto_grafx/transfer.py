@@ -571,9 +571,12 @@ def _import_into(
     tables: tuple[TableDef, ...],
     spaces: tuple[EmbeddingSpaceDef, ...],
     limits: TransferLimits,
+    *,
+    resume: bool = False,
 ) -> tuple[RecordIdMapping, ...]:
     """Import nodes before edges, then rebuild indexes and restore retired-space state."""
-    _install_schema(database, tables, spaces)
+    if not resume or not database._catalog.catalog.tables():
+        _install_schema(database, tables, spaces)
     target_catalog = database._catalog.catalog
     space_map = {s.space_id: target_catalog.space(s.name).space_id for s in spaces}
     identities: dict[tuple[str, int], int] = {}
@@ -581,11 +584,33 @@ def _import_into(
     objects = {
         t.name: item for t, item in zip(tables, manifest["objects"], strict=True)
     }
+    existing = {}
+    if resume:
+        from okto_grafx.transfer_resume import validated_inventory
+
+        existing = validated_inventory(
+            database, storage, manifest, tables, spaces, limits
+        )
     for table in sorted(tables, key=lambda t: t.kind != "node"):
         target_table = target_catalog.table(table.name)
         batch = []
+        prior = existing.get(table.name, ())
+        ordinal = 0
+        next_id = 0
         for record_id, values in _rows(storage, objects[table.name], table, limits):
-            new_id = len(identities) + 1
+            if resume:
+                if ordinal < len(prior):
+                    new_id = prior[ordinal]
+                else:
+                    if not batch:
+                        with database._transactions.page_access_section(
+                            fresh_read_view=True
+                        ):
+                            next_id = database._heap.next_record_id(target_table)
+                    new_id = next_id
+                    next_id += 1
+            else:
+                new_id = len(identities) + 1
             identities[table.name, record_id] = new_id
             values = _remap(values, space_map)
             if table.kind == "rel":
@@ -602,13 +627,17 @@ def _import_into(
             expected[table.name, new_id] = hashlib.sha256(
                 encode_values(values)
             ).digest()
-            batch.append((new_id, values))
+            if not resume or ordinal >= len(prior):
+                batch.append((new_id, values))
+            ordinal += 1
             if len(batch) >= limits.batch_rows:
                 _stage_rows(database, target_table, batch)
                 batch = []
         if batch:
             _stage_rows(database, target_table, batch)
     for index in manifest["schema"]["indexes"]:
+        if resume and database._catalog.catalog.has_index_definition(index["name"]):
+            continue  # validated_inventory proved the complete existing declaration
         if index["fulltext"] is not None:
             settings = {
                 **index["fulltext"],
@@ -645,7 +674,7 @@ def _import_into(
                 catalog._install_space(
                     replace(current, created_at_wall=space.created_at_wall)
                 )
-                if not space.is_active:
+                if not space.is_active and current.is_active:
                     catalog.retire_space(space.name)
             for page, image in database._catalog.stage(catalog):
                 database._transactions._stage_page_image(
@@ -678,17 +707,23 @@ def import_graph(
     destination: str | os.PathLike[str],
     *,
     limits: TransferLimits | None = None,
+    resume_directory: str | os.PathLike[str] | None = None,
 ) -> TransferReport:
     """Verify a logical artifact and publish a separately writable fresh-UUID database.
 
     Destination must not exist. Batches commit only inside a private sibling; errors
-    never publish a partial graph. Retry a failed attempt from the immutable artifact,
-    not from private staging. Mapping memory is bounded by max_rows. A completed
+    never publish a partial graph. Optional resume_directory retains a locked private
+    workspace and verifies durable prefixes before continuing the same artifact;
+    otherwise retry starts fresh. Mapping memory is bounded by max_rows. A completed
     artifact can be imported repeatedly into different new directories. The input is
     checksummed, not authenticated; keep it in a trusted, non-writable directory.
     """
     budget = _limits(limits)
     root = Path(source).resolve(strict=True)
+    if resume_directory is not None:
+        from okto_grafx.transfer_resume import resume_import
+
+        return resume_import(root, destination, resume_directory, budget)
     target = _destination(destination, source=root)
     try:
         with LocalStorageDevice(root, create_root=False) as storage:

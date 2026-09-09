@@ -1,6 +1,6 @@
 # SPEC-GX-CAP-6 — Explainable hybrid retrieval
 
-Status: specified / implementation not certified. Date: 2026-09-08.
+Status: bounded native v1 implemented in 0.0.5 development; acceptance tracked below. Date: 2026-09-08.
 Dependencies: GX-CAP-5; real M2 HNSW access path.
 
 ## Normative scope
@@ -16,14 +16,19 @@ Deliverables: RRF/weighted RRF; candidate union/intersection; bounded graph boos
 ## Contract and implementation boundary
 
 Binding decision: [ADR-GX-005-SEARCH.md](../architecture/ADR-GX-005-SEARCH.md).
-Planned owning modules: Domain query/result DTOs; engine fusion and bounded graph expansion; public API; no model provider in core.
+Owning modules: `domain/query/hybrid.py` (options/result DTOs), `engine/hybrid.py`
+(fusion and bounded graph evidence), `Database.search_hybrid` (public API).
+No model provider lives in the core.
 Public interfaces are typed before any new Cypher syntax. Proposed roadmap examples
 are not advertised as implemented APIs. Existing multi-reader/writer, OCC, snapshot,
 WAL, durability, fail-closed and bounded-resource contracts remain in force.
 
-Error taxonomy to specify as public typed outcomes before implementation:
-invalid fusion/weights, unavailable source, candidate/expansion budget, incompatible snapshots, unauthorized partial result. Names/fields must be reconciled with existing public errors, not added as
-generic catch-all wrappers. Cancellation and uncertain durable outcomes stay distinct.
+The implemented error taxonomy reuses configuration, transaction-state,
+unsupported-operation, query-budget, cancellation/deadline and corruption errors.
+Missing-source partial results require explicit policy; source corruption and
+incompatible reader ownership never become partial success. No generic catch-all
+wrapper or new error code is introduced. See the consumer contract for exact bounds
+and the non-preemptive native vector phase.
 
 ## Persistence and recovery prerequisite
 
@@ -43,7 +48,9 @@ sections remain binding. Tests must include failing-before implementation cases 
 hostile inputs, not only happy paths. Publish operation counts and resource evidence
 when claiming complexity/performance improvements; no new marginal timing threshold.
 
-Execution status: **not implemented by GX-CAP-0**. No release, new on-disk capability,
-installed Pulse feature, or successful crash matrix is inferred from this document.
-Record immutable code SHA, test commands/results, audit and unresolved debt here when
-implemented. Next prerequisite is the first unmet dependency, not another scope expansion.
+Execution status: the [typed consumer contract](../HYBRID_SEARCH.md) is implemented
+on top of native FTS/vector sources with no persisted hybrid format. The
+[four-item receipt](../reports/V005_SEARCH_RESUME_CHECKPOINT.md) records tests,
+measurements and limitations. Single-table/single-vector-binding and bounded
+relationship-scan semantics are explicit; no general expansion or universal ANN
+recall is claimed. No release or installed Pulse feature follows from this status.

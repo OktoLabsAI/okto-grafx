@@ -232,6 +232,8 @@ _ERROR_CODE = LabelSpec(
             "index_error",
             "query_error",
             "query_budget_exceeded",
+            "query_cancelled",
+            "query_deadline_exceeded",
             "parse_error",
             "plan_error",
             "vector_validation",

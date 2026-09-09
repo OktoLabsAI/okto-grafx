@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from okto_grafx.api import ConnectOptions, connect
 from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult
+from okto_grafx.domain.query.hybrid import HybridHit, HybridSearchOptions, HybridSearchResult
 from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.txn.commit_identity import CommitId
@@ -61,6 +62,9 @@ __all__ = [
     "DatabaseConfig",
     "DatabaseIdentity",
     "ExecuteManyReport",
+    "HybridHit",
+    "HybridSearchOptions",
+    "HybridSearchResult",
     "MetadataLimits",
     "PortRegistry",
     "Query",
@@ -69,11 +73,11 @@ __all__ = [
     "ScanCursorV1",
     "ScanPageV1",
     "ScanRowV1",
-    "Timestamp",
+    "TextHit",
     "TextIndexOptions",
     "TextSearchLimits",
-    "TextHit",
     "TextSearchResult",
+    "Timestamp",
     "Transaction",
     "VectorValue",
     "__version__",

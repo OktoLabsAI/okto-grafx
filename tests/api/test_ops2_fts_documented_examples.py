@@ -6,7 +6,7 @@ import re
 import pytest
 
 
-@pytest.mark.parametrize("guide", ["FULL_TEXT_SEARCH.md", "LOGICAL_TRANSFER.md"])
+@pytest.mark.parametrize("guide", ["FULL_TEXT_SEARCH.md", "LOGICAL_TRANSFER.md", "HYBRID_SEARCH.md"])
 def test_documented_python_workflow(guide):
     source = (Path(__file__).resolve().parents[2] / "docs" / guide).read_text(
         encoding="utf-8"

@@ -9,13 +9,23 @@ including the on-disk format.
 
 ### Changed
 
+- Closed regression drift in public root exports and query-error metric labels:
+  cancellation/deadline errors can be emitted by the validated OpenMetrics sink.
+  No-op allocation checks now isolate process-global counters without loosening
+  their zero-allocation assertions or allocating-sink counterexample.
+- Added operation-owned pure FTS analysis reuse and bounded committed-WAL advancement
+  of snapshot BM25 statistics; conservative census remains for cold/ambiguous proof.
+- Added native `search_hybrid`, weighted RRF, union/intersection, source explanations,
+  explicit partial policy and bounded snapshot-consistent graph boost/filter.
+- Added opt-in `import_graph(..., resume_directory=...)`: WAL-recovered checked
+  prefixes, lease-safe ID mappings and verified no-replace publication after crashes.
 - Added bounded versioned logical graph export/import with complete schema/value/vector
   verification, fresh identity mapping, index reconstruction and no-replace promotion.
-  Current state only; no mid-import continuation or historical-journal copy.
+  Current state only; no existing-target merge or historical-journal copy.
 - Added persisted native FTS-v1: four frozen analyzers, weighted BM25, typed/procedure
   search, snapshot filters/budgets, transactional postings and generation rebuild.
   Activation requires a new catalog capability; older builds refuse. Cold statistics
-  remain a documented linear scan, not an unmeasured performance claim.
+  remain a documented linear scan when no eligible incremental proof exists.
 - Corrected recovery baseline validation to compare real table stamps at/before the
   checkpoint instead of inventing a checkpoint-time write from a later heap stamp.
   Genuinely omitted pre-checkpoint index writes still refuse.

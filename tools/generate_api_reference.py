@@ -15,6 +15,7 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "domain/query/hybrid.py": {"HybridSearchOptions", "HybridHit", "HybridSearchResult"},
     "backup.py": {"BackupReport"},
     "transfer.py": {"TransferLimits", "TransferReport", "RecordIdMapping"},
     "domain/index/fulltext.py": {"TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"},

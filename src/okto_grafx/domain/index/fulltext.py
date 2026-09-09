@@ -275,6 +275,11 @@ def entry_keys(
     """One length-statistics entry plus one posting per distinct analyzed term."""
     options = decode_options(derivation)
     fields = field_tokens(values, positions, options)
+    return keys_from_fields(fields)
+
+
+def keys_from_fields(fields: tuple[tuple[str, ...], ...]) -> tuple[bytes, ...]:
+    """Encode already-analyzed fields without invoking the analyzer again."""
     stats = b"\x00" + struct.pack("<" + "I" * len(fields), *(len(f) for f in fields))
     return (
         stats,
@@ -283,6 +288,47 @@ def entry_keys(
             for token in sorted({t for f in fields for t in f})
         ),
     )
+
+
+class TextAnalysisMemo:
+    """Bounded operation-owned pure derivations; never heap or visibility authority."""
+
+    __slots__ = ("_items", "max_bytes", "retained_bytes")
+
+    def __init__(self, max_bytes: int = 1_048_576) -> None:
+        self._items: dict[tuple, tuple[tuple[str, ...], ...]] = {}
+        self.max_bytes = max_bytes
+        self.retained_bytes = 0
+
+    def fields(
+        self,
+        values: Sequence[object],
+        positions: tuple[int, ...],
+        options: TextIndexOptions,
+    ) -> tuple[tuple[str, ...], ...]:
+        """Capture STRING leaves and complete persisted analyzer identity before reuse."""
+        texts = tuple(values[p] for p in positions)
+        if any(v is not None and type(v) is not str for v in texts):
+            return field_tokens(values, positions, options)
+        key = (options.derivation(), texts)
+        found = self._items.get(key)
+        if found is not None:
+            return found
+        found = field_tokens(values, positions, options)
+        charge = 256 + sum(64 + 4 * len(t) for t in texts if t is not None)
+        charge += sum(64 + 4 * len(t) for field in found for t in field)
+        if self.retained_bytes + charge <= self.max_bytes:
+            self._items[key] = found
+            self.retained_bytes += charge
+        return found
+
+    def keys(
+        self, values: Sequence[object], positions: tuple[int, ...], derivation: str
+    ) -> tuple[bytes, ...]:
+        """Reuse analyzed fields for counting, staging or verification."""
+        return keys_from_fields(
+            self.fields(values, positions, decode_options(derivation))
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +340,8 @@ class TextSearchLimits:
     max_candidates: int = 10_000
     max_explanation_bytes: int = 65_536
     max_memory_bytes: int = 32 * 1024 * 1024
+    max_statistics_wal_records: int = 4096
+    max_statistics_wal_bytes: int = 8 * 1024 * 1024
 
     def __post_init__(self) -> None:
         """Reject disabled, forged or unbounded counters."""
@@ -303,6 +351,8 @@ class TextSearchLimits:
             "max_candidates",
             "max_explanation_bytes",
             "max_memory_bytes",
+            "max_statistics_wal_records",
+            "max_statistics_wal_bytes",
         ):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= 2**31:
@@ -330,3 +380,5 @@ class TextSearchResult:
     postings_visited: int
     candidates: int
     corpus_documents: int
+    statistics_regime: str = "full_census"
+    statistics_wal_records: int = 0

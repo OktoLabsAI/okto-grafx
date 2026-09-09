@@ -32,7 +32,7 @@ with TemporaryDirectory() as directory:
 ```
 
 `export_graph(database, destination, *, limits=None)` owns one read transaction.
-`import_graph(source, destination, *, limits=None)` owns the private target and its
+`import_graph(source, destination, *, limits=None, resume_directory=None)` owns the private target and its
 write batches. Both return frozen `TransferReport` values. Imports come from
 `okto_grafx.transfer`; they are not instance methods or CLI subcommands.
 
@@ -86,10 +86,70 @@ confirming its process is stopped. Source files and an existing destination rema
 untouched. If publication completed but the caller did not receive the report,
 inspect the destination before retrying; an existing directory is never overwritten.
 
-Resumption is **restart from a completed immutable artifact**, not mid-stream or
-mid-import continuation. An artifact can be imported into several new directories;
+Without `resume_directory`, retry means restart from the completed immutable artifact.
+An artifact can be imported into several new directories;
 each gets its own UUID. Export cannot resume an expired read cursor. Online merge
 into an existing graph and in-place upgrades are not supported.
+
+## Opt-in resumable import
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from okto_grafx import connect
+from okto_grafx.transfer import export_graph, import_graph, TransferLimits
+
+with TemporaryDirectory() as temporary:
+    root = Path(temporary)
+    with connect(root / 'source') as source:
+        with source.begin() as tx:
+            tx.execute('CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))')
+            tx.execute('CREATE (:N {id:1})')
+        export_graph(source, root / 'artifact')
+    report = import_graph(root / 'artifact', root / 'target',
+                          resume_directory=root / 'resume',
+                          limits=TransferLimits(batch_rows=1))
+    # The same call also recovers a lost publication acknowledgement.
+    assert import_graph(root / 'artifact', root / 'target',
+                        resume_directory=root / 'resume') == report
+```
+
+Choose a dedicated private workspace with an existing parent on the destination
+volume. Source artifact, workspace and target must be disjoint, not ancestors of
+one another. Keep all three trusted and the artifact immutable. The workspace lock
+excludes a second importer; it does not change the database's multiwriter protocol.
+Never open/write its private `database` directory from another program.
+
+Retry the same source, destination and workspace after a process interruption or
+ordinary error. Native WAL recovery decides which batches committed. The importer
+revalidates every artifact stream and proves that existing rows, schema and index
+declarations form exact source prefixes before appending missing rows. Fresh native
+RecordIds may contain lease gaps after a crash; the returned mapping, not numeric
+density, is authoritative for the copy. Nodes are mapped before endpoints. Resume
+does not reinsert committed batches, but still performs O(artifact + imported rows)
+validation and final verification. It is not constant-time restart or stream seeking.
+Limits may change between attempts (for example a smaller batch) if the full
+artifact still satisfies them. No target physical setting is inherited from the source.
+
+The small `resume.json` contains format `grafx-resume-1`, artifact manifest hash,
+absolute destination, source UUID, private target UUID, phase (`loading`/`ready`)
+and publication LSN. It is atomically replaced after barriers, **not** a second
+commit journal. COMMIT/WAL and exact readback prove rows. Incomplete, foreign,
+duplicate-field or mismatched metadata refuses. A crash before the initial marker
+exists leaves an ambiguous unpublished workspace: inspect/abandon it and choose a
+new workspace; do not infer ownership and automatically delete it.
+Finalization is idempotent for already-retired embedding spaces: it preserves the
+retired state instead of retiring twice or reactivating it. An unexpectedly retired
+target space whose artifact declares it active refuses before appending data.
+
+Only verified, checkpointed and read-only-reopened stores are promoted atomically
+without replacement. The marker/workspace remains after success. Repeating the call
+can return the same report only when that target UUID, committed LSN and full content
+still match; an unrelated or subsequently modified target refuses. Once the report
+is accepted, close any importing process and manually remove only the identified
+workspace if desired. Do not delete the published target, source or artifact.
+No automatic cleanup, export resumption, merge into existing data, arbitrary
+workspace relocation or authentication against a malicious filesystem owner is offered.
 
 ## Limits and errors
 
@@ -105,7 +165,7 @@ into an existing graph and in-place upgrades are not supported.
 The manifest additionally has a fixed 4 MiB ceiling. Payload IO is streaming, but
 schema, identity maps and expected row hashes remain in memory up to these bounds.
 Import row batches still obey engine transaction/buffer limits. These are not RSS
-caps, resumability guarantees or timing SLOs; peak memory includes Python objects,
+caps or timing SLOs; peak memory includes Python objects,
 temporary encodings and engine buffers. Imports use the current default target
 physical configuration; they do not copy source connection settings.
 

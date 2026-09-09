@@ -6,6 +6,10 @@ The connection settings below are distinct from operation-local options.
 parameters and cancellation/deadline semantics. [Logical transfer](LOGICAL_TRANSFER.md#limits-and-errors)
 documents every `TransferLimits` field. Neither options class adds a `connect`
 keyword; no existing connection default was changed for these features.
+[Hybrid search](HYBRID_SEARCH.md#options) documents all `HybridSearchOptions`
+fields, source windows, weights, graph controls and separate source budgets.
+FTS statistics WAL limits bound an optional delta proof; exceeding them selects
+the ordinary bounded census, not a partial result or weaker validation.
 
 [Documentation index](README.md) · [Operations](OPERATIONS.md)
 

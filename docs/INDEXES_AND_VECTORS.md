@@ -5,6 +5,9 @@ search procedure, see [full-text search](FULL_TEXT_SEARCH.md). It uses the exist
 exact HASH generation/WAL lifecycle but emits several postings per row; it is not
 a scalar equality index or a vector/embedding feature. `rebuild_index`/`rehash_index`
 preserve analyzer identity, and `verify('all')` includes posting coverage.
+[Hybrid search](HYBRID_SEARCH.md) combines native text and vector windows with
+weighted RRF and optional bounded graph evidence; it retains the vector source's
+exact/approximate regime and uses one read snapshot throughout.
 
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md) · [Maintenance](OPERATIONS.md)
 

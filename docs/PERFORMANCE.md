@@ -41,19 +41,41 @@ and stale diagnostic snapshots mean this is not an all-green operational audit.
 Fresh local default-config stores, Windows/Python 3.13.1; 200 five-word documents,
 one indexed STRING field, 64 buckets, 20 exact `group3` hits. CRC accelerator 1.8.0
 installed. These are new capability observations, not Pulse latency or a speedup
-comparison. [Reproduction, assertions and limits](reports/V005_OPS2_FTS_CHECKPOINT.md#final-acceptance).
+comparison. [Reproduction, assertions and limits](reports/V005_SEARCH_RESUME_CHECKPOINT.md).
 
 | Operation | Latest measured result |
 | --- | ---: |
-| Native text index build | 458.654 ms |
-| Cold BM25 top-20 | 57.658 ms / 1,220 postings visited |
-| Warm BM25 top-20, median of 20 calls | 3.903 ms / 20 postings visited |
-| One indexed document, complete durable transaction | 44.092 ms |
-| Export 201 documents | 165.526 ms / 13,344 artifact bytes |
-| Import with index rebuild, verification and promotion | 1,554.748 ms |
+| Native text index build | 229.289 ms |
+| Cold BM25 top-20 | 35.603 ms / 1,220 postings visited |
+| Warm BM25 top-20, median of 20 calls | 2.870 ms / 20 postings visited |
+| One indexed document, complete durable transaction | 27.256 ms |
+| Search for newly written unique term, incremental statistics | 4.356 ms / 21 postings + 11 WAL records |
+| Export 201 documents | 92.791 ms / 13,344 artifact bytes |
+| Import with index rebuild, verification and promotion | 938.954 ms |
 
 Cold and warm are cache regimes, not evolution de/para. Cold statistics remain
-linear and are invalidated by writes; no RSS, production SLO or large-graph claim.
+linear; eligible writes advance scalar statistics with bounded native WAL evidence.
+The new-term result was checked against an independent census with identical hits
+and scores. No RSS, production SLO or large-graph claim. These observations were
+taken while a separate regression process was running; host contention was not isolated.
+
+### Native hybrid sample
+
+Separate synthetic 200-document corpus, two-dimensional unit-circle embeddings,
+three-word text, 64 FTS buckets, source windows 100, result k=20. Native ANN explicitly
+selected (`vector_exact_scan_threshold=0`, `vector_ef_search=256`); graph disabled.
+
+| Operation | Latest measured result |
+| --- | ---: |
+| Cold hybrid top-20, including first vector-index use | 181.030 ms |
+| Warm hybrid top-20, median of 20 calls | 5.280 ms |
+| Warm maximum of those 20 calls | 5.763 ms |
+| Fused recall@20 against an exact-source run, one fixed query | 1.0 |
+
+Native-source RRF ranks/scores matched the independently assembled reference.
+This tiny low-dimensional query is a conformance fixture, not a representative
+semantic recall evaluation. Maximum of 20 calls is not a p99 estimate; peak RSS
+and cold distribution remain unmeasured. No Pulse workload was consumed.
 
 ### Previous native workloads, latest observations retained
 

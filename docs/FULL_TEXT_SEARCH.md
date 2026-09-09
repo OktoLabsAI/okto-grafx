@@ -130,10 +130,16 @@ not a promise of identical libm rounding on every architecture.
 
 `TextHit` exposes `record_id`, `score`, sorted `matched_fields`, sorted `matched_terms`.
 The result exposes `hits`, `regime='exact_index'`, `index_built_through_commit`,
-`snapshot_commit`, `postings_visited`, `candidates`, `corpus_documents`. Build coverage
+`snapshot_commit`, `postings_visited`, `candidates`, `corpus_documents`,
+`statistics_regime` and `statistics_wal_records`. Statistics regimes are
+`full_census`, `snapshot_cache` and `wal_delta`; all produce the same snapshot BM25
+semantics. The procedure reports numeric `statistics_wal_records`,
+`statistics_from_wal_delta` and `statistics_from_snapshot_cache` flags. Build coverage
 is a table-relative index certificate and can be lower than the global snapshot when
 unrelated tables committed later. A success is complete within the specified top-k;
 empty results and unavailable/stale indexes are not conflated.
+`statistics_wal_records` counts the accepted delta, not every physical read made by
+a declined proof or the storage subsystem. It is zero for a census/cache result.
 
 Each version receives distinct-term postings and a field-length statistics entry.
 Inserts, updates and tombstones use the same transaction and WAL as the heap. Exact
@@ -155,6 +161,8 @@ ordinary writer/OCC fences and atomic catalog publication, retaining the old gen
 | `max_candidates` | 10,000 | Distinct retained filter-admitted candidate documents before ranking. |
 | `max_explanation_bytes` | 65,536 | Total UTF-8 field/term text in returned hit explanations. Refuses instead of silently truncating. |
 | `max_memory_bytes` | 33,554,432 | Logical retention: 64 bytes per admitted filter/statistics/DF identity, 128 per retained candidate plus 64 + UTF-8 bytes per retained analyzed term. Not RSS, heap decode buffers or allocator overhead. |
+| `max_statistics_wal_records` | 4,096 | Maximum records in the optional complete committed interval; exceeding declines to the census. |
+| `max_statistics_wal_bytes` | 8,388,608 | Physical read budget for the optional WAL interval, including foreign-tail refresh and sparse-mark read amplification. Separate from max_memory_bytes; decoded records and payloads are additional bounded retention. |
 
 All fields require integers in 1..2³¹; `k` is separately limited to 1..10,000.
 Cancellation/deadlines are cooperative between units of work; neither preempts one
@@ -165,9 +173,27 @@ The first statistics read for a snapshot/generation visits the index and validat
 document lengths against the heap: **O(stored postings + document text)**, including
 retained old versions. Up to eight certificate/snapshot-keyed scalar statistics
 summaries per handle are cached; warm searches navigate term buckets and validate
-candidate documents. Writes/generation changes cause new certificates, so a frequently
-changing corpus pays that cold cost again. This is a known follow-up opportunity for
-incremental MVCC aggregate statistics, not a claim of graph-size-independent search.
+candidate documents. After ordinary writes, the newest same-generation prior snapshot
+summary can be advanced using the **complete committed native WAL interval**. Insert
+and tombstone length entries update N and field totals; ABORT/incomplete effects are
+never counted. No old physical row address becomes current authority. Pre/post index
+certificates and candidate heap/snapshot validation remain mandatory. Recycled or
+oversized intervals, new generations, catalog/direct-index writes, versioned entries,
+unknown record semantics and ambiguous coverage decline to a full census. WAL
+corruption is not silently swallowed. This avoids a corpus recensus on eligible DML,
+but is not graph-size-independent search: term buckets, candidates, WAL delta and
+occasional cold censuses still cost work. Summaries are process-local, not new durable
+aggregate pages; a newly opened handle starts cold.
+
+Repeated analysis uses a pure operation-owned memo keyed by exact STRING/None leaves
+and the complete persisted analyzer identity. Counting quotas and staging keys reuse
+tokens in a write transaction; commit/abort release the memo. Retention is capped at
+min(1 MiB, max_transaction_bytes/8), additional to normal transaction staging charges.
+Verification uses at most 1 MiB; each search uses min(1 MiB, max_memory_bytes/4), counted
+inside its logical memory budget. The tariff includes source/token characters at four
+bytes each plus object allowances. On cache saturation analysis proceeds uncached;
+no document limit, quota, row visibility, OCC or WAL check is omitted. This is derived
+text only, not a row, page, permission or durability-authority cache.
 Index size/write amplification grows with distinct terms; write cost is bounded by
 document and ordinary transaction quotas. Tune against your corpus, not only top-k.
 
@@ -186,6 +212,9 @@ UUID under its offline-restore contract. Both include verification. Required cap
 and wire layout are specified in [FTS-v1 format](specs/FULLTEXT_V1_FORMAT.md).
 
 This delivery does not implement relationship-property FTS, highlighting positions,
-language stemming/stopwords, hybrid/RRF retrieval, arbitrary CALL extensions, online
+language stemming/stopwords, arbitrary CALL extensions, online
 generation deletion or automatic schema/format downgrade. Those remain explicit
 [roadmap](../ROADMAP.md) limitations rather than undocumented implied capabilities.
+
+[Hybrid search](HYBRID_SEARCH.md) composes this native source with vectors on one
+reader; it does not change BM25 or require an embedding provider inside Grafx.

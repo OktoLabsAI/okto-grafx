@@ -6,11 +6,18 @@ Neither copies live participants into a fork. [FTS operations](FULL_TEXT_SEARCH.
 cover the opt-in required capability, verification, generation rebuild, transfer and
 older-reader refusal. Creating an FTS index requires compatible binaries on all
 writers; it is not merely a process-local configuration change.
+[Resumable logical import](LOGICAL_TRANSFER.md#opt-in-resumable-import) is explicitly
+opt-in through a private workspace. It recovers native WAL and validates committed
+prefixes; never serve its staging directory or reset WAL/locks to force continuation.
+The public destination appears only after full verification and atomic promotion.
 
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md)
 
 For cooperative read cancellation/deadlines and explicit orphan-index reclamation,
 see [read control and index cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md).
+The query-error metric's finite `code` label domain includes `query_cancelled` and
+`query_deadline_exceeded`; emitting either must not replace the original outcome
+with a metrics configuration error.
 
 ## Deployment and ownership
 

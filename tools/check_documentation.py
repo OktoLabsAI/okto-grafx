@@ -28,6 +28,7 @@ CONSUMER_DOCS = (
     "docs/CLI.md",
     "docs/PERFORMANCE.md",
     "docs/FULL_TEXT_SEARCH.md",
+    "docs/HYBRID_SEARCH.md",
     "docs/LOGICAL_TRANSFER.md",
     "docs/specs/FULLTEXT_V1_FORMAT.md",
     "docs/reports/README.md",
@@ -94,6 +95,7 @@ def check() -> list[str]:
         )
 
     for module, classes, guide in (
+        ("domain/query/hybrid.py", {"HybridSearchOptions"}, "HYBRID_SEARCH.md"),
         ("domain/index/fulltext.py", {"TextIndexOptions", "TextSearchLimits"}, "FULL_TEXT_SEARCH.md"),
         ("transfer.py", {"TransferLimits"}, "LOGICAL_TRANSFER.md"),
     ):

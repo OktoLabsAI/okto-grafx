@@ -16,6 +16,10 @@ for signatures, all parameters, result fields, concurrency and failure guarantee
 TransferReport, RecordIdMapping` exposes [versioned logical transfer](LOGICAL_TRANSFER.md).
 `TextIndexOptions`, `TextSearchLimits`, `TextHit` and `TextSearchResult` are root
 exports for `Database.create_text_index` / `search_text`; see [FTS usage](FULL_TEXT_SEARCH.md).
+`HybridSearchOptions`, `HybridHit` and `HybridSearchResult` are root exports for
+`Database.search_hybrid`; see [hybrid usage](HYBRID_SEARCH.md). Logical import's
+optional `resume_directory` retains an operator-owned resumable workspace; no
+partial target is published. These are additive 0.0.5 development APIs.
 
 ```python
 from okto_grafx import (
@@ -688,6 +692,14 @@ search_vectors(transaction: Transaction, *, space: str, query: Sequence[float] |
 
 Search vectors under the fixed snapshot of one active transaction.
 
+#### Database.search_hybrid
+
+```python
+search_hybrid(reader: Transaction | None=None, *, table: str, index: str | None, query: str, space: str | None, vector: Sequence[float], k: int=20, options: HybridSearchOptions | None=None, filter: RecordIdFilter | None=None, text_limits: TextSearchLimits | None=None, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> HybridSearchResult
+```
+
+Fuse text/vector candidate windows with RRF-v1 and optional bounded graph evidence.
+
 #### Database.create_text_index
 
 ```python
@@ -910,7 +922,7 @@ Stream all current logical schema/rows/vectors from one fixed reader snapshot.
 ### okto_grafx.transfer.import_graph
 
 ```python
-import_graph(source: str | os.PathLike[str], destination: str | os.PathLike[str], *, limits: TransferLimits | None=None) -> TransferReport
+import_graph(source: str | os.PathLike[str], destination: str | os.PathLike[str], *, limits: TransferLimits | None=None, resume_directory: str | os.PathLike[str] | None=None) -> TransferReport
 ```
 
 Verify a logical artifact and publish a separately writable fresh-UUID database.
@@ -922,6 +934,66 @@ construct raw engine state. Consume returned instances and documented accessors.
 `Lsn`, `Csn` and record/table IDs are integer aliases, not wall-clock times.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
+
+### HybridSearchOptions fields
+
+Annotation location: `okto_grafx.domain.query.hybrid.HybridSearchOptions`.
+
+RRF-v1 over bounded source candidates; graph work is explicit and optional.
+
+```python
+lexical_weight: float
+vector_weight: float
+rrf_k: int
+candidate_k: int
+fusion: str
+allow_partial: bool
+graph_relations: tuple[str, ...]
+graph_seeds: tuple[int, ...]
+graph_direction: str
+graph_hops: int
+graph_weight: float
+graph_filter: bool
+max_graph_edges: int
+max_memory_bytes: int
+```
+
+### HybridHit fields
+
+Annotation location: `okto_grafx.domain.query.hybrid.HybridHit`.
+
+One table-qualified identity with source ranks, raw scores and fusion explanation.
+
+```python
+table: str
+record_id: int
+score: float
+lexical_rank: int | None
+lexical_score: float | None
+vector_rank: int | None
+vector_score: float | None
+graph_distance: int | None
+```
+
+### HybridSearchResult fields
+
+Annotation location: `okto_grafx.domain.query.hybrid.HybridSearchResult`.
+
+No hidden partial or approximate source: all dispositions are retained on empty hits.
+
+```python
+hits: tuple[HybridHit, ...]
+snapshot_commit: int
+fusion: str
+regime: str
+lexical_regime: str
+vector_regime: str
+lexical_candidates: int
+vector_candidates: int
+graph_edges_visited: int
+source_errors: tuple[tuple[str, str], ...]
+lexical_index_built_through_commit: int | None
+```
 
 ### BackupReport fields
 
@@ -1020,6 +1092,8 @@ max_postings: int
 max_candidates: int
 max_explanation_bytes: int
 max_memory_bytes: int
+max_statistics_wal_records: int
+max_statistics_wal_bytes: int
 ```
 
 ### TextHit fields
@@ -1049,6 +1123,8 @@ snapshot_commit: int
 postings_visited: int
 candidates: int
 corpus_documents: int
+statistics_regime: str
+statistics_wal_records: int
 ```
 
 ### ConnectOptions fields

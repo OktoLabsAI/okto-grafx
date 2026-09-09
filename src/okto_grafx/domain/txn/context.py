@@ -266,6 +266,7 @@ class TransactionContext:
         "_effective_row_tables",
         "row_intents",
         "row_refs",
+        "_text_analysis_memo",
     )
 
     def __init__(
@@ -297,6 +298,7 @@ class TransactionContext:
         self._conflicts: int = 0
         self._commit_csn: Csn = NO_CSN
         self.read_partitions: set[int] = set()
+        self._text_analysis_memo = None
         self.write_partitions: set[int] = set()
         self.pending_records: list[WalRecordLike] = []
         self.page_images: dict[tuple[str, PageIndex], bytes] = {}
@@ -1114,6 +1116,7 @@ class TransactionContext:
             _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
         self._retained_tuple_encoding_bytes = 0
         self._state = TransactionState.COMMITTED
+        self._text_analysis_memo = None
         self._commit_csn = csn
 
     def mark_aborted(self) -> None:
@@ -1123,6 +1126,7 @@ class TransactionContext:
             _forget_tuple_encoding_proof(intent._encoding_proof, protocol=self._tuple_encoding_proofs)
         self._retained_tuple_encoding_bytes = 0
         self._state = TransactionState.ABORTED
+        self._text_analysis_memo = None
         self.read_partitions.clear()
         self.write_partitions.clear()
         self.pending_records.clear()

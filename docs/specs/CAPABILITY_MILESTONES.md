@@ -12,7 +12,7 @@ requirements remain in the [source archive](../archive/ROADMAP_SOURCES.md).
 | GX-CAP-3 | [Temporal system time](SPEC-GX-CAP-3.md) | Not certified; contract routing only |
 | GX-CAP-4 | [Valid time, bitemporal queries and graph diff](SPEC-GX-CAP-4.md) | Not certified; contract routing only |
 | GX-CAP-5 | [Native full-text search](SPEC-GX-CAP-5.md) | FTS-v1 implemented; [consumer API and limits](../FULL_TEXT_SEARCH.md); [local acceptance](../reports/V005_OPS2_FTS_CHECKPOINT.md) |
-| GX-CAP-6 | [Explainable hybrid retrieval](SPEC-GX-CAP-6.md) | Not certified; contract routing only |
+| GX-CAP-6 | [Explainable hybrid retrieval](SPEC-GX-CAP-6.md) | Bounded typed v1 implemented in 0.0.5 development; [contract](../HYBRID_SEARCH.md) and [acceptance receipt](../reports/V005_SEARCH_RESUME_CHECKPOINT.md) |
 | GX-CAP-7 | [Extension SPI and UDFs](SPEC-GX-CAP-7.md) | Not certified; contract routing only |
 | GX-CAP-8 | [Arrow and external data](SPEC-GX-CAP-8.md) | Not certified; contract routing only |
 | GX-CAP-9 | [Graph projections and algorithms](SPEC-GX-CAP-9.md) | Not certified; contract routing only |
