@@ -5,8 +5,15 @@ explicit `create_index(layout="sparse_hash")`; these are operation options, not
 global switches. `connect(extensions=None)` accepts a trusted immutable object
 separately from `DatabaseConfig` and the port `registry`. Scalar descriptor budgets
 and Arrow `batch_rows`/`max_batch_bytes` are documented in
-[Extensions and Arrow](EXTENSIONS_AND_ARROW.md). The repeated-key page memo has
-fixed per-index bounds (64 pages / 1 MiB logical), not an additional setting.
+[Extensions and Arrow](EXTENSIONS_AND_ARROW.md). The subsequent continuation after
+`69ed311` makes the repeated-key page memo configurable per connection, applied per
+index: `index_key_cache_pages=64`, `index_key_cache_bytes=1048576`; either zero
+disables retention. `vector_hnsw_total_memory_budget_bytes=None` adds optional
+aggregate per-handle picture admission, distinct from per-picture/RSS budgets.
+The same continuation adds operation-local Arrow import row/batch bounds,
+`TextIndexOptions.prefix_max_characters`, `TextSearchLimits.max_expanded_terms`
+and [ProjectionLimits](GRAPH_PROJECTIONS.md#algorithms-and-controls). These operation
+options are not additional connection keys.
 
 The eight-item continuation adds operation-local `search_vectors(timeout_seconds=,
 cancellation=)` and `HybridSearchOptions.graph_access` (`auto`/`scan`). Hybrid
@@ -120,6 +127,9 @@ custom provider registration and runtime configuration errors are unchanged.
 | `vector_exact_scan_threshold` | `4096` | Nonnegative candidate threshold for exact-vs-approximate selection; zero permits ANN whenever its other eligibility conditions hold. Inspect the returned regime, not just table size |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
 | `vector_hnsw_memory_budget_bytes` | `None` | Positive integer or `None`; per-derived-picture HNSW logical construction/cache limit. Independent of query budgets; not RSS or an aggregate across pictures/handles. See [vector memory](INDEXES_AND_VECTORS.md#hnsw-derived-picture-memory). |
+| `vector_hnsw_total_memory_budget_bytes` | `None` | Positive integer or `None`; aggregate HNSW logical reservations per handle, including construction and retired pictures held by readers. Disabled by default; not RSS or shared across handles. |
+| `index_key_cache_pages` | `64` | Integer 0..65,536; retained memo pages per index. Zero disables retention, not execution. |
+| `index_key_cache_bytes` | `1048576` | Integer 0..2^31; retained logical bytes per index. Zero disables retention. Reduce for large index/handle counts. |
 | `read_only` | `False` | No replay/repair; requires checkpoint-complete state and may refuse after a newer acknowledged commit. Distinct from `db.execute()`'s read transaction |
 
 ## Types, ranges and persistence

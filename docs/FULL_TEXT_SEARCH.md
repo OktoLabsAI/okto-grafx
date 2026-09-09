@@ -3,12 +3,58 @@
 [Documentation index](README.md) · [API](API_REFERENCE.md) · [Indexes](INDEXES_AND_VECTORS.md)
 
 FTS-v1 is available in the **0.0.5 development source**. It is a persisted inverted
-access path over one to four declared STRING properties of a node table, not a
+access path over one to four declared STRING properties of a node or relationship table, not a
 second document database or an embedding service. Index creation is explicit and
 activates a required capability: older builds without FTS support must refuse the
 store. Back up or export before introducing it into a mixed-version deployment.
 
 ## Start with the typed API
+
+### Prefix search and relationship properties
+
+Opt into prefix postings when creating an index with
+`TextIndexOptions(prefix_max_characters=8)`, then call
+`db.search_text(index="text", query="graph", prefix=True)`. The default is zero
+(disabled); allowed values are exact integers 0..32. Query analysis uses the
+index's frozen analyzer. Each analyzed query token expands into actual indexed
+terms beginning with that token. No wildcard, substring or phrase syntax is added;
+the closed `CALL grafx.search_text` and hybrid API continue to use whole terms.
+
+`TextSearchLimits(max_expanded_terms=128)` limits distinct expansion terms;
+all limits are exact positive bounded integers. Too many terms raise
+`GrafxQueryBudgetExceeded`, without truncating results. A prefix longer than the
+configured character cap, or prefix search against a non-prefix index, raises
+`GrafxUnsupportedOperation`. Existing postings/document/memory/time/cancellation
+bounds still apply. Empty analyzed queries return no hits. Filters are applied in
+the same snapshot; they do not hide corpus statistics.
+
+Each document stores distinct prefix postings in addition to whole terms, at most
+65,536 distinct prefixes per document. Exceeding that hard bound is a typed budget
+refusal. This can materially increase write amplification, WAL and storage: use it
+for interactive term completion/search only when needed; prefer whole-term indexes
+for long documents or write-heavy corpora. Expansion reads selected hash buckets,
+not all corpus terms. Corpus statistics can still require the documented census
+fallback. BM25 is exactly whole-term scoring over the expanded term set, not a new
+approximate ranking rule; `regime` is `prefix_index` and hits report actual terms.
+
+Full-text can also index declared STRING properties of relationship tables:
+`db.create_text_index("edge_text", "MENTIONS", ("description",))`. `_from`/`_to`
+are structural integer endpoints, never text fields. Hits identify physical
+relationship records, preserving parallel edges and self-loops; `matched_fields`
+contains property names. NULL fields contribute no tokens. Weights, prefix mode,
+durable/history totals, updates/deletes/rebuild and snapshot filters work as for
+nodes. The closed search procedure returns scalar hit rows, not fabricated node
+objects. Native hybrid vector targets remain node-only; relationship FTS does not
+turn a relationship into an embedding target.
+
+Prefix mode activates required capability bit 11 (`fulltext_prefixes_v1`) and
+`fulltext_v4_` derivation metadata; relationship indexes activate bit 12
+(`fulltext_relationships_v1`). Both require base FTS support. Current backup,
+logical transfer, native replay and verification preserve these features. Older
+builds lacking either required bit refuse the store; there is no in-place downgrade
+or automatic clearing of bits after dropping an index. Default node whole-term
+index bytes remain unchanged. See [prefix format](specs/FTS_PREFIX_V1.md) and
+[relationship format](specs/FTS_RELATIONSHIPS_V1.md).
 
 BM25 query-term frequencies are computed in one pass per candidate field. Ranking
 keeps the original term/field accumulation order and exact scores/tie ordering;
@@ -46,12 +92,12 @@ with connect(":memory:") as db:
 
 `create_text_index(name, table, columns, *, options=None, bucket_count=64)` owns a
 dedicated write transaction. `columns` is a tuple; each named column must be STRING
-on the same node table. With `options=None`, all fields receive weight 1.0. A custom
+on the same table. With `options=None`, all fields receive weight 1.0. A custom
 options value must provide exactly one weight per field. Hash sizing uses the same
 validated bucket-count contract as ordinary hash indexes; no implicit resize occurs.
 
 `search_text(reader=None, *, index, query, k=20, filter=None, limits=None, k1=1.2,
-b=0.75, timeout_seconds=None, cancellation=None)` returns `TextSearchResult`.
+b=0.75, timeout_seconds=None, cancellation=None, prefix=False)` returns `TextSearchResult`.
 Omitting `reader` opens/closes a fresh read transaction. A supplied reader must be
 active and belong to this database; it remains caller-owned after an error. Write
 transactions are refused: use a new reader after commit to observe indexed changes.
@@ -161,6 +207,7 @@ procedure, not restarted inside it. FTS creation uses the typed API; proposed
 | --- | --- | --- |
 | `analyzer` | `standard` | `standard`, `keyword`, `code_identifier`, `whitespace`; see below. |
 | `analyzer_version` | `1` | Only 1. Unknown versions refuse, never silently map to latest. |
+| `prefix_max_characters` | `0` | Exact integer 0..32; positive values materialize distinct prefixes, activate bit 11 and increase write/storage cost. Zero disables prefix search and preserves prior bytes. |
 | `statistics_mode` | `wal` | `wal` retains legacy index bytes and bounded memo/WAL/census statistics; `durable` explicitly activates a required format capability and persists corpus totals. See below. |
 | `statistics_history_entries` | `0` | Integer 0..32; positive values require `durable` and reserve this many historical summaries plus the current one. Page-size fit checked before creation; additional required capability bit 8. |
 | `normalization` | `NFC` | `none`, `NFC`, `NFKC` using the frozen Unicode 3.2 database. NFKC folds compatibility forms and may conflate distinctions; use none/NFC for identifiers where those distinctions matter. |
@@ -235,6 +282,7 @@ ordinary writer/OCC fences and atomic catalog publication, retaining the old gen
 | Field | Default | Bound |
 | --- | --- | --- |
 | `max_query_tokens` | 64 | Emitted query tokens, before de-duplication. |
+| `max_expanded_terms` | 128 | Distinct actual terms expanded from query prefixes; overflow refuses without partial results. |
 | `max_postings` | 100,000 | Entries visited across statistics/term buckets and certificate retries, not just matches. |
 | `max_candidates` | 10,000 | Distinct retained filter-admitted candidate documents before ranking. |
 | `max_explanation_bytes` | 65,536 | Total UTF-8 field/term text in returned hit explanations. Refuses instead of silently truncating. |
@@ -291,7 +339,7 @@ fresh postings. [Physical backup](BACKUP_RESTORE.md) preserves index/catalog byt
 UUID under its offline-restore contract. Both include verification. Required capability
 and wire layout are specified in [FTS-v1 format](specs/FULLTEXT_V1_FORMAT.md).
 
-This delivery does not implement relationship-property FTS, highlighting positions,
+This delivery does not implement phrase search, highlighting positions,
 language stemming/stopwords, arbitrary CALL extensions, online
 generation deletion or automatic schema/format downgrade. Those remain explicit
 [roadmap](../ROADMAP.md) limitations rather than undocumented implied capabilities.

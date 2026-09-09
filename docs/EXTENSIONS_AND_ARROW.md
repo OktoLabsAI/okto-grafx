@@ -1,4 +1,4 @@
-# Trusted extensions and Arrow export
+# Trusted extensions and Arrow import/export
 
 These are opt-in Python integration capabilities in 0.0.5 development. Neither
 changes a database format, enables a server, imports code from a database nor
@@ -65,9 +65,55 @@ durable function manifests remain outside this initial SPI.
 
 ## Optional Arrow batches
 
+### Atomic typed batch import
+
+```python
+from okto_grafx.arrow import import_arrow_batches
+
+with db.begin("write") as transaction:
+    report = import_arrow_batches(
+        transaction, "CREATE (:Document {id:$id, title:$title})", batches,
+        types=("INT64", "STRING"), max_rows=10000,
+    )
+    assert report.statements <= 10000
+```
+
+The iterable must yield exact PyArrow `RecordBatch` objects. Fields are named
+parameters in the supplied statement. All batches have the same ordered, unique,
+nonempty field names (at most 256 characters each) and 1..256 columns. `types` is
+an explicit tuple using the scalar names/mappings below. Exact Arrow types are
+required: no int32 widening, dictionary decoding, timezone/unit inference, nested
+types or lossy coercion. Optional `grafx.type` field metadata must agree. NULL is
+accepted according to the native target schema; timestamp microseconds, including
+negative values, and UUID bytes retain exact native meanings. Query DDL spells the
+binary property type `BLOB`, whereas this scalar interop type is `BYTES`.
+
+One native `Transaction.executemany` staging savepoint covers **every batch** in
+the call. Late malformed input, producer exceptions, budget errors or statement
+failures discard that call's staged effects but preserve earlier transaction work.
+Nothing is auto-committed; the caller owns commit/rollback, uncertain-commit handling
+and retries. Native transaction quotas remain active, so this is not unbounded
+streaming ingestion. The report is `ExecuteManyReport`, not one result per row.
+
+| Parameter | Default | Bound |
+| --- | ---: | --- |
+| `max_batch_rows` | 65,536 | 1..65,536 |
+| `max_batch_bytes` | 16 MiB | 1..2^31 logical bytes |
+| `max_rows` | 1,000,000 | 1..2^31 across the call |
+| `max_batches` | 4,096 | 1..2^31, including empty batches |
+
+Bool is not an integer option. Before Python scalar conversion, a batch is charged
+256 + 256 per column + 80 per row/column cell + four times `batch.nbytes`. One batch
+is consumed at a time. This is not RSS, caller-owned Arrow buffers, whole-transaction
+staging memory, or a deadline on arbitrary input producers. The source is neither
+closed nor retried by Grafx. Unsupported/mismatched types are typed unsupported
+operations; malformed shape/options are configuration errors; budget refusals use
+`GrafxQueryBudgetExceeded(resource="arrow_import")`. This does not add COPY syntax,
+Parquet/CSV sources, external scans or zero-copy ownership.
+
 Install `okto-grafx[arrow]` (or `.[arrow]` in this checkout). Core import/connect
 does not import PyArrow. Missing optional dependency is a typed
-`GrafxUnsupportedOperation` when export is requested.
+`GrafxUnsupportedOperation` when import or export is requested.
 
 ```python
 from okto_grafx.arrow import to_arrow_batches

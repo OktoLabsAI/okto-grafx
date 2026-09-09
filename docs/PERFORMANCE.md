@@ -36,6 +36,24 @@ and stale diagnostic snapshots mean this is not an all-green operational audit.
 
 ## Native synthetic checkpoint in the 0.0.5 development line
 
+### Continuation after 69ed311: latest bounded work observations
+
+Windows/Python 3.13 source tests, September 9, 2026. These are structural counts,
+not elapsed-time improvements, throughput estimates or Pulse UI measurements.
+
+| Operation / fixture | Latest measured result |
+| --- | ---: |
+| Empty sparse distribution, 8,192 buckets, 512-byte pages | 72 directory-page visits; budget 71 refuses |
+| 24 inserts populating at least 16 sparse heads, 4-page buffer | 1 head-initialization barrier in that committed publication |
+
+Evidence: `tests/api/test_sparse_directory_walk.py` and
+`tests/api/test_sparse_batch_heads.py`, with foreign-reader and native crash/replay
+checks. Total commit barriers include other WAL/storage obligations; the table
+counts only sparse-head initialization. Pointer examination remains O(bucket count).
+Prefix indexing trades additional write/storage work for bounded indexed expansion;
+detached projection capture remains an explicit selected-table census. Neither is
+advertised as a universal throughput improvement.
+
 ### Continuation after 3f3819f: latest bounded work observations
 
 Windows/Python 3.13.1 source tests, September 9, 2026. Counts, not latency/SLO claims:

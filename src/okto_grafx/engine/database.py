@@ -90,6 +90,7 @@ from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.query.ast import Query as QueryStatement
 from okto_grafx.domain.query.control import CancellationToken, _ReadControl, _read_control
 from okto_grafx.engine.index_distribution import IndexDistribution
+from okto_grafx.engine.key_page_memo import KeyPageCacheUsage
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_COLUMN_DEFINITIONS,
@@ -189,7 +190,7 @@ from okto_grafx.engine.public_views import (
 from okto_grafx.engine.query_engine import QueryEngine, QueryResult
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorSearchResult
-from okto_grafx.engine.vector_memory import VectorMemoryUsage
+from okto_grafx.engine.vector_memory import VectorMemoryUsage, VectorTotalMemoryUsage
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
 
 _HistoryResult = TypeVar("_HistoryResult")
@@ -2871,6 +2872,18 @@ class Database:
             )
             return ScanPageV1(rows=tuple(rows), next_cursor=next_cursor)
 
+    def vector_total_memory_usage(self) -> VectorTotalMemoryUsage:
+        """Return per-handle aggregate ANN reservations; disabled accounting reports zero."""
+        with self._public_operation("vector_total_memory_usage"):
+            vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
+            observe = getattr(vectors, "total_memory_usage", None)
+            if not callable(observe):
+                raise GrafxUnsupportedOperation(
+                    "The vector collaborator does not expose aggregate memory observations.",
+                    operation="vector_total_memory_usage",
+                )
+            return observe()
+
     def vector_memory_usage(self, space: str) -> VectorMemoryUsage:
         """Observe local HNSW cache tariffs without building or proving freshness.
 
@@ -3059,14 +3072,14 @@ class Database:
     def search_text(self, reader: Transaction | None = None, *, index: str, query: str, k: int = 20,
                     filter: RecordIdFilter | None = None, limits: TextSearchLimits | None = None,
                     k1: float = 1.2, b: float = 0.75, timeout_seconds: float | None = None,
-                    cancellation: CancellationToken | None = None) -> TextSearchResult:
+                    cancellation: CancellationToken | None = None, prefix: bool = False) -> TextSearchResult:
         """Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot."""
         if reader is None:
             with self.begin("read") as owned:
-                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation)
+                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
         if type(reader) is not Transaction:
             raise GrafxConfigurationError("reader must be a Transaction.", field="reader")
-        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation)
+        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
 
     def create_index(
         self,
@@ -3319,6 +3332,14 @@ class Database:
                 wanted_name,
                 bucket_count=target_bucket_count,
             )
+
+    def index_cache_usage(self, name: str) -> KeyPageCacheUsage:
+        """Return active-index local memo observations; not a cache/freshness certificate."""
+        with self._public_operation("index_cache_usage"):
+            self._require_open()
+            wanted = _require_text("name", name)
+            with self._transactions.page_access_section():
+                return self._indexes.active_index(wanted)._key_page_memo.usage()
 
     def index_distribution(
         self, name: str, *, max_pages: int = 65_536, max_entries: int = 1_000_000,

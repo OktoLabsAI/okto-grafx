@@ -15,8 +15,10 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection"},
     "domain/query/extensions.py": {"ScalarFunction", "ExtensionRegistry"},
-    "engine/vector_memory.py": {"VectorMemoryUsage"},
+    "engine/vector_memory.py": {"VectorMemoryUsage", "VectorTotalMemoryUsage"},
+    "engine/key_page_memo.py": {"KeyPageCacheUsage"},
     "migrations.py": {"SchemaMigration", "MigrationReport"},
     "engine/index_distribution.py": {"IndexDistribution"},
     "domain/query/hybrid.py": {"HybridSearchOptions", "HybridHit", "HybridSearchResult"},
@@ -56,7 +58,8 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
-    "arrow.py": {"to_arrow_batches"},
+    "arrow.py": {"to_arrow_batches", "import_arrow_batches"},
+    "projections.py": {"project_graph"},
     "migrations.py": {"migrate_schema"},
     "api/__init__.py": {"connect"},
     "backup.py": {"create_backup", "restore_backup"},

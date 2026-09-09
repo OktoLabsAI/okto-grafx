@@ -125,6 +125,8 @@ _LARGE_HASH_V1_BIT = 1 << 7
 _FULLTEXT_HISTORY_V1_BIT = 1 << 8
 _HEAP_FREE_INDEX_BIT = 1 << 9
 _SPARSE_HASH_BIT = 1 << 10
+_FULLTEXT_PREFIX_BIT = 1 << 11
+_FULLTEXT_RELATIONSHIPS_BIT = 1 << 12
 
 
 _KNOWN_CAPABILITY_BITS = (
@@ -139,6 +141,8 @@ _KNOWN_CAPABILITY_BITS = (
     | _FULLTEXT_HISTORY_V1_BIT
     | _HEAP_FREE_INDEX_BIT
     | _SPARSE_HASH_BIT
+    | _FULLTEXT_PREFIX_BIT
+    | _FULLTEXT_RELATIONSHIPS_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -155,6 +159,8 @@ _CAPABILITY_TO_BIT = MappingProxyType(
         FULLTEXT_HISTORY_CAPABILITY: _FULLTEXT_HISTORY_V1_BIT,
         HEAP_FREE_INDEX_CAPABILITY: _HEAP_FREE_INDEX_BIT,
         SPARSE_HASH_CAPABILITY: _SPARSE_HASH_BIT,
+        "fulltext_prefixes_v1": _FULLTEXT_PREFIX_BIT,
+        "fulltext_relationships_v1": _FULLTEXT_RELATIONSHIPS_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -517,6 +523,10 @@ class Catalog:
             capabilities.add(ORDERED_SECONDARY_INDEXES_V1_CAPABILITY)
         if any(is_fulltext(definition.key_derivation) for definition in validated.values()):
             capabilities.add(FULLTEXT_CAPABILITY)
+        if any(d.key_derivation.startswith("fulltext_v4_") for d in validated.values()):
+            capabilities.add("fulltext_prefixes_v1")
+        if any(is_fulltext(d.key_derivation) and self.table_by_id(d.table_id).kind == "rel" for d in validated.values()):
+            capabilities.add("fulltext_relationships_v1")
         if any(has_durable_statistics(d.key_derivation) for d in validated.values()):
             capabilities.add(FULLTEXT_STATISTICS_CAPABILITY)
         if any(has_historical_statistics(d.key_derivation) for d in validated.values()):
@@ -539,6 +549,10 @@ class Catalog:
         validated = self._validated_index_authority(proposed, stored=False)
         if is_fulltext(definition.key_derivation):
             self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_CAPABILITY))
+        if definition.key_derivation.startswith("fulltext_v4_"):
+            self._required_capabilities = frozenset((*self._required_capabilities, "fulltext_prefixes_v1"))
+        if is_fulltext(definition.key_derivation) and self.table_by_id(definition.table_id).kind == "rel":
+            self._required_capabilities = frozenset((*self._required_capabilities, "fulltext_relationships_v1"))
         if has_durable_statistics(definition.key_derivation):
             self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_STATISTICS_CAPABILITY))
         if has_historical_statistics(definition.key_derivation):
@@ -758,6 +772,10 @@ class Catalog:
             )
             indexes = tuple(validated[key] for key in sorted(validated))
             capability_bits = _encode_capabilities(self._required_capabilities)
+            if any(is_fulltext(d.key_derivation) and self.table_by_id(d.table_id).kind == "rel" for d in indexes) and "fulltext_relationships_v1" not in self._required_capabilities:
+                raise GrafxConfigurationError("Relationship FTS requires its capability.", field="required_capabilities")
+            if any(d.key_derivation.startswith("fulltext_v4_") for d in indexes) and "fulltext_prefixes_v1" not in self._required_capabilities:
+                raise GrafxConfigurationError("Prefix postings require their capability.", field="required_capabilities")
             if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in self._required_capabilities:
                 raise GrafxConfigurationError("Full-text indexes require their capability.", field="required_capabilities")
             if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in self._required_capabilities:
@@ -963,6 +981,10 @@ class Catalog:
         if format_version == CATALOG_FORMAT_VERSION:
             if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Full-text indexes lack their required capability.", field="required_capabilities")
+            if any(is_fulltext(d.key_derivation) and catalog.table_by_id(d.table_id).kind == "rel" for d in indexes) and "fulltext_relationships_v1" not in required_capabilities:
+                raise GrafxCorruptionDetected("Relationship FTS lacks its capability.", field="required_capabilities")
+            if any(d.key_derivation.startswith("fulltext_v4_") for d in indexes) and "fulltext_prefixes_v1" not in required_capabilities:
+                raise GrafxCorruptionDetected("Prefix postings lack their capability.", field="required_capabilities")
             if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Durable text statistics lack their capability.", field="required_capabilities")
             if any(has_historical_statistics(d.key_derivation) for d in indexes) and FULLTEXT_HISTORY_CAPABILITY not in required_capabilities:
@@ -1151,10 +1173,11 @@ class Catalog:
                     )
 
             is_identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
+            text_offset = 2 if table.kind == "rel" else 0
             if is_fulltext(definition.key_derivation) and (
-                table.kind != "node" or any(p >= len(table.columns) or table.columns[p].type is not ValueType.STRING for p in definition.positions)
+                any(p < text_offset or p >= len(table.columns) or table.columns[p].type is not ValueType.STRING for p in definition.positions)
             ):
-                refuse("Full-text indexes require declared STRING node fields.", field="positions", index=definition.name)
+                refuse("Full-text indexes require declared STRING properties, not endpoints.", field="positions", index=definition.name)
             if is_identity:
                 if table.kind != "node" or table.name not in endpoints:
                     refuse(
@@ -1342,6 +1365,8 @@ def _encode_capabilities(capabilities: frozenset[str]) -> int:
     """Encode every required capability, refusing one this build cannot uphold."""
 
     for dependent, required in (
+        ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
+        ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),
         (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),
         (HEAP_FREE_INDEX_CAPABILITY, {HEAP_RECLAIM_V1_CAPABILITY}),
     ):
@@ -1375,6 +1400,8 @@ def _decode_capabilities(bits: int) -> frozenset[str]:
         capability for capability, bit in _CAPABILITY_TO_BIT.items() if bits & bit
     )
     for dependent, required in (
+        ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
+        ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),
         (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),
         (HEAP_FREE_INDEX_CAPABILITY, {HEAP_RECLAIM_V1_CAPABILITY}),
     ):

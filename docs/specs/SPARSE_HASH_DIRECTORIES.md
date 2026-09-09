@@ -1,5 +1,16 @@
 # Opt-in sparse hash directories — next round item 4
 
+## Approved batched head publication after 69ed311
+
+No format change. Within the existing complete-COMMIT publication fence, allocate
+at most 64 absent empty heads, stamp them with that COMMIT, flush and barrier all
+of them before publishing any corresponding directory pointer. Then apply the
+ordinary logical entries and final certificate. Partial pointer publication is
+replayed through the same idempotent protocol; unreferenced allocations are never
+authority. Detached private builds may use the same bounded batches before their
+existing verification/catalog publication. RESET replay retains its scalar path.
+No grouping of independent transactions, WAL bypass or earlier ACK is permitted.
+
 Implemented and locally validated; see the [acceptance receipt](../reports/V005_NEXT_EIGHT_PROGRESS.md).
 `layout="sparse_hash"` selects
 explicit exact property indexes. Eager `hash` remains the default. No automatic

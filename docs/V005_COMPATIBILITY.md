@@ -37,7 +37,13 @@ downgrade after other 0.0.5 features have been enabled.
 | `statistics_history_entries>0` | bit 8, plus FTS bits 5/6 | Must refuse |
 | `vacuum(index_free_pages=True)` | bit 9, plus reclaim bit 1 | Must refuse |
 | `layout="sparse_hash"` | bit 10; header format 4; large bit 7 when applicable | Must refuse |
-| HNSW memory budget, scalar registry, Arrow export, repeated-key decoding | No persistent capability | Stored ordinary values/bytes unchanged |
+| `prefix_max_characters>0` | bit 11, plus FTS bit 5 and configured statistics/history bits | Must refuse; known-bitmap refusal and native replay tested in this continuation |
+| Full-text relationship STRING properties | bit 12, plus FTS bit 5 | Must refuse; backup/logical transfer/native replay tested |
+| HNSW memory budgets, scalar registry, Arrow import/export, repeated-key decoding, detached projections | No persistent capability | Stored ordinary values/bytes unchanged |
+
+The earlier real-wheel matrix above predates bits 11/12. Its four-case result is
+not evidence of a real-wheel test for these two additions; their current local
+evidence is separately recorded in [this round](reports/V005_AFTER_69ED311.md).
 
 Activation is deliberate and persistent; turning a runtime option off does not
 remove capability bits. Back up before activation. Physical backup preserves

@@ -26,6 +26,8 @@ FULLTEXT_HISTORY_CAPABILITY = "fulltext_statistics_history_v1"
 PREFIX = "fulltext_v1_"
 STATISTICS_PREFIX = "fulltext_v2_"
 HISTORY_PREFIX = "fulltext_v3_"
+PREFIX_POSTINGS = "fulltext_v4_"
+FULLTEXT_PREFIX_CAPABILITY = "fulltext_prefixes_v1"
 ANALYZERS = ("standard", "keyword", "code_identifier", "whitespace")
 _HEADER = struct.Struct("<BBBBHII")
 _NORMALIZATIONS = ("none", "NFC", "NFKC")
@@ -58,9 +60,12 @@ class TextIndexOptions:
     stemming: str = "none"
     statistics_mode: str = "wal"
     statistics_history_entries: int = 0
+    prefix_max_characters: int = 0
 
     def __post_init__(self) -> None:
         """Capture bounded immutable field weights and exact supported analyzer semantics."""
+        if type(self.prefix_max_characters) is not int or not 0 <= self.prefix_max_characters <= 32:
+            raise _bad("prefix_max_characters")
         if type(self.statistics_mode) is not str or self.statistics_mode not in ("wal", "durable"):
             raise _bad("statistics_mode")
         if (type(self.statistics_history_entries) is not int
@@ -121,12 +126,14 @@ class TextIndexOptions:
             self.max_document_tokens,
         )
         return (
-            (HISTORY_PREFIX if self.statistics_history_entries else
+            (PREFIX_POSTINGS if self.prefix_max_characters else HISTORY_PREFIX if self.statistics_history_entries else
              STATISTICS_PREFIX if self.statistics_mode == "durable" else PREFIX)
             + (
                 raw
                 + struct.pack("<" + "d" * len(self.field_weights), *self.field_weights)
-                + (bytes((self.statistics_history_entries,)) if self.statistics_history_entries else b"")
+                + (bytes((int(self.statistics_mode == "durable"), self.statistics_history_entries,
+                          self.prefix_max_characters)) if self.prefix_max_characters else
+                   bytes((self.statistics_history_entries,)) if self.statistics_history_entries else b"")
             ).hex()
         )
 
@@ -135,7 +142,17 @@ def decode_options(derivation: str) -> TextIndexOptions:
     """Decode/validate all analyzer identity bytes; reserved/unknown forms refuse."""
     try:
         raw = bytes.fromhex(derivation[len(PREFIX) :])
+        prefix_size = 0
+        mode = "durable" if derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX)) else "wal"
+        if derivation.startswith(PREFIX_POSTINGS):
+            mode_code, prefix_history, prefix_size = raw[-3:]
+            if mode_code not in (0, 1) or not prefix_size:
+                raise ValueError("invalid prefix metadata")
+            mode = "durable" if mode_code else "wal"
+            raw = raw[:-3]
         history = raw[-1] if derivation.startswith(HISTORY_PREFIX) else 0
+        if prefix_size:
+            history = prefix_history
         if derivation.startswith(HISTORY_PREFIX):
             raw = raw[:-1]
         analyzer, fields, normalization, folding, length, characters, tokens = (
@@ -151,8 +168,9 @@ def decode_options(derivation: str) -> TextIndexOptions:
             weights,
             _NORMALIZATIONS[normalization],
             _FOLDS[folding],
-            statistics_mode="durable" if derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX)) else "wal",
+            statistics_mode=mode,
             statistics_history_entries=history,
+            prefix_max_characters=prefix_size,
         )
         if derivation != options.derivation():
             raise ValueError("noncanonical")
@@ -165,17 +183,19 @@ def decode_options(derivation: str) -> TextIndexOptions:
 
 def is_fulltext(derivation: str) -> bool:
     """Recognize the reserved family; decoding still validates the complete identity."""
-    return derivation.startswith((PREFIX, STATISTICS_PREFIX, HISTORY_PREFIX))
+    return derivation.startswith((PREFIX, STATISTICS_PREFIX, HISTORY_PREFIX, PREFIX_POSTINGS))
 
 
 def has_durable_statistics(derivation: str) -> bool:
     """Recognize the opt-in derivation requiring native persisted corpus totals."""
-    return derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX))
+    return derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX)) or (
+        derivation.startswith(PREFIX_POSTINGS) and decode_options(derivation).statistics_mode == "durable")
 
 
 def has_historical_statistics(derivation: str) -> bool:
     """Recognize the opt-in bounded historical-summary derivation."""
-    return derivation.startswith(HISTORY_PREFIX)
+    return derivation.startswith(HISTORY_PREFIX) or (derivation.startswith(PREFIX_POSTINGS)
+        and decode_options(derivation).statistics_history_entries > 0)
 
 
 def _fold(text: str, policy: str) -> str:
@@ -304,18 +324,29 @@ def entry_keys(
     """One length-statistics entry plus one posting per distinct analyzed term."""
     options = decode_options(derivation)
     fields = field_tokens(values, positions, options)
-    return keys_from_fields(fields)
+    return keys_from_fields(fields, prefix_max_characters=options.prefix_max_characters)
 
 
-def keys_from_fields(fields: tuple[tuple[str, ...], ...]) -> tuple[bytes, ...]:
+def keys_from_fields(fields: tuple[tuple[str, ...], ...], *, prefix_max_characters: int = 0) -> tuple[bytes, ...]:
     """Encode already-analyzed fields without invoking the analyzer again."""
     stats = b"\x00" + struct.pack("<" + "I" * len(fields), *(len(f) for f in fields))
+    prefixes = set()
+    if prefix_max_characters:
+        for field in fields:
+            for term in field:
+                for length in range(1, min(prefix_max_characters, len(term)) + 1):
+                    value = term[:length]
+                    if value not in prefixes:
+                        if len(prefixes) >= 65536:
+                            raise GrafxQueryBudgetExceeded("Prefix postings per document exceeded.", resource="text_prefix_postings")
+                        prefixes.add(value)
     return (
         stats,
         *(
             b"\x01" + token.encode("utf-8")
             for token in sorted({t for f in fields for t in f})
         ),
+        *(b"\x02" + token.encode("utf-8") for token in sorted(prefixes)),
     )
 
 
@@ -374,7 +405,8 @@ class TextAnalysisMemo:
     ) -> tuple[bytes, ...]:
         """Reuse analyzed fields for counting, staging or verification."""
         return keys_from_fields(
-            self.fields(values, positions, decode_options(derivation))
+            self.fields(values, positions, decode_options(derivation)),
+            prefix_max_characters=decode_options(derivation).prefix_max_characters,
         )
 
 
@@ -389,6 +421,7 @@ class TextSearchLimits:
     max_memory_bytes: int = 32 * 1024 * 1024
     max_statistics_wal_records: int = 4096
     max_statistics_wal_bytes: int = 8 * 1024 * 1024
+    max_expanded_terms: int = 128
 
     def __post_init__(self) -> None:
         """Reject disabled, forged or unbounded counters."""
@@ -400,6 +433,7 @@ class TextSearchLimits:
             "max_memory_bytes",
             "max_statistics_wal_records",
             "max_statistics_wal_bytes",
+            "max_expanded_terms",
         ):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= 2**31:

@@ -4,6 +4,14 @@
 
 ## Entry points and supported imports
 
+`from okto_grafx.projections import project_graph, ProjectionLimits` exposes
+[read-only snapshot graph pictures, degrees and weak components](GRAPH_PROJECTIONS.md).
+`from okto_grafx.arrow import import_arrow_batches, to_arrow_batches` exposes
+[optional typed scalar batch interop](EXTENSIONS_AND_ARROW.md). Import stages one
+atomic call inside a caller-owned write transaction; neither function auto-commits.
+Full-text prefix mode and relationship fields use the existing native FTS facade;
+new connection cache/aggregate ANN limits are listed in [configuration](CONFIGURATION.md).
+
 `from okto_grafx.migrations import SchemaMigration, MigrationReport, migrate_schema`
 exposes the [additive application migration contract](SCHEMA_MIGRATIONS.md): exact
 checksums, dry-run, atomic per-version DDL and bounded retries. It does not change
@@ -702,6 +710,14 @@ explain(text: str) -> PlanNode
 
 Plan one statement without exposing the mutable query engine.
 
+#### Database.vector_total_memory_usage
+
+```python
+vector_total_memory_usage() -> VectorTotalMemoryUsage
+```
+
+Return per-handle aggregate ANN reservations; disabled accounting reports zero.
+
 #### Database.vector_memory_usage
 
 ```python
@@ -737,7 +753,7 @@ Create a native persisted full-text generation over one to four STRING fields.
 #### Database.search_text
 
 ```python
-search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> TextSearchResult
+search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, prefix: bool=False) -> TextSearchResult
 ```
 
 Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot.
@@ -773,6 +789,14 @@ rehash_index_if_needed(name: str, *, overflow_pages_per_bucket: int=1, check_ske
 ```
 
 Grow one exact index after a bounded directory-pressure assessment.
+
+#### Database.index_cache_usage
+
+```python
+index_cache_usage(name: str) -> KeyPageCacheUsage
+```
+
+Return active-index local memo observations; not a cache/freshness certificate.
 
 #### Database.index_distribution
 
@@ -921,6 +945,14 @@ Release owned resources under this database's checksum selection (FR-1).
 ## Public factory and transfer functions
 
 
+### okto_grafx.arrow.import_arrow_batches
+
+```python
+import_arrow_batches(transaction: Transaction, statement: str, batches: Iterable[RecordBatch], *, types: tuple[str, ...], max_batch_rows: int=65536, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
+```
+
+Atomically stage typed scalar batches as named parameters, without committing.
+
 ### okto_grafx.arrow.to_arrow_batches
 
 ```python
@@ -928,6 +960,14 @@ to_arrow_batches(source: QueryResult | QueryCursor, *, types: tuple[str, ...], b
 ```
 
 Yield copied typed batches; caller owns cursor lifetime and already-emitted batches.
+
+### okto_grafx.projections.project_graph
+
+```python
+project_graph(database: Database, reader: Transaction | None=None, *, node_tables: tuple[str, ...], relationship_tables: tuple[str, ...]=(), limits: ProjectionLimits=ProjectionLimits(), cancellation: CancellationToken | None=None) -> GraphProjection
+```
+
+Capture selected tables in one read snapshot, preserving parallel edges and loops.
 
 ### okto_grafx.migrations.migrate_schema
 
@@ -985,6 +1025,74 @@ construct raw engine state. Consume returned instances and documented accessors.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
 
+### ProjectionLimits fields
+
+Annotation location: `okto_grafx.projections.ProjectionLimits`.
+
+Logical picture/work limits; not process RSS or underlying scan I/O limits.
+
+```python
+max_nodes: int
+max_edges: int
+max_memory_bytes: int
+max_work: int
+```
+
+### ProjectionNode fields
+
+Annotation location: `okto_grafx.projections.ProjectionNode`.
+
+A table-qualified physical record identity, not an application primary key.
+
+```python
+table: str
+record_id: int
+```
+
+### ProjectionEdge fields
+
+Annotation location: `okto_grafx.projections.ProjectionEdge`.
+
+One physical relationship; endpoints are offsets in GraphProjection.nodes.
+
+```python
+table: str
+record_id: int
+source: int
+target: int
+```
+
+### GraphProjection fields
+
+Annotation location: `okto_grafx.projections.GraphProjection`.
+
+Immutable directed multigraph with no handles, pins or durable effects.
+
+```python
+database_uuid: bytes
+snapshot_lsn: int
+nodes: tuple[ProjectionNode, ...]
+edges: tuple[ProjectionEdge, ...]
+limits: ProjectionLimits
+logical_bytes: int
+```
+
+#### GraphProjection.degrees
+
+```python
+degrees(*, direction: str='total', cancellation: CancellationToken | None=None) -> tuple[int, ...]
+```
+
+Count physical incoming/outgoing occurrences; a self-loop has total degree two.
+
+#### GraphProjection.weakly_connected_components
+
+```python
+weakly_connected_components(*, cancellation: CancellationToken | None=None) -> tuple[ProjectionNode, ...]
+```
+
+Return each node's component label (minimum table/record identity), including isolates.
+
 ### ScalarFunction fields
 
 Annotation location: `okto_grafx.domain.query.extensions.ScalarFunction`.
@@ -1026,6 +1134,20 @@ call_scalar(name: str, arguments: tuple[object, ...]) -> object
 
 Invoke only an exact registered name; no module/path or builtin resolution.
 
+### VectorTotalMemoryUsage fields
+
+Annotation location: `okto_grafx.engine.vector_memory.VectorTotalMemoryUsage`.
+
+Optional per-handle aggregate reservations, including in-flight/held pictures.
+
+```python
+limit_bytes: int | None
+reserved_bytes: int
+pictures: int
+peak_reserved_bytes: int
+budget_refusals: int
+```
+
 ### VectorMemoryUsage fields
 
 Annotation location: `okto_grafx.engine.vector_memory.VectorMemoryUsage`.
@@ -1040,6 +1162,23 @@ cached_logical_bytes: int
 peak_requested_bytes: int
 budget_refusals: int
 warm_retirements: int
+```
+
+### KeyPageCacheUsage fields
+
+Annotation location: `okto_grafx.engine.key_page_memo.KeyPageCacheUsage`.
+
+Handle-local decoded-page retention and counters, not freshness or RSS.
+
+```python
+max_pages: int
+max_bytes: int
+pages: int
+logical_bytes: int
+hits: int
+misses: int
+evictions: int
+admission_refusals: int
 ```
 
 ### SchemaMigration fields
@@ -1237,6 +1376,7 @@ stopwords: str
 stemming: str
 statistics_mode: str
 statistics_history_entries: int
+prefix_max_characters: int
 ```
 
 #### TextIndexOptions.derivation
@@ -1261,6 +1401,7 @@ max_explanation_bytes: int
 max_memory_bytes: int
 max_statistics_wal_records: int
 max_statistics_wal_bytes: int
+max_expanded_terms: int
 ```
 
 ### TextHit fields
@@ -1333,6 +1474,9 @@ checksum: Literal['auto', 'pure', 'native']
 vector_exact_scan_threshold: int
 vector_ef_search: int
 vector_hnsw_memory_budget_bytes: int | None
+vector_hnsw_total_memory_budget_bytes: int | None
+index_key_cache_pages: int
+index_key_cache_bytes: int
 read_only: bool
 descriptor_revalidation: Literal['strict', 'generation']
 max_query_value_characters: int

@@ -2,18 +2,85 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Iterable
 from typing import TYPE_CHECKING
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxUnsupportedOperation, GrafxQueryBudgetExceeded
 from okto_grafx.domain.model.value import Timestamp, Uuid, encode_value
-from okto_grafx.engine.database import QueryCursor
+from okto_grafx.engine.database import QueryCursor, Transaction, ExecuteManyReport
 from okto_grafx.engine.query_engine import QueryResult
 
 if TYPE_CHECKING:
     from pyarrow import RecordBatch
 
-__all__ = ["to_arrow_batches"]
+__all__ = ["to_arrow_batches", "import_arrow_batches"]
+
+
+def import_arrow_batches(
+    transaction: Transaction, statement: str, batches: Iterable[RecordBatch], *,
+    types: tuple[str, ...], max_batch_rows: int = 65536,
+    max_batch_bytes: int = 16 * 1024 * 1024, max_rows: int = 1_000_000,
+    max_batches: int = 4096,
+) -> ExecuteManyReport:
+    """Atomically stage typed scalar batches as named parameters, without committing.
+
+    One executemany savepoint covers the whole call. Any later malformed batch or
+    bound refusal discards this call, preserving prior transaction staging. The
+    caller owns source iteration, transaction lifetime, commit and retries.
+    """
+    if type(transaction) is not Transaction:
+        raise GrafxConfigurationError("Arrow import needs a native transaction.", field="transaction")
+    for name, value, maximum in (("max_batch_rows", max_batch_rows, 65536),
+            ("max_batch_bytes", max_batch_bytes, 2**31), ("max_rows", max_rows, 2**31),
+            ("max_batches", max_batches, 2**31)):
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise GrafxConfigurationError("Invalid Arrow import bound.", field=name)
+    allowed = {"BOOL", "INT64", "DOUBLE", "STRING", "BYTES", "TIMESTAMP", "UUID"}
+    if (type(types) is not tuple or not 1 <= len(types) <= 256
+            or any(type(kind) is not str or kind not in allowed for kind in types)):
+        raise GrafxConfigurationError("Arrow import requires 1..256 explicit scalar types.", field="types")
+    try:
+        import pyarrow as pa
+    except ImportError as failure:
+        raise GrafxUnsupportedOperation("Install okto-grafx[arrow] for Arrow import.", field="arrow") from failure
+    expected = {"BOOL": pa.bool_(), "INT64": pa.int64(), "DOUBLE": pa.float64(),
+                "STRING": pa.string(), "BYTES": pa.binary(), "TIMESTAMP": pa.timestamp("us", tz="UTC"),
+                "UUID": pa.binary(16)}
+
+    def parameters() -> Iterator[dict[str, object]]:
+        """Validate/copy at most one bounded input batch inside the native savepoint."""
+        names = None
+        rows = 0
+        for batch_index, batch in enumerate(batches):
+            if batch_index >= max_batches:
+                raise GrafxQueryBudgetExceeded("Arrow import batch count exceeded.", resource="arrow_import")
+            if type(batch) is not pa.RecordBatch or batch.num_columns != len(types):
+                raise GrafxConfigurationError("Arrow input must contain typed RecordBatches.", field="batches", batch=batch_index)
+            current = tuple(batch.schema.names)
+            if (len(set(current)) != len(current) or any(not name or len(name) > 256 for name in current)
+                    or (names is not None and current != names)):
+                raise GrafxConfigurationError("Arrow parameter names must be unique and stable.", field="columns", batch=batch_index)
+            names = current
+            for field, kind in zip(batch.schema, types):
+                tag = (field.metadata or {}).get(b"grafx.type")
+                if field.type != expected[kind] or (tag is not None and tag != kind.encode("ascii")):
+                    raise GrafxUnsupportedOperation("Arrow schema differs from explicit native types.", field="types", column=field.name, batch=batch_index)
+            charge = 256 + 256 * len(types) + 80 * batch.num_rows * len(types) + 4 * batch.nbytes
+            rows += batch.num_rows
+            if batch.num_rows > max_batch_rows or charge > max_batch_bytes or rows > max_rows:
+                raise GrafxQueryBudgetExceeded("Arrow import rows/logical memory exceeded.", resource="arrow_import", batch=batch_index)
+            for row in range(batch.num_rows):
+                values = {}
+                for column, (name, kind) in enumerate(zip(names, types)):
+                    scalar = batch.column(column)[row]
+                    value = (None if not scalar.is_valid else
+                             Timestamp(scalar.cast(pa.int64()).as_py()) if kind == "TIMESTAMP" else
+                             Uuid(scalar.as_py()) if kind == "UUID" else scalar.as_py())
+                    encode_value(value)
+                    values[name] = value
+                yield values
+
+    return transaction.executemany(statement, parameters())
 
 
 def to_arrow_batches(

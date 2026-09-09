@@ -142,6 +142,7 @@ from okto_grafx.engine.index_manager import (
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
 from okto_grafx.engine.vector_memory import (
     VectorMemoryUsage, picture_tariff, require_picture_budget, require_reservation, work_tariff,
+    VectorTotalMemoryUsage, _PictureBudget, _PictureReservation,
 )
 
 __all__ = [
@@ -586,6 +587,7 @@ class _GraphSnapshot:
     entry_of_node: dict[int, IndexEntry]
     record_of_node: dict[int, RecordId]
     mark: Lsn
+    reservation: _PictureReservation | None = None
 
     def certified(self, mark: Lsn) -> _GraphSnapshot:
         """Return this same picture -- same graph, same maps -- carrying a newer mark."""
@@ -595,6 +597,7 @@ class _GraphSnapshot:
             entry_of_node=self.entry_of_node,
             record_of_node=self.record_of_node,
             mark=mark,
+            reservation=self.reservation,
         )
 
 
@@ -639,6 +642,7 @@ class VectorHnswIndex(ProximityIndex):
         "_memory_peak",
         "_memory_refusals",
         "_memory_retirements",
+        "_aggregate_memory",
     )
 
     def __init__(
@@ -663,6 +667,7 @@ class VectorHnswIndex(ProximityIndex):
         guard: GraphGuard | None = None,
         refresh: Callable[[str, object], None] | None = None,
         hnsw_memory_budget_bytes: int | None = None,
+        _aggregate_memory: _PictureBudget | None = None,
     ) -> None:
         """Build the index of one embedding space over one paged store.
 
@@ -674,6 +679,7 @@ class VectorHnswIndex(ProximityIndex):
         self._memory_peak = 0
         self._memory_refusals = 0
         self._memory_retirements = 0
+        self._aggregate_memory = _aggregate_memory
         super().__init__(definition, pool, metrics)  # type: ignore[arg-type]
         self._space_id = space_id
         self._space_name = space_name
@@ -1147,6 +1153,18 @@ class VectorHnswIndex(ProximityIndex):
             self._guard.notify_all()
 
     def _build(self, mark: Lsn, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
+        """Reserve aggregate header/work capacity before retaining build inputs."""
+        reservation = (None if self._aggregate_memory is None else
+                       self._aggregate_memory.claim(self._hnsw_memory_budget_bytes))
+        try:
+            return self._build_reserved(mark, check=check, reservation=reservation)
+        except BaseException:
+            if reservation is not None:
+                reservation.release()
+            raise
+
+    def _build_reserved(self, mark: Lsn, *, check: Callable[[], None] | None,
+                        reservation: _PictureReservation | None) -> _GraphSnapshot:
         """Build a complete picture in locals over the entries the store holds, marked at ``mark``.
 
         A tombstoned entry is inserted with the live ones: it must not be RETURNED, and it must
@@ -1156,6 +1174,10 @@ class VectorHnswIndex(ProximityIndex):
         """
         self._reserve_picture(0, cold=True)
         ceiling = self._hnsw_memory_budget_bytes
+        if reservation is not None:
+            ceiling = reservation.amount
+            base = work_tariff(0, self._dimension, self._neighbours, self._ef_construction, cold=True)
+            reservation.resize(base) if base > ceiling else None
         if ceiling is None:
             captured = self._entry_headers()
         else:
@@ -1168,8 +1190,14 @@ class VectorHnswIndex(ProximityIndex):
                 if failure.details.get("resource") != "index_entry_headers":
                     raise
                 self._reserve_picture(max_entries + 1, cold=True)
+                if reservation is not None:
+                    reservation.resize(work_tariff(max_entries + 1, self._dimension,
+                                       self._neighbours, self._ef_construction, cold=True))
                 raise
         self._reserve_picture(len(captured), cold=True)
+        if reservation is not None:
+            reservation.resize(work_tariff(len(captured), self._dimension,
+                               self._neighbours, self._ef_construction, cold=True))
         headers = sorted(captured, key=lambda item: (item.born_csn, item.encoded_ref))
         del captured
         picture = _GraphSnapshot(
@@ -1197,6 +1225,7 @@ class VectorHnswIndex(ProximityIndex):
             entry_of_node={},
             record_of_node={},
             mark=mark,
+            reservation=reservation,
         )
         try:
             for header in headers:
@@ -1222,6 +1251,8 @@ class VectorHnswIndex(ProximityIndex):
             # Success publishes no duplicate score residency; failure discards the local graph
             # and also drops the potentially large transient cache before propagating.
             picture.graph._finish_construction()
+        if reservation is not None:
+            reservation.resize(picture_tariff(len(picture.entry_of_node), self._dimension, self._neighbours))
         return picture
 
     def _retire(self, picture: _GraphSnapshot) -> None:
@@ -1273,6 +1304,10 @@ class VectorHnswIndex(ProximityIndex):
     ) -> None:
         """Resolve, check and insert one entry that the picture does not hold yet."""
         self._reserve_picture(len(picture.entry_of_node) + 1, cold=False)
+        if picture.reservation is not None:
+            picture.reservation.resize(max(picture.reservation.amount,
+                work_tariff(len(picture.entry_of_node) + 1, self._dimension,
+                            self._neighbours, self._ef_construction, cold=False)))
         try:
             resolved = self._resolve(entry.ref)
         except GrafxError as failure:
@@ -1369,7 +1404,7 @@ class VectorHnswIndex(ProximityIndex):
                     )
                 except GrafxQueryBudgetExceeded as failure:
                     self._retire(picture)
-                    if failure.details.get("resource") != "vector_hnsw_memory":
+                    if failure.details.get("resource") not in ("vector_hnsw_memory", "vector_hnsw_total_memory"):
                         raise
                     with self._guard:
                         self._memory_retirements += 1
@@ -1380,6 +1415,8 @@ class VectorHnswIndex(ProximityIndex):
                     self._retire(picture)
                     raise
                 self._adjust_live_count(picture, 1)
+                if picture.reservation is not None:
+                    picture.reservation.resize(picture_tariff(len(picture.entry_of_node), self._dimension, self._neighbours))
             return True
         if node is None:
             return True
@@ -1639,6 +1676,7 @@ class VectorEngine:
         "_catalog_changes_are_wal_logged",
         "_candidate_filter_seal",
         "_hnsw_memory_budget_bytes",
+        "_aggregate_memory",
     )
 
     def __init__(
@@ -1660,6 +1698,7 @@ class VectorEngine:
         guard: GraphGuard | None = None,
         catalog_changes_are_wal_logged: bool = False,
         hnsw_memory_budget_bytes: int | None = None,
+        hnsw_total_memory_budget_bytes: int | None = None,
     ) -> None:
         """Build the engine over one catalog, one heap and one index registry.
 
@@ -1712,6 +1751,14 @@ class VectorEngine:
         self._catalog_changes_are_wal_logged = catalog_changes_are_wal_logged
         self._candidate_filter_seal = object()
         self._hnsw_memory_budget_bytes = require_picture_budget(hnsw_memory_budget_bytes)
+        total = require_picture_budget(hnsw_total_memory_budget_bytes)
+        self._aggregate_memory = (None if total is None else
+            _PictureBudget(total, _UnguardedBuild() if guard is None else guard))
+
+    def total_memory_usage(self) -> VectorTotalMemoryUsage:
+        """Copy optional aggregate reservations without touching storage."""
+        return (VectorTotalMemoryUsage(None, 0, 0, 0, 0) if self._aggregate_memory is None
+                else self._aggregate_memory.usage())
 
     # --- spaces -------------------------------------------------------------------------------
 
@@ -1938,6 +1985,7 @@ class VectorEngine:
             guard=self._guard,
             refresh=self._refresh_heap_view,
             hnsw_memory_budget_bytes=self._hnsw_memory_budget_bytes,
+            _aggregate_memory=self._aggregate_memory,
         )
         complete_through = (
             registry.published_lsn

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable, Iterator
+from itertools import islice
 
-from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
+from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError, GrafxError
 from okto_grafx.domain.ids import NO_PAGE
 from okto_grafx.domain.index.definition import COLUMN_KEY_DERIVATION, IndexDefinition
 from okto_grafx.domain.index.keys import bucket_of
@@ -101,23 +103,70 @@ class SparseHashIndex(HashIndex):
 
     def _ensure_bucket(self, bucket: int, lsn: int) -> None:
         """Barrier an unreachable empty head before publishing its directory pointer."""
-        if self._bucket_head(bucket) != NO_PAGE:
-            return
-        page = self._pool.allocate(self.file, self.page_type, reuse=False)
-        number = page.page_index
-        self._stamp(page, lsn)
-        self._pool.unpin(self.file, number, dirty=True)
-        self._pool.flush(self.file)
-        self._pool.storage.durable_barrier(self.file)
-        ordinal, position = divmod(bucket, self._directory_capacity())
-        with self._pool.pinned(self.file, ordinal + 1) as directory:
-            values = list(self._decode_directory(directory, ordinal))
-            if values[position] != NO_PAGE:
-                raise GrafxCorruptionDetected("Sparse bucket moved inside publication fence.", field="sparse_hash_directory")
-            values[position] = number
-            directory.update_slot(0, _HEADER.pack(_MAGIC, ordinal * self._directory_capacity(), len(values))
-                                  + struct.pack("<" + "I" * len(values), *values))
-            self._stamp(directory, lsn)
+        self._ensure_buckets(iter((bucket,)), lsn)
+
+    def _ensure_buckets(self, buckets: Iterator[int], lsn: int) -> None:
+        """Durably initialize <=64 unreachable heads before any pointer publication."""
+        while chunk := tuple(islice(buckets, 64)):
+            pending = {}
+            for bucket in chunk:
+                if bucket in pending or self._bucket_head(bucket) != NO_PAGE:
+                    continue
+                page = self._pool.allocate(self.file, self.page_type, reuse=False)
+                number = page.page_index
+                self._stamp(page, lsn)
+                self._pool.unpin(self.file, number, dirty=True)
+                pending[bucket] = number
+            if not pending:
+                continue
+            self._pool.flush(self.file)
+            self._pool.storage.durable_barrier(self.file)
+            for bucket, number in pending.items():
+                ordinal, position = divmod(bucket, self._directory_capacity())
+                with self._pool.pinned(self.file, ordinal + 1) as directory:
+                    values = list(self._decode_directory(directory, ordinal))
+                    if values[position] != NO_PAGE:
+                        raise GrafxCorruptionDetected("Sparse bucket moved inside publication fence.", field="sparse_hash_directory")
+                    values[position] = number
+                    directory.update_slot(0, _HEADER.pack(_MAGIC, ordinal * self._directory_capacity(), len(values))
+                                          + struct.pack("<" + "I" * len(values), *values))
+                    self._stamp(directory, lsn)
+
+    def _commit_staged(self, txn_id, staged, stamp, *, reset, live_hot):
+        """Share head barriers only within an already authorized complete COMMIT."""
+        if reset is None and len(staged.changes) > 1:
+            try:
+                self._ensure_buckets((bucket_of(change.key, self.definition.bucket_count)
+                                      for change in staged.changes
+                                      if change.operation is IndexOperation.INSERT), stamp)
+            except GrafxError as failure:
+                self._note_commit_failure(txn_id, staged, 0, failure)
+                raise
+        return super()._commit_staged(txn_id, staged, stamp, reset=reset, live_hot=live_hot)
+
+    def _prepare_build_entries(self, entries, lsn):
+        """Retain <=64 source entries while sharing private-build head publication."""
+        iterator = iter(entries)
+        while chunk := tuple(islice(iterator, 64)):
+            self._ensure_buckets((bucket_of(key, self.definition.bucket_count)
+                                  for _ref, key, _end in chunk), lsn)
+            yield from chunk
+
+    def _populated_buckets(self, visit: Callable[[], None] | None = None) -> Iterator[int]:
+        """Read each directory once; retain only one decoded page, never page pins.
+
+        Callers still validate each selected head and chain under their existing
+        publication/stable-view fence. No cached directory is an authority proof.
+        """
+        capacity = self._directory_capacity()
+        for ordinal in range(self._minimum_pages() - 1):
+            if visit is not None:
+                visit()
+            with self._pool.pinned(self.file, ordinal + 1) as page:
+                values = self._decode_directory(page, ordinal)
+            for position, head in enumerate(values):
+                if head != NO_PAGE:
+                    yield ordinal * capacity + position
 
     def _apply_change(self, change, lsn):
         """Materialize only an INSERT's absent head; other operations remain canonical."""
@@ -134,7 +183,7 @@ class SparseHashIndex(HashIndex):
         """Sample populated heads while accounting compact-directory metadata separately."""
         self.open()
         entries = heads = 0
-        for bucket in range(self.definition.bucket_count):
+        for bucket in self._populated_buckets():
             head = self._bucket_head(bucket)
             if head == NO_PAGE:
                 continue

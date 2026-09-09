@@ -4,6 +4,12 @@ Status: v1 implemented and locally validated in the 0.0.5 development worktree.
 [Acceptance evidence and limits](../reports/V005_OPS2_FTS_CHECKPOINT.md). Date: 2026-09-08.
 Dependencies: Existing index lifecycle/freshness, budgets and planner; GX-CAP-0.
 
+Continuation after `69ed311`: bounded prefix expansion/postings and relationship
+STRING indexes are implemented; see [prefix bytes](FTS_PREFIX_V1.md),
+[relationship contract](FTS_RELATIONSHIPS_V1.md) and
+[acceptance receipt](../reports/V005_AFTER_69ED311.md). Phrase/position search and
+same-name analyzer replacement remain outside this slice.
+
 ## Normative scope
 
 [Full complementary requirements](../archive/ROADMAP_SOURCES.md#source-grafx-complementary-evolution-plan-codex), §9; §17 GX-CAP-5.

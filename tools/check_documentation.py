@@ -106,6 +106,7 @@ def check() -> list[str]:
         ("domain/query/hybrid.py", {"HybridSearchOptions"}, "HYBRID_SEARCH.md"),
         ("domain/index/fulltext.py", {"TextIndexOptions", "TextSearchLimits"}, "FULL_TEXT_SEARCH.md"),
         ("transfer.py", {"TransferLimits"}, "LOGICAL_TRANSFER.md"),
+        ("projections.py", {"ProjectionLimits"}, "GRAPH_PROJECTIONS.md"),
     ):
         tree = ast.parse((ROOT / "src/okto_grafx" / module).read_text(encoding="utf-8"))
         expected = {
@@ -153,6 +154,6 @@ if __name__ == "__main__":
     print(
         "\n".join(failures)
         if failures
-        else "Documentation PASS: links/anchors, 36 config fields, public signatures/DTOs, 11 preserved source plans"
+        else "Documentation PASS: links/anchors, 39 config fields, public signatures/DTOs, 11 preserved source plans"
     )
     raise SystemExit(bool(failures))

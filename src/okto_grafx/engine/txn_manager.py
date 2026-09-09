@@ -2008,7 +2008,8 @@ class TransactionManager:
                 value=repr(table_name),
             )
         table = source.table(table_name)
-        if table.kind != "node":
+        from okto_grafx.domain.index.fulltext import is_fulltext
+        if table.kind != "node" and not is_fulltext(key_derivation):
             raise GrafxUnsupportedOperation(
                 f"Custom exact index {name!r} cannot target relationship table "
                 f"{table.name!r}.",

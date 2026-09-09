@@ -21,6 +21,12 @@ Bit 9 (`heap_free_page_index_v1`, requires bit 1) adds immutable
 [retired-page candidate directories](HEAP_FREE_PAGE_INDEX.md). Bit 10
 (`sparse_hash_directories_v1`) admits [sparse exact hash](SPARSE_HASH_DIRECTORIES.md).
 Both are explicit operation opt-ins, and remain required after activation.
+Bit 11 (`fulltext_prefixes_v1`, requires bit 5) adds opt-in bounded
+[prefix postings and v4 metadata](FTS_PREFIX_V1.md). Bit 12
+(`fulltext_relationships_v1`, requires bit 5) admits
+[relationship text indexes](FTS_RELATIONSHIPS_V1.md). Both preserve the existing
+catalog-before-effects WAL protocol and remain required after index removal.
+Arrow import and detached projections add no persisted format or required bit.
 `tests/storage_core/test_catalog_v2.py` and
 `tests/index/test_ordered_format_discrimination.py` exercise unknown/missing bits
 and older-reader discrimination. The subsequent layouts are specified in

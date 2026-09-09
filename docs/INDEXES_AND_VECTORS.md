@@ -1,5 +1,37 @@
 # Indexes and vector search
 
+## Continuation after 69ed311: bounded maintenance and memory
+
+Sparse maintenance visits each directory page once and then populated heads;
+selected heads/chains remain revalidated. Distribution charges directory visits
+and selected-head rereads, including empty directory pages. Pointer examination
+remains O(bucket count). Absent heads are initialized in batches of at most 64
+within one committed publication; a barrier precedes all pointers in each batch.
+Detached builds use 64-entry windows; RESET replay retains its scalar path. No
+format change, cross-transaction batching or early ACK is introduced.
+
+`connect(index_key_cache_pages=64, index_key_cache_bytes=1048576)` configures the
+exact-image memo per index. Either zero disables retention. `db.index_cache_usage(name)`
+returns immutable `KeyPageCacheUsage`: limits, pages/logical bytes, hits, misses,
+evictions and admission refusals. Counters reset on instance replacement/reopen;
+they do not certify freshness. Disabled/oversized entries still decode normally.
+
+`vector_hnsw_total_memory_budget_bytes` adds an optional per-handle aggregate to
+the per-picture limit. `db.vector_total_memory_usage()` returns reservations,
+picture count, peak and refusals. With the option disabled, accounting is disabled
+and reports zero (not measured zero residency). Cold builds reserve available
+bounded header/work capacity before collecting headers, then reduce to resident
+tariff. Certified wrappers share one reservation for shared graph/maps; retired
+pictures remain charged while readers hold them. Release follows object lifetime;
+delayed collection can cause conservative refusals. Concurrent builders can refuse
+rather than wait. No reader picture is evicted and no recall regime is silently
+changed. Warm pressure retires derived cache without failing an already durable
+write; the next ANN build can refuse until space is available. Exact scans are
+unaffected. Logical accounting excludes other handles, arbitrary provider memory
+and the buffer pool; it is not a process RSS cap.
+Manually composed vector collaborators without the aggregate diagnostic capability
+receive `GrafxUnsupportedOperation`, not an invented zero measurement.
+
 ## Sparse exact hash indexes and repeated keys
 
 `db.create_index("by_status", "Document", ("status",), layout="sparse_hash",
@@ -16,12 +48,13 @@ to be faster. Distribution counts only populated chain pages in `pages`, but its
 page-work budget also charges pointer reads, including empty buckets.
 
 Repeated-key native bucket scans retain a lazy, per-index decoded-page memo: at
-most 64 pages and 1 MiB of conservatively charged logical data. Every reuse compares
+most 64 pages and 1 MiB of conservatively charged logical data by default (the
+connection options above can change or disable these limits). Every reuse compares
 the complete current slot images, key, requested reference and decoder identity;
 all page/link checks, pre/post generation certificates and heap visibility checks
 still execute. No on-disk format or consistency option changes. Changed bytes,
 foreign writes and different keys miss the memo. Oversized pages use canonical
-decoding without retention. These are fixed implementation bounds, not RSS limits.
+decoding without retention. These are logical retention bounds, not RSS limits.
 Warm repeated queries avoid entry decoding but still visit all chain pages and all
 returned candidates. Returning N matches necessarily remains O(N); increasing the
 bucket count cannot split one repeated key. A new posting-tree layout remains a

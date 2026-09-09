@@ -386,6 +386,8 @@ def assemble_database(
             artifact_nonce=_new_control_file_nonce,
             projection_context=ContextLocalValue("okto_grafx_commit_index_projection"),
             live_commit_context=ContextLocalValue("okto_grafx_live_commit_authority"),
+            key_cache_pages=config.index_key_cache_pages,
+            key_cache_bytes=config.index_key_cache_bytes,
         )
         vectors = VectorEngine(
             catalog=catalog,
@@ -405,6 +407,7 @@ def assemble_database(
             exact_scan_threshold=config.vector_exact_scan_threshold,
             ef_search=config.vector_ef_search,
             hnsw_memory_budget_bytes=config.vector_hnsw_memory_budget_bytes,
+            hnsw_total_memory_budget_bytes=config.vector_hnsw_total_memory_budget_bytes,
             # Production schema changes use QueryEngine staging and the normal WAL commit.
             # Closing the two legacy direct-save doors is the proof TXN-4 needs to retain a
             # catalog view across a CE-3 interval containing only ordinary DML.

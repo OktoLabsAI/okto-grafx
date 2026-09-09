@@ -4372,6 +4372,7 @@ class IndexManager:
         "_definition_match",
         "_projection_context",
         "_live_commit_context",
+        "_key_cache_limits",
     )
 
     def __init__(
@@ -4383,6 +4384,8 @@ class IndexManager:
         artifact_nonce: Callable[[], int] | None = None,
         projection_context: ScopedValue | None = None,
         live_commit_context: ScopedValue | None = None,
+        key_cache_pages: int = 64,
+        key_cache_bytes: int = 1024 * 1024,
     ) -> None:
         """Build the registry over the pool and heap of one database.
 
@@ -4409,6 +4412,9 @@ class IndexManager:
                 )
         self._projection_context = projection_context
         self._live_commit_context = live_commit_context
+        from okto_grafx.engine.key_page_memo import KeyPageMemo
+        KeyPageMemo(key_cache_pages, key_cache_bytes)  # validate manual composition too
+        self._key_cache_limits = (key_cache_pages, key_cache_bytes)
         self._indexes: dict[str, IndexStore] = {}
         self._index_keys_by_table: dict[tuple[int, str], set[str]] = {}
         self._published_lsn: Lsn = NO_LSN
@@ -4437,6 +4443,9 @@ class IndexManager:
     def _publish_registered_index(self, index: IndexStore) -> None:
         """Publish one raw ownership entry and its table-local structural key."""
 
+        if index._key_page_memo is None:
+            from okto_grafx.engine.key_page_memo import KeyPageMemo
+            index._key_page_memo = KeyPageMemo(*self._key_cache_limits)
         key = index.definition.registry_key
         previous = self._indexes.get(key)
         if previous is not None and previous is not index:
@@ -8135,6 +8144,8 @@ class IndexManager:
             index = SparseHashIndex(definition, self._pool, self._metrics)
         else:
             index = HashIndex(definition, self._pool, self._metrics)
+        from okto_grafx.engine.key_page_memo import KeyPageMemo
+        index._key_page_memo = KeyPageMemo(*self._key_cache_limits)
         index._set_creation_nonce(definition.artifact_nonce)
         collision = next(
             (
@@ -8195,9 +8206,10 @@ class IndexManager:
                         collect_build_statistics, publish_statistics,
                     )
                     text_statistics = (0, (0,) * len(definition.positions))
-                for ref, key, ended_at in self._detached_exact_generation_entries(
-                    definition, position, table
-                ):
+                build_entries = self._detached_exact_generation_entries(definition, position, table)
+                if definition.layout is IndexLayout.SPARSE_HASH:
+                    build_entries = index._prepare_build_entries(build_entries, position)
+                for ref, key, ended_at in build_entries:
                     if text_statistics is not None:
                         text_statistics = collect_build_statistics(text_statistics, key, ended_at)
                     insert = IndexChange(

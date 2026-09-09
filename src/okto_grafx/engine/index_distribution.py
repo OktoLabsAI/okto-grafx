@@ -56,9 +56,12 @@ def index_distribution(database: Database, name: str, *, max_pages: int, max_ent
                 counts = {}
                 entries = pages = largest_chain = largest_bucket = heads = 0
                 memory = 0
-                for bucket in range(store.definition.bucket_count):
+                buckets = (store._populated_buckets(visit)
+                           if store.definition.layout is IndexLayout.SPARSE_HASH
+                           else range(store.definition.bucket_count))
+                for bucket in buckets:
                     if store.definition.layout is IndexLayout.SPARSE_HASH:
-                        visit()  # pointer-page work, including empty buckets
+                        visit()  # selected-head revalidation rereads its directory
                     chain_pages = 0
 
                     def visit_chain() -> None:

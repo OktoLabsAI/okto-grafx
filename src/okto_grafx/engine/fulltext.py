@@ -14,6 +14,7 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxQueryBudgetExceeded,
     GrafxTransactionStateError,
+    GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.index.fulltext import (
     TextIndexOptions,
@@ -85,11 +86,11 @@ def create_text_index(
         with database._transactions.page_access_section(fresh_read_view=True):
             definition = database._catalog.catalog.table(table)
             positions = tuple(definition.column_index(column) for column in columns)
-            if definition.kind != "node" or any(
+            if any(
                 definition.columns[p].type is not ValueType.STRING for p in positions
             ):
                 raise GrafxConfigurationError(
-                    "Full-text indexes require STRING node columns.", field="columns"
+                    "Full-text indexes require declared STRING properties.", field="columns"
                 )
             if len(positions) != len(selected.field_weights):
                 raise GrafxConfigurationError(
@@ -122,10 +123,13 @@ def search_text(
     b: float,
     timeout_seconds: float | None,
     cancellation: CancellationToken | None,
+    prefix: bool = False,
     _control: _ReadControl | None = None,
     _memory: Callable[[int], None] | None = None,
 ) -> TextSearchResult:
     """Return BM25 matches only after one complete pre/post index/heap certificate."""
+    if type(prefix) is not bool:
+        raise GrafxConfigurationError("prefix must be exactly bool.", field="prefix")
     if reader._database is not database or not reader.active or reader.mode != "read":
         raise GrafxTransactionStateError(
             "Text search requires an active reader of this database.",
@@ -193,8 +197,11 @@ def search_text(
                     options.max_document_tokens, budget.max_query_tokens
                 ),
             )
-            terms = tuple(sorted(set(analyze(query, query_options))))
-            if len(terms) > budget.max_query_tokens:
+            query_terms = tuple(sorted(set(analyze(query, query_options))))
+            if prefix and (not options.prefix_max_characters or
+                           any(len(term) > options.prefix_max_characters for term in query_terms)):
+                raise GrafxUnsupportedOperation("Prefix search requires configured prefix postings and eligible token lengths.", field="prefix")
+            if len(query_terms) > budget.max_query_tokens:
                 raise GrafxQueryBudgetExceeded(
                     "Query token budget exceeded.", resource="text_query_tokens"
                 )
@@ -301,6 +308,40 @@ def search_text(
                     memory -= len(seen) * 64
                     cached = (count, tuple(totals))
                 count, totals = cached
+                terms = query_terms
+                if prefix:
+                    expanded = set()
+                    for beginning in query_terms:
+                        prefix_docs = set()
+                        prefix_key = b"\x02" + beginning.encode("utf-8")
+                        for entry in entries(bucket_of(prefix_key, definition.bucket_count)):
+                            if entry.key != prefix_key:
+                                continue
+                            version = database._heap.read(entry.ref)
+                            if version.table_id != definition.table_id:
+                                raise GrafxCorruptionDetected("Foreign row in prefix postings.", file=store.file)
+                            if not snapshot.visible(version.xmin, version.xmax):
+                                continue
+                            if version.record_id in prefix_docs:
+                                raise GrafxCorruptionDetected("Duplicate visible prefix posting.", file=store.file)
+                            check(64)
+                            prefix_docs.add(version.record_id)
+                            fields = analysis.fields(version.values, definition.positions, options)
+                            matched = False
+                            for field in fields:
+                                for term in field:
+                                    if not term.startswith(beginning):
+                                        continue
+                                    matched = True
+                                    if term not in expanded:
+                                        if len(expanded) >= budget.max_expanded_terms:
+                                            raise GrafxQueryBudgetExceeded("Prefix expansion exceeded its term bound.", resource="text_prefix_terms")
+                                        check(128 + len(term.encode("utf-8")))
+                                        expanded.add(term)
+                            if not matched:
+                                raise GrafxCorruptionDetected("Prefix posting differs from its heap row.", file=store.file)
+                        memory -= 64 * len(prefix_docs)
+                    terms = tuple(sorted(expanded))
                 frequencies = {}
                 matches = {}
                 for term in terms:
@@ -413,7 +454,7 @@ def search_text(
                 return (
                     TextSearchResult(
                         chosen,
-                        "exact_index",
+                        "prefix_index" if prefix else "exact_index",
                         certificate.header.built_through_lsn,
                         snapshot.read_lsn,
                         visited,

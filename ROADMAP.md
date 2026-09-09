@@ -14,6 +14,8 @@ reopen completed work, authorize production data changes or imply release approv
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
+- [Proposed next round: projection throughput and algorithms](#proposed-next-round-projection-throughput-and-algorithms)
+- [Approved continuation after 69ed311](#approved-continuation-after-69ed311)
 - [Approved continuation after 3f3819f](#approved-continuation-after-3f3819f)
 - [Search and resumable-transfer follow-up](#search-and-resumable-transfer-follow-up)
 - [Approved four-item follow-up](#approved-four-item-follow-up)
@@ -65,6 +67,62 @@ reopen completed work, authorize production data changes or imply release approv
 | PULSE-BENCH | Reserved workload | Latest recorded authorized run consumed one spec; 19 remain reserved. Do not consolidate more, redrive, rebuild or reset data to improve this document. New live runs need a deliberate workload decision. |
 
 ## Search and resumable-transfer follow-up
+
+### Proposed next round: projection throughput and algorithms
+
+Proposed after closing the eight-item continuation of `69ed311`. **Not selected
+or started.** These are new bounded candidates, not missing acceptance from the
+15,994-pass delivery below and not additional mandatory gates for its release.
+Order favors reusable performance foundations before dependent capabilities.
+
+| Order / existing IDs | Bounded candidate and source evidence | Effort | Expected benefit / dependency |
+| --- | --- | --- | --- |
+| 1 / OPS-8, PERF-MEM, GX-CAP-9 | Public snapshot-bound physical scan with explicit column selection and bounded pages. Reuse the internal projected-read foundation in `engine/heap_store.py` (`scan_projected`/`_read_if_projected`) instead of exposing private heap access. Existing `Transaction.scan_rows_v1` retains its default full-row contract. Preserve validation of skipped payloads, record identity, cursor ownership and snapshot. | Medium | Potentially high allocation/decode reduction for wide rows/vectors when only identities/endpoints are needed; no promise to avoid physical integrity I/O. |
+| 2 / PERF-SCALE, GX-CAP-9 | Use item 1 in `project_graph` with row/byte-bounded batches, cancellation/deadline boundaries and work diagnostics. Current `projections.py` explicitly scans `limit=1` and decodes unretained properties. Stop at preserving identical nodes, physical edges and snapshot with fewer scan/admission calls. | Small–medium | Direct reduction of per-row API/coordination overhead; depends on 1. Capture remains a selected-table census, not O(1). |
+| 3 / PERF-MEM, GX-CAP-9 | Optional immutable compact adjacency owned by a detached projection; bounded construction and explicit accounting. Current projections retain an edge tuple but no reusable adjacency. Keep physical parallel-edge/self-loop identity and no persistent catalog/cache authority. | Medium | Reuse topology for repeated traversal/algorithms without rebuilding Python adjacency each time; foundation for 4–7, not a storage-format change. |
+| 4 / GX-CAP-9 | Iterative strongly connected components with work/memory/cancellation bounds and deterministic labels. Existing public projection exposes degrees and weak components only. Independent oracle checks cycles, isolated nodes, parallel edges and loops. | Medium | New directed-dependency/cycle analysis; depends on 3. No recursion-depth or write-back dependency. |
+| 5 / GX-CAP-9 | Read-only reachability and unweighted shortest paths on the detached projection. Explicit source/target, direction, depth/output/work limits and edge-identity tie semantics; reuse BFS rather than rescan storage per frontier. | Small–medium | Repeated path/dependency analysis over one captured snapshot; depends on 3. Weighted paths remain outside this slice. |
+| 6 / GX-CAP-9 | Bounded unweighted PageRank: explicit damping, tolerance, iteration cap, dangling-node and parallel/self-loop semantics; distinguish declared non-convergence from resource refusal. No graph mutation or embedding service. | Medium | New graph-importance ranking, not faster database writes; depends on 3. |
+| 7 / GX-CAP-9 | Bounded k-core decomposition over an explicitly defined undirected interpretation; document parallel-edge/self-loop treatment and test against an independent oracle. Stored/projected physical edges are not removed or rewritten. | Medium | New cohesion/dense-subgraph analysis; depends on 3. |
+| 8 / GX-CAP-8 | Extend optional Arrow import/export to declared vector columns with fixed-size lists, explicit space/dimension/precision metadata, NULL and shape/range validation. Current `arrow.py` admits only seven scalar types. Preserve whole-call import staging atomicity and caller-owned commit. | Medium | Typed analytics/ML interop without manual list conversion; no zero-copy promise, external scans or new persisted format. |
+
+Recommended checkpoints: **1–4**, then **5–8**, only after user selection. The
+existing DoD applies: focused positive/failure tests, grouped final regression,
+executable examples and roadmap/feature/configuration/API documentation. Publish
+work counts or timings only after measurement, without marginal speed thresholds.
+These candidates do not authorize a Pulse deployment or consuming reserved specs.
+Multi-reader/writer, both OCC checks, WAL/durability and fail-closed validation stay
+unchanged. Sharding, online reclamation, persisted algorithm write-back and temporal
+storage are intentionally outside this proposed round.
+
+### Approved continuation after 69ed311
+
+Approved September 9, 2026 on `feature/v0.0.5`, in the order below. This finite
+round preserves multi-reader/writer access, both OCC checks and WAL durability.
+Checkpoint after items 1–4; all eight are authorized. No release, push or Pulse
+data mutation is included. Each item requires feature/failure tests and updated
+consumer/API/configuration contracts; final grouped regression closes the round.
+
+| Order | Approved bounded deliverable | Status |
+| --- | --- | --- |
+| 1 / OPS-5 | Page-wise sparse-directory traversal for diagnostics/maintenance | Implemented checkpoint: 8,192 empty buckets / 72 directory visits |
+| 2 / OPS-4/5 | Configurable repeated-key memo and immutable diagnostics | Implemented checkpoint: page/byte caps, zero disables, exact-image authority preserved |
+| 3 / OPS-5/6 | Batch absent sparse-head materialization inside one existing publication | Implemented checkpoint: up to 64 heads per barrier; native crash/replay tests |
+| 4 / OPS-4 | Aggregate per-handle HNSW logical-memory budget across retained pictures | Implemented checkpoint: live/retired shared reservations; not RSS |
+| 5 / GX-CAP-8 | Typed bounded Arrow batch import with explicit atomicity | Implemented checkpoint: whole-call staging savepoint, prior writes preserved on failure |
+| 6 / GX-CAP-5 | Bounded prefix full-text search | Implemented checkpoint: bit 11, exact expanded-term scoring; no phrase/position search |
+| 7 / GX-CAP-5 | Full-text indexes over relationship text properties | Implemented checkpoint: bit 12, physical edge identities, replay/backup/transfer |
+| 8 / GX-CAP-9 | Read-only snapshot-bound graph projections, degrees and connected components | Implemented checkpoint: detached directed multigraph, degree/WCC, bounds/cancellation; no persisted catalog or writes |
+
+All eight bounded items are implemented and locally validated. Consolidated
+regression: **15,994 distinct passes, 18 platform skips, no unresolved failures**;
+two missing-helper-docstring failures were corrected and revalidated. Ruff and
+documentation coverage passed. This is grouped Windows/Python 3.13 evidence, not
+a clean uninterrupted run, remote cross-platform certification or a release.
+[Round evidence and limits](docs/reports/V005_AFTER_69ED311.md).
+
+These are extensions of the completed checkpoint below, not a reopening of its
+DoD. Performance figures must be measured; there is no percentage gate.
 
 ### Approved continuation after 3f3819f
 
@@ -337,9 +395,9 @@ No additional marginal performance threshold is introduced by this requirement.
 | OPS-1 / §8.1 | R4 plus item 7: bounded physical backup/restore with chunked capture | Checked manifest, checkpoint-fenced disk spool (default) or memory capture, verified no-replace publication and offline same-UUID replacement. No no-pause/resumable hot backup, generic custom-storage backup or independently writable fork. [Contract](docs/BACKUP_RESTORE.md). |
 | OPS-2 / §8.2 | Implemented bounded v1 plus explicit resume extension | Streaming checksummed logical schema/data/vectors, parallel edges, current-ID mappings, FTS declarations, private-workspace crash resumption and verified no-replace promotion. Current state only; no existing-target merge or historical journal copy. [Contract](docs/LOGICAL_TRANSFER.md), [latest acceptance](docs/reports/V005_SEARCH_RESUME_CHECKPOINT.md). |
 | OPS-3 / P1.4, §8.3 | Partial: quiescent vacuum, validated overflow reuse and opt-in indexed candidate discovery | Retirement and immutable candidate directories are WAL-published. Default discovery remains amortized O(heap pages); indexed discovery visits candidates/stale entries/directory pages and is not constant time. Quiescence remains an operator assertion; truncation and online vacuum remain unimplemented. [Indexed discovery](docs/OPERATIONS.md#indexed-retired-overflow-discovery-005-development). |
-| OPS-4 / P1.8 | Open limitation: buffer and query budgets are not process RSS caps | Account/measure all retained engine state, vector memory, concurrent handles and temporary encodings. Preserve deterministic refusal; publish a realistic peak-memory envelope, not an RSS promise derived from nominal page bytes. |
-| OPS-5 / P1.12 | Partial: growth/rebuild, quiescent cleanup, explicit 65,536-bucket sizing, sparse allocation and bounded skew/repeated-key decoding exist | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement, sharding and a new repeated-key posting layout remain. [Index contract](docs/INDEXES_AND_VECTORS.md), [cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
-| OPS-6 / P1.11 | Open limitation: physical conflicts and exclusive publication | Remove only proven redundant publication/page work. Disjoint logical rows may still conflict; do not promise linear writer scaling or replace multiwriter with an application-wide single-writer premise. |
+| OPS-4 / P1.8 | Partial: per-picture and aggregate per-handle HNSW admission, configurable key memo and diagnostics; still not RSS caps | Cross-handle/provider/temporary retention and measured process envelopes remain. Preserve deterministic refusal; do not derive RSS promises from nominal page bytes. [Memory contract](docs/INDEXES_AND_VECTORS.md#continuation-after-69ed311-bounded-maintenance-and-memory). |
+| OPS-5 / P1.12 | Partial: growth/rebuild, quiescent cleanup, 65,536-bucket sizing, sparse page-wise maintenance/batched heads and configurable repeated-key decoding | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement, sharding and a new repeated-key posting layout remain. [Index contract](docs/INDEXES_AND_VECTORS.md), [cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
+| OPS-6 / P1.11 | Partial: sparse head-initialization barriers shared inside one committed publication; physical conflicts and exclusive publication remain | Remove only proven redundant publication/page work. Disjoint logical rows may still conflict; do not promise linear writer scaling or replace multiwriter with an application-wide single-writer premise. |
 | OPS-7 / P2.6, P2.9 | Implemented bounded DX/isolation checkpoint in 0.0.5 | Typed `Unpack[ConnectOptions]` plus per-connection checksum selection, including custom registries. Standalone low-level installers retain their legacy default outside database operations. No checksum algorithm or persisted byte semantics changed. [R2 evidence](docs/reports/V005_R1_R2_CHECKPOINT.md). |
 | OPS-8 / §8.5 | Partial: reusable Query/cursor and cooperative read cancellation/deadlines exist | `Query` is not a durable prepared plan or HTTP token. Broader streaming/prepared APIs remain; controls do not preempt blocking calls, run watchdog cleanup or interrupt commits. [Contract](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
 | OPS-9 / P1.16 | Deferred configuration capability | Expose HNSW construction knobs only with persistent identity/defaults, cold/incremental parity expectations and a controlled 8,192×384 recall profile. `vector_ef_search` already configures runtime beam; it is not construction tuning. |
@@ -465,11 +523,11 @@ physical edges do not cross stores. Embedding generation stays outside the engin
 | GX-CAP-2 | Planned | Attached CatalogSession, explicit resolution/permissions, workspace scopes, one-store writes, copy/promotion receipts; provenance depends on CAP-1. [Spec](docs/specs/SPEC-GX-CAP-2.md). |
 | GX-CAP-3 | Planned | Opt-in system-time history, historical schema/edges, delete/recreate semantics, retention, indexes and typed time-travel API; CAP-1 first. [Spec](docs/specs/SPEC-GX-CAP-3.md). |
 | GX-CAP-4 | Planned | Valid time, bitemporal semantics and graph/version diff; builds on CAP-3. [Spec](docs/specs/SPEC-GX-CAP-4.md). |
-| GX-CAP-5 | Implemented v1 plus single-pass counting and opt-in durable statistics | Native FTS, explicit analyzer/version, weighted BM25 and snapshot/filter/budget/recovery contracts. Pure analysis reuse, bounded WAL deltas and eligible persisted summaries reduce work; old/ineligible census remains linear. Prefix/phrase, relationship FTS and same-name analyzer replacement remain unsupported. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
+| GX-CAP-5 | Implemented v1 plus bounded prefixes, relationship indexes and durable/history statistics | Native FTS, frozen analyzers, weighted BM25, exact snapshot scores, full lifecycle and required bits 11/12. Pure analysis reuse, bounded WAL deltas and eligible persisted summaries reduce work; old/ineligible census remains linear. Phrase/position search and same-name analyzer replacement remain unsupported. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [latest evidence](docs/reports/V005_AFTER_69ED311.md). |
 | GX-CAP-6 | Implemented bounded v1 plus certified incident expansion and shared controls/memory | Weighted RRF, union/intersection, source explanations, graph boost/filter, explicit missing-source partial policy, indexed BFS and per-phase logical peaks. No embedding provider, cross-table fusion, graph-only candidate expansion or universal recall promise. [Usage](docs/HYBRID_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-6.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
 | GX-CAP-7 | Partial: trusted scalar SPI implemented | Explicit immutable per-handle registry, typed scalar UDFs/direct calls, NULL/value budgets and typed failures. Aggregate/table/procedure extensions, durable manifests and sandboxing are not implemented. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-7.md). |
-| GX-CAP-8 | Partial: scalar Arrow result export implemented | Explicit types, bounded copied batches over results/cursors and ownership contracts. External scans, nested/entity export and graph exchange remain; no implicit distributed transaction. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |
-| GX-CAP-9 | Planned | Bounded graph projections and optional algorithm package: reachability, components, shortest paths and ranking with declared semantics. [Spec](docs/specs/SPEC-GX-CAP-9.md). |
+| GX-CAP-8 | Partial: scalar Arrow import/export implemented | Explicit types, bounded batches, atomic import staging and caller-owned commit. External scans, nested/entity data and graph exchange remain. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |
+| GX-CAP-9 | Partial: detached snapshot projections, degrees and WCC implemented | Read-only bounded directed multigraph, cancellation, independent reachability oracle; no persistent projection catalog, SCC/PageRank/k-core, weights or algorithm writes. [Usage](docs/GRAPH_PROJECTIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-9.md). |
 | GX-CAP-10 | Partial: additive application migration ledger/checksums/dry-run implemented in the eight-item continuation | Atomic per-version CREATE NODE/REL TABLE and VECTOR SPACE with bounded retries/resumption. Staged column evolution, arbitrary ALTER, logical views and derived/materialized graphs remain; distinct from engine format migration. [Consumer guide](docs/SCHEMA_MIGRATIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-10.md). |
 | GX-CAP-11 | Partial: 0.0.5 compatibility automation and local upgrade evidence implemented | Real-wheel upgrade/refusal, cross-selector reopen and Windows/Ubuntu × Python 3.11–3.13 workflow. Remote matrix runs and release acceptance are not implied. [Current evidence](docs/V005_COMPATIBILITY.md), [spec](docs/specs/SPEC-GX-CAP-11.md). |
 

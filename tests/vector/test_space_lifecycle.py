@@ -379,5 +379,6 @@ def test_the_engine_exposes_nothing_that_could_generate_an_embedding(
         "spaces",
         "stage_delete",
         "stage_insert",
+        "total_memory_usage",
         "validate_vector",
     ]

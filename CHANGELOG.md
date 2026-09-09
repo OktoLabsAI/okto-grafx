@@ -9,6 +9,16 @@ including the on-disk format.
 
 ### Changed
 
+- Continuation after `69ed311`: page-wise sparse maintenance, configurable key-page
+  memo/diagnostics, up to 64 absent heads sharing an initialization barrier inside
+  one existing durable publication, and opt-in aggregate per-handle HNSW admission.
+- Typed optional Arrow import uses one atomic staging savepoint across bounded
+  batches; caller still owns commit/retry and native transaction quotas.
+- Opt-in bounded FTS prefix postings (required bit 11) and relationship STRING
+  indexes (required bit 12), preserving physical edge identity and snapshot BM25.
+- Detached read-only graph projections, degree and weak-component algorithms with
+  explicit multigraph semantics, cancellation and logical resource bounds.
+
 - Indexed retired-overflow candidate discovery (bit 9) published by quiescent
   vacuum, plus opt-in sparse hash directories (bit 10/header 4). Default layouts
   remain unchanged; backup, replay and old-reader refusal contracts are explicit.

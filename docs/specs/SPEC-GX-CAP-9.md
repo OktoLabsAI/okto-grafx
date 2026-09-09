@@ -1,6 +1,8 @@
 # SPEC-GX-CAP-9 — Graph projections and algorithms
 
-Status: specified / implementation not certified. Date: 2026-09-08.
+Status: first read-only slice implemented in 0.0.5 development; broader scope remains planned.
+Date: 2026-09-09. [Consumer contract](../GRAPH_PROJECTIONS.md),
+[acceptance receipt](../reports/V005_AFTER_69ED311.md).
 Dependencies: GX-CAP-7; existing traversal/query budgets.
 
 ## Normative scope
@@ -43,7 +45,12 @@ sections remain binding. Tests must include failing-before implementation cases 
 hostile inputs, not only happy paths. Publish operation counts and resource evidence
 when claiming complexity/performance improvements; no new marginal timing threshold.
 
-Execution status: **not implemented by GX-CAP-0**. No release, new on-disk capability,
+Execution status: **not implemented by GX-CAP-0**; the continuation after `69ed311`
+adds detached snapshot projection, degrees and weak components through public scans,
+with logical limits, cancellation and an independent reachability oracle. Persisted
+catalog, SCC/PageRank/k-core, weights, mutation/write modes and NetworkX acceptance
+remain backlog; the independent oracle is not recorded as a NetworkX run.
+No release, new on-disk capability,
 installed Pulse feature, or successful crash matrix is inferred from this document.
 Record immutable code SHA, test commands/results, audit and unresolved debt here when
 implemented. Next prerequisite is the first unmet dependency, not another scope expansion.
