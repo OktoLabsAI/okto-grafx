@@ -31,13 +31,14 @@ def seed(root):
     return db
 
 
-def test_backup_restore_identity_provenance_and_writable_reopen(tmp_path):
+@pytest.mark.parametrize("capture_mode", ["disk", "memory"])
+def test_backup_restore_identity_provenance_and_writable_reopen(tmp_path, capture_mode):
     source = tmp_path / "db"
     backup = tmp_path / "backup"
     with seed(source) as db:
         identity = db.identity
         history = db.commit_history()
-        report = create_backup(db, backup)
+        report = create_backup(db, backup, capture_mode=capture_mode)
         assert report.database_uuid == identity.database_uuid.hex()
         assert not (
             backup / "grafx.meta"
@@ -55,10 +56,31 @@ def test_backup_restore_identity_provenance_and_writable_reopen(tmp_path):
         assert db.verify("all").findings == ()
 
 
+def test_streamed_capture_and_artifact_readback_are_chunk_bounded(tmp_path, monkeypatch):
+    import okto_grafx.backup as module
+    from okto_grafx.adapters.storage_local import LocalStorageDevice
+
+    original = LocalStorageDevice.read_log
+    readback_sizes = []
+
+    def read(storage, name, offset, length):
+        if name.startswith("objects/"):
+            readback_sizes.append(length)
+            assert length <= 256
+        return original(storage, name, offset, length)
+
+    with seed(tmp_path / "db") as db:
+        monkeypatch.setattr(module, "_CHUNK", 256)
+        monkeypatch.setattr(LocalStorageDevice, "read_log", read)
+        report = create_backup(db, tmp_path / "backup")
+        assert report.bytes > 256 and len(readback_sizes) > report.files
+        assert not list(tmp_path.glob(".grafx-backup-spool-*"))
+    restore_backup(tmp_path / "backup", tmp_path / "copy", confirm_original_offline=True)
+
+
 def test_backup_cut_with_writer_waiting_and_writer_progress_during_artifact_io(
     tmp_path, monkeypatch
 ):
-    import okto_grafx.backup as module
     from okto_grafx.adapters.storage_local import LocalStorageDevice
 
     source = tmp_path / "db"
@@ -66,7 +88,8 @@ def test_backup_cut_with_writer_waiting_and_writer_progress_during_artifact_io(
     attempted = threading.Event()
     committed = threading.Event()
     original_read = LocalStorageDevice.read_log
-    original_put = module._put
+    original_create = LocalStorageDevice.create
+    output_observed = []
 
     def read(storage, file, offset, length):
         """Give a competing writer the opportunity to publish during the physical cut."""
@@ -76,11 +99,12 @@ def test_backup_cut_with_writer_waiting_and_writer_progress_during_artifact_io(
             assert not committed.is_set()
         return original_read(storage, file, offset, length)
 
-    def output(storage, name, payload):
+    def output(storage, name, *args, **kwargs):
         """Destination IO must run with no source commit fence retained."""
         if name.startswith("objects/"):
             assert committed.wait(10)
-        return original_put(storage, name, payload)
+            output_observed.append(name)
+        return original_create(storage, name, *args, **kwargs)
 
     with seed(source) as db, connect(source, page_size=512) as writer:
 
@@ -91,11 +115,12 @@ def test_backup_cut_with_writer_waiting_and_writer_progress_during_artifact_io(
             committed.set()
 
         monkeypatch.setattr(LocalStorageDevice, "read_log", read)
-        monkeypatch.setattr(module, "_put", output)
+        monkeypatch.setattr(LocalStorageDevice, "create", output)
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(write)
             create_backup(db, tmp_path / "backup")
             future.result(timeout=10)
+        assert output_observed
         assert db.execute("MATCH (p:P) RETURN count(p)").rows == ((2,),)
     restore_backup(
         tmp_path / "backup", tmp_path / "restored", confirm_original_offline=True
@@ -209,7 +234,6 @@ def test_capture_timeout_and_destination_publication_race_fail_closed(
 
 
 def test_backup_refuses_object_write_and_read_back_failures(tmp_path, monkeypatch):
-    import okto_grafx.backup as module
     from okto_grafx.adapters.storage_local import LocalStorageDevice
 
     with seed(tmp_path / "db") as db:
@@ -226,14 +250,12 @@ def test_backup_refuses_object_write_and_read_back_failures(tmp_path, monkeypatc
         assert not (tmp_path / "failed").exists()
         monkeypatch.setattr(LocalStorageDevice, "append_log", original)
         # Corrupt an output payload after capture, retaining its original manifest checksum.
-        original_put = module._put
-
         def corrupt(storage, name, data):
-            return original_put(
+            return original(
                 storage, name, b"x" * len(data) if name.startswith("objects/") else data
             )
 
-        monkeypatch.setattr(module, "_put", corrupt)
+        monkeypatch.setattr(LocalStorageDevice, "append_log", corrupt)
         with pytest.raises(GrafxRecoveryRefused, match="read-back"):
             create_backup(db, tmp_path / "corrupt")
         assert not (tmp_path / "corrupt").exists()
@@ -259,7 +281,6 @@ def test_authoritative_source_corruption_is_not_promoted_or_repaired(tmp_path):
 
 
 def test_backup_cut_with_a_foreign_writer_process(tmp_path, monkeypatch):
-    import okto_grafx.backup as module
     from okto_grafx.adapters.storage_local import LocalStorageDevice
 
     source = tmp_path / "db"
@@ -285,8 +306,9 @@ with connect(sys.argv[1], page_size=512) as db:
         try:
             assert process.stdout.readline().strip() == "ready"
             original_read = LocalStorageDevice.read_log
-            original_put = module._put
+            original_create = LocalStorageDevice.create
             signalled = False
+            observed_output = []
 
             def read(storage, file, offset, length):
                 nonlocal signalled
@@ -297,17 +319,20 @@ with connect(sys.argv[1], page_size=512) as db:
                     assert process.stdout.readline().strip() == "attempt"
                 return original_read(storage, file, offset, length)
 
-            def output(storage, name, payload):
+            def output(storage, name, *args, **kwargs):
+                if name.startswith("objects/"):
+                    observed_output.append(name)
                 if name.startswith("objects/") and process.poll() is None:
                     stdout, stderr = process.communicate(timeout=10)
                     assert process.returncode == 0, stderr
                     assert "committed" in stdout
-                return original_put(storage, name, payload)
+                return original_create(storage, name, *args, **kwargs)
 
             monkeypatch.setattr(LocalStorageDevice, "read_log", read)
-            monkeypatch.setattr(module, "_put", output)
+            monkeypatch.setattr(LocalStorageDevice, "create", output)
             create_backup(db, tmp_path / "backup")
             assert signalled
+            assert observed_output
             assert db.execute("MATCH (p:P) RETURN count(p)").rows == ((2,),)
         finally:
             if process.poll() is None:
@@ -411,12 +436,14 @@ def test_process_death_during_artifact_write_leaves_no_promoted_backup(tmp_path)
 import os, sys
 from okto_grafx import connect
 import okto_grafx.backup as backup
-original = backup._put
+from okto_grafx.adapters.storage_local import LocalStorageDevice
+original = LocalStorageDevice.append_log
 def cut(storage, name, payload):
-    original(storage, name, payload)
+    result = original(storage, name, payload)
     if name.startswith('objects/'):
         os._exit(77)
-backup._put = cut
+    return result
+LocalStorageDevice.append_log = cut
 with connect(sys.argv[1], page_size=512) as db:
     backup.create_backup(db, sys.argv[2])
 """

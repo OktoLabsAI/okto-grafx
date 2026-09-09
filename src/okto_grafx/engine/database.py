@@ -89,6 +89,7 @@ from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.query.ast import Query as QueryStatement
 from okto_grafx.domain.query.control import CancellationToken, _ReadControl, _read_control
+from okto_grafx.engine.index_distribution import IndexDistribution
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_COLUMN_DEFINITIONS,
@@ -1547,11 +1548,13 @@ class Maintenance:
         name: str,
         *,
         overflow_pages_per_bucket: int = 1,
+        check_skew: bool = False,
     ) -> IndexView | None:
         """Grow one physically pressured exact index by at most one directory step."""
         return self._database.rehash_index_if_needed(
             name,
             overflow_pages_per_bucket=overflow_pages_per_bucket,
+            check_skew=check_skew,
         )
 
     def publish_metrics(self) -> None:
@@ -2580,6 +2583,7 @@ class Database:
                         "index_built_through_commit": found.index_built_through_commit, "fulltext_exact_index": 1,
                         "statistics_wal_records": found.statistics_wal_records,
                         "statistics_from_wal_delta": int(found.statistics_regime == 'wal_delta'),
+                        "statistics_from_durable_summary": int(found.statistics_regime == 'durable_summary'),
                         "statistics_from_snapshot_cache": int(found.statistics_regime == 'snapshot_cache')},
         )
 
@@ -2872,6 +2876,30 @@ class Database:
         query: Sequence[float] | VectorValue,
         k: int,
         candidate_filter: RecordIdFilter | None = None,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
+    ) -> VectorSearchResult:
+        """Search one owned snapshot with optional cooperative read controls.
+
+        Controls are checked inside native candidate/ranking/navigation loops, not
+        preemptively inside a storage or third-party math call. No commit is cancelled.
+        Custom vector engines must expose search_controlled to accept these controls.
+        """
+        return self._search_vectors_with_control(
+            transaction, space=space, query=query, k=k, candidate_filter=candidate_filter,
+            control=_read_control(self._clock, timeout_seconds, cancellation),
+        )
+
+    def _search_vectors_with_control(
+        self,
+        transaction: Transaction,
+        *,
+        space: str,
+        query: Sequence[float] | VectorValue,
+        k: int,
+        candidate_filter: RecordIdFilter | None = None,
+        control: _ReadControl | None = None,
+        memory=None,
     ) -> VectorSearchResult:
         """Search vectors under the fixed snapshot of one active transaction.
 
@@ -2952,13 +2980,29 @@ class Database:
                         space=wanted_space,
                     )
                 snapshot = _public_snapshot(transaction._context.snapshot)
-                result = vectors.search(  # type: ignore[attr-defined]
+                operation = vectors.search
+                extra = {}
+                if control is not None or memory is not None:
+                    if control is not None:
+                        control.check()
+                    operation = getattr(vectors, "search_controlled", None)
+                    if not callable(operation):
+                        raise GrafxUnsupportedOperation(
+                            "The vector engine does not support cooperative controls.",
+                            operation="search_vectors", field="read_control",
+                        )
+                    extra["control"] = control
+                    extra["memory"] = memory
+                result = operation(
                     space=wanted_space,
                     query=wanted_query,
                     k=wanted_k,
                     snapshot=snapshot,
                     candidate_filter=wanted_filter,
+                    **extra,
                 )
+                if control is not None:
+                    control.check()
             return _vector_search_result_view(
                 result,
                 requested_k=wanted_k,
@@ -3180,12 +3224,13 @@ class Database:
         name: str,
         *,
         overflow_pages_per_bucket: int = 1,
+        check_skew: bool = False,
     ) -> IndexView | None:
         """Grow one exact index after a bounded directory-pressure assessment.
 
         The probe validates the physical identity and only the eager head page of each bucket;
         it never follows overflow chains or decodes entries.  Its cost is therefore
-        O(bucket_count), capped by the format at 4,096 pages, rather than O(index entries).  One
+        O(bucket_count), capped by the format at 65,536 pages, rather than O(index entries). One
         growth step is suggested when average occupied head slots reach the canonical sizing
         target, or when retained overflow reaches the configured integer ratio to bucket heads.
         Tombstones and pages retained after an interrupted append can make either signal
@@ -3202,6 +3247,8 @@ class Database:
         """
 
         with self._public_operation("rehash_index_if_needed"):
+            if type(check_skew) is not bool:
+                raise GrafxConfigurationError("check_skew must be boolean.", field="check_skew")
             self._require_open()
             self._require_writable("rehash an exact index when physically pressured")
             indexes = self._require_component(
@@ -3246,10 +3293,25 @@ class Database:
 
             # Re-enter the existing public protocol after releasing the read observation.  Its
             # fresh catalog/OCC checks are the authority; the advisory page-count sample is not.
+            if check_skew and self.index_distribution(wanted_name).recommendation == "inspect_key_skew":
+                return None
             return self.rehash_index(
                 wanted_name,
                 bucket_count=target_bucket_count,
             )
+
+    def index_distribution(
+        self, name: str, *, max_pages: int = 65_536, max_entries: int = 1_000_000,
+        max_memory_bytes: int = 64 * 1024 * 1024,
+    ) -> IndexDistribution:
+        """Bounded physical HASH distribution, without exposing keys or mutating data.
+
+        Retained old entries count too. This explicit maintenance census is O(entries
+        + pages), not a per-query optimization or an authoritative live cardinality.
+        """
+        from okto_grafx.engine.index_distribution import index_distribution
+        return index_distribution(self, name, max_pages=max_pages, max_entries=max_entries,
+                                  max_memory_bytes=max_memory_bytes)
 
     def verify(self, scope: str = "all") -> VerificationReport:
         """Walk the database and report every finding, precisely located (SPEC-M1 FR-11).

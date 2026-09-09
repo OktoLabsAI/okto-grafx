@@ -177,11 +177,12 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
         name: str,
         *,
         overflow_pages_per_bucket: int = 1,
+        check_skew: bool = False,
     ) -> object:
         calls.append(
             (
                 "rehash_index_if_needed",
-                (name, overflow_pages_per_bucket),
+                (name, overflow_pages_per_bucket, check_skew),
             )
         )
         return index_result
@@ -245,6 +246,7 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
                 is index_result
             )
             assert maintenance.rebuild_index("by_name") is index_result
+            assert maintenance.rehash_index_if_needed("by_name", check_skew=True) is index_result
     finally:
         database.close()
 
@@ -261,8 +263,9 @@ def test_operational_methods_delegate_to_the_existing_database_doors(
             ("by_name", "Person", ("name",), None, 1_000, "hash"),
         ),
         ("rehash_index", ("by_name", 128, None)),
-        ("rehash_index_if_needed", ("by_name", 2)),
+        ("rehash_index_if_needed", ("by_name", 2, False)),
         ("rebuild_index", "by_name"),
+        ("rehash_index_if_needed", ("by_name", 1, True)),
     ]
 
 

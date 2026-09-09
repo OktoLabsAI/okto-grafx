@@ -49,6 +49,9 @@ context exit commits, and an exceptional exit rolls back. See
 | Exact and approximate vector search with declared space, metric and precision | [Indexes and vectors](docs/INDEXES_AND_VECTORS.md) |
 | Native full-text indexes, versioned analyzers, weighted BM25 and bounded snapshot search (0.0.5 development) | [Full-text search](docs/FULL_TEXT_SEARCH.md) |
 | Snapshot-consistent weighted RRF text/vector fusion with bounded graph evidence (0.0.5 development) | [Hybrid search](docs/HYBRID_SEARCH.md) |
+| Indexed hybrid BFS, aggregate search-memory diagnostics and cooperative vector controls; opt-in durable FTS totals (0.0.5 development) | [Hybrid contracts](docs/HYBRID_SEARCH.md), [FTS modes](docs/FULL_TEXT_SEARCH.md) |
+| Explicit hash directories up to 65,536 buckets and bounded, key-private skew diagnostics (0.0.5 development) | [Index sizing](docs/INDEXES_AND_VECTORS.md#explicit-distribution-diagnostics-and-wide-directories) |
+| Versioned additive application migrations, checksum ledger and read-only dry-run (0.0.5 development) | [Schema migrations](docs/SCHEMA_MIGRATIONS.md) |
 | Opt-in durable commit provenance, qualified lookup and snapshot-paged history (0.0.5 development) | [Commit history](docs/COMMIT_HISTORY.md) |
 | Query/transaction budgets, optional spill, acceleration and metrics | [All configuration fields](docs/CONFIGURATION.md) |
 | Verification, evidence ledger/quarantine, recovery/checkpoint, manual vacuum and WAL compression | [Operations](docs/OPERATIONS.md) |

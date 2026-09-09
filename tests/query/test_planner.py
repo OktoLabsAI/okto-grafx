@@ -10,6 +10,7 @@ from okto_grafx.domain.errors import (
     GrafxPlanError,
 )
 from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.keys import MAX_BUCKET_COUNT, MAX_EXPECTED_CARDINALITY
 from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
@@ -574,13 +575,13 @@ def test_an_ordered_custom_index_plan_persists_its_narrow_key_contract() -> None
         ),
         ("CREATE INDEX i FOR (r:Knows) ON (r.since)", GrafxPlanError, "table"),
         (
-            "CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS bucket_count = 4097",
+            f"CREATE INDEX i FOR (p:Person) ON (p.name) OPTIONS bucket_count = {MAX_BUCKET_COUNT + 1}",
             GrafxIndexError,
             "bucket_count",
         ),
         (
             "CREATE INDEX i FOR (p:Person) ON (p.name) "
-            "OPTIONS expected_cardinality = 262145",
+            f"OPTIONS expected_cardinality = {MAX_EXPECTED_CARDINALITY + 1}",
             GrafxIndexError,
             "expected_cardinality",
         ),

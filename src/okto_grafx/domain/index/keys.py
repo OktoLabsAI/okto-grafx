@@ -45,13 +45,15 @@ __all__ = [
 MIN_BUCKET_COUNT: int = 1
 """The smallest legal bucket count: one bucket is a single chain and is still a correct index."""
 
-MAX_BUCKET_COUNT: int = 4096
+LEGACY_MAX_BUCKET_COUNT: int = 4096
+LARGE_HASH_CAPABILITY: str = "large_hash_directories_v1"
+MAX_BUCKET_COUNT: int = 65_536
 """The largest legal bucket count.
 
 Every bucket owns a head page from the moment the index is created, so the count is also the
-minimum size of the file in pages. Four thousand pages is 32 MiB at the default page size, which
-is a generous ceiling for a reference index and a bound that keeps a mistyped configuration from
-allocating a file the engine may never shrink (G6).
+minimum size of the file in pages. The explicit maximum is 512 MiB of eager heads
+at the default 8 KiB page size. Catalog capability gating protects old writers;
+defaults remain small and large sizing is an explicit operator choice (G6).
 """
 
 DEFAULT_BUCKET_COUNT: int = 64

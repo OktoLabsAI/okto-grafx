@@ -9,6 +9,18 @@ including the on-disk format.
 
 ### Changed
 
+- Eight-item 0.0.5 continuation: single-pass BM25 term counts; certified incident
+  BFS for hybrid evidence; cooperative exact/ANN vector read control; aggregate
+  logical hybrid memory accounting and per-phase diagnostics.
+- Opt-in durable FTS corpus totals, complete-COMMIT replay and independent verification;
+  required capability bit 6 preserves older-build refusal and unchanged default bytes.
+- Explicit hash directories up to 65,536 buckets (bit 7), bounded distribution/skew
+  diagnostics and optional skew-aware assisted growth; default remains 64.
+- Physical backup now defaults to chunked temporary-disk capture/readback; explicit
+  memory capture remains available. The consistent-cut writer pause remains.
+- Added application migration plans/checksum ledger, native additive DDL simulation,
+  dry-run, atomic per-version commits and bounded concurrent resumption.
+
 - Closed regression drift in public root exports and query-error metric labels:
   cancellation/deadline errors can be emitted by the validated OpenMetrics sink.
   No-op allocation checks now isolate process-global counters without loosening

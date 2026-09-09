@@ -371,6 +371,7 @@ def test_the_engine_exposes_nothing_that_could_generate_an_embedding(
         "retire_space",
         "rollback",
         "search",
+        "search_controlled",
         # Header-only exact live cardinality at one snapshot frontier. It observes caller-owned
         # vectors and cannot synthesize an embedding (D-12).
         "snapshot_frontier_live_count",

@@ -65,6 +65,7 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
+    GrafxQueryBudgetExceeded,
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import (
@@ -135,7 +136,9 @@ from okto_grafx.domain.page import (
 )
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.txn.context import RowIntent, TransactionContext
-from okto_grafx.domain.index.fulltext import TextAnalysisMemo, is_fulltext
+from okto_grafx.domain.index.fulltext import (
+    TextAnalysisMemo, is_fulltext, has_durable_statistics, decode_options as decode_text_options,
+)
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
@@ -842,6 +845,9 @@ class IndexStore:
                     )
                 FileHeaderPage.initialize(page, header)
                 page.insert_slot(index_header.encode())
+                if has_durable_statistics(self._definition.key_derivation):
+                    from okto_grafx.engine.fulltext_durable import initial_statistics
+                    page.insert_slot(initial_statistics(self._definition.key_derivation))
             finally:
                 self._pool.unpin(self.file, HEADER_PAGE_INDEX, dirty=True)
             return
@@ -856,6 +862,9 @@ class IndexStore:
                 )
             FileHeaderPage.initialize(page, header)
             page.insert_slot(index_header.encode())
+            if has_durable_statistics(self._definition.key_derivation):
+                from okto_grafx.engine.fulltext_durable import initial_statistics
+                page.insert_slot(initial_statistics(self._definition.key_derivation))
 
     def _grow_buckets(self) -> None:
         """Give every bucket a head page, repairing a file a redo grew before this ran."""
@@ -3790,6 +3799,8 @@ class IndexStore:
         *,
         first_matching_page: bool = False,
         keys: frozenset[bytes] | None = None,
+        max_matches: int | None = None,
+        visit: Callable[[], None] | None = None,
     ) -> tuple[tuple[PageIndex, ...], tuple[IndexEntry, ...]]:
         """Validate one chain and optionally collect matches during that same page pass.
 
@@ -3829,6 +3840,8 @@ class IndexStore:
         limit: int | None = None
         index: PageIndex = self._bucket_head(bucket)
         while index != NO_PAGE:
+            if visit is not None:
+                visit()
             if limit is None and len(pages) >= lazy_bound_after:
                 limit = self._pool.storage.page_count(self.file) + 1
             if limit is not None:
@@ -3848,6 +3861,11 @@ class IndexStore:
                     for slot, image in page.iter_slot_views():
                         entry = IndexEntry.decode_if_matches(image, key, ref)
                         if entry is not None:
+                            if max_matches is not None and len(matches) >= max_matches:
+                                raise GrafxQueryBudgetExceeded(
+                                    "Exact candidate capture budget exceeded.",
+                                    resource="index_candidates",
+                                )
                             matches.append(entry.located_at(index, slot))
                     if first_matching_page and matches:
                         # Scalar mutation historically stopped decoding after the first page
@@ -3859,6 +3877,11 @@ class IndexStore:
                         raw, encoded_ref, born, dead, versioned = _validated_image(image)
                         stored_key = bytes(raw[INDEX_ENTRY_HEADER_SIZE:])
                         if stored_key in keys:
+                            if max_matches is not None and len(matches) >= max_matches:
+                                raise GrafxQueryBudgetExceeded(
+                                    "Exact candidate capture budget exceeded.",
+                                    resource="index_candidates",
+                                )
                             matches.append(IndexEntry(
                                 key=stored_key, ref=RecordRef.decode(encoded_ref),
                                 versioned=versioned, born_csn=born, dead_csn=dead,
@@ -6734,6 +6757,10 @@ class IndexManager:
         )
         for index in indexes:
             observed = observations[index]
+            statistics_changes = (
+                tuple(index.pending(txn)) if has_durable_statistics(index.definition.key_derivation)
+                else None
+            )
             if authorised_scope is not None:
                 authorised_scope.store = index
             try:
@@ -6753,6 +6780,10 @@ class IndexManager:
                     # Preserve custom store overrides and their existing two-arg
                     # contract. They keep scalar validation, not ambient authority.
                     moved = commit(txn, csn)
+                if statistics_changes is not None and observed:
+                    from okto_grafx.engine.fulltext_durable import finish_statistics
+                    finish_statistics(index, statistics_changes, csn)
+                    self._pool.flush(index.file)
             finally:
                 if authorised_scope is not None:
                     authorised_scope.store = None
@@ -8141,9 +8172,17 @@ class IndexManager:
                 index.create(proved_present=True)
 
                 empty_build = _EmptyIndexBuild()
+                text_statistics = None
+                if has_durable_statistics(definition.key_derivation):
+                    from okto_grafx.engine.fulltext_durable import (
+                        collect_build_statistics, publish_statistics,
+                    )
+                    text_statistics = (0, (0,) * len(definition.positions))
                 for ref, key, ended_at in self._detached_exact_generation_entries(
                     definition, position, table
                 ):
+                    if text_statistics is not None:
+                        text_statistics = collect_build_statistics(text_statistics, key, ended_at)
                     insert = IndexChange(
                         index=definition.name,
                         operation=IndexOperation.INSERT,
@@ -8168,6 +8207,8 @@ class IndexManager:
                         )
                         if accelerated is None:
                             index._apply_change(tombstone, position)
+                if text_statistics is not None:
+                    publish_statistics(index, position, *text_statistics)
 
             # The header claim is flushed before verification, and the final checkpoint below
             # then barriers the complete verified generation as one unreachable shadow.
@@ -8312,6 +8353,7 @@ class IndexManager:
         """Check every stored entry against the heap version it points at."""
         findings: list[IndexFinding] = []
         analysis = TextAnalysisMemo()
+        text_statistics = [0, [0] * len(index.definition.positions)] if has_durable_statistics(index.definition.key_derivation) else None
         entries: tuple[IndexEntry, ...]
         try:
             entries = index.walk()
@@ -8346,6 +8388,23 @@ class IndexManager:
                 )
                 continue
             findings.extend(self._compare(index, entry, version, analysis=analysis))
+            if (text_statistics is not None and entry.key.startswith(b"\x00")
+                    and is_committed_csn(version.xmin) and is_open_end_csn(version.xmax)
+                    and version.table_id == index.definition.table_id):
+                fields = analysis.fields(version.values, index.definition.positions,
+                                         decode_text_options(index.definition.key_derivation))
+                text_statistics[0] += 1
+                text_statistics[1] = [a + len(b) for a, b in zip(text_statistics[1], fields, strict=True)]
+        if text_statistics is not None:
+            from okto_grafx.engine.fulltext_durable import read_statistics
+            try:
+                _, count, totals = read_statistics(index)
+                if count != text_statistics[0] or totals != tuple(text_statistics[1]):
+                    findings.append(IndexFinding(kind="index_heap_divergence", index=index.name,
+                                                 detail="Durable text statistics differ from heap census.", file=index.file, page=0))
+            except GrafxCorruptionDetected as damaged:
+                findings.append(IndexFinding(kind="index_page_damaged", index=index.name,
+                                             detail=damaged.message, file=index.file, page=0))
         return tuple(findings)
 
     def _compare(

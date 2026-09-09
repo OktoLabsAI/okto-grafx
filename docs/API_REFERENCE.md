@@ -4,6 +4,13 @@
 
 ## Entry points and supported imports
 
+`from okto_grafx.migrations import SchemaMigration, MigrationReport, migrate_schema`
+exposes the [additive application migration contract](SCHEMA_MIGRATIONS.md): exact
+checksums, dry-run, atomic per-version DDL and bounded retries. It does not change
+the engine file-format migration API. `Database.index_distribution` returns a
+bounded physical `IndexDistribution` observation; its type is listed below and
+its sizing/skew semantics are in [indexes](INDEXES_AND_VECTORS.md).
+
 Opt-in durable commit provenance on the 0.0.5 development branch is described in
 [commit history](COMMIT_HISTORY.md), including activation, metadata, qualified
 lookup, snapshot pagination, verification, cost and transfer/restore limitations.
@@ -379,7 +386,7 @@ Delegate immutable exact-index reconstruction to the database.
 #### Maintenance.rehash_index_if_needed
 
 ```python
-rehash_index_if_needed(name: str, *, overflow_pages_per_bucket: int=1) -> IndexView | None
+rehash_index_if_needed(name: str, *, overflow_pages_per_bucket: int=1, check_skew: bool=False) -> IndexView | None
 ```
 
 Grow one physically pressured exact index by at most one directory step.
@@ -687,10 +694,10 @@ Plan one statement without exposing the mutable query engine.
 #### Database.search_vectors
 
 ```python
-search_vectors(transaction: Transaction, *, space: str, query: Sequence[float] | VectorValue, k: int, candidate_filter: RecordIdFilter | None=None) -> VectorSearchResult
+search_vectors(transaction: Transaction, *, space: str, query: Sequence[float] | VectorValue, k: int, candidate_filter: RecordIdFilter | None=None, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> VectorSearchResult
 ```
 
-Search vectors under the fixed snapshot of one active transaction.
+Search one owned snapshot with optional cooperative read controls.
 
 #### Database.search_hybrid
 
@@ -743,10 +750,18 @@ Rebuild one exact index into a compact, immutable fresh generation.
 #### Database.rehash_index_if_needed
 
 ```python
-rehash_index_if_needed(name: str, *, overflow_pages_per_bucket: int=1) -> IndexView | None
+rehash_index_if_needed(name: str, *, overflow_pages_per_bucket: int=1, check_skew: bool=False) -> IndexView | None
 ```
 
 Grow one exact index after a bounded directory-pressure assessment.
+
+#### Database.index_distribution
+
+```python
+index_distribution(name: str, *, max_pages: int=65536, max_entries: int=1000000, max_memory_bytes: int=64 * 1024 * 1024) -> IndexDistribution
+```
+
+Bounded physical HASH distribution, without exposing keys or mutating data.
 
 #### Database.verify
 
@@ -887,6 +902,14 @@ Release owned resources under this database's checksum selection (FR-1).
 ## Public factory and transfer functions
 
 
+### okto_grafx.migrations.migrate_schema
+
+```python
+migrate_schema(database: Database, migrations: tuple[SchemaMigration, ...], *, namespace: str, dry_run: bool=False, max_attempts: int=3) -> MigrationReport
+```
+
+Validate/apply a complete ordered 1..N plan, atomically per version.
+
 ### okto_grafx.api.connect
 
 ```python
@@ -898,10 +921,10 @@ Open the database at `path`, creating it when it does not exist yet (SPEC-M1 FR-
 ### okto_grafx.backup.create_backup
 
 ```python
-create_backup(database: Database, destination: str | os.PathLike[str], *, max_bytes: int=_DEFAULT_MAX_BYTES, max_capture_seconds: float=5.0) -> BackupReport
+create_backup(database: Database, destination: str | os.PathLike[str], *, max_bytes: int=_DEFAULT_MAX_BYTES, max_capture_seconds: float=5.0, capture_mode: str='disk') -> BackupReport
 ```
 
-Capture a local checkpoint into a checked, non-database artifact at a new directory.
+Create a verified consistent cut with bounded chunked capture and read-back.
 
 ### okto_grafx.backup.restore_backup
 
@@ -935,6 +958,58 @@ construct raw engine state. Consume returned instances and documented accessors.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
 
+### SchemaMigration fields
+
+Annotation location: `okto_grafx.migrations.SchemaMigration`.
+
+One immutable, contiguous application version and its exact DDL strings.
+
+```python
+version: int
+statements: tuple[str, ...]
+```
+
+#### SchemaMigration.checksum
+
+```python
+checksum: str  # read-only property
+```
+
+SHA-256 of version and exact text, including whitespace, in canonical JSON v1.
+
+### MigrationReport fields
+
+Annotation location: `okto_grafx.migrations.MigrationReport`.
+
+Observed versions and versions committed by this invocation; dry-run writes none.
+
+```python
+namespace: str
+dry_run: bool
+previously_applied: tuple[int, ...]
+applied: tuple[int, ...]
+pending: tuple[int, ...]
+applied_lsns: tuple[tuple[int, int], ...]
+```
+
+### IndexDistribution fields
+
+Annotation location: `okto_grafx.engine.index_distribution.IndexDistribution`.
+
+Physical entries, including retained versions; not live row cardinality.
+
+```python
+bucket_count: int
+entries: int
+pages: int
+overflow_pages: int
+largest_chain_pages: int
+largest_bucket_entries: int
+largest_key_entries: int
+dominant_key_fraction: float
+recommendation: str
+```
+
 ### HybridSearchOptions fields
 
 Annotation location: `okto_grafx.domain.query.hybrid.HybridSearchOptions`.
@@ -956,6 +1031,7 @@ graph_weight: float
 graph_filter: bool
 max_graph_edges: int
 max_memory_bytes: int
+graph_access: str
 ```
 
 ### HybridHit fields
@@ -993,6 +1069,11 @@ vector_candidates: int
 graph_edges_visited: int
 source_errors: tuple[tuple[str, str], ...]
 lexical_index_built_through_commit: int | None
+graph_regime: str
+memory_peak_bytes: int
+lexical_memory_peak_bytes: int
+vector_memory_peak_bytes: int
+graph_memory_peak_bytes: int
 ```
 
 ### BackupReport fields
@@ -1070,6 +1151,7 @@ case_folding: str
 locale: str
 stopwords: str
 stemming: str
+statistics_mode: str
 ```
 
 #### TextIndexOptions.derivation

@@ -374,7 +374,7 @@ def test_an_index_name_that_could_not_be_a_file_is_refused() -> None:
 def test_the_bucket_bounds_are_the_declared_ones() -> None:
     """Amendment A68: assert the literal, so the expectation cannot slide with the constant."""
     assert MIN_BUCKET_COUNT == 1
-    assert MAX_BUCKET_COUNT == 4096
+    assert MAX_BUCKET_COUNT == 65_536
     assert DEFAULT_BUCKET_COUNT == 64
     for outside in (0, MAX_BUCKET_COUNT + 1, -1, True, 1.5):
         with pytest.raises(GrafxIndexError):

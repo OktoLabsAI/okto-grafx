@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import struct
-from collections.abc import Iterator
+from collections.abc import Iterator, Callable
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING
 
@@ -24,6 +24,7 @@ from okto_grafx.domain.index.fulltext import (
     decode_options,
     is_fulltext,
     TextAnalysisMemo,
+    query_term_frequencies,
 )
 from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.entry import IndexEntry
@@ -36,6 +37,7 @@ from okto_grafx.domain.query.control import (
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.engine.index_manager import _IndexReadCertificate
 from okto_grafx.engine.fulltext_stats import advance_statistics
+from okto_grafx.engine.fulltext_durable import snapshot_statistics
 
 if TYPE_CHECKING:
     from okto_grafx.engine.database import Database, Transaction
@@ -118,6 +120,7 @@ def search_text(
     timeout_seconds: float | None,
     cancellation: CancellationToken | None,
     _control: _ReadControl | None = None,
+    _memory: Callable[[int], None] | None = None,
 ) -> TextSearchResult:
     """Return BM25 matches only after one complete pre/post index/heap certificate."""
     if reader._database is not database or not reader.active or reader.mode != "read":
@@ -197,12 +200,15 @@ def search_text(
             visited = 0
             memory = 0 if allowed is None else len(allowed) * 64
             analysis = TextAnalysisMemo(min(1_048_576, budget.max_memory_bytes // 4))
+            wal_reservation = 0
 
             def check(charge: int = 0, *, posting: bool = False) -> None:
                 """Charge attempted work, including certificate retries, before more work."""
                 nonlocal visited, memory
                 visited += int(posting)
                 memory += charge
+                if _memory is not None:
+                    _memory(memory + analysis.retained_bytes + wal_reservation)
                 if (
                     visited > budget.max_postings
                     or memory + analysis.retained_bytes > budget.max_memory_bytes
@@ -226,7 +232,7 @@ def search_text(
                 certificate: _IndexReadCertificate,
             ) -> tuple[TextSearchResult, tuple, tuple[int, tuple[int, ...]]]:
                 """Execute statistics, candidates and ranking under the same certificate."""
-                nonlocal memory
+                nonlocal memory, wal_reservation
                 memory = 0 if allowed is None else len(allowed) * 64
                 database._indexes._prepare_heap_view(store.file, certificate)
                 cache_key = (store.file, certificate, snapshot.read_lsn)
@@ -234,11 +240,25 @@ def search_text(
                 statistics_regime = (
                     "snapshot_cache" if cached is not None else "full_census"
                 )
+                if cached is None:
+                    cached = snapshot_statistics(store, snapshot.read_lsn)
+                    if cached is not None:
+                        statistics_regime = "durable_summary"
                 wal_records = 0
                 if cached is None:
-                    incremental = advance_statistics(
-                        database, store, snapshot.read_lsn, budget, check
-                    )
+                    def reserve_wal(amount: int) -> None:
+                        """Charge bounded WAL capture while it coexists with lexical state."""
+                        nonlocal wal_reservation
+                        wal_reservation = amount
+                        check()
+
+                    try:
+                        incremental = advance_statistics(
+                            database, store, snapshot.read_lsn, budget, check,
+                            reserve=reserve_wal if _memory is not None else None,
+                        )
+                    finally:
+                        wal_reservation = 0
                     if incremental is not None:
                         cached, wal_records = incremental
                         statistics_regime = "wal_delta"
@@ -333,7 +353,9 @@ def search_text(
                     )
                 hits = []
                 for rid, fields in matches.items():
-                    check()
+                    frequency_bytes = 128 + len(fields) * (64 + 64 * len(terms))
+                    check(frequency_bytes)
+                    term_counts = query_term_frequencies(fields, terms)
                     score = 0.0
                     matched_fields = set()
                     matched_terms = set()
@@ -341,7 +363,7 @@ def search_text(
                         df = frequencies[term]
                         idf = math.log1p((count - df + 0.5) / (df + 0.5))
                         for position, tokens in enumerate(fields):
-                            tf = tokens.count(term)
+                            tf = term_counts[position][term]
                             if not tf:
                                 continue
                             average = (
@@ -360,6 +382,8 @@ def search_text(
                                 table.columns[definition.positions[position]].name
                             )
                             matched_terms.add(term)
+                    del term_counts
+                    memory -= frequency_bytes
                     hits.append(
                         TextHit(
                             rid,

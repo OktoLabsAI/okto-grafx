@@ -16,6 +16,7 @@ with connect("./graph") as db:
         db, "./graph-backup-001",          # must not exist; parent must exist
         max_bytes=256 * 1024 * 1024,
         max_capture_seconds=5.0,
+        capture_mode="disk",              # private temporary-file capture
     )
     print(report.database_uuid, report.checkpoint_lsn, report.files, report.bytes)
 
@@ -41,11 +42,12 @@ existing `partitions_per_table` value is preserved, not reconfigured.
    cover the capture: committed effects are applied and barriered; the published
    checkpoint equals the captured committed LSN; WAL cannot be recycled underneath
    the copy. First/second OCC and all ordinary writer admission rules are unchanged.
-3. Capture the bounded file bytes into memory while that fence remains held.
+3. Capture bounded file bytes in 1 MiB chunks into a private temporary spool
+   beside the destination (default `disk`), or a RAM buffer (`memory`), while that fence remains held.
    Other participants may read/stage work; **commit publication waits during this
-   capture**. This is not a no-pause/streaming hot backup. A caller should size its
+   capture**, including spool I/O. This is not a no-pause hot backup. A caller should size its
    budgets and other participants' timeouts accordingly.
-4. Release the source fence before writing the artifact, reading it back, hashing,
+4. Release the source fence before writing the artifact, reading it back, verifying hashes,
    or running complete verification. Concurrent source commits can now advance;
    they do not change the already captured cut. No live reader/lock files are copied.
 5. Materialize a private verification copy from the written artifact. Open it
@@ -66,10 +68,11 @@ detection that every original participant is stopped.
 
 | Function / parameter | Meaning |
 | --- | --- |
-| `create_backup(database, destination, *, max_bytes=268435456, max_capture_seconds=5.0)` | Capture a verified artifact from a writable default-local-storage handle. Custom storage wrappers and read-only handles are refused. No source transaction may be open on this handle. |
+| `create_backup(database, destination, *, max_bytes=268435456, max_capture_seconds=5.0, capture_mode="disk")` | Capture a verified artifact from a writable default-local-storage handle. Custom storage wrappers and read-only handles are refused. No source transaction may be open on this handle. |
 | `restore_backup(backup, destination, *, confirm_original_offline=False, max_bytes=268435456)` | Restore for offline replacement only. The exact boolean `True` assertion is required. Original and existing destination data are never overwritten. |
-| `max_bytes` | Positive maximum total database payload bytes. Includes retained WAL and copied index files. Bounds captured payload, **not total Python RSS**: object, hashing and temporary-copy overhead also exist. Restore copies in 1 MiB chunks. |
-| `max_capture_seconds` | Positive finite capture budget, checked between source reads. Does not include prerequisite checkpoint or destination work and cannot interrupt a single blocked OS/device read. |
+| `max_bytes` | Positive maximum total database payload bytes. Includes retained WAL and copied index files. Bounds payload, not total Python RSS. Source capture, artifact copy/readback and restore use 1 MiB chunks; metadata and full verification have separate costs. |
+| `capture_mode` | `disk` defaults to temporary storage, avoiding a whole-payload RAM copy. `memory` keeps the full captured payload in RAM and avoids spool disk writes while fenced. Use disk for larger cuts with adequate local free space, memory for small cuts when RAM is available and spool latency matters. Neither is resumable or no-pause. |
+| `max_capture_seconds` | Positive finite capture budget, checked between source reads and after spool flush. Does not include prerequisite checkpoint or artifact verification and cannot interrupt a single blocked OS/device call. |
 | destination | New directory with an existing parent, outside source/backup directory trees. No overwrite option. |
 | `BackupReport.destination` | Absolute promoted directory. |
 | `BackupReport.database_uuid` | Original UUID as lowercase hexadecimal. |
@@ -79,6 +82,11 @@ detection that every original participant is stopped.
 Additional fixed bounds: 10,000 payload files; 4 MiB manifest. A workload exceeding
 these limits needs another backup design or an explicit byte budget increase when
 only `max_bytes` is exceeded. Do not raise budgets blindly on a memory-constrained host.
+
+Disk mode needs temporary free space for the captured spool, artifact and verification
+copy (approximately three payload copies at peak, besides the source). Spools are
+unpublished and cleaned on ordinary success/refusal. Artifact publication, manifest
+format, identity checks and same-UUID offline restore rules are unchanged.
 
 ## Artifact, identity and integrity
 

@@ -54,6 +54,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from okto_grafx.domain.errors import (
+    GrafxCorruptionDetected,
     GrafxConfigurationError,
     GrafxError,
     GrafxPortNotConfigured,
@@ -1477,6 +1478,27 @@ class Verifier:
                 )
             ]
         findings: list[VerificationFinding] = []
+        from okto_grafx.domain.index.fulltext import has_durable_statistics, decode_options, field_tokens
+        if has_durable_statistics(getattr(definition, "key_derivation", "")):
+            from okto_grafx.engine.fulltext_durable import read_statistics_from_device
+            try:
+                _, actual_count, actual_totals = read_statistics_from_device(index)
+                options = decode_options(definition.key_derivation)
+                count = 0
+                totals = [0] * len(positions)
+                for _, version in versions:
+                    if version.live:
+                        count += 1
+                        fields = field_tokens(version.values, positions, options)
+                        totals = [a + len(b) for a, b in zip(totals, fields, strict=True)]
+                if actual_count != count or actual_totals != tuple(totals):
+                    raise GrafxCorruptionDetected("Durable text statistics differ from the heap census.")
+            except GrafxError as failure:
+                findings.append(VerificationFinding(
+                    kind=FindingKind.INDEX_UNREADABLE,
+                    location=FindingLocation(index=name, file=_index_file(index), page=0),
+                    detail=f"Durable text statistics could not be verified: {failure}",
+                ))
         for ref, version in versions:
             if not version.live:
                 continue

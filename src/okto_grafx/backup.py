@@ -13,6 +13,8 @@ import json
 import math
 import os
 import tempfile
+import io
+from typing import BinaryIO
 from time import monotonic
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -196,12 +198,41 @@ def create_backup(
     *,
     max_bytes: int = _DEFAULT_MAX_BYTES,
     max_capture_seconds: float = 5.0,
+    capture_mode: str = "disk",
+) -> BackupReport:
+    """Create a verified consistent cut with bounded chunked capture and read-back.
+
+    disk (default) spools to a private temporary file beside the destination;
+    memory retains the legacy RAM-backed capture choice. Writers wait during the
+    entire source-to-spool copy. Neither mode is a no-pause hot backup. Temporary
+    objects are unpublished and removed on every normal success/failure exit.
+    """
+    if type(capture_mode) is not str or capture_mode not in ("disk", "memory"):
+        raise GrafxConfigurationError("capture_mode must be disk or memory.", field="capture_mode")
+    storage = database._storage
+    if type(storage) is not LocalStorageDevice or database.read_only:
+        raise GrafxUnsupportedOperation("Physical backup requires writable local storage.",
+                                       operation="physical_backup")
+    target = _destination(destination, source=Path(storage.root).resolve(strict=True))
+    with (tempfile.TemporaryFile(dir=target.parent, prefix=".grafx-backup-spool-")
+          if capture_mode == "disk" else io.BytesIO()) as capture:
+        return _create_backup(database, destination, max_bytes=max_bytes,
+                              max_capture_seconds=max_capture_seconds, capture=capture)
+
+
+def _create_backup(
+    database: Database,
+    destination: str | os.PathLike[str],
+    *,
+    max_bytes: int,
+    max_capture_seconds: float,
+    capture: BinaryIO,
 ) -> BackupReport:
     """Capture a local checkpoint into a checked, non-database artifact at a new directory.
 
-    The bounded memory capture holds the existing commit/WAL fence: other participants may
+    The bounded spool capture holds the existing commit/WAL fence: other participants may
     read and stage work, but commit publication waits during capture. Artifact IO and full
-    verify/reopen run after releasing that fence. This is not a streaming/no-pause hot backup.
+    verify/reopen run after releasing that fence. This is not a no-pause hot backup.
     max_bytes bounds captured payload (not total Python RSS); max_capture_seconds is checked
     between source reads, not an OS-level timeout for one blocked device call. No live source
     reader registrations or locks are copied. The source must have no transaction on this handle.
@@ -226,7 +257,7 @@ def create_backup(
     target = _destination(destination, source=source)
     identity = database.identity
 
-    def capture(lsn: int) -> tuple[int, dict[str, bytes]]:
+    def capture_cut(lsn: int) -> tuple[int, dict[str, tuple[int, int, str]]]:
         """Read exactly one already-published checkpoint while recycling/commits are fenced."""
         started = monotonic()
         names = tuple(name for name in storage.list_files() if _logical_file(name))
@@ -248,9 +279,10 @@ def create_backup(
                 raise _refuse(
                     "The physical snapshot exceeds max_bytes.", "backup_budget"
                 )
-        payloads: dict[str, bytes] = {}
+        payloads: dict[str, tuple[int, int, str]] = {}
         for name in names:
-            chunks = []
+            start = capture.tell()
+            digest = hashlib.sha256()
             for offset in range(0, sizes[name], _CHUNK):
                 if monotonic() - started > max_capture_seconds:
                     raise _refuse(
@@ -262,8 +294,11 @@ def create_backup(
                     raise _refuse(
                         "A source file changed or returned a short read.", "short_read"
                     )
-                chunks.append(data)
-            payloads[name] = b"".join(chunks)
+                if capture.write(data) != len(data):
+                    raise _refuse("Short temporary capture write.", "short_write")
+                digest.update(data)
+            payloads[name] = (start, sizes[name], digest.hexdigest())
+        capture.flush()
         if monotonic() - started > max_capture_seconds:
             raise _refuse(
                 "The bounded checkpoint capture timed out.", "capture_timeout"
@@ -278,7 +313,7 @@ def create_backup(
                     "Close this handle's transactions before backup.",
                     "active_transaction",
                 )
-            _, (lsn, payloads) = database._transactions._checkpoint(capture)
+            _, (lsn, payloads) = database._transactions._checkpoint(capture_cut)
     manifest = {
         "format": "okto-grafx-physical-1",
         "database_uuid": identity.database_uuid.hex(),
@@ -289,8 +324,8 @@ def create_backup(
             {
                 "name": name,
                 "object": f"objects/{i:06d}",
-                "size": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": data[1],
+                "sha256": data[2],
             }
             for i, (name, data) in enumerate(sorted(payloads.items()))
         ],
@@ -307,17 +342,34 @@ def create_backup(
             ) as verification,
         ):
             for item in manifest["files"]:
-                _put(artifact, item["object"], payloads[item["name"]])
-                copied = artifact.read_log(item["object"], 0, item["size"])
-                if (
-                    len(copied) != item["size"]
-                    or hashlib.sha256(copied).hexdigest() != item["sha256"]
-                ):
+                artifact.create(item["object"])
+                capture.seek(payloads[item["name"]][0])
+                digest = hashlib.sha256()
+                for offset in range(0, item["size"], _CHUNK):
+                    wanted = min(_CHUNK, item["size"] - offset)
+                    data = capture.read(wanted)
+                    if len(data) != wanted:
+                        raise _refuse("Short temporary capture read.", "short_read")
+                    digest.update(data)
+                    artifact.append_log(item["object"], data)
+                if digest.hexdigest() != item["sha256"]:
+                    raise _refuse("Temporary capture checksum mismatch.", "object_mismatch")
+                artifact.durable_barrier(item["object"])
+                verification.create(item["name"])
+                digest = hashlib.sha256()
+                for offset in range(0, item["size"], _CHUNK):
+                    wanted = min(_CHUNK, item["size"] - offset)
+                    copied = artifact.read_log(item["object"], offset, wanted)
+                    if len(copied) != wanted:
+                        raise _refuse("Short artifact read-back.", "object_mismatch")
+                    digest.update(copied)
+                    verification.append_log(item["name"], copied)
+                if digest.hexdigest() != item["sha256"]:
                     raise _refuse(
                         "The written backup object failed read-back verification.",
                         "object_mismatch",
                     )
-                _put(verification, item["name"], copied)
+                verification.durable_barrier(item["name"])
             raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
             if len(raw) > _MANIFEST_LIMIT:
                 raise _refuse("The manifest exceeds its bound.", "backup_budget")
@@ -334,7 +386,7 @@ def create_backup(
         manifest["database_uuid"],
         lsn,
         len(payloads),
-        sum(map(len, payloads.values())),
+        sum(item[1] for item in payloads.values()),
     )
 
 

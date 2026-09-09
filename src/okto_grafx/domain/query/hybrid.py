@@ -26,6 +26,7 @@ class HybridSearchOptions:
     graph_filter: bool = False
     max_graph_edges: int = 10_000
     max_memory_bytes: int = 32 * 1024 * 1024
+    graph_access: str = "auto"
 
     def __post_init__(self) -> None:
         for name in ("lexical_weight", "vector_weight", "graph_weight"):
@@ -49,6 +50,7 @@ class HybridSearchOptions:
         for name, choices in (
             ("fusion", ("union", "intersection")),
             ("graph_direction", ("out", "in", "both")),
+            ("graph_access", ("auto", "scan")),
         ):
             if (
                 type(getattr(self, name)) is not str
@@ -113,3 +115,8 @@ class HybridSearchResult:
     graph_edges_visited: int
     source_errors: tuple[tuple[str, str], ...]
     lexical_index_built_through_commit: int | None = None
+    graph_regime: str = "disabled"
+    memory_peak_bytes: int = 0
+    lexical_memory_peak_bytes: int = 0
+    vector_memory_peak_bytes: int = 0
+    graph_memory_peak_bytes: int = 0

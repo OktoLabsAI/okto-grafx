@@ -26,7 +26,7 @@ def main() -> None:
             assert archive.read(name) == (root / "src" / name).read_bytes()
             assert archive.read(name) == (package / relative).read_bytes()
     examples = 0
-    for guide in ("FULL_TEXT_SEARCH.md", "HYBRID_SEARCH.md", "LOGICAL_TRANSFER.md"):
+    for guide in ("FULL_TEXT_SEARCH.md", "HYBRID_SEARCH.md", "LOGICAL_TRANSFER.md", "SCHEMA_MIGRATIONS.md"):
         content = (root / "docs" / guide).read_text(encoding="utf-8")
         blocks = re.findall(r"```python\n(.*?)```", content, re.S)
         assert blocks

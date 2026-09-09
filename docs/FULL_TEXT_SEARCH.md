@@ -10,6 +10,14 @@ store. Back up or export before introducing it into a mixed-version deployment.
 
 ## Start with the typed API
 
+BM25 query-term frequencies are computed in one pass per candidate field. Ranking
+keeps the original term/field accumulation order and exact scores/tie ordering;
+only requested terms are retained. Temporary counting tables reserve
+`128 + fields * (64 + 64 * query_terms)` logical bytes before construction and are
+released per candidate. This changes neither analyzer/index bytes nor corpus
+document frequency, and adds no configuration keyword. Hybrid retrieval also
+accounts this work against its aggregate operation envelope.
+
 ```python
 from okto_grafx import connect, TextIndexOptions, TextSearchLimits
 from okto_grafx.domain.vector.filter import RecordIdFilter
@@ -55,6 +63,36 @@ post-filter of an already truncated result. IDs refer to the indexed table, not
 automatically to application primary keys. Corpus statistics use all indexed
 documents, not only permitted hits; scores/count metadata are not a secrecy boundary.
 
+## Durable corpus totals (opt-in)
+
+Declare `TextIndexOptions(statistics_mode="durable", field_weights=(1.0,))`
+when creating a new text index. The `fulltext_statistics_v1` required capability
+(catalog bit 6) and `fulltext_v2_` derivation prevent older readers/writers from
+opening it. Existing `wal` indexes are unchanged; rebuilding one preserves its
+declaration rather than upgrading it. Use a separately named index to change modes.
+
+`TextSearchResult.statistics_regime="durable_summary"` means the page-0 corpus
+count and field-length totals cover this reader's table high-water and do not
+exceed its snapshot. It eliminates the cold full-corpus statistics walk at eligible
+cuts, not query-term posting reads or BM25 candidate scoring. Same-snapshot caches
+may still report `snapshot_cache`; older snapshots retain exact WAL/census paths.
+Procedure statistics add numeric `statistics_from_durable_summary` (0/1).
+
+Complete COMMIT effects advance the summary once; INSERT/TOMBSTONE use existing
+length postings, without retokenizing or extra logical WAL records. Rollback cannot
+advance it. Native recovery replays only proved complete commits, idempotently.
+Private builds accumulate totals from their fenced canonical entries before
+verification/publication. Full verification independently compares corpus totals.
+Malformed/future/wrong-identity metadata refuses; no guessed zero or silent repair.
+
+Use durable mode for repeated cold/reopened searches over large corpora when every
+participant supports the capability. Prefer the default `wal` mode for mixed older
+builds or when its warm cache already suffices: durable mode adds summary updates
+to commits and a compatibility commitment, with no universal latency improvement.
+Physical backup preserves it; logical export/import rebuilds it from its declaration.
+It is not a history store, an authorization filter or an upgrade that can be undone
+by removing a capability bit. See [format/recovery contract](specs/FTS_DURABLE_STATISTICS.md).
+
 ## Procedure query
 
 Materialized `Database.execute` and read `Transaction.execute` also accept:
@@ -85,6 +123,7 @@ procedure, not restarted inside it. FTS creation uses the typed API; proposed
 | --- | --- | --- |
 | `analyzer` | `standard` | `standard`, `keyword`, `code_identifier`, `whitespace`; see below. |
 | `analyzer_version` | `1` | Only 1. Unknown versions refuse, never silently map to latest. |
+| `statistics_mode` | `wal` | `wal` retains legacy index bytes and bounded memo/WAL/census statistics; `durable` explicitly activates a required format capability and persists corpus totals. See below. |
 | `normalization` | `NFC` | `none`, `NFC`, `NFKC` using the frozen Unicode 3.2 database. NFKC folds compatibility forms and may conflate distinctions; use none/NFC for identifiers where those distinctions matter. |
 | `case_folding` | `unicode` | `none`, `ascii`, `unicode`. Unicode uses a checked-in full case-fold table from Unicode 15.1, not the host Python table. Case folding can expand terms (e.g. ß → ss); choose none for case-sensitive identity. |
 | `locale` | `und` | Only und (locale-independent). No host locale or Turkish-specific folding. |
@@ -169,7 +208,7 @@ Cancellation/deadlines are cooperative between units of work; neither preempts o
 storage call nor interrupts a durable write/commit. The initial typed autocommit reader
 admission is not a preemptive timeout guarantee.
 
-The first statistics read for a snapshot/generation visits the index and validates
+With default `statistics_mode="wal"`, the first statistics read for a snapshot/generation visits the index and validates
 document lengths against the heap: **O(stored postings + document text)**, including
 retained old versions. Up to eight certificate/snapshot-keyed scalar statistics
 summaries per handle are cached; warm searches navigate term buckets and validate
@@ -183,7 +222,9 @@ unknown record semantics and ambiguous coverage decline to a full census. WAL
 corruption is not silently swallowed. This avoids a corpus recensus on eligible DML,
 but is not graph-size-independent search: term buckets, candidates, WAL delta and
 occasional cold censuses still cost work. Summaries are process-local, not new durable
-aggregate pages; a newly opened handle starts cold.
+aggregate pages; a newly opened handle starts cold in that default mode. Opt-in
+`durable` mode uses the native scalar page when its coverage is eligible, including
+after reopen; old snapshots can still require the exact census described above.
 
 Repeated analysis uses a pure operation-owned memo keyed by exact STRING/None leaves
 and the complete persisted analyzer identity. Counting quotas and staging keys reuse

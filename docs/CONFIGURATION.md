@@ -1,5 +1,21 @@
 # Configuration reference
 
+The eight-item continuation adds operation-local `search_vectors(timeout_seconds=,
+cancellation=)` and `HybridSearchOptions.graph_access` (`auto`/`scan`). Hybrid
+`max_memory_bytes` now applies to simultaneous logical source/fusion/graph tariffs,
+with per-phase peak diagnostics; it is not an RSS cap. See [hybrid contracts](HYBRID_SEARCH.md)
+and [vector controls](INDEXES_AND_VECTORS.md#cooperative-vector-read-control).
+
+Other operation-local additions are `TextIndexOptions.statistics_mode="durable"`
+(opt-in persisted compatibility fence), `index_distribution` with explicit page,
+entry and logical-memory caps, `rehash_index_if_needed(check_skew=True)`,
+`create_backup(capture_mode="disk")` (default temporary-storage streaming; `memory`
+retains the RAM choice), and [application migrations](SCHEMA_MIGRATIONS.md) with
+`namespace`, `dry_run=False`, `max_attempts=3`. Hash sizing now permits 65,536
+explicit buckets / 4,194,304 expected entries; defaults remain unchanged. Large
+eager directories consume disk even when empty. Backup still pauses commit
+publication throughout source capture, including temporary-file I/O.
+
 The connection settings below are distinct from operation-local options.
 [Full-text search](FULL_TEXT_SEARCH.md#analyzer-and-index-options) documents every
 `TextIndexOptions` field (persisted), `TextSearchLimits` field (per search), BM25
@@ -80,7 +96,7 @@ custom provider registration and runtime configuration errors are unchanged.
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
 | `max_index_build_entries` | `None` | Optional hard limit on final exact entries across one detached shadow-build batch; counted to at most N+1 and refused before catalog staging or the first generation file is created |
-| `automatic_index_expected_cardinality` | `None` | Keyword-only expected rows per newly materialized automatic exact index; derives 1..4096 eager buckets at 64 expected entries each, activates an empty writable catalog to v2, is persisted with that generation, and never rehashes an existing index |
+| `automatic_index_expected_cardinality` | `None` | Keyword-only expected rows (1..4,194,304) per newly materialized automatic exact index; derives 1..65,536 eager buckets at 64 expected entries each, activates an empty writable catalog to v2, is persisted with that generation, and never rehashes an existing index. Counts above 4,096 buckets activate an additional required capability. |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |

@@ -1,5 +1,21 @@
 # Indexes and vector search
 
+## Cooperative vector read control
+
+`db.search_vectors(reader, space=..., query=..., k=..., timeout_seconds=None,
+cancellation=None)` accepts the same positive finite timeout and exact
+`CancellationToken` as materialized reads. Defaults preserve ordinary execution.
+Native exact candidate reads/scoring, ANN scoring/navigation and cold HNSW builds
+between insertions check the signal. A cancelled build publishes no partial picture;
+the caller-owned transaction remains open until its context exits. A subsequent
+read/write can proceed. No commit is interrupted and no partial ranking is returned.
+
+Use controls for interactive or abandoned work; do not interpret them as a hard OS
+deadline. Admission, individual storage/math calls, header capture/sorting and one
+construction insertion are not preempted. Custom vector collaborators need the
+explicit `search_controlled` capability; requests refuse if it is absent, rather
+than silently ignoring a timeout. Hybrid search shares one deadline across sources.
+
 For native inverted text indexes, versioned analyzers, BM25, filters and the closed
 search procedure, see [full-text search](FULL_TEXT_SEARCH.md). It uses the existing
 exact HASH generation/WAL lifecycle but emits several postings per row; it is not
@@ -26,11 +42,43 @@ general-purpose B-tree API or a persistent public cursor.
 For example, after creating a table with `created_at TIMESTAMP, id STRING`, call
 `db.create_index("by_created", "Event", ("created_at", "id"), layout="ordered")`.
 `create_index` owns a dedicated transaction; do not assume it joins an unrelated
-open transaction. Hash `bucket_count` is a power of two from 1–4,096;
-`expected_cardinality` is 1–262,144; both together refuse. Rehash grows hash
+open transaction. Explicit hash `bucket_count` is an integer from 1–65,536;
+`expected_cardinality` is 1–4,194,304 and rounds the derived count to a power of two;
+both together refuse. The default remains 64. Rehash grows hash
 directories, while `rebuild_index` reconstructs a fresh immutable generation.
 
 ## Indexes
+
+### Explicit distribution diagnostics and wide directories
+
+`db.index_distribution(name, max_pages=65536, max_entries=1000000,
+max_memory_bytes=67108864)` performs a bounded physical census of one certified
+active hash generation. It reports `bucket_count`, `entries`, `pages`,
+`overflow_pages`, `largest_chain_pages`, `largest_bucket_entries`,
+`largest_key_entries`, `dominant_key_fraction`, and `recommendation`, without key
+values. Counts include retained physical versions, not just visible live rows.
+Budgets fail with `GrafxQueryBudgetExceeded`; this is not a heap integrity audit.
+Each diagnostic bound must be an integer in 1..2,147,483,648; booleans refuse.
+Its O(pages + entries) cost is explicit maintenance, never a new query/commit hook.
+
+`recommendation` is `inspect_key_skew` when at least 16 entries exist and one key
+accounts for at least half, otherwise `consider_growth` for overflow or more than
+64 average entries per bucket, otherwise `balanced`. These are heuristics, not
+throughput promises. `rehash_index_if_needed(..., check_skew=True)` runs this
+diagnostic only after ordinary head-pressure admission, skips growth for dominant
+key skew, and propagates exhausted diagnostic budgets. The default `False` keeps
+the existing O(bucket_count) decision without a full entry census. Rehash cannot
+spread many identical encoded keys across different buckets.
+
+Any retained generation above 4,096 buckets activates required capability
+`large_hash_directories_v1` (bit 7). All participants must understand it; the flag
+cannot be removed to downgrade. The layout remains eager: 65,536 heads at 8 KiB
+consume 512 MiB per index even before entries. Use explicit larger sizing only
+after observing pressure; defaults stay 64 and no sparse directory/sharding was
+introduced. Old-reader visibility, immutable generation publication and recovery
+are unchanged. [Layout contract](specs/LARGE_HASH_DIRECTORIES.md).
+
+### Existing index contracts
 
 - **A declared `PRIMARY KEY` gets an index automatically**, created by the DDL and re-adopted at
   every later open. A keyed read plans an index seek; an unkeyed predicate plans a scan.
@@ -72,7 +120,7 @@ directories, while `rebuild_index` reconstructs a fresh immutable generation.
   samples only the bounded eager bucket heads and grows at most one `2x` step when average head
   occupancy reaches the canonical 64-entry target or retained overflow reaches the configured
   ratio. It never runs from commit or in a background worker and never walks all entries merely to
-  decide. `None` means only “no assisted growth was selected now” (or the 4,096-bucket ceiling),
+  decide by default. `None` means only “no assisted growth was selected now” (or the 65,536-bucket ceiling),
   not that the index is healthy. The eventual foreground shadow build has the same writer-pause,
   OCC, WAL and durability contract as `rehash_index`; do not call it repeatedly without
   reassessing a concurrent refusal or data skew.

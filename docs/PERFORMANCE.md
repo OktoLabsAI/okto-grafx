@@ -36,6 +36,30 @@ and stale diagnostic snapshots mean this is not an all-green operational audit.
 
 ## Native synthetic checkpoint in the 0.0.5 development line
 
+### Eight-item continuation: latest small installed-wheel probe
+
+September 9, 2026; isolated installed 0.0.5 wheel, Windows/Python 3.13.1, 512-byte
+pages, 24 documents, 23 edges, three-dimensional vectors and default source windows.
+This is a small consumer correctness probe with one timing sample during another
+regression run, not a Pulse benchmark, tail-latency result or large-graph speedup.
+Reproduce with `python -I tools/check_installed_eight_followup.py` from the isolated
+environment after building/installing the matching source wheel.
+
+| Operation / regime | Latest measured result |
+| --- | ---: |
+| Cold native FTS using durable corpus summary, unique term | 2.924 ms; 1 posting visited |
+| Hybrid retrieval with one-hop indexed graph evidence | 11.741 ms; 1 incident edge visited |
+| Aggregate hybrid logical-memory peak | 8,491,776 bytes (logical tariff, not RSS) |
+| Disk-spooled physical backup payload | 4,607,121 bytes; restored and verified |
+
+The probe also checks per-version migration idempotence, vector cancellation with
+reader reuse, 8,192-bucket text-index rehash, offline restore and exact hit parity.
+Separate feature tests compare indexed graph expansion against full scanning with
+identical hits/scores on disconnected-edge fixtures, and count exactly one token
+iteration per candidate field for query-term frequencies. These demonstrate
+bounded work elimination, not a universal latency multiplier. Durable summaries
+avoid only the eligible corpus-statistics census; posting/candidate work remains.
+
 ### Latest FTS and logical-transfer sample
 
 Fresh local default-config stores, Windows/Python 3.13.1; 200 five-word documents,
@@ -53,8 +77,10 @@ comparison. [Reproduction, assertions and limits](reports/V005_SEARCH_RESUME_CHE
 | Export 201 documents | 92.791 ms / 13,344 artifact bytes |
 | Import with index rebuild, verification and promotion | 938.954 ms |
 
-Cold and warm are cache regimes, not evolution de/para. Cold statistics remain
-linear; eligible writes advance scalar statistics with bounded native WAL evidence.
+Cold and warm are cache regimes, not evolution de/para. This sample uses default
+`statistics_mode="wal"`, whose cold statistics remain linear; eligible writes
+advance scalar statistics with bounded native WAL evidence. Opt-in durable mode
+is measured separately above on a different workload, not as an A/B speedup.
 The new-term result was checked against an independent census with identical hits
 and scores. No RSS, production SLO or large-graph claim. These observations were
 taken while a separate regression process was running; host contention was not isolated.

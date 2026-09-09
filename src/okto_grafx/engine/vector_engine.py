@@ -76,10 +76,14 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
+    GrafxQueryBudgetExceeded,
+    GrafxQueryCancelled,
+    GrafxQueryDeadlineExceeded,
     GrafxUnsupportedOperation,
     GrafxVectorValidationError,
 )
 from okto_grafx.domain.ids import NO_LSN, Csn, Lsn, RecordId, RecordRef
+from okto_grafx.domain.query.control import _ReadControl
 from okto_grafx.domain.index.definition import (
     IndexDefinition,
     index_definition_matches_table,
@@ -973,7 +977,7 @@ class VectorHnswIndex(ProximityIndex):
         """Return the graph of the current picture, building one when there is none or it is behind."""
         return self.snapshot().graph
 
-    def snapshot(self) -> _GraphSnapshot:
+    def snapshot(self, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
         """Return one complete picture of the index as of now, building it when needed.
 
         THE RULE (P0.5). A picture is built in locals and published by ONE reference
@@ -1008,9 +1012,13 @@ class VectorHnswIndex(ProximityIndex):
         """
         token = self._guard.thread_token()
         while True:
+            if check is not None:
+                check()
             owner = False
             waited = 0
             while True:
+                if check is not None:
+                    check()
                 header = self.built_through_lsn
                 with self._guard:
                     current = self._snapshot
@@ -1041,7 +1049,8 @@ class VectorHnswIndex(ProximityIndex):
                         generation = self._graph_generation
                         break
             try:
-                built = self._catch_up(self._build(header))
+                built = (self._catch_up(self._build(header)) if check is None else
+                         self._catch_up(self._build(header, check=check), check=check))
             except BaseException:
                 # A build that does not finish leaves NOTHING behind -- and takes nothing away.
                 # Its locals go with this frame; the published picture, which may be another
@@ -1071,7 +1080,7 @@ class VectorHnswIndex(ProximityIndex):
             if not superseded:
                 return built
 
-    def _catch_up(self, picture: _GraphSnapshot) -> _GraphSnapshot:
+    def _catch_up(self, picture: _GraphSnapshot, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
         """Replace a not-yet-published picture that the store moved under with a fresh build.
 
         The walk that fed the build is a moment in the past. A commit that landed after it is in
@@ -1091,10 +1100,12 @@ class VectorHnswIndex(ProximityIndex):
         rebuilds; never a certification the build did not verify.
         """
         for _pass in range(_BUILD_CATCH_UP_PASSES):
+            if check is not None:
+                check()
             header = self.built_through_lsn
             if header == picture.mark:
                 return picture
-            picture = self._build(header)
+            picture = self._build(header) if check is None else self._build(header, check=check)
         return picture
 
     def _release_build(self) -> None:
@@ -1104,7 +1115,7 @@ class VectorHnswIndex(ProximityIndex):
             self._builder = None
             self._guard.notify_all()
 
-    def _build(self, mark: Lsn) -> _GraphSnapshot:
+    def _build(self, mark: Lsn, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
         """Build a complete picture in locals over the entries the store holds, marked at ``mark``.
 
         A tombstoned entry is inserted with the live ones: it must not be RETURNED, and it must
@@ -1143,6 +1154,8 @@ class VectorHnswIndex(ProximityIndex):
                 self._entry_headers(),
                 key=lambda item: (item.born_csn, item.encoded_ref),
             ):
+                if check is not None:
+                    check()
                 # The header walk has already validated every persisted image before this first
                 # fallible heap/vector operation.  Construct the final graph-owned DTO once,
                 # with its physical location, instead of decode + ``located_at`` constructing it
@@ -1439,6 +1452,8 @@ class VectorHnswIndex(ProximityIndex):
         *,
         ef: int | None = None,
         entry_admits: Callable[[RecordId, RecordRef], bool] | None = None,
+        check: Callable[[], None] | None = None,
+        observe: Callable[[int], None] | None = None,
     ) -> tuple[tuple[ScoredEntry, ...], TraversalStats]:
         """Return the best visible, admitted versions for a query, with traversal statistics.
 
@@ -1478,7 +1493,7 @@ class VectorHnswIndex(ProximityIndex):
             # The picture this search answers from is fixed HERE, by one capture. A commit on
             # another thread may retire or replace the published picture while the traversal
             # runs; the outer certificate rejects it if a foreign durable generation changed.
-            picture = self.snapshot()
+            picture = self.snapshot() if check is None else self.snapshot(check=check)
             entries = picture.entry_of_node
             records = picture.record_of_node
 
@@ -1494,7 +1509,10 @@ class VectorHnswIndex(ProximityIndex):
                     return bool(entry_admits(record, entry.ref))
                 return admits is None or bool(admits(record))
 
-            ranked, stats = picture.graph.search(query, width, visible_and_admitted)
+            ranked, stats = (
+                picture.graph.search(query, width, visible_and_admitted) if check is None and observe is None else
+                picture.graph.search(query, width, visible_and_admitted, check=check, observe=observe)
+            )
             scored = [
                 ScoredEntry(entry=entries[node], record_id=records[node], score=score)
                 for score, node in ranked
@@ -1510,6 +1528,26 @@ class VectorHnswIndex(ProximityIndex):
             f"VectorHnswIndex(name={self.name!r}, space={self._space_name!r}, "
             f"stale={self.stale})"
         )
+
+
+class _CheckedCandidates(Sequence):
+    """A borrowed candidate sequence checking before each native math observation."""
+
+    def __init__(self, values: Sequence[tuple[int, Sequence[float]]], check: Callable[[], None]) -> None:
+        self.values = values
+        self.check = check
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __getitem__(self, index: int) -> tuple[int, Sequence[float]]:
+        self.check()
+        return self.values[index]
+
+    def __iter__(self) -> Iterable[tuple[int, Sequence[float]]]:
+        for value in self.values:
+            self.check()
+            yield value
 
 
 class VectorEngine:
@@ -2649,6 +2687,8 @@ class VectorEngine:
         k: int,
         snapshot: SnapshotLike,
         candidate_filter: CandidateFilter | None = None,
+        _control: _ReadControl | None = None,
+        _memory: Callable[[int], None] | None = None,
     ) -> VectorSearchResult:
         """Return the nearest neighbours of a query inside one embedding space.
 
@@ -2661,6 +2701,8 @@ class VectorEngine:
         estimate, and this is the estimate that describes the work: an exact scan reads every
         entry and discards the ones the snapshot cannot see.
         """
+        if _control is not None:
+            _control.check()
         started = self._reading()
         definition = self._catalog.catalog.space(space)
         _require_positive_k(k)
@@ -2687,11 +2729,17 @@ class VectorEngine:
                 snapshot,
                 candidate_filter,
                 space_size=space_size,
+                control=_control,
+                memory=_memory,
             )
         else:
             hits = self._search_approximately(
-                definition, index, components, k, snapshot, candidate_filter
+                definition, index, components, k, snapshot, candidate_filter,
+                control=_control,
+                memory=_memory,
             )
+        if _control is not None:
+            _control.check()
         self._publish_search_metrics(plan, len(hits))
         return VectorSearchResult(
             hits=hits,
@@ -2701,6 +2749,14 @@ class VectorEngine:
             space=definition.name,
             filter_cardinality=plan.filter_cardinality,
         )
+
+    def search_controlled(self, *, space: str, query: Sequence[float], k: int,
+                          snapshot: SnapshotLike, candidate_filter: CandidateFilter | None = None,
+                          control: _ReadControl | None,
+                          memory: Callable[[int], None] | None = None) -> VectorSearchResult:
+        """Explicit collaborator capability; ordinary search keeps its existing contract."""
+        return self.search(space=space, query=query, k=k, snapshot=snapshot,
+                           candidate_filter=candidate_filter, _control=control, _memory=memory)
 
     def _require_committed_search_index(
         self, index: VectorHnswIndex, space: EmbeddingSpaceDef
@@ -2728,6 +2784,8 @@ class VectorEngine:
         candidate_filter: CandidateFilter | None,
         *,
         space_size: int,
+        control: _ReadControl | None = None,
+        memory: Callable[[int], None] | None = None,
     ) -> tuple[VectorHit, ...]:
         """Scan the filtered set against the heap, which is the authority on what exists.
 
@@ -2759,6 +2817,11 @@ class VectorEngine:
                     return admits is None or admits(record_id)
 
                 for ref in index._entry_refs_from_headers():
+                    if control is not None:
+                        control.check()
+                    if memory is not None:
+                        memory((len(candidates) + 1) * (256 + 32 * len(query)) +
+                               (len(scanned) + 1) * 64 + k * 128)
                     # Two entries may name one heap location -- an entry filed under a key the
                     # row no longer carries sits beside the matching one. Deduplicate locations;
                     # two DISTINCT visible locations for one record remain a refusal below.
@@ -2795,6 +2858,11 @@ class VectorEngine:
                 index_witnesses: list[tuple[bytes, RecordRef]] = []
                 try:
                     for expected_record_id, ref in witnesses:
+                        if control is not None:
+                            control.check()
+                        if memory is not None:
+                            memory((len(candidates) + 1) * (384 + 32 * len(query)) +
+                                   len(witnesses) * 128 + k * 128)
 
                         def wanted(record_id: int, xmin: int, xmax: int) -> bool:
                             """Accept only this visible physical identity from its heap header."""
@@ -2824,7 +2892,8 @@ class VectorEngine:
                         index_witnesses
                     ):
                         return None
-                except GrafxCorruptionDetected:
+                except (GrafxCorruptionDetected, GrafxQueryBudgetExceeded,
+                        GrafxQueryCancelled, GrafxQueryDeadlineExceeded):
                     # A selected heap ref or bucket was actually read and found corrupt. Hiding
                     # that finding behind a successful fallback would make selective search a
                     # corruption mask, so the located diagnostic remains authoritative.
@@ -2833,6 +2902,8 @@ class VectorEngine:
                     # NULL/malformed vectors, absent rows and other incomplete proofs do not
                     # invent a result. The unchanged canonical scan owns their observable
                     # outcome and error ordering.
+                    if control is not None:
+                        control.check()
                     return None
                 return candidates, location
 
@@ -2848,7 +2919,10 @@ class VectorEngine:
             self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
             started = self._reading()
             ranked = (
-                self._math.top_k(query, candidates, k, space.metric)
+                self._math.top_k(
+                    query, candidates if control is None else _CheckedCandidates(candidates, control.check),
+                    k, space.metric,
+                )
                 if candidates
                 else []
             )
@@ -2875,6 +2949,9 @@ class VectorEngine:
         k: int,
         snapshot: SnapshotLike,
         candidate_filter: CandidateFilter | None,
+        *,
+        control: _ReadControl | None = None,
+        memory: Callable[[int], None] | None = None,
     ) -> tuple[VectorHit, ...]:
         """Traverse the versioned index, evaluating the filter during navigation."""
         started = self._reading()
@@ -2884,7 +2961,13 @@ class VectorEngine:
             else None
         )
         admits = None if entry_admits is not None else _guarded_admits(candidate_filter)
-        if entry_admits is None:
+        if control is not None or memory is not None:
+            scored, _stats = index.search(
+                query, k, snapshot, admits, entry_admits=entry_admits,
+                check=None if control is None else control.check,
+                observe=memory,
+            )
+        elif entry_admits is None:
             # Preserve the established positional call for subclasses/adapters implementing the
             # original VectorHnswIndex.search seam. Only the private filtered path opts into the
             # new ref-aware keyword.

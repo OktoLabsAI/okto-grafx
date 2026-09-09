@@ -160,7 +160,9 @@ were an application-approved write.
 The 0.0.5 development line provides `okto_grafx.backup.create_backup` and
 `restore_backup`: [full contract, budgets and examples](BACKUP_RESTORE.md).
 Capture uses the existing checkpoint fence; writers wait for checkpoint/capture,
-not destination IO or verification. Restore requires an offline-original assertion
+including the default temporary-disk spool I/O, but not subsequent artifact output
+or verification. `capture_mode="memory"` is the explicit RAM-backed alternative.
+Restore requires an offline-original assertion
 and a new destination, preserving UUID/commit provenance rather than creating a fork.
 
 For a manual filesystem backup, stop **all** participants, close handles successfully and
@@ -172,7 +174,9 @@ segments is not a supported consistent backup procedure.
 Before an upgrade, pin/test the target binary on a copy and keep a pre-upgrade
 backup. `page_size` must match persisted identity. `partitions_per_table` is adopted
 from existing identity rather than reconfigured by reopen. Catalog-v2, heap reclaim
-and WAL v2 capabilities can be one-way fences. Do not open migrated files with
+and WAL v2 capabilities can be one-way fences. Durable FTS summaries and hash
+generations above 4,096 buckets activate additional required bits in the 0.0.5
+continuation. Do not open migrated files with
 older binaries; there is no general downgrade API. The CLI's offline control-format
 downgrade is a narrowly scoped exception, not a way to undo catalog/WAL capabilities.
 

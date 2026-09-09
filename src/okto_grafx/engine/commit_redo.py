@@ -36,6 +36,7 @@ from okto_grafx.engine.buffer_pool import (
 )
 from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore, read_catalog_page_images
 from okto_grafx.engine.commit_catalog_store import CommitCatalogPageImage, CommitCatalogStore
+from okto_grafx.engine.fulltext_durable import replay_statistics
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -202,6 +203,7 @@ class CommitRedo:
                 if batch_files is not None:
                     for file in batch_files:
                         remember(file)
+                    replay_statistics(manager, replay)
                     return CommitRedoResult(
                         effects_replayed=len(replay.effects),
                         index_effects_replayed=len(replay.effects),
@@ -273,6 +275,7 @@ class CommitRedo:
                 )
             indexes_dispatched += 1
 
+        replay_statistics(manager, replay)
         return CommitRedoResult(
             effects_replayed=len(replay.effects),
             page_effects_replayed=len(prepared_pages),

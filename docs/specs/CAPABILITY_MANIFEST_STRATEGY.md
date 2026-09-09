@@ -9,7 +9,10 @@ Authority: complementary plan D16, §§6–15, 19.5; existing catalog/recovery c
 `src/okto_grafx/domain/model/catalog.py` supports legacy catalog v1 and v2 with
 a required-capability bitmap, bounded index metadata and checksum. Current known
 bits cover identity secondary indexes, heap reclamation, WAL-v2 records and
-ordered secondary indexes, commit catalog v1 (bit 4) and full-text indexes v1 (bit 5).
+ordered secondary indexes, commit catalog v1 (bit 4), full-text indexes v1 (bit 5),
+durable FTS statistics (`fulltext_statistics_v1`, bit 6) and large hash directories
+(`large_hash_directories_v1`, bit 7). The latter two are opt-in persisted additions
+in the eight-item 0.0.5 continuation; unchanged defaults retain their prior bytes.
 Unknown required bits raise a typed refusal.
 `tests/storage_core/test_catalog_v2.py` and
 `tests/index/test_ordered_format_discrimination.py` exercise unknown/missing bits

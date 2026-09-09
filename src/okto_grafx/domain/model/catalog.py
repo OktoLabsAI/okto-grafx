@@ -51,8 +51,11 @@ from okto_grafx.domain.index.definition import (
     automatic_index_definitions,
 )
 from okto_grafx.domain.index.layout import IndexLayout
-from okto_grafx.domain.index.fulltext import FULLTEXT_CAPABILITY, is_fulltext
+from okto_grafx.domain.index.fulltext import (
+    FULLTEXT_CAPABILITY, is_fulltext, FULLTEXT_STATISTICS_CAPABILITY, has_durable_statistics,
+)
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.index.keys import LARGE_HASH_CAPABILITY, LEGACY_MAX_BUCKET_COUNT
 from okto_grafx.domain.model.schema import (
     SPACE_STATE_ACTIVE,
     ColumnDef,
@@ -110,6 +113,8 @@ _WAL_RECORD_V2_BIT = 1 << 2
 _ORDERED_SECONDARY_INDEXES_V1_BIT = 1 << 3
 _COMMIT_CATALOG_V1_BIT = 1 << 4
 _FULLTEXT_V1_BIT = 1 << 5
+_FULLTEXT_STATISTICS_V1_BIT = 1 << 6
+_LARGE_HASH_V1_BIT = 1 << 7
 
 
 _KNOWN_CAPABILITY_BITS = (
@@ -119,6 +124,8 @@ _KNOWN_CAPABILITY_BITS = (
     | _ORDERED_SECONDARY_INDEXES_V1_BIT
     | _COMMIT_CATALOG_V1_BIT
     | _FULLTEXT_V1_BIT
+    | _FULLTEXT_STATISTICS_V1_BIT
+    | _LARGE_HASH_V1_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -130,6 +137,8 @@ _CAPABILITY_TO_BIT = MappingProxyType(
         ),
         COMMIT_CATALOG_V1_CAPABILITY: _COMMIT_CATALOG_V1_BIT,
         FULLTEXT_CAPABILITY: _FULLTEXT_V1_BIT,
+        FULLTEXT_STATISTICS_CAPABILITY: _FULLTEXT_STATISTICS_V1_BIT,
+        LARGE_HASH_CAPABILITY: _LARGE_HASH_V1_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -167,6 +176,10 @@ def _require_commit_catalog_sequence(sequence: int) -> None:
         raise GrafxConfigurationError(
             "Invalid commit catalog activation sequence.", field="commit_catalog_activation"
         )
+
+
+def _large_hash_generations(definitions: Iterable[CatalogIndexDefinition]) -> bool:
+    return any(g.bucket_count > LEGACY_MAX_BUCKET_COUNT for d in definitions for g in d.generations)
 
 
 class Catalog:
@@ -488,6 +501,10 @@ class Catalog:
             capabilities.add(ORDERED_SECONDARY_INDEXES_V1_CAPABILITY)
         if any(is_fulltext(definition.key_derivation) for definition in validated.values()):
             capabilities.add(FULLTEXT_CAPABILITY)
+        if any(has_durable_statistics(d.key_derivation) for d in validated.values()):
+            capabilities.add(FULLTEXT_STATISTICS_CAPABILITY)
+        if _large_hash_generations(validated.values()):
+            capabilities.add(LARGE_HASH_CAPABILITY)
         self._required_capabilities = frozenset(capabilities)
         self._install_indexes(validated)
         return self
@@ -502,6 +519,10 @@ class Catalog:
         validated = self._validated_index_authority(proposed, stored=False)
         if is_fulltext(definition.key_derivation):
             self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_CAPABILITY))
+        if has_durable_statistics(definition.key_derivation):
+            self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_STATISTICS_CAPABILITY))
+        if _large_hash_generations(validated.values()):
+            self._required_capabilities = frozenset((*self._required_capabilities, LARGE_HASH_CAPABILITY))
         if definition.layout is IndexLayout.ORDERED:
             self._required_capabilities = frozenset(
                 (
@@ -572,6 +593,8 @@ class Catalog:
             for item in self.index_definitions()
         )
         validated = self._validated_index_authority(proposed, stored=False)
+        if _large_hash_generations(validated.values()):
+            self._required_capabilities = frozenset((*self._required_capabilities, LARGE_HASH_CAPABILITY))
         self._install_indexes(validated)
         return definition
 
@@ -709,6 +732,10 @@ class Catalog:
             capability_bits = _encode_capabilities(self._required_capabilities)
             if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in self._required_capabilities:
                 raise GrafxConfigurationError("Full-text indexes require their capability.", field="required_capabilities")
+            if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Durable text statistics require their capability.", field="required_capabilities")
+            if _large_hash_generations(indexes) and LARGE_HASH_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Large hash directories require their capability.", field="required_capabilities")
             if not capability_bits & _IDENTITY_SECONDARY_INDEXES_V1_BIT:
                 raise GrafxConfigurationError(
                     "Catalog format 2 requires identity_secondary_indexes_v1.",
@@ -904,6 +931,10 @@ class Catalog:
         if format_version == CATALOG_FORMAT_VERSION:
             if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Full-text indexes lack their required capability.", field="required_capabilities")
+            if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Durable text statistics lack their capability.", field="required_capabilities")
+            if _large_hash_generations(indexes) and LARGE_HASH_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Large hash directories lack their capability.", field="required_capabilities")
             if any(
                 definition.layout is IndexLayout.ORDERED for definition in indexes
             ) and (

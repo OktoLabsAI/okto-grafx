@@ -23,6 +23,7 @@ from okto_grafx.domain.index.catalog import identity_index_name
 from okto_grafx.domain.index.keys import record_id_key
 from okto_grafx.domain.index.definition import RECORD_ID_KEY_DERIVATION
 from okto_grafx.engine.public_views import _vector_query_snapshot
+from okto_grafx.engine.search_memory import SearchMemory
 
 __all__: list[str] = []
 
@@ -88,15 +89,23 @@ def search_hybrid(
         + selected.candidate_k * 1024
         + len(selected.graph_seeds) * 128
     )
+    memory = SearchMemory(selected.max_memory_bytes)
+    graph_base = None
 
     def check() -> None:
         """Cooperatively bound graph retention and phase transitions, including empty answers."""
-        if retained > selected.max_memory_bytes:
-            raise GrafxQueryBudgetExceeded(
-                "Hybrid retention budget exceeded.", resource="hybrid_memory"
-            )
+        if graph_base is None:
+            memory.set("fusion", retained)
+        else:
+            memory.set("graph", max(0, retained - graph_base))
         if control is not None:
             control.check()
+
+    def reserve(amount: int) -> None:
+        """Charge or release graph work in the shared logical operation envelope."""
+        nonlocal retained
+        retained += amount
+        check()
 
     # Native capture enforces finite components and dimension bounds before coordination.
     wanted_vector = _vector_query_snapshot(vector) if selected.vector_weight else ()
@@ -149,6 +158,7 @@ def search_hybrid(
                         timeout_seconds=None,
                         cancellation=None,
                         _control=control,
+                        _memory=lambda amount: memory.set("lexical", amount),
                     )
                     lexical = {
                         hit.record_id: (rank, hit.score)
@@ -156,6 +166,7 @@ def search_hybrid(
                     }
                     lexical_regime = result.regime
                     lexical_coverage = result.index_built_through_commit
+                    memory.set("lexical", 0)
             check()
             if selected.vector_weight:
                 owners = [
@@ -173,12 +184,14 @@ def search_hybrid(
                         field="space",
                     )
                 else:
-                    result = database.search_vectors(
+                    result = database._search_vectors_with_control(
                         reader,
                         space=space,
                         query=wanted_vector,
                         k=selected.candidate_k,
                         candidate_filter=filter,
+                        control=control,
+                        memory=lambda amount: memory.set("vector", amount),
                     )
                     for rank, hit in enumerate(result.hits, 1):
                         if hit.record_id in vectors:
@@ -187,6 +200,7 @@ def search_hybrid(
                             )
                         vectors[hit.record_id] = (rank, hit.score)
                     vector_regime = result.regime
+                    memory.set("vector", 0)
             check()
             if errors and (
                 not selected.allow_partial
@@ -213,7 +227,9 @@ def search_hybrid(
             )
             distance = {}
             visited = 0
+            graph_regime = "disabled"
             if selected.graph_weight or selected.graph_filter:
+                graph_base = retained
                 if allowed is not None and not set(selected.graph_seeds) <= allowed:
                     raise GrafxConfigurationError(
                         "Graph seeds must satisfy the candidate filter.",
@@ -244,7 +260,17 @@ def search_hybrid(
                         "Every graph seed must name one visible target row.",
                         field="graph_seeds",
                     )
-                for name in selected.graph_relations:
+                from okto_grafx.engine.hybrid_graph import (
+                    select_incident_indexes, incident_distances,
+                )
+
+                paths = select_incident_indexes(database, table, selected)
+                graph_regime = "scan" if paths is None else "incident_index"
+                if paths is not None:
+                    distance, visited = incident_distances(
+                        database, reader, identity, paths, selected, allowed, check, reserve,
+                    )
+                for name in selected.graph_relations if paths is None else ():
                     relation = catalog.table(name)
                     if (
                         relation.kind != "rel"
@@ -306,9 +332,10 @@ def search_hybrid(
                         cursor = page.next_cursor
                         if cursor is None:
                             break
-                distance = {rid: 0 for rid in selected.graph_seeds}
+                if paths is None:
+                    distance = {rid: 0 for rid in selected.graph_seeds}
                 frontier = set(distance)
-                for depth in range(1, selected.graph_hops + 1):
+                for depth in range(1, selected.graph_hops + 1) if paths is None else ():
                     following = {
                         end
                         for start in frontier
@@ -349,4 +376,9 @@ def search_hybrid(
                 visited,
                 tuple(errors),
                 lexical_coverage,
+                graph_regime,
+                memory.peak,
+                memory.peaks.get("lexical", 0),
+                memory.peaks.get("vector", 0),
+                memory.peaks.get("graph", 0),
             )

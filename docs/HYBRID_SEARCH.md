@@ -71,8 +71,9 @@ lexical-only search. At least one text/vector source must remain enabled.
 | `graph_hops` | 1 | 1..8 BFS hops. Seeds have distance 0; shortest permitted distance wins. |
 | `graph_weight` | 0.0 | Finite 0..1000; adds weight/(rrf_k + distance + 1) for reachable candidates. Zero disables boost, not an explicit graph_filter. |
 | `graph_filter` | False | Keep only base text/vector candidates reachable from seeds; does not create graph-only hits. |
-| `max_graph_edges` | 10000 | 1..1000000; counts every scanned physical visible relationship occurrence, including parallel edges and rejected filtered edges. Exceeding refuses, never truncates traversal. |
-| `max_memory_bytes` | 33554432 | 1..2³¹ logical fusion/graph retention. Tariff: 1024 per candidate-window slot, 64 per allowed ID, 128 per seed, retained directed adjacency and reached frontier ID. Not total process RSS or native source allocation. |
+| `max_graph_edges` | 10000 | 1..1000000; scan counts all visible scanned relationships; incident mode counts unique visible `(table, relationship ID)` encountered from the frontier, including parallel and filtered-out edges. Exceeding refuses, never truncates traversal. |
+| `max_memory_bytes` | 33554432 | 1..2³¹ aggregate logical operation envelope: simultaneous fusion, lexical/vector temporary work and graph work. Not process RSS or resident engine/vector cache size. See accounting below. |
+| `graph_access` | `auto` | `auto` uses certified endpoint indexes when all selected paths exist; absent paths select scan before lookup. `scan` explicitly retains the canonical full-relation path for comparison/legacy budget behavior. Corruption or refusal after index adoption never triggers fallback. |
 
 `filter` is an immutable `RecordIdFilter`; derive allowed IDs from your application's
 policy using the same reader. Both sources apply it before their own top-k. For
@@ -82,11 +83,14 @@ validated through native exact identity/heap certificates. Missing identity inde
 refuse: prepare them with `ensure_identity_indexes()` outside the read operation.
 Duplicate/missing visible endpoints refuse; no dangling edge becomes evidence.
 
-Graph v1 scans the allowlisted relationship tables in bounded pages, builds a
-bounded adjacency map and performs BFS. Cycles/self-loops/parallel edges do not
-multiply boost; all stored occurrences still consume the scan budget. This is
-**O(selected relationships + bounded traversal)**, not an incident-index-only walk
-or constant-time KG retrieval. Graph disabled means zero graph scanning.
+Graph defaults to indexed BFS over the allowlisted tables: only endpoint buckets
+for the current frontier are probed, under native pre/post certificates and heap
+visibility/key/endpoint validation. Collisions, skew and retained versions can still
+increase work; this is not a universal O(neighborhood) or constant-time promise.
+The explicit/fallback scan builds bounded adjacency in O(selected relationships).
+Both paths preserve shortest-hop results, cycles, self-loops and parallel-edge
+semantics. Unvisited disconnected relationships are not a whole-graph integrity audit;
+use `verify` for that. Graph disabled means zero graph scanning.
 The edge counter is not a physical-page/I/O ceiling: scans can also examine retained
 invisible MVCC versions. Page decoding and a single native scan call are not
 preempted by the outer cooperative deadline.
@@ -105,7 +109,10 @@ vector_rank/vector_score and graph_distance. Missing evidence is None, not zero.
 `HybridSearchResult`: hits, snapshot_commit, fusion (`rrf_v1_union` or
 `rrf_v1_intersection`), regime (`complete`/`partial`), lexical_regime, vector_regime,
 lexical_candidates, vector_candidates, graph_edges_visited, source_errors and
-lexical_index_built_through_commit (None when disabled/unavailable). The complete
+lexical_index_built_through_commit (None when disabled/unavailable), `graph_regime`
+(`disabled`, `scan`, `incident_index`) and logical `memory_peak_bytes`,
+`lexical_memory_peak_bytes`, `vector_memory_peak_bytes`, `graph_memory_peak_bytes`.
+Phase peaks are not simultaneous and must not be summed as actual peak RSS. The complete
 status concerns source availability, **not exact ANN recall**. Preserve vector
 regime/fallback explanations; empty hits do not erase source disposition.
 Candidate counts describe the returned source windows, not total matching rows in
@@ -119,11 +126,20 @@ retrieval; do not enable it to mask corruption or authorization failures.
 
 `text_limits` supplies `TextSearchLimits` to the lexical source with default BM25
 k1=1.2/b=0.75. Vector work follows native connection settings, including
-`vector_exact_scan_threshold`, `vector_ef_search` and vector budgets. Fusion memory
-is additional to those source budgets, decoder buffers and result objects.
-Cancellation/deadlines share one control across text and phase/graph checks; they
-cannot preempt a blocking storage call, initial reader admission or the interior of
-native vector search. A vector phase that returns after deadline yields a typed
+`vector_exact_scan_threshold`, `vector_ef_search` and vector budgets. The aggregate
+logical envelope reserves 1024 bytes per fusion window slot, 64 per allowed ID,
+128 per seed/frontier/edge, plus lexical accounting (including bounded WAL proof
+reservation), vector candidate components and ANN navigation containers. Native
+source limits still apply independently. Engine caches, a cold HNSW picture and its
+construction state, page/decoder buffers, allocator overhead, sorting temporaries
+and caller-owned result retention are not an RSS-capped memory pool. Inspect native
+cache/vector budgets separately. Source reservations are released between phases.
+
+Cancellation/deadlines share one control across lexical, vector and graph work,
+including native vector candidate/scoring/navigation loops and between cold HNSW
+insertions. They cannot preempt a blocking storage/math call, initial admission,
+native header capture/sorting or one HNSW construction insertion. A vector phase
+that returns after deadline yields a typed
 deadline error, not late successful hits. No write/COMMIT is cancelled.
 
 Invalid options/bindings/readers, exhausted budgets and corruption preserve the

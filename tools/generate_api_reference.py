@@ -15,6 +15,8 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "migrations.py": {"SchemaMigration", "MigrationReport"},
+    "engine/index_distribution.py": {"IndexDistribution"},
     "domain/query/hybrid.py": {"HybridSearchOptions", "HybridHit", "HybridSearchResult"},
     "backup.py": {"BackupReport"},
     "transfer.py": {"TransferLimits", "TransferReport", "RecordIdMapping"},
@@ -52,6 +54,7 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
+    "migrations.py": {"migrate_schema"},
     "api/__init__.py": {"connect"},
     "backup.py": {"create_backup", "restore_backup"},
     "transfer.py": {"export_graph", "import_graph"},

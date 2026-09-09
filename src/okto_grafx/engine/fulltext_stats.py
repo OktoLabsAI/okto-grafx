@@ -30,6 +30,8 @@ def advance_statistics(
     through: int,
     limits: TextSearchLimits,
     check: Callable[[], None],
+    *,
+    reserve: Callable[[int], None] | None = None,
 ) -> tuple[tuple[int, tuple[int, ...]], int] | None:
     """Advance the newest eligible seed; never assume that a prefix remains retained."""
     candidates = [
@@ -40,6 +42,8 @@ def advance_statistics(
     if not candidates or type(database._wal) is not WalManager:
         return None
     previous, stats = max(candidates, key=lambda item: item[0])
+    if reserve is not None:
+        reserve(limits.max_statistics_wal_bytes + limits.max_statistics_wal_records * 256)
     records = database._wal.read_bounded(
         previous + 1,
         through,

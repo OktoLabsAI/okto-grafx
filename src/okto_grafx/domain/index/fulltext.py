@@ -21,7 +21,9 @@ from okto_grafx.domain.errors import (
 __all__ = ["TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"]
 
 FULLTEXT_CAPABILITY = "fulltext_indexes_v1"
+FULLTEXT_STATISTICS_CAPABILITY = "fulltext_statistics_v1"
 PREFIX = "fulltext_v1_"
+STATISTICS_PREFIX = "fulltext_v2_"
 ANALYZERS = ("standard", "keyword", "code_identifier", "whitespace")
 _HEADER = struct.Struct("<BBBBHII")
 _NORMALIZATIONS = ("none", "NFC", "NFKC")
@@ -52,9 +54,12 @@ class TextIndexOptions:
     locale: str = "und"
     stopwords: str = "none"
     stemming: str = "none"
+    statistics_mode: str = "wal"
 
     def __post_init__(self) -> None:
         """Capture bounded immutable field weights and exact supported analyzer semantics."""
+        if type(self.statistics_mode) is not str or self.statistics_mode not in ("wal", "durable"):
+            raise _bad("statistics_mode")
         if type(self.analyzer) is not str or self.analyzer not in ANALYZERS:
             raise _bad("analyzer")
         if type(self.analyzer_version) is not int or self.analyzer_version != 1:
@@ -109,7 +114,7 @@ class TextIndexOptions:
             self.max_document_tokens,
         )
         return (
-            PREFIX
+            (STATISTICS_PREFIX if self.statistics_mode == "durable" else PREFIX)
             + (
                 raw
                 + struct.pack("<" + "d" * len(self.field_weights), *self.field_weights)
@@ -134,6 +139,7 @@ def decode_options(derivation: str) -> TextIndexOptions:
             weights,
             _NORMALIZATIONS[normalization],
             _FOLDS[folding],
+            statistics_mode="durable" if derivation.startswith(STATISTICS_PREFIX) else "wal",
         )
         if derivation != options.derivation():
             raise ValueError("noncanonical")
@@ -146,7 +152,12 @@ def decode_options(derivation: str) -> TextIndexOptions:
 
 def is_fulltext(derivation: str) -> bool:
     """Recognize the reserved family; decoding still validates the complete identity."""
-    return derivation.startswith(PREFIX)
+    return derivation.startswith((PREFIX, STATISTICS_PREFIX))
+
+
+def has_durable_statistics(derivation: str) -> bool:
+    """Recognize the opt-in derivation requiring native persisted corpus totals."""
+    return derivation.startswith(STATISTICS_PREFIX)
 
 
 def _fold(text: str, policy: str) -> str:
@@ -288,6 +299,24 @@ def keys_from_fields(fields: tuple[tuple[str, ...], ...]) -> tuple[bytes, ...]:
             for token in sorted({t for f in fields for t in f})
         ),
     )
+
+
+def query_term_frequencies(
+    fields: tuple[tuple[str, ...], ...], terms: tuple[str, ...]
+) -> tuple[dict[str, int], ...]:
+    """Count only requested terms in one pass per field, without retaining others.
+
+    Callers reserve O(fields * query terms) temporary space before invoking this
+    pure derivation. Document frequency and snapshot visibility are not cached here.
+    """
+    result = []
+    for tokens in fields:
+        counts = dict.fromkeys(terms, 0)
+        for token in tokens:
+            if token in counts:
+                counts[token] += 1
+        result.append(counts)
+    return tuple(result)
 
 
 class TextAnalysisMemo:
