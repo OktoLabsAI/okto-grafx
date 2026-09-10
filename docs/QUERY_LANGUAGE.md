@@ -31,11 +31,11 @@ Python `execute()` call; CLI multi-statement arguments remain separate statement
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | |
 | Aggregates | Exactly `count`, `sum`, `avg`, `min`, `max`, `collect`; scalar/aggregate type restrictions apply |
-| Scalar functions | `coalesce`, `string_split`, `size`, `label`, `timestamp` |
+| Scalar functions | `coalesce`, `string_split`, `size`, `label`, `timestamp`; 0.0.6 adds `lower`, `upper`, `trim`, `abs` |
 | Conditional/list expressions | searched and simple `CASE`; one-based and negative `list[index]` |
 | Parameters | `$name`, refused before anything runs if one is missing |
 | `OPTIONAL MATCH` | Root labelled node or correlated incident-hop pipeline, as detailed below; not arbitrary optional joins |
-| `UNION` | Exactly two top-level read-only RETURN branches, equal arity, global DISTINCT; no UNION ALL/chains/nesting |
+| `UNION`, `UNION ALL` | Exactly two top-level read-only RETURN branches, equal arity; UNION deduplicates, ALL preserves duplicates (0.0.6); no chains/nesting |
 | Path projection | Narrow outgoing typed one-hop path map; no arbitrary path functions/projection shapes |
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
@@ -138,7 +138,29 @@ UNWIND, writes or vector predicates inside that optional pipeline remain restric
 `RETURN 1 AS n UNION RETURN 1.0 AS n` returns one numerically promoted value.
 Both branches share a snapshot and budgets, names come from the left, and each
 branch's ORDER BY/SKIP/LIMIT is local. No post-UNION sort/window, chaining, nested
-UNION, UNION ALL or write branches. Incompatible/unprovable result families refuse.
+UNION or write branches. Incompatible/unprovable result families refuse.
+Since 0.0.6, `RETURN 1 AS n UNION ALL RETURN 1.0 AS n` instead returns two
+`1.0` rows. ALL removes only the global deduplication step: branch-local DISTINCT
+and windows still apply, types/NULL promotion and shared budgets are unchanged.
+Rows from the left branch precede rows from the right, but order inside an
+unsorted branch is not a substitute for ORDER BY. ALL does not admit additional
+branches, nested set operators, OPTIONAL composition or writes.
+
+### Native scalar additions (0.0.6)
+
+`lower`, `upper`, `trim` and `abs` take exactly one positional argument; no star,
+DISTINCT or named arguments. NULL propagates. String functions accept STRING only:
+lower/upper use Python Unicode case conversion (not locale-specific collation or
+casefold; output length may change), and trim removes leading/trailing Unicode
+whitespace, preserving internal whitespace. Unicode tables follow the supported
+Python runtime; these are not persistent index normalization changes.
+
+`abs` accepts INT64/DOUBLE, not BOOL or numeric strings. It preserves numeric type
+and refuses signed-INT64-min overflow and non-finite results rather than widening
+or wrapping. Known schema/literal and bound parameter type errors are rejected
+before rows, including empty matches; row-dependent numeric overflow is checked
+when evaluated. Composed expressions remain subject to the existing query subset
+and budgets. These functions are built in, not trusted host UDFs.
 
 Typed traversal supports bounded directions/ranges and preserves relationship
 isomorphism and parallel-edge multiplicity. Omitted upper bound means **20 hops**,

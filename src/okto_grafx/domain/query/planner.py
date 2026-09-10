@@ -32,6 +32,8 @@ Each is a refusal with a message that names the rule, never a silent partial ans
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_type
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
@@ -635,15 +637,10 @@ class _Planner:
                     right_type,
                 )
             )
+        combined = UnionRows(left=pipelines[0], right=pipelines[1], columns=columns)
         return self._planned(
-            ProduceResults(
-                child=DistinctRows(
-                    child=UnionRows(
-                        left=pipelines[0], right=pipelines[1], columns=columns
-                    )
-                ),
-                columns=columns,
-            ),
+            ProduceResults(child=combined if statement.all else DistinctRows(child=combined),
+                           columns=columns),
             columns=columns,
         )
 
@@ -1592,6 +1589,8 @@ class _Planner:
             for node in walk(expression):
                 if not isinstance(node, FunctionCall):
                     continue
+                if node.name.upper() in NATIVE_SCALARS:
+                    self._pulse_expression_type(node, owner=node.name)
                 if node.name.upper() == "UDF":
                     if (not node.arguments or type(node.arguments[0]) is not Literal
                             or type(node.arguments[0].value) is not str
@@ -1978,6 +1977,8 @@ class _Planner:
             )
         if isinstance(expression, FunctionCall):
             name = expression.name.upper()
+            if name in NATIVE_SCALARS:
+                return scalar_type(name, self._pulse_expression_type(expression.arguments[0], owner=owner))
             if name == "UDF" and expression.arguments and isinstance(expression.arguments[0], Literal):
                 result = self.scalar_types.get(expression.arguments[0].value)
                 if result is not None:
@@ -2268,6 +2269,8 @@ class _Planner:
                 if argument.operator == "^" or ValueType.DOUBLE in concrete:
                     return ValueType.DOUBLE
                 return ValueType.INT64
+        if isinstance(argument, FunctionCall) and argument.name.upper() in NATIVE_SCALARS:
+            return self._pulse_expression_type(argument, owner=call.name)
         if isinstance(argument, FunctionCall) and argument.name.upper() == (
             LABEL_FUNCTION
         ):

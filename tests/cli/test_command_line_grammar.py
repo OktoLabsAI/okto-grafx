@@ -35,6 +35,12 @@ def _assert_required_attribution(text: str) -> None:
 def test_the_command_table_covers_the_operator_surface() -> None:
     labels = {spec.label for spec in COMMANDS}
     assert labels == {
+        "schema",
+        "indexes",
+        "capabilities",
+        "search text",
+        "search vector",
+        "search hybrid",
         "status",
         "verify",
         "query",
@@ -61,8 +67,11 @@ def test_every_command_documents_itself_and_accepts_the_shared_options(spec: obj
     assert spec.summary.strip().endswith(".")
     names = {option.name for option in spec.options}
     assert JSON_OPTION.name in names
-    for option in CONNECTION_OPTIONS:
-        assert option.name in names
+    if spec.positionals:
+        for option in CONNECTION_OPTIONS:
+            assert option.name in names
+    else:
+        assert names == {JSON_OPTION.name}, "build discovery must not pretend to open storage"
     assert len(names) == len(spec.options), "an option is declared twice"
     text = command_help(spec)
     assert PROGRAM_NAME in text

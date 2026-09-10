@@ -52,6 +52,8 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_type, scalar_value
+
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from heapq import heappop, heappush, heapreplace
@@ -4193,7 +4195,10 @@ class QueryEngine:
         rows = handler(self, node, context)
         if context.read_control is not None:
             rows = self._controlled_rows(rows, context.read_control)
-        if self._max_intermediate_rows is None or node is context.result_node:
+        # UNION ALL removes DistinctRows, not the pair's shared UnionRows budget.
+        if self._max_intermediate_rows is None or (
+            node is context.result_node and type(node) is not UnionRows
+        ):
             return rows
         return self._admit_intermediate_rows(node, context, rows)
 
@@ -15352,6 +15357,8 @@ def _infer_bound_pulse_expression_type(
             ):
                 return ValueType.NULL
             return result_type
+        if name in NATIVE_SCALARS:
+            return scalar_type(name, argument_types[0])
         if name == STRING_SPLIT_FUNCTION:
             wrong = tuple(
                 value_type
@@ -15929,6 +15936,9 @@ def _bound_case_types(
         id(expression): value_type
         for expression, value_type in plan.pulse_expression_types
     }
+    for expression, _value_type in plan.pulse_expression_types:
+        if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS:
+            _bound_pulse_expression_type(expression, static_types, parameters, owner=expression.name)
     resolved: dict[int, ValueType | None] = {}
     for expression, planned_results in plan.case_result_types:
         compared = (
@@ -16419,6 +16429,11 @@ def _bound_coalesce_types(
             if planned_type is not None:
                 argument_types.append(planned_type)
                 continue
+            if isinstance(argument, FunctionCall) and argument.name.upper() in NATIVE_SCALARS:
+                static_types = {id(item): value_type for item, value_type in plan.pulse_expression_types}
+                argument_types.append(_bound_pulse_expression_type(
+                    argument, static_types, parameters, owner=expression.name))
+                continue
             if not isinstance(argument, Parameter):
                 message = f"{expression.name} could not resolve the type of {argument.describe()}."
                 raise GrafxPlanError(
@@ -16462,6 +16477,8 @@ def _coalesce_selected(
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name in NATIVE_SCALARS:
+        return scalar_value(name, _evaluate(expression.arguments[0], row, context))
     if name == "UDF":
         registry = context.engine._extensions
         if registry is None:

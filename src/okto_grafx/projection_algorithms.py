@@ -17,7 +17,45 @@ if TYPE_CHECKING:
     from okto_grafx.projections import GraphProjection, ProjectionNode, ProjectionEdge
 
 __all__ = ["ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult",
-           "PageRankPreparation", "SimpleTopology", "LabelPropagationResult"]
+           "PageRankPreparation", "SimpleTopology", "LabelPropagationResult", "TopologicalOrderResult"]
+
+
+@dataclass(frozen=True, slots=True)
+class TopologicalOrderResult:
+    """Typed DAG/cycle result. Blocked includes cycle descendants, not just cycle members."""
+    order: tuple[ProjectionNode, ...]
+    acyclic: bool
+    blocked: tuple[ProjectionNode, ...]
+
+
+def _topological_order(graph, cancellation):
+    work = _control(graph, cancellation, edge_workspace=128)
+    n = len(graph.nodes)
+    work.step(n)
+    incoming = [0] * n
+    outgoing = [[] for _ in range(n)]
+    for edge in graph.edges:
+        work.step()
+        if not (type(edge.source) is int and type(edge.target) is int
+                and 0 <= edge.source < n and 0 <= edge.target < n):
+            raise GrafxConfigurationError("Invalid projection endpoint.", field="edges")
+        incoming[edge.target] += 1
+        outgoing[edge.source].append(edge.target)
+    # FIFO ready queue: deterministic capture order without an O(log N) priority queue.
+    ready = deque(i for i, count in enumerate(incoming) if count == 0)
+    order = []
+    while ready:
+        work.step()
+        node = ready.popleft()
+        order.append(graph.nodes[node])
+        for target in outgoing[node]:
+            work.step()
+            incoming[target] -= 1
+            if incoming[target] == 0:
+                ready.append(target)
+    work.step(n)
+    blocked = tuple(graph.nodes[i] for i, count in enumerate(incoming) if count)
+    return TopologicalOrderResult(tuple(order), not blocked, blocked)
 
 
 @dataclass(frozen=True, slots=True)

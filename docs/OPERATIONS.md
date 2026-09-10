@@ -35,6 +35,25 @@ are met. Neither mode makes concurrent external file replacement a supported res
 
 ## Concurrency contract
 
+### ACID scope
+
+Grafx implements ACID transaction properties within one supported local store,
+with snapshot isolation and optimistic conflict validation. This describes the
+implemented contract, not independent certification or universal serializability.
+
+| Property | Implemented guarantee and boundary | Evidence |
+| --- | --- | --- |
+| Atomicity | A transaction's changes commit together or roll back; recovery must not promote effects without a valid durable COMMIT. A failure after the durable barrier is not a rollback. | [Commit/rollback protocol tests](../tests/txn/test_commit_protocol.py), [committed redo](../tests/recovery/test_commit_redo.py). |
+| Consistency | Supported type, primary-key, endpoint, schema and storage invariants are enforced by the corresponding operations. Arbitrary business invariants are not inferred or enforced automatically. | [Typed query/write contract](QUERY_LANGUAGE.md), [native protocol](architecture/CONTRACT.md). |
+| Isolation | Readers use MVCC snapshots; writers must pass optimistic logical and physical validation. Do not infer general predicate locking or serializability for every application invariant. | [Visibility tests](../tests/txn/test_snapshot.py), [OCC tests](../tests/txn/test_occ.py). |
+| Durability | A successful durable write acknowledges its WAL barrier; verified recovery handles committed effects. Guarantees depend on supported filesystem/storage behavior. `:memory:` is not power-loss durable. | [WAL ordering and post-barrier outcomes](../tests/txn/test_commit_protocol.py), [recovery tests](../tests/recovery/test_commit_redo.py). |
+
+ACID does not mean distributed transactions, zero possible corruption, automatic
+repair of arbitrary damage, or identical isolation levels across products.
+Host side effects, other databases and remote calls are outside this transaction.
+For read-dependent business rules, validate the specific concurrent workload and
+enforcement strategy; do not assume snapshot isolation alone prevents every anomaly.
+
 Independent processes/threads can own concurrent transactions. Each reader sees
 its snapshot and each writer uses optimistic validation. A writer lease and an
 exclusive commit publication section remain: multiwriter is not lock-free or

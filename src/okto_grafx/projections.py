@@ -14,6 +14,7 @@ from okto_grafx.projection_algorithms import (
     ProjectionLookup, ProjectionAdjacency, ProjectionPath, WeightedProjectionPath, PageRankResult,
     _with_lookup, _with_adjacency, _strong_components, _bfs, _pagerank, _k_core, _weight, _weighted_path,
     PageRankPreparation, SimpleTopology, LabelPropagationResult, _with_pagerank, _with_simple, _label_propagation,
+    TopologicalOrderResult,
 )
 
 __all__ = ["ProjectionLimits", "ProjectionDiagnostics", "ProjectionNode", "ProjectionEdge", "GraphProjection", "project_graph"]
@@ -111,6 +112,11 @@ class GraphProjection:
     weights: tuple[float, ...] | None = None
     pagerank_preparation: PageRankPreparation | None = None
     simple_topology: SimpleTopology | None = None
+
+    def topological_order(self, *, cancellation: CancellationToken | None = None) -> TopologicalOrderResult:
+        """Return deterministic Kahn ordering or a typed cycle/blocked result, in O(V+E)."""
+        from okto_grafx.projection_algorithms import _topological_order
+        return _topological_order(self, cancellation)
 
     def with_pagerank(self, *, backend: str = "python", weighted: bool = False,
                       cancellation: CancellationToken | None = None) -> GraphProjection:

@@ -276,6 +276,33 @@ def _database_command(
 
 
 COMMANDS: tuple[CommandSpec, ...] = (
+    CommandSpec("capabilities", "Describe this build's CLI contracts, not store activation.",
+                options=(JSON_OPTION,)),
+    _database_command("indexes", "Inspect secondary and vector index metadata.",
+        force_read_only=True,
+        options=(Option("--limit", "Maximum entries per inventory (default 100).",
+                        integer=True, minimum=0),)),
+    *(_database_command("search", f"Run bounded {kind} search in one read snapshot.",
+        subcommand=kind, force_read_only=True,
+        options=(
+            Option("--k", "Maximum hits (default 20, at most 1000).", integer=True, minimum=1),
+            Option("--filter", "JSON array of physical record IDs; [] matches nothing."),
+            Option("--timeout-seconds", "Cooperative operation timeout (default 30 seconds)."),
+            *((Option("--index", "Text index name."), Option("--query", "Text query."))
+              if kind != "vector" else ()),
+            *((Option("--space", "Embedding space name."), Option("--vector", "JSON numeric vector."))
+              if kind != "text" else ()),
+            *((Option("--table", "Node table for hybrid fusion."),) if kind == "hybrid" else ()),
+        )) for kind in ("text", "vector", "hybrid")),
+    _database_command(
+        "schema",
+        "Inspect table definitions without reading graph rows or changing the database.",
+        force_read_only=True,
+        options=(Option(name="--limit", summary="Maximum table definitions printed (default 100).",
+                        integer=True, minimum=0, metavar="COUNT"),),
+        details=("Captures one immutable catalog view. The limit bounds output, not catalog loading.",
+                 "--create is refused. Truncated output is explicitly marked, not a full inventory."),
+    ),
     _database_command(
         "status",
         "Open a database and report what state it is in.",

@@ -4,6 +4,13 @@
 
 ## Entry points and supported imports
 
+0.0.6 adds `okto_grafx.sqlite_import` (`SQLiteImportLimits`, `read_sqlite_rows`,
+`import_sqlite`) for [bounded local SQLite consumption](LOCAL_SQLITE_IMPORT.md),
+and `okto_grafx.html_snapshot` (`HtmlSnapshotLimits`, `render_html_snapshot`) for
+[offline HTML pictures](HTML_SNAPSHOTS.md). `GraphProjection.topological_order`
+returns the frozen `TopologicalOrderResult`; see [algorithms](GRAPH_PROJECTIONS.md).
+All new options are operation-local; no durable-format migration is introduced.
+
 `from okto_grafx.projections import project_graph, ProjectionLimits` exposes
 [read-only snapshot graph pictures, adjacency, degree/WCC/SCC, paths, PageRank and k-core](GRAPH_PROJECTIONS.md).
 `from okto_grafx.arrow import import_arrow_batches, to_arrow_batches` exposes
@@ -946,6 +953,30 @@ Release owned resources under this database's checksum selection (FR-1).
 ## Public factory and transfer functions
 
 
+### okto_grafx.html_snapshot.render_html_snapshot
+
+```python
+render_html_snapshot(graph: GraphProjection, *, catalog: CatalogView | None=None, limits: HtmlSnapshotLimits=HtmlSnapshotLimits(), cancellation: CancellationToken | None=None) -> str
+```
+
+Render detached identities/edges and optional separately captured schema; never write files.
+
+### okto_grafx.sqlite_import.read_sqlite_rows
+
+```python
+read_sqlite_rows(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], query: str, columns: tuple[str, ...], types: tuple[str, ...], parameters: tuple=(), limits: SQLiteImportLimits=SQLiteImportLimits(), cancellation: CancellationToken | None=None) -> tuple[dict[str, object], ...]
+```
+
+Read one bounded SELECT; SQL NULL stays None; no source connection survives return.
+
+### okto_grafx.sqlite_import.import_sqlite
+
+```python
+import_sqlite(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], query: str, columns: tuple[str, ...], types: tuple[str, ...], parameters: tuple=(), limits: SQLiteImportLimits=SQLiteImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
+```
+
+Atomically stage the complete bounded selection; caller owns Grafx commit/rollback.
+
 ### okto_grafx.graph_interop.to_networkx
 
 ```python
@@ -1203,6 +1234,14 @@ pagerank_preparation: PageRankPreparation | None
 simple_topology: SimpleTopology | None
 ```
 
+#### GraphProjection.topological_order
+
+```python
+topological_order(*, cancellation: CancellationToken | None=None) -> TopologicalOrderResult
+```
+
+Return deterministic Kahn ordering or a typed cycle/blocked result, in O(V+E).
+
 #### GraphProjection.with_pagerank
 
 ```python
@@ -1307,6 +1346,18 @@ weakly_connected_components(*, cancellation: CancellationToken | None=None) -> t
 
 Return each node's component label (minimum table/record identity), including isolates.
 
+### TopologicalOrderResult fields
+
+Annotation location: `okto_grafx.projection_algorithms.TopologicalOrderResult`.
+
+Typed DAG/cycle result. Blocked includes cycle descendants, not just cycle members.
+
+```python
+order: tuple[ProjectionNode, ...]
+acyclic: bool
+blocked: tuple[ProjectionNode, ...]
+```
+
 ### PageRankPreparation fields
 
 Annotation location: `okto_grafx.projection_algorithms.PageRankPreparation`.
@@ -1408,6 +1459,32 @@ out_edges: tuple[int, ...]
 in_offsets: tuple[int, ...]
 in_edges: tuple[int, ...]
 logical_bytes: int
+```
+
+### HtmlSnapshotLimits fields
+
+Annotation location: `okto_grafx.html_snapshot.HtmlSnapshotLimits`.
+
+Display limits; source capture uses independent ProjectionLimits.
+
+```python
+max_nodes: int
+max_edges: int
+max_bytes: int
+max_work: int
+```
+
+### SQLiteImportLimits fields
+
+Annotation location: `okto_grafx.sqlite_import.SQLiteImportLimits`.
+
+Logical input bounds, including SQLite VM instructions; not a process RSS promise.
+
+```python
+max_rows: int
+max_bytes: int
+max_field_bytes: int
+max_work: int
 ```
 
 ### PolarsFrame fields

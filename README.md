@@ -5,7 +5,7 @@ snapshot isolation, WAL-backed durability, verification and fail-closed recovery
 No database server is required. The base installation includes NumPy and native CRC-32C;
 engine/domain mechanisms remain isolated behind ports.
 
-**Version: 0.0.5, pre-alpha — published on PyPI.** See the
+**Source version: 0.0.6, pre-alpha — in development.** Latest published release: 0.0.5. See the
 [publication receipt](docs/reports/PYPI_0_0_5_PUBLICATION.md). API and persistent-format compatibility
 must be checked before upgrading; see [operations](docs/OPERATIONS.md).
 
@@ -72,6 +72,9 @@ context exit commits, and an exceptional exit rolls back. See
 | Streaming logical export/import, opt-in crash resumption, fresh identities and verified promotion (0.0.5 development) | [Logical transfer](docs/LOGICAL_TRANSFER.md) |
 | Cooperative read cancellation/deadlines and quiescent orphan-index inventory/removal (0.0.5 development) | [Read control and cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | Embedded Python, machine-readable CLI, configurable ports/adapters | [API](docs/API_REFERENCE.md), [CLI](docs/CLI.md), [ports](docs/PORTS.md) |
+| 0.0.6: CLI schema/index inventory and text/vector/hybrid search; JS/TS recipe | [CLI and contracts](docs/CLI.md) |
+| 0.0.6: native lower/upper/trim/abs and two-branch UNION ALL | [Query language](docs/QUERY_LANGUAGE.md) |
+| 0.0.6: bounded SQLite ingestion, offline HTML viewer, topological ordering | [SQLite](docs/LOCAL_SQLITE_IMPORT.md), [HTML](docs/HTML_SNAPSHOTS.md), [algorithms](docs/GRAPH_PROJECTIONS.md) |
 
 Concurrent transactions do not imply lock-free commits: publication has an exclusive
 section, different rows can conflict on physical pages, and operations may wait or
@@ -114,6 +117,7 @@ historical evidence; integrating the library does not require reading the latter
 - [Query language](docs/QUERY_LANGUAGE.md)
 - [Operations, concurrency, errors and upgrades](docs/OPERATIONS.md)
 - [Performance and measurement boundaries](docs/PERFORMANCE.md)
+- [Feature comparison: Grafx vs Ladybug vs Neo4j](docs/FEATURE_COMPARISON.md)
 - **[Roadmap: evolution, known limitations and corrective work](ROADMAP.md)** — the sole active backlog
 - [Changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md), [security](SECURITY.md)
 

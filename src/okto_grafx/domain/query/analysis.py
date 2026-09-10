@@ -22,6 +22,8 @@ exists to forbid.
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.scalars import NATIVE_SCALARS
+
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -362,6 +364,8 @@ def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
     Nothing is interpolated into the message. A branch of a forged type would be asked to render
     itself while the refusal was being built, and a refusal that raises reports nothing at all.
     """
+    if type(statement.all) is not bool:
+        return ("UNION ALL selection must be a boolean.", "all")
     for branch in (statement.left, statement.right):
         if type(branch) is not Query:
             return (
@@ -1521,6 +1525,9 @@ class _Analyzer:
     def _check_call(self, call: FunctionCall, *, where: str) -> None:
         """Check one function call: aggregate nesting, the star form and the two extensions."""
         name = call.name.upper()
+        if name in NATIVE_SCALARS:
+            self._check_positional_call(call, arguments=1)
+            return
         if name == "UDF":
             if call.star or call.distinct or call.named_arguments or not 1 <= len(call.arguments) <= 33:
                 raise self._refuse("udf(name, ...) needs 1..33 positional arguments.", field="function", value=call.name)

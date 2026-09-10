@@ -779,7 +779,7 @@ class UnionRows(PlanNode):
     produced it. The operator maps position by position instead, which is also the only reading
     that works when both branches return the same name for different things.
 
-    Deduplication is NOT here. A single DistinctRows sits above, because the pair is one result
+    Deduplication is NOT here. Unless UNION ALL is selected, a single DistinctRows sits above, because the pair is one result
     and duplicates across branches are duplicates: removing them inside each branch would leave
     a row that appears once on each side appearing twice.
     """

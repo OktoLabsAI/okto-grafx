@@ -7,6 +7,22 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Added (0.0.6 development)
+
+- MP-1: read-only JSON table/space and secondary/vector index inventories;
+  path-free build CLI capabilities, explicit truncation and stale metadata.
+- MP-2/3: snapshot-owned text/vector/hybrid CLI search and bounded JS/TS subprocess
+  recipe, including typed envelopes, failure cleanup and unsafe-integer refusal.
+- MP-4: native Unicode lower/upper/trim and numeric abs, with static/bound/runtime
+  type checks, NULL propagation and finite/INT64 overflow refusal.
+- MP-5/6: offline script-free HTML graph/schema pictures and bounded read-only
+  SQLite ingestion with closed-source, whole-call atomic Grafx staging.
+- MP-7: two-branch read-only UNION ALL preserving duplicate rows, type promotion,
+  snapshot ownership and shared intermediate/result budgets.
+- MP-8: O(V+E) deterministic topological ordering with typed DAG/cycle results,
+  logical work/memory bounds and cancellation.
+- Comparative feature-gap register and ordered MP-1–MP-8 minimum-parity roadmap.
+
 ### Changed
 
 - Continuation after `a4dd85a`: opt-in immutable PageRank transition preparation and

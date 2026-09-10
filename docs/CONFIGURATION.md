@@ -1,5 +1,16 @@
 # Configuration reference
 
+## 0.0.6 operation-local additions
+
+No `connect`/`DatabaseConfig` fields or defaults change in MP-1–MP-8.
+[CLI discovery/search](CLI.md) adds metadata `--limit` (100), search `--k` (20,
+maximum 1000), optional record-ID `--filter`, and `--timeout-seconds` (30).
+[SQLiteImportLimits](LOCAL_SQLITE_IMPORT.md) bounds detached ingestion rows,
+bytes, field size and work. [HtmlSnapshotLimits](HTML_SNAPSHOTS.md) bounds shown
+nodes/edges, output bytes and rendering work. [Topological ordering](GRAPH_PROJECTIONS.md)
+reuses `ProjectionLimits` and optional cancellation. These are per-operation
+arguments, not persisted settings or new promises of RSS/OS-call preemption.
+
 In the September 10, 2026 0.0.5 development revision, the base install includes
 NumPy and google-crc32c. New connections default to `codec="numpy"` and
 `vector_math="numpy"`; `checksum="auto"` still validates and selects native CRC.

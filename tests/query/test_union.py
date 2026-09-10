@@ -784,7 +784,7 @@ def test_a_quoted_name_spelled_like_the_keyword_stays_a_name(database: object) -
 @pytest.mark.parametrize(
     "text",
     (
-        "MATCH (n:A) RETURN n.id UNION ALL MATCH (m:B) RETURN m.id",
+        "MATCH (n:A) RETURN n.id UNION ALL MATCH (m:B) RETURN m.id UNION ALL RETURN 1",
         "MATCH (a:A) RETURN a.id UNION MATCH (b:B) RETURN b.id UNION MATCH (c:A) RETURN c.id",
         "MATCH (n:A) RETURN n.id UNION",
         "UNION MATCH (n:A) RETURN n.id",

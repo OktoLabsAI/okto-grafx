@@ -755,7 +755,7 @@ class Query(Statement):
 
 @dataclass(frozen=True, slots=True)
 class UnionQuery(Statement):
-    """Two reading queries whose rows are one result, with the duplicates removed.
+    """Two reading queries; duplicates removed unless explicit ALL is selected.
 
     Exactly two branches, and deliberately not a list. A list would say that three branches
     are the same shape as two, and they are not: the second UNION would have to decide whether
@@ -769,10 +769,12 @@ class UnionQuery(Statement):
 
     left: Query
     right: Query
+    all: bool = False
 
     def describe(self) -> str:
         """Return the statement as it would be written back."""
-        return f"{self.left.describe()} UNION {self.right.describe()}"
+        operator = "UNION ALL" if self.all else "UNION"
+        return f"{self.left.describe()} {operator} {self.right.describe()}"
 
 
 @dataclass(frozen=True, slots=True)

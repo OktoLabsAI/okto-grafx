@@ -16,7 +16,9 @@ MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
     "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection", "ProjectionDiagnostics"},
-    "projection_algorithms.py": {"ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult", "PageRankPreparation", "SimpleTopology", "LabelPropagationResult"},
+    "projection_algorithms.py": {"ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult", "PageRankPreparation", "SimpleTopology", "LabelPropagationResult", "TopologicalOrderResult"},
+    "html_snapshot.py": {"HtmlSnapshotLimits"},
+    "sqlite_import.py": {"SQLiteImportLimits"},
     "polars.py": {"PolarsFrame"},
     "text_import.py": {"TextImportLimits"},
     "parquet.py": {"ParquetExportReport"},
@@ -63,6 +65,8 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
+    "html_snapshot.py": {"render_html_snapshot"},
+    "sqlite_import.py": {"read_sqlite_rows", "import_sqlite"},
     "graph_interop.py": {"to_networkx", "projection_arrow_batches"},
     "polars.py": {"to_polars", "import_polars"},
     "text_import.py": {"read_csv_batches", "import_csv", "read_jsonl_batches", "import_jsonl"},

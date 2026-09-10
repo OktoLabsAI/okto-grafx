@@ -1,8 +1,9 @@
 # Okto Grafx roadmap
 
-**Single active product backlog — reconciled September 9, 2026.**
-Baseline: published `0.0.4`, tag `v0.0.4`, main merge
-`425362a44c4b8224cb43b33f0f7f65458c4ee193`; latest recorded Pulse measurement is a different build,
+**Single active product backlog — reconciled September 10, 2026.**
+Published/main baseline: `0.0.5`, tag `v0.0.5`, main merge
+`83cc3137bb7e95ad2a1ed9271b1a1134063097a8`. The `feature/v0.0.6` MP-1–MP-8
+checkpoint is implemented and locally validated, not released. Latest recorded Pulse measurement is a different build,
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
 
 This roadmap includes **new capabilities, corrective work, known limitations,
@@ -14,8 +15,8 @@ reopen completed work, authorize production data changes or imply release approv
 
 September 10, 2026 — `okto-grafx==0.0.5` published on PyPI using the same wheel
 validated and installed in Pulse. See the [publication receipt](docs/reports/PYPI_0_0_5_PUBLICATION.md).
-Publication does not imply a Git merge/tag; the historical baseline above remains
-the last recorded main/tag baseline.
+Publication and merge/tag are separate events; the 0.0.5 main/tag baseline above
+was independently verified in Git when preparing the 0.0.6 checkpoint commit.
 
 September 10, 2026 — approved 0.0.5 default-acceleration update: NumPy and
 google-crc32c move to base dependencies; `[accel]` remains a compatibility alias.
@@ -39,6 +40,7 @@ not a full release-wide regression. See [configuration](docs/CONFIGURATION.md).
 - [Proposed next round after the 0.0.5 checkpoint](#proposed-next-round-after-the-005-checkpoint)
 - [Next proposed round after N1–N4 closure](#next-proposed-round-after-n1n4-closure)
 - [Known limitations and corrective work](#known-limitations-and-corrective-work)
+- [Comparative feature gaps and minimum parity](#comparative-feature-gaps-and-minimum-parity)
 - [Operational checkpoint after R1–R4](#operational-checkpoint-after-r1r4)
 - [Remaining performance work](#remaining-performance-work)
 - [Next iteration assessment: feature/v0.0.5](#next-iteration-assessment-featurev005)
@@ -670,6 +672,12 @@ branches that independently redefine the protocol.
 
 ## CAP-2 through CAP-4 opportunity assessment
 
+0.0.6 consumption additions also extend the bounded CAP-8/9 surfaces above:
+[SQLite ingestion](docs/LOCAL_SQLITE_IMPORT.md), [offline HTML inspection](docs/HTML_SNAPSHOTS.md)
+and [topological ordering](docs/GRAPH_PROJECTIONS.md#topological-ordering-006).
+These do not implement CatalogSession, temporal history or the other remaining
+CAP-8/9 capabilities.
+
 Assessed September 9, 2026 against `65ab659`, after the preceding eight-item
 implementation was committed and pushed. **Assessment only: CAP-2/3/4 remain
 Planned.** No new version assignment, implementation approval, release or Pulse
@@ -821,6 +829,96 @@ GX-CAP-1. Release/compatibility certification remains version/platform-specific.
 The DELETE quota correction is retained: a DELETE intent has an empty tuple and
 must not be re-encoded as a row just to compute quota; charge its fixed intent
 entry. Keep its regression when evolving write accounting.
+
+## Comparative feature gaps and minimum parity
+
+Registered September 10, 2026 at the user's request, from
+[Where Grafx is less complete](docs/FEATURE_COMPARISON.md#where-grafx-is-less-complete).
+This records the complete gap set without replacing existing capability specs.
+The broad CMP register remains **assessment/backlog**. Its selected MP-1–MP-8
+minimum-parity slices were subsequently approved and implemented for 0.0.6,
+as recorded below. This does not authorize Pulse changes, release or relaxation
+of multi-read/write, WAL, consistency or isolation guarantees.
+
+### Complete comparative gap register
+
+| ID | Gap retained from the comparison | Existing owner / bounded direction | Effort and disposition |
+| --- | --- | --- | --- |
+| CMP-Q | Query-language breadth | Extend the closed query surface in explicit slices; broader joins/subqueries/procedures are not supplied by parser acceptance. Reuse CAP-7 for extension contracts. | Small-to-large by slice; no full Cypher compatibility claim. |
+| CMP-T | Stored value/type breadth | Evaluate DATE, DECIMAL and nested-column needs against current typed values; coordinate schema evolution with CAP-10 and upgrade/refusal with CAP-11. | Medium-to-large; persistent types require format/recovery/interop decisions, not just Python wrappers. |
+| CMP-D | Language drivers | First consider documented structured CLI consumption from another language. A real network protocol/client or native binding is a separate supported surface. | Small for recipes; medium-to-large for genuine drivers. |
+| CMP-U | Graphical tooling | Start with detached read-only graph/schema inspection using bounded exports; later consider an optional local explorer. Pulse UI is not a bundled Grafx GUI. | Small-to-medium for a static viewer; larger for interactive administration. |
+| CMP-F | Remote federation and attached catalogs | CAP-2 owns CatalogSession, resolution/permissions/workspaces and one-store writes. CAP-8 owns external scans/interoperability; bounded import is not federation. | Large overall; selected ingestion adapters can be smaller. |
+| CMP-HA | Distributed availability | Retain replication/synchronization direction with explicit conflict policy; cluster/consensus/sharding still requires a separate architecture/scope decision. | Very large; deferred, not promoted into the current local-first delivery by this register. |
+| CMP-S | Built-in authentication/authorization | Assess optional service-boundary auth and scoped read/write policy before any server exposure. Distinguish API permissions from direct filesystem access; never claim a wrapper secures untrusted local file owners. | Medium-to-large plus threat modeling. At-rest encryption retains its separate key-lifecycle prerequisite. |
+| CMP-H | Full temporal history and bitemporal queries | CAP-3 owns retained historical schema/nodes/edges and time travel; CAP-4 adds valid time/bitemporal semantics and graph/version diff. | Large/very large; depends on CAP-1 and then CAP-3, not satisfied by commit metadata or current MVCC snapshots. |
+| CMP-E | Ecosystem | Broader examples, language recipes and optional integrations; CAP-7/8/9 and AGENT remain the owners of real extension/interop/analytics/agent capabilities. | Small for bounded recipes; medium-to-large for maintained integrations. |
+| CMP-O | Operational evidence and maturity | CAP-11 plus existing operational validation: supported-version/platform results, reproducible crash/reopen cases, mixed-workload measurements and explicitly bounded SLO evidence. Publication/test counts alone do not prove production maturity. | Small for an evidence map; sustained work for certification/SLOs. No endless percentage-based performance gate. |
+
+These ten entries decompose all four bullets in the comparison; they do not add
+ten competing execution programs. Missing catalog/temporal/security/HA features
+remain missing until their own acceptance contracts are met.
+
+### Relatively inexpensive minimum-parity candidates
+
+Execution approved for the 0.0.6 development line (`feature/v0.0.6`).
+MP-1–MP-8 are **delivered and validated locally**: 3419 passing grouped regression
+tests, 4 Node tests (including the real CLI), strict TypeScript compilation and
+Chrome viewer acceptance. See the [acceptance report](docs/reports/V006_MINIMUM_PARITY_ACCEPTANCE.md)
+for the exact test scope and remaining platform/release boundaries. Their minimum
+contracts are documented below; larger CMP gaps remain open. No persistent-format,
+multi-reader/writer, WAL/durability or default connection changes were required.
+
+| Delivered slice | Public consumption and focused evidence |
+| --- | --- |
+| MP-1 | [CLI schema/spaces/indexes/build capabilities](docs/CLI.md); `tests/cli/test_schema_inventory.py`, `tests/cli/test_discovery_search.py` |
+| MP-2 | [CLI text/vector/hybrid search](docs/CLI.md); native search/filter/refusal acceptance in `tests/cli/test_discovery_search.py` |
+| MP-3 | [JS/TS subprocess recipe](examples/cli-consumer/README.md); Node tests including real CLI, timeout/output/JSON/unsafe-integer failures; strict TypeScript compile |
+| MP-4 | [Native scalar contracts](docs/QUERY_LANGUAGE.md#native-scalar-additions-006); `tests/query/test_native_scalars.py` |
+| MP-5 | [Offline HTML picture](docs/HTML_SNAPSHOTS.md); `tests/api/test_html_snapshot.py` plus headless Chrome acceptance |
+| MP-6 | [Bounded SQLite ingestion](docs/LOCAL_SQLITE_IMPORT.md); `tests/api/test_sqlite_import.py`, including whole-call rollback/source release |
+| MP-7 | [Two-branch UNION ALL](docs/QUERY_LANGUAGE.md); `tests/query/test_union_all.py`, including shared budgets and old/new snapshots |
+| MP-8 | [Topological order/cycle result](docs/GRAPH_PROJECTIONS.md#topological-ordering-006); `tests/api/test_topological_order.py` against an independent stdlib oracle |
+
+Effort is a comparative engineering estimate, **including focused tests and docs**,
+not a measured schedule. Low means a bounded wrapper/recipe over existing contracts;
+low–medium adds UI or adapter behavior; medium changes a closed query/algorithm
+surface. None provides complete parity with Ladybug or Neo4j.
+
+| Order / ID | Minimum useful delivery | Comparison target and reuse | Effort / expected benefit | Explicit boundary and acceptance |
+| --- | --- | --- | --- | --- |
+| 1 / MP-1 | CLI schema/index/capability inventory as stable JSON | Minimum schema-inspection convenience of Ladybug Explorer/Neo4j tooling; reuse public catalog/index views and existing CLI envelopes. CMP-U/D/E. | Low / better discovery for developers and agents. | Read-only, deterministic schema, no index creation; cover empty stores, stale handles, budgets and CLI exit codes. Inventory APIs already exist; this is a new consumption path, not a new engine capability. |
+| 2 / MP-2 | CLI text/vector/hybrid search subcommands | Expose existing search APIs without requiring a Python script. CAP-5/6, CMP-D/E. | Low / immediate search accessibility. | Typed vector/space/filter input, one owned read snapshot, bounded output and faithful error/partial-result status; no new ranking engine or embedding provider. |
+| 3 / MP-3 | Tested JavaScript/TypeScript CLI-consumer recipe | Minimal non-Python consumption alongside competitors' drivers. Reuse existing `--json`, subprocess lifetime and error envelopes. CMP-D/E. | Low / onboarding with no server deployment. | No shell interpolation, bounded stdout/timeouts and process cleanup. Explicitly not a native driver, connection pool, remote service or long-lived transaction API. |
+| 4 / MP-4 | Small native scalar-function batch: lower/upper/trim and abs | Reduce routine Cypher adaptation; reuse current scalar planning/evaluation and trusted-UDF experience. CMP-Q/CAP-7. | Low–medium / common query compatibility. | Freeze arity, NULL/Unicode/numeric/overflow semantics; test planner and execution agreement. No general casts, date arithmetic or language-complete claim. |
+| 5 / MP-5 | Standalone read-only HTML graph/schema snapshot viewer | Minimum visualization comparable in purpose to Explorer/Browser; reuse bounded detached projections/exports. CMP-U. | Low–medium / useful inspection without Pulse. | Node/edge cap, visible truncation metadata, escaped labels, no executable property content or external CDN dependence. Static snapshot only: not live administration, authentication or editing. |
+| 6 / MP-6 | Bounded SQLite-to-Grafx ingestion recipe/adapter | Minimum interoperability with a common local relational source; reuse SQLite reads and typed atomic import staging. CMP-F/E, CAP-8. | Low–medium / simpler local adoption. | Read-only source, explicit query/type/root/NULL policy, row/byte limits, rollback tests. Not SQL pushdown/federation, CDC or a cross-database transaction; do not hold unrelated source locks across long commits. |
+| 7 / MP-7 | Two-branch read-only `UNION ALL` | Narrow query-language parity beyond current duplicate-eliminating UNION. CMP-Q. | Medium / fewer client-side merges. | Preserve duplicates, compatible types/arity, NULLs, budgets and documented branch/order/window rules. No chains, nesting, write branches or general set-operator expansion. |
+| 8 / MP-8 | Bounded topological ordering with typed cycle detection | Small graph-analytics addition using detached projections, adjacency and existing work/cancellation budgets. CMP-E, CAP-9. | Medium / useful dependency-graph analysis without a full analytics subsystem. | Directed graph only; deterministic order, disconnected graphs, self-loops and cycles tested against an independent oracle. No persisted algorithm catalog, mutation or claim of GDS parity. |
+
+Checkpoint order: MP-1–3 before MP-4–6; MP-7–8 remain
+separate bounded query/algorithm slices. Prioritize actual consumer demand; a wrapper that
+duplicates an already sufficient API need not be implemented just to gain a checkbox.
+
+Not cheap substitutes: nested persistent types, phrase-position FTS, general
+federation, native multi-language bindings, full temporal storage, arbitrary
+serializability, production RBAC and HA/consensus. A demo or wrapper does not close
+those contracts. All selected code changes require feature/adversarial tests,
+grouped regression and updated public API/configuration/usage documentation.
+
+### ACID is a clarification, not a missing engine feature
+
+The first comparison used “ACID” for competitors but listed Grafx's mechanisms,
+creating a misleading asymmetry. Corrected: Grafx implements single-store ACID
+properties with snapshot/OCC isolation and documented host/filesystem boundaries.
+[ACID scope and evidence](docs/OPERATIONS.md#acid-scope). This does not promise
+general serializability or independent certification.
+
+`CMP-O` includes a bounded public guarantee-to-test evidence map and any genuinely
+uncovered anomaly/recovery cases discovered by review. **Do not create an
+“implement ACID” backlog item or count ACID as a new performance feature.** A
+future stronger isolation mode would need its own supported workload, anomaly
+tests and concurrency/throughput analysis, not an automatic serialization of writers.
 
 ## Legacy requirement register
 

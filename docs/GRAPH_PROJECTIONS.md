@@ -1,5 +1,24 @@
 # Snapshot graph projections
 
+## Topological ordering (0.0.6)
+
+`projection.topological_order(cancellation=None)` returns a frozen
+`TopologicalOrderResult(order, acyclic, blocked)` from `okto_grafx.projection_algorithms`.
+`order` is a tuple of `ProjectionNode` identities, not positions. `acyclic=True`
+means every node was emitted; otherwise `order` is a valid processed prefix and
+`blocked` contains the unprocessed nodes in capture order. **Blocked includes
+descendants of cycles, not only cycle members**; use SCC for exact cycle grouping.
+Never treat a cyclic result's prefix as a full topological order.
+
+The directed Kahn algorithm is iterative, O(V+E), accounts for physical parallel
+edges and self-loops, and supports disconnected/empty graphs. FIFO ready nodes
+follow capture/edge encounter order, giving deterministic output for an identical
+projection, not the lexicographically smallest possible order. Existing projection
+logical-memory/work limits and cooperative cancellation apply before and during
+the algorithm. No database, WAL, schema or row changes occur.
+
+For an offline picture see [HTML snapshots](HTML_SNAPSHOTS.md).
+
 Available in **0.0.5 development** through `okto_grafx.projections`. This is the
 bounded GX-CAP-9 API, not a persistent projection catalog or algorithm server.
 The default algorithms require no optional dependency and do not write WAL, properties

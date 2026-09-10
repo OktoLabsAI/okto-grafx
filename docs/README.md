@@ -1,6 +1,6 @@
 # Documentation index
 
-The consumer guides include source version **0.0.5 development** additions, marked
+The consumer guides include source version **0.0.6 development** additions, marked
 with their implementation and acceptance status. They do not assert PyPI
 publication or that the latest source is installed in a particular application.
 
@@ -23,7 +23,11 @@ publication or that the latest source is installed in a particular application.
 | How do I handle conflicts, uncertain writes, recovery and upgrades? | [Operations](OPERATIONS.md) |
 | How can I cancel reads or safely reclaim orphan index files? | [Read control and index cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | How can a script/agent consume structured results? | [CLI](CLI.md) |
+| How do I ingest a bounded local SQLite selection? | [SQLite ingestion](LOCAL_SQLITE_IMPORT.md) |
+| How can I inspect a graph offline without a server? | [HTML snapshots](HTML_SNAPSHOTS.md) |
+| How can JavaScript/TypeScript consume the CLI safely? | [Subprocess recipe](../examples/cli-consumer/README.md) |
 | What has actually been measured? | [Performance](PERFORMANCE.md) |
+| How does Grafx compare with Ladybug and Neo4j? | [Feature comparison and trade-offs](FEATURE_COMPARISON.md) |
 | What is missing or planned? | [Roadmap](../ROADMAP.md) |
 
 Recommended reading order: tutorial → integration → configuration → operations;

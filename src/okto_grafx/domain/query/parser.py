@@ -308,15 +308,9 @@ class _Parser:
         clauses.
         """
         self._take_keyword("UNION")
-        if self._at_keyword("ALL"):
-            # Refused by name rather than by falling through to a puzzling word: UNION ALL is
-            # the form that keeps duplicates, and this subset has exactly one union and it
-            # deduplicates. A caller who wrote ALL asked for the other one.
-            raise self._refuse(
-                "UNION in this subset removes duplicates; UNION ALL is not supported",
-                field="clause",
-                value="UNION ALL",
-            )
+        keep_duplicates = self._at_keyword("ALL")
+        if keep_duplicates:
+            self._take_keyword("ALL")
         right = self._query()
         for branch in (left, right):
             if any(clause.optional for clause in branch.match_clauses):
@@ -346,7 +340,7 @@ class _Parser:
                 field="clause",
                 value="UNION",
             )
-        return UnionQuery(left=left, right=right)
+        return UnionQuery(left=left, right=right, all=keep_duplicates)
 
     def _create_index(self) -> CreateIndexStatement:
         """Parse the P2-ID custom exact-index declaration."""
