@@ -299,6 +299,7 @@ def _validate(package, limits):
 def capture_copy(
     source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits = CopyLimits(),
     record_ids: dict[str, tuple[int, ...]] | None = None, history: str = "refuse",
+    include_endpoints: bool = False,
 ) -> CopyPackage:
     """Capture tables or explicit RID subsets from one native read snapshot.
 
@@ -309,6 +310,8 @@ def capture_copy(
     ``history='current-only'``; history is never copied or invented at the target.
     """
     limits = _limits(limits)
+    if type(include_endpoints) is not bool or (include_endpoints and record_ids is None):
+        raise _invalid("include_endpoints")
     if type(source) is not Transaction or not source.active or source.mode != "read":
         raise GrafxTransactionStateError(
             "Copy capture requires an active native read transaction."
@@ -333,8 +336,8 @@ def capture_copy(
                 raise _invalid("record_ids")
         if sum(map(len, record_ids.values())) > limits.max_rows:
             raise _invalid("max_rows")
-    history = source.commit_history(limit=1)
-    identity = CommitId(history.database_uuid, history.read_sequence)
+    history_page = source.commit_history(limit=1)
+    identity = CommitId(history_page.database_uuid, history_page.read_sequence)
     if source.lookup_commit(identity) is None:
         raise GrafxUnsupportedOperation(
             "Source snapshot needs tracked commit provenance.", operation="capture_copy"
@@ -343,12 +346,36 @@ def capture_copy(
     with db._transactions.page_access_section(transaction=source._context):
         catalog = db._catalog.catalog
         schemas = tuple(_capture_schema(catalog.table(name)) for name in sorted(tables))
+        if include_endpoints:
+            selected_schemas = {schema.name: schema for schema in schemas}
+            record_ids = {name: set(ids) for name, ids in record_ids.items()}
+            for schema in schemas:
+                if schema.kind == "rel":
+                    for name in (schema.from_table, schema.to_table):
+                        selected_schemas.setdefault(name, _capture_schema(catalog.table(name)))
+                        record_ids.setdefault(name, set())
+            if len(selected_schemas) > limits.max_tables:
+                raise _invalid("max_tables")
+            schemas = tuple(sorted(selected_schemas.values(), key=lambda schema: (schema.kind != "rel", schema.name)))
         spaces = tuple(replace(s) for s in catalog.spaces())
         if history != "current-only" and any(s.table_id in {key for key, _, _ in catalog.system_history_tables()} for s in schemas):
             raise GrafxUnsupportedOperation("Temporal tables require history='current-only' for logical copy.", operation="capture_copy")
     copied = []
     count = 0
     byte_count = 0
+
+    def append_selected(schema: TableDef, rows: list[tuple[int, bytes]], rid: int, raw: bytes) -> None:
+        """Expand only selected relationship endpoints under the existing aggregate bounds."""
+        rows.append((rid, raw))
+        if include_endpoints and schema.kind == "rel":
+            values = _values(schema, raw)
+            for name, endpoint in ((schema.from_table, values[0]), (schema.to_table, values[1])):
+                if type(endpoint) is not int or not 0 < endpoint < 2**64:
+                    raise _invalid("endpoint_closure")
+                record_ids[name].add(endpoint)
+            if sum(map(len, record_ids.values())) > limits.max_rows:
+                raise _invalid("max_rows")
+
     for schema in schemas:
         rows = []
         cursor = None
@@ -365,7 +392,7 @@ def capture_copy(
                     byte_count += len(raw)
                     if count > limits.max_rows or len(raw) > limits.max_row_bytes or byte_count > limits.max_bytes:
                         raise _invalid("row_limits")
-                    rows.append((rid, raw))
+                    append_selected(schema, rows, rid, raw)
             copied.append(CopyTable(schema, tuple(rows)))
             continue
         while True:
@@ -388,7 +415,7 @@ def capture_copy(
                 ):
                     raise _invalid("row_limits")
                 if record_ids is None or row.record_id in record_ids[schema.name]:
-                    rows.append((row.record_id, raw))
+                    append_selected(schema, rows, row.record_id, raw)
             cursor = page.next_cursor
             if cursor is None:
                 break
@@ -403,6 +430,7 @@ def capture_copy(
             raise GrafxWriteConflict(
                 "Schema changed during copy capture; recapture explicitly."
             )
+    copied.sort(key=lambda item: item.schema.name)
     package = CopyPackage(
         identity, tuple(copied), spaces, _digest(identity, copied, spaces, limits)
     )

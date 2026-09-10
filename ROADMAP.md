@@ -32,7 +32,7 @@ not a full release-wide regression. See [configuration](docs/CONFIGURATION.md).
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
 - [Latest authorized eight-item follow-up](#authorized-follow-up-after-204bd2e)
-- [Next proposed round after native-history closure](#next-proposed-round-after-native-history-closure)
+- [Native-history consumer and access-path round](#native-history-consumer-and-access-path-round-nhc-18)
 - [Approved capability continuation after 4ee4d2e](#approved-capability-continuation-after-4ee4d2e)
 - [Approved continuation after a4dd85a](#approved-continuation-after-a4dd85a)
 - [Approved continuation after 970aa1e](#approved-continuation-after-970aa1e)
@@ -112,13 +112,22 @@ Consumer docs: [system time](docs/SYSTEM_TIME_HISTORY.md), [CLI](docs/CLI.md),
 [posting memo](docs/POSTING_HASH.md), [matrix](docs/V006_COMPATIBILITY.md).
 [Round evidence](docs/reports/V006_NATIVE_HISTORY_ROUND.md) tracks final acceptance.
 
-### Next proposed round after native-history closure
+### Native-history consumer and access-path round (NHC-1–8)
 
-**Proposal only, not authorized or started.** These are remaining slices of the
+**Complete in development on feature/v0.0.6; local DoD satisfied.** These are slices of the
 existing roadmap, not additional acceptance requirements for the completed round.
 Effort is relative; benefits below are expected, not measured speedups.
 
-| Order | Existing initiative | Finite proposed delivery | Effort / expected benefit |
+All eight implementations, feature/crash tests and consumer documentation are
+complete. Final affected regression: **269 passed**; final corrective regression:
+**2,774 passed**, covering all nine failures found by the initial full run
+(16,929 passed, 19 attributed skips). No failure remains unaccounted for; the
+initial full run is not relabeled as green. The real-wheel matrix passed all
+14 cells, with 207 packaged modules matching the final source. No Pulse install,
+commit/push or package publication is implied by this implementation checkpoint.
+[Scope, evidence and explicit limits](docs/reports/V006_NHC_ROUND.md).
+
+| Order | Existing initiative | Completed bounded delivery | Effort / expected benefit |
 | --- | --- | --- | --- |
 | 1 / NHC-1 | GX-CAP-5 | Typed bounded return of matched token positions/field identities, using the existing positional evidence and owning snapshot. Token positions are not original-text character offsets. | Low–medium; enables explanations and consumer highlighting integrations without a second search. |
 | 2 / NHC-2 | GX-CAP-5 | Explicit ordered proximity/slop for phrase search, built on item 1 and durable positional chunks; fixed work/output bounds, repeated-term and field-boundary semantics. | Medium; more flexible text retrieval, no universal latency improvement promised. |
@@ -760,10 +769,10 @@ physical edges do not cross stores. Embedding generation stays outside the engin
 | --- | --- | --- |
 | GX-CAP-0 | Implemented checkpoint | Database-first boundaries, six ADRs, capability manifest, isolated package/import checks. [Spec](docs/specs/SPEC-GX-CAP-0.md). |
 | GX-CAP-1 | Implemented bounded N4 checkpoint | Qualified CommitId, opt-in durable metadata/history, monotonic logical commit time, lookup/pagination, verification and coordinated transfer/restore semantics. Not full temporal row history; logical graph v1 transfer excludes historical journal entries. [Evidence](docs/reports/V005_N3_N4_ACCEPTANCE.md), [usage](docs/COMMIT_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-1.md). |
-| GX-CAP-2 | Partial: sessions/workspaces, CLI and selected bounded copy implemented | Explicit permissions/ownership and one-store transactions; JSON inventory/resolution; selected RIDs, skip-node/fail policies and atomic receipt replay. Arbitrary predicates, automatic subgraph closure, anonymous nodes, merge and federation remain open. [Spec](docs/specs/SPEC-GX-CAP-2.md), [current evidence](docs/reports/V006_NATIVE_HISTORY_ROUND.md). |
-| GX-CAP-3 | Native bounded system-time slice implemented and locally validated | Atomic activation/current/history WAL, typed as-of/versions, historical nullable schema/edges/delete-recreate, durable pins, bounded payload redaction, verification and physical backup. Temporal indexes, physical history compaction, full temporal logical export and embedding-space timelines remain open. [Usage](docs/SYSTEM_TIME_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-3.md), [acceptance](docs/reports/V006_NATIVE_HISTORY_ROUND.md). |
-| GX-CAP-4 | Planned | Valid time, bitemporal semantics and graph/version diff; builds on CAP-3. [Spec](docs/specs/SPEC-GX-CAP-4.md). |
-| GX-CAP-5 | Implemented v1 plus prefixes, relationship indexes, durable/history statistics and opt-in positional phrase postings | Native FTS, frozen analyzers, weighted BM25, snapshot scores and full lifecycle. Same-snapshot heap validation remains. Position-return/proximity APIs and same-name analyzer replacement remain open; ineligible-statistics census remains linear. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [current evidence](docs/reports/V006_NATIVE_HISTORY_ROUND.md). |
+| GX-CAP-2 | Partial: sessions/workspaces, CLI and selected bounded copy implemented | Explicit permissions/ownership and one-store transactions; JSON inventory/resolution; selected RIDs, skip-node/fail policies and atomic receipt replay. NHC adds opt-in direct endpoint closure. Arbitrary predicates, recursive subgraph closure, anonymous nodes, merge and federation remain open. [Spec](docs/specs/SPEC-GX-CAP-2.md), [NHC acceptance status](docs/reports/V006_NHC_ROUND.md). |
+| GX-CAP-3 | Native bounded system-time slice plus NHC access/maintenance implementation | Atomic activation/current/history WAL, typed as-of/versions, historical nullable schema/edges/delete-recreate, durable pins, bounded payload redaction, verification and physical backup. NHC adds optional persistent temporal indexing and quiescent physical compaction. Full temporal logical export, online compaction and embedding-space timelines remain open. [Usage](docs/SYSTEM_TIME_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-3.md), [NHC acceptance status](docs/reports/V006_NHC_ROUND.md). |
+| GX-CAP-4 | Partial: bounded system-time diff implemented in NHC | Typed graph/schema/property diff with lineage; valid time, bitemporal semantics and two-coordinate diff remain planned. [Usage](docs/SYSTEM_TIME_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-4.md), [NHC acceptance status](docs/reports/V006_NHC_ROUND.md). |
+| GX-CAP-5 | Implemented v1 plus NHC position/proximity/replacement surfaces | Native FTS, frozen analyzers, weighted BM25, snapshot scores and full lifecycle, prefixes, relationship fields and durable/history statistics. NHC adds bounded token-position results, ordered slop and same-name analyzer replacement. Same-snapshot heap validation remains; original-character offsets and ineligible-statistics census optimization remain open. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [NHC acceptance status](docs/reports/V006_NHC_ROUND.md). |
 | GX-CAP-6 | Implemented bounded v1 plus certified incident expansion and shared controls/memory | Weighted RRF, union/intersection, source explanations, graph boost/filter, explicit missing-source partial policy, indexed BFS and per-phase logical peaks. No embedding provider, cross-table fusion, graph-only candidate expansion or universal recall promise. [Usage](docs/HYBRID_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-6.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
 | GX-CAP-7 | Partial: trusted scalar SPI implemented | Explicit immutable per-handle registry, typed scalar UDFs/direct calls, NULL/value budgets and typed failures. Aggregate/table/procedure extensions, durable manifests and sandboxing are not implemented. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-7.md). |
 | GX-CAP-8 | Partial: scalar/vector Arrow, Pandas/Polars, local Parquet/CSV/JSONL and detached graph exchange implemented | Explicit native vector identity, nullable typed batches, atomic import staging and caller-owned commit; bounded local files and NetworkX/projection Arrow exports. External query scans/COPY, arbitrary nested/entity ingestion and graph import remain. [Usage](docs/TABULAR_AND_PARQUET.md), [text](docs/LOCAL_TEXT_IMPORT.md), [exchange](docs/GRAPH_EXCHANGE.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |

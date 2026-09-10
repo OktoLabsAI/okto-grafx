@@ -51,7 +51,8 @@ independent source snapshot, not a distributed read/write transaction.
   mapping; an empty tuple selects no rows. Missing IDs, duplicate/bool IDs and
   missing selected endpoints refuse. Node identity indexes are used when present;
   remaining table selections use a bounded scan charged against the same row/byte
-  budgets. No implicit endpoint expansion, arbitrary predicate or unbounded scan.
+  budgets. Default behavior has no endpoint expansion; the explicit option below
+  adds bounded one-hop closure. No arbitrary predicate or unbounded scan.
 - Node tables require primary keys; anonymous nodes are explicitly unsupported.
 - Native typed/null properties and vector values are copied. Vector space IDs are
   remapped by compatible space names/definitions, including nested vector values;
@@ -74,6 +75,23 @@ independent source snapshot, not a distributed read/write transaction.
   is separate from copied application data.
 
 ## Atomicity and retry contract
+
+### Automatic endpoint closure
+
+`capture_copy(reader, tables=("Knows",), record_ids={"Knows": (5,)},
+include_endpoints=True)` includes the directly referenced endpoint nodes and
+their declared table schemas. The input mapping still covers every explicitly
+selected table. Missing endpoints refuse; no arbitrary recursion is performed.
+Caller-supplied selections are not mutated. Additional endpoint schemas count
+against `CopyLimits.max_tables`; selected and scanned rows/bytes share the same
+aggregate limits. Node identity indexes are used where available.
+
+Closure reads the same owning source snapshot, including when a concurrent writer
+changes an endpoint. The resulting package is identical to the equivalent fully
+closed manual selection and uses the same target COMMIT/idempotency receipt.
+`include_endpoints` must be exactly boolean and requires explicit `record_ids`.
+Temporal endpoint tables also require `history="current-only"`; that policy does
+not transfer their history. No new persistent format or connection setting is added.
 
 Preparation explicitly enables existing identity/provenance capabilities and
 creates the ordinary ledger `_grafx_copy_receipts_v1`. These setup stages can

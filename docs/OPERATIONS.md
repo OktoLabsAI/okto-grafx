@@ -4,6 +4,10 @@ Opt-in [native system history](SYSTEM_TIME_HISTORY.md) participates in the same
 COMMIT/recovery protocol and physical backup. Its named retention pins are
 independent of MVCC/WAL reader registration. Pruning is an explicit bounded
 payload-redaction operation, not disk compaction or autonomous recovery.
+The separate `compact_system_history(confirm_quiescent=True)` reclaims expired
+payload extents/obsolete temporal paths only after native replacement and
+checkpoint, with all other processes stopped. Optional temporal indexes share
+the history COMMIT, verification and recovery; they are not permission caches.
 See [0.0.6 wheel compatibility](V006_COMPATIBILITY.md) before enabling new bits.
 
 [Logical export/import](LOGICAL_TRANSFER.md) creates a separately writable fresh-UUID

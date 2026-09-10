@@ -4,6 +4,15 @@
 
 ## Entry points and supported imports
 
+0.0.6 NHC adds `TextMatchPositions` and `TemporalCompactionReport` at the root.
+`okto_grafx.temporal_diff` exports `diff_graph`, `TemporalDiff`,
+`TemporalSchemaChange`, `TemporalRowChange` and `TemporalPropertyChange`.
+The same diff is exposed through `Database.system_diff` / `Transaction.system_diff`.
+See [system time](SYSTEM_TIME_HISTORY.md) for persistent-index activation, access
+selection, compaction, return fields and errors; [FTS](FULL_TEXT_SEARCH.md) for
+position/slop and analyzer replacement. All signatures/DTO fields are generated
+in the appendix below. These additions do not imply CLI equivalents.
+
 `db.add_nullable_column(table, column)` uses
 `okto_grafx.domain.model.schema.ColumnDef` and native
 `okto_grafx.domain.model.value.ValueType`; see [nullable schema evolution](NULLABLE_COLUMNS.md).
@@ -281,6 +290,14 @@ system_as_of(at: CommitId | Timestamp, *, tables: tuple[str, ...], limits: Tempo
 ```
 
 Read durable system-time rows under this transaction's snapshot, excluding private writes.
+
+#### Transaction.system_diff
+
+```python
+system_diff(before: CommitId, after: CommitId, *, tables: tuple[str, ...], limits: TemporalLimits=TemporalLimits(), max_changes: int=100000) -> TemporalDiff
+```
+
+Return a bounded same-store historical graph diff under this transaction's snapshot.
 
 #### Transaction.system_versions
 
@@ -802,10 +819,18 @@ create_text_index(name: str, table: str, columns: tuple[str, ...], *, options: T
 
 Create a native persisted full-text generation over one to four STRING fields.
 
+#### Database.replace_text_index
+
+```python
+replace_text_index(name: str, *, options: TextIndexOptions) -> IndexView
+```
+
+Atomically replace a text analyzer/options using a fresh complete generation.
+
 #### Database.search_text
 
 ```python
-search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, prefix: bool=False, phrase: bool=False) -> TextSearchResult
+search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, prefix: bool=False, phrase: bool=False, return_positions: bool=False, slop: int=0) -> TextSearchResult
 ```
 
 Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot.
@@ -898,6 +923,14 @@ system_versions(table: str, record_id: int, *, limits: TemporalLimits=TemporalLi
 
 Return create/update/delete-bounded intervals for one logical row identity.
 
+#### Database.system_diff
+
+```python
+system_diff(before: CommitId, after: CommitId, *, tables: tuple[str, ...], limits: TemporalLimits=TemporalLimits(), max_changes: int=100000) -> TemporalDiff
+```
+
+Compare retained system-time commits; no valid-time or write effects are introduced.
+
 #### Database.enable_system_history
 
 ```python
@@ -905,6 +938,22 @@ enable_system_history(tables: tuple[str, ...]) -> None
 ```
 
 Atomically opt tables into durable system-time history with their current baseline.
+
+#### Database.enable_system_history_index
+
+```python
+enable_system_history_index(*, max_bytes: int=16 * 1024 * 1024) -> bool
+```
+
+Atomically build the optional persistent temporal access path.
+
+#### Database.compact_system_history
+
+```python
+compact_system_history(*, confirm_quiescent: bool=False, max_bytes: int=16 * 1024 * 1024) -> TemporalCompactionReport
+```
+
+Reclaim redacted history payloads and obsolete temporal tree paths offline.
 
 #### Database.pin_system_history
 
@@ -1189,10 +1238,18 @@ Execute a validated read definition at one native snapshot, never open a writer.
 ## Public factory and transfer functions
 
 
+### okto_grafx.temporal_diff.diff_graph
+
+```python
+diff_graph(reader: Transaction, before: CommitId, after: CommitId, *, tables: tuple[str, ...], limits: TemporalLimits=TemporalLimits(), max_changes: int=100000) -> TemporalDiff
+```
+
+Capture two retained pictures under one owning transaction and return no partial diff.
+
 ### okto_grafx.catalog_copy.capture_copy
 
 ```python
-capture_copy(source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits=CopyLimits(), record_ids: dict[str, tuple[int, ...]] | None=None, history: str='refuse') -> CopyPackage
+capture_copy(source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits=CopyLimits(), record_ids: dict[str, tuple[int, ...]] | None=None, history: str='refuse', include_endpoints: bool=False) -> CopyPackage
 ```
 
 Capture tables or explicit RID subsets from one native read snapshot.
@@ -1439,6 +1496,7 @@ Aggregate encoded-input, event and live/output-row bounds; not an RSS ceiling.
 max_events: int
 max_bytes: int
 max_rows: int
+access_path: str
 ```
 
 ### TemporalVersion fields
@@ -1496,6 +1554,19 @@ Durable named retention protection; explicitly released, with no implicit TTL.
 name: str
 at: CommitId
 tables: tuple[str, ...]
+```
+
+### TemporalCompactionReport fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalCompactionReport`.
+
+Physical reclamation after a durable logical replacement and checkpoint.
+
+```python
+commit: CommitId | None
+physical_bytes_before: int
+physical_bytes_after: int
+physical_bytes_reclaimed: int
 ```
 
 ### TemporalPruneReport fields
@@ -2343,6 +2414,20 @@ max_memory_bytes: int
 max_statistics_wal_records: int
 max_statistics_wal_bytes: int
 max_expanded_terms: int
+max_position_results: int
+max_proximity_work: int
+```
+
+### TextMatchPositions fields
+
+Annotation location: `okto_grafx.domain.index.fulltext.TextMatchPositions`.
+
+Validated zero-based analyzed token ordinals for one field/term, not character offsets.
+
+```python
+field: str
+term: str
+positions: tuple[int, ...]
 ```
 
 ### TextHit fields
@@ -2356,6 +2441,7 @@ record_id: int
 score: float
 matched_fields: tuple[str, ...]
 matched_terms: tuple[str, ...]
+positions: tuple[TextMatchPositions, ...]
 ```
 
 ### TextSearchResult fields
@@ -2374,6 +2460,63 @@ candidates: int
 corpus_documents: int
 statistics_regime: str
 statistics_wal_records: int
+```
+
+### TemporalPropertyChange fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalPropertyChange`.
+
+Absent and NULL are distinct; endpoint slots use names _from/_to from native schema.
+
+```python
+name: str
+before_present: bool
+after_present: bool
+before: object
+after: object
+```
+
+### TemporalRowChange fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalRowChange`.
+
+One node/relationship lineage change; recreate is a separate added identity.
+
+```python
+table: str
+table_kind: str
+record_id: int
+operation: str
+before: TemporalVersion | None
+after: TemporalVersion | None
+properties: tuple[TemporalPropertyChange, ...]
+```
+
+### TemporalSchemaChange fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalSchemaChange`.
+
+Explicit historical schema change, even for tables containing no rows.
+
+```python
+table: str
+before: TableDef | None
+after: TableDef | None
+```
+
+### TemporalDiff fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalDiff`.
+
+Complete same-store diff; scan counters cover both captured pictures.
+
+```python
+before: CommitId
+after: CommitId
+schemas: tuple[TemporalSchemaChange, ...]
+rows: tuple[TemporalRowChange, ...]
+events_scanned: int
+encoded_bytes_scanned: int
 ```
 
 ### ConnectOptions fields

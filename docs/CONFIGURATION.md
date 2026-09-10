@@ -1,5 +1,18 @@
 # Configuration reference
 
+NHC operation-local additions (no new `connect` defaults):
+
+| Option / operation | Default | Consumer contract |
+| --- | --- | --- |
+| `search_text(return_positions, slop)` | `False`, `0` | [Matched positions and proximity](FULL_TEXT_SEARCH.md#position-results-and-ordered-proximity) |
+| `TextSearchLimits.max_position_results` / `max_proximity_work` | 100,000 / 1,000,000 | Aggregate output ordinals / ordered matching work; fail without partial results |
+| `replace_text_index(name, options=...)` | Explicit only | Fresh complete generation; table/fields/sizing unchanged |
+| `capture_copy(include_endpoints)` | `False` | [One-hop selected relationship closure](CATALOG_COPY.md#automatic-endpoint-closure) |
+| `TemporalLimits.access_path` | `"auto"` | `auto`, `scan`, `index`; [eligibility and costs](SYSTEM_TIME_HISTORY.md#persistent-temporal-access-path) |
+| `system_diff(max_changes)` | 100,000 | 1–1,000,000 schema/row/property entries, plus shared input limits |
+| `enable_system_history_index(max_bytes)` | 16 MiB | Explicit one-way native index build; 1–2 GiB capture limit |
+| `compact_system_history(confirm_quiescent, max_bytes)` | `False`, 16 MiB | Requires explicit stopped-other-process assertion and no local transaction; 1–2 GiB capture limit |
+
 0.0.6 adds explicit `enable_system_history(tables)`, temporal query limits,
 durable pins and bounded prune budgets; none is enabled by connecting. See the
 [temporal configuration table](SYSTEM_TIME_HISTORY.md#configuration-and-bounded-cost).

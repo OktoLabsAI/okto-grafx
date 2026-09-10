@@ -1630,6 +1630,7 @@ class TransactionManager:
         expected_cardinality: int | None,
         layout: IndexLayout = IndexLayout.HASH,
         key_derivation: str = COLUMN_KEY_DERIVATION,
+        replace_text: bool = False,
     ) -> CatalogIndexDefinition:
         """Seal a full custom exact-index build into one fresh write transaction.
 
@@ -1687,6 +1688,7 @@ class TransactionManager:
                     layout=layout,
                     key_derivation=key_derivation,
                     operation=operation,
+                    replace_text=replace_text,
                 )
                 published = self._published_state_in_section().last_committed_lsn
                 activation = self._plan_identity_index_activation(
@@ -1708,7 +1710,10 @@ class TransactionManager:
                     state=IndexGenerationState.ACTIVE,
                 )
                 logical = replace(provisional, generations=(generation,))
-                candidate.add_index_definition(logical)
+                if replace_text:
+                    candidate._replace_text_index_definition(logical)
+                else:
+                    candidate.add_index_definition(logical)
                 custom_runtime = logical.runtime_definition(generation)
                 complete_runtime = (*runtime_definitions, custom_runtime)
                 self._declare_complete_table_reads(txn, {table.table_id: table})
@@ -2000,6 +2005,7 @@ class TransactionManager:
         layout: IndexLayout,
         key_derivation: str,
         operation: str,
+        replace_text: bool = False,
     ) -> tuple[TableDef, CatalogIndexDefinition]:
         """Validate one custom definition without changing catalog, txn or nonce state."""
 
@@ -2064,7 +2070,15 @@ class TransactionManager:
                     value=provisional.positions,
                     index=provisional.name,
                 )
-        if source.has_index_definition(provisional.name):
+        if type(replace_text) is not bool:
+            raise GrafxConfigurationError("Invalid analyzer replacement flag.", field="replace_text")
+        if replace_text:
+            existing = source.index_definition(provisional.name)
+            if (not is_fulltext(existing.key_derivation) or not is_fulltext(key_derivation)
+                    or existing.table_id != table.table_id or existing.positions != positions
+                    or existing.automatic or existing.layout is not layout):
+                raise GrafxConfigurationError("Replacement must retain the text index table and fields.", field="replace_text")
+        if source.has_index_definition(provisional.name) and not replace_text:
             raise GrafxConfigurationError(
                 f"Catalog index name {provisional.name!r} is already defined without regard "
                 "to case.",
@@ -2075,7 +2089,7 @@ class TransactionManager:
             )
 
         indexes = getattr(manager, "indexes", None)
-        if callable(indexes) and any(
+        if not replace_text and callable(indexes) and any(
             getattr(getattr(index, "definition", None), "registry_key", None)
             == provisional.registry_key
             for index in indexes()

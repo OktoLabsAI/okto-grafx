@@ -57,7 +57,22 @@ def read_system_history(database: Database, context: TransactionContext, *,
         if entry is None:
             raise GrafxHistoryUnavailable("No tracked commit at the requested coordinate.", field="at")
         target = entry.identity
-        catalog = database._catalog.catalog
+
+        def read(file: str, index: int) -> bytes:
+            """Read fresh pages within this passage's native publication boundary."""
+            raw = database._pool.codec.encode_page(database._pool.read_fresh_page(file, index))
+            from okto_grafx.domain.page import PageHeader
+            if PageHeader.decode(raw).page_lsn > boundary:
+                raise GrafxUnsupportedOperation("History publication is moving; retry the read.", retryable=True,
+                                                reason="publication_in_progress", field="system_history_observation")
+            return raw
+
+        from okto_grafx.engine.catalog_store import read_published_catalog
+        catalog, metadata_bytes = read_published_catalog(read, page_size=database._pool.page_size,
+                                                        max_bytes=limits.max_bytes)
+        if metadata_bytes >= limits.max_bytes:
+            raise GrafxQueryBudgetExceeded("Temporal metadata exhausted the read budget.", resource="history_scan")
+        captured_limits = replace(limits, max_bytes=limits.max_bytes - metadata_bytes)
         selected = tuple(catalog.table(name) for name in tables)
         policy = {key: (start, horizon) for key, start, horizon in catalog.system_history_tables()}
         for table in selected:
@@ -70,25 +85,33 @@ def read_system_history(database: Database, context: TransactionContext, *,
             if record_id is None and table.kind == "rel" and any(name not in tables for name in (table.from_table, table.to_table)):
                 raise GrafxConfigurationError("Historical graphs require selected endpoint tables.", field="tables")
 
-        def read(file: str, index: int) -> bytes:
-            """Read through the native participant's current, verified page boundary."""
-            raw = database._pool.codec.encode_page(database._pool.read_fresh_page(file, index))
-            from okto_grafx.domain.page import PageHeader
-            if PageHeader.decode(raw).page_lsn > boundary:
-                raise GrafxUnsupportedOperation("History publication is moving; retry the read.", retryable=True,
-                                                reason="publication_in_progress", field="system_history_observation")
-            return raw
-
         store = SystemHistoryStore(read, database_uuid=database.identity.database_uuid, page_size=database._pool.page_size)
         length = database._storage.file_size("system-history.dat")
         if length % database._pool.page_size:
             raise _corrupt("history_extent")
-        graph, versions = fold_history(store, expected_sequence=boundary, page_count=length // database._pool.page_size,
+        from okto_grafx.engine.system_history_index_store import head_root
+        from okto_grafx.engine.system_history_store import _HEAD
+        store._head(boundary, length // database._pool.page_size)
+        root = head_root(store._page(0).read_slot(0), _HEAD.size)
+        if (root is not None) != ("system_history_index_v1" in catalog.required_capabilities()):
+            raise _corrupt("index_capability")
+        if (store._page(0).read_slot(0)[:8] == b"GXHYHD03") != (
+                "system_history_compaction_v1" in catalog.required_capabilities()):
+            raise _corrupt("compaction_capability")
+        if limits.access_path == "index" and root is None:
+            raise GrafxUnsupportedOperation("Enable the native temporal index first.", field="access_path")
+        if root is not None and limits.access_path != "scan":
+            from okto_grafx.engine.system_history_index_reader import read_indexed_history
+            graph, versions = read_indexed_history(store, root=root, boundary=boundary, target=target,
+                table_ids=tuple(table.table_id for table in selected), limits=captured_limits, record_id=record_id,
+                horizons={key: value[1] for key, value in policy.items()})
+        else:
+            graph, versions = fold_history(store, expected_sequence=boundary, page_count=length // database._pool.page_size,
                                        target=target, table_ids=tuple(table.table_id for table in selected),
-                                       limits=limits, record_id=record_id,
+                                       limits=captured_limits, record_id=record_id,
                                        retention_horizons={key: value[1] for key, value in policy.items()})
         if record_id is None:
-            return graph
+            return replace(graph, encoded_bytes_scanned=graph.encoded_bytes_scanned + metadata_bytes)
         start, horizon = policy[selected[0].table_id]
         return TemporalVersions(target, selected[0].name, record_id, versions,
                                 CommitId(target.database_uuid, start), CommitId(target.database_uuid, horizon))
@@ -116,6 +139,10 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
     output_versions = []
     snapshot_rows = snapshot_schemas = None
     events = consumed = 0
+    from okto_grafx.engine.system_history_index_store import head_root
+    from okto_grafx.engine.system_history_store import _HEAD
+    root = head_root(store._page(0).read_slot(0), _HEAD.size)
+    indexed_expected = {} if root is not None else None
 
     def row_key(table: TableDef, values: tuple[object, ...]) -> tuple[int, bytes] | None:
         """Use the native exact-index value grammar for primary-key uniqueness."""
@@ -134,6 +161,9 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
         events += len(changes)
         if events > limits.max_events or consumed > limits.max_bytes:
             raise GrafxQueryBudgetExceeded("Temporal scan budget exhausted; no partial result returned.", resource="history_scan")
+        if indexed_expected is not None:
+            for change in changes:
+                indexed_expected[change.table.table_id, change.record_id, identity.sequence] = change.encode()
         if identity.sequence > target.sequence and snapshot_rows is None:
             snapshot_rows, snapshot_schemas = dict(live), dict(schemas)
         affected_edges = set()
@@ -215,6 +245,24 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
                 raise _corrupt("historical_endpoint")
     if redacted_live:
         raise _corrupt("redacted_current_version")
+    if indexed_expected is not None:
+        from okto_grafx.engine.system_history_index import HistoryAccessTree
+
+        def charge_index(amount: int) -> None:
+            """Include index verification reads in the complete history byte budget."""
+            nonlocal consumed
+            consumed += amount
+            if consumed > limits.max_bytes:
+                raise GrafxQueryBudgetExceeded("Temporal verification byte budget exhausted.", resource="history_scan")
+
+        tree = HistoryAccessTree(store.read_page, database_uuid=target.database_uuid, page_size=store.page_size,
+            sequence=expected_sequence, root=root, charge=charge_index,
+            read_extent=_HEAD.unpack_from(store._page(0).read_slot(0))[5])
+        for key, ref in tree.entries((0, 0, 0), (2**32 - 1, 2**64 - 1, 2**64 - 1)):
+            if indexed_expected.pop(key, None) != tree.value(ref):
+                raise _corrupt("index_history_coverage")
+        if indexed_expected:
+            raise _corrupt("index_history_missing")
     if snapshot_rows is None:
         snapshot_rows, snapshot_schemas = live, schemas
     selected_schemas = tuple(snapshot_schemas[key] for key in table_ids if key in snapshot_schemas)

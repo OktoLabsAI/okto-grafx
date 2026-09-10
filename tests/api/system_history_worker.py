@@ -43,6 +43,13 @@ def main():
         TransactionManager._apply_images = apply
         if operation == "activate":
             db.enable_system_history(("N",))
+        elif operation == "index":
+            db.enable_system_history_index()
+        elif operation == "compact":
+            db.compact_system_history(confirm_quiescent=True)
+        elif operation == "replace_text":
+            from okto_grafx import TextIndexOptions
+            db.replace_text_index("text", options=TextIndexOptions(positions=True))
         elif operation == "prune":
             from okto_grafx import CommitId
             boundary = CommitId(db.identity.database_uuid, db._transactions.published_state().last_committed_lsn)

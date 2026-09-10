@@ -23,6 +23,9 @@ class PreparedHistoryRetention:
     redacted_versions: int
     redacted_bytes: int
     original_extent: int
+    index_activation: int | None = None
+    compact: bool = False
+    allows_tail: bool = False
 
     def bind(self, sequence: int) -> tuple[HistoryPageImage, ...]:
         """Rebuild identical extents/intervals and append the retention COMMIT at exact LSN."""
@@ -30,21 +33,41 @@ class PreparedHistoryRetention:
         store = SystemHistoryStore(lambda file, number: pages[file, number],
                                    database_uuid=self.database_uuid, page_size=self.page_size)
         previous = None
+        baseline = []
+        root = None
         for identity, changes in self.batches:
             if previous is None:
                 images = store.activation_images(changes, identity.sequence)
             else:
-                images = store.prepare(changes, expected_sequence=previous, page_count=len(pages)).bind(identity.sequence)
+                from okto_grafx.engine.system_history_index_store import PreparedHistoryIndex, head_root
+                from okto_grafx.engine.system_history_store import _HEAD
+                index = None
+                if not self.compact and identity.sequence == self.index_activation:
+                    index = PreparedHistoryIndex(store.read_page, baseline=tuple(baseline))
+                elif root is not None:
+                    index = PreparedHistoryIndex(store.read_page, root)
+                images = store.prepare(changes, expected_sequence=previous, page_count=len(pages), index=index).bind(identity.sequence)
             for image in images:
                 pages[image.file, image.page_index] = image.raw
             previous = identity.sequence
-        if len(pages) != self.original_extent or previous != self.previous_sequence:
+            baseline.append((identity.sequence, changes))
+            from okto_grafx.engine.system_history_index_store import head_root
+            from okto_grafx.engine.system_history_store import _HEAD
+            root = head_root(store._page(0).read_slot(0), _HEAD.size)
+        if (not self.compact and len(pages) != self.original_extent) or previous != self.previous_sequence:
             raise GrafxCorruptionDetected("Retention changed immutable batch extents.", field="system_history_retention")
-        for image in store.prepare((), expected_sequence=previous, page_count=len(pages)).bind(sequence):
+        from okto_grafx.engine.system_history_index_store import PreparedHistoryIndex
+        index = None if root is None else PreparedHistoryIndex(store.read_page, root)
+        if self.compact and self.index_activation is not None:
+            index = PreparedHistoryIndex(store.read_page, baseline=tuple(baseline))
+        for image in store.prepare((), expected_sequence=previous, page_count=len(pages), index=index).bind(sequence):
             pages[image.file, image.page_index] = image.raw
         output = []
         for (file, index), raw in sorted(pages.items()):
             page = Page.from_bytes(raw)
+            if index == 0 and (self.compact or self.allows_tail):
+                from okto_grafx.engine.system_history_store import _COMPACT_HEAD_MAGIC
+                page.update_slot(0, _COMPACT_HEAD_MAGIC + page.read_slot(0)[8:])
             page.page_lsn = sequence
             output.append(HistoryPageImage(file, index, page.to_bytes()))
         return tuple(output)
@@ -85,4 +108,6 @@ def prepare_retention(store: SystemHistoryStore, *, sequence: int, page_count: i
             else:
                 active[key] = (batch_number, index)
     return PreparedHistoryRetention(store.database_uuid, store.page_size, sequence,
-        tuple((identity, tuple(changes)) for identity, changes in captured), redacted_count, redacted_bytes, page_count)
+        tuple((identity, tuple(changes)) for identity, changes in captured), redacted_count, redacted_bytes,
+        store._head(sequence, page_count)[3], store._index_start(expected_sequence=sequence, page_count=page_count),
+        allows_tail=store._page(0).read_slot(0)[:8] == b"GXHYHD03")

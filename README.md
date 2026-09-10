@@ -46,6 +46,8 @@ context exit commits, and an exceptional exit rolls back. See
 
 | Capability | Consumer documentation |
 | --- | --- |
+| Bounded position results/proximity, atomic analyzer replacement, endpoint-closed copy (0.0.6 development) | [Text contracts](docs/FULL_TEXT_SEARCH.md), [copy](docs/CATALOG_COPY.md) |
+| System-time diff, optional persistent temporal access tree and quiescent history compaction (0.0.6 development) | [History usage, limits and maintenance](docs/SYSTEM_TIME_HISTORY.md) |
 | Native opt-in system-time history, typed as-of/versions, pins and bounded retention (0.0.6 development) | [Temporal APIs and operations](docs/SYSTEM_TIME_HISTORY.md) |
 | Durable positional phrase postings and explicit catalog/workspace CLI inventory (0.0.6 development) | [FTS](docs/FULL_TEXT_SEARCH.md), [CLI](docs/CLI.md) |
 | Opt-in page-local repeated-key posting indexes (0.0.6 development) | [Posting hash](docs/POSTING_HASH.md) |

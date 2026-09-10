@@ -9,6 +9,18 @@ including the on-disk format.
 
 ### Added (0.0.6 development)
 
+- Refreshed the Ladybug/Neo4j comparison against the validated 0.0.6 development
+  capabilities, with explicit release, concurrency, temporal/search and evidence
+  boundaries; the comparison is included in the consumer documentation checks.
+- NHC-1–8: bounded matched token positions and ordered phrase slop; opt-in
+  endpoint-closed selected copies; typed system-time graph diff; optional native
+  temporal access tree for versions/as-of (required bit 17); atomic same-name
+  analyzer replacement; quiescent physical history compaction (required bit 18).
+  Both new storage capabilities are explicit, one-way operations. Connection
+  defaults, multi-reader/writer, OCC and WAL durability guarantees are unchanged.
+- Corrected current-only temporal copy admission: the commit-history lookup no
+  longer shadows the caller's explicit `history` policy.
+
 - Follow-up 1–3: native opt-in system-time activation and atomic current/history
   COMMIT; typed as-of/versions, schema and delete/recreate lineage; verification,
   physical backup/restore, explicit current-only transfer and durable pins with

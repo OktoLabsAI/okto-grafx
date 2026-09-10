@@ -31,6 +31,8 @@ detail is exactly the defect A47 was written about.
 
 from __future__ import annotations
 
+from okto_grafx.temporal_diff import TemporalDiff
+
 from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextSearchResult
 from okto_grafx.domain.query.hybrid import HybridSearchOptions, HybridSearchResult
 from okto_grafx.engine.hybrid import search_hybrid as _search_hybrid
@@ -113,7 +115,7 @@ from okto_grafx.domain.txn.commit_metadata import CommitMetadata, capture_commit
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry
 from okto_grafx.domain.txn.commit_history import CommitHistoryPage
 from okto_grafx.engine.commit_history_reader import observe_commit_catalog
-from okto_grafx.domain.temporal import TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersions
+from okto_grafx.domain.temporal import TemporalCompactionReport, TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersions
 from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.verify.findings import VerificationReport, VerificationFinding, FindingKind, FindingLocation
@@ -1218,6 +1220,13 @@ class Transaction:
         """Read durable system-time rows under this transaction's snapshot, excluding private writes."""
         self._require_active()
         return self._database._read_system_history(self._context, at=at, tables=tables, limits=limits)
+
+    def system_diff(self, before: CommitId, after: CommitId, *, tables: tuple[str, ...],
+                    limits: TemporalLimits = TemporalLimits(), max_changes: int = 100_000) -> TemporalDiff:
+        """Return a bounded same-store historical graph diff under this transaction's snapshot."""
+        from okto_grafx.temporal_diff import diff_graph
+        self._require_active()
+        return diff_graph(self, before, after, tables=tables, limits=limits, max_changes=max_changes)
 
     def system_versions(self, table: str, record_id: int, *,
                         limits: TemporalLimits = TemporalLimits()) -> TemporalVersions:
@@ -3124,18 +3133,41 @@ class Database:
         """Create a native persisted full-text generation over one to four STRING fields."""
         return _create_text_index(self, name, table, columns, options=options, bucket_count=bucket_count)
 
+    def replace_text_index(self, name: str, *, options: TextIndexOptions) -> IndexView:
+        """Atomically replace a text analyzer/options using a fresh complete generation.
+
+        The table, fields and sizing stay fixed. Old files are not reinterpreted
+        or deleted; catalog publication is the only switch. Each new search uses
+        the currently published analyzer with its owning data snapshot, while an
+        in-flight certificate must still validate its selected generation.
+        """
+        if type(name) is not str or type(options) is not TextIndexOptions:
+            raise GrafxConfigurationError("Expected an index name and TextIndexOptions.", field="replace_text_index")
+        from okto_grafx.domain.index.fulltext import is_fulltext
+        with self._public_operation("replace_text_index"):
+            self._require_writable("replace text index")
+            with self._transactions.page_access_section(fresh_read_view=True):
+                logical = self._catalog.catalog.index_definition(name)
+                if not is_fulltext(logical.key_derivation) or logical.active_generation() is None:
+                    raise GrafxConfigurationError("Select an active full-text index.", field="name")
+                table = self._catalog.catalog.table_by_id(logical.table_id)
+                columns = tuple(table.columns[position].name for position in logical.positions)
+                buckets = logical.active_generation().bucket_count
+            return _create_text_index(self, logical.name, table.name, columns, options=options,
+                bucket_count=buckets, _replace_existing=True)
+
     def search_text(self, reader: Transaction | None = None, *, index: str, query: str, k: int = 20,
                     filter: RecordIdFilter | None = None, limits: TextSearchLimits | None = None,
                     k1: float = 1.2, b: float = 0.75, timeout_seconds: float | None = None,
                     cancellation: CancellationToken | None = None, prefix: bool = False,
-                    phrase: bool = False) -> TextSearchResult:
+                    phrase: bool = False, return_positions: bool = False, slop: int = 0) -> TextSearchResult:
         """Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot."""
         if reader is None:
             with self.begin("read") as owned:
-                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase)
+                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase, return_positions=return_positions, slop=slop)
         if type(reader) is not Transaction:
             raise GrafxConfigurationError("reader must be a Transaction.", field="reader")
-        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase)
+        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase, return_positions=return_positions, slop=slop)
 
     def create_index(
         self,
@@ -3443,7 +3475,7 @@ class Database:
                 catalog = self._catalog.catalog
                 tables = tuple(catalog.table_by_id(key) for key, _, _ in catalog.system_history_tables())
                 graph = tx.system_as_of(CommitId(self.identity.database_uuid, tx.snapshot.read_lsn),
-                    tables=tuple(table.name for table in tables))
+                    tables=tuple(table.name for table in tables), limits=TemporalLimits(access_path="scan"))
                 current = {(table.table_id, version.record_id): tuple(version.values)
                            for table in tables for _, version in self._heap.scan(table, tx._context.snapshot)}
                 historical = {(row.table_id, row.record_id): row.values for row in graph.rows}
@@ -3846,7 +3878,15 @@ class Database:
     def _read_system_history(self, context, *, at, tables, limits, record_id=None):
         from okto_grafx.engine.system_history_reader import read_system_history
         with self._public_operation("read system history"):
-            return read_system_history(self, context, at=at, tables=tables, limits=limits, record_id=record_id)
+              return read_system_history(self, context, at=at, tables=tables, limits=limits, record_id=record_id)
+
+    def system_diff(self, before: CommitId, after: CommitId, *, tables: tuple[str, ...],
+                    limits: TemporalLimits = TemporalLimits(), max_changes: int = 100_000) -> TemporalDiff:
+        """Compare retained system-time commits; no valid-time or write effects are introduced."""
+        from okto_grafx.temporal_diff import _validate
+        _validate(before, after, limits, max_changes)
+        with self.begin('read') as reader:
+            return reader.system_diff(before, after, tables=tables, limits=limits, max_changes=max_changes)
 
     def enable_system_history(self, tables: tuple[str, ...]) -> None:
         """Atomically opt tables into durable system-time history with their current baseline.
@@ -3860,6 +3900,36 @@ class Database:
             self._require_writable("enable system history")
             with self.begin("write") as transaction:
                 self._transactions._history_publication.stage_activation(transaction._context, tables)
+
+    def enable_system_history_index(self, *, max_bytes: int = 16 * 1024 * 1024) -> bool:
+        """Atomically build the optional persistent temporal access path.
+
+        Requires native system history. Activation is one-way and refuses older
+        readers through a required catalog capability. A dedicated bounded build
+        captures all retained events; later commits update immutable search paths.
+        Returns False when already active. No connection default is changed.
+        """
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 2**31:
+            raise GrafxConfigurationError("Invalid index build budget.", field="max_bytes")
+        with self._public_operation("enable_system_history_index"):
+            self._require_writable("enable system history index")
+            with self.begin("write") as transaction:
+                changed = self._transactions._history_publication.stage_index(
+                    transaction._context, max_bytes=max_bytes)
+            return changed
+
+    def compact_system_history(self, *, confirm_quiescent: bool = False,
+                               max_bytes: int = 16 * 1024 * 1024) -> TemporalCompactionReport:
+        """Reclaim redacted history payloads and obsolete temporal tree paths offline.
+
+        Requires no open local transaction and explicit confirmation that other
+        processes are stopped. Retained horizons, pins and row/edge lineage do not
+        change. A native full-image COMMIT and checkpoint precede truncation; a
+        crash may leave an unused tail, never a partly authoritative history.
+        No old WAL, physical backup or filesystem snapshot is securely erased.
+        """
+        from okto_grafx.engine.system_history_operations import compact
+        return compact(self, confirm_quiescent=confirm_quiescent, max_bytes=max_bytes)
 
     def pin_system_history(self, name: str, at: CommitId, *, tables: tuple[str, ...]) -> None:
         """Persist named protection against retention beyond ``at`` for selected tables.

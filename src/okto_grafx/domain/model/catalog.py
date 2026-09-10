@@ -133,6 +133,8 @@ _NULLABLE_COLUMNS_BIT = 1 << 13
 _POSTING_HASH_BIT = 1 << 14
 _SYSTEM_HISTORY_BIT = 1 << 15
 _FULLTEXT_POSITIONS_BIT = 1 << 16
+_SYSTEM_HISTORY_INDEX_BIT = 1 << 17
+_SYSTEM_HISTORY_COMPACTION_BIT = 1 << 18
 SYSTEM_HISTORY_CAPABILITY = "system_history_v1"
 
 
@@ -154,6 +156,8 @@ _KNOWN_CAPABILITY_BITS = (
     | _POSTING_HASH_BIT
     | _SYSTEM_HISTORY_BIT
     | _FULLTEXT_POSITIONS_BIT
+    | _SYSTEM_HISTORY_INDEX_BIT
+    | _SYSTEM_HISTORY_COMPACTION_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -176,6 +180,8 @@ _CAPABILITY_TO_BIT = MappingProxyType(
         "posting_hash_v1": _POSTING_HASH_BIT,
         SYSTEM_HISTORY_CAPABILITY: _SYSTEM_HISTORY_BIT,
         "fulltext_positions_v1": _FULLTEXT_POSITIONS_BIT,
+        "system_history_index_v1": _SYSTEM_HISTORY_INDEX_BIT,
+        "system_history_compaction_v1": _SYSTEM_HISTORY_COMPACTION_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -342,6 +348,13 @@ class Catalog:
         self._invalidate_derived()
         return self
 
+    def _enable_system_history_index(self) -> None:
+        """Activate the native temporal access grammar on a detached catalog candidate."""
+        if not self._system_history:
+            raise GrafxConfigurationError("Enable native history first.", field="system_history")
+        self._required_capabilities = frozenset((*self._required_capabilities, "system_history_index_v1"))
+        self._invalidate_derived()
+
     def _retarget_system_history(self, table_ids: tuple[int, ...], old: int, new: int) -> None:
         _require_commit_catalog_sequence(new)
         if any(self._system_history.get(key) != (old, old) for key in table_ids):
@@ -412,6 +425,14 @@ class Catalog:
         if self._system_history_revision != old:
             raise GrafxConfigurationError("Retention revision retarget differs.", field="system_history_revision")
         self._system_history_revision = new
+        self._invalidate_derived()
+
+    def _stage_history_compaction(self) -> None:
+        """Mark a detached full rewrite without advancing any table horizon or pin."""
+        if not self._system_history:
+            raise GrafxConfigurationError("Enable history first.", field="system_history")
+        self._required_capabilities = frozenset((*self._required_capabilities, "system_history_compaction_v1"))
+        self._system_history_revision = 1
         self._invalidate_derived()
 
     def index_definitions(self) -> tuple[CatalogIndexDefinition, ...]:
@@ -692,6 +713,25 @@ class Catalog:
             )
         self._install_indexes(validated)
         return definition
+
+    def _replace_text_index_definition(self, definition: CatalogIndexDefinition) -> None:
+        """Replace analyzer meaning only through a fresh detached physical generation."""
+        existing = self.index_definition(definition.name)
+        if (not is_fulltext(existing.key_derivation) or not is_fulltext(definition.key_derivation)
+                or existing.automatic or definition.automatic
+                or _logical_index_identity(existing) != _logical_index_identity(
+                    replace(definition, key_derivation=existing.key_derivation))
+                or len(definition.generations) != 1 or definition.active_generation() is None
+                or any(new.artifact_nonce == old.artifact_nonce for new in definition.generations
+                       for item in self.index_definitions() for old in item.generations)):
+            raise GrafxConfigurationError("Analyzer replacement requires unchanged fields and a fresh generation.",
+                                          field="text_index_replacement")
+        candidate = self.copy()
+        candidate._install_indexes({item.registry_key: item for item in candidate.index_definitions()
+                                    if item.registry_key != existing.registry_key})
+        candidate.add_index_definition(definition)
+        self._required_capabilities = candidate._required_capabilities
+        self._install_indexes(dict(candidate._indexes_by_key))
 
     def enable_heap_reclaim(self, *, index_free_pages: bool = False) -> Catalog:
         """Add the one-way heap-reclaim capability to an already-active v2 catalog.
@@ -1588,6 +1628,8 @@ def _encode_capabilities(capabilities: frozenset[str]) -> int:
     """Encode every required capability, refusing one this build cannot uphold."""
 
     for dependent, required in (
+        ("system_history_index_v1", {SYSTEM_HISTORY_CAPABILITY}),
+        ("system_history_compaction_v1", {SYSTEM_HISTORY_CAPABILITY}),
         ("fulltext_positions_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),
@@ -1624,6 +1666,8 @@ def _decode_capabilities(bits: int) -> frozenset[str]:
         capability for capability, bit in _CAPABILITY_TO_BIT.items() if bits & bit
     )
     for dependent, required in (
+        ("system_history_index_v1", {SYSTEM_HISTORY_CAPABILITY}),
+        ("system_history_compaction_v1", {SYSTEM_HISTORY_CAPABILITY}),
         ("fulltext_positions_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),

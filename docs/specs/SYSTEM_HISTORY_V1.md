@@ -122,3 +122,49 @@ replaced by a later selected retention COMMIT; that prefix is validated by the
 later complete rewrite rather than mixing pre/post-redaction hashes. Final
 resident targets still need exact known after-image witnesses, never only a
 greater LSN. There is no online truncation or reclamation of old WAL/backups.
+
+## Optional indexed and compacted native extensions (NHC-5/6/8)
+
+Catalog bit 17 (`system_history_index_v1`, dependent on bit 15) enables an optional
+head suffix `<8sI32s>`: `GXHYIR01`, root page number, SHA-256 payload hash.
+Indexed batches use `GXHYBL02` with the unchanged bounded batch-chunk struct.
+Immediately after the event chunks is one META transition page containing
+`<8s16sQI32sI32sI>`: `GXHYIT01`, database UUID, final COMMIT, predecessor
+root/hash, new root/hash, appended tree-page count. The following consecutive
+pages are immutable tree/value images. The transition payload hash extends the
+native chain digest: SHA256(previous chain + little-endian COMMIT + event-payload
+hash + transition-payload hash). The qualified head binds the final tree root.
+An empty writing commit still has a transition; its appended tree-page count
+can be zero. Activation has a zero predecessor and a fully validated baseline.
+
+Tree payload prefix `<8s16sBQ>` is `GXHYIX01`, UUID, kind (0 leaf, 1 internal,
+2 value chunk), creation COMMIT. Ordered keys are big-endian `<table:u32,
+lineage:u64,commit:u64>` (network byte order); references are little-endian
+`<page:u32,sha256:32 bytes>`. Leaves map keys to encoded HistoryChange chunks;
+internal entries are inclusive maximum keys and child references. Both use a
+little-endian u16 count and fixed bounded fanout. Value chunks carry next reference
+then bytes; zero page/hash terminates. Every visited reference verifies payload
+hash/UUID/framing/stamp bounds. Native publication owns the root, not a checksum
+or Python object. Full scan/verify compares every indexed event and detects
+missing/extra entries; ordinary reads verify only relevant authenticated paths.
+
+Preparation captures only immutable predecessor paths, builds detached images,
+charges native transaction/WAL limits and includes all locations in second OCC.
+Final-LSN rebinding regenerates the same image cardinality without new host reads.
+Recovery regenerates complete transitions under the native COMMIT selection.
+When a later full retention rewrite supersedes earlier history images, its full
+chain/index/interval proof must complete before any effect applies; earlier
+effects still require COMMIT and exact target witnesses. The replacement includes
+**every** writing COMMIT in the selected post-checkpoint range, not just a subset.
+
+Catalog bit 18 (`system_history_compaction_v1`, dependent on bit 15) permits head
+magic `GXHYHD03`. Its logical next-page extent may be smaller than the physical
+file only after a native full replacement revision. Other head fields/suffix
+retain their grammar. Compaction retains all batch identities and schema/lineage
+events, shortens redacted payloads to zero length, and optionally builds a fresh
+bulk tree at the compaction COMMIT. Full rewritten pages carry that COMMIT stamp;
+embedded event/tree creation coordinates may be older. No future stamp is accepted
+without native authority. Quiescent truncation occurs only after checkpoint.
+Interrupted reclamation leaves an ignored, unreferenced tail; later native appends
+can reuse it only beyond the proved predecessor logical extent. Bits/grammar must
+agree. No file is truncated merely because it has a valid CRC or large LSN.

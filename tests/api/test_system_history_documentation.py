@@ -10,6 +10,6 @@ def test_temporal_consumer_workflow(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     namespace = {"__name__": "__temporal_example__"}
     examples = re.findall(r"```python\n(.*?)```", source, re.DOTALL)
-    assert len(examples) == 2
+    assert len(examples) == 3
     for example in examples:
         exec(compile(example, guide.name, "exec"), namespace)

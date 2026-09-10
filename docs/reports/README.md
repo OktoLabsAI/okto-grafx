@@ -1,5 +1,6 @@
 # Evidence and report index
 
+- [0.0.6 NHC-1–8: positional search, selected copy, temporal diff/index/compaction and analyzer replacement](V006_NHC_ROUND.md)
 - [0.0.6 native history/catalog/search round: fixed eight-item scope and validation](V006_NATIVE_HISTORY_ROUND.md)
 
 [Documentation index](../README.md) · [Current performance](../PERFORMANCE.md) · [Roadmap](../../ROADMAP.md)

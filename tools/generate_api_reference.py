@@ -15,7 +15,7 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
-    "domain/temporal.py": {"TemporalGraph", "TemporalLimits", "TemporalPin", "TemporalPruneReport", "TemporalVersion", "TemporalVersions"},
+    "domain/temporal.py": {"TemporalCompactionReport", "TemporalGraph", "TemporalLimits", "TemporalPin", "TemporalPruneReport", "TemporalVersion", "TemporalVersions"},
     "views.py": {"ViewParameter", "ViewDefinition"},
     "catalog_copy.py": {"CopyLimits", "CopyTable", "CopyPackage", "CopyReceipt"},
     "catalogs.py": {"CatalogPathPolicy", "CatalogInfo"},
@@ -36,7 +36,8 @@ DTO_SOURCES = {
     "domain/query/hybrid.py": {"HybridSearchOptions", "HybridHit", "HybridSearchResult"},
     "backup.py": {"BackupReport"},
     "transfer.py": {"TransferLimits", "TransferReport", "RecordIdMapping"},
-    "domain/index/fulltext.py": {"TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"},
+    "domain/index/fulltext.py": {"TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult", "TextMatchPositions"},
+    "temporal_diff.py": {"TemporalDiff", "TemporalPropertyChange", "TemporalRowChange", "TemporalSchemaChange"},
     "api/options.py": {"ConnectOptions"},
     "engine/database.py": {
         "DatabaseIdentity",
@@ -70,6 +71,7 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
+    "temporal_diff.py": {"diff_graph"},
     "catalog_copy.py": {"capture_copy", "prepare_copy_target", "copy_graph"},
     "workspace.py": {"resolve_workspace"},
     "html_snapshot.py": {"render_html_snapshot"},

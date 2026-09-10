@@ -22,8 +22,8 @@ emitted whole-token/component sequence; they are not source-code character offse
 
 Without `TextIndexOptions.positions=True`, the result regime is `phrase_verified`: existing whole-term postings nominate
 candidates and their **same-snapshot heap tokens** verify contiguous positions.
-That default mode adds no positional-posting format, new capability bit, index rebuild, persisted
-position list, term-offset response or write amplification is introduced. This
+That default mode introduces no positional-posting format, capability bit, index rebuild,
+persisted position list, term-offset response or extra positional write amplification. This
 is exact phrase semantics, not a claim of a durable positional index. Verification
 is linear in candidate field tokens, with O(query tokens) KMP state. It does not
 add a table scan beyond the existing documented corpus-statistics fallback.
@@ -35,8 +35,9 @@ examined, including those rejected by phrase verification. Ranking/ties and `k`
 are applied **after** verification, never by filtering a truncated term top-k.
 
 `phrase` defaults to `False` and accepts only exact booleans. `prefix=True` plus
-`phrase=True` refuses with `GrafxUnsupportedOperation`. No slop, proximity operator,
-quote-based query grammar or implicit phrase mode is added. Empty analyzed queries
+`phrase=True` refuses with `GrafxUnsupportedOperation`. The non-positional path requires
+`slop=0`; ordered slop for durable positions is documented below. No quote-based
+query grammar or implicit phrase mode is added. Empty analyzed queries
 return no hits. Existing token/posting/candidate/memory/explanation bounds, filters,
 deadlines and cancellation apply; repeated query tokens count toward token bounds.
 Phrase state reserves additional logical memory before allocation. Updates,
@@ -135,7 +136,8 @@ options value must provide exactly one weight per field. Hash sizing uses the sa
 validated bucket-count contract as ordinary hash indexes; no implicit resize occurs.
 
 `search_text(reader=None, *, index, query, k=20, filter=None, limits=None, k1=1.2,
-b=0.75, timeout_seconds=None, cancellation=None, prefix=False)` returns `TextSearchResult`.
+b=0.75, timeout_seconds=None, cancellation=None, prefix=False, phrase=False,
+return_positions=False, slop=0)` returns `TextSearchResult`.
 Omitting `reader` opens/closes a fresh read transaction. A supplied reader must be
 active and belong to this database; it remains caller-owned after an error. Write
 transactions are refused: use a new reader after commit to observe indexed changes.
@@ -153,7 +155,8 @@ Declare `TextIndexOptions(statistics_mode="durable", field_weights=(1.0,))`
 when creating a new text index. The `fulltext_statistics_v1` required capability
 (catalog bit 6) and `fulltext_v2_` derivation prevent older readers/writers from
 opening it. Existing `wal` indexes are unchanged; rebuilding one preserves its
-declaration rather than upgrading it. Use a separately named index to change modes.
+declaration rather than upgrading it. Use a separately named index, or the explicit
+atomic replacement API below, to change modes.
 
 `TextSearchResult.statistics_regime="durable_summary"` means the page-0 corpus
 count and field-length totals cover this reader's table high-water and do not
@@ -325,6 +328,8 @@ ordinary writer/OCC fences and atomic catalog publication, retaining the old gen
 | `max_postings` | 100,000 | Entries visited across statistics/term buckets and certificate retries, not just matches. |
 | `max_candidates` | 10,000 | Distinct retained filter-admitted candidate documents before ranking. |
 | `max_explanation_bytes` | 65,536 | Total UTF-8 field/term text in returned hit explanations. Refuses instead of silently truncating. |
+| `max_position_results` | 100,000 | Aggregate returned token ordinals; positive exact integer up to 2^31. |
+| `max_proximity_work` | 1,000,000 | Ordered matching work across retries; positive exact integer up to 2^31. |
 | `max_memory_bytes` | 33,554,432 | Logical retention: 64 bytes per admitted filter/statistics/DF identity, 128 per retained candidate plus 64 + UTF-8 bytes per retained analyzed term. Not RSS, heap decode buffers or allocator overhead. |
 | `max_statistics_wal_records` | 4,096 | Maximum records in the optional complete committed interval; exceeding declines to the census. |
 | `max_statistics_wal_bytes` | 8,388,608 | Physical read budget for the optional WAL interval, including foreign-tail refresh and sparse-mark read amplification. Separate from max_memory_bytes; decoded records and payloads are additional bounded retention. |
@@ -378,7 +383,7 @@ fresh postings. [Physical backup](BACKUP_RESTORE.md) preserves index/catalog byt
 UUID under its offline-restore contract. Both include verification. Required capability
 and wire layout are specified in [FTS-v1 format](specs/FULLTEXT_V1_FORMAT.md).
 
-This delivery does not implement highlighting/returned offsets or phrase slop,
+This delivery does not implement original-character highlighting/returned character offsets,
 language stemming/stopwords, arbitrary CALL extensions, online
 generation deletion or automatic schema/format downgrade. Those remain explicit
 [roadmap](../ROADMAP.md) limitations rather than undocumented implied capabilities.
@@ -406,7 +411,8 @@ It adds canonical field/term/position chunks of up to 32 occurrences, routed to
 the same bucket as that term's ordinary posting. Field-relative token positions
 are zero-based after the declared analyzer, not original character offsets.
 Repeated terms, token order and field boundaries are exact; fields never join
-into one phrase. Phrase/prefix combination and slop remain unsupported.
+into one phrase. Phrase/prefix combination remains unsupported; ordered slop is
+available explicitly as described below.
 
 Search intersects persisted relative positions, while validating every chunk's
 coverage against the native visible heap row under the existing pre/post index
@@ -428,3 +434,78 @@ and requires catalog bit **16**, `fulltext_positions_v1`, dependent on base FTS.
 Older builds refuse before using incompatible routing. No in-place downgrade or
 automatic conversion is provided. See [format](specs/FTS_POSITIONAL_POSTINGS.md)
 and [wheel compatibility](V006_COMPATIBILITY.md).
+
+## Position results and ordered proximity
+
+```python
+from okto_grafx import connect, TextIndexOptions
+
+with connect(":memory:") as proximity_db:
+    with proximity_db.begin("write") as tx:
+        tx.execute("CREATE NODE TABLE Document(id INT64, body STRING, PRIMARY KEY(id))")
+        tx.execute("CREATE (:Document {id:1,body:'graph native database'})")
+    proximity_db.create_text_index("body_positions", "Document", ("body",),
+        options=TextIndexOptions(positions=True))
+    result = proximity_db.search_text(index="body_positions", query="graph database",
+        phrase=True, slop=1, return_positions=True)
+    assert len(result.hits) == 1
+    assert {item.term: item.positions for item in result.hits[0].positions} == {
+        "graph": (0,), "database": (2,)}
+```
+
+`return_positions=True` opts into output (default `False`) and requires persisted
+`positions=True`.
+`TextHit.positions` defaults to `()` and contains frozen
+`TextMatchPositions(field, term, positions)` values: zero-based analyzed token
+ordinals for each matched term in matched fields, ordered by term then index field.
+These are **all occurrences of those terms in the matched fields**, not only the
+spans participating in one phrase. They are not original Unicode character offsets
+and must not be used to slice original strings without a consumer mapping.
+`max_position_results=100_000` bounds the aggregate returned ordinals across top-k;
+memory and explanation budgets also include this output. No partial output on refusal.
+
+`slop=0` retains exact phrase semantics. Integers 1–65,535 require `phrase=True`
+and durable positional postings. Terms must occur in query order with distinct,
+strictly increasing ordinals in one field; the sum of intervening extra tokens is
+at most slop. Repeated terms need separate occurrences. `a x b y c` matches
+`a b c` at slop 2, not 1; `b a` does not match `a b` at any slop.
+The result regime is `proximity_positions`. `max_proximity_work=1_000_000`
+charges start candidates and binary successor searches, including certificate
+retries; query deadline/cancellation remain in force. Both new positive limits
+accept exact integers up to 2^31, not bools. No phrase/prefix combination is added.
+
+## Atomic analyzer replacement
+
+```python
+from okto_grafx import connect, TextIndexOptions
+
+with connect(":memory:") as replacement_db:
+    with replacement_db.begin("write") as tx:
+        tx.execute("CREATE NODE TABLE Document(id INT64, body STRING, PRIMARY KEY(id))")
+        tx.execute("CREATE (:Document {id:1,body:'graph database'})")
+    replacement_db.create_text_index("docs_text", "Document", ("body",))
+    replacement_db.replace_text_index("docs_text", options=TextIndexOptions(
+        analyzer="keyword", field_weights=(1.0,), positions=True))
+    result = replacement_db.search_text(index="docs_text", query="graph database")
+    assert len(result.hits) == 1
+    assert not replacement_db.search_text(index="docs_text", query="graph").hits
+```
+
+Supply complete options, including one field weight per existing field. This
+retains name, table, columns and physical bucket sizing, but builds a fresh full
+generation with the requested analyzer/statistics/prefix/position configuration.
+The catalog COMMIT is the only switch; failure before publication keeps the old
+definition. Old files are not modified, relabeled or immediately deleted. They
+become retained orphan artifacts eligible for the existing explicit cleanup rules.
+Retired generations with the old analyzer are deliberately not described using
+the new analyzer. Ordinary `rebuild_index` still retains the analyzer unchanged.
+
+Each newly issued search uses the **currently published analyzer**, even inside
+an older data snapshot. Row visibility still belongs to that snapshot. An
+in-flight search must validate its selected generation before returning; a
+publication race cannot mix old postings with a new analyzer. This is not a
+historical analyzer-selection API or an online background rebuild. The foreground
+build fences scanned data, uses native OCC/quotas, and may conflict with writers.
+Use replacement when changing search semantics; keep the existing generation if
+only queries/limits change. Recovery, backup and unsupported-capability refusal
+follow the native detached-generation protocol.

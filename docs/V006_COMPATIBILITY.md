@@ -12,7 +12,7 @@ Install NumPy and google-crc32c in the invoking Python environment first. Isolat
 workers ignore user-site/PYTHONPATH; a venv avoids accidentally relying on user
 packages. The script never installs globally or touches production stores.
 
-Ten cells cover pure and native-CRC/NumPy writers for each boundary:
+Fourteen cells cover pure and native-CRC/NumPy writers for each boundary:
 
 | Store case | New wheel reads/appends to 0.0.5 | Old wheel after opt-in | Opposite selector readback |
 | --- | --- | --- | --- |
@@ -21,6 +21,8 @@ Ten cells cover pure and native-CRC/NumPy writers for each boundary:
 | Nullable column layouts, bit 13 | Required | Refuses | Required |
 | System-time history, bit 15 | Required | Refuses | Required |
 | Positional FTS, bit 16 | Required | Refuses | Required |
+| Temporal access tree, bit 17 | Required | Refuses | Required |
+| Quiescent temporal compaction, bit 18 | Required | Refuses | Required |
 
 Each cell verifies native rows, full verification and checkpoint/reopen. Temporal
 and positional cells also exercise their public APIs; old-reader refusal must
@@ -30,7 +32,9 @@ emitted as JSON. Both package versions are asserted, not inferred from filenames
 The GitHub workflow `v006-compatibility.yml` defines Windows/Ubuntu and Python
 3.11/3.12/3.13 coverage, with the focused feature/crash tests. A configured workflow
 is not evidence of a remote run. Actual local regression, artifact hashes and
-matrix outcomes are recorded in the [round acceptance report](reports/V006_NATIVE_HISTORY_ROUND.md).
+matrix outcomes are recorded in the [NHC acceptance report](reports/V006_NHC_ROUND.md).
+The [preceding round report](reports/V006_NATIVE_HISTORY_ROUND.md) preserves its
+earlier ten-cell checkpoint rather than claiming the later boundaries were tested then.
 No format downgrade is provided; install compatible binaries on all participants
 before opting into new capabilities. Native exact-source tests remain separate
 from wheel consumption checks.

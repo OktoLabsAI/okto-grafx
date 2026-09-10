@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__all__ = ["TemporalGraph", "TemporalLimits", "TemporalPin", "TemporalPruneReport", "TemporalVersion", "TemporalVersions"]
+__all__ = ["TemporalCompactionReport", "TemporalGraph", "TemporalLimits", "TemporalPin", "TemporalPruneReport", "TemporalVersion", "TemporalVersions"]
 
 from dataclasses import dataclass
 
@@ -18,9 +18,12 @@ class TemporalLimits:
     max_events: int = 100_000
     max_bytes: int = 64 * 1024 * 1024
     max_rows: int = 100_000
+    access_path: str = "auto"
 
     def __post_init__(self) -> None:
         """Reject bools, unbounded values and invalid budgets before database access."""
+        if type(self.access_path) is not str or self.access_path not in ("auto", "scan", "index"):
+            raise GrafxConfigurationError("Choose auto, scan or index.", field="access_path")
         for field, maximum in (("max_events", 10_000_000), ("max_bytes", 2**31), ("max_rows", 1_000_000)):
             value = getattr(self, field)
             if type(value) is not int or not 1 <= value <= maximum:
@@ -70,6 +73,16 @@ class TemporalPin:
     name: str
     at: CommitId
     tables: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalCompactionReport:
+    """Physical reclamation after a durable logical replacement and checkpoint."""
+
+    commit: CommitId | None
+    physical_bytes_before: int
+    physical_bytes_after: int
+    physical_bytes_reclaimed: int
 
 
 @dataclass(frozen=True, slots=True)

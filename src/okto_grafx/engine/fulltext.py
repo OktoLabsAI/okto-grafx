@@ -20,6 +20,7 @@ from okto_grafx.domain.index.fulltext import (
     TextIndexOptions,
     TextSearchLimits,
     TextHit,
+    TextMatchPositions,
     TextSearchResult,
     analyze,
     decode_options,
@@ -55,6 +56,7 @@ def create_text_index(
     *,
     options: TextIndexOptions | None,
     bucket_count: int,
+    _replace_existing: bool = False,
 ) -> IndexView:
     """Publish a complete nonced generation through the existing detached build protocol."""
     if (
@@ -105,6 +107,7 @@ def create_text_index(
                 bucket_count=bucket_count,
                 expected_cardinality=None,
                 key_derivation=selected.derivation(),
+                replace_text=_replace_existing,
             )
         database._refresh_index_inventory()
         return database._committed_index_receipt(name)
@@ -153,6 +156,8 @@ def search_text(
     cancellation: CancellationToken | None,
     prefix: bool = False,
     phrase: bool = False,
+    return_positions: bool = False,
+    slop: int = 0,
     _control: _ReadControl | None = None,
     _memory: Callable[[int], None] | None = None,
 ) -> TextSearchResult:
@@ -161,6 +166,10 @@ def search_text(
         raise GrafxConfigurationError("prefix must be exactly bool.", field="prefix")
     if type(phrase) is not bool:
         raise GrafxConfigurationError("phrase must be exactly bool.", field="phrase")
+    if type(return_positions) is not bool:
+        raise GrafxConfigurationError("return_positions must be exactly bool.", field="return_positions")
+    if type(slop) is not int or not 0 <= slop <= 65_535 or (slop and not phrase):
+        raise GrafxConfigurationError("slop requires phrase=True and an integer in 0..65535.", field="slop")
     if phrase and prefix:
         raise GrafxUnsupportedOperation("Phrase and prefix modes cannot be combined.", field="phrase")
     if reader._database is not database or not reader.active or reader.mode != "read":
@@ -224,6 +233,8 @@ def search_text(
                     "The named index is not a full-text index.", field="index"
                 )
             options = decode_options(definition.key_derivation)
+            if (return_positions or slop) and not options.positions:
+                raise GrafxUnsupportedOperation("Position results require durable positional postings.", field="return_positions")
             query_options = replace(
                 options,
                 max_document_tokens=min(
@@ -245,6 +256,15 @@ def search_text(
             memory = 0 if allowed is None else len(allowed) * 64
             analysis = TextAnalysisMemo(min(1_048_576, budget.max_memory_bytes // 4))
             wal_reservation = 0
+            proximity_work = 0
+
+            def proximity(amount: int) -> None:
+                """Bound all ordered matching attempts, including certificate retries."""
+                nonlocal proximity_work
+                proximity_work += amount
+                if proximity_work > budget.max_proximity_work:
+                    raise GrafxQueryBudgetExceeded("Proximity work budget exceeded.", resource="text_proximity")
+                check()
 
             def check(charge: int = 0, *, posting: bool = False) -> None:
                 """Charge attempted work, including certificate retries, before more work."""
@@ -388,7 +408,7 @@ def search_text(
                     docs = set()
                     documents = {}
                     positional = None
-                    if phrase and options.positions:
+                    if (phrase or return_positions) and options.positions:
                         from okto_grafx.engine.fulltext_positions import PositionEvidence
                         positional = PositionEvidence(term, check)
                     for entry in entries(bucket_of(key, definition.bucket_count)):
@@ -459,7 +479,7 @@ def search_text(
                     if phrase and options.positions:
                         from okto_grafx.engine.fulltext_positions import phrase_fields as positional_phrase_fields
                         check(128 + 64 * sum(len(field) for field in fields))
-                        phrase_fields = positional_phrase_fields(phrase_positions.get(rid, {}), ordered_terms, len(fields))
+                        phrase_fields = positional_phrase_fields(phrase_positions.get(rid, {}), ordered_terms, len(fields), slop=slop, work=proximity)
                     check()
                     if phrase and not any(phrase_fields):
                         continue
@@ -507,11 +527,29 @@ def search_text(
                 chosen = tuple(
                     sorted(hits, key=lambda hit: (-hit.score, hit.record_id))[:k]
                 )
+                if return_positions:
+                    enriched = []
+                    position_count = 0
+                    for hit in chosen:
+                        locations = []
+                        for term in hit.matched_terms:
+                            for field, ordinals in enumerate(phrase_positions[hit.record_id][term]):
+                                name = table.columns[definition.positions[field]].name
+                                if not ordinals or name not in hit.matched_fields:
+                                    continue
+                                position_count += len(ordinals)
+                                if position_count > budget.max_position_results:
+                                    raise GrafxQueryBudgetExceeded("Position output budget exceeded.", resource="text_positions")
+                                check(128 + 8 * len(ordinals) + len(name.encode("utf-8")) + len(term.encode("utf-8")))
+                                locations.append(TextMatchPositions(name, term, ordinals))
+                        enriched.append(replace(hit, positions=tuple(locations)))
+                    chosen = tuple(enriched)
                 explanation = sum(
                     sum(
                         len(v.encode("utf-8"))
                         for v in (*hit.matched_fields, *hit.matched_terms)
                     )
+                    + sum(16 + len(p.field.encode("utf-8")) + len(p.term.encode("utf-8")) + 8 * len(p.positions) for p in hit.positions)
                     for hit in chosen
                 )
                 if explanation > budget.max_explanation_bytes:
@@ -522,7 +560,7 @@ def search_text(
                 return (
                     TextSearchResult(
                         chosen,
-                        ("phrase_positions" if options.positions else "phrase_verified") if phrase else ("prefix_index" if prefix else "exact_index"),
+                        ("proximity_positions" if slop else "phrase_positions" if options.positions else "phrase_verified") if phrase else ("prefix_index" if prefix else "exact_index"),
                         certificate.header.built_through_lsn,
                         snapshot.read_lsn,
                         visited,

@@ -17,6 +17,10 @@ from okto_grafx.domain.txn.commit_identity import CommitId
 from okto_grafx.engine.system_history_store import (
     HistoryPageImage, SystemHistoryStore, _BLOCK, _BLOCK_MAGIC, _FILE, _HEAD, _HEAD_MAGIC,
     _MAX_BATCH, _decode_changes, _image,
+    _COMPACT_HEAD_MAGIC,
+)
+from okto_grafx.engine.system_history_index_store import (
+    PreparedHistoryIndex, head_root, trailer, _EXT, _EXT_MAGIC, _INDEX_BLOCK_MAGIC,
 )
 
 
@@ -97,12 +101,21 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
         head = store._head(final, storage.page_count(_FILE))
         if head[0] != activation:
             raise _refuse("system_history_activation")
+        if (head_root(store._page(0).read_slot(0), _HEAD.size) is not None) != (
+                "system_history_index_v1" in catalog.required_capabilities()):
+            raise _refuse("system_history_index_capability")
+        if (store._page(0).read_slot(0)[:8] == _COMPACT_HEAD_MAGIC) != (
+                "system_history_compaction_v1" in catalog.required_capabilities()):
+            raise _refuse("system_history_compaction_capability")
         return
     previous = checkpoint_lsn
     previous_root = None
     expected_by_page = {}
     rewritten = set()
+    reusable_tail = set()
     final_extent = 0
+    last_rewrite = max((sequence for sequence, item in schemas
+                        if item.system_history_revision == sequence), default=0)
     for terminal in replay.commit_records:
         images = tuple(history_groups.get((terminal.epoch, terminal.txn_id), ()))
         if terminal.lsn < activation:
@@ -116,6 +129,17 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
         chunks = sorted((image for image in images if image.page_index != 0), key=lambda image: image.page_index)
         if len(roots) != 1 or not chunks:
             raise _refuse("system_history_commit_coverage")
+        if terminal.lsn < last_rewrite:
+            # A later qualified full rewrite is the sole surviving history
+            # picture. Do not combine its resident tree pages with an earlier
+            # root. Defer semantic authority to that complete image below; every
+            # earlier effect still needs its own native COMMIT and target checks.
+            # No page is applied until the entire replay preflight succeeds.
+            for image in images:
+                expected_by_page.setdefault(image.page_index, {})[terminal.lsn] = image.raw
+            previous_root = roots[0].raw
+            previous = terminal.lsn
+            continue
         schema = schema_by_sequence.get(terminal.lsn)
         rewrite = schema is not None and schema.system_history_revision == terminal.lsn
         if rewrite:
@@ -133,9 +157,14 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
                          table_ids=tuple(key for key, _, _ in schema.system_history_tables()),
                          retention_horizons={key: floor for key, _, floor in schema.system_history_tables()},
                          limits=TemporalLimits(max_events=10_000_000, max_bytes=2**31, max_rows=1_000_000))
+            rewritten_commits = set()
             for identity, _, _ in after._iter_batches(expected_sequence=terminal.lsn, page_count=len(incoming)):
                 if identity.sequence > checkpoint_lsn and identity.sequence not in terminals:
                     raise _refuse("system_history_rewrite_lineage")
+                if identity.sequence > checkpoint_lsn:
+                    rewritten_commits.add(identity.sequence)
+            if rewritten_commits != {csn for csn in terminals if max(checkpoint_lsn + 1, activation) <= csn <= terminal.lsn}:
+                raise _refuse("system_history_rewrite_commit_coverage")
             previous_root = roots[0].raw
             final_extent = len(incoming)
             for image in images:
@@ -147,10 +176,12 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
         if len(first) <= _BLOCK.size:
             raise _refuse("system_history_chunk")
         magic, identity, sequence, ordinal, position, count, size, digest, _ = _BLOCK.unpack_from(first)
-        if magic != _BLOCK_MAGIC or identity != database_uuid or sequence != terminal.lsn or position != 0:
+        if magic not in (_BLOCK_MAGIC, _INDEX_BLOCK_MAGIC) or identity != database_uuid or sequence != terminal.lsn or position != 0:
             raise _refuse("system_history_lineage")
         capacity = pool.page_size - 32 - 4 - _BLOCK.size
-        if not 4 <= size <= _MAX_BATCH or count != (size + capacity - 1) // capacity or count != len(chunks):
+        indexed = magic == _INDEX_BLOCK_MAGIC
+        if (not 4 <= size <= _MAX_BATCH or count != (size + capacity - 1) // capacity
+                or (not indexed and count != len(chunks)) or indexed and count >= len(chunks)):
             raise _refuse("system_history_batch_bound")
         if terminal.lsn == activation:
             if chunks[0].page_index != 1 or ordinal != 0:
@@ -161,8 +192,27 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
             if {image.page_index: image.raw for image in expected} != {image.page_index: image.raw for image in images}:
                 raise _refuse("system_history_activation_images")
         else:
+            index_plan = None
+            extension = b""
+            if indexed:
+                if "system_history_index_v1" not in catalog.required_capabilities():
+                    raise _refuse("system_history_index_capability")
+                old_index, new_index, node_count = trailer(Page.from_bytes(chunks[count].raw).read_slot(0),
+                                                          database_uuid, terminal.lsn)
+                if count + 1 + node_count != len(chunks):
+                    raise _refuse("system_history_index_extent")
+                if old_index[0]:
+                    extension = _EXT.pack(_EXT_MAGIC, *old_index)
+                elif schema is None or "system_history_index_v1" not in schema.required_capabilities():
+                    raise _refuse("system_history_index_activation")
+            compacted = Page.from_bytes(roots[0].raw).read_slot(0)[:8] == _COMPACT_HEAD_MAGIC
+            if compacted:
+                if "system_history_compaction_v1" not in catalog.required_capabilities():
+                    raise _refuse("system_history_compaction_capability")
+                reusable_tail.update(image.page_index for image in chunks)
             root = _image(pool.page_size, 0, previous, _HEAD.pack(
-                _HEAD_MAGIC, database_uuid, activation, previous, ordinal, chunks[0].page_index, digest)).raw
+                _COMPACT_HEAD_MAGIC if compacted else _HEAD_MAGIC,
+                database_uuid, activation, previous, ordinal, chunks[0].page_index, digest) + extension).raw
             if previous_root is not None:
                 if root != previous_root:
                     raise _refuse("system_history_transition_chain")
@@ -188,19 +238,39 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
                 # Its exact full image and logical lineage are proved below,
                 # before this preflight permits application of ANY page. Reading
                 # resident old chunks here would mix pre/post-redaction digests.
-            transition = SystemHistoryStore(lambda _file, _index: root, database_uuid=database_uuid, page_size=pool.page_size)
+            def predecessor_read(file: str, number: int) -> bytes:
+                """Prefer earlier proved WAL images over possibly interrupted resident application."""
+                if number == 0:
+                    return root
+                versions = expected_by_page.get(number)
+                return versions[max(versions)] if versions else storage.read_page(file, number)
+
+            if indexed:
+                baseline = ()
+                if not old_index[0]:
+                    prefix = SystemHistoryStore(predecessor_read, database_uuid=database_uuid, page_size=pool.page_size)
+                    baseline = tuple((item.sequence, changes) for item, changes, _ in
+                        prefix._iter_batches(expected_sequence=previous, page_count=chunks[0].page_index))
+                index_plan = PreparedHistoryIndex(predecessor_read, old_index, baseline)
+            transition = SystemHistoryStore(predecessor_read, database_uuid=database_uuid, page_size=pool.page_size)
             transition.validate_append_images(images, previous_sequence=previous, page_count=chunks[0].page_index,
-                                              commit=CommitId(database_uuid, terminal.lsn))
+                                              commit=CommitId(database_uuid, terminal.lsn), index=index_plan)
         previous_root = roots[0].raw
-        final_extent = _HEAD.unpack(Page.from_bytes(previous_root).read_slot(0))[5]
+        final_extent = _HEAD.unpack_from(Page.from_bytes(previous_root).read_slot(0))[5]
         for image in images:
             expected_by_page.setdefault(image.page_index, {})[terminal.lsn] = image.raw
         previous = terminal.lsn
     if previous_root is None:
         raise _refuse("system_history_commit_coverage")
+    if (head_root(Page.from_bytes(previous_root).read_slot(0), _HEAD.size) is not None) != (
+            "system_history_index_v1" in catalog.required_capabilities()):
+        raise _refuse("system_history_index_capability")
+    compacted = Page.from_bytes(previous_root).read_slot(0)[:8] == _COMPACT_HEAD_MAGIC
+    if compacted != ("system_history_compaction_v1" in catalog.required_capabilities()):
+        raise _refuse("system_history_compaction_capability")
     if storage.exists(_FILE):
         length = storage.file_size(_FILE)
-        if length % pool.page_size or length // pool.page_size > final_extent:
+        if length % pool.page_size or length // pool.page_size > final_extent and not compacted:
             raise _refuse("system_history_extent")
     for index, versions in expected_by_page.items():
         candidates = []
@@ -223,5 +293,5 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
             if page.page_lsn > checkpoint_lsn:
                 if versions.get(page.page_lsn) != _canonical(raw):
                     raise _refuse("system_history_target_lsn")
-            elif index != 0 and index not in rewritten:
+            elif index != 0 and index not in rewritten and index not in reusable_tail:
                 raise _refuse("system_history_old_chunk_overwrite")

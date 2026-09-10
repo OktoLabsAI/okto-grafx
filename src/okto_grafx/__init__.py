@@ -25,12 +25,12 @@ from __future__ import annotations
 
 from okto_grafx.api import ConnectOptions, connect
 from okto_grafx.catalogs import CatalogInfo, CatalogPathPolicy, CatalogSession
-from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult
+from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult, TextMatchPositions
 from okto_grafx.domain.query.hybrid import HybridHit, HybridSearchOptions, HybridSearchResult
 from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.txn.commit_identity import CommitId
-from okto_grafx.domain.temporal import TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersion, TemporalVersions
+from okto_grafx.domain.temporal import TemporalCompactionReport, TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersion, TemporalVersions
 from okto_grafx.domain.txn.commit_metadata import CommitMetadata, MetadataLimits
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry, CommitKind
 from okto_grafx.domain.txn.commit_history import CommitHistoryPage
@@ -78,6 +78,7 @@ __all__ = [
     "ScanCursorV1",
     "ScanPageV1",
     "ScanRowV1",
+    "TemporalCompactionReport",
     "TemporalGraph",
     "TemporalLimits",
     "TemporalPin",
@@ -86,6 +87,7 @@ __all__ = [
     "TemporalVersions",
     "TextHit",
     "TextIndexOptions",
+    "TextMatchPositions",
     "TextSearchLimits",
     "TextSearchResult",
     "Timestamp",

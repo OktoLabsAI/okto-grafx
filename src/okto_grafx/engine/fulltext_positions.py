@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from bisect import bisect_right
 from okto_grafx.domain.ids import RecordRef
 from okto_grafx.domain.index.entry import IndexEntry
 
@@ -68,10 +69,33 @@ class PositionEvidence:
         return result
 
 
-def phrase_fields(postings: Mapping[str, Sequence[Sequence[int]]], ordered_terms: Sequence[str], width: int) -> tuple[bool, ...]:
-    """Intersect relative positions; repeated terms/order never cross a field boundary."""
+def phrase_fields(postings: Mapping[str, Sequence[Sequence[int]]], ordered_terms: Sequence[str], width: int,
+                  *, slop: int = 0, work: Callable[[int], None] | None = None) -> tuple[bool, ...]:
+    """Ordered proximity: total intervening tokens <= slop, strict increasing positions per field."""
     result = []
     for field in range(width):
+        if slop:
+            lists = [postings.get(term, ((),) * width)[field] for term in ordered_terms]
+            matched = False
+            if lists and all(lists):
+                for start in lists[0]:
+                    previous = start
+                    if work is not None:
+                        work(1)
+                    for positions in lists[1:]:
+                        if work is not None:
+                            work(1 + len(positions).bit_length())
+                        index = bisect_right(positions, previous)
+                        if index == len(positions):
+                            break
+                        previous = positions[index]
+                        if previous - start > slop + len(lists) - 1:
+                            break
+                    else:
+                        matched = True
+                        break
+            result.append(matched)
+            continue
         starts = None
         for offset, term in enumerate(ordered_terms):
             positions = postings.get(term)

@@ -19,7 +19,7 @@ from okto_grafx.domain.errors import (
     GrafxQueryBudgetExceeded,
 )
 
-__all__ = ["TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"]
+__all__ = ["TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult", "TextMatchPositions"]
 
 FULLTEXT_CAPABILITY = "fulltext_indexes_v1"
 FULLTEXT_STATISTICS_CAPABILITY = "fulltext_statistics_v1"
@@ -431,6 +431,8 @@ class TextSearchLimits:
     max_statistics_wal_records: int = 4096
     max_statistics_wal_bytes: int = 8 * 1024 * 1024
     max_expanded_terms: int = 128
+    max_position_results: int = 100_000
+    max_proximity_work: int = 1_000_000
 
     def __post_init__(self) -> None:
         """Reject disabled, forged or unbounded counters."""
@@ -443,10 +445,21 @@ class TextSearchLimits:
             "max_statistics_wal_records",
             "max_statistics_wal_bytes",
             "max_expanded_terms",
+            "max_position_results",
+            "max_proximity_work",
         ):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= 2**31:
                 raise _bad(name)
+
+
+@dataclass(frozen=True, slots=True)
+class TextMatchPositions:
+    """Validated zero-based analyzed token ordinals for one field/term, not character offsets."""
+
+    field: str
+    term: str
+    positions: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,6 +470,7 @@ class TextHit:
     score: float
     matched_fields: tuple[str, ...]
     matched_terms: tuple[str, ...]
+    positions: tuple[TextMatchPositions, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

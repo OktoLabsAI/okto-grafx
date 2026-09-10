@@ -5,25 +5,25 @@
 Reviewed September 10, 2026. This is a capability and integration comparison,
 not a benchmark, migration guarantee or product certification.
 
-Additional 0.0.6 development scope: explicit [posting-hash indexes](POSTING_HASH.md)
-share repeated keys per physical page. The later development continuation adds
-[native system-time APIs](SYSTEM_TIME_HISTORY.md) and
-[positional phrase postings](FULL_TEXT_SEARCH.md#durable-positional-postings-006-development).
-These do not change the **published 0.0.5 baseline** or snapshot/ACID claims below;
-the historical comparison table is not a release claim for 0.0.6.
+The cross-product tables describe **validated 0.0.6 development source**, including
+the completed NHC-1–8 round. They do **not** describe the published 0.0.5 package.
+Section 5 identifies the development additions; release availability must be
+checked separately. Local feature/regression/documentation acceptance is recorded
+in the [delivery evidence](reports/V006_NHC_ROUND.md), not inferred from feature names.
 
 ## Scope and reading rules
 
 | Product | Baseline and evidence |
 | --- | --- |
 | Okto Grafx | Published **0.0.5**, tag `v0.0.5`, merge `83cc313`. Local consumer contracts and implementation are the authority. [Publication receipt](reports/PYPI_0_0_5_PUBLICATION.md). |
+| Okto Grafx development (comparison baseline) | **0.0.6**, `feature/v0.0.6`, including completed NHC-1–8, reviewed September 10, 2026. Local acceptance, not a published package or remote CI claim. [Changelog](../CHANGELOG.md), [NHC evidence](reports/V006_NHC_ROUND.md). |
 | Ladybug | **0.20.3** release, plus official rolling documentation accessed on the review date. Source was inspected where the concurrency documentation leaves an important ambiguity. This is not the older Ladybug 0.16.0 used in some Grafx benchmarks. [Release](https://github.com/LadybugDB/ladybug/releases/tag/v0.20.3). |
 | Neo4j | Current self-managed documentation accessed on the review date, distinguishing **Community (CE)**, **Enterprise (EE)** and separately installed libraries. Not an installed-version conformance test. Rolling documentation may describe features newer than a particular deployed release. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
 
-The 0.0.6 development line adds the bounded MP-1–MP-8 consumption/query/analytics
-slices described in the [roadmap](../ROADMAP.md#relatively-inexpensive-minimum-parity-candidates).
-This comparison remains a versioned 0.0.5 baseline, not a claim that every broader
-gap below is closed by those minimum-parity additions.
+The development line includes MP-1–MP-8 and subsequent catalog, temporal, posting
+and NHC additions. These close specific API gaps; they do not establish general
+Cypher compatibility, distributed transactions, full bitemporality or production
+maturity. See the exact boundaries in section 5.
 
 Neo4j was selected to complement the embedded Ladybug comparison with a
 client/server graph database. A server is a different deployment trade-off, not
@@ -37,10 +37,10 @@ No third-party database was installed or benchmarked for this document.
 
 ## 1. Deployment, concurrency and durability
 
-| Capability | Grafx 0.0.5 | Ladybug | Neo4j |
+| Capability | Grafx 0.0.6 development | Ladybug | Neo4j |
 | --- | --- | --- | --- |
 | Embedded Python use | Native synchronous Python library; no database server. [Integration](INTEGRATION.md). | Embedded engine with Python bindings. [Python API](https://docs.ladybugdb.com/client-apis/python/). | Python driver connects to a DBMS; not an in-process Python replacement. [Driver](https://neo4j.com/docs/python-manual/current/). |
-| Other languages | Python and local CLI are the supported consumption surfaces; no native multi-language driver family. [CLI](CLI.md). | APIs include C/C++, Rust, Java, JavaScript, Go and Swift in addition to Python. [Installation](https://docs.ladybugdb.com/installation/). | Official network drivers include Python, Java, JavaScript, Go and .NET. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
+| Other languages | Python and JSON CLI, with a JS/TS subprocess recipe; not a native multi-language driver family or network protocol. [CLI](CLI.md). | APIs include C/C++, Rust, Java, JavaScript, Go and Swift in addition to Python. [Installation](https://docs.ladybugdb.com/installation/). | Official network drivers include Python, Java, JavaScript, Go and .NET. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
 | Storage/execution emphasis | Paged local storage; Python engine with NumPy codec/vector acceleration and accepted native CRC. [Architecture](ARCHITECTURE.md), [configuration](CONFIGURATION.md). | Columnar storage, CSR adjacency, vectorized/factorized processing and multicore query execution. [Overview](https://docs.ladybugdb.com/). | Native graph storage and server-managed query execution; runtime availability depends on edition. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
 | Concurrent readers and writers | Independent participants, including processes, can own snapshots/write transactions against the same local store. OCC and publication fencing remain. [Operations](OPERATIONS.md#concurrency-contract). | Concurrent connections through one shared writable `Database`; separate directly opened processes are documented as read-only together or a single writable owner. [Concurrency](https://docs.ladybugdb.com/concurrency/). | Multiple clients transact through the server with locks and deadlock detection, rather than directly opening its files. [Transactions](https://neo4j.com/docs/operations-manual/current/database-internals/). |
 | Isolation | Snapshot reads and optimistic write-conflict validation; not a blanket serializability claim. [Contract](OPERATIONS.md#concurrency-contract). | Manual describes serializable transactions and one writer; source contains a multiwrite switch. See the qualification below. [Transactions](https://docs.ladybugdb.com/cypher/transaction/). | Default is read committed; explicit locking can strengthen isolation. Do not assume a repeatable transaction-wide snapshot. [Isolation](https://neo4j.com/docs/operations-manual/current/database-internals/concurrent-data-access/). |
@@ -85,24 +85,24 @@ not the same deployment model or isolation contract as Grafx.
 
 ## 2. Modeling, queries and indexes
 
-| Capability | Grafx 0.0.5 | Ladybug | Neo4j |
+| Capability | Grafx 0.0.6 development | Ladybug | Neo4j |
 | --- | --- | --- | --- |
 | Property graph/schema | Typed node/relationship tables, declared endpoints and primary keys. [Query reference](QUERY_LANGUAGE.md). | Structured property graph with typed tables. [Overview](https://docs.ladybugdb.com/). | Labels/types and property graphs with configurable constraints. [Constraints](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
-| Query language | Deliberately bounded Cypher-inspired subset, not full Ladybug/Neo4j compatibility. Limited `OPTIONAL MATCH`, two-branch `UNION`, no arbitrary `CALL/YIELD`. [Exact surface](QUERY_LANGUAGE.md). | Cypher surface includes subqueries and macros beyond Grafx's closed subset. [Macros](https://docs.ladybugdb.com/cypher/macro/). | Broad Cypher language and procedure ecosystem; queries still need dialect/version validation. [Cypher manual](https://neo4j.com/docs/cypher-manual/current/). |
+| Query language | Bounded Cypher-inspired subset: limited `OPTIONAL MATCH`, two-branch `UNION`/`UNION ALL`, `lower`/`upper`/`trim`/`abs`; no arbitrary `CALL/YIELD`. [Exact surface](QUERY_LANGUAGE.md). | Cypher surface includes subqueries and macros beyond Grafx's closed subset. [Macros](https://docs.ladybugdb.com/cypher/macro/). | Broad Cypher language and procedure ecosystem; queries still need dialect/version validation. [Cypher manual](https://neo4j.com/docs/cypher-manual/current/). |
 | Stored value breadth | INT64, DOUBLE, STRING, BOOL, BLOB, UUID, TIMESTAMP and declared vectors. Query lists/maps do not imply general nested-column support. [Types](QUERY_LANGUAGE.md#values-and-python-mapping). | Additional integer widths, DECIMAL, DATE/INTERVAL and nested LIST/ARRAY/STRUCT/MAP/UNION families. [Types](https://docs.ladybugdb.com/cypher/data-types/). | A different property/constraint model; do not port typed table DDL unchanged. [Schema](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
-| Scalar/structural indexes | PK, endpoint and identity indexes; custom equality/hash and ordered indexes; explicit sizing, sparse layout and maintenance. [Indexes](INDEXES_AND_VECTORS.md). | PK hash/ART indexes and automatic column zone maps; not an identical secondary-index API. [Indexes](https://docs.ladybugdb.com/cypher/indexes/). | Range, text, point and token-lookup indexes, with planner integration. [Index families](https://neo4j.com/docs/cypher-manual/current/indexes/search-performance-indexes/). |
+| Scalar/structural indexes | PK, endpoint and identity indexes; custom equality/hash and ordered indexes; optional repeated-key `posting_hash`, explicit sizing and maintenance. [Indexes](INDEXES_AND_VECTORS.md), [posting hash](POSTING_HASH.md). | PK hash/ART indexes and automatic column zone maps; not an identical secondary-index API. [Indexes](https://docs.ladybugdb.com/cypher/indexes/). | Range, text, point and token-lookup indexes, with planner integration. [Index families](https://neo4j.com/docs/cypher-manual/current/indexes/search-performance-indexes/). |
 | Bulk and streamed consumption | Atomic `executemany`, bounded physical scans, cursor ownership and typed batch import/export. [Integration](INTEGRATION.md). | `COPY FROM` and Python data-frame interoperability. [Python](https://docs.ladybugdb.com/client-apis/python/). | Driver transactions/results and server import tooling; boundaries differ from an embedded transaction. [Python driver](https://neo4j.com/docs/python-manual/current/). |
-| Multiple stores/federation | Independent handles and logical copy exist; attached `CatalogSession` and workspace scopes are **planned GX-CAP-2**. [Roadmap](../ROADMAP.md). | `ATTACH`/`DETACH`; external systems through extensions. No cross-store atomicity equivalence is asserted. [Attach](https://docs.ladybugdb.com/cypher/attach/). | Additional databases/composite databases are EE features, not direct attachment of Grafx/Ladybug files. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
+| Multiple stores/federation | Attached `CatalogSession`, explicit alias/permission/workspace resolution and single-store transactions; no cross-store joins, edges or distributed COMMIT. [Catalogs](CATALOGS_AND_WORKSPACES.md). | `ATTACH`/`DETACH`; external systems through extensions. No cross-store atomicity equivalence is asserted. [Attach](https://docs.ladybugdb.com/cypher/attach/). | Additional databases/composite databases are EE features, not direct attachment of Grafx/Ladybug files. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
 
 ## 3. Retrieval, analytics and interoperability
 
-| Capability | Grafx 0.0.5 | Ladybug | Neo4j |
+| Capability | Grafx 0.0.6 development | Ladybug | Neo4j |
 | --- | --- | --- | --- |
 | Vector search | Native exact and HNSW search, declared spaces/metrics/precision, filters and memory/work controls. [Vectors](INDEXES_AND_VECTORS.md). | `vector` extension: disk-based HNSW and filtered search on node vector properties. [Vector extension](https://docs.ladybugdb.com/extensions/vector/). | Native ANN indexes for node/relationship embeddings in CE and EE; native `VECTOR` property storage has additional format/edition requirements. [Vector indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/). |
-| Full-text search | Native snapshot-consistent weighted BM25; node and relationship text properties; versioned analyzers. [FTS](FULL_TEXT_SEARCH.md). | `fts` extension with BM25, stop words and configurable stemming. [FTS extension](https://docs.ladybugdb.com/extensions/full-text-search/). | Lucene-based full-text node/relationship indexes and analyzers. [Full-text indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/). |
-| Text semantics and limits | Bounded prefix expansion; no phrase/position query language or language stemmer. Python API is richer than the closed text `CALL` door. [FTS limits](FULL_TEXT_SEARCH.md). | Do not equate its analyzer/query behavior or index visibility with Grafx solely because both expose BM25. [FTS contract](https://docs.ladybugdb.com/extensions/full-text-search/). | Lucene query syntax and optional eventually-consistent index updates; not equivalent to Grafx's snapshot contract. [Full-text contract](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/). |
+| Full-text search | Native snapshot-bound weighted BM25 over node/relationship properties; explicit atomic analyzer/options replacement. New searches use the current analyzer with their owning data snapshot. [FTS](FULL_TEXT_SEARCH.md). | `fts` extension with BM25, stop words and stemming; documented FTS targets are node-table STRING properties. [FTS extension](https://docs.ladybugdb.com/extensions/full-text-search/). | Lucene-based full-text node/relationship indexes and analyzers. [Full-text indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/). |
+| Text semantics and limits | Bounded prefix and exact phrase search; optional persisted positions, ordered slop and typed token-position output. No phrase/prefix combination, character offsets or language stemming. Python API is richer than CLI/closed CALL. [FTS limits](FULL_TEXT_SEARCH.md). | Conjunctive/disjunctive term matching and stemming are documented; equivalent typed slop/position-return contracts are not established here. BM25 alone does not imply identical visibility or analysis. [FTS contract](https://docs.ladybugdb.com/extensions/full-text-search/). | Lucene query syntax, including quoted exact matches, and optional eventually-consistent index updates; not equivalent to Grafx's snapshot contract or position DTO. [Full-text contract](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/). |
 | Hybrid retrieval | Native `search_hybrid`: weighted RRF plus bounded graph evidence on one owned snapshot; one target node table. [Hybrid](HYBRID_SEARCH.md). | Vector and FTS components exist; an equivalent single-snapshot RRF/graph-evidence API was not established here. [Extensions](https://docs.ladybugdb.com/extensions/). | Supported via query composition and the separate GraphRAG Python library (`HybridRetriever`); not the same native API/consistency contract. [GraphRAG](https://neo4j.com/docs/neo4j-graphrag-python/current/user_guide_rag.html). |
-| Graph algorithms | Detached bounded projections: WCC/SCC, BFS/Dijkstra, PageRank/personalization, k-core and label propagation; optional NumPy PageRank. [Algorithms](GRAPH_PROJECTIONS.md). | `algo` extension includes PageRank, shortest paths, components, k-core and Louvain. [Algorithms](https://docs.ladybugdb.com/extensions/algo/). | Separate GDS library with extensive algorithms and ML pipelines; CE/EE licensing has its own limits. [GDS](https://neo4j.com/docs/graph-data-science/current/introduction/). |
+| Graph algorithms | Detached bounded projections: WCC/SCC, BFS/Dijkstra, PageRank/personalization, k-core, label propagation and topological ordering with cycle detection; optional NumPy PageRank. [Algorithms](GRAPH_PROJECTIONS.md). | `algo` extension includes PageRank, shortest paths, components, k-core and Louvain. [Algorithms](https://docs.ladybugdb.com/extensions/algo/). | Separate GDS library with extensive algorithms and ML pipelines; CE/EE licensing has its own limits. [GDS](https://neo4j.com/docs/graph-data-science/current/introduction/). |
 | Tabular/file exchange | Native local CSV/JSONL; optional Arrow, Pandas, Polars, Parquet and NetworkX adapters. [Text](LOCAL_TEXT_IMPORT.md), [tabular](TABULAR_AND_PARQUET.md), [graph exchange](GRAPH_EXCHANGE.md). | CSV, Parquet, NumPy/DataFrame integration, plus external-store extensions. [Python](https://docs.ladybugdb.com/client-apis/python/), [extensions](https://docs.ladybugdb.com/extensions/). | Driver-based exchange plus ecosystem tooling; GDS Arrow integration is edition-dependent. [GDS editions](https://neo4j.com/docs/graph-data-science/current/introduction/). |
 | Lakehouse/remote connectors | Not a native S3/relational federation layer; current local import APIs require explicit bounds/path policy. [Ingestion](LOCAL_TEXT_IMPORT.md). | Extensions include S3, Azure, GCS, ADBC, DuckDB, PostgreSQL, SQLite and lakehouse formats. [Extension inventory](https://docs.ladybugdb.com/extensions/). | Server ecosystem differs from embedded file scanners; connector-specific contracts must be assessed separately. |
 
@@ -113,21 +113,61 @@ GDS EE must not be silently treated as the same entitlement.
 
 ## 4. Operations, history, security and tooling
 
-| Capability | Grafx 0.0.5 | Ladybug | Neo4j |
+| Capability | Grafx 0.0.6 development | Ladybug | Neo4j |
 | --- | --- | --- | --- |
 | Physical backup/restore | Bounded verified backup; same-UUID replacement restore requires the original offline. It is not a concurrently writable fork. [Backup](BACKUP_RESTORE.md). | WAL/checkpoint and export are documented; equivalence to Grafx's manifest/identity-aware restore API was not established. [Transactions](https://docs.ladybugdb.com/cypher/transaction/), [export](https://docs.ladybugdb.com/export/). | CE: offline dump/load and consistency checks. EE: online backup and additional restore tooling. [Backup](https://neo4j.com/docs/operations-manual/current/backup-restore/). |
-| Logical copy and resumption | Checksummed logical export/import into a fresh identity; opt-in crash-resumable staging and verified promotion. [Transfer](LOGICAL_TRANSFER.md). | CSV/Parquet/JSON export; not proof of identical logical identity/resumption guarantees. [Export](https://docs.ladybugdb.com/export/). | Dump/load is not equivalent to Grafx's typed resumable logical-transfer API. [Backup modes](https://neo4j.com/docs/operations-manual/current/backup-restore/). |
+| Logical copy and resumption | Checksummed resumable fresh-store transfer plus bounded existing-target copy, durable receipts and optional one-hop endpoint closure. History-bearing transfers require explicit current-only semantics. [Transfer](LOGICAL_TRANSFER.md), [copy](CATALOG_COPY.md). | CSV/Parquet/JSON export; not proof of identical logical identity/resumption guarantees. [Export](https://docs.ladybugdb.com/export/). | Dump/load is not equivalent to Grafx's typed resumable logical-transfer API. [Backup modes](https://neo4j.com/docs/operations-manual/current/backup-restore/). |
 | Commit provenance/change capture | Opt-in durable metadata and database-qualified commit lookup/paging. **Not row-change CDC**. [History](COMMIT_HISTORY.md). | An equivalent public commit-catalog/metadata API was not established by this review. | CDC is available in EE and specified Aura tiers; change records are not an exact database copy or Grafx's commit catalog. [CDC](https://neo4j.com/docs/cdc/current/). |
-| Historical/bitemporal graph queries | **Planned GX-CAP-3/4**. MVCC snapshots and commit history do not provide arbitrary durable `AS OF` queries. [Roadmap](../ROADMAP.md). | Temporal value types exist; built-in bitemporal graph versioning was not established. [Types](https://docs.ladybugdb.com/cypher/data-types/). | CDC is not evidence of built-in arbitrary historical graph snapshots; no bitemporal equivalence is claimed. [CDC scope](https://neo4j.com/docs/cdc/current/). |
+| Historical/bitemporal graph queries | Native opt-in retained system-time as-of, versions and graph/schema/property diff; optional authenticated temporal index, retention/pins and quiescent physical compaction. No valid time or full bitemporality. [Temporal scope](SYSTEM_TIME_HISTORY.md). | Temporal value types exist; equivalent native retained graph versions/diff or bitemporal semantics were not established. [Types](https://docs.ladybugdb.com/cypher/data-types/). | CDC is not evidence of built-in arbitrary historical graph snapshots; no bitemporal equivalence is claimed. [CDC scope](https://neo4j.com/docs/cdc/current/). |
 | Authentication/authorization | Host application responsibility; no native users/RBAC/TLS service boundary or at-rest encryption. [Deployment](OPERATIONS.md#deployment-and-ownership). | Embedded file ownership is not an application authorization model; an equivalent native user/RBAC contract was not established. | Server security surface; advanced RBAC/LDAP belongs to EE. [Editions](https://neo4j.com/docs/operations-manual/current/introduction/). |
 | Observability/control | Typed errors/commit reports, verification/ledger, metrics, query budgets and cooperative read cancellation. [Operations](OPERATIONS.md), [read controls](READ_CONTROL_AND_INDEX_CLEANUP.md), [configuration](CONFIGURATION.md). | Separate CLI/Explorer tooling; compare individual operational contracts rather than assuming Grafx's diagnostics are unique. [Documentation](https://docs.ladybugdb.com/). | Server query management and monitoring; tooling/metrics availability varies by edition. [Editions](https://neo4j.com/docs/operations-manual/current/introduction/). |
-| GUI and agent interfaces | Local CLI, no bundled graph GUI or MCP server. Pulse's UI/MCP are **Pulse features**, not Grafx features. [CLI](CLI.md). | Ladybug Explorer and visualization integrations. [Documentation](https://docs.ladybugdb.com/). | Neo4j Browser and additional tooling, some separate products. [Editions](https://neo4j.com/docs/operations-manual/current/introduction/). |
+| GUI and agent interfaces | Local CLI; 0.0.6 adds script-free offline HTML snapshots, not an interactive GUI or native MCP server. Pulse's UI/MCP remain **Pulse features**. [CLI](CLI.md), [HTML snapshots](HTML_SNAPSHOTS.md). | Ladybug Explorer and visualization integrations. [Documentation](https://docs.ladybugdb.com/). | Neo4j Browser and additional tooling, some separate products. [Editions](https://neo4j.com/docs/operations-manual/current/introduction/). |
 | License model | Elastic License 2.0 plus SaaS/branding addendum; do not describe it as MIT or unrestricted hosted-service licensing. [License](../LICENSE), [terms](../README.md#deployment-and-license). | MIT. [Versioned license](https://github.com/LadybugDB/ladybug/blob/v0.20.3/LICENSE). | CE is GPLv3; EE has separate licensing. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
 
 License labels are descriptive, not legal advice; review the actual terms for
 redistribution, embedding or hosted deployment.
 
-## 5. Practical assessment
+## 5. Current Grafx development: implemented deltas and practical value
+
+Every row below is **0.0.6 development**, not the published 0.0.5 package.
+NHC-1–8 have completed local acceptance: 269 affected tests and 2,774 final
+corrective tests passed, plus all 14 real-wheel compatibility cells. The initial
+full run recorded 16,929 passes and nine failures; every failure was corrected
+and explicitly covered by the passing rerun. Counts overlap; this is not a claim
+that a second unchanged full run or a remote platform matrix executed.
+[Exact validation provenance](reports/V006_NHC_ROUND.md).
+The application examples are architectural uses of these contracts, not measured
+customer outcomes or new engine guarantees.
+
+| Capability in development | What it can solve | Boundary and evidence |
+| --- | --- | --- |
+| Native system-time history | Inspect retained nodes, edges and schema as of a qualified commit or timestamp; understand how project knowledge evolved. | Explicit activation captures a baseline, not pre-activation history. Typed `system_as_of`/`system_versions`; bounded retention and pins. System time only, not valid time or full bitemporality. [History](SYSTEM_TIME_HISTORY.md). |
+| System-time graph diff (NHC) | Identify retained schema, node, relationship and property changes between two commits. | `system_diff` compares the same store with explicit bounds and lineage semantics; not arbitrary cross-database diff or row CDC streaming. [Diff API](SYSTEM_TIME_HISTORY.md). |
+| Temporal access tree and physical compaction (NHC) | Use native indexed temporal access and reclaim eligible history storage. | Opt-in capability bits 17/18, one-way activation; compaction requires quiescence. No measured speed or space-saving ratio is asserted. [Temporal operations](SYSTEM_TIME_HISTORY.md), [compatibility](V006_COMPATIBILITY.md). |
+| Named catalogs and workspace resolution | Route application operations to explicitly attached local stores. | `CatalogSession` pins each transaction to one store. No cross-store edges/joins or distributed transaction. [Catalogs](CATALOGS_AND_WORKSPACES.md). |
+| Bounded existing-target copy and endpoint closure | Reuse selected records with durable receipts and indexed idempotent replay; optionally include endpoints of selected relationships. | Atomic target data/receipt, bounded explicit selection; NHC endpoint closure is one hop. Not distributed source/target atomicity. Historical copying requires explicit current-only policy. [Copy](CATALOG_COPY.md). |
+| Typed logical views and nullable columns | Reuse read definitions and add optional fields to an evolving application's schema. | Logical views execute against snapshots and replace atomically. Nullable append preserves prior row layouts without a heap rewrite; neither means arbitrary schema migration. [Views](LOGICAL_VIEWS.md), [columns](NULLABLE_COLUMNS.md). |
+| Exact phrases and durable token positions | Search terms in order; return analyzed token evidence for consumer-side explanations. | Opt-in positional postings, bounded candidate verification. Returned positions are token ordinals, not original character offsets or only matched phrase spans. [FTS](FULL_TEXT_SEARCH.md). |
+| Ordered proximity and analyzer replacement (NHC) | Match ordered phrases with bounded gaps and change an index's analyzer/options under the same name. | `slop` requires durable positions; no phrase/prefix combination. Foreground fresh-generation replacement is atomic, may conflict with writers and uses the current analyzer even for an older data snapshot. [FTS](FULL_TEXT_SEARCH.md). |
+| Posting-hash indexes | Share repeated property keys per physical page and bound repeated-key decoding. | Opt-in index layout; preserves WAL/OCC/verification. Not a universal throughput or write-amplification improvement. [Posting hash](POSTING_HASH.md). |
+| CLI inventories and text/vector/hybrid search | Inspect local schemas, indexes, catalogs and bounded search results from scripts. | Machine-readable local CLI; JS/TS subprocess recipe is not a native network driver. [CLI](CLI.md). |
+| Local SQLite ingestion and offline HTML snapshots | Bring data from a closed local SQLite source into Grafx and inspect/export a graph picture. | Bounded whole-call atomic staging; script-free static HTML, not an interactive graph console. [SQLite](LOCAL_SQLITE_IMPORT.md), [HTML](HTML_SNAPSHOTS.md). |
+| Scalar functions, UNION ALL and topological ordering | Normalize simple values, preserve duplicate rows across two branches and examine directed dependency order. | Closed scalar set; exactly two UNION ALL branches; topological result explicitly reports blocked nodes when cycles prevent a full order. [Queries](QUERY_LANGUAGE.md), [algorithms](GRAPH_PROJECTIONS.md). |
+
+### Competitor interpretation of these additions
+
+These deltas correct Grafx's status; they do not automatically prove a unique
+feature. Ladybug supports attached stores, richer types and an algorithm extension.
+Neo4j has a broad query/procedure ecosystem, GDS and edition-specific CDC and
+operations. Temporal values or CDC alone do not establish equivalence to Grafx's
+retained system-time APIs; conversely, this review does not establish absence of
+all historical-graph solutions in those ecosystems.
+[Ladybug attach](https://docs.ladybugdb.com/cypher/attach/),
+[Ladybug algorithms](https://docs.ladybugdb.com/extensions/algo/),
+[Neo4j GDS](https://neo4j.com/docs/graph-data-science/current/introduction/),
+[Neo4j CDC](https://neo4j.com/docs/cdc/current/).
+
+## 6. Practical assessment
 
 The following are architectural inferences from the contracts above, not measured
 rankings:
@@ -157,7 +197,12 @@ rankings:
   The 0.0.6 development line now has local attached catalogs and bounded atomic
   copy, but no distributed transaction or federated query. [Catalogs](CATALOGS_AND_WORKSPACES.md),
   [copy boundaries](CATALOG_COPY.md).
-- Full temporal graph history and bitemporal queries: **not delivered in 0.0.5**.
+- Valid-time and full bitemporal graph queries remain absent. Retained system-time
+  reads, versions, diffs, an optional index and physical compaction are implemented
+  in the 0.0.6 baseline; they are no longer listed as missing capabilities.
+- Text retrieval still lacks original-character highlighting, language stemming
+  and stopword configuration. Phrase/proximity and token positions close narrower
+  gaps, not the broader language-analysis capabilities of Lucene or Ladybug FTS.
 - Ecosystem and operational evidence: release publication and a large passing
   test suite do not establish production maturity or large-graph SLOs.
 
@@ -167,7 +212,7 @@ Its bounded minimum-parity candidates distinguish inexpensive API/tooling exposu
 from new engine guarantees. Registration is not implementation approval, a version
 promise, or permission to change Pulse. The roadmap remains the sole backlog.
 
-## 6. Performance and migration boundaries
+## 7. Performance and migration boundaries
 
 No common dataset, hardware, cache state, durability policy or query-result
 contract was benchmarked across these three products for this comparison.
@@ -187,7 +232,9 @@ Do not migrate by replacing an import or changing a database filename. Validate
 query syntax, parameter/result types, transaction retries, pagination identity,
 search consistency, maintenance and schema/format activation. Grafx's public
 contracts describe these boundaries in [integration](INTEGRATION.md),
-[queries](QUERY_LANGUAGE.md) and [compatibility](V005_COMPATIBILITY.md).
+[queries](QUERY_LANGUAGE.md) and [0.0.6 compatibility](V006_COMPATIBILITY.md).
+Opt-in native layouts require compatible binaries for every participant; accepting
+the development source does not make those layouts readable by the 0.0.5 wheel.
 
 ## Maintenance
 
@@ -196,3 +243,18 @@ changes. In particular, revalidate Ladybug's documented versus enabled multiwrit
 semantics, Neo4j edition-dependent features and any claimed new temporal/cluster
 capabilities. Linked rolling documentation is evidence accessed on the review
 date, not a frozen promise about future releases.
+
+### September 10, 2026 refresh record
+
+- Promoted the main comparison baseline to validated 0.0.6 development; retained
+  the published 0.0.5 reference explicitly rather than mixing release availability.
+- Added NHC positional/proximity, temporal diff/access/compaction, endpoint closure
+  and analyzer replacement with the acceptance and format boundaries above.
+- Rechecked official Ladybug release, concurrency, transactions, vector/FTS/algo
+  documentation and Neo4j edition, isolation, vector, GraphRAG, GDS and backup
+  documentation. Ladybug 0.20.3 remains the pinned release comparison; rolling
+  docs are not assumed to be release-frozen.
+- Preserved the documented-versus-source Ladybug multiwrite qualification;
+  retained primary source links instead of turning that ambiguity into a negative
+  capability checkbox.
+- No shared workload benchmark or competitor conformance test was performed.

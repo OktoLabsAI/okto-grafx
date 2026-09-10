@@ -40,7 +40,7 @@ try:
             from okto_grafx.domain.model.schema import ColumnDef
             from okto_grafx.domain.model.value import ValueType
             db.add_nullable_column('D', ColumnDef('extra', ValueType.STRING))
-        elif operation == 'system_history':
+        elif operation in ('system_history', 'history_index', 'history_compaction'):
             db.ensure_identity_indexes()
             db.enable_commit_history()
             db.enable_system_history(('D',))
@@ -48,6 +48,19 @@ try:
             assert len(db.system_as_of(at, tables=('D',)).rows) == 2
             db.pin_system_history('matrix', at, tables=('D',))
             assert len(db.system_history_pins()) == 1
+            if operation != 'system_history':
+                db.enable_system_history_index()
+                assert len(db.system_versions('D', db.system_as_of(at, tables=('D',)).rows[0].record_id).versions) == 1
+            if operation == 'history_compaction':
+                db.unpin_system_history('matrix')
+                for i in range(4):
+                    with db.begin() as tx:
+                        tx.execute('MATCH (d:D {id:1}) SET d.v=$v', {'v':str(i)*8000})
+                with db.begin() as tx:
+                    tx.execute("MATCH (d:D {id:1}) SET d.v='retained'")
+                at = db.commit_history().entries[-1].identity
+                db.prune_system_history(at, tables=('D',))
+                assert db.compact_system_history(confirm_quiescent=True).physical_bytes_reclaimed > 0
         elif operation == 'positions':
             from okto_grafx import TextIndexOptions
             db.create_text_index('fts', 'D', ('v',), bucket_count=4,
@@ -95,7 +108,7 @@ def main():
             subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(package), str(wheel)],
                            check=True, capture_output=True, text=True, timeout=120)
         for profile in ("pure", "accelerated"):
-            for capability in ("default", "posting", "nullable", "system_history", "positions"):
+            for capability in ("default", "posting", "nullable", "system_history", "positions", "history_index", "history_compaction"):
                 path = root / (profile + "-" + capability)
                 seed = run(packages[0], path, "seed", profile)
                 assert seed == dict(version="0.0.5", outcome="opened", rows=[[1]]), seed

@@ -13,6 +13,10 @@ import hashlib
 import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from okto_grafx.engine.system_history_index_store import PreparedHistoryIndex
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError, GrafxCorruptionDetected, GrafxError, GrafxQueryBudgetExceeded,
@@ -30,6 +34,7 @@ _BLOCK = struct.Struct("<8s16sQIIII32s32s")
 _ROW = struct.Struct("<BQII")
 _U32 = struct.Struct("<I")
 _HEAD_MAGIC = b"GXHYHD01"
+_COMPACT_HEAD_MAGIC = b"GXHYHD03"
 _BLOCK_MAGIC = b"GXHYBL01"
 _MAX_BATCH = 16 * 1024 * 1024
 _MAX_ROW = 1024 * 1024
@@ -187,6 +192,8 @@ class PreparedHistoryAppend:
     first_page: int
     previous_digest: bytes
     payload: bytes
+    index: PreparedHistoryIndex | None = None
+    compacted: bool = False
 
     def __post_init__(self) -> None:
         """Refuse forged/unbounded detached inputs; this still grants no write authority."""
@@ -207,29 +214,44 @@ class PreparedHistoryAppend:
     def image_count(self) -> int:
         """Return fixed cardinality independent of the terminal WAL sequence."""
         capacity = self.page_size - 32 - 4 - _BLOCK.size
-        return 1 + (len(self.payload) + capacity - 1) // capacity
+        count = (len(self.payload) + capacity - 1) // capacity
+        if self.index is None:
+            return 1 + count
+        _, _, indexed = self.index.bind(database_uuid=self.database_uuid, page_size=self.page_size,
+            sequence=self.previous_sequence + 1, first_page=self.first_page + count,
+            changes=_decode_changes(self.payload))
+        return 1 + count + len(indexed)
 
     def bind(self, sequence: int) -> tuple[HistoryPageImage, ...]:
         """Produce immutable head/chunks at one qualified future COMMIT coordinate."""
         CommitId(self.database_uuid, sequence)
         if sequence <= self.previous_sequence:
             raise _invalid("commit_order")
-        count = self.image_count - 1
         capacity = self.page_size - 32 - 4 - _BLOCK.size
+        count = (len(self.payload) + capacity - 1) // capacity
         if self.first_page + count >= NO_PAGE:
             raise _invalid("page_extent")
         digest = hashlib.sha256(self.payload).digest()
-        chain = hashlib.sha256(self.previous_digest + struct.pack("<Q", sequence) + digest).digest()
-        header = _HEAD.pack(_HEAD_MAGIC, self.database_uuid, self.activation,
-                            sequence, self.batch_count + 1, self.first_page + count, chain)
-        images = [_image(self.page_size, 0, sequence, header)]
+        extra = ()
+        extension = proof = b""
+        block_magic = _BLOCK_MAGIC
+        if self.index is not None:
+            from okto_grafx.engine.system_history_index_store import _EXT, _EXT_MAGIC, _INDEX_BLOCK_MAGIC
+            root, proof, extra = self.index.bind(database_uuid=self.database_uuid, page_size=self.page_size,
+                sequence=sequence, first_page=self.first_page + count, changes=_decode_changes(self.payload))
+            extension = _EXT.pack(_EXT_MAGIC, *root)
+            block_magic = _INDEX_BLOCK_MAGIC
+        chain = hashlib.sha256(self.previous_digest + struct.pack("<Q", sequence) + digest + proof).digest()
+        header = _HEAD.pack(_COMPACT_HEAD_MAGIC if self.compacted else _HEAD_MAGIC, self.database_uuid, self.activation,
+                            sequence, self.batch_count + 1, self.first_page + count + len(extra), chain)
+        images = [_image(self.page_size, 0, sequence, header + extension)]
         for part in range(count):
             chunk = self.payload[part * capacity:(part + 1) * capacity]
-            block = _BLOCK.pack(_BLOCK_MAGIC, self.database_uuid, sequence,
+            block = _BLOCK.pack(block_magic, self.database_uuid, sequence,
                                 self.batch_count, part, count, len(self.payload),
                                 self.previous_digest, digest) + chunk
             images.append(_image(self.page_size, self.first_page + part, sequence, block))
-        return tuple(images)
+        return (*images, *extra)
 
 
 def _image(page_size: int, number: int, sequence: int, payload: bytes) -> HistoryPageImage:
@@ -276,33 +298,39 @@ class SystemHistoryStore:
             raise _corrupt("page_shape")
         return page
 
-    def _head(self, expected_sequence: int, page_count: int):
+    def _head_state(self, expected_sequence: int, page_count: int):
         CommitId(self.database_uuid, expected_sequence)
         if type(page_count) is not int or not 1 <= page_count < NO_PAGE:
             raise _invalid("page_count")
         page = self._page(0)
         raw = page.read_slot(0)
-        if len(raw) != _HEAD.size:
-            raise _corrupt("head_length")
-        magic, identity, activation, sequence, batches, next_page, digest = _HEAD.unpack(raw)
-        if (magic != _HEAD_MAGIC or identity != self.database_uuid or sequence != expected_sequence
+        from okto_grafx.engine.system_history_index_store import head_root
+        head_root(raw, _HEAD.size)
+        magic, identity, activation, sequence, batches, next_page, digest = _HEAD.unpack_from(raw)
+        if (magic not in (_HEAD_MAGIC, _COMPACT_HEAD_MAGIC) or identity != self.database_uuid or sequence != expected_sequence
                 or page.page_lsn != sequence or not 0 < activation <= sequence
-                or next_page != page_count or batches > next_page - 1 or batches >= 2**32
+                or next_page > page_count or next_page != page_count and magic != _COMPACT_HEAD_MAGIC
+                or batches > next_page - 1 or batches >= 2**32
                 or (batches == 0 and (next_page != 1 or digest != bytes(32) or activation != sequence))):
             raise _corrupt("head_coverage")
-        return activation, sequence, batches, next_page, digest
+        return (activation, sequence, batches, next_page, digest), magic == _COMPACT_HEAD_MAGIC
+
+    def _head(self, expected_sequence: int, page_count: int):
+        return self._head_state(expected_sequence, page_count)[0]
 
     def prepare(self, changes: Sequence[HistoryChange], *, expected_sequence: int,
-                page_count: int) -> PreparedHistoryAppend:
+                page_count: int, index: PreparedHistoryIndex | None = None) -> PreparedHistoryAppend:
         """Capture bounded event bytes and one exact root, without allocation or writes."""
         payload = _encode_changes(changes)
-        activation, sequence, batches, next_page, digest = self._head(expected_sequence, page_count)
+        head, compacted = self._head_state(expected_sequence, page_count)
+        activation, sequence, batches, next_page, digest = head
         return PreparedHistoryAppend(self.database_uuid, self.page_size, activation, sequence,
-                                     batches, next_page, digest, payload)
+                                     batches, next_page, digest, payload, index,
+                                     compacted)
 
     def validate_append_images(
         self, images: tuple[HistoryPageImage, ...], *, previous_sequence: int,
-        page_count: int, commit: CommitId,
+        page_count: int, commit: CommitId, index: PreparedHistoryIndex | None = None,
     ) -> tuple[HistoryChange, ...]:
         """Check one complete append against a separately supplied previous root.
 
@@ -322,6 +350,8 @@ class SystemHistoryStore:
             raise _invalid("page_count")
         capacity = self.page_size - 32 - 4 - _BLOCK.size
         max_images = 1 + (_MAX_BATCH + capacity - 1) // capacity
+        if index is not None:
+            max_images = 2**31 // self.page_size
         if type(images) is not tuple or not 2 <= len(images) <= max_images:
             raise _corrupt("append_image_count")
         supplied = {}
@@ -338,7 +368,8 @@ class SystemHistoryStore:
             raise _corrupt("append_extent")
 
         # All input/resource checks above precede even the single predecessor read.
-        activation, sequence, batches, next_page, digest = self._head(previous_sequence, page_count)
+        head, compacted = self._head_state(previous_sequence, page_count)
+        activation, sequence, batches, next_page, digest = head
 
         def read_image(file: str, number: int) -> bytes:
             """Read captured images only; never fill a missing chunk from storage."""
@@ -353,7 +384,13 @@ class SystemHistoryStore:
             raise _corrupt("append_root_transition")
         pieces = []
         total = 0
-        for number in range(page_count, extent):
+        first_payload = incoming._page(page_count).read_slot(0)
+        if len(first_payload) <= _BLOCK.size:
+            raise _corrupt("append_chunk")
+        history_chunks = _BLOCK.unpack_from(first_payload)[5]
+        if not 1 <= history_chunks <= (_MAX_BATCH + capacity - 1) // capacity:
+            raise _corrupt("append_chunk_count")
+        for number in range(page_count, page_count + history_chunks):
             page = incoming._page(number)
             raw = page.read_slot(0)
             if page.page_lsn != commit.sequence or len(raw) <= _BLOCK.size:
@@ -366,7 +403,8 @@ class SystemHistoryStore:
         payload = b"".join(pieces)
         changes = _decode_changes(payload)
         expected = PreparedHistoryAppend(self.database_uuid, self.page_size, activation,
-                                         sequence, batches, next_page, digest, payload)
+                                         sequence, batches, next_page, digest, payload, index,
+                                         compacted)
         if expected.image_count != len(images):
             raise _corrupt("append_image_count")
         # Canonical regeneration binds every chunk header/hash and the whole root
@@ -398,6 +436,18 @@ class SystemHistoryStore:
             output.append((identity, changes))
         return tuple(output)
 
+    def _index_start(self, *, expected_sequence: int, page_count: int) -> int | None:
+        """Locate activation through bounded batch descriptors, skipping immutable tree pages."""
+        from okto_grafx.engine.system_history_index_store import _INDEX_BLOCK_MAGIC
+        _, _, batches, _, _ = self._head(expected_sequence, page_count)
+        number = 1
+        for _ in range(batches):
+            fields = _BLOCK.unpack_from(self._page(number).read_slot(0))
+            if fields[0] == _INDEX_BLOCK_MAGIC:
+                return fields[2]
+            number += fields[5]
+        return None
+
     def _iter_batches(self, *, expected_sequence: int, page_count: int):
         """Stream private validation work, bounded per batch, with terminal chain proof.
 
@@ -405,7 +455,9 @@ class SystemHistoryStore:
         Public callers materialize under their own aggregate budgets; recovery
         can validate arbitrary retained extent without keeping old events in RAM.
         """
-        activation, _, batches, _, expected_digest = self._head(expected_sequence, page_count)
+        from okto_grafx.engine.system_history_index_store import head_root, trailer, _INDEX_BLOCK_MAGIC
+        activation, _, batches, page_count, expected_digest = self._head(expected_sequence, page_count)
+        root = None
         number = 1
         previous_sequence = activation - 1 if batches else activation
         chain = bytes(32)
@@ -422,8 +474,8 @@ class SystemHistoryStore:
                     raise _corrupt("chunk_length")
                 magic, identity, sequence, batch, position, count, size, previous, digest = _BLOCK.unpack_from(raw)
                 capacity = self.page_size - 32 - 4 - _BLOCK.size
-                descriptor = (sequence, count, size, previous, digest)
-                if (magic != _BLOCK_MAGIC or identity != self.database_uuid or batch != ordinal
+                descriptor = (sequence, count, size, previous, digest, magic)
+                if (magic not in (_BLOCK_MAGIC, _INDEX_BLOCK_MAGIC) or identity != self.database_uuid or batch != ordinal
                         or position != part or not previous_sequence < sequence <= expected_sequence
                         or not sequence <= page.page_lsn <= expected_sequence or previous != chain
                         or not 4 <= size <= _MAX_BATCH or count != (size + capacity - 1) // capacity
@@ -440,8 +492,26 @@ class SystemHistoryStore:
             if hashlib.sha256(payload).digest() != digest:
                 raise _corrupt("batch_digest")
             changes = _decode_changes(payload)
+            proof = b""
+            if magic == _INDEX_BLOCK_MAGIC:
+                marker = self._page(number)
+                if not sequence <= marker.page_lsn <= expected_sequence:
+                    raise _corrupt("index_transition_stamp")
+                raw_marker = marker.read_slot(0)
+                previous_root, current_root, node_count = trailer(raw_marker, self.database_uuid, sequence)
+                if root is not None and previous_root != root or root is None and previous_root != (0, bytes(32)):
+                    raise _corrupt("index_transition_chain")
+                root = current_root
+                number += 1 + node_count
+                if number > page_count or root[0] >= number:
+                    raise _corrupt("index_transition_extent")
+                proof = hashlib.sha256(raw_marker).digest()
+            elif root is not None:
+                raise _corrupt("index_transition_missing")
             yield CommitId(self.database_uuid, sequence), changes, len(payload)
-            chain = hashlib.sha256(chain + struct.pack("<Q", sequence) + digest).digest()
+            chain = hashlib.sha256(chain + struct.pack("<Q", sequence) + digest + proof).digest()
             previous_sequence = sequence
         if number != page_count or chain != expected_digest or previous_sequence != expected_sequence:
             raise _corrupt("chain_coverage")
+        if root != head_root(self._page(0).read_slot(0), _HEAD.size):
+            raise _corrupt("index_terminal_root")

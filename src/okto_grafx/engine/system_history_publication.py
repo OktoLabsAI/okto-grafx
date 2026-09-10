@@ -19,6 +19,7 @@ from okto_grafx.engine.system_history_store import (
     HistoryChange, HistoryPageImage, PreparedHistoryAppend, SystemHistoryStore, _encode_changes,
 )
 from okto_grafx.engine.system_history_retention import PreparedHistoryRetention
+from okto_grafx.engine.system_history_index_store import PreparedHistoryIndex, head_root
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,7 @@ class _Control:
     reads: frozenset[int]
     retention: PreparedHistoryRetention | None = None
     sequence: int = 1
+    index: PreparedHistoryIndex | None = None
 
 
 class HistoryPublication:
@@ -216,8 +218,31 @@ class HistoryPublication:
             if prepared.previous_sequence != current:
                 raise GrafxConfigurationError("Retention's original picture changed.", field="system_history_retention")
         else:
+            index = None if control is None else control.index
+            if "system_history_index_v1" in source.required_capabilities() or index is not None:
+                from okto_grafx.engine.system_history_store import _HEAD
+                root = head_root(store._page(0).read_slot(0), _HEAD.size)
+                if index is None:
+                    if root is None:
+                        raise GrafxConfigurationError("Enabled temporal index has no native root.", field="system_history_index")
+                    index = PreparedHistoryIndex(read, root)
+                captured = {}
+                original = index
+
+                def capture(file: str, number: int) -> bytes:
+                    """Capture the immutable predecessor paths once, before second OCC."""
+                    if (file, number) not in captured:
+                        captured[file, number] = original.read(file, number)
+                    return captured[file, number]
+
+                from dataclasses import replace
+                index = replace(index, read=capture)
+                preview = store.prepare(changes, expected_sequence=current,
+                    page_count=pool.storage.page_count("system-history.dat"), index=index)
+                preview.bind(current + 1)
+                index = replace(index, read=lambda file, number: captured[file, number])
             prepared = None if first else store.prepare(changes, expected_sequence=current,
-                                                         page_count=pool.storage.page_count("system-history.dat"))
+                page_count=pool.storage.page_count("system-history.dat"), index=index)
         attempt = _Attempt(txn.txn_id, prepared, changes, manager._database_uuid, pool.page_size)
         images = attempt.bind(current + 1)
         locations = frozenset((image.file, image.page_index) for image in images)
@@ -241,6 +266,89 @@ class HistoryPublication:
         if attempt is None or attempt.txn_id != txn_id:
             return {}
         return {(image.file, image.page_index): image.raw for image in attempt.bind(sequence)}
+
+    def stage_index(self, txn: TransactionContext, *, max_bytes: int) -> bool:
+        """Build an optional temporal access baseline in a sealed dedicated transaction."""
+        manager = self.manager
+        operation = "enable system history index"
+        manager._require_fresh_index_catalog_transaction(txn, operation=operation, purpose=operation)
+        with manager._participant_section():
+            manager._require_current_active(txn)
+            manager._require_recovery_complete()
+            with manager.schema_artifact_section(sync_if=lambda: True):
+                source = manager._catalog.catalog
+                if "system_history_index_v1" in source.required_capabilities():
+                    return False
+                if not source.system_history_tables():
+                    raise GrafxConfigurationError("Enable system history first.", field="system_history")
+                pool = manager._pool
+                if pool.storage.file_size("system-history.dat") > max_bytes:
+                    raise GrafxTransactionBudgetExceeded("Index baseline exceeds capture budget.", field="max_bytes")
+                txn.note_read(page_partition("system-history.dat", 0))
+                store = SystemHistoryStore(lambda file, number: pool.codec.encode_page(pool.read_fresh_page(file, number)),
+                    database_uuid=manager._database_uuid, page_size=pool.page_size)
+                from okto_grafx.engine.system_history_reader import fold_history
+                from okto_grafx.domain.temporal import TemporalLimits
+                sequence = txn.snapshot.read_lsn
+                count = pool.storage.page_count("system-history.dat")
+                fold_history(store, expected_sequence=sequence, page_count=count,
+                    target=CommitId(manager._database_uuid, sequence),
+                    table_ids=tuple(key for key, _, _ in source.system_history_tables()),
+                    retention_horizons={key: floor for key, _, floor in source.system_history_tables()},
+                    limits=TemporalLimits(max_bytes=max_bytes))
+                baseline = tuple((identity.sequence, changes) for identity, changes, _ in
+                    store._iter_batches(expected_sequence=sequence, page_count=count))
+                candidate = source.copy()
+                candidate._enable_system_history_index()
+                candidate.serialize()
+                for number, raw in manager._catalog.stage(candidate):
+                    manager._stage_page_image(txn, manager._file_ids.catalog_file, number, raw)
+                self.controls[txn.txn_id] = _Control(candidate.serialize(), frozenset(txn.read_partitions),
+                    index=PreparedHistoryIndex(lambda *_: b"", baseline=baseline))
+                return True
+
+    def stage_compaction(self, txn: TransactionContext, *, max_bytes: int) -> PreparedHistoryRetention | None:
+        """Capture a quiescent full replacement with unchanged logical retention policy."""
+        manager = self.manager
+        operation = "compact system history"
+        manager._require_fresh_index_catalog_transaction(txn, operation=operation, purpose=operation)
+        with manager._participant_section():
+            manager._require_current_active(txn)
+            manager._require_recovery_complete()
+            with manager.schema_artifact_section(sync_if=lambda: True):
+                from dataclasses import replace
+                from okto_grafx.engine.system_history_reader import fold_history
+                from okto_grafx.engine.system_history_retention import prepare_retention
+                from okto_grafx.domain.temporal import TemporalLimits
+                source = manager._catalog.catalog
+                if not source.system_history_tables():
+                    raise GrafxConfigurationError("Enable history first.", field="system_history")
+                pool = manager._pool
+                original = pool.storage.file_size("system-history.dat")
+                if original > max_bytes:
+                    raise GrafxTransactionBudgetExceeded("Compaction capture exceeds byte budget.", field="max_bytes")
+                sequence = txn.snapshot.read_lsn
+                store = SystemHistoryStore(lambda file, number: pool.codec.encode_page(pool.read_fresh_page(file, number)),
+                    database_uuid=manager._database_uuid, page_size=pool.page_size)
+                count = pool.storage.page_count("system-history.dat")
+                fold_history(store, expected_sequence=sequence, page_count=count,
+                    target=CommitId(manager._database_uuid, sequence),
+                    table_ids=tuple(key for key, _, _ in source.system_history_tables()),
+                    retention_horizons={key: floor for key, _, floor in source.system_history_tables()},
+                    limits=TemporalLimits(max_bytes=max_bytes))
+                plan = prepare_retention(store, sequence=sequence, page_count=count, tables=(), before=0)
+                plan = replace(plan, compact=True, batches=tuple((identity, tuple(
+                    replace(change, redacted_bytes=0) if change.operation in (5, 6) else change for change in changes))
+                    for identity, changes in plan.batches))
+                if len(plan.bind(sequence + 1)) * pool.page_size >= original:
+                    return None
+                txn.note_read(page_partition("system-history.dat", 0))
+                candidate = source.copy()
+                candidate._stage_history_compaction()
+                for number, raw in manager._catalog.stage(candidate):
+                    manager._stage_page_image(txn, manager._file_ids.catalog_file, number, raw)
+                self.controls[txn.txn_id] = _Control(candidate.serialize(), frozenset(txn.read_partitions), plan)
+                return plan
 
     def stage_control(self, txn: TransactionContext, *, operation: str, names: tuple[str, ...] = (),
                       before: CommitId | None = None, pin_name: str | None = None,
