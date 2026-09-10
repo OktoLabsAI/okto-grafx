@@ -30,6 +30,7 @@ not a full release-wide regression. See [configuration](docs/CONFIGURATION.md).
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
+- [Approved capability continuation after 4ee4d2e](#approved-capability-continuation-after-4ee4d2e)
 - [Approved continuation after a4dd85a](#approved-continuation-after-a4dd85a)
 - [Approved continuation after 970aa1e](#approved-continuation-after-970aa1e)
 - [Approved continuation after 7dde256](#approved-continuation-after-7dde256)
@@ -75,6 +76,49 @@ not a full release-wide regression. See [configuration](docs/CONFIGURATION.md).
 | Open limitation | Present constraint or unclosed acceptance requirement |
 | Historical / revalidate | Older finding retained; do not assert it still reproduces without checking current source |
 | Deferred / rejected | Not an active implementation task; reopening needs evidence/decision |
+
+## Approved capability continuation after 4ee4d2e
+
+Approved September 10, 2026, on `feature/v0.0.6`; these are **not** the already
+completed minimum-parity MP-1–MP-8. Fixed order and DoD: feature tests, grouped
+affected regression, roadmap plus capability/configuration/API docs. No Pulse
+installation, PyPI release or production store mutation is implied.
+
+| Order | Existing initiative | Bounded delivery | Current status |
+| --- | --- | --- | --- |
+| 1 | GX-CAP-2 | CatalogSession: aliases, ownership/permissions and single-store pinned transactions | Complete in development; grouped affected regression passed |
+| 2 | GX-CAP-2 | Optional explicit-root/allowlist/bounded-marker workspace resolver | Complete in development; grouped affected regression passed |
+| 3 | GX-CAP-2 | Bounded copy/promotion into an existing target, atomic data plus durable idempotency receipt | Implemented and tested: bounded PK-table/fail-policy slice; broader copy policies remain outside this slice |
+| 4 | GX-CAP-5 | Positional full-text phrase search | Implemented and tested: exact analyzed phrase verification; durable positional postings/position-return APIs remain open |
+| 5 | GX-CAP-10 | Read-only logical views | Implemented and tested: bounded typed base-table views, snapshots and atomic definitions. [Evidence](docs/reports/V006_VIEWS_SCHEMA_CHECKPOINT.md) |
+| 6 | GX-CAP-10 | Nullable column addition with old-row/schema compatibility | Implemented and tested: typed append-only column API, required bit 13 and exact prior layouts. [Evidence](docs/reports/V006_VIEWS_SCHEMA_CHECKPOINT.md) |
+| 7 | OPS-5 / PERF-SCALE | Repeated-key posting layout, based on confirmed hotspot evidence | Implemented and tested: opt-in `posting_hash`, bounded same-key INSERT preparation, native snapshots/recovery/maintenance. [Usage](docs/POSTING_HASH.md), [acceptance](docs/reports/V006_POSTING_TEMPORAL_CHECKPOINT.md) |
+| 8 | GX-CAP-3 | Opt-in durable system-time history, first persistence checkpoint | Partial internal foundation: typed event codec, bounded immutable append-image plans and complete append-transition validation tested. **Not connected to native commit/recovery, not a consumer history API.** [Exact remaining boundary](docs/specs/SYSTEM_HISTORY_APPEND_DRAFT.md) |
+
+Items 1–2 share **437 passing affected regression tests** (51.06 s, Windows).
+[Acceptance evidence and exclusions](docs/reports/V006_CATALOG_WORKSPACE_ACCEPTANCE.md).
+The subsequent 1–4 checkpoint passed **916 grouped tests** (241.58 s), including
+an inherited scalar import-contract correction. [Evidence and explicit boundaries](docs/reports/V006_COPY_PHRASE_ACCEPTANCE.md).
+The 1–6 expanded checkpoint passed **7,535 tests** (994.36 s), followed by
+**155 supplemental tests** (144.57 s) after the virtual-NULL cache-admission fix.
+Counts overlap and are not added. [Commands, crash cuts and remaining work](docs/reports/V006_VIEWS_SCHEMA_CHECKPOINT.md).
+The item-7 checkpoint passed **6,830 affected regression tests**, followed by
+**1,314 final supplemental tests** after reference-preflight and documentation
+corrections. Item 8 has a tested internal prototype, not native history recording.
+[Exact build/test boundaries and remaining delivery](docs/reports/V006_POSTING_TEMPORAL_CHECKPOINT.md).
+The entire eight-item delivery remains **in progress**. Items 1–2 introduce no
+persistent format changes or new connection flags. Public consumption
+and limits: [catalogs/workspaces](docs/CATALOGS_AND_WORKSPACES.md). Their completion
+does not close the full CAP-2 spec: arbitrary subgraph selection and CLI inventory remain
+separately tracked. [Copy consumption and limitations](docs/CATALOG_COPY.md),
+[phrase semantics](docs/FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development).
+A snapshot or commit journal is **not** retained graph history.
+Existing logical transfer into a fresh destination does **not** satisfy item 3's
+atomic update and replay contract for an existing destination.
+
+Persistence work must freeze exact capabilities, bytes, recovery/refusal and
+backup/transfer behavior before claiming completion. This is the existing spec's
+prerequisite, not a new performance gate. No marginal timing target is added.
 
 ## Current delivery boundary
 
@@ -529,7 +573,7 @@ No additional marginal performance threshold is introduced by this requirement.
 | OPS-2 / §8.2 | Implemented bounded v1 plus explicit resume extension | Streaming checksummed logical schema/data/vectors, parallel edges, current-ID mappings, FTS declarations, private-workspace crash resumption and verified no-replace promotion. Current state only; no existing-target merge or historical journal copy. [Contract](docs/LOGICAL_TRANSFER.md), [latest acceptance](docs/reports/V005_SEARCH_RESUME_CHECKPOINT.md). |
 | OPS-3 / P1.4, §8.3 | Partial: quiescent vacuum, validated overflow reuse and opt-in indexed candidate discovery | Retirement and immutable candidate directories are WAL-published. Default discovery remains amortized O(heap pages); indexed discovery visits candidates/stale entries/directory pages and is not constant time. Quiescence remains an operator assertion; truncation and online vacuum remain unimplemented. [Indexed discovery](docs/OPERATIONS.md#indexed-retired-overflow-discovery-005-development). |
 | OPS-4 / P1.8 | Partial: per-picture and aggregate per-handle HNSW admission, configurable key memo and diagnostics; still not RSS caps | Cross-handle/provider/temporary retention and measured process envelopes remain. Preserve deterministic refusal; do not derive RSS promises from nominal page bytes. [Memory contract](docs/INDEXES_AND_VECTORS.md#continuation-after-69ed311-bounded-maintenance-and-memory). |
-| OPS-5 / P1.12 | Partial: growth/rebuild, quiescent cleanup, 65,536-bucket sizing, sparse page-wise maintenance/batched heads and configurable repeated-key decoding | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement, sharding and a new repeated-key posting layout remain. [Index contract](docs/INDEXES_AND_VECTORS.md), [cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
+| OPS-5 / P1.12 | Partial: growth/rebuild, quiescent cleanup, 65,536-bucket sizing, sparse page-wise maintenance/batched heads, configurable HASH decoding and opt-in repeated-key posting layout | Cleanup preserves catalog-owned STALE/BUILDING and retained-WAL dependencies. Online/catalog-generation retirement and sharding remain. [Posting layout](docs/POSTING_HASH.md), [index contract](docs/INDEXES_AND_VECTORS.md), [cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
 | OPS-6 / P1.11 | Partial: sparse head-initialization barriers shared inside one committed publication; physical conflicts and exclusive publication remain | Remove only proven redundant publication/page work. Disjoint logical rows may still conflict; do not promise linear writer scaling or replace multiwriter with an application-wide single-writer premise. |
 | OPS-7 / P2.6, P2.9 | Implemented bounded DX/isolation checkpoint in 0.0.5 | Typed `Unpack[ConnectOptions]` plus per-connection checksum selection, including custom registries. Standalone low-level installers retain their legacy default outside database operations. No checksum algorithm or persisted byte semantics changed. [R2 evidence](docs/reports/V005_R1_R2_CHECKPOINT.md). |
 | OPS-8 / §8.5 | Partial: reusable Query/cursor and cooperative read cancellation/deadlines exist | `Query` is not a durable prepared plan or HTTP token. Broader streaming/prepared APIs remain; controls do not preempt blocking calls, run watchdog cleanup or interrupt commits. [Contract](docs/READ_CONTROL_AND_INDEX_CLEANUP.md). |
@@ -653,15 +697,15 @@ physical edges do not cross stores. Embedding generation stays outside the engin
 | --- | --- | --- |
 | GX-CAP-0 | Implemented checkpoint | Database-first boundaries, six ADRs, capability manifest, isolated package/import checks. [Spec](docs/specs/SPEC-GX-CAP-0.md). |
 | GX-CAP-1 | Implemented bounded N4 checkpoint | Qualified CommitId, opt-in durable metadata/history, monotonic logical commit time, lookup/pagination, verification and coordinated transfer/restore semantics. Not full temporal row history; logical graph v1 transfer excludes historical journal entries. [Evidence](docs/reports/V005_N3_N4_ACCEPTANCE.md), [usage](docs/COMMIT_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-1.md). |
-| GX-CAP-2 | Planned | Attached CatalogSession, explicit resolution/permissions, workspace scopes, one-store writes, copy/promotion receipts; provenance depends on CAP-1. [Spec](docs/specs/SPEC-GX-CAP-2.md). |
-| GX-CAP-3 | Planned | Opt-in system-time history, historical schema/edges, delete/recreate semantics, retention, indexes and typed time-travel API; CAP-1 first. [Spec](docs/specs/SPEC-GX-CAP-3.md). |
+| GX-CAP-2 | Partial: session/workspace and bounded copy implemented | Explicit resolution/permissions, ownership, pinned one-store transactions, bounded workspace discovery and atomic PK-table copy/fail policy with indexed durable receipts. Arbitrary selection, skip/merge, anonymous-node copy, CLI inventory and federation remain open. [Spec](docs/specs/SPEC-GX-CAP-2.md), [evidence](docs/reports/V006_COPY_PHRASE_ACCEPTANCE.md). |
+| GX-CAP-3 | Partial internal prototype; native persistence not implemented | Typed event/image planning and append-transition validation tested, without runtime admission. Opt-in atomic history, historical schema/edge semantics, retention, indexes and typed time-travel API remain. [Spec](docs/specs/SPEC-GX-CAP-3.md), [exact prototype boundary](docs/specs/SYSTEM_HISTORY_APPEND_DRAFT.md). |
 | GX-CAP-4 | Planned | Valid time, bitemporal semantics and graph/version diff; builds on CAP-3. [Spec](docs/specs/SPEC-GX-CAP-4.md). |
-| GX-CAP-5 | Implemented v1 plus bounded prefixes, relationship indexes and durable/history statistics | Native FTS, frozen analyzers, weighted BM25, exact snapshot scores, full lifecycle and required bits 11/12. Pure analysis reuse, bounded WAL deltas and eligible persisted summaries reduce work; old/ineligible census remains linear. Phrase/position search and same-name analyzer replacement remain unsupported. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [latest evidence](docs/reports/V005_AFTER_69ED311.md). |
+| GX-CAP-5 | Implemented v1 plus prefixes, relationship indexes, durable/history statistics and exact phrase verification | Native FTS, frozen analyzers, weighted BM25, snapshot scores and full lifecycle. Phrase positions are verified in same-snapshot heap candidates; durable positional postings, position-return/proximity APIs and same-name analyzer replacement remain open. Existing ineligible-statistics census remains linear. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [latest evidence](docs/reports/V006_COPY_PHRASE_ACCEPTANCE.md). |
 | GX-CAP-6 | Implemented bounded v1 plus certified incident expansion and shared controls/memory | Weighted RRF, union/intersection, source explanations, graph boost/filter, explicit missing-source partial policy, indexed BFS and per-phase logical peaks. No embedding provider, cross-table fusion, graph-only candidate expansion or universal recall promise. [Usage](docs/HYBRID_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-6.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
 | GX-CAP-7 | Partial: trusted scalar SPI implemented | Explicit immutable per-handle registry, typed scalar UDFs/direct calls, NULL/value budgets and typed failures. Aggregate/table/procedure extensions, durable manifests and sandboxing are not implemented. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-7.md). |
 | GX-CAP-8 | Partial: scalar/vector Arrow, Pandas/Polars, local Parquet/CSV/JSONL and detached graph exchange implemented | Explicit native vector identity, nullable typed batches, atomic import staging and caller-owned commit; bounded local files and NetworkX/projection Arrow exports. External query scans/COPY, arbitrary nested/entity ingestion and graph import remain. [Usage](docs/TABULAR_AND_PARQUET.md), [text](docs/LOCAL_TEXT_IMPORT.md), [exchange](docs/GRAPH_EXCHANGE.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |
 | GX-CAP-9 | Partial: weighted projections, retained lookup/CSR/transitions/simple topology, degree/WCC/SCC, BFS/Dijkstra, PageRank, k-core and label propagation implemented | Bounded read-only algorithms, cancellation, explicit NumPy and independent/NetworkX oracles for declared algorithms. Persistent catalog, mutation/write modes, Louvain and broader algorithm packages remain. [Usage](docs/GRAPH_PROJECTIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-9.md). |
-| GX-CAP-10 | Partial: additive application migration ledger/checksums/dry-run implemented in the eight-item continuation | Atomic per-version CREATE NODE/REL TABLE and VECTOR SPACE with bounded retries/resumption. Staged column evolution, arbitrary ALTER, logical views and derived/materialized graphs remain; distinct from engine format migration. [Consumer guide](docs/SCHEMA_MIGRATIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-10.md). |
+| GX-CAP-10 | Partial: additive migrations, bounded logical views and nullable-column evolution | Atomic per-version CREATE DDL; typed persisted base-table read views; typed append-only nullable columns with exact old-row layouts. Arbitrary ALTER, other S1/S2/S3 migrations, nested views and derived/materialized graphs remain. [Migrations](docs/SCHEMA_MIGRATIONS.md), [views](docs/LOGICAL_VIEWS.md), [columns](docs/NULLABLE_COLUMNS.md), [remaining spec](docs/specs/SPEC-GX-CAP-10.md). |
 | GX-CAP-11 | Partial: 0.0.5 compatibility automation and local upgrade evidence implemented | Real-wheel upgrade/refusal, cross-selector reopen and Windows/Ubuntu × Python 3.11–3.13 workflow. Remote matrix runs and release acceptance are not implied. [Current evidence](docs/V005_COMPATIBILITY.md), [spec](docs/specs/SPEC-GX-CAP-11.md). |
 
 Implementation precedence: close release boundary → complete CAP-1 → catalog/

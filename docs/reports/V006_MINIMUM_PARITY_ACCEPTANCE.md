@@ -3,6 +3,12 @@
 Date: 2026-09-10. Branch: `feature/v0.0.6`. This describes the local source
 working tree, not a published wheel, merge or installation in Pulse.
 
+Subsequent correction: the expanded copy/phrase checkpoint found and fixed the
+missing postponed-annotation import in `domain/query/scalars.py`. The scalar
+feature/parameter/extension suites were rerun in its 916-test passing regression.
+[Follow-up evidence](V006_COPY_PHRASE_ACCEPTANCE.md). Earlier results below remain
+the original checkpoint's scope, not a retroactive full import-policy pass.
+
 ## Scope delivered
 
 | ID | Implementation | Consumer contract / focused tests |

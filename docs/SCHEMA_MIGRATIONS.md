@@ -1,5 +1,9 @@
 # Application schema migrations
 
+For the separate 0.0.6 typed nullable-column operation, see
+[append-only schema evolution](NULLABLE_COLUMNS.md). The string-based migration
+runner below does not yet accept ALTER statements or typed operations.
+
 [Index](README.md) · [API](API_REFERENCE.md) · [Roadmap](../ROADMAP.md)
 
 The 0.0.5 development API `okto_grafx.migrations` provides a bounded additive

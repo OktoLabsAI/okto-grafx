@@ -14,6 +14,17 @@ New gaps are recorded in the roadmap, not a recreated punch-list. The current
 [performance policy](../PERFORMANCE.md) supersedes historical timing gates only;
 storage, concurrency, recovery and quality invariants are unchanged.
 
+Authorized 0.0.6 extension routing: [nullable columns v1](../specs/NULLABLE_COLUMNS_V1.md)
+adds required bit 13 and explicitly recorded prior tuple layouts; this does not
+permit guessing schema compatibility or relaxing WAL/OCC. [Logical views v1](../specs/LOGICAL_VIEWS_V1.md)
+is a bounded read-query registry composed over native transactions, with no new
+Cypher grammar or persisted physical plans. These versioned extensions do not
+retroactively change the original v1 byte contract below.
+
+[Posting hash v1](../specs/POSTING_HASH_V1.md) adds required bit 14, an explicit
+index-layout discriminator and page-local dictionary/reference slots. It does not
+change the logical index WAL, native exact visibility or either OCC baseline.
+
 Authorized 0.0.5 extension routing: [FTS-v1](../specs/FULLTEXT_V1_FORMAT.md) adds
 required capability bit 5, index derivation tag 4 and multiple postings per row
 inside the existing exact HASH/index-WAL protocol. Single-key scalar derivations

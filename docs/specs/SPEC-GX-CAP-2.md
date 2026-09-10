@@ -3,6 +3,18 @@
 Status: specified / implementation not certified. Date: 2026-09-08.
 Dependencies: M1 lifecycle; GX-CAP-0; GX-CAP-1 for promotion receipts.
 
+September 10, 2026 checkpoint: the 0.0.6 development line implements the
+non-persisting `CatalogSession` and optional bounded workspace resolver. See
+[consumer contract](../CATALOGS_AND_WORKSPACES.md) and
+[active execution status](../../ROADMAP.md#approved-capability-continuation-after-4ee4d2e).
+The full CAP-2 scope is **not complete**. The subsequent bounded existing-target
+[copy/receipt slice](../CATALOG_COPY.md) is implemented; arbitrary subgraph
+selection, skip/merge policies, anonymous-node copy and catalog CLI inventory
+remain pending. The initial checkpoint supersedes "not implemented" only for the
+two named Python API slices; it does not certify any new persistent capability.
+[Local acceptance](../reports/V006_CATALOG_WORKSPACE_ACCEPTANCE.md): 437 affected
+regression tests passed; full repository/POSIX/release matrices are not inferred.
+
 ## Normative scope
 
 [Full complementary requirements](../archive/ROADMAP_SOURCES.md#source-grafx-complementary-evolution-plan-codex), §8; §17 GX-CAP-2.

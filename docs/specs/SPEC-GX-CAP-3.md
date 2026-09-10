@@ -47,3 +47,27 @@ Execution status: **not implemented by GX-CAP-0**. No release, new on-disk capab
 installed Pulse feature, or successful crash matrix is inferred from this document.
 Record immutable code SHA, test commands/results, audit and unresolved debt here when
 implemented. Next prerequisite is the first unmet dependency, not another scope expansion.
+
+## Continuation item 8: implementation handoff (September 10)
+
+The preceding repeated-key physical layout is not the history representation.
+Its entries are reclaimable, and exact candidates remain tied to heap visibility.
+Retaining that index, the decoded-page memo or recycled WAL cannot implement this
+contract. No system-time catalog bit, table activation or public history API has
+been enabled by that work. Item 8 now has an
+[internal event/image-planning prototype](SYSTEM_HISTORY_APPEND_DRAFT.md), but
+its native persistence checkpoint remains unimplemented and unexposed.
+
+The existing native integration points are `TransactionManager._write_rows`
+(settled row identities and old/new values), `_prepare_journal` followed by
+`_materialized_page_delta` (attempt-local physical planning before second OCC),
+`_build_records` / `_retarget_commit_batch` (binding the final COMMIT sequence),
+and `CommitRedo._validate_native_catalog` (complete preflight before application).
+A history append needs the corresponding immutable preparation, complete
+publication/coverage proof and retargeting, not a post-commit callback or late
+logical intents. Any selected format must also participate in backup, verification
+and transfer/refusal; existing ordinary-table copy receipts are not a substitute.
+
+This records the implementation boundary, not an additional performance gate,
+new scope, released format or successful temporal crash test. The fixed acceptance
+criteria above and ADR-GX-002 remain the authority.

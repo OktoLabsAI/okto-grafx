@@ -1,7 +1,8 @@
 """The in-memory catalog and the bytes it is persisted as (CONTRACT.md section 7.2).
 
 The catalog is the answer to "what tables and what embedding spaces exist". It is a value with
-rules rather than a container: a table is added once and never mutated, a space is added once and
+rules rather than a container: table definitions are immutable values (the explicit
+nullable-column capability may install an append-only replacement), a space is added once and
 the only change it ever accepts is from active to retired (SPEC-VEC TR-2), and a vector column
 may only point at a space that already exists and still accepts writes.
 
@@ -25,6 +26,7 @@ import struct
 from collections.abc import Iterable
 from types import MappingProxyType
 from typing import NoReturn
+from dataclasses import replace
 
 from okto_grafx.domain.ids import PROVISIONAL_CSN
 
@@ -127,6 +129,8 @@ _HEAP_FREE_INDEX_BIT = 1 << 9
 _SPARSE_HASH_BIT = 1 << 10
 _FULLTEXT_PREFIX_BIT = 1 << 11
 _FULLTEXT_RELATIONSHIPS_BIT = 1 << 12
+_NULLABLE_COLUMNS_BIT = 1 << 13
+_POSTING_HASH_BIT = 1 << 14
 
 
 _KNOWN_CAPABILITY_BITS = (
@@ -143,6 +147,8 @@ _KNOWN_CAPABILITY_BITS = (
     | _SPARSE_HASH_BIT
     | _FULLTEXT_PREFIX_BIT
     | _FULLTEXT_RELATIONSHIPS_BIT
+    | _NULLABLE_COLUMNS_BIT
+    | _POSTING_HASH_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -161,6 +167,8 @@ _CAPABILITY_TO_BIT = MappingProxyType(
         SPARSE_HASH_CAPABILITY: _SPARSE_HASH_BIT,
         "fulltext_prefixes_v1": _FULLTEXT_PREFIX_BIT,
         "fulltext_relationships_v1": _FULLTEXT_RELATIONSHIPS_BIT,
+        "nullable_columns_v1": _NULLABLE_COLUMNS_BIT,
+        "posting_hash_v1": _POSTING_HASH_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -186,7 +194,7 @@ _STATE_TO_TAG = MappingProxyType(
 )
 _TAG_TO_STATE = MappingProxyType({value: key for key, value in _STATE_TO_TAG.items()})
 _LAYOUT_TO_TAG = MappingProxyType(
-    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1, IndexLayout.SPARSE_HASH: 2}
+    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1, IndexLayout.SPARSE_HASH: 2, IndexLayout.POSTING_HASH: 3}
 )
 _TAG_TO_LAYOUT = MappingProxyType(
     {value: key for key, value in _LAYOUT_TO_TAG.items()}
@@ -535,6 +543,8 @@ class Catalog:
             capabilities.add(LARGE_HASH_CAPABILITY)
         if any(d.layout is IndexLayout.SPARSE_HASH for d in validated.values()):
             capabilities.add(SPARSE_HASH_CAPABILITY)
+        if any(d.layout is IndexLayout.POSTING_HASH for d in validated.values()):
+            capabilities.add("posting_hash_v1")
         self._required_capabilities = frozenset(capabilities)
         self._install_indexes(validated)
         return self
@@ -561,6 +571,8 @@ class Catalog:
             self._required_capabilities = frozenset((*self._required_capabilities, LARGE_HASH_CAPABILITY))
         if any(d.layout is IndexLayout.SPARSE_HASH for d in validated.values()):
             self._required_capabilities = frozenset((*self._required_capabilities, SPARSE_HASH_CAPABILITY))
+        if any(d.layout is IndexLayout.POSTING_HASH for d in validated.values()):
+            self._required_capabilities = frozenset((*self._required_capabilities, "posting_hash_v1"))
         if definition.layout is IndexLayout.ORDERED:
             self._required_capabilities = frozenset(
                 (
@@ -639,6 +651,21 @@ class Catalog:
             self._required_capabilities = frozenset((*self._required_capabilities, LARGE_HASH_CAPABILITY))
         self._install_indexes(validated)
         return definition
+
+    def add_nullable_column(self, name: str, column: ColumnDef) -> TableDef:
+        """Append one nullable non-vector column, retaining exact prior decode layouts."""
+        self._require_index_catalog()
+        table = self.table(name)
+        if (type(column) is not ColumnDef or not column.nullable or column.vector_space is not None
+                or column.type in (ValueType.VECTOR_F32, ValueType.VECTOR_F64)):
+            raise GrafxConfigurationError("Only nullable non-vector columns can be appended.", field="column")
+        if len(table.columns) >= 65535:
+            raise GrafxConfigurationError("Table column limit reached.", field="columns")
+        updated = replace(table, columns=(*table.columns, column), schema_version=table.schema_version + 1,
+                          schema_layouts=(*table.schema_layouts, (table.schema_version, len(table.columns))))
+        self._required_capabilities = self._required_capabilities | {"nullable_columns_v1"}
+        self._install_table(updated)
+        return updated
 
     def add_table(self, table: TableDef) -> TableDef:
         """Install a table, refusing a duplicate name or id and an unusable vector column."""
@@ -786,6 +813,8 @@ class Catalog:
                 raise GrafxConfigurationError("Large hash directories require their capability.", field="required_capabilities")
             if any(d.layout is IndexLayout.SPARSE_HASH for d in indexes) and SPARSE_HASH_CAPABILITY not in self._required_capabilities:
                 raise GrafxConfigurationError("Sparse hash requires its capability.", field="required_capabilities")
+            if any(d.layout is IndexLayout.POSTING_HASH for d in indexes) and "posting_hash_v1" not in self._required_capabilities:
+                raise GrafxConfigurationError("Posting hash requires its capability.", field="required_capabilities")
             if not capability_bits & _IDENTITY_SECONDARY_INDEXES_V1_BIT:
                 raise GrafxConfigurationError(
                     "Catalog format 2 requires identity_secondary_indexes_v1.",
@@ -818,6 +847,12 @@ class Catalog:
             parts.append(_U64.pack(self._commit_catalog_activation))
         for table in self.tables():
             parts.append(_encode_table(table))
+            if "nullable_columns_v1" in self._required_capabilities:
+                parts.append(_U16.pack(len(table.schema_layouts)))
+                for version, count in table.schema_layouts:
+                    parts.append(_U16.pack(version) + _U16.pack(count))
+            elif table.schema_layouts:
+                raise GrafxConfigurationError("Prior layouts require nullable_columns_v1.", field="required_capabilities")
         for space in self.spaces():
             parts.append(_encode_space(space))
         for definition in indexes:
@@ -961,6 +996,16 @@ class Catalog:
         try:
             for _ in range(table_count):
                 table, offset = _decode_table(raw, offset)
+                if "nullable_columns_v1" in required_capabilities:
+                    _require(raw, offset, _U16.size, "schema layout count")
+                    layout_count = _U16.unpack_from(raw, offset)[0]
+                    offset += _U16.size
+                    if layout_count > 64:
+                        raise GrafxCorruptionDetected("Too many prior schema layouts.", field="schema_layouts")
+                    _require(raw, offset, layout_count * 4, "schema layouts")
+                    layouts = tuple((_U16.unpack_from(raw, offset + i * 4)[0], _U16.unpack_from(raw, offset + i * 4 + 2)[0]) for i in range(layout_count))
+                    offset += layout_count * 4
+                    table = replace(table, schema_layouts=layouts)
                 tables.append(table)
             for _ in range(space_count):
                 space, offset = _decode_space(raw, offset)
@@ -993,6 +1038,8 @@ class Catalog:
                 raise GrafxCorruptionDetected("Large hash directories lack their capability.", field="required_capabilities")
             if any(d.layout is IndexLayout.SPARSE_HASH for d in indexes) and SPARSE_HASH_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Sparse hash lacks its capability.", field="required_capabilities")
+            if any(d.layout is IndexLayout.POSTING_HASH for d in indexes) and "posting_hash_v1" not in required_capabilities:
+                raise GrafxCorruptionDetected("Posting hash lacks its capability.", field="required_capabilities")
             if any(
                 definition.layout is IndexLayout.ORDERED for definition in indexes
             ) and (

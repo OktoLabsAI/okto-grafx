@@ -45,7 +45,7 @@ target_record_id)` entries. Table names qualify IDs; a record ID is not your use
 
 | Contents | Logical import behavior |
 | --- | --- |
-| Schema | Node/relationship tables, declared types, nullability, PKs, endpoint table names and embedding spaces. Immutable schema version 1 is supported; other versions refuse. |
+| Schema | Node/relationship tables, declared types, nullability, PKs, endpoint table names and embedding spaces. Export of certified nullable-column evolution emits the complete current layout as destination schema version 1, without source physical layout history. Other unsupported schema versions still refuse. [Evolution contract](NULLABLE_COLUMNS.md). |
 | Rows | Every snapshot-visible physical occurrence, including parallel edges, self-loops, empty tables, nulls, bytes, lists/maps, timestamps, UUID values and vector precision. Floating values travel through the tagged binary value codec, not lossy JSON numbers. |
 | Graph identity | A fresh database UUID. New numeric table/space IDs follow target allocation; current node/edge RecordIds are remapped and returned in the report. Relationship endpoints and nested vector space references are rewritten. User PKs, strings, UUID properties and arbitrary application references are **not** rewritten. |
 | Embedding spaces | Names, dimensions, metric, precision, normalization declaration, original creation time and retired state. Import writes data through active-space validation, then restores retirement before publication. |

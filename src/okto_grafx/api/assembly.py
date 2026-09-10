@@ -763,11 +763,14 @@ def _attach_primary_key_indexes(
             continue
         try:
             from okto_grafx.engine.sparse_hash import SparseHashIndex
+            from okto_grafx.engine.posting_hash import PostingHashIndex
             index = (
                 OrderedIndex(definition, pool, metrics)
                 if definition.layout is IndexLayout.ORDERED
                 else SparseHashIndex(definition, pool, metrics)
                 if definition.layout is IndexLayout.SPARSE_HASH
+                else PostingHashIndex(definition, pool, metrics)
+                if definition.layout is IndexLayout.POSTING_HASH
                 else HashIndex(definition, pool, metrics)
             )
             try:

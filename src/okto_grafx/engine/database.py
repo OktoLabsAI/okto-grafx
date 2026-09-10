@@ -43,6 +43,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Self, TypeVar
+from okto_grafx.domain.model.schema import ColumnDef, TableDef
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -196,6 +197,7 @@ from okto_grafx.engine.verifier import VERIFICATION_SCOPES
 _HistoryResult = TypeVar("_HistoryResult")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from okto_grafx.views import LogicalViews
     from okto_grafx.engine.wal_manager import WalManager
 
 __all__ = [
@@ -2005,6 +2007,13 @@ class Database:
             return snapshot
 
     @property
+    def views(self) -> LogicalViews:
+        """Return the bounded, persistent read-only logical view API; prepare explicitly."""
+        from okto_grafx.views import LogicalViews
+        self._require_open()
+        return LogicalViews(self)
+
+    @property
     def heap(self) -> HeapStoreView:
         """Return immutable heap layout metadata without row or page mutation doors."""
         with self._public_transition():
@@ -3103,14 +3112,15 @@ class Database:
     def search_text(self, reader: Transaction | None = None, *, index: str, query: str, k: int = 20,
                     filter: RecordIdFilter | None = None, limits: TextSearchLimits | None = None,
                     k1: float = 1.2, b: float = 0.75, timeout_seconds: float | None = None,
-                    cancellation: CancellationToken | None = None, prefix: bool = False) -> TextSearchResult:
+                    cancellation: CancellationToken | None = None, prefix: bool = False,
+                    phrase: bool = False) -> TextSearchResult:
         """Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot."""
         if reader is None:
             with self.begin("read") as owned:
-                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
+                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase)
         if type(reader) is not Transaction:
             raise GrafxConfigurationError("reader must be a Transaction.", field="reader")
-        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
+        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase)
 
     def create_index(
         self,
@@ -3129,6 +3139,8 @@ class Database:
         both is refused by the same planner used by textual ``CREATE INDEX``. The ordered
         layout is selected explicitly with ``layout='ordered'`` and accepts only a
         TIMESTAMP+STRING key, without hash sizing hints.
+        ``layout='posting_hash'`` deduplicates repeated property keys per page;
+        it remains an exact candidate index with native heap visibility checks.
         """
         with self._public_operation("create_index"):
             self._require_open()
@@ -3718,6 +3730,27 @@ class Database:
                         for report in index_reports
                     ),
                 )
+
+    def add_nullable_column(self, table: str, column: ColumnDef) -> TableDef:
+        """Atomically append one nullable non-vector column, without rewriting old rows.
+
+        Requires explicit identity-index activation. Publishes the one-way
+        nullable_columns_v1 capability; incompatible old binaries refuse the store.
+        One dedicated native transaction, no automatic retry or backfill.
+        """
+        from okto_grafx.engine.public_views import _table_definition
+        if type(table) is not str or table.startswith("_grafx_") or type(column) is not ColumnDef:
+            raise GrafxConfigurationError("Invalid nullable-column input.", field="column")
+        captured = ColumnDef(column.name, column.type, nullable=column.nullable, vector_space=column.vector_space)
+        with self._public_operation("add_nullable_column"):
+            self._require_open()
+            self._require_writable("add nullable column")
+            engine = self._require_component("queries", self._queries, "the query engine (C10)")
+            with self.begin("write") as tx:
+                with self._transactions.page_access_section(transaction=tx._context):
+                    self._public_contexts.setdefault(tx.txn_id, tx._context)
+                    updated = engine.add_nullable_column(tx._context, table, captured)
+            return _table_definition(updated)
 
     def ensure_identity_indexes(self) -> None:
         """Persist and activate every exact access path required by endpoint identities.

@@ -201,6 +201,7 @@ class TableDef(_TableDefColumnCache):
     from_table: str | None = None
     to_table: str | None = None
     schema_version: int = 1
+    schema_layouts: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse a table whose shape contradicts the kind it declares.
@@ -323,6 +324,24 @@ class TableDef(_TableDefColumnCache):
                 field="schema_version",
                 value=self.schema_version,
             )
+        if type(self.schema_layouts) is not tuple or len(self.schema_layouts) > 64:
+            raise GrafxConfigurationError("At most 64 prior append-only layouts are supported.", field="schema_layouts")
+        for position, layout in enumerate(self.schema_layouts):
+            if (type(layout) is not tuple or len(layout) != 2
+                    or any(type(n) is not int for n in layout)):
+                raise GrafxConfigurationError("Invalid prior schema layout.", field="schema_layouts")
+            version, count = layout
+            remaining = len(self.schema_layouts) - position
+            if (version != self.schema_version - remaining or version < 1
+                    or count != len(self.columns) - remaining or count < (2 if self.kind == "rel" else 1)):
+                raise GrafxConfigurationError("Prior layouts must be contiguous one-column additions.", field="schema_layouts")
+        if self.schema_layouts and any(not c.nullable for c in self.columns[self.schema_layouts[0][1]:]):
+            raise GrafxConfigurationError("Appended columns must be nullable.", field="schema_layouts")
+        if self.schema_layouts:
+            base_count = self.schema_layouts[0][1]
+            if (self.primary_key is not None and self.primary_key not in {c.name for c in self.columns[:base_count]}
+                    or any(c.type in VECTOR_VALUE_TYPES for c in self.columns[base_count:])):
+                raise GrafxConfigurationError("Prior layouts cannot imply a new PK or vector column.", field="schema_layouts")
         if self.primary_key is not None:
             _require_identifier("primary_key", self.primary_key)
             if self.primary_key not in seen:

@@ -3531,7 +3531,10 @@ class HeapStore:
         self, table: TableDef, header: RecordHeader, content: bytes
     ) -> bytes:
         """Return one payload after the checks shared by full and projected decoders."""
+        prior_count = None
         if header.schema_version != table.schema_version:
+            prior_count = next((count for version, count in table.schema_layouts if version == header.schema_version), None)
+        if header.schema_version != table.schema_version and prior_count is None:
             raise GrafxSchemaVersionMismatch(
                 f"A stored version of table {table.name!r} was written under schema version "
                 f"{header.schema_version}, and the catalog now declares "
@@ -3552,6 +3555,10 @@ class HeapStore:
                 declared=header.payload_len,
                 observed=len(payload),
             )
+        if header.schema_version != table.schema_version:
+            prior = replace(table, columns=table.columns[:prior_count], schema_version=header.schema_version, schema_layouts=())
+            values = decode_tuple(prior, payload)
+            return encode_tuple(table, (*values, *((None,) * (len(table.columns) - prior_count))))
         return payload
 
     def _payload_of(self, header: RecordHeader, content: bytes) -> bytes:

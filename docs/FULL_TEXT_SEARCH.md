@@ -10,6 +10,44 @@ store. Back up or export before introducing it into a mixed-version deployment.
 
 ## Start with the typed API
 
+### Exact analyzed phrases (0.0.6 development)
+
+Use `db.search_text(index="document_text", query="graph database", phrase=True)`
+to require the entire analyzed query, in order and contiguously, within at least
+one declared field. Repeated tokens matter: `graph graph` is not the same phrase
+as `graph`. Phrases never cross field boundaries. Token positions follow the
+index's fixed analyzer/normalization/case rules, not byte offsets or literal
+substring matching. For `code_identifier`, positions follow the analyzer's
+emitted whole-token/component sequence; they are not source-code character offsets.
+
+The result regime is `phrase_verified`: existing whole-term postings nominate
+candidates and their **same-snapshot heap tokens** verify contiguous positions.
+No positional-posting format, new capability bit, index rebuild, persisted
+position list, term-offset response or write amplification is introduced. This
+is exact phrase semantics, not a claim of a durable positional index. Verification
+is linear in candidate field tokens, with O(query tokens) KMP state. It does not
+add a table scan beyond the existing documented corpus-statistics fallback.
+
+BM25 scoring and `matched_fields` include only fields containing the full phrase;
+document frequencies/corpus totals still use the complete snapshot. `matched_terms`
+remains the distinct analyzed terms. `candidates` counts whole-term candidates
+examined, including those rejected by phrase verification. Ranking/ties and `k`
+are applied **after** verification, never by filtering a truncated term top-k.
+
+`phrase` defaults to `False` and accepts only exact booleans. `prefix=True` plus
+`phrase=True` refuses with `GrafxUnsupportedOperation`. No slop, proximity operator,
+quote-based query grammar or implicit phrase mode is added. Empty analyzed queries
+return no hits. Existing token/posting/candidate/memory/explanation bounds, filters,
+deadlines and cancellation apply; repeated query tokens count toward token bounds.
+Phrase state reserves additional logical memory before allocation. Updates,
+deletes, read-only reopen and rebuild retain the same native snapshot/certificate
+rules. Node and relationship text fields are supported.
+
+The closed `CALL grafx.search_text`, CLI and hybrid entry points continue their
+documented whole-term behavior; this slice adds the typed Python `phrase` keyword.
+Changing default term search or adding phrase options to those protocols is not
+implied. This is an operation option, not `TextIndexOptions` or a connection flag.
+
 ### Prefix search and relationship properties
 
 Opt into prefix postings when creating an index with
@@ -17,7 +55,7 @@ Opt into prefix postings when creating an index with
 `db.search_text(index="text", query="graph", prefix=True)`. The default is zero
 (disabled); allowed values are exact integers 0..32. Query analysis uses the
 index's frozen analyzer. Each analyzed query token expands into actual indexed
-terms beginning with that token. No wildcard, substring or phrase syntax is added;
+terms beginning with that token. No wildcard, substring or phrase query syntax is added;
 the closed `CALL grafx.search_text` and hybrid API continue to use whole terms.
 
 `TextSearchLimits(max_expanded_terms=128)` limits distinct expansion terms;

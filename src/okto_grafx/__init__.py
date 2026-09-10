@@ -24,6 +24,7 @@ that owns it (A24), and this module only makes it reachable by its supported pat
 from __future__ import annotations
 
 from okto_grafx.api import ConnectOptions, connect
+from okto_grafx.catalogs import CatalogInfo, CatalogPathPolicy, CatalogSession
 from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult
 from okto_grafx.domain.query.hybrid import HybridHit, HybridSearchOptions, HybridSearchResult
 from okto_grafx.domain.model import Timestamp, VectorValue
@@ -50,6 +51,9 @@ from okto_grafx.runtime.registry import PortRegistry
 
 __all__ = [
     "CancellationToken",
+    "CatalogInfo",
+    "CatalogPathPolicy",
+    "CatalogSession",
     "CommitCatalogEntry",
     "CommitHistoryPage",
     "CommitId",

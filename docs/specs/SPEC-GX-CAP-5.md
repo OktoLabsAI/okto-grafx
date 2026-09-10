@@ -10,6 +10,12 @@ STRING indexes are implemented; see [prefix bytes](FTS_PREFIX_V1.md),
 [acceptance receipt](../reports/V005_AFTER_69ED311.md). Phrase/position search and
 same-name analyzer replacement remain outside this slice.
 
+September 10 continuation: typed `phrase=True` now verifies exact analyzed token
+positions in same-snapshot heap candidates under existing FTS certificates and
+budgets. [Contract](../FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development).
+This introduces no durable positional postings; position-return/proximity APIs
+and same-name analyzer replacement remain separate residual scope.
+
 ## Normative scope
 
 [Full complementary requirements](../archive/ROADMAP_SOURCES.md#source-grafx-complementary-evolution-plan-codex), §9; §17 GX-CAP-5.

@@ -1,6 +1,16 @@
 # SPEC-GX-CAP-10 — Application schema evolution and views
 
 Status: specified / implementation not certified. Date: 2026-09-08.
+
+September 10 development checkpoint: bounded persisted base-table logical views
+are implemented through `db.views`, with typed parameters, checksum/dependency
+validation, native read snapshots and atomic create/replace/drop. See
+[consumer contracts](../LOGICAL_VIEWS.md) and [persistence v1](LOGICAL_VIEWS_V1.md).
+The subsequent nullable-column slice implements typed append-only evolution,
+exact prior row layouts and required bit 13; see [its consumer contract](../NULLABLE_COLUMNS.md).
+[Acceptance commands, results and crash cases](../reports/V006_VIEWS_SCHEMA_CHECKPOINT.md)
+cover these bounded slices, not a release certification.
+Nested view expansion and materialized refresh remain open. Full CAP-10 remains open.
 Dependencies: Commit metadata; schema/catalog epochs; backup/export; changefeed for incremental refresh.
 
 ## Normative scope

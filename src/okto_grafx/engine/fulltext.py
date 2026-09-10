@@ -110,6 +110,34 @@ def create_text_index(
         return database._committed_index_receipt(name)
 
 
+def _phrase_failure(pattern: tuple[str, ...]) -> tuple[int, ...]:
+    """KMP prefix lengths; O(query tokens) bounded temporary state."""
+    result = [0] * len(pattern)
+    matched = 0
+    for i in range(1, len(pattern)):
+        while matched and pattern[i] != pattern[matched]:
+            matched = result[matched - 1]
+        if pattern[i] == pattern[matched]:
+            matched += 1
+        result[i] = matched
+    return tuple(result)
+
+
+def _contains_phrase(tokens: tuple[str, ...], pattern: tuple[str, ...], failure: tuple[int, ...]) -> bool:
+    """Verify contiguous analyzed token positions in one field; never cross fields."""
+    if not pattern:
+        return False
+    matched = 0
+    for token in tokens:
+        while matched and token != pattern[matched]:
+            matched = failure[matched - 1]
+        if token == pattern[matched]:
+            matched += 1
+            if matched == len(pattern):
+                return True
+    return False
+
+
 def search_text(
     database: Database,
     reader: Transaction,
@@ -124,12 +152,17 @@ def search_text(
     timeout_seconds: float | None,
     cancellation: CancellationToken | None,
     prefix: bool = False,
+    phrase: bool = False,
     _control: _ReadControl | None = None,
     _memory: Callable[[int], None] | None = None,
 ) -> TextSearchResult:
     """Return BM25 matches only after one complete pre/post index/heap certificate."""
     if type(prefix) is not bool:
         raise GrafxConfigurationError("prefix must be exactly bool.", field="prefix")
+    if type(phrase) is not bool:
+        raise GrafxConfigurationError("phrase must be exactly bool.", field="phrase")
+    if phrase and prefix:
+        raise GrafxUnsupportedOperation("Phrase and prefix modes cannot be combined.", field="phrase")
     if reader._database is not database or not reader.active or reader.mode != "read":
         raise GrafxTransactionStateError(
             "Text search requires an active reader of this database.",
@@ -197,7 +230,8 @@ def search_text(
                     options.max_document_tokens, budget.max_query_tokens
                 ),
             )
-            query_terms = tuple(sorted(set(analyze(query, query_options))))
+            ordered_terms = analyze(query, query_options)
+            query_terms = tuple(sorted(set(ordered_terms)))
             if prefix and (not options.prefix_max_characters or
                            any(len(term) > options.prefix_max_characters for term in query_terms)):
                 raise GrafxUnsupportedOperation("Prefix search requires configured prefix postings and eligible token lengths.", field="prefix")
@@ -244,6 +278,10 @@ def search_text(
                 """Execute statistics, candidates and ranking under the same certificate."""
                 nonlocal memory, wal_reservation
                 memory = 0 if allowed is None else len(allowed) * 64
+                if phrase:
+                    check(128 + sum(64 + len(t.encode("utf-8")) for t in ordered_terms)
+                          + 16 * len(ordered_terms) + 16 * len(definition.positions))
+                phrase_failure = _phrase_failure(ordered_terms) if phrase else ()
                 database._indexes._prepare_heap_view(store.file, certificate)
                 cache_key = (store.file, certificate, snapshot.read_lsn)
                 cached = database._text_stats_cache.get(cache_key)
@@ -397,6 +435,10 @@ def search_text(
                     )
                 hits = []
                 for rid, fields in matches.items():
+                    phrase_fields = tuple(_contains_phrase(tokens, ordered_terms, phrase_failure) for tokens in fields) if phrase else ()
+                    check()
+                    if phrase and not any(phrase_fields):
+                        continue
                     frequency_bytes = 128 + len(fields) * (64 + 64 * len(terms))
                     check(frequency_bytes)
                     term_counts = query_term_frequencies(fields, terms)
@@ -407,6 +449,8 @@ def search_text(
                         df = frequencies[term]
                         idf = math.log1p((count - df + 0.5) / (df + 0.5))
                         for position, tokens in enumerate(fields):
+                            if phrase and not phrase_fields[position]:
+                                continue
                             tf = term_counts[position][term]
                             if not tf:
                                 continue
@@ -454,7 +498,7 @@ def search_text(
                 return (
                     TextSearchResult(
                         chosen,
-                        "prefix_index" if prefix else "exact_index",
+                        "phrase_verified" if phrase else ("prefix_index" if prefix else "exact_index"),
                         certificate.header.built_through_lsn,
                         snapshot.read_lsn,
                         visited,

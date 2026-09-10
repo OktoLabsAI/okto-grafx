@@ -159,6 +159,10 @@ def _schema(catalog: Catalog) -> dict:
             )
             for c in table.columns
         ]
+        # Logical transfer writes complete decoded current tuples into a fresh
+        # schema; source physical decode layouts are neither needed nor portable.
+        if table.schema_layouts:
+            item["schema_version"] = 1
         tables.append(item)
     spaces = []
     for space in catalog.spaces():
@@ -237,7 +241,7 @@ def _tables(schema: dict) -> tuple[tuple[TableDef, ...], tuple[EmbeddingSpaceDef
             "fulltext",
         }:
             raise _refuse("schema_invalid")
-        if index["layout"] not in ("hash", "ordered", "sparse_hash"):
+        if index["layout"] not in ("hash", "ordered", "sparse_hash", "posting_hash"):
             raise _refuse("unsupported_index_layout")
         if index["fulltext"] is not None:
             TextIndexOptions(

@@ -52,6 +52,7 @@ def render_html_snapshot(
     parts, size = [], 0
 
     def append(text):
+        """Charge bounded encoded HTML before retaining the fragment."""
         nonlocal size
         work.step()
         size += len(text.encode("utf-8"))
@@ -62,6 +63,7 @@ def render_html_snapshot(
         parts.append(text)
 
     def label(text):
+        """Bound and escape a text label for safe HTML consumption."""
         # Check before escaping to avoid an unbounded temporary expansion.
         if len(text) > limits.max_bytes // 6:
             raise GrafxQueryBudgetExceeded(
@@ -77,7 +79,7 @@ def render_html_snapshot(
         "<title>Okto Grafx snapshot</title><body><h1>Okto Grafx snapshot</h1>"
     )
     append(
-        f"<p>Database {graph.database_uuid.hex()} — snapshot LSN {graph.snapshot_lsn}. "
+        f"<p>Database {graph.database_uuid.hex()} &mdash; snapshot LSN {graph.snapshot_lsn}. "
         "Detached, read-only picture. No live updates.</p>"
     )
     append(
@@ -88,6 +90,7 @@ def render_html_snapshot(
     )
 
     def position(i):
+        """Place a detached node on the bounded static circular layout."""
         return (
             500 + 400 * math.cos(i * 2 * math.pi / max(1, len(nodes))),
             500 + 400 * math.sin(i * 2 * math.pi / max(1, len(nodes))),

@@ -5,6 +5,10 @@
 Reviewed September 10, 2026. This is a capability and integration comparison,
 not a benchmark, migration guarantee or product certification.
 
+Additional 0.0.6 development scope: explicit [posting-hash indexes](POSTING_HASH.md)
+share repeated keys per physical page. This does not change the snapshot/ACID
+claims below or imply that the planned system-time history API is available.
+
 ## Scope and reading rules
 
 | Product | Baseline and evidence |
@@ -146,8 +150,10 @@ rankings:
 ### Where Grafx is less complete
 
 - Query language and stored type breadth, language drivers and graphical tooling.
-- Remote federation/attached catalogs, distributed availability and built-in
-  authentication/authorization.
+- Remote federation, distributed availability and built-in authentication/authorization.
+  The 0.0.6 development line now has local attached catalogs and bounded atomic
+  copy, but no distributed transaction or federated query. [Catalogs](CATALOGS_AND_WORKSPACES.md),
+  [copy boundaries](CATALOG_COPY.md).
 - Full temporal graph history and bitemporal queries: **not delivered in 0.0.5**.
 - Ecosystem and operational evidence: release publication and a large passing
   test suite do not establish production maturity or large-graph SLOs.

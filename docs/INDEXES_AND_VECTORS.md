@@ -1,5 +1,10 @@
 # Indexes and vector search
 
+0.0.6 adds opt-in [`layout="posting_hash"`](POSTING_HASH.md) for repeated
+property keys. It shares keys within each page; unlike the decoded-page cache,
+this changes physical storage and requires catalog capability bit 14. It retains
+the existing candidate/heap visibility, transaction and maintenance APIs.
+
 ## Continuation after 69ed311: bounded maintenance and memory
 
 Sparse maintenance visits each directory page once and then populated heads;

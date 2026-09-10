@@ -1,5 +1,29 @@
 # Configuration reference
 
+`Database.create_index(..., layout="posting_hash")` is an explicit per-index
+physical layout, not a connection flag. See [eligibility, limits and trade-offs](POSTING_HASH.md).
+
+`Database.add_nullable_column` takes a native nullable `ColumnDef` and explicitly
+requires v2 identity indexes; it activates one-way `nullable_columns_v1` format
+compatibility. It adds no connection option. See [scope and fixed limits](NULLABLE_COLUMNS.md#supported-scope).
+
+`Database.views` has operation-local preparation, typed parameter declarations,
+replacement, pagination and query-timeout options, not connection flags. See
+[logical view semantics and limits](LOGICAL_VIEWS.md#semantics-and-limits).
+
+`Database.search_text(..., phrase=False)` is an operation-local boolean for
+[exact analyzed phrases](FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development).
+It reuses existing FTS limits and cannot be combined with prefix mode; it adds no
+persisted index/connection option.
+
+For whole-package copy bounds and idempotency/metadata options, see
+[CopyLimits and results](CATALOG_COPY.md#configuration-and-result-contracts).
+They do not override native transaction quotas or add connection flags.
+
+For operation-local `CatalogPathPolicy` and `WorkspacePolicy`, see the complete
+[catalog/workspace option table](CATALOGS_AND_WORKSPACES.md#path-and-workspace-configuration).
+These are not connection options and do not enable scopes implicitly.
+
 ## 0.0.6 operation-local additions
 
 No `connect`/`DatabaseConfig` fields or defaults change in MP-1–MP-8.

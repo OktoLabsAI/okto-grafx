@@ -15,6 +15,10 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "views.py": {"ViewParameter", "ViewDefinition"},
+    "catalog_copy.py": {"CopyLimits", "CopyTable", "CopyPackage", "CopyReceipt"},
+    "catalogs.py": {"CatalogPathPolicy", "CatalogInfo"},
+    "workspace.py": {"WorkspacePolicy", "ResolvedWorkspace"},
     "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection", "ProjectionDiagnostics"},
     "projection_algorithms.py": {"ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult", "PageRankPreparation", "SimpleTopology", "LabelPropagationResult", "TopologicalOrderResult"},
     "html_snapshot.py": {"HtmlSnapshotLimits"},
@@ -65,6 +69,8 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
+    "catalog_copy.py": {"capture_copy", "prepare_copy_target", "copy_graph"},
+    "workspace.py": {"resolve_workspace"},
     "html_snapshot.py": {"render_html_snapshot"},
     "sqlite_import.py": {"read_sqlite_rows", "import_sqlite"},
     "graph_interop.py": {"to_networkx", "projection_arrow_batches"},
@@ -124,6 +130,12 @@ def render() -> str:
     ]
     for cls in source_tree("engine/database.py").body:
         if isinstance(cls, ast.ClassDef) and cls.name in FACADES:
+            result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
+    for cls in source_tree("catalogs.py").body:
+        if isinstance(cls, ast.ClassDef) and cls.name == "CatalogSession":
+            result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
+    for cls in source_tree("views.py").body:
+        if isinstance(cls, ast.ClassDef) and cls.name == "LogicalViews":
             result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
     result.append("\n## Public factory and transfer functions\n\n")
     for relative, names in FUNCTION_SOURCES.items():

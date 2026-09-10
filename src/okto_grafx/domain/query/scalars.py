@@ -1,5 +1,7 @@
 """Closed native scalar contracts shared by planning and row evaluation."""
 
+from __future__ import annotations
+
 import math
 
 from okto_grafx.domain.errors import GrafxPlanError
@@ -9,6 +11,7 @@ NATIVE_SCALARS = frozenset(("LOWER", "UPPER", "TRIM", "ABS"))
 
 
 def scalar_type(name, argument):
+    """Infer a closed native scalar's result type or refuse an incompatible input."""
     allowed = (
         (ValueType.INT64, ValueType.DOUBLE) if name == "ABS" else (ValueType.STRING,)
     )
@@ -22,6 +25,7 @@ def scalar_type(name, argument):
 
 
 def scalar_value(name, value):
+    """Evaluate a validated native scalar, preserving null and numeric bounds."""
     if value is None:
         return None
     if name == "ABS":

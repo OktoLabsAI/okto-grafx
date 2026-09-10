@@ -2,12 +2,21 @@
 
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 9, 2026. “Current” means the **latest recorded observation for
+Updated September 10, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
-Current development source is 0.0.5; published baseline is 0.0.4 with CAP-1 recovery work.
+Current development source is 0.0.6; published baseline is 0.0.5.
 The latest live measurement used
 `0.0.4@fa8f188`, not that later recovery checkpoint. No new live benchmark or
 spec consolidation was performed for this documentation refactor.
+
+## Latest 0.0.6 physical posting evidence
+
+Windows/Python 3.13, September 10: 60 rows repeating one 80-character string,
+512-byte pages and one hash bucket, explicit `posting_hash`: **4 bucket pages**.
+A separate 120-row same-key INSERT batch performs **1 membership chain scan**.
+These are deterministic structural counts, not latency/throughput or a Pulse
+measurement. See [usage and limits](POSTING_HASH.md) and
+`tests/api/test_posting_hash.py`; full results remain O(output + bucket pages).
 
 ## Latest real Pulse sample
 

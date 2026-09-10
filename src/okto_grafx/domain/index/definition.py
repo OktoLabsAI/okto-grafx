@@ -243,11 +243,11 @@ class IndexDefinition:
         object.__setattr__(
             self, "bucket_count", validate_bucket_count(self.bucket_count)
         )
-        if self.layout is IndexLayout.SPARSE_HASH and (
+        if self.layout in (IndexLayout.SPARSE_HASH, IndexLayout.POSTING_HASH) and (
             self.visibility is not IndexVisibility.EXACT
             or self.key_derivation != COLUMN_KEY_DERIVATION
         ):
-            raise GrafxIndexError("Sparse hash requires an exact property index.", field="layout")
+            raise GrafxIndexError("Compact hash requires an exact property index.", field="layout")
         if is_fulltext(self.key_derivation):
             options = decode_options(self.key_derivation)
             if len(options.field_weights) != len(self.positions) or self.layout is not IndexLayout.HASH or self.visibility is not IndexVisibility.EXACT:

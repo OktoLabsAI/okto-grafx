@@ -46,6 +46,12 @@ context exit commits, and an exceptional exit rolls back. See
 
 | Capability | Consumer documentation |
 | --- | --- |
+| Opt-in page-local repeated-key posting indexes (0.0.6 development) | [Posting hash](docs/POSTING_HASH.md) |
+| Exact analyzed phrase search with bounded same-snapshot candidate verification (0.0.6 development) | [Phrase semantics and limitations](docs/FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development) |
+| Bounded existing-target copy with atomic data/receipt and indexed idempotent replay (0.0.6 development) | [Catalog copy](docs/CATALOG_COPY.md) |
+| Durable typed logical read views with atomic replacement and snapshot execution (0.0.6 development) | [Logical views](docs/LOGICAL_VIEWS.md) |
+| Append nullable columns with explicit old-row layouts and no heap rewrite (0.0.6 development) | [Schema evolution](docs/NULLABLE_COLUMNS.md) |
+| Named catalog-pinned transactions and optional bounded workspace resolution (0.0.6 development) | [Catalogs and workspace policies](docs/CATALOGS_AND_WORKSPACES.md) |
 | Opt-in sparse hash directories, bounded repeated-key decoding and indexed retired-page discovery (0.0.5 development) | [Index layouts](docs/INDEXES_AND_VECTORS.md#sparse-exact-hash-indexes-and-repeated-keys), [operations](docs/OPERATIONS.md) |
 | Explicit trusted typed scalar UDFs and optional scalar/vector Arrow batch import/export (0.0.5 development) | [Extensions and Arrow](docs/EXTENSIONS_AND_ARROW.md), [compatibility evidence](docs/V005_COMPATIBILITY.md) |
 | Explicit Arrow-backed Pandas/Polars frames and bounded local Parquet import/export (0.0.5 development) | [Tabular interoperability](docs/TABULAR_AND_PARQUET.md) |

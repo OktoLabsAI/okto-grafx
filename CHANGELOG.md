@@ -9,6 +9,27 @@ including the on-disk format.
 
 ### Added (0.0.6 development)
 
+- Continuation 7: opt-in `posting_hash` property indexes with page-local key
+  dictionaries, stable reference slots and bounded same-key INSERT preparation.
+  Native WAL, snapshots, generation fencing and maintenance remain in force.
+- Continuation 8 internal foundation: bounded historical event codec, detached
+  append-image planning and complete append-transition validation. Not connected to native publication, not an activated
+  persistent capability or a public system-time history API.
+
+- Capability continuation 1–2: named catalog sessions with explicit ownership and
+  permissions, and bounded opt-in workspace/path resolution.
+- Continuation 3: bounded existing-target native copy with atomic data/receipt,
+  indexed idempotent replay and source/target commit provenance.
+- Continuation 4: exact analyzed phrase verification in snapshot-bound FTS
+  candidates; no persisted positional-posting format or slop operator.
+- Continuation 5: durable typed logical read views with checksum/dependency
+  validation, snapshot execution and atomic create/replace/drop.
+- Continuation 6: typed nullable-column append with exact prior decode layouts,
+  required capability bit 13, no heap rewrite and stale-writer refusal. Physical
+  backup preserves layouts; logical transfer exports decoded current rows into
+  fresh schema version 1. Native temporal-history integration remains open;
+  posting-layout delivery is recorded above.
+
 - MP-1: read-only JSON table/space and secondary/vector index inventories;
   path-free build CLI capabilities, explicit truncation and stale metadata.
 - MP-2/3: snapshot-owned text/vector/hybrid CLI search and bounded JS/TS subprocess

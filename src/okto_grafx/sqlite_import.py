@@ -87,6 +87,7 @@ def read_sqlite_rows(
     interrupted = None
 
     def progress():
+        """Translate cooperative cancellation or budget exhaustion to SQLite interruption."""
         nonlocal interrupted
         try:
             work.step(100)
@@ -96,6 +97,7 @@ def read_sqlite_rows(
         return 0
 
     def authorize(action, arg1, arg2, database, trigger):
+        """Allow only the bounded read-only SQLite query surface."""
         allowed = (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_RECURSIVE)
         if action == sqlite3.SQLITE_FUNCTION:
             # No extension, file, randomblob/zeroblob, or host callbacks.
@@ -216,6 +218,7 @@ def import_sqlite(
     work = _Work(limits.max_work, cancellation)
 
     def controlled_rows():
+        """Charge each source row before passing it to native atomic staging."""
         for row in rows:
             work.step()
             yield row

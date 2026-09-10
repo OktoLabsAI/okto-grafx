@@ -17,7 +17,8 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxRecoveryRefused,
 )
-from okto_grafx.domain.ids import Lsn, NO_LSN, PROVISIONAL_CSN
+from okto_grafx.domain.ids import Lsn, NO_LSN, NO_PAGE, PROVISIONAL_CSN
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.records import IndexOperation, change_of
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
@@ -997,6 +998,13 @@ class CommitRedo:
                         lsn=record.lsn,
                     )
                 max_key_bytes = getattr(index, "max_key_bytes", None)
+                if (getattr(index.definition, "layout", None) is IndexLayout.POSTING_HASH
+                        and change.operation is not IndexOperation.RESET
+                        and change.ref.page in (0, NO_PAGE)):
+                    raise GrafxCorruptionDetected(
+                        "Posting WAL references no heap data page; no effect was applied.",
+                        field="ref", index=change.index, lsn=record.lsn,
+                    )
                 if isinstance(max_key_bytes, int) and len(change.key) > max_key_bytes:
                     raise GrafxCorruptionDetected(
                         f"A record for index {change.index!r} carries a key of "

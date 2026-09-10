@@ -4,6 +4,26 @@
 
 ## Entry points and supported imports
 
+`db.add_nullable_column(table, column)` uses
+`okto_grafx.domain.model.schema.ColumnDef` and native
+`okto_grafx.domain.model.value.ValueType`; see [nullable schema evolution](NULLABLE_COLUMNS.md).
+
+`db.views` exposes durable logical read views. Parameter/definition types are
+`okto_grafx.views.ViewParameter` and `ViewDefinition`; registry preparation is
+explicit. See [logical view usage, bounds and errors](LOGICAL_VIEWS.md).
+
+`okto_grafx.catalog_copy` provides `capture_copy`, `prepare_copy_target`,
+`copy_graph` and frozen `CopyLimits`, `CopyTable`, `CopyPackage`, `CopyReceipt`.
+[Existing-target copy](CATALOG_COPY.md) is one atomic native transaction with an
+indexed durable receipt; its v1 selection/schema/PK restrictions are explicit.
+
+`from okto_grafx import CatalogSession, CatalogPathPolicy, CatalogInfo` provides
+[named single-store transactions](CATALOGS_AND_WORKSPACES.md). Optional resolution
+uses `okto_grafx.workspace.WorkspacePolicy`, `ResolvedWorkspace` and
+`resolve_workspace`. Construction requires explicit `owned` and `policy`;
+permissions default to read-only. No distributed write or automatic receipt-ledger
+preparation is implied; `apply_copy` requires the explicit copy setup above.
+
 0.0.6 adds `okto_grafx.sqlite_import` (`SQLiteImportLimits`, `read_sqlite_rows`,
 `import_sqlite`) for [bounded local SQLite consumption](LOCAL_SQLITE_IMPORT.md),
 and `okto_grafx.html_snapshot` (`HtmlSnapshotLimits`, `render_html_snapshot`) for
@@ -606,6 +626,14 @@ catalog: CatalogStoreView  # read-only property
 
 Return a complete, linearized schema and catalog-layout snapshot.
 
+#### Database.views
+
+```python
+views: LogicalViews  # read-only property
+```
+
+Return the bounded, persistent read-only logical view API; prepare explicitly.
+
 #### Database.heap
 
 ```python
@@ -761,7 +789,7 @@ Create a native persisted full-text generation over one to four STRING fields.
 #### Database.search_text
 
 ```python
-search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, prefix: bool=False) -> TextSearchResult
+search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, prefix: bool=False, phrase: bool=False) -> TextSearchResult
 ```
 
 Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot.
@@ -821,6 +849,14 @@ verify(scope: str='all') -> VerificationReport
 ```
 
 Walk the database and report every finding, precisely located (SPEC-M1 FR-11).
+
+#### Database.add_nullable_column
+
+```python
+add_nullable_column(table: str, column: ColumnDef) -> TableDef
+```
+
+Atomically append one nullable non-vector column, without rewriting old rows.
 
 #### Database.ensure_identity_indexes
 
@@ -950,8 +986,168 @@ close() -> None
 
 Release owned resources under this database's checksum selection (FR-1).
 
+### CatalogSession
+
+Bounded aliases and pinned native transactions. Python permissions are not an OS sandbox.
+
+#### CatalogSession.open
+
+```python
+open(path: str | os.PathLike[str], *, policy: CatalogPathPolicy, read_only: bool=True) -> CatalogSession
+```
+
+Open an existing main store; no creation or workspace lookup. Writable opens may recover.
+
+#### CatalogSession.attach_handle
+
+```python
+attach_handle(database: Database, *, alias: str, owned: bool, read_only: bool=True) -> None
+```
+
+Attach caller-supplied handle; ownership transfers only after successful publication.
+
+#### CatalogSession.attach
+
+```python
+attach(path: str | os.PathLike[str], *, alias: str, read_only: bool=True) -> None
+```
+
+Open an existing local catalog with read-only default; release failed acquisitions.
+
+#### CatalogSession.catalogs
+
+```python
+catalogs() -> tuple[CatalogInfo, ...]
+```
+
+Return bounded sorted alias/permission/ownership inventory; omit private paths.
+
+#### CatalogSession.use
+
+```python
+use(alias: str) -> None
+```
+
+Change the default for future begins only.
+
+#### CatalogSession.begin
+
+```python
+begin(mode: str='read', *, catalog: str | None=None, metadata: CommitMetadata | None=None) -> Transaction
+```
+
+Return a native transaction permanently owned by the selected store, not the session default.
+
+#### CatalogSession.apply_copy
+
+```python
+apply_copy(package: CopyPackage, *, target: str, idempotency_key: str, conflict: str='fail', metadata: CommitMetadata | None=None, limits: CopyLimits | None=None) -> CopyReceipt
+```
+
+Apply a detached package using the target permission/lifetime and a pinned native commit.
+
+#### CatalogSession.detach
+
+```python
+detach(alias: str) -> None
+```
+
+Refuse in-use detach; close owned handles only. main cannot detach.
+
+#### CatalogSession.close
+
+```python
+close() -> None
+```
+
+Refuse active transactions; otherwise close every owned handle, preserving first failure.
+
+### LogicalViews
+
+Database-owned logical view operations; no separately closable resources or caches.
+
+#### LogicalViews.prepare
+
+```python
+prepare() -> None
+```
+
+Create the owned registry in one native transaction; repeat adds no commit.
+
+#### LogicalViews.create
+
+```python
+create(name: str, *, query: str, parameters_schema: tuple[ViewParameter, ...]=(), replace: bool=False) -> ViewDefinition
+```
+
+Validate and atomically create/replace one definition; no automatic OCC retry.
+
+#### LogicalViews.get
+
+```python
+get(name: str, *, snapshot: Transaction | None=None) -> ViewDefinition | None
+```
+
+Inspect one checked definition at a read snapshot; None means no visible name.
+
+#### LogicalViews.list
+
+```python
+list(*, after: str | None=None, limit: int=100, snapshot: Transaction | None=None) -> tuple[ViewDefinition, ...]
+```
+
+Bounded lexicographic introspection; reuse one snapshot across stable pages.
+
+#### LogicalViews.drop
+
+```python
+drop(name: str) -> bool
+```
+
+Atomically remove a definition; absent returns False without a new commit.
+
+#### LogicalViews.execute
+
+```python
+execute(name: str, parameters: Mapping[str, object] | None=None, *, snapshot: Transaction | None=None, timeout_seconds: float | None=None) -> QueryResult
+```
+
+Execute a validated read definition at one native snapshot, never open a writer.
+
 ## Public factory and transfer functions
 
+
+### okto_grafx.catalog_copy.capture_copy
+
+```python
+capture_copy(source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits=CopyLimits()) -> CopyPackage
+```
+
+Capture complete selected tables from one native read snapshot; no source writes.
+
+### okto_grafx.catalog_copy.prepare_copy_target
+
+```python
+prepare_copy_target(database: Database) -> None
+```
+
+Explicitly enable existing provenance capabilities and initialize the ordinary receipt ledger.
+
+### okto_grafx.catalog_copy.copy_graph
+
+```python
+copy_graph(package: CopyPackage, target: Database, *, idempotency_key: str, conflict: str='fail', metadata: CommitMetadata | None=None, limits: CopyLimits=CopyLimits()) -> CopyReceipt
+```
+
+Copy into pre-existing compatible tables with data+receipt in one native durable commit.
+
+### okto_grafx.workspace.resolve_workspace
+
+```python
+resolve_workspace(*, policy: WorkspacePolicy, explicit_store: str | Path | None=None, project_root: str | Path | None=None, cwd: str | Path | None=None, user_store: str | Path | None=None) -> ResolvedWorkspace
+```
+
+Resolve explicit store > project root > bounded marker > opted-in cwd. No mkdir/open.
 
 ### okto_grafx.html_snapshot.render_html_snapshot
 
@@ -1160,6 +1356,146 @@ construct raw engine state. Consume returned instances and documented accessors.
 `Lsn`, `Csn` and record/table IDs are integer aliases, not wall-clock times.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
+
+### ViewParameter fields
+
+Annotation location: `okto_grafx.views.ViewParameter`.
+
+An exact native scalar type; all declared arguments are required, even if nullable.
+
+```python
+name: str
+type: ValueType
+nullable: bool
+```
+
+### ViewDefinition fields
+
+Annotation location: `okto_grafx.views.ViewDefinition`.
+
+Detached definition; dependencies pair table names with complete schema hashes.
+
+```python
+name: str
+query: str
+parameters_schema: tuple[ViewParameter, ...]
+columns: tuple[str, ...]
+dependencies: tuple[tuple[str, str], ...]
+sha256: str
+```
+
+### CopyLimits fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyLimits`.
+
+Whole-package logical bounds, not process RSS or durable transaction quota overrides.
+
+```python
+max_rows: int
+max_bytes: int
+max_row_bytes: int
+max_tables: int
+```
+
+### CopyTable fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyTable`.
+
+One immutable schema plus native encoded rows; record IDs remain source-qualified.
+
+```python
+schema: TableDef
+rows: tuple[tuple[int, bytes], ...]
+```
+
+### CopyPackage fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyPackage`.
+
+Detached retry input; checksummed, not authenticated or a physical backup.
+
+```python
+source_commit: CommitId
+tables: tuple[CopyTable, ...]
+spaces: tuple[EmbeddingSpaceDef, ...]
+sha256: str
+```
+
+### CopyReceipt fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyReceipt`.
+
+One proven target commit; replayed=True adds no new target effects.
+
+```python
+source_commit: CommitId
+target_commit: CommitId
+request_sha256: str
+rows: int
+replayed: bool
+```
+
+### CatalogPathPolicy fields
+
+Annotation location: `okto_grafx.catalogs.CatalogPathPolicy`.
+
+Existing allowed roots, no links/UNC, no implicit home expansion or directory creation.
+
+```python
+allowed_roots: tuple[str, ...]
+max_catalogs: int
+max_active_transactions: int
+```
+
+#### CatalogPathPolicy.resolve
+
+```python
+resolve(path: str | os.PathLike[str], *, existing: bool=True) -> str
+```
+
+Validate an explicit path against roots; this never creates or opens a store.
+
+### CatalogInfo fields
+
+Annotation location: `okto_grafx.catalogs.CatalogInfo`.
+
+Detached catalog inventory; store identity is not filesystem authority.
+
+```python
+alias: str
+database_uuid: bytes
+read_only: bool
+owned: bool
+active_transactions: int
+```
+
+### WorkspacePolicy fields
+
+Annotation location: `okto_grafx.workspace.WorkspacePolicy`.
+
+Opt-in discovery within explicit allowed roots, with no environment/home fallback.
+
+```python
+paths: CatalogPathPolicy
+markers: tuple[str, ...]
+max_parent_steps: int
+allow_cwd: bool
+allow_user_store: bool
+project_store_name: str
+```
+
+### ResolvedWorkspace fields
+
+Annotation location: `okto_grafx.workspace.ResolvedWorkspace`.
+
+Explicit absolute paths, not open handles; source records which precedence rule won.
+
+```python
+root: str
+project_store: str
+user_store: str | None
+source: str
+```
 
 ### ProjectionLimits fields
 
@@ -3182,6 +3518,7 @@ primary_key: str | None
 from_table: str | None
 to_table: str | None
 schema_version: int
+schema_layouts: tuple[tuple[int, int], ...]
 ```
 
 #### TableDef.arity

@@ -26,6 +26,7 @@ def dto(value):
 
 
 def capabilities(invocation):
+    """Report build-level CLI contracts without implying store activation."""
     from okto_grafx.cli.commands import Report
     from okto_grafx.cli.parser import COMMANDS
 
@@ -53,6 +54,7 @@ def capabilities(invocation):
 
 
 def inspect_indexes(invocation, database):
+    """Return bounded read-only index metadata and explicit truncation counts."""
     from okto_grafx.cli.commands import Report
 
     limit = invocation.number("limit", 100)
@@ -101,6 +103,7 @@ def _array(text, name):
 
 
 def search(invocation, database):
+    """Validate CLI options and execute one snapshot-bound public search."""
     from okto_grafx.cli.commands import Report
 
     kind = invocation.spec.subcommand

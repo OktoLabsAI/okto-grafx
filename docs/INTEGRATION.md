@@ -1,5 +1,10 @@
 # Integration recipes
 
+For named databases, explicit ownership/read-write permissions and bounded
+project/user scope resolution, see [Catalogs and workspaces](CATALOGS_AND_WORKSPACES.md).
+Transactions remain native and pinned to one catalog; independent stores do not
+gain a distributed commit or a shared atomic snapshot.
+
 For host-provided typed scalar functions and optional Arrow result batches, see
 [Extensions and Arrow](EXTENSIONS_AND_ARROW.md). The registry is explicitly
 per connection; cursor ownership and native transaction semantics remain unchanged.

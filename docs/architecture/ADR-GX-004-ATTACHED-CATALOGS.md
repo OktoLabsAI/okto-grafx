@@ -1,6 +1,8 @@
 # ADR GX-004 — Named catalogs with single-store transactions
 
 Status: accepted semantic contract; GX-CAP-2 implementation pending.
+The non-persisting session/workspace Python slice is implemented in 0.0.6
+development; [full CAP-2 remains open](../specs/SPEC-GX-CAP-2.md).
 Source: complementary plan §8; agent-first §§6, 14 in full.
 
 ## Decision

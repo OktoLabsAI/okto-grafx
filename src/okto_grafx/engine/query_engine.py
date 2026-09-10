@@ -808,7 +808,16 @@ class _Row:
     columns: dict[str, object] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AddNullableColumn(PlanNode):
+    """Internal typed-only DDL; never accepted as user query text or a persisted plan."""
+
+    table: str
+    column: ColumnDef
+
+
 _WRITE_PLAN_NODES: tuple[type[PlanNode], ...] = (
+    _AddNullableColumn,
     CreateIndex,
     CreateNodeTable,
     CreateRelTable,
@@ -2206,6 +2215,14 @@ def _owner_landing_result_bytes(
         return charge
     authenticated = found[1].stored_payload_bytes
     if authenticated is not None:
+        if found[1].schema_version != table.schema_version:
+            prior_count = next((count for version, count in table.schema_layouts
+                                if version == found[1].schema_version), None)
+            if prior_count is None:
+                return None  # unproved optional retention must not undercharge
+            # Each virtual appended NULL has one byte in the logical encoding.
+            # The authenticated physical length deliberately remains unchanged.
+            authenticated += len(table.columns) - prior_count
         return (
             _OWNER_LANDING_RESULT_BASE_BYTES
             + authenticated * _OWNER_LANDING_PAYLOAD_MULTIPLIER
@@ -4280,6 +4297,11 @@ class QueryEngine:
 
     # --- schema ------------------------------------------------------------------------------
 
+    def add_nullable_column(self, txn: object, table: str, column: ColumnDef) -> TableDef:
+        """Stage typed append-only DDL using the native schema statement journal."""
+        self._schema(_AddNullableColumn(table, column), txn, {})
+        return self._working_catalog(txn).table(table)
+
     def _schema(self, node: PlanNode, txn: object, statistics: dict[str, int]) -> None:
         """Install one schema change and stage the catalog pages it wrote.
 
@@ -4478,6 +4500,8 @@ class QueryEngine:
                 catalog=catalog,
             )
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
+        elif isinstance(node, _AddNullableColumn):
+            catalog.add_nullable_column(node.table, node.column)
         else:  # pragma: no cover - the caller checked the type
             raise GrafxPlanError(
                 f"The operator {node.label} is not a schema change.",

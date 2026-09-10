@@ -2947,6 +2947,20 @@ class TransactionManager:
                 observe(published_lsn)
             if self._index_sync is not None:
                 self._index_sync()
+        committed_catalog = getattr(catalog, "catalog", None)
+        if (type(committed_catalog) is Catalog
+                and "nullable_columns_v1" in committed_catalog.required_capabilities()):
+            for intent in reduced_intents:
+                table = intent.table
+                if committed_catalog.has_table(table.name):
+                    current_table = committed_catalog.table(table.name)
+                    if current_table.table_id == table.table_id and current_table != table:
+                        raise GrafxSchemaVersionMismatch(
+                            "A staged row was bound before the table schema changed; retry in a new transaction.",
+                            field="schema_version", table=table.name,
+                            stored_schema_version=table.schema_version,
+                            current_schema_version=current_table.schema_version,
+                        )
         if manager is None:
             return
 

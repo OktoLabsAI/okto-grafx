@@ -1152,6 +1152,8 @@ def _table_definition(value: Any) -> TableDef:
             _domain_field(value, TableDef, "to_table"), field="table.to_table"
         ),
         schema_version=_builtin_int(_domain_field(value, TableDef, "schema_version")),
+        schema_layouts=tuple(tuple(_builtin_int(n) for n in _tuple_items(pair, field="table.schema_layout"))
+                             for pair in _tuple_items(_domain_field(value, TableDef, "schema_layouts"), field="table.schema_layouts")),
     )
 
 
@@ -2913,16 +2915,17 @@ def _query_plan_field_snapshot(
                     value=len(raw_items),
                     limit=MAX_LIST_ELEMENTS,
                 )
-            if len(arguments) != 2 or arguments[1] is not Ellipsis:
+            repeated = len(arguments) == 2 and arguments[1] is Ellipsis
+            if not repeated and (not arguments or len(raw_items) != len(arguments)):
                 raise GrafxPlanError(
-                    "A query plan tuple must declare one repeated item type.",
+                    "A query plan tuple must match its declared item types and arity.",
                     field=field,
                     value="tuple_grammar",
                 )
             return tuple(
                 _query_plan_field_snapshot(
                     item,
-                    annotation=arguments[0],
+                    annotation=arguments[0] if repeated else arguments[position],
                     detached_nodes=detached_nodes,
                     active=active,
                     expression_depth=expression_depth,

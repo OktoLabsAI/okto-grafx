@@ -829,7 +829,8 @@ class IndexStore:
         storage = self._pool.storage
         header = FileHeader(kind=FileKind.INDEX, page_size=self._pool.page_size)
         index_header = IndexHeader(
-            format_version=4 if self._definition.layout is IndexLayout.SPARSE_HASH else 2,
+            format_version=(5 if self._definition.layout is IndexLayout.POSTING_HASH else
+                            4 if self._definition.layout is IndexLayout.SPARSE_HASH else 2),
             layout=self._definition.layout,
             visibility=self._definition.visibility,
             table_id=self._definition.table_id,
@@ -2808,13 +2809,17 @@ class IndexStore:
                 entries.extend(self._entries_on(page_index))
         return tuple(entries)
 
+    def _entry_images(self, page: Page):
+        """Iterate canonical entry images; physical layouts may decode their own slots."""
+        return page.iter_slot_views()
+
     def _entries_on(self, page_index: PageIndex) -> tuple[IndexEntry, ...]:
         """Return the entries stored on one page, tagged with where each one lives."""
         with self._pool.pinned(self.file, page_index) as page:
             self._require_index_page(page, page_index)
             return tuple(
                 IndexEntry.decode(payload).located_at(page_index, slot)
-                for slot, payload in page.iter_slot_views()
+                for slot, payload in self._entry_images(page)
             )
 
     def _entry_headers(self, *, max_entries: int | None = None) -> tuple[_IndexEntryHeader, ...]:
@@ -2832,7 +2837,7 @@ class IndexStore:
             for page_index in self._bucket_pages(bucket):
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for slot, image in page.iter_slot_views():
+                    for slot, image in self._entry_images(page):
                         (
                             validated,
                             encoded_ref,
@@ -2873,7 +2878,7 @@ class IndexStore:
             for page_index in self._bucket_pages(bucket):
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for _slot, image in page.iter_slot_views():
+                    for _slot, image in self._entry_images(page):
                         _image, _ref, _born_csn, dead_csn, _versioned = (
                             _validated_image(image)
                         )
@@ -2896,7 +2901,7 @@ class IndexStore:
             for page_index in self._bucket_pages(bucket):
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for _slot, image in page.iter_slot_views():
+                    for _slot, image in self._entry_images(page):
                         _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
                             _validated_image(image)
                         )
@@ -2916,7 +2921,7 @@ class IndexStore:
                 refs: list[RecordRef] = []
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for _slot, image in page.iter_slot_views():
+                    for _slot, image in self._entry_images(page):
                         _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
                             _validated_image(image)
                         )
@@ -2941,8 +2946,8 @@ class IndexStore:
         found: list[IndexEntry] = []
         with self._pool.pinned(self.file, page_index) as page:
             self._require_index_page(page, page_index)
-            for slot in page.live_slots():
-                entry = IndexEntry.decode_if_matches(page.slot_view(slot), key, ref)
+            for slot, raw in self._entry_images(page):
+                entry = IndexEntry.decode_if_matches(raw, key, ref)
                 if entry is not None:
                     found.append(entry.located_at(page_index, slot))
         return tuple(found)
@@ -3874,7 +3879,10 @@ class IndexStore:
                     if self._key_page_memo is None:
                         from okto_grafx.engine.key_page_memo import KeyPageMemo
                         self._key_page_memo = KeyPageMemo()
-                    for entry in self._key_page_memo.matches(page, key, ref):
+                    selected = (self._posting_matches(page, key, ref)
+                                if self.definition.layout is IndexLayout.POSTING_HASH
+                                else self._key_page_memo.matches(page, key, ref))
+                    for entry in selected:
                         if max_matches is not None and len(matches) >= max_matches:
                             raise GrafxQueryBudgetExceeded(
                                 "Exact candidate capture budget exceeded.",
@@ -3887,7 +3895,7 @@ class IndexStore:
                         # page type/link. Preserve that bounded work and error surface exactly.
                         matching_complete = True
                 elif keys is not None:
-                    for slot, image in page.iter_slot_views():
+                    for slot, image in self._entry_images(page):
                         raw, encoded_ref, born, dead, versioned = _validated_image(image)
                         stored_key = bytes(raw[INDEX_ENTRY_HEADER_SIZE:])
                         if stored_key in keys:
@@ -8142,6 +8150,9 @@ class IndexManager:
         elif definition.layout is IndexLayout.SPARSE_HASH:
             from okto_grafx.engine.sparse_hash import SparseHashIndex
             index = SparseHashIndex(definition, self._pool, self._metrics)
+        elif definition.layout is IndexLayout.POSTING_HASH:
+            from okto_grafx.engine.posting_hash import PostingHashIndex
+            index = PostingHashIndex(definition, self._pool, self._metrics)
         else:
             index = HashIndex(definition, self._pool, self._metrics)
         from okto_grafx.engine.key_page_memo import KeyPageMemo

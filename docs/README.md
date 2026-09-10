@@ -8,6 +8,11 @@ publication or that the latest source is installed in a particular application.
 
 | Question | Read |
 | --- | --- |
+| How can repeated property keys share physical index storage? | [Posting hash](POSTING_HASH.md) |
+| How do I copy data into an existing catalog and safely retry? | [Atomic catalog copy](CATALOG_COPY.md) |
+| How do I persist and consume named, typed read queries? | [Logical views](LOGICAL_VIEWS.md) |
+| How do I add a nullable column without rewriting the graph? | [Append-only schema evolution](NULLABLE_COLUMNS.md) |
+| How do I attach databases and resolve explicit workspaces? | [Catalogs and workspaces](CATALOGS_AND_WORKSPACES.md) |
 | How do I install, create a graph and reopen it? | [Getting started](GETTING_STARTED.md) |
 | How do I integrate a synchronous library into services, workers or agents? | [Integration](INTEGRATION.md) |
 | Which public methods and return values exist? | [API reference](API_REFERENCE.md) |
