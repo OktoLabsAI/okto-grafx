@@ -31,12 +31,18 @@ detail is exactly the defect A47 was written about.
 
 from __future__ import annotations
 
+from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextSearchResult
+from okto_grafx.domain.query.hybrid import HybridSearchOptions, HybridSearchResult
+from okto_grafx.engine.hybrid import search_hybrid as _search_hybrid
+from okto_grafx.engine.fulltext import create_text_index as _create_text_index, search_text as _search_text
+from okto_grafx.domain.query.text_procedure import text_call
+
 import struct
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Self
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Self, TypeVar
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -82,6 +88,9 @@ from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.query.ast import Query as QueryStatement
+from okto_grafx.domain.query.control import CancellationToken, _ReadControl, _read_control
+from okto_grafx.engine.index_distribution import IndexDistribution
+from okto_grafx.engine.key_page_memo import KeyPageCacheUsage
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_COLUMN_DEFINITIONS,
@@ -98,11 +107,18 @@ from okto_grafx.domain.txn.context import (
 )
 from okto_grafx.domain.txn.partitions import page_partition, partition_key
 from okto_grafx.domain.txn.snapshot import Snapshot
+from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.txn.commit_metadata import CommitMetadata, capture_commit_metadata, decode_commit_metadata
+from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry
+from okto_grafx.domain.txn.commit_history import CommitHistoryPage
+from okto_grafx.engine.commit_history_reader import observe_commit_catalog
+from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
 from okto_grafx.domain.vector.filter import RecordIdFilter
-from okto_grafx.domain.verify.findings import VerificationReport
+from okto_grafx.domain.verify.findings import VerificationReport, VerificationFinding, FindingKind, FindingLocation
 from okto_grafx.domain.wal.replay import RecycleReport
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.catalog_store import CatalogStore
+from okto_grafx.engine.index_cleanup import IndexCleanupReport, _cleanup_indexes
 from okto_grafx.engine.heap_store import HeapStore, _HeapScanPosition
 from okto_grafx.engine.metrics_catalog import metric
 from okto_grafx.engine.public_views import (
@@ -174,7 +190,10 @@ from okto_grafx.engine.public_views import (
 from okto_grafx.engine.query_engine import QueryEngine, QueryResult
 from okto_grafx.engine.txn_manager import TransactionManager
 from okto_grafx.engine.vector_engine import VectorSearchResult
+from okto_grafx.engine.vector_memory import VectorMemoryUsage, VectorTotalMemoryUsage
 from okto_grafx.engine.verifier import VERIFICATION_SCOPES
+
+_HistoryResult = TypeVar("_HistoryResult")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from okto_grafx.engine.wal_manager import WalManager
@@ -763,6 +782,7 @@ class ScanCursorV1:
         "_schema_version",
         "_table_id",
         "_table_name",
+        "_columns",
     )
 
     def __init__(self) -> None:
@@ -781,6 +801,7 @@ class ScanCursorV1:
         table_id: int,
         schema_version: int,
         position: _HeapScanPosition,
+        columns: tuple[str, ...] | None = None,
     ) -> ScanCursorV1:
         cursor = object.__new__(cls)
         object.__setattr__(cursor, "_consumed", False)
@@ -789,6 +810,7 @@ class ScanCursorV1:
         object.__setattr__(cursor, "_table_id", table_id)
         object.__setattr__(cursor, "_schema_version", schema_version)
         object.__setattr__(cursor, "_position", position)
+        object.__setattr__(cursor, "_columns", columns)
         return cursor
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -923,13 +945,18 @@ class Query:
         self._parameters = parameters
 
     def cursor(
-        self, *, batch_size: int = DEFAULT_QUERY_CURSOR_BATCH_ROWS
+        self,
+        *,
+        batch_size: int = DEFAULT_QUERY_CURSOR_BATCH_ROWS,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> QueryCursor:
         """Open a cursor whose read transaction lives until exhaustion or explicit close."""
         return self._database._open_query_cursor(
             self._text,
             self._parameters,
             batch_size=_query_cursor_batch_size(batch_size),
+            control=_read_control(self._database._clock, timeout_seconds, cancellation),
         )
 
 
@@ -948,6 +975,7 @@ class QueryCursor:
         "_closed",
         "_database",
         "_raw",
+        "_control",
         "_source_done",
         "_transaction",
         "columns",
@@ -963,10 +991,12 @@ class QueryCursor:
         columns: tuple[str, ...],
         plan: PlanNode,
         batch_size: int,
+        control: _ReadControl | None = None,
     ) -> None:
         self._database = database
         self._transaction = transaction
         self._raw = raw
+        self._control = control
         self._batch_size = batch_size
         self._buffer: tuple[tuple[Value, ...], ...] = ()
         self._buffer_position = 0
@@ -1069,6 +1099,8 @@ class QueryCursor:
         """Make a database close terminal even when this cursor buffered detached rows."""
         try:
             self._database._require_open()
+            if self._control is not None:
+                self._control.check()
         except BaseException as failure:
             try:
                 self._database._close_query_cursor(self)
@@ -1152,7 +1184,12 @@ class Transaction:
         return _public_commit_report(self._report)
 
     def execute(
-        self, text: str, parameters: Mapping[str, object] | None = None
+        self,
+        text: str,
+        parameters: Mapping[str, object] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> QueryResult:
         """Run one statement inside this transaction and return its result.
 
@@ -1162,7 +1199,26 @@ class Transaction:
         """
         self._require_active()
         self._require_batch_idle("execute")
-        return self._database._run_statement(self._context, text, parameters)
+        if (
+            (timeout_seconds is not None or cancellation is not None)
+            and self._context.mode is not TransactionMode.READ
+        ):
+            raise GrafxUnsupportedOperation(
+                "Execution cancellation and deadlines require a read transaction.",
+                operation="execute", field="mode",
+            )
+        control = _read_control(self._database._clock, timeout_seconds, cancellation)
+        return self._database._run_statement(self._context, text, parameters, control=control)
+
+    def commit_history(self, *, after: CommitId | None = None, limit: int = 100) -> CommitHistoryPage:
+        """Read an ascending bounded history page under this transaction's snapshot."""
+        self._require_active()
+        return self._database._commit_history(self._context, after=after, limit=limit)
+
+    def lookup_commit(self, identity: CommitId) -> CommitCatalogEntry | None:
+        """Look up a qualified commit visible here; None does not certify legacy absence."""
+        self._require_active()
+        return self._database._lookup_commit(self._context, identity)
 
     def executemany(
         self,
@@ -1189,12 +1245,18 @@ class Transaction:
         *,
         limit: int,
         cursor: ScanCursorV1 | None = None,
+        columns: tuple[str, ...] | None = None,
+        max_batch_bytes: int | None = None,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> ScanPageV1:
         """Read one bounded page of physical rows under this transaction's fixed snapshot.
 
-        Values follow ``TableDef.columns`` exactly. Relationship rows therefore expose ``_from``
-        and ``_to`` in their first two positions and preserve every physical occurrence. The
-        cursor is process-local and valid only for this transaction and table.
+        By default values follow ``TableDef.columns``; relationship endpoints lead the tuple.
+        Explicit ``columns`` selects values in requested order, or identities only when empty.
+        Omitted payloads remain validated. The one-shot cursor binds this transaction, table
+        and exact projection. Optional logical batch bounds and cooperative read controls
+        refuse without returning a partial page; the caller retains its transaction.
         """
 
         self._require_active()
@@ -1208,6 +1270,14 @@ class Transaction:
             )
         table_name = _builtin_text(table, field="table", empty=False)
         page_limit = _require_positive_integer("limit", limit)
+        if columns is not None and (type(columns) is not tuple or len(columns) > 256
+                or any(type(c) is not str or not c for c in columns)
+                or len(set(columns)) != len(columns)):
+            raise GrafxConfigurationError("columns must be a tuple of distinct names or None.", field="columns")
+        if max_batch_bytes is not None:
+            max_batch_bytes = _require_positive_integer("max_batch_bytes", max_batch_bytes)
+            if max_batch_bytes > 2**31 or page_limit > 65536:
+                raise GrafxConfigurationError("Bounded scans allow <=65536 rows and <=2^31 bytes.", field="limit")
         payload = (
             None
             if cursor is None
@@ -1223,6 +1293,8 @@ class Transaction:
             limit=page_limit,
             cursor_payload=payload,
             cursor_owner=self._scan_owner,
+            columns=columns, max_batch_bytes=max_batch_bytes,
+            control=_read_control(self._database._clock, timeout_seconds, cancellation),
         )
 
     def commit(self) -> CommitReport:
@@ -1401,12 +1473,27 @@ class Maintenance:
         """Return a conservative read-only heap-bloat census."""
         return self._database._bloat(table)
 
+    def cleanup_indexes(
+        self,
+        *,
+        dry_run: bool = True,
+        confirm_quiescent: bool = False,
+        max_files: int = 10000,
+        max_wal_records: int = 100000,
+    ) -> IndexCleanupReport:
+        """Inventory or reclaim unreferenced native generations with every other handle stopped."""
+        return _cleanup_indexes(
+            self._database, dry_run=dry_run, confirm_quiescent=confirm_quiescent,
+            max_files=max_files, max_wal_records=max_wal_records,
+        )
+
     def vacuum(
         self,
         table: str | None = None,
         *,
         confirm_quiescent: bool = False,
         max_versions: int | None = None,
+        index_free_pages: bool = False,
     ) -> VacuumReport:
         """Run explicit foreground MVCC reclamation under the v1 quiescence contract."""
 
@@ -1414,6 +1501,7 @@ class Maintenance:
             table,
             confirm_quiescent=confirm_quiescent,
             max_versions=max_versions,
+            index_free_pages=index_free_pages,
         )
 
     def checkpoint(self) -> RecycleReport:
@@ -1483,11 +1571,13 @@ class Maintenance:
         name: str,
         *,
         overflow_pages_per_bucket: int = 1,
+        check_skew: bool = False,
     ) -> IndexView | None:
         """Grow one physically pressured exact index by at most one directory step."""
         return self._database.rehash_index_if_needed(
             name,
             overflow_pages_per_bucket=overflow_pages_per_bucket,
+            check_skew=check_skew,
         )
 
     def publish_metrics(self) -> None:
@@ -1520,7 +1610,9 @@ class Database:
         "_catalog",
         "_catalog_view_memo",
         "_plan_view_memo",
+        "_text_stats_cache",
         "_plan_guard_factory",
+        "_checksum_scope",
         "_heap",
         "_wal",
         "_transactions",
@@ -1627,6 +1719,7 @@ class Database:
             int, tuple[PlanNode, PlanNode]
         ] = OrderedDict()
         self._plan_guard_factory = plan_guard_factory
+        self._checksum_scope: Callable[[], AbstractContextManager[object]] = nullcontext
         self._heap: HeapStore = heap
         self._wal: WalManager = wal
         self._transactions: TransactionManager = transactions
@@ -1694,6 +1787,7 @@ class Database:
         # settlement, so Database.close can finish it before storage and the pool disappear. A
         # transaction that never executed a statement needs no entry and no post-close unwind.
         self._public_contexts: dict[int, TransactionContext] = {}
+        self._text_stats_cache: dict = {}
         self._close_releasing: bool = False
         self._close_released: bool = False
         self._close_failure: BaseException | None = None
@@ -2061,7 +2155,7 @@ class Database:
 
     # --- transactions -------------------------------------------------------------------------
 
-    def begin(self, mode: str = "write") -> Transaction:
+    def begin(self, mode: str = "write", *, metadata: CommitMetadata | None = None) -> Transaction:
         """Open a transaction in ``"read"`` or ``"write"`` mode (SPEC-M1 FR-2).
 
         A reader sees the consistent snapshot of the instant it opened for its whole life, even
@@ -2071,13 +2165,18 @@ class Database:
         """
         self._require_open()
         parsed = TransactionMode.parse(mode)
+        captured = capture_commit_metadata(metadata)
+        if captured is not None and parsed is not TransactionMode.WRITE:
+            raise GrafxConfigurationError("Read transactions cannot publish metadata.", field="metadata")
+        admitted = None if captured is None else decode_commit_metadata(captured)
         if parsed is TransactionMode.WRITE:
             self._require_writable("begin a write transaction")
         with self._public_transition():
             # Seal the check/transition race: close may publish after the preliminary guard but
             # before this process-wide facade boundary increments its settlement count.
             self._require_open()
-            context = self._transactions.begin(parsed.value)
+            context = (self._transactions.begin(parsed.value) if admitted is None
+                       else self._transactions.begin(parsed.value, metadata=admitted))
             return self._public_transaction(context)
 
     def retry(self, transaction: Transaction) -> Transaction:
@@ -2149,7 +2248,7 @@ class Database:
             return self._public_transaction(successor)
 
     @contextmanager
-    def transaction(self, mode: str = "write") -> Iterator[Transaction]:
+    def transaction(self, mode: str = "write", *, metadata: CommitMetadata | None = None) -> Iterator[Transaction]:
         """Open a transaction as a block, committing on a clean exit and rolling back otherwise.
 
         The lexical boundary also retains this participant section's unlocked descriptor. Its
@@ -2157,13 +2256,23 @@ class Database:
         one-statement transaction avoids repeated open/close calls without retaining the lock or
         weakening another process's admission.
         """
+        captured = capture_commit_metadata(metadata)
+        parsed = TransactionMode.parse(mode)
+        if captured is not None and parsed is not TransactionMode.WRITE:
+            raise GrafxConfigurationError("Read transactions cannot publish metadata.", field="metadata")
+        admitted = None if captured is None else decode_commit_metadata(captured)
         with self._transactions._participant_descriptor_scope(revalidate_identity=True):
-            txn = self.begin(mode)
+            txn = self.begin(parsed.value, metadata=admitted)
             with txn:
                 yield txn
 
     def execute(
-        self, text: str, parameters: Mapping[str, object] | None = None
+        self,
+        text: str,
+        parameters: Mapping[str, object] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> QueryResult:
         """Run one statement in its own read transaction and return its result.
 
@@ -2172,6 +2281,7 @@ class Database:
         that has been released.
         """
         self._require_open()
+        control = _read_control(self._clock, timeout_seconds, cancellation)
         with self._public_transition():
             # Close may win after the preliminary guard but before the transition becomes
             # visible. Refuse before retaining the unlocked participant descriptor.
@@ -2179,7 +2289,10 @@ class Database:
             with self._transactions._participant_descriptor_scope():
                 txn = self.begin("read")
                 try:
-                    result = txn.execute(text, parameters)
+                    result = (txn.execute(text, parameters) if control is None else
+                              self._run_statement(txn._context, text, parameters, control=control))
+                    if control is not None:
+                        control.check()
                     txn.commit()
                 except BaseException as failure:
                     if txn.active:
@@ -2199,9 +2312,9 @@ class Database:
     def query(self, text: str, parameters: Mapping[str, object] | None = None) -> Query:
         """Return a reusable canonical read query whose cursors own their snapshots.
 
-        ``execute`` remains the materialised convenience and the only autocommit door for
-        statements that write.  This builder copies text and parameter values immediately, so
-        mutating the caller's containers after this call cannot change a later cursor.
+        ``execute`` remains the materialised read convenience; statements that write require
+        an explicit write transaction. This builder copies text and parameter values immediately,
+        so mutating the caller's containers after this call cannot change a later cursor.
         """
         with self._public_operation("query prepare"):
             self._require_open()
@@ -2218,12 +2331,15 @@ class Database:
         parameters: Mapping[str, object] | None,
         *,
         batch_size: int,
+        control: _ReadControl | None = None,
     ) -> QueryCursor:
         """Open the internal stream and its owning read transaction as one public outcome."""
         self._require_open()
         transaction = self.begin("read")
         raw: object | None = None
         try:
+            if control is not None:
+                control.check()
             with self._public_operation("query cursor open"):
                 self._require_open()
                 engine = self._require_component(
@@ -2248,7 +2364,12 @@ class Database:
                             field="component",
                             value="query_cursor",
                         )
-                    raw = opener(text, transaction._context, parameters)
+                    raw = (
+                        opener(text, transaction._context, parameters) if control is None
+                        else opener(text, transaction._context, parameters, read_control=control)
+                    )
+                    if control is not None:
+                        control.check()
                 # Rebuild metadata after page access, just like the materialised result door.
                 columns = getattr(raw, "columns", None)
                 plan = getattr(raw, "plan", None)
@@ -2280,6 +2401,7 @@ class Database:
                     columns=metadata.columns,
                     plan=metadata.plan,
                     batch_size=batch_size,
+                    control=control,
                 )
         except BaseException as failure:
             if raw is not None:
@@ -2314,7 +2436,11 @@ class Database:
                 with self._transactions.page_access_section():
                     self._require_open()
                     transaction._require_active()
+                    if cursor._control is not None:
+                        cursor._control.check()
                     observed = cursor._raw.fetch(limit)
+                    if cursor._control is not None:
+                        cursor._control.check()
                 if type(observed) is not tuple or len(observed) != 2:
                     raise GrafxConfigurationError(
                         "The query cursor collaborator returned a malformed batch.",
@@ -2332,6 +2458,8 @@ class Database:
                     QueryResult(columns=cursor.columns, rows=raw_rows),  # type: ignore[arg-type]
                     max_string_characters=self._max_query_value_characters,
                 )
+                if cursor._control is not None:
+                    cursor._control.check()
             if raw_exhausted:
                 self._settle_query_cursor(cursor)
             return detached.rows, raw_exhausted
@@ -2403,6 +2531,8 @@ class Database:
         context: TransactionContext,
         text: str,
         parameters: Mapping[str, object] | None = None,
+        *,
+        control: _ReadControl | None = None,
     ) -> QueryResult:
         """Run one statement for a context already validated by the public Transaction."""
         with self._public_operation("query"):
@@ -2415,6 +2545,9 @@ class Database:
                 parameters,
                 max_string_characters=self._max_query_value_characters,
             )
+            call = text_call(statement, detached_parameters)
+            if call is not None:
+                return self._run_text_procedure(context, call, control)
             with self._transactions.page_access_section(transaction=context):
                 self._require_open()
                 if not context.active:
@@ -2428,13 +2561,16 @@ class Database:
                 # therefore neither miss a context that may have acquired a schema journal nor
                 # release storage while the statement is installing one.
                 self._public_contexts.setdefault(context.txn_id, context)
-                raw_result = engine.execute(  # type: ignore[attr-defined]
-                    statement, context, detached_parameters
-                )
+                if control is not None:
+                    control.check()
+                    raw_result = engine.execute(statement, context, detached_parameters, read_control=control)  # type: ignore[attr-defined]
+                    control.check()
+                else:
+                    raw_result = engine.execute(statement, context, detached_parameters)  # type: ignore[attr-defined]
             # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
             # after leaving page access, while _public_operation still translates ordinary host
             # failures and deliberately lets process-control signals pass unchanged.
-            return _query_result_view(
+            result = _query_result_view(
                 raw_result,
                 max_string_characters=self._max_query_value_characters,
                 internally_owned_plan=(
@@ -2447,6 +2583,32 @@ class Database:
                 plan_memo=self._plan_view_memo,
                 plan_guard_factory=self._plan_guard_factory,
             )
+            if control is not None:
+                control.check()
+            return result
+
+    def _run_text_procedure(self, context: TransactionContext, call: tuple[object, ...], control: _ReadControl | None) -> QueryResult:
+        """Run the closed FTS read procedure, sharing the calling statement's deadline."""
+        candidate_filter = None
+        if len(call) == 4:
+            if type(call[3]) not in (list, tuple):
+                raise GrafxConfigurationError("record_ids must be a list parameter.", field="record_ids")
+            candidate_filter = RecordIdFilter.of(call[3])
+        found = _search_text(self, Transaction(self, context), index=call[0], query=call[1], k=call[2],
+                             filter=candidate_filter, limits=None, k1=1.2, b=0.75,
+                             timeout_seconds=None, cancellation=None, _control=control)
+        return QueryResult(
+            columns=("record_id", "score", "matched_fields", "matched_terms", "regime", "index_built_through_commit", "snapshot_commit"),
+            rows=tuple((hit.record_id, hit.score, hit.matched_fields, hit.matched_terms, found.regime,
+                        found.index_built_through_commit, found.snapshot_commit) for hit in found.hits),
+            statistics={"postings_visited": found.postings_visited, "candidates": found.candidates,
+                        "corpus_documents": found.corpus_documents, "snapshot_commit": found.snapshot_commit,
+                        "index_built_through_commit": found.index_built_through_commit, "fulltext_exact_index": 1,
+                        "statistics_wal_records": found.statistics_wal_records,
+                        "statistics_from_wal_delta": int(found.statistics_regime == 'wal_delta'),
+                        "statistics_from_durable_summary": int(found.statistics_regime == 'durable_summary'),
+                        "statistics_from_snapshot_cache": int(found.statistics_regime == 'snapshot_cache')},
+        )
 
     def _run_many(
         self,
@@ -2624,6 +2786,9 @@ class Database:
         limit: int,
         cursor_payload: tuple[int, int, _HeapScanPosition, ScanCursorV1] | None,
         cursor_owner: object,
+        columns: tuple[str, ...] | None = None,
+        max_batch_bytes: int | None = None,
+        control: _ReadControl | None = None,
     ) -> ScanPageV1:
         """Serve the bounded scan door after its public arguments have been canonicalised."""
 
@@ -2647,6 +2812,7 @@ class Database:
                         operation="scan_rows_v1",
                     )
                 table_def = self._catalog.catalog.table(table)
+                positions = None if columns is None else tuple(table_def.column_index(c) for c in columns)
                 position: _HeapScanPosition | None = None
                 if cursor_payload is not None:
                     cursor_table_id, cursor_schema_version, position, cursor_token = (
@@ -2655,6 +2821,7 @@ class Database:
                     if (
                         cursor_table_id != table_def.table_id
                         or cursor_schema_version != table_def.schema_version
+                        or getattr(cursor_token, "_columns", None) != columns
                     ):
                         raise GrafxTransactionStateError(
                             "A scan continuation no longer names the same table definition.",
@@ -2678,12 +2845,14 @@ class Database:
                             value="consumed",
                         )
                     object.__setattr__(cursor_token, "_consumed", True)
+                options = {}
+                if columns is not None or max_batch_bytes is not None or control is not None:
+                    if type(self._heap) is not HeapStore:
+                        raise GrafxUnsupportedOperation("The heap collaborator lacks bounded projected scans.", operation="scan_rows_v1")
+                    options = dict(materialized_positions=None if positions is None else frozenset(positions),
+                                   max_batch_bytes=max_batch_bytes, check=None if control is None else control.check)
                 raw_rows, next_position = self._heap.scan_page(
-                    table_def,
-                    context.snapshot,
-                    limit=limit,
-                    position=position,
-                )
+                    table_def, context.snapshot, limit=limit, position=position, **options)
 
             # Heap values are decoded into owned objects, but maps are mutable and every public
             # door promises detachment. Rebuild all leaves after page access so no frame, store or
@@ -2691,7 +2860,9 @@ class Database:
             active: set[int] = set()
             rows: list[ScanRowV1] = []
             for row_position, (_ref, version) in enumerate(raw_rows):
-                raw_values = version.values
+                if control is not None:
+                    control.check()
+                raw_values = version.values if positions is None else tuple(version.values[p] for p in positions)
                 detached_values = _scan_exact_scalar_values_snapshot(
                     raw_values,
                     max_string_characters=self._max_query_value_characters,
@@ -2725,9 +2896,41 @@ class Database:
                     table_id=table_def.table_id,
                     schema_version=table_def.schema_version,
                     position=next_position,
+                    columns=columns,
                 )
             )
+            if control is not None:
+                control.check()
             return ScanPageV1(rows=tuple(rows), next_cursor=next_cursor)
+
+    def vector_total_memory_usage(self) -> VectorTotalMemoryUsage:
+        """Return per-handle aggregate ANN reservations; disabled accounting reports zero."""
+        with self._public_operation("vector_total_memory_usage"):
+            vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
+            observe = getattr(vectors, "total_memory_usage", None)
+            if not callable(observe):
+                raise GrafxUnsupportedOperation(
+                    "The vector collaborator does not expose aggregate memory observations.",
+                    operation="vector_total_memory_usage",
+                )
+            return observe()
+
+    def vector_memory_usage(self, space: str) -> VectorMemoryUsage:
+        """Observe local HNSW cache tariffs without building or proving freshness.
+
+        The per-picture limit is independent of query memory and is not an RSS or
+        aggregate multi-handle ceiling. No persistent state is changed.
+        """
+        with self._public_operation("vector_memory_usage"):
+            vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
+            index = vectors.index(_require_text("space", space))
+            observe = getattr(index, "memory_usage", None)
+            if not callable(observe):
+                raise GrafxUnsupportedOperation(
+                    "The vector collaborator does not expose memory observations.",
+                    operation="vector_memory_usage",
+                )
+            return observe()
 
     def search_vectors(
         self,
@@ -2737,6 +2940,30 @@ class Database:
         query: Sequence[float] | VectorValue,
         k: int,
         candidate_filter: RecordIdFilter | None = None,
+        timeout_seconds: float | None = None,
+        cancellation: CancellationToken | None = None,
+    ) -> VectorSearchResult:
+        """Search one owned snapshot with optional cooperative read controls.
+
+        Controls are checked inside native candidate/ranking/navigation loops, not
+        preemptively inside a storage or third-party math call. No commit is cancelled.
+        Custom vector engines must expose search_controlled to accept these controls.
+        """
+        return self._search_vectors_with_control(
+            transaction, space=space, query=query, k=k, candidate_filter=candidate_filter,
+            control=_read_control(self._clock, timeout_seconds, cancellation),
+        )
+
+    def _search_vectors_with_control(
+        self,
+        transaction: Transaction,
+        *,
+        space: str,
+        query: Sequence[float] | VectorValue,
+        k: int,
+        candidate_filter: RecordIdFilter | None = None,
+        control: _ReadControl | None = None,
+        memory=None,
     ) -> VectorSearchResult:
         """Search vectors under the fixed snapshot of one active transaction.
 
@@ -2817,13 +3044,29 @@ class Database:
                         space=wanted_space,
                     )
                 snapshot = _public_snapshot(transaction._context.snapshot)
-                result = vectors.search(  # type: ignore[attr-defined]
+                operation = vectors.search
+                extra = {}
+                if control is not None or memory is not None:
+                    if control is not None:
+                        control.check()
+                    operation = getattr(vectors, "search_controlled", None)
+                    if not callable(operation):
+                        raise GrafxUnsupportedOperation(
+                            "The vector engine does not support cooperative controls.",
+                            operation="search_vectors", field="read_control",
+                        )
+                    extra["control"] = control
+                    extra["memory"] = memory
+                result = operation(
                     space=wanted_space,
                     query=wanted_query,
                     k=wanted_k,
                     snapshot=snapshot,
                     candidate_filter=wanted_filter,
+                    **extra,
                 )
+                if control is not None:
+                    control.check()
             return _vector_search_result_view(
                 result,
                 requested_k=wanted_k,
@@ -2832,6 +3075,42 @@ class Database:
             )
 
     # --- operator surface ---------------------------------------------------------------------
+
+    def search_hybrid(self, reader: Transaction | None = None, *, table: str,
+                      index: str | None, query: str, space: str | None,
+                      vector: Sequence[float], k: int = 20,
+                      options: HybridSearchOptions | None = None,
+                      filter: RecordIdFilter | None = None,
+                      text_limits: TextSearchLimits | None = None,
+                      timeout_seconds: float | None = None,
+                      cancellation: CancellationToken | None = None) -> HybridSearchResult:
+        """Fuse text/vector candidate windows with RRF-v1 and optional bounded graph evidence."""
+        if reader is None:
+            with self.begin("read") as owned:
+                return self.search_hybrid(owned, table=table, index=index, query=query,
+                    space=space, vector=vector, k=k, options=options, filter=filter,
+                    text_limits=text_limits, timeout_seconds=timeout_seconds, cancellation=cancellation)
+        if type(reader) is not Transaction:
+            raise GrafxConfigurationError("Expected Transaction reader.", field="reader")
+        return _search_hybrid(self, reader, table=table, index=index, query=query,
+            space=space, vector=vector, k=k, options=options, filter=filter,
+            text_limits=text_limits, timeout_seconds=timeout_seconds, cancellation=cancellation)
+
+    def create_text_index(self, name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None = None, bucket_count: int = 64) -> IndexView:
+        """Create a native persisted full-text generation over one to four STRING fields."""
+        return _create_text_index(self, name, table, columns, options=options, bucket_count=bucket_count)
+
+    def search_text(self, reader: Transaction | None = None, *, index: str, query: str, k: int = 20,
+                    filter: RecordIdFilter | None = None, limits: TextSearchLimits | None = None,
+                    k1: float = 1.2, b: float = 0.75, timeout_seconds: float | None = None,
+                    cancellation: CancellationToken | None = None, prefix: bool = False) -> TextSearchResult:
+        """Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot."""
+        if reader is None:
+            with self.begin("read") as owned:
+                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
+        if type(reader) is not Transaction:
+            raise GrafxConfigurationError("reader must be a Transaction.", field="reader")
+        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
 
     def create_index(
         self,
@@ -3009,12 +3288,13 @@ class Database:
         name: str,
         *,
         overflow_pages_per_bucket: int = 1,
+        check_skew: bool = False,
     ) -> IndexView | None:
         """Grow one exact index after a bounded directory-pressure assessment.
 
         The probe validates the physical identity and only the eager head page of each bucket;
         it never follows overflow chains or decodes entries.  Its cost is therefore
-        O(bucket_count), capped by the format at 4,096 pages, rather than O(index entries).  One
+        O(bucket_count), capped by the format at 65,536 pages, rather than O(index entries). One
         growth step is suggested when average occupied head slots reach the canonical sizing
         target, or when retained overflow reaches the configured integer ratio to bucket heads.
         Tombstones and pages retained after an interrupted append can make either signal
@@ -3031,6 +3311,8 @@ class Database:
         """
 
         with self._public_operation("rehash_index_if_needed"):
+            if type(check_skew) is not bool:
+                raise GrafxConfigurationError("check_skew must be boolean.", field="check_skew")
             self._require_open()
             self._require_writable("rehash an exact index when physically pressured")
             indexes = self._require_component(
@@ -3075,10 +3357,33 @@ class Database:
 
             # Re-enter the existing public protocol after releasing the read observation.  Its
             # fresh catalog/OCC checks are the authority; the advisory page-count sample is not.
+            if check_skew and self.index_distribution(wanted_name).recommendation == "inspect_key_skew":
+                return None
             return self.rehash_index(
                 wanted_name,
                 bucket_count=target_bucket_count,
             )
+
+    def index_cache_usage(self, name: str) -> KeyPageCacheUsage:
+        """Return active-index local memo observations; not a cache/freshness certificate."""
+        with self._public_operation("index_cache_usage"):
+            self._require_open()
+            wanted = _require_text("name", name)
+            with self._transactions.page_access_section():
+                return self._indexes.active_index(wanted)._key_page_memo.usage()
+
+    def index_distribution(
+        self, name: str, *, max_pages: int = 65_536, max_entries: int = 1_000_000,
+        max_memory_bytes: int = 64 * 1024 * 1024,
+    ) -> IndexDistribution:
+        """Bounded physical HASH distribution, without exposing keys or mutating data.
+
+        Retained old entries count too. This explicit maintenance census is O(entries
+        + pages), not a per-query optimization or an authoritative live cardinality.
+        """
+        from okto_grafx.engine.index_distribution import index_distribution
+        return index_distribution(self, name, max_pages=max_pages, max_entries=max_entries,
+                                  max_memory_bytes=max_memory_bytes)
 
     def verify(self, scope: str = "all") -> VerificationReport:
         """Walk the database and report every finding, precisely located (SPEC-M1 FR-11).
@@ -3098,7 +3403,37 @@ class Database:
             with self._transactions.page_access_section(fresh_read_view=True):
                 verifier = factory()  # type: ignore[operator]
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
+                if wanted_scope != "indexes" and self._catalog.catalog.commit_catalog_activation is not None:
+                    report = self._verify_commit_history(report)
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def _verify_commit_history(self, report: VerificationReport) -> VerificationReport:
+        """Include logical history in public verification, with no repair side effect."""
+        files = ("commits.dir", "commits.dat")
+        try:
+            with self.begin("read") as transaction:
+                def check(store: CommitCatalogStore) -> tuple[int, int]:
+                    """Verify complete history and count the physically checked journal pages."""
+                    head = store.verify()
+                    pages = sum(self._storage.file_size(file) // self._pool.page_size for file in files)
+                    return head.entry_count, pages
+
+                records, pages = self._observe_history(transaction._context, check, (0, 0))
+            return replace(
+                report, records_checked=report.records_checked + records,
+                pages_checked=report.pages_checked + pages,
+                files_checked=tuple(dict.fromkeys((*report.files_checked, *files))),
+            )
+        except GrafxError as failure:
+            # Never certify a partial/moving/unreadable history as a clean empty
+            # result. Keep metadata and raw exception payloads out of diagnostics.
+            finding = VerificationFinding(
+                kind=FindingKind.CATALOG_UNREADABLE,
+                location=FindingLocation(file="commits.dir"),
+                detail="Commit history verification refused; journal publication or integrity could not be proved.",
+            )
+            del failure
+            return replace(report, findings=(*report.findings, finding))
 
     def _bloat(self, table: str | None = None) -> BloatReport:
         """Measure heap bloat at the existing recyclable horizon without changing state.
@@ -3208,12 +3543,15 @@ class Database:
         *,
         confirm_quiescent: bool,
         max_versions: int | None,
+        index_free_pages: bool = False,
     ) -> VacuumReport:
         """Execute the guarded two-transaction vacuum v1 protocol."""
 
         with self._public_operation("vacuum MVCC history"):
             self._require_open()
             self._require_writable("vacuum MVCC history")
+            if type(index_free_pages) is not bool:
+                raise GrafxConfigurationError("index_free_pages must be a bool.", field="index_free_pages")
             wanted_table = None if table is None else _require_text("table", table)
             wanted_limit = (
                 None
@@ -3244,6 +3582,9 @@ class Database:
                     capability_active = (
                         HEAP_RECLAIM_V1_CAPABILITY in source.required_capabilities()
                     )
+                    from okto_grafx.engine.free_page_index import CAPABILITY
+                    if index_free_pages and CAPABILITY not in source.required_capabilities():
+                        capability_active = False
 
                 capability_activated = False
                 capability_wrote = False
@@ -3252,7 +3593,7 @@ class Database:
                     try:
                         capability_activated = (
                             self._transactions.prepare_heap_reclaim_activation(
-                                activation._context
+                                activation._context, index_free_pages=index_free_pages
                             )
                         )
                         activation_report = activation.commit()
@@ -3336,11 +3677,18 @@ class Database:
                             item.skipped_overflow_versions,
                             field="skipped_overflow_versions",
                         ),
+                        eligible_overflow_versions=_builtin_int(
+                            item.eligible_overflow_versions, field="eligible_overflow_versions"
+                        ),
+                        reclaimed_overflow_pages=_builtin_int(
+                            item.reclaimed_overflow_pages, field="reclaimed_overflow_pages"
+                        ),
                     )
                     for item in plan.tables
                 )
 
                 def total(field: str) -> int:
+                    """Sum one validated integer field across the selected table reports."""
                     return sum(
                         _builtin_int(getattr(item, field), field=field)
                         for item in table_reports
@@ -3363,6 +3711,7 @@ class Database:
                     reclaimed_slot_bytes=total("reclaimed_slot_bytes"),
                     relinked_versions=total("relinked_versions"),
                     skipped_overflow_versions=total("skipped_overflow_versions"),
+                    reclaimed_overflow_pages=total("reclaimed_overflow_pages"),
                     indexes_reconciled=len(index_reports),
                     index_entries_removed=sum(
                         _builtin_int(report.removed, field="index_entries_removed")
@@ -3400,6 +3749,95 @@ class Database:
 
             self._refresh_index_inventory()
             return None
+
+    def enable_commit_history(self) -> None:
+        """Activate one-way durable provenance after ensure_identity_indexes().
+
+        The activation commit establishes untracked legacy history, not an
+        invented record. Subsequent writing commits publish qualified history.
+        This is opt-in and adds journal IO/storage; it cannot be disabled.
+        """
+        with self._public_operation("enable_commit_history"):
+            self._require_writable("enable commit history")
+            with self.begin("write") as transaction:
+                self._transactions.prepare_commit_catalog_activation(transaction._context)
+
+    def commit_history(self, *, after: CommitId | None = None, limit: int = 100) -> CommitHistoryPage:
+        """Read a bounded history page in a new snapshot; use a read transaction for paging."""
+        self._require_open()
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise GrafxConfigurationError("History limit must be 1..1000.", field="limit")
+        after = None if after is None else self._history_identity(after)
+        with self.begin("read") as transaction:
+            return transaction.commit_history(after=after, limit=limit)
+
+    def lookup_commit(self, identity: CommitId) -> CommitCatalogEntry | None:
+        """Return a durable entry visible in a new snapshot, or None in the tracked interval."""
+        self._require_open()
+        identity = self._history_identity(identity)
+        with self.begin("read") as transaction:
+            return transaction.lookup_commit(identity)
+
+    def _history_identity(self, identity: CommitId) -> CommitId:
+        if type(identity) is not CommitId:
+            raise GrafxConfigurationError("Expected a qualified CommitId.", field="identity")
+        captured = CommitId(identity.database_uuid, identity.sequence)
+        if captured.database_uuid != self._identity.database_uuid:
+            raise GrafxConfigurationError("Commit belongs to another database.", field="database_uuid")
+        return captured
+
+    def _observe_history(
+        self, context: TransactionContext,
+        operation: Callable[[CommitCatalogStore], _HistoryResult], empty: _HistoryResult,
+    ) -> _HistoryResult:
+        with self._transactions.page_access_section(transaction=context, allow_writeback=False):
+            self._transactions._require_current_active(context)
+            source = self._catalog.catalog
+            activation = source.commit_catalog_activation
+            if activation is None or context.snapshot.read_lsn < activation:
+                raise GrafxUnsupportedOperation(
+                    "Commit history is not enabled in this snapshot.", field="commit_catalog",
+                    remedy="enable_commit_history",
+                )
+
+            def read(file: str, index: int) -> bytes:
+                """Read a fresh detached page without retaining a journal authority cache."""
+                return self._pool.codec.encode_page(self._pool.read_fresh_page(file, index))
+
+            return observe_commit_catalog(
+                database_uuid=self._identity.database_uuid, page_size=self._pool.page_size,
+                activation=activation, read_page=read, file_size=self._storage.file_size,
+                exists=self._storage.exists,
+                published=lambda: self._transactions._published_state_in_section().last_committed_lsn,
+                operation=operation, empty=empty, minimum_sequence=context.snapshot.read_lsn,
+            )
+
+    def _commit_history(self, context: TransactionContext, *, after: CommitId | None, limit: int) -> CommitHistoryPage:
+        with self._public_operation("commit_history"):
+            if type(limit) is not int or not 1 <= limit <= 1000:
+                raise GrafxConfigurationError("History limit must be 1..1000.", field="limit")
+            sequence = 0 if after is None else self._history_identity(after).sequence
+            read_lsn = context.snapshot.read_lsn
+
+            def collect(store: CommitCatalogStore) -> tuple[CommitCatalogEntry, ...]:
+                """Collect a bounded ascending history page within the owning snapshot."""
+                return store.history(after=sequence, read_lsn=read_lsn, limit=limit + 1)
+
+            empty_entries: tuple[CommitCatalogEntry, ...] = ()
+            entries = self._observe_history(context, collect, empty_entries)
+            activation = self._catalog.catalog.commit_catalog_activation
+            assert activation is not None
+            return CommitHistoryPage(
+                self._identity.database_uuid, activation,
+                read_lsn, entries[:limit], len(entries) > limit,
+            )
+
+    def _lookup_commit(self, context: TransactionContext, identity: CommitId) -> CommitCatalogEntry | None:
+        with self._public_operation("lookup_commit"):
+            captured = self._history_identity(identity)
+            return self._observe_history(
+                context, lambda store: store.lookup(captured, read_lsn=context.snapshot.read_lsn), None,
+            )
 
     def enable_wal_page_compression(self) -> None:
         """Persist the compatibility fence before emitting compressed WAL page images.
@@ -4097,6 +4535,18 @@ class Database:
     # --- lifecycle ----------------------------------------------------------------------------
 
     def close(self) -> None:
+        """Release owned resources under this database's checksum selection (FR-1).
+
+        Abort open transactions before releasing lower dependencies. If transaction/schema
+        cleanup cannot complete, preserve the safe leak for a later retry. Closing twice after
+        successful release is a no-op; concurrent/reentrant close may be terminal but incomplete
+        until ``close_complete`` becomes true. An unobserved terminal release failure is raised
+        once on the next explicit close without repeating resource release.
+        """
+        with self._checksum_scope():
+            self._close_in_checksum_scope()
+
+    def _close_in_checksum_scope(self) -> None:
         """Release everything this database opened, and never corrupt anything doing it (FR-1).
 
         Transaction close and every tracked QueryEngine schema journal must first prove complete.
@@ -4380,7 +4830,7 @@ class Database:
         transition = getattr(self._metrics, "transition", None)
         boundary = transition() if callable(transition) else nullcontext()
         try:
-            with boundary:
+            with self._checksum_scope(), boundary:
                 yield
         finally:
             if self._closed and not self._close_released:

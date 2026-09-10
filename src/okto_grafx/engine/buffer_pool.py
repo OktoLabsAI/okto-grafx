@@ -952,6 +952,27 @@ class BufferPool:
         frame = self._frames.get((file, page_index))
         return 0 if frame is None else frame.pins
 
+    @_guarded
+    def _require_file_unpinned(self, file: str) -> None:
+        """Refuse orphan retirement while even a doomed frame or in-flight read has a holder."""
+        self._wait_for_evictions(file)
+        pinned = any(key[0] == file and frame.pins for key, frame in self._frames.items())
+        doomed = any(key[0] == file and any(frame.pins for frame in frames) for key, frames in self._doomed.items())
+        if pinned or doomed or any(key[0] == file for key in self._loads):
+            raise GrafxUnsupportedOperation("An orphan candidate still has local page holders.", file=file)
+
+    @_guarded
+    def _discard_unowned_file(self, file: str) -> None:
+        """Forget all cached bytes/claims of a proven orphan without writing any back."""
+        self._require_file_unpinned(file)
+        keys = {key for key in self._frames if key[0] == file}
+        keys.update(key for key in self._doomed if key[0] == file)
+        for _, page_index in keys:
+            self.discard(file, page_index)
+        self._abandoned.pop(file, None)
+        self._grown.difference_update(key for key in tuple(self._grown) if key[0] == file)
+        self._bump_drop_epoch(file)
+
     def _add_dirty_candidate(self, key: tuple[str, PageIndex]) -> None:
         """Conservatively admit one location before its page can change outside the guard."""
 
@@ -1624,6 +1645,7 @@ class BufferPool:
         prospective: PageIndex | None = None
 
         def prospective_index() -> PageIndex:
+            """Resolve the next physical allocation index without inventing an absent extent."""
             nonlocal prospective
             if prospective is None:
                 try:
@@ -2703,6 +2725,7 @@ class BufferPool:
         )
 
         def target_index() -> PageIndex:
+            """Resolve and retain this operation's requested page index once."""
             nonlocal resolved_page_index
             if resolved_page_index is None:
                 assert callable(page_index)

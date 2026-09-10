@@ -386,6 +386,8 @@ def assemble_database(
             artifact_nonce=_new_control_file_nonce,
             projection_context=ContextLocalValue("okto_grafx_commit_index_projection"),
             live_commit_context=ContextLocalValue("okto_grafx_live_commit_authority"),
+            key_cache_pages=config.index_key_cache_pages,
+            key_cache_bytes=config.index_key_cache_bytes,
         )
         vectors = VectorEngine(
             catalog=catalog,
@@ -404,6 +406,8 @@ def assemble_database(
             indexes=indexes,
             exact_scan_threshold=config.vector_exact_scan_threshold,
             ef_search=config.vector_ef_search,
+            hnsw_memory_budget_bytes=config.vector_hnsw_memory_budget_bytes,
+            hnsw_total_memory_budget_bytes=config.vector_hnsw_total_memory_budget_bytes,
             # Production schema changes use QueryEngine staging and the normal WAL commit.
             # Closing the two legacy direct-save doors is the proof TXN-4 needs to retain a
             # catalog view across a CE-3 interval containing only ordinary DML.
@@ -549,13 +553,16 @@ def assemble_database(
             catalog_changes_are_wal_logged=True,
         )
         # A writable open may create a missing accelerator only under the same artifact section
-        # as DDL attach and commit publication.  That section first adopts existing files and
-        # rebases the durable catalog, then holds COMMIT_SECTION through create/legacy-nonce
-        # upgrade.  Read-only open performs only the non-mutating existing-file adoption.
+        # as DDL attach and commit publication. That section first completes any committed gap
+        # and rebases the durable catalog, then holds COMMIT_SECTION through adoption/create/
+        # legacy-nonce upgrade. The single sync below already reopens every v2 artifact; a
+        # second existing-only sync in this same section repeated that complete admission.
+        # Recovery's own existing-only baseline callbacks remain unchanged. Read-only open
+        # performs only the non-mutating existing-file adoption.
         if config.read_only:
             sync_indexes(existing_only=True)
         else:
-            with transactions.schema_artifact_section(sync_if=lambda: True):
+            with transactions.schema_artifact_section():
                 sync_indexes(existing_only=False)
         queries = QueryEngine(
             catalog=catalog,
@@ -755,9 +762,12 @@ def _attach_primary_key_indexes(
         if definition.visibility is not IndexVisibility.EXACT:
             continue
         try:
+            from okto_grafx.engine.sparse_hash import SparseHashIndex
             index = (
                 OrderedIndex(definition, pool, metrics)
                 if definition.layout is IndexLayout.ORDERED
+                else SparseHashIndex(definition, pool, metrics)
+                if definition.layout is IndexLayout.SPARSE_HASH
                 else HashIndex(definition, pool, metrics)
             )
             try:

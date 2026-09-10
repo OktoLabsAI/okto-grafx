@@ -200,6 +200,15 @@ def test_an_untouched_table_does_not_become_stale_at_a_later_replay_floor(
     assert not database.proximity.stale
 
 
+def test_later_heap_write_does_not_hide_a_real_pre_floor_omission(database: Database) -> None:
+    """Historical floor calculation must still reject a genuinely short baseline."""
+    _commit_row(database, 1, "Ada", BORN)
+    database.insert(2, "omitted before checkpoint", BORN + 5)
+    database.insert(3, "after checkpoint", ENDED + 20)
+    stale = database.manager.check_replay_floor(ENDED)
+    assert {index.name for index in stale} == {"person_by_name", "person_near_name"}
+
+
 def test_an_index_ahead_of_the_published_position_is_marked_stale(
     database: Database,
 ) -> None:

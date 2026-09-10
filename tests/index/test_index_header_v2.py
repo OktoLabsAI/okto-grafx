@@ -72,13 +72,13 @@ def test_position_transitions_preserve_the_artifact_nonce() -> None:
 
 
 def test_a_future_v2_shaped_header_is_refused_before_its_payload_is_trusted() -> None:
-    image = _V2.pack(4, 1, 0, 1, 4, 0, 0, _DIGEST, 73)
+    image = _V2.pack(5, 1, 0, 1, 4, 0, 0, _DIGEST, 73)
 
     with pytest.raises(GrafxSchemaVersionMismatch) as refused:
         IndexHeader.decode(image)
 
     assert refused.value.details["field"] == "format_version"
-    assert refused.value.details["value"] == 4
+    assert refused.value.details["value"] == 5
 
 
 def test_explicit_v1_writes_the_exact_legacy_layout() -> None:

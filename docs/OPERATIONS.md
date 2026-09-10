@@ -1,6 +1,23 @@
 # Operations, concurrency and recovery
 
+[Logical export/import](LOGICAL_TRANSFER.md) creates a separately writable fresh-UUID
+store; [physical restore](BACKUP_RESTORE.md) remains an offline same-UUID replacement.
+Neither copies live participants into a fork. [FTS operations](FULL_TEXT_SEARCH.md#operations-and-compatibility)
+cover the opt-in required capability, verification, generation rebuild, transfer and
+older-reader refusal. Creating an FTS index requires compatible binaries on all
+writers; it is not merely a process-local configuration change.
+[Resumable logical import](LOGICAL_TRANSFER.md#opt-in-resumable-import) is explicitly
+opt-in through a private workspace. It recovers native WAL and validates committed
+prefixes; never serve its staging directory or reset WAL/locks to force continuation.
+The public destination appears only after full verification and atomic promotion.
+
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md)
+
+For cooperative read cancellation/deadlines and explicit orphan-index reclamation,
+see [read control and index cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md).
+The query-error metric's finite `code` label domain includes `query_cancelled` and
+`query_deadline_exceeded`; emitting either must not replace the original outcome
+with a metrics configuration error.
 
 ## Deployment and ownership
 
@@ -140,7 +157,15 @@ were an application-approved write.
 | `inspect_index(name)` | Materializes an entry inventory; do not put unbounded inspection on a hot request. |
 | `read_quarantine(name)` / `quarantine_receipts(name)` | Checksum-verified preserved bytes / receipt names; not a restore command. |
 
-For a filesystem backup, stop **all** participants, close handles successfully and
+The 0.0.5 development line provides `okto_grafx.backup.create_backup` and
+`restore_backup`: [full contract, budgets and examples](BACKUP_RESTORE.md).
+Capture uses the existing checkpoint fence; writers wait for checkpoint/capture,
+including the default temporary-disk spool I/O, but not subsequent artifact output
+or verification. `capture_mode="memory"` is the explicit RAM-backed alternative.
+Restore requires an offline-original assertion
+and a new destination, preserving UUID/commit provenance rather than creating a fork.
+
+For a manual filesystem backup, stop **all** participants, close handles successfully and
 copy the complete directory as one quiescent artifact. Preserve hashes, Grafx
 version/configuration and identity. Verify/reopen a separate restored copy before
 relying on it. Copying only `heap.dat`, an open live directory or selected WAL
@@ -149,7 +174,9 @@ segments is not a supported consistent backup procedure.
 Before an upgrade, pin/test the target binary on a copy and keep a pre-upgrade
 backup. `page_size` must match persisted identity. `partitions_per_table` is adopted
 from existing identity rather than reconfigured by reopen. Catalog-v2, heap reclaim
-and WAL v2 capabilities can be one-way fences. Do not open migrated files with
+and WAL v2 capabilities can be one-way fences. Durable FTS summaries and hash
+generations above 4,096 buckets activate additional required bits in the 0.0.5
+continuation. Do not open migrated files with
 older binaries; there is no general downgrade API. The CLI's offline control-format
 downgrade is a narrowly scoped exception, not a way to undo catalog/WAL capabilities.
 
@@ -184,14 +211,24 @@ Grafx process and handle**, including an older binary, for the whole call; reade
 treated as proof of safety. The first call publishes the required `heap_reclaim_v1` capability,
 so older builds fail closed, then one WAL-before-data commit atomically advances a durable global
 snapshot floor, reconciles ACTIVE indexes, relinks retained chains and removes eligible inline
-versions. Use `max_versions` to bound removed heap versions per pass; index reconciliation is not
+and overflow-backed versions. Overflow chains are retired only after checking complete payload
+coverage and exclusive ownership across every table, including unselected/retained records.
+Use `max_versions` to bound removed heap versions per pass; ownership scans and index reconciliation are not
 part of that quota. A table filter still advances a heap-global floor and is therefore an
 availability choice for the whole database.
 
-The immutable `VacuumReport` distinguishes heap data pages rewritten, tuple-slot bytes removed,
-chain relinks, index entries removed and overflow versions skipped. `complete` means all eligible
-**inline** versions in the selected tables were handled by that pass; overflow history remains.
-Vacuum v1 does not truncate files, reclaim overflow pages or reuse page, slot or `RecordRef`
+The immutable `VacuumReport` distinguishes pages rewritten, tuple-slot bytes removed,
+chain relinks, index entries removed and `reclaimed_overflow_pages`. Table reports include
+`eligible_overflow_versions`; `skipped_overflow_versions` counts eligible overflow versions not
+selected under the pass quota. `complete` covers eligible inline **and overflow** versions in
+the selected tables. Retired overflow pages are WAL-logged as empty FREE pages, not silently
+removed from disk. The ownership pass is foreground O(total reachable overflow pages), not a
+new cost on ordinary queries/commits; `max_versions` is not an IO or total plan-memory limit.
+Subsequent overflow writes reuse eligible persisted FREE pages under normal commit
+fences, with current-page revalidation. Discovery uses O(1) advisory cursor memory
+and scans a fixed heap extent incrementally per participant/reclaim floor. It is
+amortized discovery, not a persistent O(1) free-page index. No file truncation occurs.
+Vacuum never reassigns slots or `RecordRef`
 identities. Restart application processes after the maintenance window so their first transaction
 adopts the new capability, floor and index authority. See
 [`docs/architecture/MVCC_VACUUM_V1.md`](architecture/MVCC_VACUUM_V1.md).
@@ -234,6 +271,8 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 | `GrafxBufferBudgetExceeded` | ✅ | The working set exceeded the budget |
 | `GrafxTransactionBudgetExceeded` | ❌ | An enabled statement, transaction or final WAL-batch limit was exceeded before partial persistence |
 | `GrafxQueryBudgetExceeded` | ❌ | An enabled row, traversal or logical query-memory limit was exceeded before statement release |
+| `GrafxQueryCancelled` | ❌ | A caller signal was observed by a read; owned cursor/autocommit resources are released |
+| `GrafxQueryDeadlineExceeded` | ❌ | A cooperative read deadline expired; retry only with an explicitly chosen new budget |
 | `GrafxSchemaVersionMismatch` | ❌ | This build cannot read this database |
 | `GrafxPortNotConfigured` | ❌ | An incomplete registry, naming every missing slot |
 | `GrafxTransactionStateError` | ❌ | The transaction is not in a state that allows this |
@@ -242,5 +281,31 @@ translate exceptions it raises later. Such an exception can therefore propagate 
 | `GrafxVectorValidationError`, `GrafxEmbeddingSpaceMismatch`, `GrafxSpaceRetired` | ❌ | Embeddings |
 | `GrafxConfigurationError` | ❌ | An option, naming the field |
 | `GrafxUnsupportedOperation` | ❌ | Declared not to exist, rather than silently ignored |
+
+## Indexed retired-overflow discovery (0.0.5 development)
+
+`db.maintenance.vacuum(confirm_quiescent=True, index_free_pages=True)` explicitly
+activates `heap_free_page_index_v1` (bit 9) and builds a bounded-page immutable
+directory of already retired overflow candidates. Existing catalog-v2 activation
+and the caller's real quiescence assertion remain prerequisites. Default False
+does not upgrade a store; once active, later vacuum calls maintain the directory.
+Capability publication without a completed directory is recoverable and keeps
+legacy discovery until initialization commits. There is no supported downgrade
+by removing the required bit.
+
+Normal writes traverse candidate IDs rather than scanning every heap page. Each
+candidate still needs current physical FREE/LSN validation under the ordinary
+publication fence; candidates used by another writer are OVERFLOW and skipped.
+The directory/root are immutable during allocation: an interrupted pre-COMMIT
+attempt cannot lose membership. Local cursor state resets on reopen/new reclaim
+floor. Costs are O(requested pages + stale candidates + directory pages), not a
+universal O(k) or O(1) guarantee. No online vacuum, truncation or single-writer
+application premise is introduced.
+
+Use for churn-heavy heaps with reusable overflow space and many cold participants.
+It spends a small fraction of retired pages on the directory and adds an explicit
+whole-heap census to quiescent directory construction/verification. It does not
+benefit heaps with no eligible overflow pages. Physical backup preserves allocator
+metadata; logical transfer uses a fresh heap. See [format and failure boundaries](specs/HEAP_FREE_PAGE_INDEX.md).
 
 ---

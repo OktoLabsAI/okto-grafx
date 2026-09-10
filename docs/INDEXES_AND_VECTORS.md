@@ -1,6 +1,94 @@
 # Indexes and vector search
 
+## Continuation after 69ed311: bounded maintenance and memory
+
+Sparse maintenance visits each directory page once and then populated heads;
+selected heads/chains remain revalidated. Distribution charges directory visits
+and selected-head rereads, including empty directory pages. Pointer examination
+remains O(bucket count). Absent heads are initialized in batches of at most 64
+within one committed publication; a barrier precedes all pointers in each batch.
+Detached builds use 64-entry windows; RESET replay retains its scalar path. No
+format change, cross-transaction batching or early ACK is introduced.
+
+`connect(index_key_cache_pages=64, index_key_cache_bytes=1048576)` configures the
+exact-image memo per index. Either zero disables retention. `db.index_cache_usage(name)`
+returns immutable `KeyPageCacheUsage`: limits, pages/logical bytes, hits, misses,
+evictions and admission refusals. Counters reset on instance replacement/reopen;
+they do not certify freshness. Disabled/oversized entries still decode normally.
+
+`vector_hnsw_total_memory_budget_bytes` adds an optional per-handle aggregate to
+the per-picture limit. `db.vector_total_memory_usage()` returns reservations,
+picture count, peak and refusals. With the option disabled, accounting is disabled
+and reports zero (not measured zero residency). Cold builds reserve available
+bounded header/work capacity before collecting headers, then reduce to resident
+tariff. Certified wrappers share one reservation for shared graph/maps; retired
+pictures remain charged while readers hold them. Release follows object lifetime;
+delayed collection can cause conservative refusals. Concurrent builders can refuse
+rather than wait. No reader picture is evicted and no recall regime is silently
+changed. Warm pressure retires derived cache without failing an already durable
+write; the next ANN build can refuse until space is available. Exact scans are
+unaffected. Logical accounting excludes other handles, arbitrary provider memory
+and the buffer pool; it is not a process RSS cap.
+Manually composed vector collaborators without the aggregate diagnostic capability
+receive `GrafxUnsupportedOperation`, not an invented zero measurement.
+
+## Sparse exact hash indexes and repeated keys
+
+`db.create_index("by_status", "Document", ("status",), layout="sparse_hash",
+bucket_count=128)` opts an explicit property index into compact pointer pages and
+lazy bucket heads. Default `layout="hash"`, automatic indexes, FTS and vectors are
+unchanged. Rebuild/rehash retains the selected layout; physical backup and logical
+transfer preserve its declaration. Older binaries refuse required capability bit
+10. [Format and recovery contract](specs/SPARSE_HASH_DIRECTORIES.md).
+
+Use sparse layout when many buckets would be empty. At 512-byte pages a 65,536-bucket
+empty index uses 571 pages, versus 65,537 for eager hash. The first write to a new
+bucket requires an additional flush/barrier; do not select it expecting every write
+to be faster. Distribution counts only populated chain pages in `pages`, but its
+page-work budget also charges pointer reads, including empty buckets.
+
+Repeated-key native bucket scans retain a lazy, per-index decoded-page memo: at
+most 64 pages and 1 MiB of conservatively charged logical data by default (the
+connection options above can change or disable these limits). Every reuse compares
+the complete current slot images, key, requested reference and decoder identity;
+all page/link checks, pre/post generation certificates and heap visibility checks
+still execute. No on-disk format or consistency option changes. Changed bytes,
+foreign writes and different keys miss the memo. Oversized pages use canonical
+decoding without retention. These are logical retention bounds, not RSS limits.
+Warm repeated queries avoid entry decoding but still visit all chain pages and all
+returned candidates. Returning N matches necessarily remains O(N); increasing the
+bucket count cannot split one repeated key. A new posting-tree layout remains a
+distinct future change, not a claim made by this decoding optimization.
+
+## Cooperative vector read control
+
+`db.search_vectors(reader, space=..., query=..., k=..., timeout_seconds=None,
+cancellation=None)` accepts the same positive finite timeout and exact
+`CancellationToken` as materialized reads. Defaults preserve ordinary execution.
+Native exact candidate reads/scoring, ANN scoring/navigation and cold HNSW builds
+between insertions check the signal. A cancelled build publishes no partial picture;
+the caller-owned transaction remains open until its context exits. A subsequent
+read/write can proceed. No commit is interrupted and no partial ranking is returned.
+
+Use controls for interactive or abandoned work; do not interpret them as a hard OS
+deadline. Admission, individual storage/math calls, header capture/sorting and one
+construction insertion are not preempted. Custom vector collaborators need the
+explicit `search_controlled` capability; requests refuse if it is absent, rather
+than silently ignoring a timeout. Hybrid search shares one deadline across sources.
+
+For native inverted text indexes, versioned analyzers, BM25, filters and the closed
+search procedure, see [full-text search](FULL_TEXT_SEARCH.md). It uses the existing
+exact HASH generation/WAL lifecycle but emits several postings per row; it is not
+a scalar equality index or a vector/embedding feature. `rebuild_index`/`rehash_index`
+preserve analyzer identity, and `verify('all')` includes posting coverage.
+[Hybrid search](HYBRID_SEARCH.md) combines native text and vector windows with
+weighted RRF and optional bounded graph evidence; it retains the vector source's
+exact/approximate regime and uses one read snapshot throughout.
+
 [Documentation index](README.md) · [Configuration](CONFIGURATION.md) · [Maintenance](OPERATIONS.md)
+
+0.0.5 development adds [quiescent orphan-file inventory and cleanup](READ_CONTROL_AND_INDEX_CLEANUP.md#orphan-index-inventory-and-removal).
+This does not retire catalog-owned STALE/BUILDING generations or change query access paths.
 
 ## Choosing an access path
 
@@ -14,11 +102,43 @@ general-purpose B-tree API or a persistent public cursor.
 For example, after creating a table with `created_at TIMESTAMP, id STRING`, call
 `db.create_index("by_created", "Event", ("created_at", "id"), layout="ordered")`.
 `create_index` owns a dedicated transaction; do not assume it joins an unrelated
-open transaction. Hash `bucket_count` is a power of two from 1–4,096;
-`expected_cardinality` is 1–262,144; both together refuse. Rehash grows hash
+open transaction. Explicit hash `bucket_count` is an integer from 1–65,536;
+`expected_cardinality` is 1–4,194,304 and rounds the derived count to a power of two;
+both together refuse. The default remains 64. Rehash grows hash
 directories, while `rebuild_index` reconstructs a fresh immutable generation.
 
 ## Indexes
+
+### Explicit distribution diagnostics and wide directories
+
+`db.index_distribution(name, max_pages=65536, max_entries=1000000,
+max_memory_bytes=67108864)` performs a bounded physical census of one certified
+active hash generation. It reports `bucket_count`, `entries`, `pages`,
+`overflow_pages`, `largest_chain_pages`, `largest_bucket_entries`,
+`largest_key_entries`, `dominant_key_fraction`, and `recommendation`, without key
+values. Counts include retained physical versions, not just visible live rows.
+Budgets fail with `GrafxQueryBudgetExceeded`; this is not a heap integrity audit.
+Each diagnostic bound must be an integer in 1..2,147,483,648; booleans refuse.
+Its O(pages + entries) cost is explicit maintenance, never a new query/commit hook.
+
+`recommendation` is `inspect_key_skew` when at least 16 entries exist and one key
+accounts for at least half, otherwise `consider_growth` for overflow or more than
+64 average entries per bucket, otherwise `balanced`. These are heuristics, not
+throughput promises. `rehash_index_if_needed(..., check_skew=True)` runs this
+diagnostic only after ordinary head-pressure admission, skips growth for dominant
+key skew, and propagates exhausted diagnostic budgets. The default `False` keeps
+the existing O(bucket_count) decision without a full entry census. Rehash cannot
+spread many identical encoded keys across different buckets.
+
+Any retained generation above 4,096 buckets activates required capability
+`large_hash_directories_v1` (bit 7). All participants must understand it; the flag
+cannot be removed to downgrade. The layout remains eager: 65,536 heads at 8 KiB
+consume 512 MiB per index even before entries. Use explicit larger sizing only
+after observing pressure; defaults stay 64 and no sparse directory/sharding was
+introduced. Old-reader visibility, immutable generation publication and recovery
+are unchanged. [Layout contract](specs/LARGE_HASH_DIRECTORIES.md).
+
+### Existing index contracts
 
 - **A declared `PRIMARY KEY` gets an index automatically**, created by the DDL and re-adopted at
   every later open. A keyed read plans an index seek; an unkeyed predicate plans a scan.
@@ -60,7 +180,7 @@ directories, while `rebuild_index` reconstructs a fresh immutable generation.
   samples only the bounded eager bucket heads and grows at most one `2x` step when average head
   occupancy reaches the canonical 64-entry target or retained overflow reaches the configured
   ratio. It never runs from commit or in a background worker and never walks all entries merely to
-  decide. `None` means only “no assisted growth was selected now” (or the 4,096-bucket ceiling),
+  decide by default. `None` means only “no assisted growth was selected now” (or the 65,536-bucket ceiling),
   not that the index is healthy. The eventual foreground shadow build has the same writer-pause,
   OCC, WAL and durability contract as `rehash_index`; do not call it repeatedly without
   reassessing a concurrent refusal or data skew.
@@ -149,3 +269,49 @@ can fall back to a scan; proximity-index repair has explicit freshness/rebuild
 semantics. `rebuild_vector_index(space)` derives from valid heap data, not from
 an untrusted external snapshot. For index health use `read_index_status` and
 verification, not only the absence of an exception from a query.
+
+## HNSW derived-picture memory
+
+`connect(path, vector_hnsw_memory_budget_bytes=64 * 1024 * 1024)` opts into a
+positive logical-byte ceiling for **each** derived HNSW picture, including cold
+construction work and warm insertion work. `None` (default) preserves unlimited
+admission. It does not change persisted vector/index bytes, approximate recall,
+the exact/ANN planner threshold, or the chosen arithmetic adapter.
+
+Use `db.vector_memory_usage("space_name")` to obtain an immutable
+`VectorMemoryUsage` with `space`, `limit_bytes`, `cached_entries`,
+`cached_logical_bytes`, `peak_requested_bytes`, `budget_refusals` and
+`warm_retirements`. This observes the local attached index only: it neither builds
+the HNSW graph nor reads device pages or certifies that a cached picture is fresh.
+Counts include retained tombstoned versions. Counters reset with index/handle
+replacement; requested peak includes refused reservations. A missing space/index
+keeps normal typed refusal; a custom collaborator without this observation refuses
+with `GrafxUnsupportedOperation`.
+
+The deterministic tariff uses `N` stored entries, `D` dimensions, `M` neighbours
+(currently 16), and `E` construction beam (currently 200):
+
+- Resident: `4096 + N * (1024 + 32*D + 32*M*34)` logical bytes.
+- Insertion work: resident plus `128*N + 128*E + 64*D`.
+- Cold build: insertion work plus `N * (256 + 64*M*34)` for retained headers,
+  sort slots and transient link-score capacity.
+
+Maximum-height towers are reserved even for short towers, and compact adapters
+receive the same component tariff. This is deliberately conservative, **not RSS**.
+One page decoder, Python allocator overhead, query/search buffers and custom math
+provider allocations are outside the envelope. Distinct spaces, handles and
+simultaneously retained old/replacement pictures have distinct envelopes; adding
+participants can multiply memory. Use process/container limits for an RSS policy.
+
+Header admission refuses before materializing an over-budget header collection
+or resolving vectors. A cold ANN request exceeding the limit raises
+`GrafxQueryBudgetExceeded` with resource `vector_hnsw_memory`, `requested_bytes`
+and `limit_bytes`; no partial cache is published and the caller's reader remains
+usable. No silent switch to a different recall regime occurs. Exact scans do not
+construct HNSW and remain governed by the normal query limits.
+
+If a **durable write** would overgrow a warm picture, that derived cache is retired
+and the write succeeds. The next ANN build may refuse; raise the budget or choose
+an explicit exact-search policy as appropriate. Do not set a tiny budget expecting
+automatic exact fallback or a cap shared by all handles. This policy cannot fail
+or undo a proved COMMIT and never weakens WAL/OCC or reader isolation.

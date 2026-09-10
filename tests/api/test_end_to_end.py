@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from okto_grafx import connect
-from okto_grafx.domain.errors import GrafxTransactionStateError, GrafxUnsupportedOperation
+from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxTransactionStateError, GrafxUnsupportedOperation
 from okto_grafx.domain.index import index_file
 from okto_grafx.domain.model.schema import EmbeddingSpaceDef
 from okto_grafx.domain.page import Page, PageType
@@ -35,9 +35,14 @@ ROW = b"a durable row"
 
 
 def _image(db: Database, payloads: list[bytes], page_index: int) -> bytes:
-    """Return a valid heap page image carrying these payloads, one per slot."""
+    """Return an opaque overflow payload page, not a forged HEAP record page.
+
+    These physical-WAL tests deliberately do not construct graph records. A HEAP
+    page needs a four-byte table descriptor in slot zero; arbitrary payload there
+    is correctly refused by redo's table-watermark validation.
+    """
     page = Page(
-        int(PageType.HEAP),
+        int(PageType.OVERFLOW),
         page_size=db.codec.page_size,
         page_index=page_index,
         page_lsn=0,
@@ -58,7 +63,7 @@ def _grow_to(db: Database, page_index: int) -> None:
     for _ in range(page_index + 2):
         if db._storage.page_count(HEAP) > page_index:
             return
-        page = db._pool.allocate(HEAP, int(PageType.HEAP))
+        page = db._pool.allocate(HEAP, int(PageType.OVERFLOW))
         db._pool.unpin(HEAP, page.page_index, dirty=True)
     raise AssertionError(f"The heap did not reach page {page_index}.")
 
@@ -97,6 +102,21 @@ def test_a_commit_through_the_public_surface_is_durable_across_a_reopen(
         assert reopened.recovery_report.outcome == "clean"
         assert _payloads(reopened, 3) == (ROW,)
         assert reopened.transactions.published_lsn() == committed
+
+
+def test_redo_refuses_arbitrary_payload_masquerading_as_heap_descriptor(tmp_path):
+    """Keep the old invalid fixture as an explicit fail-closed regression."""
+    root = tmp_path / "invalid-descriptor"
+    with connect(root, page_size=512) as db:
+        _grow_to(db, 3)
+        page = Page(int(PageType.HEAP), page_size=512, page_index=3, seq=2)
+        page.insert_slot(ROW)
+        with db.begin("write") as tx:
+            tx._context.owner._stage_page_image(tx._context, HEAP, 3, db._codec.encode_page(page))
+            tx._context.note_write(db.transactions.partition_of(1, ROW))
+    with pytest.raises(GrafxCorruptionDetected) as refused:
+        connect(root, page_size=512)
+    assert refused.value.details["field"] == "page_descriptor"
 
 
 def test_commit_and_each_checkpoint_commit_section_derive_one_wal_tail_picture(

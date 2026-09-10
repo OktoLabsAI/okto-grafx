@@ -11,3 +11,5 @@ from okto_grafx.domain.model.schema import TupleEncodingProofs, _tuple_encoding_
 def new_tuple_encoding_proofs() -> TupleEncodingProofs:
     """Allocate a private registry; encoding and heap I/O never run under its guard."""
     return _tuple_encoding_proof_protocol(WeakKeyDictionary(), Lock())
+
+__all__ = ["new_tuple_encoding_proofs"]

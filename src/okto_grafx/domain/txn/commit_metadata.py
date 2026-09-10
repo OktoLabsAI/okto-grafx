@@ -1,8 +1,8 @@
 """Bounded, immutable commit metadata admission (GX-CAP-1A).
 
-Canonical bytes also define the nested v1 body in COMMIT_CATALOG_V1.md. No page,
-WAL type, activation or public begin option is exposed until publication/recovery
-and lookup can persist these values atomically with a logical commit.
+Canonical bytes also define the nested v1 body in COMMIT_CATALOG_V1.md. The
+development public begin door captures these bytes again before IO; native
+publication/recovery persists them atomically with the corresponding commit.
 """
 
 from __future__ import annotations
@@ -74,12 +74,14 @@ class _Admission:
         self.active: set[int] = set()
 
     def append(self, data: bytes) -> None:
+        """Append canonical bytes only after checking the complete metadata byte budget."""
         size = len(self.encoded) + len(data)
         if size > self.limits.max_bytes:
             raise _budget("bytes", self.limits.max_bytes, size)
         self.encoded.extend(data)
 
     def text(self, value: str, *, key: bool = False, field: str = "attributes") -> str:
+        """Validate or decode one bounded UTF-8 metadata string."""
         if type(value) is not str:
             raise _invalid(field, "expected_string")
         ceiling = self.limits.max_key_bytes if key else self.limits.max_string_bytes
@@ -98,6 +100,7 @@ class _Admission:
         return value
 
     def freeze(self, value: object, depth: int = 0) -> MetadataValue:
+        """Copy a bounded primitive metadata tree into immutable canonical values."""
         kind = type(value)
         container = kind in (dict, list, tuple)
         if container and id(value) in self.active:
@@ -225,6 +228,25 @@ class CommitMetadata:
         return f"CommitMetadata(encoded_bytes={len(self._canonical)}, attributes={len(self.attributes)})"
 
 
+def capture_commit_metadata(value: CommitMetadata | None) -> bytes | None:
+    """Admit the canonical value again at begin, before any storage/coordinator IO.
+
+    Canonical bytes, not display fields, define this value's equality and payload.
+    Never retain the caller object or trust a host-replaced private byte field.
+    """
+    if value is None:
+        return None
+    if type(value) is not CommitMetadata:
+        raise _invalid("metadata", "expected_commit_metadata")
+    raw = value._canonical
+    if type(raw) is not bytes:
+        raise _invalid("metadata", "invalid_encoding")
+    try:
+        return decode_commit_metadata(raw).canonical_bytes
+    except (GrafxCorruptionDetected, GrafxSchemaVersionMismatch):
+        raise _invalid("metadata", "invalid_encoding") from None
+
+
 def _corrupt(field: str, offset: int, reason: str) -> GrafxCorruptionDetected:
     return GrafxCorruptionDetected(
         "Invalid encoded commit metadata.", component="commit_metadata",
@@ -244,6 +266,7 @@ class _MetadataReader:
         self.values = 0
 
     def take(self, count: int, field: str) -> bytes:
+        """Consume exactly the requested bytes or report truncated metadata."""
         if count > len(self.raw) - self.offset:
             raise _corrupt(field, self.offset, "truncated")
         start = self.offset
@@ -251,9 +274,11 @@ class _MetadataReader:
         return self.raw[start:self.offset]
 
     def count(self, field: str) -> int:
+        """Decode one little-endian metadata count from the bounded input."""
         return int.from_bytes(self.take(4, field), "little")
 
     def text(self, *, key: bool = False) -> str:
+        """Validate or decode one bounded UTF-8 metadata string."""
         size = self.count("string_length")
         ceiling = self.limits.max_key_bytes if key else self.limits.max_string_bytes
         if size > ceiling:
@@ -266,6 +291,7 @@ class _MetadataReader:
             raise _corrupt("string", offset, "invalid_utf8") from None
 
     def optional_field(self) -> str | None:
+        """Decode a nullable metadata text field with strict tag admission."""
         tag = self.take(1, "field_tag")
         if tag == b"n":
             return None
@@ -274,6 +300,7 @@ class _MetadataReader:
         raise _corrupt("field_tag", self.offset - 1, "expected_optional_text")
 
     def value(self, depth: int = 0) -> object:
+        """Decode one bounded metadata value while enforcing depth and value quotas."""
         self.values += 1
         if self.values > self.limits.max_values:
             raise _corrupt("values", self.offset, "format_limit")
@@ -356,3 +383,5 @@ def decode_commit_metadata(raw: bytes) -> CommitMetadata:
     if metadata.canonical_bytes != raw:
         raise _corrupt("metadata", 0, "noncanonical_encoding")
     return metadata
+
+__all__ = ["MetadataLimits","CommitMetadata","capture_commit_metadata","decode_commit_metadata","MetadataValue","MAX_METADATA_BYTES"]

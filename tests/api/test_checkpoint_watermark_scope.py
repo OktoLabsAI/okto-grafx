@@ -53,9 +53,9 @@ class _Spy:
         real_photo = IndexManager.table_watermark_photo
         spy = self
 
-        def walk(self_: HeapStore, table: object):  # type: ignore[no-untyped-def]
+        def walk(self_: HeapStore, table: object, **kwargs):  # type: ignore[no-untyped-def]
             (spy.inside_photo if spy._depth else spy.outside_photo).append(table.name)
-            return real_walk(self_, table)
+            return real_walk(self_, table, **kwargs)
 
         def photo(self_: IndexManager, *, refresh_table_ids=None):  # type: ignore[no-untyped-def]
             spy.photos.append(

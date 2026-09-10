@@ -14,7 +14,7 @@ The first mutating pass uses two durable transactions:
 
 1. publish catalog-v2 required capability `heap_reclaim_v1`;
 2. in one ordinary WAL-before-data commit, advance the heap-wide retained-snapshot floor, free
-   eligible inline version slots, relink retained version chains, and reconcile every ACTIVE
+   eligible version slots and owned overflow payloads, relink retained version chains, and reconcile every ACTIVE
    index at the same horizon.
 
 Catalog v2 and its identity-index authority must already be active. The capability transaction
@@ -44,8 +44,10 @@ closed.
 ## Eligibility and physical effects
 
 A version is eligible only when both birth and end are committed, `xmin <= xmax`, and
-`xmax <= horizon`. Vacuum v1 reclaims inline versions only. Overflow-backed versions and their
-pages remain untouched; the report names them as skipped. Provisional or structurally implausible
+`xmax <= horizon`. The 0.0.5 extension also retires overflow-backed versions. Before emitting
+any retirement image, it checks all reachable overflow chains across all catalog tables for
+exclusive ownership, acyclicity, page kind/slots and exact payload length. This includes
+unselected tables and retained versions. Provisional or structurally implausible
 lifetimes are retained and remain verifier concerns.
 
 Reclamation uses `Page.free_slot()` followed by in-page compaction. Slot directory entries,
@@ -64,13 +66,39 @@ authoritative generation was built against the heap state current at its publica
 therefore keeps reconciliation records stamped with the vacuum horizon; stamping them with the
 later commit CSN would incorrectly claim reconciliation of versions between those two values.
 
-`max_versions`, when supplied, limits only inline heap versions selected in deterministic
+`max_versions`, when supplied, limits heap versions selected in deterministic
 table/page/slot order. Reconciliation may remove more index tombstones because every ACTIVE index
 of a selected table must be safe before any selected slot disappears. `complete` reports whether
 all eligible inline versions were selected; skipped overflow history is reported separately.
-`pages_rewritten` counts changed heap data pages and excludes the heap-header floor image.
+`pages_rewritten` counts changed heap data/overflow pages and excludes the heap-header floor image.
 Selecting one table does not create a table-local floor: the durable floor remains heap-global,
 so snapshots below it are rejected for every table.
+
+## Reuse of retired overflow pages (0.0.5 R3)
+
+Ordinary subsequent overflow writes may reuse the empty terminal FREE pages that
+vacuum persisted. The reuse protocol needs no new disk format or mutable free-list:
+`heap_reclaim_v1`, its nonzero durable snapshot floor, and a current FREE image with
+a committed page LSN are the persisted eligibility evidence. Unwritten allocations
+and abandoned FREE pages with LSN zero are not eligible. Malformed FREE images fail
+closed. Existing N3 retirement images qualify after reopen as well.
+
+Selection runs under the normal commit fence and current durable read view; an old
+participant's cached FREE image is not authority after another writer consumes it.
+Reused pages preserve their page LSN/sequence until the ordinary commit stamps and
+WAL-logs them. No table slot or `RecordRef` is reassigned: only unreachable overflow
+payload pages change ownership. First/second OCC, quotas and WAL-before-data remain
+unchanged; low-level manual heap compositions retain their existing obligation to
+supply synchronization. Old snapshots below the reclaim floor remain refused.
+
+The per-participant discovery cursor is advisory and O(1) memory. It scans at most
+the fixed heap extent per observed reclaim floor, incrementally until enough
+candidates are found; later allocations continue that cursor rather than restart
+at page 1. Cold discovery is still O(heap pages), amortized across allocations,
+and a new vacuum floor restarts discovery. This is not an O(1) persistent free-page
+index. A failed speculative allocation can burn capacity/hints until later
+maintenance or reopen; it never makes an uncommitted row visible. No fallback
+reconstructs authority from a stale pointer or repairs malformed pages.
 
 ## Explicit exclusions
 
@@ -79,9 +107,9 @@ This version does not:
 - run online, automatically, or in the background;
 - derive safety from TTL pruning;
 - truncate files or unlink/relink table pages;
-- reuse a durable page or slot ID;
+- reuse a heap data page or slot ID (only retired overflow payload pages qualify);
 - let a retired `RecordRef(page, slot)` resolve to another record;
-- reclaim overflow chains;
+- reclaim immutable-index orphan generations;
 - weaken the existing first or second OCC pass, WAL barrier, publication-last rule, recovery
   latch, or multiwriter/multireader behavior outside the explicitly quiescent operation.
 
@@ -91,7 +119,7 @@ Freed slots are skipped before `RecordHeader.peek`, and compacted pages no longe
 tuple bytes. This reduces header decoding, tuple materialization pressure, and resident/durable
 payload bytes on churned pages. Because page chains and slot-directory entries remain and inserts
 stay append-only, scans are still proportional to historical pages/slots; v1 does not claim file
-shrinkage, physical identity reuse, or elimination of every `O(history pages)` path.
+shrinkage, record identity reuse, or elimination of every `O(history pages)` path.
 
 ## Operator contract
 

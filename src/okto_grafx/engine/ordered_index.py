@@ -30,6 +30,7 @@ from okto_grafx.domain.ids import (
     Csn,
     Lsn,
     PageIndex,
+    RecordId,
     RecordRef,
 )
 from okto_grafx.domain.index import (
@@ -200,7 +201,7 @@ class OrderedIndex(IndexStore):
     remains a single root-certified COW batch.
     """
 
-    __slots__ = ()
+    __slots__ = ("_heap_view_certificate",)
 
     def __init__(
         self,
@@ -208,6 +209,7 @@ class OrderedIndex(IndexStore):
         pool: BufferPool,
         metrics: MetricsSink,
     ) -> None:
+        self._heap_view_certificate: OrderedRootDescriptor | None = None
         if not isinstance(definition, IndexDefinition):
             raise GrafxIndexError(
                 "An OrderedIndex needs an IndexDefinition.",
@@ -383,6 +385,9 @@ class OrderedIndex(IndexStore):
                 field="ordered_root",
                 file=self.file,
             )
+        # This root was built from this participant's heap view. Direct component
+        # users may still own dirty heap frames; only a later foreign root rebases them.
+        self._heap_view_certificate = selected
         return selected
 
     def create(self, *, proved_present: bool = False) -> IndexHeader:
@@ -499,10 +504,12 @@ class OrderedIndex(IndexStore):
 
     @property
     def built_through_lsn(self) -> Lsn:
+        """Return the applied-through sequence of the proved ordered-index generation."""
         return self._read_certificate().selection.descriptor.applied_through_lsn
 
     @property
     def reconciled_through_lsn(self) -> Lsn:
+        """Return the reconciled-through sequence of the proved ordered-index generation."""
         return self._read_certificate().selection.descriptor.reconciled_through_lsn
 
     def check_freshness(
@@ -789,6 +796,7 @@ class OrderedIndex(IndexStore):
         """Return every reachable entry in deterministic ascending physical identity order."""
 
         def materialize(descriptor: OrderedRootDescriptor) -> tuple[IndexEntry, ...]:
+            """Materialize bounded ordered candidates from the selected root descriptor."""
             return tuple(
                 reversed(
                     tuple(
@@ -1037,6 +1045,7 @@ class OrderedIndex(IndexStore):
                             f"{cleanup_failure!r}"
                         )
                 raise
+            self._heap_view_certificate = descriptor
             return OrderedBatchPublication(
                 descriptor=descriptor,
                 changes=len(materialized),
@@ -1058,6 +1067,7 @@ class OrderedIndex(IndexStore):
         read_lsn = _required_read_lsn(snapshot)
 
         def materialize(descriptor: OrderedRootDescriptor) -> tuple[IndexEntry, ...]:
+            """Materialize bounded ordered candidates from the selected root descriptor."""
             return tuple(
                 walk_ordered_desc(
                     descriptor.root_page,
@@ -1101,6 +1111,8 @@ class OrderedIndex(IndexStore):
         def materialize(
             descriptor: OrderedRootDescriptor,
         ) -> tuple[tuple[RecordRef, HeapVersion], ...]:
+            """Materialize bounded ordered candidates from the selected root descriptor."""
+            self._prepare_ordered_heap_view(heap, descriptor)
             selected: list[tuple[RecordRef, HeapVersion]] = []
             candidates = walk_ordered_desc(
                 descriptor.root_page,
@@ -1151,6 +1163,18 @@ class OrderedIndex(IndexStore):
         *,
         upper_key: bytes | None = None,
     ) -> Iterator[tuple[bytes, RecordRef, HeapVersion]]:
+        """Yield full heap-validated rows below one certified descending root."""
+        yield from self._iter_visible_desc(heap, table, snapshot, upper_key=upper_key)
+
+    def _iter_visible_desc(
+        self,
+        heap: HeapStore,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        *,
+        upper_key: bytes | None = None,
+        materialized_positions: frozenset[int] | None = None,
+    ) -> Iterator[tuple[bytes, RecordRef, HeapVersion]]:
         """Yield heap-validated rows lazily below one certified descending root.
 
         Unlike :meth:`visible_desc`, this door does not retain a candidate prefix per table.
@@ -1191,6 +1215,7 @@ class OrderedIndex(IndexStore):
 
         failure: BaseException | None = None
         try:
+            self._prepare_ordered_heap_view(heap, descriptor)
             candidates = walk_ordered_desc(
                 descriptor.root_page,
                 descriptor.height,
@@ -1198,10 +1223,14 @@ class OrderedIndex(IndexStore):
                 upper_key=upper_key,
             )
             for entry in candidates:
-                version = heap.read_if(
-                    entry.ref,
-                    lambda _record_id, xmin, xmax: snapshot.visible(xmin, xmax),
-                )
+                def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+                    """Return visibility under the owning transaction snapshot."""
+                    return snapshot.visible(xmin, xmax)
+
+                if materialized_positions is not None and type(heap) is HeapStore:
+                    version = heap._read_if_projected(entry.ref, visible, materialized_positions)
+                else:
+                    version = heap.read_if(entry.ref, visible)
                 if version is None:
                     continue
                 if version.table_id != table.table_id:
@@ -1249,6 +1278,35 @@ class OrderedIndex(IndexStore):
                     "Closing the ordered read certificate also failed with "
                     f"{type(certificate_failure).__name__}: {certificate_failure}"
                 )
+
+    def _prepare_ordered_heap_view(
+        self, heap: HeapStore, descriptor: OrderedRootDescriptor
+    ) -> None:
+        """Pair heap frames with the root freshly proved by the surrounding read.
+
+        This is not authority reuse: every caller still reads and compares both root
+        certificates. A foreign root can contain newer physical references than resident
+        heap frames, even for an old MVCC snapshot. Refresh the clean physical view and let
+        the record headers enforce that original snapshot. Dirty frames are never discarded.
+        """
+        if heap._pool is not self._pool:
+            raise GrafxIndexError(
+                "An ordered heap view must belong to the same buffer pool as its index.",
+                field="heap", index=self.name, file=self.file,
+            )
+        if self._heap_view_certificate == descriptor:
+            return
+        local = self._local_certificate
+        if not (
+            local is not None
+            and local.seq == descriptor.generation
+            and local.header.artifact_nonce == descriptor.artifact_nonce
+            and local.header.digest == descriptor.definition_digest
+            and local.header.built_through_lsn == descriptor.applied_through_lsn
+            and local.header.reconciled_through_lsn == descriptor.reconciled_through_lsn
+        ):
+            heap._pool.discard_clean_file(heap.file)
+        self._heap_view_certificate = descriptor
 
     def _stable_read(
         self,
@@ -1500,3 +1558,6 @@ class OrderedIndex(IndexStore):
                 expected_table=self._definition.table_name,
                 observed_table=table.name,
             )
+
+
+_NATIVE_ORDERED_DESC = OrderedIndex.iter_visible_desc

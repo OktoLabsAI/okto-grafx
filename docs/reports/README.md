@@ -6,7 +6,31 @@ Dated evidence, not active execution queues. Each report retains its original
 measurement conditions, source paths, limitations and checkpoint history.
 Private artifact/consumer-repository paths may not be available in this checkout.
 
+- [0.0.5 PyPI publication — exact installed wheel, default acceleration and registry verification](PYPI_0_0_5_PUBLICATION.md)
+
+- [Pulse adoption of advanced Grafx capabilities — assessment and agnostic Core boundary](PULSE_GRAFX_CAPABILITY_ADOPTION_ASSESSMENT.md)
+- [Pulse 0.0.5 adoption checkpoint — local installation, read lanes and Settings](PULSE_V005_ADOPTION_CHECKPOINT.md)
+- [0.0.5 pre-Pulse candidate validation — full regression and installed artifacts](V005_PRE_PULSE_VALIDATION.md)
+- [Reusable analytics and local ingestion after a4dd85a](V005_AFTER_A4DD85A.md)
+- [Weighted analytics and tabular interop after 970aa1e](V005_AFTER_970AA1E.md)
+- [Projection throughput and algorithms after 7dde256 — eight-item acceptance](V005_AFTER_7DDE256.md)
+
+- [Eight-item continuation after 69ed311 — scope, checkpoint and final regression](V005_AFTER_69ED311.md)
+
+- [Next eight-item continuation after 3f3819f — local acceptance and corrective regression evidence](V005_NEXT_EIGHT_PROGRESS.md)
+
 - [Documentation refactor and validation](DOCUMENTATION_REFACTOR_2026_09_08.md)
+- [0.0.5 native performance checkpoint](V005_NATIVE_PERFORMANCE_CHECKPOINT.md)
+- [0.0.5 four-item follow-up: projected pages, admission, complete synthetic Pulse ACK and typed options](V005_FOUR_ITEM_FOLLOWUP.md)
+- [0.0.5 N1–N2 checkpoint: existing-index admission and scalar parameter preparation](V005_N1_N2_CHECKPOINT.md)
+- [0.0.5 N3 overflow retirement and N4 native publication progress](V005_N3_N4_PROGRESS.md)
+- [0.0.5 N3/N4 implementation and regression closure](V005_N3_N4_ACCEPTANCE.md)
+- [0.0.5 R1–R2 checkpoint: cold validation and checksum isolation](V005_R1_R2_CHECKPOINT.md)
+- [0.0.5 R3–R4 checkpoint: persisted overflow reuse and physical backup/restore](V005_R3_R4_CHECKPOINT.md)
+- [0.0.5 operational checkpoint: orphan-index cleanup and cooperative read control](V005_OPS5_OPS8_CHECKPOINT.md)
+- [0.0.5 items 3–4: logical transfer, full-text search and retrospective documentation audit](V005_OPS2_FTS_CHECKPOINT.md)
+- [0.0.5 search performance, native hybrid retrieval and resumable import](V005_SEARCH_RESUME_CHECKPOINT.md)
+- [0.0.5 eight-item continuation: search, wide indexes, streamed backup and application migrations](V005_EIGHT_ITEM_CHECKPOINT.md)
 
 - [Architecture boundary debt: query synchronization and pure algorithms](ARCHITECTURE_BOUNDARY_RECONCILIATION_0_0_4.md)
 - [Bounded relationship census with exact endpoint validation](BATCHED_RELATIONSHIP_COUNT_0_0_4.md)

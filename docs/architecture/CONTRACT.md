@@ -14,6 +14,14 @@ New gaps are recorded in the roadmap, not a recreated punch-list. The current
 [performance policy](../PERFORMANCE.md) supersedes historical timing gates only;
 storage, concurrency, recovery and quality invariants are unchanged.
 
+Authorized 0.0.5 extension routing: [FTS-v1](../specs/FULLTEXT_V1_FORMAT.md) adds
+required capability bit 5, index derivation tag 4 and multiple postings per row
+inside the existing exact HASH/index-WAL protocol. Single-key scalar derivations
+retain their original encoding. [Logical transfer](../LOGICAL_TRANSFER.md) is an
+outer composition API using existing native transactions; it introduces no alternate
+page authority, relaxed OCC or independently writable same-UUID clone. Later extension
+specifications govern these added bytes without rewriting historical scalar contracts.
+
 ---
 
 ## 0. Non-negotiables (from the board guidelines and binding decisions D1–D9)
@@ -23,7 +31,7 @@ storage, concurrency, recovery and quality invariants are unchanged.
 | G1 | **All product surfaces are en-US**: class names, function names, exception messages, metric names & descriptions, CLI help, docstrings. | Code review + `tests/test_language_surface.py` |
 | G2 | **Hexagonal**: `okto_grafx/domain/**` and `okto_grafx/engine/**` contain NO mechanism. Forbidden: `open()`, `os`, `pathlib` I/O, `mmap`, `socket`, `sys.platform`, `os.name`, `threading`, `time.time`, `time.monotonic`, `random` (unseeded), any third-party import. **D-26 diagnostic exception:** only the exact, unaliased import `okto_grafx.engine.txn_manager <- time.perf_counter_ns` is allowed, solely for outcome-neutral commit timings; it never supplies lease/liveness, storage, WAL or visibility decisions. This avoids invoking the host `Clock` under an exclusive window. | `tests/test_import_boundary.py`, budget **ZERO**, fails closed |
 | G2b | **No `random` in the domain.** Anything needing randomness (HNSW level assignment, sampling) uses `okto_grafx.domain.rand.SplitMix64` — an explicitly seeded, deterministic, reproducible PRNG owned by C1. Reproducibility is a spec requirement (seeded interleavings, seeded corpora), not a preference. | `tests/test_import_boundary.py` |
-| G3 | **Pure-Python core, single universal wheel.** Runtime deps: stdlib only. `numpy` only under extra `[accel]`, imported only in the closed adapter set `adapters/vectormath_numpy.py` and `adapters/codec_numpy.py`. `google-crc32c` only under extra `[accel]`, imported only in `adapters/checksum_native.py`, and admitted only after the acceptance corpus proves it byte-identical to the pure reference (its successful proof is memoized per process under the provider's strong identity, strictly bounded per closed slot and serialized in the adapter, D-29). `ladybug` only under extra `[bench]`. | `pyproject.toml` + import-boundary test |
+| G3 | **Pure-Python core, single universal Grafx wheel.** Authorized 2026-09-10 packaging amendment: `numpy` and `google-crc32c` are base runtime dependencies; `[accel]` remains a compatibility alias. NumPy is the default codec/vector adapter, with explicit pure implementations retained. Third-party imports remain confined to adapters, never domain/engine. Native CRC is admitted only after the acceptance corpus proves it byte-identical to the pure reference (successful proof memoized per process under strong provider identity, bounded and serialized, D-29). `ladybug` remains only under the independent benchmark extra `[bench]`. | `pyproject.toml` + import-boundary test |
 | G4 | **Windows and POSIX are equal citizens.** No test may be silently skipped on a family; a family-specific test must be explicitly marked `@pytest.mark.platform_specific` and have a counterpart. **Extended by A32 (runtime observation, not static prediction) and REPLACED in its attribution rule by A54 (three registered markers: `platform_specific` with a family condition + counterpart, `optional_dependency("<module>")`, `pending`/`xfail`).** | `tests/test_platform_parity.py` |
 | G5 | **Fail-closed ports**: an unfilled port slot refuses startup with `GrafxPortNotConfigured`. No silent default, no no-op fallback (except the explicitly selected `NoOpMetricsSink`). | `runtime/registry.py` + tests |
 | G6 | **No sanctioned operation destroys the main data file.** Recovery, quarantine, recycling and purge never move/rename/delete `heap.dat`, `catalog.dat` or `index/*`. | `tests/test_main_file_untouched.py` |
@@ -149,11 +157,18 @@ Concrete classes (`code`, `retryable`) — **exact names, en-US messages**:
 | `GrafxIndexError` | `index_error` | False |
 | `GrafxQueryError` | `query_error` | False |
 | `GrafxQueryBudgetExceeded` | `query_budget_exceeded` | False |
+| `GrafxQueryCancelled` | `query_cancelled` | False |
+| `GrafxQueryDeadlineExceeded` | `query_deadline_exceeded` | False |
 | `GrafxVectorValidationError` | `vector_validation` | False |
 | `GrafxEmbeddingSpaceMismatch` | `embedding_space_mismatch` | False |
 | `GrafxSpaceRetired` | `space_retired` | False |
 | `GrafxConfigurationError` | `configuration_error` | False |
 | `GrafxUnsupportedOperation` | `unsupported_operation` | False |
+
+Read-only execution controls additionally raise `GrafxQueryCancelled`
+(`query_cancelled`) and `GrafxQueryDeadlineExceeded` (`query_deadline_exceeded`),
+both non-retryable subclasses of `GrafxQueryError`. Checks are cooperative and do
+not interrupt durable commit publication. See [read-control semantics](../READ_CONTROL_AND_INDEX_CLEANUP.md).
 
 `GrafxQueryError` gets subclasses `GrafxQueryBudgetExceeded` (`query_budget_exceeded`),
 `GrafxParseError` (`parse_error`) and `GrafxPlanError` (`plan_error`).
@@ -1465,6 +1480,8 @@ refusal leaves the transaction exactly as it entered the statement.
 
 M1: `oktografx_lease_wait_seconds`{outcome=granted|timeout|takeover} ·
 `oktografx_write_conflicts_total` · `oktografx_commit_retries_total` ·
+`oktografx_commits_with_metadata_total` · `oktografx_commit_metadata_bytes_total` ·
+`oktografx_commit_id_high_watermark_count` ·
 `oktografx_active_transactions`{mode=read|write} ·
 `oktografx_commit_window_duration_seconds`{window=writer_lease|commit_section,interval=wait|hold} ·
 `oktografx_commit_phase_duration_seconds`{phase=other|occ|materialize|build_records|append|barrier|apply|flush|index|publish} ·
@@ -2026,11 +2043,13 @@ runtime result shape.
   component. The real gates are **`MetricDescriptor.__post_init__`** (C0, declaration-time) and
   **`MetricsSink.register`** (C8, duplicate/conflict detection at registration). G7 is read as naming
   both.
-* **A52** numpy's home is **`[accel]`** (G3 / SPEC-VEC TR-6 / IR-2 -- the optional accelerator behind
-  the `VectorMath` and byte-identical `PageCodec` ports). Its additional presence in `[bench]` satisfies SPEC-M1 TR-9 because the
-  harness needs it too, and is a convenience rather than a second home. No contradiction exists in
-  `pyproject.toml`; this records which clause is authoritative if they ever diverge.
-  `google-crc32c` shares that home: it is the optional accelerator behind the checksum slot
+* **A52 (amended with user authorization, 2026-09-10).** NumPy and `google-crc32c`
+  now belong to base dependencies; `[accel]` is a backward-compatible empty alias.
+  This supersedes the original stdlib-only packaging requirement, not G2's adapter
+  isolation. `codec` and `vector_math` default to `numpy`; explicit pure selectors
+  and the existing pure meaning of `vector_math="auto"` remain supported. The codec
+  stays byte-identical; vector math retains its documented numerical tolerance.
+  `google-crc32c` remains behind the checksum slot
   (PORTS.md), imported only in `adapters/checksum_native.py`, proved against the acceptance corpus
   before it can be installed, and since D-29 that successful proof is memoized per process under
   the provider's strong identity (module, attribute, origin, version, function object) -- never for

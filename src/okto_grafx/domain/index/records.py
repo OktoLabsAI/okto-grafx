@@ -396,6 +396,7 @@ def _proof_protocol() -> tuple[
     token = object()
 
     def proved_change(record: WalRecord) -> IndexChange:
+        """Reuse only a payload-bound decoded change, otherwise decode canonically."""
         payload = record.payload
         entry = record._decoded
         if (
@@ -424,6 +425,7 @@ def _proof_protocol() -> tuple[
         epoch: Epoch = 0,
         txn_id: TxnId = 0,
     ) -> WalRecord:
+        """Encode an index change and attach its operation-local decode proof."""
         payload = change.encode()
         if template is None:
             record = WalRecord(

@@ -23,8 +23,16 @@ that owns it (A24), and this module only makes it reachable by its supported pat
 
 from __future__ import annotations
 
-from okto_grafx.api import connect
+from okto_grafx.api import ConnectOptions, connect
+from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult
+from okto_grafx.domain.query.hybrid import HybridHit, HybridSearchOptions, HybridSearchResult
 from okto_grafx.domain.model import Timestamp, VectorValue
+from okto_grafx.domain.query.control import CancellationToken
+from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.txn.commit_metadata import CommitMetadata, MetadataLimits
+from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry, CommitKind
+from okto_grafx.domain.txn.commit_history import CommitHistoryPage
+from okto_grafx.domain.txn.commit_transfer import CommitImport, CommitMapping, prepare_commit_import
 from okto_grafx.engine.database import (
     Database,
     DatabaseIdentity,
@@ -41,10 +49,23 @@ from okto_grafx.runtime.config import DatabaseConfig
 from okto_grafx.runtime.registry import PortRegistry
 
 __all__ = [
+    "CancellationToken",
+    "CommitCatalogEntry",
+    "CommitHistoryPage",
+    "CommitId",
+    "CommitImport",
+    "CommitKind",
+    "CommitMapping",
+    "CommitMetadata",
+    "ConnectOptions",
     "Database",
     "DatabaseConfig",
     "DatabaseIdentity",
     "ExecuteManyReport",
+    "HybridHit",
+    "HybridSearchOptions",
+    "HybridSearchResult",
+    "MetadataLimits",
     "PortRegistry",
     "Query",
     "QueryCursor",
@@ -52,11 +73,16 @@ __all__ = [
     "ScanCursorV1",
     "ScanPageV1",
     "ScanRowV1",
+    "TextHit",
+    "TextIndexOptions",
+    "TextSearchLimits",
+    "TextSearchResult",
     "Timestamp",
     "Transaction",
     "VectorValue",
     "__version__",
     "connect",
+    "prepare_commit_import",
 ]
 
-__version__: str = "0.0.4"
+__version__: str = "0.0.5"

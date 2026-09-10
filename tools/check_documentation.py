@@ -15,6 +15,15 @@ sys.path.insert(0, str(ROOT / "tools"))
 from generate_api_reference import MARKER, render  # noqa: E402
 
 CONSUMER_DOCS = (
+    "docs/GRAPH_PROJECTIONS.md",
+    "docs/TABULAR_AND_PARQUET.md",
+    "docs/GRAPH_EXCHANGE.md",
+    "docs/LOCAL_TEXT_IMPORT.md",
+    "docs/POLARS_RECIPE.md",
+    "docs/EXTENSIONS_AND_ARROW.md",
+    "docs/V005_COMPATIBILITY.md",
+    "docs/specs/HEAP_FREE_PAGE_INDEX.md",
+    "docs/specs/SPARSE_HASH_DIRECTORIES.md",
     "README.md",
     "ROADMAP.md",
     "docs/README.md",
@@ -27,6 +36,14 @@ CONSUMER_DOCS = (
     "docs/OPERATIONS.md",
     "docs/CLI.md",
     "docs/PERFORMANCE.md",
+    "docs/FULL_TEXT_SEARCH.md",
+    "docs/HYBRID_SEARCH.md",
+    "docs/SCHEMA_MIGRATIONS.md",
+    "docs/BACKUP_RESTORE.md",
+    "docs/specs/FTS_DURABLE_STATISTICS.md",
+    "docs/specs/LARGE_HASH_DIRECTORIES.md",
+    "docs/LOGICAL_TRANSFER.md",
+    "docs/specs/FULLTEXT_V1_FORMAT.md",
     "docs/reports/README.md",
 )
 
@@ -90,6 +107,22 @@ def check() -> list[str]:
             f"Config field drift: missing={sorted(fields - documented)}, extra={sorted(documented - fields)}"
         )
 
+    for module, classes, guide in (
+        ("domain/query/hybrid.py", {"HybridSearchOptions"}, "HYBRID_SEARCH.md"),
+        ("domain/index/fulltext.py", {"TextIndexOptions", "TextSearchLimits"}, "FULL_TEXT_SEARCH.md"),
+        ("transfer.py", {"TransferLimits"}, "LOGICAL_TRANSFER.md"),
+        ("projections.py", {"ProjectionLimits"}, "GRAPH_PROJECTIONS.md"),
+        ("text_import.py", {"TextImportLimits"}, "LOCAL_TEXT_IMPORT.md"),
+    ):
+        tree = ast.parse((ROOT / "src/okto_grafx" / module).read_text(encoding="utf-8"))
+        expected = {
+            field.target.id for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name in classes
+            for field in cls.body if isinstance(field, ast.AnnAssign) and isinstance(field.target, ast.Name)
+        }
+        found = set(re.findall(r"^\| `([a-z_]+)` \|", (ROOT / "docs" / guide).read_text(encoding="utf-8"), re.M))
+        if expected != found:
+            errors.append(f"{guide}: option drift: missing={sorted(expected - found)}, extra={sorted(found - expected)}")
+
     api = (ROOT / "docs/API_REFERENCE.md").read_text(encoding="utf-8")
     if MARKER not in api or api.split(MARKER, 1)[1] != render().split(MARKER, 1)[1]:
         errors.append("Public signature/DTO appendix stale; regenerate it")
@@ -127,6 +160,6 @@ if __name__ == "__main__":
     print(
         "\n".join(failures)
         if failures
-        else "Documentation PASS: links/anchors, 36 config fields, public signatures/DTOs, 11 preserved source plans"
+        else "Documentation PASS: links/anchors, 39 config fields, public signatures/DTOs, 11 preserved source plans"
     )
     raise SystemExit(bool(failures))

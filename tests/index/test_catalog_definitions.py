@@ -14,6 +14,7 @@ from okto_grafx.domain.index.catalog import (
     IndexGenerationState,
 )
 from okto_grafx.domain.index.definition import RECORD_ID_KEY_DERIVATION
+from okto_grafx.domain.index.keys import MAX_BUCKET_COUNT, MAX_EXPECTED_CARDINALITY
 from okto_grafx.domain.index.visibility import IndexVisibility
 
 
@@ -59,7 +60,7 @@ def test_a_generation_nonce_must_be_non_zero_u64(nonce: object) -> None:
     assert refused.value.details["field"] == "artifact_nonce"
 
 
-@pytest.mark.parametrize("bucket_count", [0, 4097, True, 1.0, None])
+@pytest.mark.parametrize("bucket_count", [0, MAX_BUCKET_COUNT + 1, True, 1.0, None])
 def test_a_generation_bucket_count_uses_the_bounded_index_domain(
     bucket_count: object,
 ) -> None:
@@ -244,11 +245,11 @@ def test_expected_cardinality_accepts_the_supported_eager_directory_domain() -> 
     )
     assert replace(exact_definition(), expected_cardinality=1).expected_cardinality == 1
     assert (
-        replace(exact_definition(), expected_cardinality=262_144).expected_cardinality
-        == 262_144
+        replace(exact_definition(), expected_cardinality=MAX_EXPECTED_CARDINALITY).expected_cardinality
+        == MAX_EXPECTED_CARDINALITY
     )
     with pytest.raises(GrafxIndexError) as refused:
-        replace(exact_definition(), expected_cardinality=262_145)
+        replace(exact_definition(), expected_cardinality=MAX_EXPECTED_CARDINALITY + 1)
     assert refused.value.details["field"] == "expected_cardinality"
 
 

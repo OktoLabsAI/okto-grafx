@@ -5,6 +5,7 @@ import pytest
 from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.index import (
     DEFAULT_BUCKET_COUNT,
+    MAX_BUCKET_COUNT,
     MAX_EXPECTED_CARDINALITY,
     custom_index_sizing,
     identity_index_name,
@@ -19,7 +20,8 @@ from okto_grafx.domain.index import (
         (0, 4096, 64),
         (2048, 4096, 64),
         (2049, 4098, 128),
-        (131_072, MAX_EXPECTED_CARDINALITY, 4096),
+        (131_072, 262_144, 4096),
+        (MAX_EXPECTED_CARDINALITY // 2, MAX_EXPECTED_CARDINALITY, MAX_BUCKET_COUNT),
     ],
 )
 def test_automatic_identity_sizing_follows_the_adr_boundaries(
@@ -35,10 +37,10 @@ def test_automatic_identity_sizing_follows_the_adr_boundaries(
 
 def test_automatic_identity_sizing_refuses_the_first_unsupported_row_count() -> None:
     with pytest.raises(GrafxIndexError) as raised:
-        identity_index_sizing(131_073)
+        identity_index_sizing(MAX_EXPECTED_CARDINALITY // 2 + 1)
 
     assert raised.value.details["field"] == "visible_rows"
-    assert raised.value.details["expected_cardinality"] == 262_146
+    assert raised.value.details["expected_cardinality"] == MAX_EXPECTED_CARDINALITY + 2
     assert raised.value.details["max_expected_cardinality"] == MAX_EXPECTED_CARDINALITY
 
 
@@ -68,7 +70,7 @@ def test_automatic_identity_sizing_refuses_invalid_counts(
         (65, 2),
         (4096, DEFAULT_BUCKET_COUNT),
         (4097, 128),
-        (MAX_EXPECTED_CARDINALITY, 4096),
+        (MAX_EXPECTED_CARDINALITY, MAX_BUCKET_COUNT),
     ],
 )
 def test_custom_sizing_derives_the_next_power_of_two_directory(
@@ -120,7 +122,7 @@ def test_custom_sizing_refuses_ambiguous_or_out_of_domain_hints(
         (
             2048,
             {"expected_cardinality": MAX_EXPECTED_CARDINALITY},
-            (4096, MAX_EXPECTED_CARDINALITY),
+            (MAX_BUCKET_COUNT, MAX_EXPECTED_CARDINALITY),
         ),
     ],
 )
@@ -145,8 +147,8 @@ def test_rehash_sizing_accepts_every_kind_of_strict_growth_boundary(
         (64, {"bucket_count": 63}, "bucket_count"),
         (64, {"expected_cardinality": 4096}, "bucket_count"),
         (64, {"expected_cardinality": 1}, "bucket_count"),
-        (4096, {"expected_cardinality": MAX_EXPECTED_CARDINALITY}, "bucket_count"),
-        (64, {"bucket_count": 4097}, "bucket_count"),
+        (MAX_BUCKET_COUNT, {"expected_cardinality": MAX_EXPECTED_CARDINALITY}, "bucket_count"),
+        (64, {"bucket_count": MAX_BUCKET_COUNT + 1}, "bucket_count"),
         (
             64,
             {"expected_cardinality": MAX_EXPECTED_CARDINALITY + 1},
@@ -167,7 +169,7 @@ def test_rehash_sizing_refuses_missing_ambiguous_non_growing_or_invalid_hints(
     assert raised.value.details["field"] == field
 
 
-@pytest.mark.parametrize("current_bucket_count", [0, 4097, True, 1.5, None])
+@pytest.mark.parametrize("current_bucket_count", [0, MAX_BUCKET_COUNT + 1, True, 1.5, None])
 def test_rehash_sizing_refuses_an_invalid_active_directory(
     current_bucket_count: object,
 ) -> None:

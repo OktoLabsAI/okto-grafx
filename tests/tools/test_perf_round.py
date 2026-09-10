@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,6 +15,37 @@ from tools.perf_round import baseline_runs, board_copy, receipt
 
 TEST_GRAFX_SHA = receipt.git_sha_of(receipt.PROJECT_ROOT)
 assert TEST_GRAFX_SHA is not None
+
+
+@pytest.fixture(scope="module")
+def pinned_grafx_checkout(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Run provenance instruments against a clean independent pin, without copying all history."""
+    root = tmp_path_factory.mktemp("perf-source") / "grafx"
+    subprocess.run(
+        ["git", "clone", "--no-local", "--depth", "1", "--quiet", "--no-checkout",
+         str(receipt.PROJECT_ROOT), str(root)], check=True, capture_output=True,
+        timeout=30,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "checkout", "--detach", "--quiet", TEST_GRAFX_SHA],
+        check=True, capture_output=True,
+        timeout=20,
+    )
+    assert receipt.git_sha_of(root) == TEST_GRAFX_SHA
+    return root
+
+
+@pytest.fixture(autouse=True)
+def use_pinned_grafx_checkout(
+    pinned_grafx_checkout: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin both the parent provenance check and child imports without bypassing clean checks."""
+    identity = dict(receipt.grafx_identity())
+    identity["file"] = str(pinned_grafx_checkout / "src" / "okto_grafx" / "__init__.py")
+    identity["git_sha"] = TEST_GRAFX_SHA
+    monkeypatch.setattr(baseline_runs, "SOURCE_ROOT", pinned_grafx_checkout)
+    monkeypatch.setattr(baseline_runs, "SOURCE_IMPORT_ROOT", pinned_grafx_checkout / "src")
+    monkeypatch.setattr(baseline_runs, "grafx_identity", lambda: dict(identity))
 
 # A fake instrument: writes JSON with a metric derived from its run index and seed, no timing.
 _FAKE_INSTRUMENT = (

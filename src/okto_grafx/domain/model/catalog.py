@@ -51,7 +51,12 @@ from okto_grafx.domain.index.definition import (
     automatic_index_definitions,
 )
 from okto_grafx.domain.index.layout import IndexLayout
+from okto_grafx.domain.index.fulltext import (
+    FULLTEXT_CAPABILITY, is_fulltext, FULLTEXT_STATISTICS_CAPABILITY, has_durable_statistics,
+    FULLTEXT_HISTORY_CAPABILITY, has_historical_statistics,
+)
 from okto_grafx.domain.index.visibility import IndexVisibility
+from okto_grafx.domain.index.keys import LARGE_HASH_CAPABILITY, LEGACY_MAX_BUCKET_COUNT
 from okto_grafx.domain.model.schema import (
     SPACE_STATE_ACTIVE,
     ColumnDef,
@@ -91,6 +96,12 @@ WAL_RECORD_V2_CAPABILITY: str = "wal_record_v2"
 COMMIT_CATALOG_V1_CAPABILITY: str = "commit_catalog_v1"
 """Required capability guarding the persisted commit-history activation horizon."""
 
+HEAP_FREE_INDEX_CAPABILITY: str = "heap_free_page_index_v1"
+"""Required capability for the heap-header linked retired-page directory."""
+
+SPARSE_HASH_CAPABILITY: str = "sparse_hash_directories_v1"
+"""Required capability for exact sparse-hash bucket directories."""
+
 _PREAMBLE = struct.Struct("<8sHHIIII")
 _V2_EXTENSION = struct.Struct("<QII")
 _INDEX_META = struct.Struct("<BBBBHHQ")
@@ -108,6 +119,14 @@ _HEAP_RECLAIM_V1_BIT = 1 << 1
 _WAL_RECORD_V2_BIT = 1 << 2
 _ORDERED_SECONDARY_INDEXES_V1_BIT = 1 << 3
 _COMMIT_CATALOG_V1_BIT = 1 << 4
+_FULLTEXT_V1_BIT = 1 << 5
+_FULLTEXT_STATISTICS_V1_BIT = 1 << 6
+_LARGE_HASH_V1_BIT = 1 << 7
+_FULLTEXT_HISTORY_V1_BIT = 1 << 8
+_HEAP_FREE_INDEX_BIT = 1 << 9
+_SPARSE_HASH_BIT = 1 << 10
+_FULLTEXT_PREFIX_BIT = 1 << 11
+_FULLTEXT_RELATIONSHIPS_BIT = 1 << 12
 
 
 _KNOWN_CAPABILITY_BITS = (
@@ -116,6 +135,14 @@ _KNOWN_CAPABILITY_BITS = (
     | _WAL_RECORD_V2_BIT
     | _ORDERED_SECONDARY_INDEXES_V1_BIT
     | _COMMIT_CATALOG_V1_BIT
+    | _FULLTEXT_V1_BIT
+    | _FULLTEXT_STATISTICS_V1_BIT
+    | _LARGE_HASH_V1_BIT
+    | _FULLTEXT_HISTORY_V1_BIT
+    | _HEAP_FREE_INDEX_BIT
+    | _SPARSE_HASH_BIT
+    | _FULLTEXT_PREFIX_BIT
+    | _FULLTEXT_RELATIONSHIPS_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -126,6 +153,14 @@ _CAPABILITY_TO_BIT = MappingProxyType(
             _ORDERED_SECONDARY_INDEXES_V1_BIT
         ),
         COMMIT_CATALOG_V1_CAPABILITY: _COMMIT_CATALOG_V1_BIT,
+        FULLTEXT_CAPABILITY: _FULLTEXT_V1_BIT,
+        FULLTEXT_STATISTICS_CAPABILITY: _FULLTEXT_STATISTICS_V1_BIT,
+        LARGE_HASH_CAPABILITY: _LARGE_HASH_V1_BIT,
+        FULLTEXT_HISTORY_CAPABILITY: _FULLTEXT_HISTORY_V1_BIT,
+        HEAP_FREE_INDEX_CAPABILITY: _HEAP_FREE_INDEX_BIT,
+        SPARSE_HASH_CAPABILITY: _SPARSE_HASH_BIT,
+        "fulltext_prefixes_v1": _FULLTEXT_PREFIX_BIT,
+        "fulltext_relationships_v1": _FULLTEXT_RELATIONSHIPS_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -151,7 +186,7 @@ _STATE_TO_TAG = MappingProxyType(
 )
 _TAG_TO_STATE = MappingProxyType({value: key for key, value in _STATE_TO_TAG.items()})
 _LAYOUT_TO_TAG = MappingProxyType(
-    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1}
+    {IndexLayout.HASH: 0, IndexLayout.ORDERED: 1, IndexLayout.SPARSE_HASH: 2}
 )
 _TAG_TO_LAYOUT = MappingProxyType(
     {value: key for key, value in _LAYOUT_TO_TAG.items()}
@@ -163,6 +198,10 @@ def _require_commit_catalog_sequence(sequence: int) -> None:
         raise GrafxConfigurationError(
             "Invalid commit catalog activation sequence.", field="commit_catalog_activation"
         )
+
+
+def _large_hash_generations(definitions: Iterable[CatalogIndexDefinition]) -> bool:
+    return any(g.bucket_count > LEGACY_MAX_BUCKET_COUNT for d in definitions for g in d.generations)
 
 
 class Catalog:
@@ -482,6 +521,20 @@ class Catalog:
             for definition in validated.values()
         ):
             capabilities.add(ORDERED_SECONDARY_INDEXES_V1_CAPABILITY)
+        if any(is_fulltext(definition.key_derivation) for definition in validated.values()):
+            capabilities.add(FULLTEXT_CAPABILITY)
+        if any(d.key_derivation.startswith("fulltext_v4_") for d in validated.values()):
+            capabilities.add("fulltext_prefixes_v1")
+        if any(is_fulltext(d.key_derivation) and self.table_by_id(d.table_id).kind == "rel" for d in validated.values()):
+            capabilities.add("fulltext_relationships_v1")
+        if any(has_durable_statistics(d.key_derivation) for d in validated.values()):
+            capabilities.add(FULLTEXT_STATISTICS_CAPABILITY)
+        if any(has_historical_statistics(d.key_derivation) for d in validated.values()):
+            capabilities.add(FULLTEXT_HISTORY_CAPABILITY)
+        if _large_hash_generations(validated.values()):
+            capabilities.add(LARGE_HASH_CAPABILITY)
+        if any(d.layout is IndexLayout.SPARSE_HASH for d in validated.values()):
+            capabilities.add(SPARSE_HASH_CAPABILITY)
         self._required_capabilities = frozenset(capabilities)
         self._install_indexes(validated)
         return self
@@ -494,6 +547,20 @@ class Catalog:
         self._require_index_catalog()
         proposed = (*self.index_definitions(), definition)
         validated = self._validated_index_authority(proposed, stored=False)
+        if is_fulltext(definition.key_derivation):
+            self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_CAPABILITY))
+        if definition.key_derivation.startswith("fulltext_v4_"):
+            self._required_capabilities = frozenset((*self._required_capabilities, "fulltext_prefixes_v1"))
+        if is_fulltext(definition.key_derivation) and self.table_by_id(definition.table_id).kind == "rel":
+            self._required_capabilities = frozenset((*self._required_capabilities, "fulltext_relationships_v1"))
+        if has_durable_statistics(definition.key_derivation):
+            self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_STATISTICS_CAPABILITY))
+        if has_historical_statistics(definition.key_derivation):
+            self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_HISTORY_CAPABILITY))
+        if _large_hash_generations(validated.values()):
+            self._required_capabilities = frozenset((*self._required_capabilities, LARGE_HASH_CAPABILITY))
+        if any(d.layout is IndexLayout.SPARSE_HASH for d in validated.values()):
+            self._required_capabilities = frozenset((*self._required_capabilities, SPARSE_HASH_CAPABILITY))
         if definition.layout is IndexLayout.ORDERED:
             self._required_capabilities = frozenset(
                 (
@@ -504,7 +571,7 @@ class Catalog:
         self._install_indexes(validated)
         return definition
 
-    def enable_heap_reclaim(self) -> Catalog:
+    def enable_heap_reclaim(self, *, index_free_pages: bool = False) -> Catalog:
         """Add the one-way heap-reclaim capability to an already-active v2 catalog.
 
         The capability is published before any heap floor or reclaimed slot.  Older builds then
@@ -516,6 +583,10 @@ class Catalog:
         capabilities = frozenset(
             (*self._required_capabilities, HEAP_RECLAIM_V1_CAPABILITY)
         )
+        if type(index_free_pages) is not bool:
+            raise GrafxConfigurationError("index_free_pages must be a bool.", field="index_free_pages")
+        if index_free_pages:
+            capabilities = frozenset((*capabilities, HEAP_FREE_INDEX_CAPABILITY))
         if capabilities != self._required_capabilities:
             self._required_capabilities = capabilities
             self._invalidate_derived()
@@ -564,6 +635,8 @@ class Catalog:
             for item in self.index_definitions()
         )
         validated = self._validated_index_authority(proposed, stored=False)
+        if _large_hash_generations(validated.values()):
+            self._required_capabilities = frozenset((*self._required_capabilities, LARGE_HASH_CAPABILITY))
         self._install_indexes(validated)
         return definition
 
@@ -699,6 +772,20 @@ class Catalog:
             )
             indexes = tuple(validated[key] for key in sorted(validated))
             capability_bits = _encode_capabilities(self._required_capabilities)
+            if any(is_fulltext(d.key_derivation) and self.table_by_id(d.table_id).kind == "rel" for d in indexes) and "fulltext_relationships_v1" not in self._required_capabilities:
+                raise GrafxConfigurationError("Relationship FTS requires its capability.", field="required_capabilities")
+            if any(d.key_derivation.startswith("fulltext_v4_") for d in indexes) and "fulltext_prefixes_v1" not in self._required_capabilities:
+                raise GrafxConfigurationError("Prefix postings require their capability.", field="required_capabilities")
+            if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Full-text indexes require their capability.", field="required_capabilities")
+            if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Durable text statistics require their capability.", field="required_capabilities")
+            if any(has_historical_statistics(d.key_derivation) for d in indexes) and FULLTEXT_HISTORY_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Historical text statistics require their capability.", field="required_capabilities")
+            if _large_hash_generations(indexes) and LARGE_HASH_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Large hash directories require their capability.", field="required_capabilities")
+            if any(d.layout is IndexLayout.SPARSE_HASH for d in indexes) and SPARSE_HASH_CAPABILITY not in self._required_capabilities:
+                raise GrafxConfigurationError("Sparse hash requires its capability.", field="required_capabilities")
             if not capability_bits & _IDENTITY_SECONDARY_INDEXES_V1_BIT:
                 raise GrafxConfigurationError(
                     "Catalog format 2 requires identity_secondary_indexes_v1.",
@@ -892,6 +979,20 @@ class Catalog:
             _require_canonical_order(tables, spaces, indexes)
         catalog._install_loaded(tables, spaces)
         if format_version == CATALOG_FORMAT_VERSION:
+            if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Full-text indexes lack their required capability.", field="required_capabilities")
+            if any(is_fulltext(d.key_derivation) and catalog.table_by_id(d.table_id).kind == "rel" for d in indexes) and "fulltext_relationships_v1" not in required_capabilities:
+                raise GrafxCorruptionDetected("Relationship FTS lacks its capability.", field="required_capabilities")
+            if any(d.key_derivation.startswith("fulltext_v4_") for d in indexes) and "fulltext_prefixes_v1" not in required_capabilities:
+                raise GrafxCorruptionDetected("Prefix postings lack their capability.", field="required_capabilities")
+            if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Durable text statistics lack their capability.", field="required_capabilities")
+            if any(has_historical_statistics(d.key_derivation) for d in indexes) and FULLTEXT_HISTORY_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Historical text statistics lack their capability.", field="required_capabilities")
+            if _large_hash_generations(indexes) and LARGE_HASH_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Large hash directories lack their capability.", field="required_capabilities")
+            if any(d.layout is IndexLayout.SPARSE_HASH for d in indexes) and SPARSE_HASH_CAPABILITY not in required_capabilities:
+                raise GrafxCorruptionDetected("Sparse hash lacks its capability.", field="required_capabilities")
             if any(
                 definition.layout is IndexLayout.ORDERED for definition in indexes
             ) and (
@@ -993,6 +1094,7 @@ class Catalog:
         error_type = GrafxCorruptionDetected if stored else GrafxConfigurationError
 
         def refuse(message: str, *, field: str, **details: object) -> NoReturn:
+            """Report invalid persisted state through the owning error taxonomy."""
             raise error_type(message, field=field, **details)
 
         automatic: dict[str, list[object]] = {}
@@ -1071,6 +1173,11 @@ class Catalog:
                     )
 
             is_identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
+            text_offset = 2 if table.kind == "rel" else 0
+            if is_fulltext(definition.key_derivation) and (
+                any(p < text_offset or p >= len(table.columns) or table.columns[p].type is not ValueType.STRING for p in definition.positions)
+            ):
+                refuse("Full-text indexes require declared STRING properties, not endpoints.", field="positions", index=definition.name)
             if is_identity:
                 if table.kind != "node" or table.name not in endpoints:
                     refuse(
@@ -1257,6 +1364,14 @@ def _matches_automatic_exact(
 def _encode_capabilities(capabilities: frozenset[str]) -> int:
     """Encode every required capability, refusing one this build cannot uphold."""
 
+    for dependent, required in (
+        ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
+        ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),
+        (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),
+        (HEAP_FREE_INDEX_CAPABILITY, {HEAP_RECLAIM_V1_CAPABILITY}),
+    ):
+        if dependent in capabilities and not required <= capabilities:
+            raise GrafxConfigurationError("Required capability dependencies are missing.", field="required_capabilities")
     bits = 0
     for capability in capabilities:
         bit = _CAPABILITY_TO_BIT.get(capability)
@@ -1281,9 +1396,18 @@ def _decode_capabilities(bits: int) -> frozenset[str]:
             value=bits,
             unsupported=unknown,
         )
-    return frozenset(
+    capabilities = frozenset(
         capability for capability, bit in _CAPABILITY_TO_BIT.items() if bits & bit
     )
+    for dependent, required in (
+        ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
+        ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),
+        (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),
+        (HEAP_FREE_INDEX_CAPABILITY, {HEAP_RECLAIM_V1_CAPABILITY}),
+    ):
+        if dependent in capabilities and not required <= capabilities:
+            raise GrafxCorruptionDetected("Required capability dependencies are missing.", field="required_capabilities")
+    return capabilities
 
 
 def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
@@ -1305,7 +1429,7 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
         )
     try:
         visibility_tag = _VISIBILITY_TO_TAG[definition.visibility]
-        derivation_tag = _DERIVATION_TO_TAG[definition.key_derivation]
+        derivation_tag = 4 if is_fulltext(definition.key_derivation) else _DERIVATION_TO_TAG[definition.key_derivation]
         layout_tag = _LAYOUT_TO_TAG[definition.layout]
     except KeyError as failure:
         raise GrafxConfigurationError(
@@ -1327,6 +1451,8 @@ def _encode_catalog_index(definition: CatalogIndexDefinition) -> bytes:
             definition.expected_cardinality or 0,
         ),
     ]
+    if derivation_tag == 4:
+        parts.append(_encode_text(definition.key_derivation))
     parts.extend(_U32.pack(position) for position in definition.positions)
     parts.extend(
         _INDEX_GENERATION.pack(
@@ -1377,7 +1503,7 @@ def _decode_catalog_index(
             index=name,
         )
     key_derivation = _TAG_TO_DERIVATION.get(derivation_tag)
-    if key_derivation is None:
+    if key_derivation is None and derivation_tag != 4:
         raise GrafxCorruptionDetected(
             f"Index {name!r} declares unknown key-derivation tag {derivation_tag}.",
             field="key_derivation",
@@ -1391,6 +1517,10 @@ def _decode_catalog_index(
             value=automatic,
             index=name,
         )
+    if derivation_tag == 4:
+        key_derivation, offset = _decode_text(raw, offset)
+        if not is_fulltext(key_derivation):
+            raise GrafxCorruptionDetected("Invalid full-text derivation family.", field="key_derivation")
     positions: list[int] = []
     for _ in range(position_count):
         _require(raw, offset, _U32.size, "index position")

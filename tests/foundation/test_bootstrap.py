@@ -52,14 +52,48 @@ def test_building_the_default_registry_fills_every_required_slot() -> None:
         bootstrap.release_ports(registry)
 
 
+@pytest.mark.parametrize("options", [{}, {"codec": "numpy"}])
 def test_an_explicit_numpy_page_codec_never_silently_falls_back(
     monkeypatch: pytest.MonkeyPatch,
+    options: dict,
 ) -> None:
     monkeypatch.setitem(sys.modules, "okto_grafx.adapters.codec_numpy", None)
     with pytest.raises(GrafxConfigurationError) as raised:
-        bootstrap.build_default_registry(DatabaseConfig(path=":memory:", codec="numpy"))
+        bootstrap.build_default_registry(DatabaseConfig(path=":memory:", **options))
     assert raised.value.details == {"field": "codec", "value": "numpy"}
     assert "accel" in raised.value.message
+
+
+def test_default_acceleration_and_explicit_pure_ports():
+    for options, codec_module, vector_module in (
+        ({}, "codec_numpy", "vectormath_numpy"),
+        ({"codec": "pure", "vector_math": "pure"}, "codec_v1", "vectormath_pure"),
+    ):
+        registry = bootstrap.build_default_registry(DatabaseConfig(path=":memory:", **options))
+        try:
+            assert type(registry.get("codec")).__module__.endswith(codec_module)
+            assert type(registry.get("vector_math")).__module__.endswith(vector_module)
+        finally:
+            bootstrap.release_ports(registry)
+
+
+def test_default_numpy_and_pure_handles_share_snapshot_and_durable_bytes(tmp_path):
+    from okto_grafx import connect
+
+    path = tmp_path / "mixed-codecs"
+    with connect(path, codec="pure", vector_math="pure") as reference:
+        with reference.begin("write") as writer:
+            writer.execute("CREATE NODE TABLE T(id INT64, value INT64, PRIMARY KEY(id))")
+            writer.execute("CREATE (:T {id:1, value:10})")
+        with reference.begin("read") as snapshot, connect(path) as accelerated:
+            assert snapshot.execute("MATCH (n:T) RETURN n.value").rows == ((10,),)
+            with accelerated.begin("write") as writer:
+                writer.execute("MATCH (n:T {id:1}) SET n.value=20")
+            assert snapshot.execute("MATCH (n:T) RETURN n.value").rows == ((10,),)
+            assert accelerated.execute("MATCH (n:T) RETURN n.value").rows == ((20,),)
+    with connect(path, codec="pure", vector_math="pure") as reopened:
+        assert reopened.execute("MATCH (n:T) RETURN n.value").rows == ((20,),)
+        assert reopened.verify("all").findings == ()
 
 
 def test_the_local_storage_descriptor_budget_comes_from_database_config(
@@ -301,7 +335,7 @@ def test_a_huge_finite_section_timeout_is_supported_without_numeric_overflow() -
     database.close()
 
 
-def test_custom_registry_does_not_disable_the_process_global_checksum_selector(
+def test_custom_registry_does_not_disable_the_explicit_checksum_selector(
     complete_registry: PortRegistry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     observed: list[str] = []

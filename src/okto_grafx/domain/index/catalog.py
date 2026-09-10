@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from okto_grafx.domain.errors import GrafxIndexError
+from okto_grafx.domain.index.fulltext import decode_options, is_fulltext
 from okto_grafx.domain.index.definition import (
     COLUMN_KEY_DERIVATION,
     ORDERED_KEY_DERIVATION,
@@ -289,7 +290,7 @@ class CatalogIndexDefinition:
                 value=visibility.value,
                 index=self.name,
             )
-        if self.key_derivation not in {
+        if not is_fulltext(self.key_derivation) and self.key_derivation not in {
             COLUMN_KEY_DERIVATION,
             RECORD_ID_KEY_DERIVATION,
             ORDERED_KEY_DERIVATION,
@@ -301,6 +302,14 @@ class CatalogIndexDefinition:
                 value=self.key_derivation,
                 index=self.name,
             )
+        if is_fulltext(self.key_derivation):
+            options = decode_options(self.key_derivation)
+            if self.automatic or layout is not IndexLayout.HASH or len(options.field_weights) != len(self.positions):
+                raise GrafxIndexError("Invalid full-text catalog definition.", field="definition")
+        if layout is IndexLayout.SPARSE_HASH and (
+            self.automatic or self.key_derivation != COLUMN_KEY_DERIVATION
+        ):
+            raise GrafxIndexError("Sparse hash requires an explicit property index.", field="layout")
         if layout is IndexLayout.ORDERED:
             if self.key_derivation != ORDERED_KEY_DERIVATION:
                 raise GrafxIndexError(

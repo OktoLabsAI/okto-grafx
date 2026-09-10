@@ -712,8 +712,8 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "unsupported_operation": 4,
     }
 
-    assert frozen["counts"]["classification:already_supported"] == 82
-    assert frozen["counts"]["classification:generic_gap"] == 13
+    assert frozen["counts"]["classification:already_supported"] == 83
+    assert frozen["counts"]["classification:generic_gap"] == 12
 
 
 def test_every_raw_probe_has_one_contract_and_engine_verdict(frozen: dict) -> None:

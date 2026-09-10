@@ -1521,6 +1521,12 @@ class _Analyzer:
     def _check_call(self, call: FunctionCall, *, where: str) -> None:
         """Check one function call: aggregate nesting, the star form and the two extensions."""
         name = call.name.upper()
+        if name == "UDF":
+            if call.star or call.distinct or call.named_arguments or not 1 <= len(call.arguments) <= 33:
+                raise self._refuse("udf(name, ...) needs 1..33 positional arguments.", field="function", value=call.name)
+            if not isinstance(call.arguments[0], Literal) or type(call.arguments[0].value) is not str:
+                raise self._refuse("udf needs a literal registered name.", field="function", value=call.name)
+            return
         if is_aggregate(call):
             if call.star and name != "COUNT":
                 raise self._refuse(

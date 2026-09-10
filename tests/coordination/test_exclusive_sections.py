@@ -539,6 +539,30 @@ def test_a_replaced_lock_file_is_never_locked_through_the_old_descriptor(
     assert counters["proved"] == 1
 
 
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name != "nt", reason="Windows denies unlink of the parked open lock file.")
+def test_windows_preserves_the_lock_file_while_its_descriptor_is_parked(
+    make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Windows counterpart of replacement detection proves OS-enforced identity stability."""
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    counters, _ = _count_probes(monkeypatch)
+    directory = coordinator._lock_directory
+    assert directory is not None
+    path = os.path.join(directory, f"commit{coordination_local.LOCK_FILE_SUFFIX}")
+    with coordinator._reuse_revalidated_unlocked_section_descriptor("commit"):
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+        before = os.stat(path)
+        with pytest.raises(PermissionError):
+            os.unlink(path)
+        assert os.stat(path).st_ino == before.st_ino
+        with coordinator.exclusive("commit", timeout=1.0):
+            pass
+    assert counters["opened"] == 1
+    assert counters["proved"] == 1
+
+
 def test_a_failed_identity_proof_releases_the_borrow_and_the_descriptor(
     make_coordinator: CoordinatorFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:

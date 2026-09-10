@@ -64,8 +64,8 @@ def test_defaults_match_the_contract() -> None:
     assert config.metrics == "noop"
     assert config.metrics_destination is None
     assert config.allow_remote_metrics is False
-    assert config.codec == "pure"
-    assert config.vector_math == "auto"
+    assert config.codec == "numpy"
+    assert config.vector_math == "numpy"
     assert config.vector_exact_scan_threshold == 4096
     assert config.vector_ef_search == 320
     assert "vector_recall_target" not in {

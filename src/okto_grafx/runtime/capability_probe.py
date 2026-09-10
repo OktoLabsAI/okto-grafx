@@ -25,3 +25,5 @@ def port_has_attribute(instance: object, name: str) -> bool:
         except AttributeError:
             return False
     return True
+
+__all__ = ["port_has_attribute"]

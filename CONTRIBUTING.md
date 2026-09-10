@@ -27,6 +27,13 @@ with one reachable implementation is an unmeasured surface however green the sui
 
 Run a slice while iterating:
 
+The full Pulse corpus check also needs local checkouts with HEAD exactly at Community commit
+`befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595` and Core commit
+`f602c7cc2f6a9f5ef446d4c991309196bd4667c7`. Set `PULSE_COMMUNITY_BASELINE` and
+`PULSE_CORE_BASELINE` to those repositories if the documented sibling names are
+not present. The freezer verifies HEAD and reads pinned Git objects; do not replace these references
+with current source or skip the corpus to produce a green full regression.
+
 ```bash
 pytest tests/query -q
 pytest tests/txn/test_chain_relink_regressions.py -q

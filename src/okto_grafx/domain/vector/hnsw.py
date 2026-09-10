@@ -439,6 +439,9 @@ class HnswGraph:
         query: Sequence[float],
         ef: int,
         admits: Callable[[int], bool] | None = None,
+        *,
+        check: Callable[[], None] | None = None,
+        observe: Callable[[int], None] | None = None,
     ) -> tuple[tuple[tuple[float, int], ...], TraversalStats]:
         """Return the best admitted nodes for a query, with what the traversal did to find them.
 
@@ -447,17 +450,29 @@ class HnswGraph:
         construction uses.
         """
         _require_positive("ef", ef)
+        if check is not None:
+            check()
         if self._entry_point is None:
             return (), TraversalStats(
                 visited=0, bridges=0, admitted=0, hops=0, exhaustive=True
             )
         scorer = self._scorer(tuple(float(component) for component in query))
+        if check is not None:
+            original_scorer = scorer
+
+            def scorer(node: int) -> float:
+                """Check read control before each distance evaluation, without changing math."""
+                check()
+                return original_scorer(node)
         current = self._entry_point
         hops = 0
         for layer in range(self._top_level, 0, -1):
             current, layer_hops = self._descend_counted(scorer, current, layer)
             hops += layer_hops
-        ranked, stats = self._search_layer_counted(scorer, (current,), ef, 0, admits)
+        ranked, stats = (
+            self._search_layer_counted(scorer, (current,), ef, 0, admits) if observe is None else
+            self._search_layer_counted(scorer, (current,), ef, 0, admits, observe=observe)
+        )
         return ranked, TraversalStats(
             visited=stats.visited,
             bridges=stats.bridges,
@@ -531,6 +546,7 @@ class HnswGraph:
             measured, cached = self._prepare_cosine_with_norm(query)
 
             def cosine(node: int) -> float:
+                """Compute cosine similarity using the retained query or candidate norm when available."""
                 stored = self._values[node]
                 retained = self._norms.get(node)
                 if retained is not None and retained[0] is stored:
@@ -760,6 +776,8 @@ class HnswGraph:
         ef: int,
         layer: int,
         admits: Callable[[int], bool] | None,
+        *,
+        observe: Callable[[int], None] | None = None,
     ) -> tuple[tuple[tuple[float, int], ...], TraversalStats]:
         """Run one beam search, evaluating the predicate during expansion (the ACORN rule).
 
@@ -793,7 +811,7 @@ class HnswGraph:
             admits is not None or ef >= node_count
         ):
             return self._search_layer_counted_heap(
-                scorer, entry_points, ef, layer, admits
+                scorer, entry_points, ef, layer, admits, observe=observe
             )
 
         visited: set[int] = set()
@@ -812,6 +830,8 @@ class HnswGraph:
             else:
                 bridges += 1
         while beam:
+            if observe is not None:
+                observe(len(visited) * 96 + len(beam) * 128 + len(results) * 64)
             score, node = beam.pop(0)
             if len(results) >= ef and score < results[-1][0]:
                 break
@@ -842,6 +862,8 @@ class HnswGraph:
         ef: int,
         layer: int,
         admits: Callable[[int], bool] | None,
+        *,
+        observe: Callable[[int], None] | None = None,
     ) -> tuple[tuple[tuple[float, int], ...], TraversalStats]:
         """Run the same beam search with a heap only for predictably wide frontiers.
 
@@ -870,6 +892,8 @@ class HnswGraph:
             else:
                 bridges += 1
         while beam:
+            if observe is not None:
+                observe(len(visited) * 96 + len(beam) * 128 + len(results) * 64)
             _priority, node, score = heappop(beam)
             if len(results) >= ef and score < results[-1][0]:
                 break

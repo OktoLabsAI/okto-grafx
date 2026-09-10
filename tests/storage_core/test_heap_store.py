@@ -485,6 +485,9 @@ def test_committed_high_water_observes_stamps_without_materializing_headers(
     monkeypatch.setattr(RecordHeader, "__init__", counted)
 
     assert heap_store.committed_high_water(person_table) == 17
+    assert heap_store.committed_high_water(person_table, through_lsn=15) == 11
+    assert heap_store.committed_high_water(person_table, through_lsn=9) == 5
+    assert heap_store.committed_high_water(person_table, through_lsn=4) == 0
     assert constructions == [], (
         "the watermark needs only the three fields exposed by peek"
     )
@@ -3438,7 +3441,7 @@ def test_vacuum_limit_is_deterministic_and_reports_an_incomplete_pass(
         assert not page.is_slot_free(middle.slot)
 
 
-def test_vacuum_v1_reports_but_does_not_reclaim_overflow_history(
+def test_vacuum_retires_overflow_history_with_detached_images(
     pool: BufferPool,
     heap_store: HeapStore,
     catalog_store: CatalogStore,
@@ -3457,10 +3460,13 @@ def test_vacuum_v1_reports_but_does_not_reclaim_overflow_history(
     plan = heap_store.plan_vacuum((person_table,), 3)
 
     assert plan.complete is True
-    assert plan.page_images == ()
+    assert plan.page_images
     assert plan.tables[0].eligible_inline_versions == 0
-    assert plan.tables[0].reclaimed_versions == 0
-    assert plan.tables[0].skipped_overflow_versions == 1
+    assert plan.tables[0].eligible_overflow_versions == 1
+    assert plan.tables[0].reclaimed_versions == 1
+    assert plan.tables[0].reclaimed_overflow_pages > 0
+    assert plan.tables[0].skipped_overflow_versions == 0
+    # Planning itself is non-mutating; retirement happens only through WAL/apply.
     assert heap_store.read(old).values[1].startswith("x")
 
 

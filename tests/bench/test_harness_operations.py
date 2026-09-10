@@ -80,7 +80,7 @@ def test_nothing_at_the_repository_root_can_reach_the_wheel() -> None:
     manifest = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     discovery = manifest["tool"]["setuptools"]["packages"]["find"]
     assert discovery["where"] == ["src"]
-    assert discovery["include"] == ["okto_grafx*"]
+    assert discovery["include"] == ["okto_grafx", "okto_grafx.*"]
     assert (PROJECT_ROOT / "bench").is_dir(), "the exclusion is only evidence if bench exists"
     assert not (PROJECT_ROOT / "src" / "okto_grafx" / "bench").exists()
 

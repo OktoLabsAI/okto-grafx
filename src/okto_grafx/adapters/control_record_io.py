@@ -23,3 +23,5 @@ def read_control_if_exists(
     if not storage.exists(file):
         return None
     return storage.read_log(file, offset, length)
+
+__all__ = ["read_control_if_exists"]

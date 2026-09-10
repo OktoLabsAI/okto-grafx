@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import fields
+from typing import Unpack, cast
 
 from okto_grafx.api.assembly import assemble_database
+from okto_grafx.api.options import ConnectOptions
+from okto_grafx.domain.query.extensions import ExtensionRegistry
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxError
 from okto_grafx.engine.database import (
     Database,
@@ -37,6 +40,7 @@ from okto_grafx.runtime.config import DatabaseConfig
 from okto_grafx.runtime.registry import PortRegistry
 
 __all__ = [
+    "ConnectOptions",
     "Database",
     "DatabaseConfig",
     "DatabaseIdentity",
@@ -57,7 +61,8 @@ def connect(
     path: str | os.PathLike[str],
     *,
     registry: PortRegistry | None = None,
-    **options: object,
+    extensions: ExtensionRegistry | None = None,
+    **options: Unpack[ConnectOptions],
 ) -> Database:
     """Open the database at ``path``, creating it when it does not exist yet (SPEC-M1 FR-1).
 
@@ -85,8 +90,12 @@ def connect(
     returned object is a context manager, and closing it releases the lease, the reader
     registrations and everything else this call opened.
     """
-    config = _configure(path, options)
-    return open_database(config, registry=registry)
+    if extensions is not None and type(extensions) is not ExtensionRegistry:
+        raise GrafxConfigurationError("extensions must be an exact ExtensionRegistry.", field="extensions")
+    config = _configure(path, cast(dict[str, object], options))
+    database = open_database(config, registry=registry)
+    database._queries._extensions = extensions
+    return database
 
 
 def _configure(

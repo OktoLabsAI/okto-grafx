@@ -76,10 +76,14 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
+    GrafxQueryBudgetExceeded,
+    GrafxQueryCancelled,
+    GrafxQueryDeadlineExceeded,
     GrafxUnsupportedOperation,
     GrafxVectorValidationError,
 )
 from okto_grafx.domain.ids import NO_LSN, Csn, Lsn, RecordId, RecordRef
+from okto_grafx.domain.query.control import _ReadControl
 from okto_grafx.domain.index.definition import (
     IndexDefinition,
     index_definition_matches_table,
@@ -136,6 +140,10 @@ from okto_grafx.engine.index_manager import (
     StagingTransaction,
 )
 from okto_grafx.engine.metrics_catalog import MetricEmitter, metric
+from okto_grafx.engine.vector_memory import (
+    VectorMemoryUsage, picture_tariff, require_picture_budget, require_reservation, work_tariff,
+    VectorTotalMemoryUsage, _PictureBudget, _PictureReservation,
+)
 
 __all__ = [
     "DEFAULT_INDEX_SEED",
@@ -579,6 +587,7 @@ class _GraphSnapshot:
     entry_of_node: dict[int, IndexEntry]
     record_of_node: dict[int, RecordId]
     mark: Lsn
+    reservation: _PictureReservation | None = None
 
     def certified(self, mark: Lsn) -> _GraphSnapshot:
         """Return this same picture -- same graph, same maps -- carrying a newer mark."""
@@ -588,6 +597,7 @@ class _GraphSnapshot:
             entry_of_node=self.entry_of_node,
             record_of_node=self.record_of_node,
             mark=mark,
+            reservation=self.reservation,
         )
 
 
@@ -628,6 +638,11 @@ class VectorHnswIndex(ProximityIndex):
         "_graph_generation",
         "_building",
         "_builder",
+        "_hnsw_memory_budget_bytes",
+        "_memory_peak",
+        "_memory_refusals",
+        "_memory_retirements",
+        "_aggregate_memory",
     )
 
     def __init__(
@@ -651,6 +666,8 @@ class VectorHnswIndex(ProximityIndex):
         _compact_vectors: bool = False,
         guard: GraphGuard | None = None,
         refresh: Callable[[str, object], None] | None = None,
+        hnsw_memory_budget_bytes: int | None = None,
+        _aggregate_memory: _PictureBudget | None = None,
     ) -> None:
         """Build the index of one embedding space over one paged store.
 
@@ -658,6 +675,11 @@ class VectorHnswIndex(ProximityIndex):
         without one the index is fit for a single thread only.
         """
         search_width = _require_ef_search(ef_search)
+        self._hnsw_memory_budget_bytes = require_picture_budget(hnsw_memory_budget_bytes)
+        self._memory_peak = 0
+        self._memory_refusals = 0
+        self._memory_retirements = 0
+        self._aggregate_memory = _aggregate_memory
         super().__init__(definition, pool, metrics)  # type: ignore[arg-type]
         self._space_id = space_id
         self._space_name = space_name
@@ -973,7 +995,26 @@ class VectorHnswIndex(ProximityIndex):
         """Return the graph of the current picture, building one when there is none or it is behind."""
         return self.snapshot().graph
 
-    def snapshot(self) -> _GraphSnapshot:
+    def memory_usage(self) -> VectorMemoryUsage:
+        """Observe this local cache without building it or reading its index pages."""
+        with self._guard:
+            count = 0 if self._snapshot is None else len(self._snapshot.entry_of_node)
+            return VectorMemoryUsage(
+                self._space_name, self._hnsw_memory_budget_bytes, count,
+                0 if self._snapshot is None else picture_tariff(count, self._dimension, self._neighbours),
+                self._memory_peak, self._memory_refusals, self._memory_retirements,
+            )
+
+    def _reserve_picture(self, count: int, *, cold: bool) -> None:
+        """Check a complete picture/work reservation without storage access."""
+        amount = work_tariff(count, self._dimension, self._neighbours, self._ef_construction, cold=cold)
+        with self._guard:
+            self._memory_peak = max(self._memory_peak, amount)
+            if self._hnsw_memory_budget_bytes is not None and amount > self._hnsw_memory_budget_bytes:
+                self._memory_refusals += 1
+        require_reservation(amount, self._hnsw_memory_budget_bytes)
+
+    def snapshot(self, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
         """Return one complete picture of the index as of now, building it when needed.
 
         THE RULE (P0.5). A picture is built in locals and published by ONE reference
@@ -1008,9 +1049,13 @@ class VectorHnswIndex(ProximityIndex):
         """
         token = self._guard.thread_token()
         while True:
+            if check is not None:
+                check()
             owner = False
             waited = 0
             while True:
+                if check is not None:
+                    check()
                 header = self.built_through_lsn
                 with self._guard:
                     current = self._snapshot
@@ -1041,7 +1086,8 @@ class VectorHnswIndex(ProximityIndex):
                         generation = self._graph_generation
                         break
             try:
-                built = self._catch_up(self._build(header))
+                built = (self._catch_up(self._build(header)) if check is None else
+                         self._catch_up(self._build(header, check=check), check=check))
             except BaseException:
                 # A build that does not finish leaves NOTHING behind -- and takes nothing away.
                 # Its locals go with this frame; the published picture, which may be another
@@ -1071,7 +1117,7 @@ class VectorHnswIndex(ProximityIndex):
             if not superseded:
                 return built
 
-    def _catch_up(self, picture: _GraphSnapshot) -> _GraphSnapshot:
+    def _catch_up(self, picture: _GraphSnapshot, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
         """Replace a not-yet-published picture that the store moved under with a fresh build.
 
         The walk that fed the build is a moment in the past. A commit that landed after it is in
@@ -1091,10 +1137,12 @@ class VectorHnswIndex(ProximityIndex):
         rebuilds; never a certification the build did not verify.
         """
         for _pass in range(_BUILD_CATCH_UP_PASSES):
+            if check is not None:
+                check()
             header = self.built_through_lsn
             if header == picture.mark:
                 return picture
-            picture = self._build(header)
+            picture = self._build(header) if check is None else self._build(header, check=check)
         return picture
 
     def _release_build(self) -> None:
@@ -1104,7 +1152,19 @@ class VectorHnswIndex(ProximityIndex):
             self._builder = None
             self._guard.notify_all()
 
-    def _build(self, mark: Lsn) -> _GraphSnapshot:
+    def _build(self, mark: Lsn, *, check: Callable[[], None] | None = None) -> _GraphSnapshot:
+        """Reserve aggregate header/work capacity before retaining build inputs."""
+        reservation = (None if self._aggregate_memory is None else
+                       self._aggregate_memory.claim(self._hnsw_memory_budget_bytes))
+        try:
+            return self._build_reserved(mark, check=check, reservation=reservation)
+        except BaseException:
+            if reservation is not None:
+                reservation.release()
+            raise
+
+    def _build_reserved(self, mark: Lsn, *, check: Callable[[], None] | None,
+                        reservation: _PictureReservation | None) -> _GraphSnapshot:
         """Build a complete picture in locals over the entries the store holds, marked at ``mark``.
 
         A tombstoned entry is inserted with the live ones: it must not be RETURNED, and it must
@@ -1112,6 +1172,34 @@ class VectorHnswIndex(ProximityIndex):
         rule the ACORN traversal applies to a filtered node. Every refusal on the way in
         propagates, and the caller drops the picture with the frame.
         """
+        self._reserve_picture(0, cold=True)
+        ceiling = self._hnsw_memory_budget_bytes
+        if reservation is not None:
+            ceiling = reservation.amount
+            base = work_tariff(0, self._dimension, self._neighbours, self._ef_construction, cold=True)
+            reservation.resize(base) if base > ceiling else None
+        if ceiling is None:
+            captured = self._entry_headers()
+        else:
+            base = work_tariff(0, self._dimension, self._neighbours, self._ef_construction, cold=True)
+            per_entry = work_tariff(1, self._dimension, self._neighbours, self._ef_construction, cold=True) - base
+            max_entries = (ceiling - base) // per_entry
+            try:
+                captured = self._entry_headers(max_entries=max_entries)
+            except GrafxQueryBudgetExceeded as failure:
+                if failure.details.get("resource") != "index_entry_headers":
+                    raise
+                self._reserve_picture(max_entries + 1, cold=True)
+                if reservation is not None:
+                    reservation.resize(work_tariff(max_entries + 1, self._dimension,
+                                       self._neighbours, self._ef_construction, cold=True))
+                raise
+        self._reserve_picture(len(captured), cold=True)
+        if reservation is not None:
+            reservation.resize(work_tariff(len(captured), self._dimension,
+                               self._neighbours, self._ef_construction, cold=True))
+        headers = sorted(captured, key=lambda item: (item.born_csn, item.encoded_ref))
+        del captured
         picture = _GraphSnapshot(
             graph=HnswGraph(
                 self._math,
@@ -1137,12 +1225,12 @@ class VectorHnswIndex(ProximityIndex):
             entry_of_node={},
             record_of_node={},
             mark=mark,
+            reservation=reservation,
         )
         try:
-            for header in sorted(
-                self._entry_headers(),
-                key=lambda item: (item.born_csn, item.encoded_ref),
-            ):
+            for header in headers:
+                if check is not None:
+                    check()
                 # The header walk has already validated every persisted image before this first
                 # fallible heap/vector operation.  Construct the final graph-owned DTO once,
                 # with its physical location, instead of decode + ``located_at`` constructing it
@@ -1163,6 +1251,8 @@ class VectorHnswIndex(ProximityIndex):
             # Success publishes no duplicate score residency; failure discards the local graph
             # and also drops the potentially large transient cache before propagating.
             picture.graph._finish_construction()
+        if reservation is not None:
+            reservation.resize(picture_tariff(len(picture.entry_of_node), self._dimension, self._neighbours))
         return picture
 
     def _retire(self, picture: _GraphSnapshot) -> None:
@@ -1213,6 +1303,11 @@ class VectorHnswIndex(ProximityIndex):
         self, picture: _GraphSnapshot, entry: IndexEntry, identity: tuple[bytes, int]
     ) -> None:
         """Resolve, check and insert one entry that the picture does not hold yet."""
+        self._reserve_picture(len(picture.entry_of_node) + 1, cold=False)
+        if picture.reservation is not None:
+            picture.reservation.resize(max(picture.reservation.amount,
+                work_tariff(len(picture.entry_of_node) + 1, self._dimension,
+                            self._neighbours, self._ef_construction, cold=False)))
         try:
             resolved = self._resolve(entry.ref)
         except GrafxError as failure:
@@ -1307,10 +1402,21 @@ class VectorHnswIndex(ProximityIndex):
                             born_csn=change.csn,
                         ),
                     )
+                except GrafxQueryBudgetExceeded as failure:
+                    self._retire(picture)
+                    if failure.details.get("resource") not in ("vector_hnsw_memory", "vector_hnsw_total_memory"):
+                        raise
+                    with self._guard:
+                        self._memory_retirements += 1
+                    # The index mutation is already durable. Refuse the next
+                    # ANN build, never the committed write, for cache pressure.
+                    return False
                 except BaseException:
                     self._retire(picture)
                     raise
                 self._adjust_live_count(picture, 1)
+                if picture.reservation is not None:
+                    picture.reservation.resize(picture_tariff(len(picture.entry_of_node), self._dimension, self._neighbours))
             return True
         if node is None:
             return True
@@ -1439,6 +1545,8 @@ class VectorHnswIndex(ProximityIndex):
         *,
         ef: int | None = None,
         entry_admits: Callable[[RecordId, RecordRef], bool] | None = None,
+        check: Callable[[], None] | None = None,
+        observe: Callable[[int], None] | None = None,
     ) -> tuple[tuple[ScoredEntry, ...], TraversalStats]:
         """Return the best visible, admitted versions for a query, with traversal statistics.
 
@@ -1478,7 +1586,7 @@ class VectorHnswIndex(ProximityIndex):
             # The picture this search answers from is fixed HERE, by one capture. A commit on
             # another thread may retire or replace the published picture while the traversal
             # runs; the outer certificate rejects it if a foreign durable generation changed.
-            picture = self.snapshot()
+            picture = self.snapshot() if check is None else self.snapshot(check=check)
             entries = picture.entry_of_node
             records = picture.record_of_node
 
@@ -1494,7 +1602,10 @@ class VectorHnswIndex(ProximityIndex):
                     return bool(entry_admits(record, entry.ref))
                 return admits is None or bool(admits(record))
 
-            ranked, stats = picture.graph.search(query, width, visible_and_admitted)
+            ranked, stats = (
+                picture.graph.search(query, width, visible_and_admitted) if check is None and observe is None else
+                picture.graph.search(query, width, visible_and_admitted, check=check, observe=observe)
+            )
             scored = [
                 ScoredEntry(entry=entries[node], record_id=records[node], score=score)
                 for score, node in ranked
@@ -1510,6 +1621,26 @@ class VectorHnswIndex(ProximityIndex):
             f"VectorHnswIndex(name={self.name!r}, space={self._space_name!r}, "
             f"stale={self.stale})"
         )
+
+
+class _CheckedCandidates(Sequence):
+    """A borrowed candidate sequence checking before each native math observation."""
+
+    def __init__(self, values: Sequence[tuple[int, Sequence[float]]], check: Callable[[], None]) -> None:
+        self.values = values
+        self.check = check
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __getitem__(self, index: int) -> tuple[int, Sequence[float]]:
+        self.check()
+        return self.values[index]
+
+    def __iter__(self) -> Iterable[tuple[int, Sequence[float]]]:
+        for value in self.values:
+            self.check()
+            yield value
 
 
 class VectorEngine:
@@ -1544,6 +1675,8 @@ class VectorEngine:
         "_guard",
         "_catalog_changes_are_wal_logged",
         "_candidate_filter_seal",
+        "_hnsw_memory_budget_bytes",
+        "_aggregate_memory",
     )
 
     def __init__(
@@ -1564,6 +1697,8 @@ class VectorEngine:
         ef_search: int = DEFAULT_EF_SEARCH,
         guard: GraphGuard | None = None,
         catalog_changes_are_wal_logged: bool = False,
+        hnsw_memory_budget_bytes: int | None = None,
+        hnsw_total_memory_budget_bytes: int | None = None,
     ) -> None:
         """Build the engine over one catalog, one heap and one index registry.
 
@@ -1615,6 +1750,15 @@ class VectorEngine:
             )
         self._catalog_changes_are_wal_logged = catalog_changes_are_wal_logged
         self._candidate_filter_seal = object()
+        self._hnsw_memory_budget_bytes = require_picture_budget(hnsw_memory_budget_bytes)
+        total = require_picture_budget(hnsw_total_memory_budget_bytes)
+        self._aggregate_memory = (None if total is None else
+            _PictureBudget(total, _UnguardedBuild() if guard is None else guard))
+
+    def total_memory_usage(self) -> VectorTotalMemoryUsage:
+        """Copy optional aggregate reservations without touching storage."""
+        return (VectorTotalMemoryUsage(None, 0, 0, 0, 0) if self._aggregate_memory is None
+                else self._aggregate_memory.usage())
 
     # --- spaces -------------------------------------------------------------------------------
 
@@ -1840,6 +1984,8 @@ class VectorEngine:
             _compact_vectors=self._math.name == "numpy",
             guard=self._guard,
             refresh=self._refresh_heap_view,
+            hnsw_memory_budget_bytes=self._hnsw_memory_budget_bytes,
+            _aggregate_memory=self._aggregate_memory,
         )
         complete_through = (
             registry.published_lsn
@@ -2649,6 +2795,8 @@ class VectorEngine:
         k: int,
         snapshot: SnapshotLike,
         candidate_filter: CandidateFilter | None = None,
+        _control: _ReadControl | None = None,
+        _memory: Callable[[int], None] | None = None,
     ) -> VectorSearchResult:
         """Return the nearest neighbours of a query inside one embedding space.
 
@@ -2661,6 +2809,8 @@ class VectorEngine:
         estimate, and this is the estimate that describes the work: an exact scan reads every
         entry and discards the ones the snapshot cannot see.
         """
+        if _control is not None:
+            _control.check()
         started = self._reading()
         definition = self._catalog.catalog.space(space)
         _require_positive_k(k)
@@ -2687,11 +2837,17 @@ class VectorEngine:
                 snapshot,
                 candidate_filter,
                 space_size=space_size,
+                control=_control,
+                memory=_memory,
             )
         else:
             hits = self._search_approximately(
-                definition, index, components, k, snapshot, candidate_filter
+                definition, index, components, k, snapshot, candidate_filter,
+                control=_control,
+                memory=_memory,
             )
+        if _control is not None:
+            _control.check()
         self._publish_search_metrics(plan, len(hits))
         return VectorSearchResult(
             hits=hits,
@@ -2701,6 +2857,14 @@ class VectorEngine:
             space=definition.name,
             filter_cardinality=plan.filter_cardinality,
         )
+
+    def search_controlled(self, *, space: str, query: Sequence[float], k: int,
+                          snapshot: SnapshotLike, candidate_filter: CandidateFilter | None = None,
+                          control: _ReadControl | None,
+                          memory: Callable[[int], None] | None = None) -> VectorSearchResult:
+        """Explicit collaborator capability; ordinary search keeps its existing contract."""
+        return self.search(space=space, query=query, k=k, snapshot=snapshot,
+                           candidate_filter=candidate_filter, _control=control, _memory=memory)
 
     def _require_committed_search_index(
         self, index: VectorHnswIndex, space: EmbeddingSpaceDef
@@ -2728,6 +2892,8 @@ class VectorEngine:
         candidate_filter: CandidateFilter | None,
         *,
         space_size: int,
+        control: _ReadControl | None = None,
+        memory: Callable[[int], None] | None = None,
     ) -> tuple[VectorHit, ...]:
         """Scan the filtered set against the heap, which is the authority on what exists.
 
@@ -2759,6 +2925,11 @@ class VectorEngine:
                     return admits is None or admits(record_id)
 
                 for ref in index._entry_refs_from_headers():
+                    if control is not None:
+                        control.check()
+                    if memory is not None:
+                        memory((len(candidates) + 1) * (256 + 32 * len(query)) +
+                               (len(scanned) + 1) * 64 + k * 128)
                     # Two entries may name one heap location -- an entry filed under a key the
                     # row no longer carries sits beside the matching one. Deduplicate locations;
                     # two DISTINCT visible locations for one record remain a refusal below.
@@ -2795,6 +2966,11 @@ class VectorEngine:
                 index_witnesses: list[tuple[bytes, RecordRef]] = []
                 try:
                     for expected_record_id, ref in witnesses:
+                        if control is not None:
+                            control.check()
+                        if memory is not None:
+                            memory((len(candidates) + 1) * (384 + 32 * len(query)) +
+                                   len(witnesses) * 128 + k * 128)
 
                         def wanted(record_id: int, xmin: int, xmax: int) -> bool:
                             """Accept only this visible physical identity from its heap header."""
@@ -2824,7 +3000,8 @@ class VectorEngine:
                         index_witnesses
                     ):
                         return None
-                except GrafxCorruptionDetected:
+                except (GrafxCorruptionDetected, GrafxQueryBudgetExceeded,
+                        GrafxQueryCancelled, GrafxQueryDeadlineExceeded):
                     # A selected heap ref or bucket was actually read and found corrupt. Hiding
                     # that finding behind a successful fallback would make selective search a
                     # corruption mask, so the located diagnostic remains authoritative.
@@ -2833,6 +3010,8 @@ class VectorEngine:
                     # NULL/malformed vectors, absent rows and other incomplete proofs do not
                     # invent a result. The unchanged canonical scan owns their observable
                     # outcome and error ordering.
+                    if control is not None:
+                        control.check()
                     return None
                 return candidates, location
 
@@ -2848,7 +3027,10 @@ class VectorEngine:
             self._observe_phase(REGIME_EXACT, PHASE_TRAVERSE, started)
             started = self._reading()
             ranked = (
-                self._math.top_k(query, candidates, k, space.metric)
+                self._math.top_k(
+                    query, candidates if control is None else _CheckedCandidates(candidates, control.check),
+                    k, space.metric,
+                )
                 if candidates
                 else []
             )
@@ -2875,6 +3057,9 @@ class VectorEngine:
         k: int,
         snapshot: SnapshotLike,
         candidate_filter: CandidateFilter | None,
+        *,
+        control: _ReadControl | None = None,
+        memory: Callable[[int], None] | None = None,
     ) -> tuple[VectorHit, ...]:
         """Traverse the versioned index, evaluating the filter during navigation."""
         started = self._reading()
@@ -2884,7 +3069,13 @@ class VectorEngine:
             else None
         )
         admits = None if entry_admits is not None else _guarded_admits(candidate_filter)
-        if entry_admits is None:
+        if control is not None or memory is not None:
+            scored, _stats = index.search(
+                query, k, snapshot, admits, entry_admits=entry_admits,
+                check=None if control is None else control.check,
+                observe=memory,
+            )
+        elif entry_admits is None:
             # Preserve the established positional call for subclasses/adapters implementing the
             # original VectorHnswIndex.search seam. Only the private filtered path opts into the
             # new ref-aware keyword.

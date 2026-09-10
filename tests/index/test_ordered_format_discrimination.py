@@ -231,7 +231,7 @@ def test_header_refuses_unknown_layout_and_future_writes() -> None:
             table_id=7,
             bucket_count=1,
             digest=_DIGEST,
-            format_version=ORDERED_INDEX_HEADER_FORMAT_VERSION + 1,
+            format_version=5,
         )
 
     with pytest.raises(GrafxIndexError):

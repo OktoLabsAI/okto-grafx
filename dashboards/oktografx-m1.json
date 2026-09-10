@@ -1465,6 +1465,21 @@
         {"refId": "C", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "sum(rate(oktografx_descriptor_cache_evictions_total[5m]))", "legendFormat": "evictions/s", "range": true}
       ]
     }
+    ,{
+      "id": 32,
+      "type": "timeseries",
+      "title": "Acknowledged commit provenance",
+      "description": "Local acknowledgements only; sequence is not a timestamp or a global cross-database order. No metadata payload is exported.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 110},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"refId": "A", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "rate(oktografx_commits_with_metadata_total[5m])", "legendFormat": "metadata commits/s", "range": true},
+        {"refId": "B", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "rate(oktografx_commit_metadata_bytes_total[5m])", "legendFormat": "metadata bytes/s", "range": true},
+        {"refId": "C", "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "editorMode": "code", "expr": "oktografx_commit_id_high_watermark_count", "legendFormat": "tracked commit sequence", "range": true}
+      ]
+    }
   ],
   "refresh": "30s",
   "schemaVersion": 39,

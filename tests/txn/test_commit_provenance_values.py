@@ -298,8 +298,8 @@ def test_unsupported_subclasses_do_not_run_host_hooks() -> None:
         CommitId(STORE, HostileInt(1))
 
 
-def test_admission_slice_is_not_an_inert_public_capability() -> None:
+def test_completed_native_admission_values_are_public_reexports() -> None:
     import okto_grafx
 
-    assert not hasattr(okto_grafx, "CommitMetadata")
-    assert not hasattr(okto_grafx, "CommitId")
+    assert okto_grafx.CommitMetadata is CommitMetadata
+    assert okto_grafx.CommitId is CommitId

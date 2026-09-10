@@ -1,5 +1,10 @@
 # Query language reference
 
+The closed read-only `CALL grafx.search_text(index, query, k [, record_ids])`
+procedure is supported through materialized `execute`; see [FTS procedure syntax](FULL_TEXT_SEARCH.md#procedure-query).
+This does not enable arbitrary CALL/YIELD, suffix composition, cursor/explain support
+or textual full-text DDL. Use `Database.create_text_index` to create FTS indexes.
+
 [Documentation index](README.md) · [Python API](API_REFERENCE.md)
 
 
@@ -70,6 +75,13 @@ Graph row projections are backend-specific detached values. Prefer explicit scal
 property projections for stable integrations. Do not assume `uuid.UUID` or
 `datetime.datetime` is automatically accepted in place of Grafx wrappers.
 
+Encapsulated vector write parameters obey the same target-space admission as numeric
+lists: identity, precision, dimension, active state and normalized declaration are
+checked before staging. [Arrow vector interop](EXTENSIONS_AND_ARROW.md#explicit-native-vectors)
+does not bypass those checks. [Detached graph algorithms](GRAPH_PROJECTIONS.md) are
+Python APIs over a captured snapshot, not new Cypher syntax or a relaxation of the
+query-path restrictions above.
+
 `WHERE` retains true predicates; null is not true. `IS NULL`/`IS NOT NULL` test
 null explicitly. Missing properties on polymorphic label-free reads are null;
 incompatible declared property families refuse before streaming. Parameter-map
@@ -93,6 +105,7 @@ not Python coercion of arbitrary objects. Unsupported operators/functions refuse
 | `label(binding)` | One matched node/relationship; physical table name; null propagates; not a logical Pulse relationship type mapper |
 | `timestamp(value)` | Timestamp passthrough, null, or ISO-8601 string normalized to UTC; no zone means UTC; numeric epoch arguments refuse |
 | `similarity(n.embedding, $q, space => 'space')` | Planned vector-search extension, not an arbitrary scalar UDF; literal/bound space, declared vector column and supported query shape required |
+| `udf('app.name', value, ...)` | Optional trusted per-connection scalar registry; literal name, positional exact typed scalars, NULL propagation; [SPI and restrictions](EXTENSIONS_AND_ARROW.md) |
 | `similarity_score()` | Zero arguments; only where a similarity operator has supplied a score |
 | `CASE WHEN ... THEN ... ELSE ... END` / simple CASE | Eager written-expression evaluation, first match, absent ELSE null; scalar-family checks and numeric promotion; do not depend on short-circuiting to hide an invalid expression |
 | `list[index]` | One-based positive index, negative from end; null propagates; zero/out-of-range/noninteger refuses. Not map-key bracket access |

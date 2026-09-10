@@ -74,6 +74,7 @@ class CommitCatalogHead:
 
 @dataclass(frozen=True, slots=True)
 class CommitCatalogPageImage:
+    """Detached journal page image awaiting transactional publication."""
     file: str
     page_index: int
     raw: bytes = field(repr=False)
@@ -120,6 +121,7 @@ class PreparedCommitCatalogAppend:
         candidate = CommitCatalogEntry(identity, captured.timing, captured.metadata_bytes, captured.kind)
 
         def read(file: str, index: int) -> bytes:
+            """Read one page from this operation's selected journal view."""
             try:
                 return self._pages[file, index]
             except KeyError:
@@ -142,6 +144,7 @@ class _DirectoryItem:
     ordered: int
 
     def encode(self) -> bytes:
+        """Encode this directory entry using the fixed-width journal record layout."""
         return _ITEM.pack(self.sequence, self.offset, self.size, 0, self.ordered)
 
 
@@ -371,6 +374,7 @@ class CommitCatalogStore:
         pages: dict[tuple[str, int], bytes] = {}
 
         def read(file: str, index: int) -> bytes:
+            """Read one page from this operation's selected journal view."""
             location = (file, index)
             if location not in pages:
                 pages[location] = self._read_page(file, index)
@@ -515,6 +519,7 @@ class CommitCatalogStore:
         predecessor_pages: dict[tuple[str, int], bytes] = {}
 
         def before_read(file: str, index: int) -> bytes:
+            """Read the predecessor page view used to validate this append."""
             key = (file, index)
             if key not in predecessor_pages:
                 predecessor_pages[key] = self._read_page(file, index)
@@ -526,6 +531,7 @@ class CommitCatalogStore:
             raise _corrupt("published_coverage")
 
         def after_read(file: str, index: int) -> bytes:
+            """Overlay incoming images on the captured predecessor page view."""
             raw = incoming.get((file, index))
             return before_read(file, index) if raw is None else raw
 
@@ -597,6 +603,7 @@ class CommitCatalogStore:
         saved: dict[tuple[str, int], bytes] = {}
 
         def read(file: str, index: int) -> bytes:
+            """Read one page from this operation's selected journal view."""
             key = (file, index)
             if key in incoming:
                 return incoming[key]
@@ -667,6 +674,7 @@ class CommitCatalogStore:
                 virtual[old.file, old.page_index] = old.raw
 
         def before_read(file: str, index: int) -> bytes:
+            """Read the predecessor page view used to validate this append."""
             raw = virtual.get((file, index))
             return read(file, index) if raw is None else raw
 
@@ -727,6 +735,7 @@ class CommitCatalogStore:
         overlay: dict[tuple[str, int], bytes] = {}
 
         def read(file: str, index: int) -> bytes:
+            """Read one page from this operation's selected journal view."""
             raw = overlay.get((file, index))
             return self._read_page(file, index) if raw is None else raw
 
@@ -774,6 +783,7 @@ class CommitCatalogStore:
 
         def canonical(page: Page) -> bytes:
             # Physical publication advances the seqlock without changing content.
+            """Normalize publication-only page state before comparing logical content."""
             page.seq = 0
             return page.to_bytes()
 
@@ -793,6 +803,7 @@ class CommitCatalogStore:
             raise _corrupt("physical_extent")
 
         def check(file: str, index: int, raw: bytes) -> None:
+            """Validate this observation before allowing it to contribute to the result."""
             if type(raw) is not bytes or len(raw) != self._page_size:
                 raise _corrupt("page_size")
             if raw == bytes(self._page_size):
@@ -832,6 +843,7 @@ class CommitCatalogStore:
             projected[file] = max(projected[file], (index + 1) * self._page_size)
 
         def read(file: str, index: int) -> bytes:
+            """Read one page from this operation's selected journal view."""
             raw = latest.get((file, index))
             return self._read_page(file, index) if raw is None else raw
 
@@ -872,6 +884,38 @@ class CommitCatalogStore:
                 hi, upper = middle, item.sequence
         return None
 
+    def history(self, *, after: int, read_lsn: int, limit: int) -> tuple[CommitCatalogEntry, ...]:
+        """Seek once, then read a bounded ascending page in a caller-proved view."""
+        if type(after) is not int or not 0 <= after < PROVISIONAL_CSN:
+            raise _invalid("after")
+        if type(read_lsn) is not int or not 0 <= read_lsn < PROVISIONAL_CSN:
+            raise _invalid("read_lsn")
+        if type(limit) is not int or not 1 <= limit <= 1001:
+            raise _invalid("limit")
+        head = self.read_head()
+        lo, hi = 0, head.entry_count
+        lower, upper = head.activation_sequence, head.last_sequence + 1
+        while lo < hi:
+            middle = (lo + hi) // 2
+            item = self._item(middle, head)
+            if not lower < item.sequence < upper:
+                raise _corrupt("search_order")
+            if item.sequence <= after:
+                lo, lower = middle + 1, item.sequence
+            else:
+                hi, upper = middle, item.sequence
+        output: list[CommitCatalogEntry] = []
+        previous = self._item(lo - 1, head) if lo else None
+        for ordinal in range(lo, min(head.entry_count, lo + limit)):
+            item = self._item(ordinal, head)
+            if previous is not None:
+                self._adjacent(previous, item)
+            if item.sequence > read_lsn:
+                break
+            output.append(self._record(item, head))
+            previous = item
+        return tuple(output)
+
     def validate_published_head(
         self, *, sequence: int, activation_sequence: int,
         file_size: Callable[[str], int],
@@ -894,6 +938,7 @@ class CommitCatalogStore:
         stamps: dict[tuple[str, int], int] = {}
 
         def read(file: str, index: int) -> bytes:
+            """Read one page from this operation's selected journal view."""
             raw = self._read_page(file, index)
             if type(raw) is not bytes or len(raw) != self._page_size:
                 raise _corrupt("page_size")
@@ -956,3 +1001,5 @@ class CommitCatalogStore:
             self._record(item, head)
             previous = item
         return head
+
+__all__ = ["CommitCatalogHead","CommitCatalogPageImage","CommitCatalogPlan","PreparedCommitCatalogAppend","CommitCatalogStore"]

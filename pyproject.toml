@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "okto-grafx"
-version = "0.0.4"
+version = "0.0.5"
 description = "Okto Grafx - embedded graph database for Python: multi-process safe, verifiable on disk, recoverable by construction"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,10 +37,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
-# The core is pure Python and the standard library is its only runtime requirement.
-# Everything optional lives behind an extra below, and nothing is imported unless it
-# was asked for by configuration.
-dependencies = []
+# Accelerators are installed by default; engine mechanisms remain behind ports.
+dependencies = ["numpy>=1.24", "google-crc32c>=1.5"]
 
 [project.urls]
 Homepage = "https://github.com/OktoLabsAI/okto-grafx"
@@ -51,8 +49,11 @@ Changelog = "https://github.com/OktoLabsAI/okto-grafx/blob/main/CHANGELOG.md"
 License = "https://github.com/OktoLabsAI/okto-grafx/blob/main/LICENSE"
 
 [project.optional-dependencies]
-# RECOMMENDED for any real workload. Two accelerators behind ports the engine already
-# declares, and neither one changes an answer:
+arrow = ["pyarrow>=14"]
+pandas = ["pyarrow>=14", "pandas>=2"]
+polars = ["pyarrow>=14", "polars>=1"]
+networkx = ["networkx>=3"]
+# Default accelerators remain behind the existing ports:
 #
 #   google-crc32c - a native CRC-32C. `install_crc32c` replays an acceptance corpus
 #     against the pure-Python reference and REFUSES a candidate that disagrees on any
@@ -62,13 +63,11 @@ License = "https://github.com/OktoLabsAI/okto-grafx/blob/main/LICENSE"
 #     binding decision D5 sets.
 #
 #   numpy - accelerated vector math and an independently selected page codec. Vector
-#     math is selected only by `vector_math="numpy"` and agrees to a stated tolerance.
+#     math defaults to `vector_math="numpy"` and agrees to a stated tolerance.
 #     `codec="numpy"` remains byte-identical to page format v1. Neither selector falls
-#     back silently when the optional dependency is absent.
-accel = [
-    "numpy>=1.24",
-    "google-crc32c>=1.5",
-]
+#     back silently when NumPy is absent. Explicit pure selectors remain available.
+# Backward-compatible extra name: both dependencies now belong to the base install.
+accel = []
 # The side-by-side benchmark harness against the reference engine (the D5 measurements
 # in docs/architecture/COMPONENTS.md). Not needed to run or test Okto Grafx.
 bench = [

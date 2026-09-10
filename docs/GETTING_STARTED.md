@@ -7,7 +7,7 @@
 Use Python 3.11, 3.12 or 3.13 on a local filesystem:
 
 ```sh
-pip install "okto-grafx[accel]"
+pip install okto-grafx
 python -c "import okto_grafx; print(okto_grafx.__version__, okto_grafx.__file__)"
 oktografx --help
 ```
@@ -16,10 +16,13 @@ Pin the package version your application has validated. For unreleased source,
 `pip install -e ".[dev,accel]"` selects this checkout; do not assume an already
 running process adopts an installation change. Drain and restart that process.
 
-`[accel]` adds `google-crc32c` and NumPy. `checksum="auto"` detects an accepted
-native checksum provider. `vector_math="auto"` still uses the pure oracle;
-choose `vector_math="numpy"` and/or `codec="numpy"` explicitly if validated for
-your deployment. Explicit missing dependencies refuse instead of silently falling back.
+In the latest 0.0.5 development revision, NumPy and `google-crc32c` are base
+dependencies; `[accel]` remains a compatible installation alias. Both `codec`
+and `vector_math` default to `"numpy"`. `checksum="auto"` detects an accepted
+native checksum provider. Explicit `vector_math="auto"` still uses the pure
+oracle, and `"pure"` remains available for both selectors. Missing NumPy refuses
+instead of silently falling back. Earlier releases may require `[accel]` and
+explicit NumPy selectors. Saved explicit settings are not overwritten.
 
 ## A complete durable example
 

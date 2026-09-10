@@ -585,9 +585,8 @@ def _local_assignments(tree: ast.AST, target: ast.AST) -> dict[str, list[ast.exp
     # so looking only at the inner scope found nothing at all.
     holders = [
         node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.lineno
+        for node in _function_scopes(tree)
+        if node.lineno
         <= getattr(target, "lineno", -1)
         <= getattr(node, "end_lineno", node.lineno)
     ]
@@ -625,11 +624,22 @@ def _collect_assignments(holder: ast.AST, values: dict[str, list[ast.expr]]) -> 
             values.setdefault(node.target.id, []).append(node)
 
 
+def _function_scopes(tree: ast.AST) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]:
+    """Index immutable parse scopes once, bounded to 64 modules within one corpus build."""
+    cached = _FUNCTION_SCOPE_CACHE.get(id(tree))
+    if cached is not None and cached[0] is tree:
+        return cached[1]
+    scopes = tuple(node for node in ast.walk(tree)
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    if len(_FUNCTION_SCOPE_CACHE) >= 64:
+        _FUNCTION_SCOPE_CACHE.pop(next(iter(_FUNCTION_SCOPE_CACHE)))
+    _FUNCTION_SCOPE_CACHE[id(tree)] = (tree, scopes)
+    return scopes
+
+
 def _parameter_names(tree: ast.AST, target: ast.AST) -> set[str]:
     names: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
+    for node in _function_scopes(tree):
         start = node.lineno
         end = getattr(node, "end_lineno", start)
         if start <= getattr(target, "lineno", -1) <= end:
@@ -718,6 +728,7 @@ _MODULE_EVALUATOR: Any = None
 _EVALUATOR_CACHE: dict[tuple[int, str], Any] = {}
 _RESOLVABLE_CACHE: dict[tuple[int, int, int], Any] = {}
 _LOCAL_ASSIGNMENT_CACHE: dict[tuple[int, int, int], Any] = {}
+_FUNCTION_SCOPE_CACHE: dict[int, tuple[ast.AST, tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]]] = {}
 
 
 def _reset_caches() -> None:
@@ -726,6 +737,7 @@ def _reset_caches() -> None:
     _EVALUATOR_CACHE.clear()
     _RESOLVABLE_CACHE.clear()
     _LOCAL_ASSIGNMENT_CACHE.clear()
+    _FUNCTION_SCOPE_CACHE.clear()
 
 
 def _resolvable_locals(

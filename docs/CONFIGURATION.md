@@ -1,5 +1,92 @@
 # Configuration reference
 
+In the September 10, 2026 0.0.5 development revision, the base install includes
+NumPy and google-crc32c. New connections default to `codec="numpy"` and
+`vector_math="numpy"`; `checksum="auto"` still validates and selects native CRC.
+Explicit `pure` settings remain supported. Vector `auto` still selects pure;
+there is no silent NumPy fallback. Existing explicitly saved settings are not
+rewritten. Page bytes and transactional guarantees do not change. NumPy vector
+results follow the documented floating-point tolerances, not pure bit equality.
+Operation-local algorithm options (such as PageRank's `backend`) are unchanged.
+
+The continuation after `a4dd85a` adds only operation-local options: opt-in
+`with_pagerank(backend="python", weighted=False)`, `with_simple_topology()` and
+`label_propagation(max_iterations=100)` with existing projection work/memory and
+cancellation controls; see [analytics](GRAPH_PROJECTIONS.md). Optional `networkx`
+and `polars` extras enable [graph exchange](GRAPH_EXCHANGE.md) and
+[typed eager frames](TABULAR_AND_PARQUET.md). Graph export defaults are 64 MiB
+logical NetworkX output or Arrow batches of 256 rows / 16 MiB. The
+[TextImportLimits table](LOCAL_TEXT_IMPORT.md#limits-errors-and-file-policy)
+specifies all eight CSV/JSONL controls; required schema/root and CSV delimiter/NULL
+policy are explicit. No new DatabaseConfig field, environment variable, automatic
+backend selection or format capability is introduced.
+
+The continuation after `970aa1e` adds **operation-local**, not connection, options:
+projection `weight_columns=None`/`default_weight=None`; PageRank `backend="python"`,
+`weighted=False`, `personalization=None`; Dijkstra `max_distance=None` and existing
+direction/output/cancellation controls. [Algorithm contracts](GRAPH_PROJECTIONS.md)
+explain memory/work charges and the explicit NumPy choice. Optional `pandas` and
+`arrow` extras enable the [Pandas/Parquet APIs](TABULAR_AND_PARQUET.md), whose complete
+row/batch/file/frame defaults and required `types`/`allowed_root` are documented
+there. No environment variable, global backend switch or durable format changes.
+
+The continuation after `3f3819f` also adds `vacuum(index_free_pages=False)` and
+explicit `create_index(layout="sparse_hash")`; these are operation options, not
+global switches. `connect(extensions=None)` accepts a trusted immutable object
+separately from `DatabaseConfig` and the port `registry`. Scalar descriptor budgets
+and Arrow `batch_rows`/`max_batch_bytes` are documented in
+[Extensions and Arrow](EXTENSIONS_AND_ARROW.md). The subsequent continuation after
+`69ed311` makes the repeated-key page memo configurable per connection, applied per
+index: `index_key_cache_pages=64`, `index_key_cache_bytes=1048576`; either zero
+disables retention. `vector_hnsw_total_memory_budget_bytes=None` adds optional
+aggregate per-handle picture admission, distinct from per-picture/RSS budgets.
+The same continuation adds operation-local Arrow import row/batch bounds,
+`TextIndexOptions.prefix_max_characters`, `TextSearchLimits.max_expanded_terms`
+and [ProjectionLimits](GRAPH_PROJECTIONS.md#algorithms-and-controls). These operation
+options are not additional connection keys.
+
+The continuation after `7dde256` adds projected physical scan columns, byte caps
+and read controls; projection `batch_rows=256` and `max_batch_bytes=16777216`,
+capture timeout, algorithm direction/depth/output limits, PageRank controls and
+explicit `ArrowVectorType` descriptors. All are **operation-local**; see
+[scan contracts](INTEGRATION.md#bounded-physical-scans),
+[algorithm options](GRAPH_PROJECTIONS.md#algorithms-and-controls) and
+[vector Arrow contracts](EXTENSIONS_AND_ARROW.md#explicit-native-vectors).
+No new connection default, environment variable or durable format is introduced.
+
+The eight-item continuation adds operation-local `search_vectors(timeout_seconds=,
+cancellation=)` and `HybridSearchOptions.graph_access` (`auto`/`scan`). Hybrid
+`max_memory_bytes` now applies to simultaneous logical source/fusion/graph tariffs,
+with per-phase peak diagnostics; it is not an RSS cap. See [hybrid contracts](HYBRID_SEARCH.md)
+and [vector controls](INDEXES_AND_VECTORS.md#cooperative-vector-read-control).
+
+Other operation-local additions are `TextIndexOptions.statistics_mode="durable"`
+(opt-in persisted compatibility fence), `index_distribution` with explicit page,
+entry and logical-memory caps, `rehash_index_if_needed(check_skew=True)`,
+`create_backup(capture_mode="disk")` (default temporary-storage streaming; `memory`
+retains the RAM choice), and [application migrations](SCHEMA_MIGRATIONS.md) with
+`namespace`, `dry_run=False`, `max_attempts=3`. Hash sizing now permits 65,536
+explicit buckets / 4,194,304 expected entries; defaults remain unchanged. Large
+eager directories consume disk even when empty. Backup still pauses commit
+publication throughout source capture, including temporary-file I/O.
+
+The connection settings below are distinct from operation-local options.
+The next continuation adds `vector_hnsw_memory_budget_bytes=None` per connection
+and persisted `TextIndexOptions.statistics_history_entries=0` (0..32, positive
+only with durable mode). Both defaults preserve previous behavior. See
+[HNSW memory](INDEXES_AND_VECTORS.md#hnsw-derived-picture-memory) and
+[historical FTS](FULL_TEXT_SEARCH.md#bounded-historical-corpus-totals) for limits,
+costs and when to use them.
+[Full-text search](FULL_TEXT_SEARCH.md#analyzer-and-index-options) documents every
+`TextIndexOptions` field (persisted), `TextSearchLimits` field (per search), BM25
+parameters and cancellation/deadline semantics. [Logical transfer](LOGICAL_TRANSFER.md#limits-and-errors)
+documents every `TransferLimits` field. Neither options class adds a `connect`
+keyword; no existing connection default was changed for these features.
+[Hybrid search](HYBRID_SEARCH.md#options) documents all `HybridSearchOptions`
+fields, source windows, weights, graph controls and separate source budgets.
+FTS statistics WAL limits bound an optional delta proof; exceeding them selects
+the ordinary bounded census, not a partial result or weaker validation.
+
 [Documentation index](README.md) · [Operations](OPERATIONS.md)
 
 
@@ -13,6 +100,31 @@ changing your own settings object does not reconfigure an open handle. Unless
 noted otherwise, operational options are selected at open and apply to that handle.
 `connect` also accepts `pathlib.Path`; `DatabaseConfig.path` itself is a string.
 Unknown keywords and the removed `vector_recall_target` refuse with a typed error.
+
+## Typed connection options (0.0.5)
+
+`connect` exposes all configuration keywords through `Unpack[ConnectOptions]`.
+Editors/type checkers supporting PEP 692 can suggest keyword names, reject typos
+and check selector literals. For reusable dictionaries:
+
+```python
+from okto_grafx import ConnectOptions, connect
+
+options: ConnectOptions = {
+    "buffer_budget_bytes": 128 * 1024 * 1024,
+    "descriptor_revalidation": "strict",
+    "max_result_rows": 1000,
+}
+with connect("./graph", **options) as db:
+    print(db.execute("RETURN 1").rows)
+```
+
+Every key is optional; omitted keys retain the defaults below. `ConnectOptions`
+is a typing contract, not a validating constructor or another source of defaults.
+For dynamic/untrusted JSON, validate it at your application boundary and retain
+Grafx's runtime validation: annotations do not prove ranges, persisted identity or
+provider availability. `registry=PortRegistry(...)` remains a separate keyword;
+custom provider registration and runtime configuration errors are unchanged.
 
 ## Defaults and effect
 
@@ -44,15 +156,19 @@ Unknown keywords and the removed `vector_recall_target` refuse with a typed erro
 | `max_transaction_bytes` | `None` | Optional hard limit on encoded row tuples, staged logical-record `encoded_length()` values and retained page-image generations; ordinary replacement charges the byte delta, while a rollback preimage held by a live statement mark remains charged until settle/discard |
 | `max_wal_batch_bytes` | `None` | Optional hard limit on the sum of final record `encoded_length()` values, including `COMMIT` and excluding `SEGMENT_HEADER`; checked before WAL append |
 | `max_index_build_entries` | `None` | Optional hard limit on final exact entries across one detached shadow-build batch; counted to at most N+1 and refused before catalog staging or the first generation file is created |
-| `automatic_index_expected_cardinality` | `None` | Keyword-only expected rows per newly materialized automatic exact index; derives 1..4096 eager buckets at 64 expected entries each, activates an empty writable catalog to v2, is persisted with that generation, and never rehashes an existing index |
+| `automatic_index_expected_cardinality` | `None` | Keyword-only expected rows (1..4,194,304) per newly materialized automatic exact index; derives 1..65,536 eager buckets at 64 expected entries each, activates an empty writable catalog to v2, is persisted with that generation, and never rehashes an existing index. Counts above 4,096 buckets activate an additional required capability. |
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
-| `codec` | `"pure"` | `"pure"` binds the byte-contract oracle; `"numpy"` explicitly selects the NumPy-backed, byte-identical dense-directory codec and requires `[accel]` |
-| `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
-| `checksum` | `"auto"` | `"auto"` detects an accepted accelerator, `"pure"` selects the reference, `"native"` requires the native provider; selection is process-global |
+| `codec` | `"numpy"` | NumPy-backed, byte-identical dense-directory codec; NumPy is a base dependency. `"pure"` selects the reference codec. |
+| `vector_math` | `"numpy"` | NumPy acceleration by default; `"auto"` and `"pure"` retain reference arithmetic. See vector tolerance/ranking contracts. |
+| `checksum` | `"auto"` | `"auto"` detects an accepted accelerator, `"pure"` selects the reference, `"native"` requires the native provider; 0.0.5 connections capture an isolated per-database selection |
 | `vector_exact_scan_threshold` | `4096` | Nonnegative candidate threshold for exact-vs-approximate selection; zero permits ANN whenever its other eligibility conditions hold. Inspect the returned regime, not just table size |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |
+| `vector_hnsw_memory_budget_bytes` | `None` | Positive integer or `None`; per-derived-picture HNSW logical construction/cache limit. Independent of query budgets; not RSS or an aggregate across pictures/handles. See [vector memory](INDEXES_AND_VECTORS.md#hnsw-derived-picture-memory). |
+| `vector_hnsw_total_memory_budget_bytes` | `None` | Positive integer or `None`; aggregate HNSW logical reservations per handle, including construction and retired pictures held by readers. Disabled by default; not RSS or shared across handles. |
+| `index_key_cache_pages` | `64` | Integer 0..65,536; retained memo pages per index. Zero disables retention, not execution. |
+| `index_key_cache_bytes` | `1048576` | Integer 0..2^31; retained logical bytes per index. Zero disables retention. Reduce for large index/handle counts. |
 | `read_only` | `False` | No replay/repair; requires checkpoint-complete state and may refuse after a newer acknowledged commit. Distinct from `db.execute()`'s read transaction |
 
 ## Types, ranges and persistence
@@ -98,10 +214,41 @@ caller-owned resources. See [ports](PORTS.md).
   abort/close/crash; never use internal row IDs as a gap-free business sequence.
 - Size new indexes when cardinality is known. Oversizing eager buckets consumes
   memory/disk and slows full scans; unknown growth uses explicit maintenance.
-- Keep all handles' checksum policy coherent: the last process-global provider
-  selection can affect other databases' CPU cost, though accepted digests are identical.
+- Each 0.0.5 connection retains its selected checksum provider. Opening another
+  database or changing the standalone installer cannot change that handle's policy.
+
+### Checksum isolation in 0.0.5
+
+`connect` / `open_database`, including a custom `PortRegistry`, capture a validated
+provider during construction. Public operations, transactions, checkpoint and close
+bind that immutable selection using execution-local transport; nested calls and
+threads restore their previous selection even on exceptions. No global operation
+lock is introduced. Native provider proof memoization remains bounded and shared,
+but the selected provider is not shared mutable configuration.
+
+`pure`, `auto` and `native` retain their admission rules: explicit native absence
+refuses before opening the store; auto may fall back to pure. Injected providers
+retain per-call reference verification. The checksum algorithm, persisted bytes,
+WAL grammar and disk format are unchanged, so a store written with pure can be
+reopened with native/auto. This isolates CPU/provider policy, not different algorithms.
+
+The low-level `install_crc32c` / `install_checksum` compatibility doors still set
+the standalone default used by domain utilities outside a database operation.
+Manually assembled low-level components do not implicitly acquire a database scope.
+Installers invoked by a callback cannot replace its active database's selection.
 
 ## Detailed descriptor, metrics and budget contracts
+
+In the 0.0.5 development line, optional internal preparation retains at most 256
+parsed statements and 256 plans per engine. Texts exceeding 16,384 characters are
+not retained in the parse/plan/statement-authority caches. Plans additionally use
+a 32 MiB conservative admission tariff (source-derived objects, catalog images,
+index definitions and dirty-table keys), not a measured heap-size or RSS bound.
+These are internal acceleration limits, not new `connect` options. Exceeding one
+executes the query normally without retaining that plan; it does not reject a statement
+or waive schema/index/snapshot validation. Independent handles have independent
+caches. Compiled predicates, row caches, buffers and caller-owned results are
+separate retained state, so this tariff is not the whole database's memory budget.
 
 `descriptor_revalidation="strict"` is the safe default: on every cached hit, the local adapter
 proves that the logical name still names the physical file held by its descriptor. The opt-in

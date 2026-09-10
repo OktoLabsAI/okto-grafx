@@ -12,6 +12,8 @@ from __future__ import annotations
 import gc
 import sys
 import tracemalloc
+import subprocess
+from pathlib import Path
 from collections.abc import Callable
 
 import pytest
@@ -182,7 +184,7 @@ def test_the_sink_carries_no_per_instance_state() -> None:
         sink.counter = 1  # type: ignore[attr-defined]
 
 
-def test_the_hot_path_allocates_no_blocks_beyond_an_empty_loop() -> None:
+def _assert_zero_blocks() -> None:
     sink = NoOpMetricsSink()
     _hot(sink, WARMUP)
     _control(WARMUP)
@@ -198,7 +200,7 @@ def test_the_hot_path_allocates_no_blocks_beyond_an_empty_loop() -> None:
     assert abs(hot_delta) <= ALLOCATION_TOLERANCE
 
 
-def test_the_hot_path_traces_no_memory_beyond_an_empty_loop() -> None:
+def _assert_zero_traced_bytes() -> None:
     # tracemalloc is the portable half of the proof: it works on any implementation that
     # supports the module, including one without sys.getallocatedblocks.
     sink = NoOpMetricsSink()
@@ -214,7 +216,7 @@ def test_the_hot_path_traces_no_memory_beyond_an_empty_loop() -> None:
     )
 
 
-def test_the_measurement_can_fail_on_a_sink_that_does_allocate() -> None:
+def _assert_allocating_sink_is_detected() -> None:
     # A proof that cannot fail proves nothing: the same harness must see a sink that keeps a
     # list of what it was told.
     class _AllocatingSink:
@@ -225,7 +227,9 @@ def test_the_measurement_can_fail_on_a_sink_that_does_allocate() -> None:
         def enabled(self) -> bool:
             return True
 
-        def increment(self, name: str, value: float = 1.0, labels: object = None) -> None:
+        def increment(
+            self, name: str, value: float = 1.0, labels: object = None
+        ) -> None:
             self.calls.append((name, value))
 
         def set_gauge(self, name: str, value: float, labels: object = None) -> None:
@@ -242,3 +246,45 @@ def test_the_measurement_can_fail_on_a_sink_that_does_allocate() -> None:
     control_delta = _blocks(_control, ITERATIONS)
     greedy_delta = _blocks(lambda iterations: _hot(greedy, iterations), ITERATIONS)  # type: ignore[arg-type]
     assert greedy_delta > control_delta
+
+
+def _isolated_allocation_check(name: str) -> None:
+    """Process-wide allocator readings must not include other tests' workers/caches.
+
+    Keep the exact original assertions and allocating-sink counterexample. A fresh
+    interpreter changes attribution, not the accepted byte/block budget.
+    """
+    path = Path(__file__).resolve()
+    code = (
+        "import runpy,sys; "
+        "sys.path.insert(0,sys.argv[1]); "
+        "namespace=runpy.run_path(sys.argv[2]); "
+        "namespace[sys.argv[3]](); "
+        'namespace["_assert_allocating_sink_is_detected"]()'
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(path.parents[2] / "src"),
+            str(path),
+            name,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_hot_path_allocates_no_blocks_beyond_an_empty_loop() -> None:
+    _isolated_allocation_check("_assert_zero_blocks")
+
+
+def test_the_hot_path_traces_no_memory_beyond_an_empty_loop() -> None:
+    _isolated_allocation_check("_assert_zero_traced_bytes")
+
+
+def test_the_measurement_can_fail_on_a_sink_that_does_allocate() -> None:
+    _isolated_allocation_check("_assert_allocating_sink_is_detected")

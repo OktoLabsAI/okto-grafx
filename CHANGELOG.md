@@ -7,6 +7,182 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Changed
+
+- Continuation after `a4dd85a`: opt-in immutable PageRank transition preparation and
+  simple topology reuse; bounded deterministic read-only label propagation.
+- Optional NetworkX multigraph export/conformance and bounded Arrow projection/result
+  batches with explicit identity/provenance; metadata-bearing Polars frames.
+- Typed bounded local CSV/JSONL scalar readers and whole-call atomic native import
+  staging, with explicit root, codecs, cancellation and malformed-input contracts.
+
+- Continuation after `970aa1e`: retained immutable identity lookup, discovery-sized
+  BFS workspace and linear bucket k-core; explicit NumPy PageRank acceleration.
+- Snapshot-captured non-negative relationship weights, bounded Dijkstra paths and
+  weighted/personalized PageRank, preserving physical multiplicity and read/write rights.
+- Optional typed Arrow-backed Pandas import/export and local Parquet batches with
+  explicit schema/bounds, atomic native import and no-overwrite file publication.
+  Nullable vectors use tagged variable lists on disk and fixed-size lists at the API.
+
+- Continuation after `7dde256`: column-projected physical scan with byte limits and
+  cooperative controls; batched graph capture with work diagnostics, preserving
+  omitted-payload validation and one-shot cursor/snapshot identity.
+- Immutable reusable bidirectional CSR, iterative SCC, bounded BFS paths,
+  unweighted PageRank with explicit convergence, and simple-undirected k-core.
+- Optional Arrow fixed-size-list vectors with explicit space/dimension/precision
+  and atomic native import. Encapsulated vector parameters now pass target-space
+  identity/dimension/precision/active/normalized checks instead of bypassing admission.
+
+- Continuation after `69ed311`: page-wise sparse maintenance, configurable key-page
+  memo/diagnostics, up to 64 absent heads sharing an initialization barrier inside
+  one existing durable publication, and opt-in aggregate per-handle HNSW admission.
+- Typed optional Arrow import uses one atomic staging savepoint across bounded
+  batches; caller still owns commit/retry and native transaction quotas.
+- Opt-in bounded FTS prefix postings (required bit 11) and relationship STRING
+  indexes (required bit 12), preserving physical edge identity and snapshot BM25.
+- Detached read-only graph projections, degree and weak-component algorithms with
+  explicit multigraph semantics, cancellation and logical resource bounds.
+
+- Indexed retired-overflow candidate discovery (bit 9) published by quiescent
+  vacuum, plus opt-in sparse hash directories (bit 10/header 4). Default layouts
+  remain unchanged; backup, replay and old-reader refusal contracts are explicit.
+- Bounded exact-image repeated-key page decoding; native chain validation,
+  certificates and heap visibility remain authoritative.
+- Explicit per-connection trusted scalar registry, typed `udf('namespace.name', ...)`
+  and optional `[arrow]` copied scalar result batches. No dynamic plugin loading.
+- Reproducible 0.0.5 platform/accelerator matrix and real-wheel upgrade checks;
+  unexecuted platform rows remain documented rather than counted as passed.
+
+- Next 0.0.5 round: optional per-picture HNSW logical-memory admission and public
+  diagnostics; cache-budget pressure retires warm derived state without failing
+  a durable write. Exact search and default unlimited admission remain unchanged.
+- Optional bounded FTS summary history (1..32 older reductions), capability bit 8;
+  historical corpus lookup preserves exact snapshot scores, with census outside
+  the proved retained interval. Default scalar/legacy bytes remain unchanged.
+
+- Eight-item 0.0.5 continuation: single-pass BM25 term counts; certified incident
+  BFS for hybrid evidence; cooperative exact/ANN vector read control; aggregate
+  logical hybrid memory accounting and per-phase diagnostics.
+- Opt-in durable FTS corpus totals, complete-COMMIT replay and independent verification;
+  required capability bit 6 preserves older-build refusal and unchanged default bytes.
+- Explicit hash directories up to 65,536 buckets (bit 7), bounded distribution/skew
+  diagnostics and optional skew-aware assisted growth; default remains 64.
+- Physical backup now defaults to chunked temporary-disk capture/readback; explicit
+  memory capture remains available. The consistent-cut writer pause remains.
+- Added application migration plans/checksum ledger, native additive DDL simulation,
+  dry-run, atomic per-version commits and bounded concurrent resumption.
+
+- Closed regression drift in public root exports and query-error metric labels:
+  cancellation/deadline errors can be emitted by the validated OpenMetrics sink.
+  No-op allocation checks now isolate process-global counters without loosening
+  their zero-allocation assertions or allocating-sink counterexample.
+- Added operation-owned pure FTS analysis reuse and bounded committed-WAL advancement
+  of snapshot BM25 statistics; conservative census remains for cold/ambiguous proof.
+- Added native `search_hybrid`, weighted RRF, union/intersection, source explanations,
+  explicit partial policy and bounded snapshot-consistent graph boost/filter.
+- Added opt-in `import_graph(..., resume_directory=...)`: WAL-recovered checked
+  prefixes, lease-safe ID mappings and verified no-replace publication after crashes.
+- Added bounded versioned logical graph export/import with complete schema/value/vector
+  verification, fresh identity mapping, index reconstruction and no-replace promotion.
+  Current state only; no existing-target merge or historical-journal copy.
+- Added persisted native FTS-v1: four frozen analyzers, weighted BM25, typed/procedure
+  search, snapshot filters/budgets, transactional postings and generation rebuild.
+  Activation requires a new catalog capability; older builds refuse. Cold statistics
+  remain a documented linear scan when no eligible incremental proof exists.
+- Corrected recovery baseline validation to compare real table stamps at/before the
+  checkpoint instead of inventing a checkpoint-time write from a later heap stamp.
+  Genuinely omitted pre-checkpoint index writes still refuse.
+- Corrected detached index creation/rebuild with commit history enabled: the sealed
+  transaction admits exactly its internally prepared journal's physical interests,
+  while extra caller interests/images/rows remain refused.
+- Audited prior consumer documentation: commit-provenance capability status, backup
+  report DTOs and top-level API signatures now appear in the generated reference.
+
+- Added explicit quiescent orphan-index inventory/removal, with catalog/retained-WAL
+  protection, dry-run default, budgets, cache retirement and interruption-safe retry.
+  Catalog-owned STALE/BUILDING generations are not garbage-collected.
+- Added `CancellationToken`, cooperative per-read `timeout_seconds` and typed
+  cancellation/deadline errors for materialized reads and query cursors. Write
+  transactions refuse controls; durable commits remain non-cancellable. See
+  [consumer contracts](docs/READ_CONTROL_AND_INDEX_CLEANUP.md).
+
+- Added ordinary overflow allocation reuse of persisted vacuum FREE pages, guarded
+  by the retained-snapshot floor, current durable view and page LSN. Discovery is
+  incremental/O(1) memory, without a new mutable free-list format or file truncation.
+- Added `okto_grafx.backup.create_backup` / `restore_backup`: bounded local physical
+  capture under checkpoint fences, checked artifacts, verified no-replace publication,
+  and offline same-UUID replacement preserving commit provenance/epoch lineage.
+  This is not a no-pause streaming backup or an independently writable fork.
+
+- Reduced cold catalog identifier-validation CPU with an equivalent exact-ASCII
+  built-in predicate; retained subclass behavior and all IO/authority checks.
+- Isolated checksum selection per connection and execution context, including
+  nested calls, threads, custom registries and cleanup. Standalone installers
+  retain their compatibility default; CRC-32C bytes and durability are unchanged.
+
+- Connected opt-in durable commit history: explicit activation, immutable metadata
+  capture at begin and retry, qualified snapshot lookup/paging, public journal
+  verification and content-free metadata metrics. Logical-transfer hooks record
+  source-to-target references atomically; fresh logical forks and offline physical
+  restore have distinct identity contracts. These are 0.0.5 development APIs;
+  local regression/integration evidence is recorded separately from release.
+
+- Started the 0.0.5 development line for the six selected performance workstreams;
+  package and public runtime versions are now 0.0.5. No release is implied.
+- Expanded prepared-plan retention to the existing 256-statement working set,
+  with a 32 MiB conservative admission tariff and a 16,384-character per-text
+  retention ceiling. Capacity misses execute normally; runtime authority remains fenced.
+- Numeric `IN` parameters now reuse bounded, statement-local membership keys with
+  the existing float-normalized query equality, preserving nulls, signed zero,
+  large-integer rounding and NaN non-matches. Unsupported/custom values keep the walk.
+- Unstaged native writers may reuse scalar primary-key preflight values under fresh
+  per-read certificates; write statements and staged transactions retain their old path.
+- Top-k heaps use standard-library heap operations with unchanged ordering,
+  stable ties, retained-row limits and validation semantics.
+- Ordered multi-table pages now materialize only proven demanded columns, while
+  validating full payloads, overflow chains and index keys. Fresh pre/post root
+  certificates remain mandatory; foreign roots refresh clean companion heap
+  frames so a pinned old snapshot cannot follow a new reference into a stale page.
+- Writable startup performs one final fenced index admission instead of two;
+  independent recovery baseline checks and catalog/identity validation remain.
+- Native existing-only index registration combines creation-shape and open
+  checks in one extent/header observation. Fresh per-index and companion-heap
+  certificates remain independent; overridden public admission hooks retain
+  their canonical path. No format, OCC or checkpoint protocol change.
+- Parameter map validation bypasses dynamic container checks for exact built-in
+  scalar leaves; nested map collision checks, custom types and per-bind validation
+  remain intact. The matching Pulse Community adapter applies the same bounded
+  scalar conversion shortcut without changing Core or adding a batch API.
+
+### Added
+
+- Quiescent vacuum retirement of horizon-eligible overflow history, with complete
+  chain ownership/coverage checks and WAL-logged FREE pages. Added overflow page
+  counters to vacuum reports; no truncation or automatic reuse is claimed.
+- Internal CAP-1 writer publication after private activation: journal images join
+  physical OCC, raw/compressed required WAL framing and segment-roll rebinding.
+  Includes first-file initialization and identity-floor commits. Public metadata,
+  history, metrics and transfer remain pending; no public capability activation yet.
+
+- `ConnectOptions` and typed `connect` keywords for all configuration fields,
+  including selector literals and a separately typed custom `registry` argument.
+  No new defaults, runtime dependencies or persisted formats.
+- Isolated full Pulse consolidation harness covering Community composition,
+  real SQLite, graph writes, outbox flush/reopen verification, durable ACK and
+  an idempotent empty second worker tick; no production specs consumed.
+
+### Validation
+
+- Closed the six bounded 0.0.5 performance actions with reproducible native,
+  real Pulse route/renderer, Global inventory/write, pinned-snapshot churn/RSS
+  and independent-reader/writer fixtures. Documented remaining physical growth,
+  non-linear thread throughput and unmeasured full production ACK attribution
+  without introducing timing gates or claiming those broader limits are fixed.
+- Candidate wheel passes isolated stdlib-only installation and durable reopen
+  smoke. No production Pulse installation or PyPI publication is implied.
+
+## [0.0.4] - 2026-09-08
+
 ### Added
 
 - Reorganized documentation around consumer integration: tutorial, synchronous/async

@@ -55,10 +55,12 @@ class NumpyPageCodecV1:
 
     @property
     def format_version(self) -> int:
+        """Return the supported on-disk page codec version."""
         return PAGE_CODEC_FORMAT_VERSION
 
     @property
     def page_size(self) -> int:
+        """Return the configured size of one encoded page."""
         return self._page_size
 
     def checksum(self, payload: bytes) -> int:

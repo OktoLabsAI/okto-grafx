@@ -15,6 +15,22 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "projections.py": {"ProjectionLimits", "ProjectionNode", "ProjectionEdge", "GraphProjection", "ProjectionDiagnostics"},
+    "projection_algorithms.py": {"ProjectionLookup", "ProjectionAdjacency", "ProjectionPath", "WeightedProjectionPath", "PageRankResult", "PageRankPreparation", "SimpleTopology", "LabelPropagationResult"},
+    "polars.py": {"PolarsFrame"},
+    "text_import.py": {"TextImportLimits"},
+    "parquet.py": {"ParquetExportReport"},
+    "arrow.py": {"ArrowVectorType"},
+    "domain/query/extensions.py": {"ScalarFunction", "ExtensionRegistry"},
+    "engine/vector_memory.py": {"VectorMemoryUsage", "VectorTotalMemoryUsage"},
+    "engine/key_page_memo.py": {"KeyPageCacheUsage"},
+    "migrations.py": {"SchemaMigration", "MigrationReport"},
+    "engine/index_distribution.py": {"IndexDistribution"},
+    "domain/query/hybrid.py": {"HybridSearchOptions", "HybridHit", "HybridSearchResult"},
+    "backup.py": {"BackupReport"},
+    "transfer.py": {"TransferLimits", "TransferReport", "RecordIdMapping"},
+    "domain/index/fulltext.py": {"TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"},
+    "api/options.py": {"ConnectOptions"},
     "engine/database.py": {
         "DatabaseIdentity",
         "ExecuteManyReport",
@@ -24,8 +40,14 @@ DTO_SOURCES = {
     "engine/query_engine.py": {"QueryResult"},
     "engine/vector_engine.py": {"VectorHit", "VectorSearchResult"},
     "engine/public_views.py": None,
+    "engine/index_cleanup.py": None,
     "domain/txn/context.py": {"Snapshot", "CommitReport"},
     "domain/txn/snapshot.py": {"Snapshot"},
+    "domain/txn/commit_identity.py": {"CommitId", "CommitTime"},
+    "domain/txn/commit_metadata.py": {"CommitMetadata", "MetadataLimits"},
+    "domain/txn/commit_catalog.py": {"CommitCatalogEntry", "CommitKind"},
+    "domain/txn/commit_history.py": {"CommitHistoryPage"},
+    "domain/txn/commit_transfer.py": {"CommitImport", "CommitMapping"},
     "domain/ids.py": {"RecordRef"},
     "domain/wal/replay.py": {"RecycleReport"},
     "domain/recovery/report.py": {"RecoveryReport", "RecoveryFinding"},
@@ -37,6 +59,21 @@ DTO_SOURCES = {
     "domain/model/schema.py": {"TableDef", "ColumnDef", "EmbeddingSpaceDef"},
     "domain/model/value.py": {"Timestamp", "Uuid", "VectorValue"},
     "domain/vector/filter.py": {"RecordIdFilter"},
+}
+
+
+FUNCTION_SOURCES = {
+    "graph_interop.py": {"to_networkx", "projection_arrow_batches"},
+    "polars.py": {"to_polars", "import_polars"},
+    "text_import.py": {"read_csv_batches", "import_csv", "read_jsonl_batches", "import_jsonl"},
+    "tabular.py": {"to_pandas", "import_pandas"},
+    "parquet.py": {"read_parquet_batches", "import_parquet", "write_parquet"},
+    "arrow.py": {"to_arrow_batches", "import_arrow_batches"},
+    "projections.py": {"project_graph"},
+    "migrations.py": {"migrate_schema"},
+    "api/__init__.py": {"connect"},
+    "backup.py": {"create_backup", "restore_backup"},
+    "transfer.py": {"export_graph", "import_graph"},
 }
 
 
@@ -84,6 +121,12 @@ def render() -> str:
     for cls in source_tree("engine/database.py").body:
         if isinstance(cls, ast.ClassDef) and cls.name in FACADES:
             result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
+    result.append("\n## Public factory and transfer functions\n\n")
+    for relative, names in FUNCTION_SOURCES.items():
+        module = "okto_grafx." + relative.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+        for node in source_tree(relative).body:
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                result.append(f"\n### {module}.{node.name}\n\n```python\n{node.name}({ast.unparse(node.args)}) -> {ast.unparse(node.returns)}\n```\n\n{description(node)}\n")
     result.append(
         "\n## Result and observation type fields\n\n"
         "DTO module paths below are annotation/import locations, not permission to\n"

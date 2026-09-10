@@ -407,8 +407,8 @@ def build_codec(context: PortContext) -> object:
         from okto_grafx.adapters.codec_numpy import NumpyPageCodecV1
     except ImportError as failure:
         raise GrafxConfigurationError(
-            "The NumPy page codec needs the optional 'accel' extra; install "
-            "okto-grafx[accel] or configure codec='pure'.",
+            "The NumPy page codec needs the base NumPy dependency; reinstall "
+            "okto-grafx (the accel alias is also supported) or configure codec='pure'.",
             field="codec",
             value=selector,
         ) from failure
@@ -447,12 +447,12 @@ def build_vector_math(context: PortContext) -> object:
     """Build the vector math adapter a configuration selects (C9, SPEC-VEC FR-7, A52).
 
     ``"pure"`` and ``"auto"`` both bind the pure oracle, and that is deliberate. SPEC-VEC FR-7
-    describes the accelerator as *selected by configuration*, TR-6 and IR-2 put numpy in the
-    optional ``[accel]`` extra, and the two adapters agree only to a stated tolerance -- so a
+    describes the accelerator as *selected by configuration*. NumPy is now a base dependency,
+    and the two adapters agree only to a stated tolerance -- so a
     selector that silently bound whichever adapter happened to be installed would make the
     ranking of a query depend on the machine it ran on. ``"auto"`` therefore means "let the
     composition root choose", and the composition root chooses the answer that is the same
-    everywhere. ``"numpy"`` binds the accelerator and refuses when the extra is not installed,
+    everywhere. The default ``"numpy"`` binds the accelerator and refuses when NumPy is missing,
     rather than falling back to something the caller did not ask for.
     """
     selector = context.config.vector_math
@@ -462,8 +462,8 @@ def build_vector_math(context: PortContext) -> object:
         from okto_grafx.adapters.vectormath_numpy import NumpyVectorMath
     except ImportError as failure:
         raise GrafxConfigurationError(
-            "The numpy vector math adapter needs the optional 'accel' extra; install "
-            "okto-grafx[accel] or configure vector_math='pure'.",
+            "The numpy vector math adapter needs the base NumPy dependency; reinstall "
+            "okto-grafx (the accel alias is also supported) or configure vector_math='pure'.",
             field="vector_math",
             value=selector,
         ) from failure
@@ -473,10 +473,11 @@ def build_vector_math(context: PortContext) -> object:
 def install_checksum(config: DatabaseConfig) -> str:
     """Install the CRC-32C implementation this configuration selects, and return its name.
 
-    This is not a port. The checksum is installed process-wide because every component that
+    This compatibility installer selects the standalone default; connection/bootstrap
+    callers capture it in an isolated execution scope instead. Every component that
     computes one must compute the SAME one -- a page written by the pool and verified by the
-    verifier is one answer, not two -- and a value injected per database would let two open
-    databases in one process disagree about what a byte range hashes to.
+    verifier is one answer, not two. Per-database selection captures only providers
+    admitted by this same validator; it never permits a different checksum algorithm.
 
     Installing is safe in a way that binding a vector math adapter is not, and that is why
     ``"auto"`` accelerates here and does not there. The native path is a closed provider list,
@@ -509,8 +510,8 @@ def install_checksum(config: DatabaseConfig) -> str:
     except ImportError as failure:
         if selector == "native":
             raise GrafxConfigurationError(
-                "The native CRC-32C adapter needs a provider from the optional 'accel' extra; "
-                "install okto-grafx[accel] or configure checksum='pure'.",
+                "The native CRC-32C adapter needs the base google-crc32c dependency; "
+                "reinstall okto-grafx (accel alias supported) or configure checksum='pure'.",
                 field="checksum",
                 value=selector,
             ) from failure
@@ -683,7 +684,15 @@ def build_default_registry(config: DatabaseConfig) -> PortRegistry:
     attempt from publishing over the same names.
     """
     config = _require_database_config(config)
-    install_checksum(config)
+    from okto_grafx.runtime.checksum_scope import capture_checksum, checksum_scope
+
+    state = capture_checksum(lambda: install_checksum(config))
+    with checksum_scope(state):
+        return _build_default_registry(config)
+
+
+def _build_default_registry(config: DatabaseConfig) -> PortRegistry:
+    """Build ports inside the caller's already-selected checksum scope."""
     registry = PortRegistry()
     built: dict[str, object] = {}
     try:
@@ -764,14 +773,27 @@ def open_database(
     second release here would make neither observable on its own (A67).
     """
     config = _require_database_config(config)
+    from functools import partial
+    from okto_grafx.runtime.checksum_scope import capture_checksum, checksum_scope
+
+    state = capture_checksum(lambda: install_checksum(config))
+    with checksum_scope(state):
+        database = _open_database_selected(config, registry=registry)
+        database._checksum_scope = partial(checksum_scope, state)
+        database._transactions._checksum_scope = database._checksum_scope
+        return database
+
+
+def _open_database_selected(
+    config: DatabaseConfig, *, registry: PortRegistry | None
+) -> Database:
+    """Complete open and failure cleanup using one captured checksum provider."""
     owns_ports = registry is None
     if registry is None:
-        ports = build_default_registry(config)
+        ports = _build_default_registry(config)
     else:
         ports = _require_port_registry(registry)
-        # CRC-32C is deliberately process-global rather than a port. A custom port registry
-        # replaces the seven adapters, not this explicit configuration choice.
-        install_checksum(config)
+        # A custom registry does not replace the explicit per-database checksum choice.
     ports.require_complete()
     database = _assemble_database(config, ports, owns_ports=owns_ports)
     if (

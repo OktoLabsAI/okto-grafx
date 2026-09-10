@@ -1,6 +1,8 @@
 # ADR GX-005 — Native full-text and explainable hybrid retrieval
 
-Status: accepted semantic contract; GX-CAP-5/6 implementation pending.
+Status: accepted semantic contract; GX-CAP-5 v1 implemented in development with
+local validation; bounded GX-CAP-6 v1 is implemented in development. See [hybrid contract](../HYBRID_SEARCH.md), [FTS contract](../FULL_TEXT_SEARCH.md)
+and [wire format](../specs/FULLTEXT_V1_FORMAT.md) for actual supported semantics and limits.
 Source: complementary plan §§9–10 in full; agent-first §12.
 
 ## Decision

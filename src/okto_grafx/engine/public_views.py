@@ -381,6 +381,8 @@ class TableVacuumReport:
     reclaimed_slot_bytes: int
     relinked_versions: int
     skipped_overflow_versions: int
+    eligible_overflow_versions: int = 0
+    reclaimed_overflow_pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +403,7 @@ class VacuumReport:
     skipped_overflow_versions: int
     indexes_reconciled: int
     index_entries_removed: int
+    reclaimed_overflow_pages: int = 0
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -2600,6 +2603,7 @@ def _query_owned_plan_clone_factory(value: PlanNode) -> _OwnedPlanClone:
     clone_field = _query_owned_plan_field_clone_factory(value)
 
     def clone_plan() -> PlanNode:
+        """Clone the owned plan template and validate its operator root."""
         cloned = clone_field()
         if (
             type(cloned) not in _QUERY_PLAN_NODE_TYPES
@@ -2631,6 +2635,7 @@ def _query_owned_plan_field_clone_factory(value: object) -> _OwnedPlanFieldClone
             )
 
             def clone_literal(private_value: Value = private_value) -> object:
+                """Detach the captured literal value into a fresh expression node."""
                 cloned = object.__new__(Literal)
                 object.__setattr__(
                     cloned,
@@ -2662,6 +2667,7 @@ def _query_owned_plan_field_clone_factory(value: object) -> _OwnedPlanFieldClone
                 exact: type[object] = exact,
                 field_clones: tuple[_OwnedPlanFieldClone, ...] = field_clones,
             ) -> object:
+                """Construct an exact canonical dataclass from cloned fields."""
                 return exact(*(clone() for clone in field_clones))
 
             return clone_canonical_dataclass
@@ -2671,6 +2677,7 @@ def _query_owned_plan_field_clone_factory(value: object) -> _OwnedPlanFieldClone
             field_names: tuple[str, ...] = field_names,
             field_clones: tuple[_OwnedPlanFieldClone, ...] = field_clones,
         ) -> object:
+            """Copy each captured field into a fresh exact dataclass instance."""
             cloned = object.__new__(exact)
             for field_name, clone in zip(field_names, field_clones, strict=True):
                 object.__setattr__(cloned, field_name, clone())
@@ -2686,6 +2693,7 @@ def _query_owned_plan_field_clone_factory(value: object) -> _OwnedPlanFieldClone
         def clone_tuple(
             item_clones: tuple[_OwnedPlanFieldClone, ...] = item_clones,
         ) -> object:
+            """Clone every captured tuple element without sharing mutable children."""
             return tuple(clone() for clone in item_clones)
 
         return clone_tuple

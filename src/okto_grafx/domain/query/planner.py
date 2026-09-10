@@ -32,7 +32,7 @@ Each is a refusal with a message that names the rule, never a silent partial ans
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from okto_grafx.domain.errors import GrafxEmbeddingSpaceMismatch, GrafxPlanError
@@ -467,6 +467,7 @@ def build_plan(
     catalog: Catalog,
     indexes: Sequence[IndexDefinition] = (),
     analysis: QueryAnalysis | None = None,
+    scalar_types: Mapping[str, ValueType] | None = None,
 ) -> PlannedQuery:
     """Return the operator tree that answers one statement against this catalog.
 
@@ -481,7 +482,8 @@ def build_plan(
             value=type(catalog).__name__,
         )
     resolved = analysis if analysis is not None else analyze(statement)
-    planner = _Planner(catalog=catalog, indexes=tuple(indexes), analysis=resolved)
+    planner = _Planner(catalog=catalog, indexes=tuple(indexes), analysis=resolved,
+                       scalar_types={} if scalar_types is None else scalar_types)
     return planner.run(statement)
 
 
@@ -492,6 +494,7 @@ class _Planner:
     catalog: Catalog
     indexes: tuple[IndexDefinition, ...]
     analysis: QueryAnalysis
+    scalar_types: Mapping[str, ValueType] = field(default_factory=dict)
     tables: dict[str, TableDef] = field(default_factory=dict)
     multi_hop_variables: set[str] = field(default_factory=set)
     polymorphic_variables: set[str] = field(default_factory=set)
@@ -582,6 +585,7 @@ class _Planner:
         branch_type_expressions: list[tuple[Expression, ...]] = []
         for branch in (statement.left, statement.right):
             sub = _Planner(
+                scalar_types=self.scalar_types,
                 catalog=self.catalog,
                 indexes=self.indexes,
                 analysis=analyze(branch),
@@ -1588,6 +1592,11 @@ class _Planner:
             for node in walk(expression):
                 if not isinstance(node, FunctionCall):
                     continue
+                if node.name.upper() == "UDF":
+                    if (not node.arguments or type(node.arguments[0]) is not Literal
+                            or type(node.arguments[0].value) is not str
+                            or node.arguments[0].value not in self.scalar_types):
+                        raise GrafxPlanError("Scalar function is not registered on this handle.", field="udf_name")
                 if node.name.upper() != COALESCE_FUNCTION:
                     continue
                 types = tuple(
@@ -1969,6 +1978,10 @@ class _Planner:
             )
         if isinstance(expression, FunctionCall):
             name = expression.name.upper()
+            if name == "UDF" and expression.arguments and isinstance(expression.arguments[0], Literal):
+                result = self.scalar_types.get(expression.arguments[0].value)
+                if result is not None:
+                    return result
             if name == COALESCE_FUNCTION:
                 types = tuple(
                     self._pulse_expression_type(argument, owner=owner)
@@ -3980,6 +3993,7 @@ class _Planner:
                 terms.append(current)
 
         def property_is(expression: Expression, column: str) -> bool:
+            """Recognize an exact property access on the selected query variable."""
             return (
                 isinstance(expression, Property)
                 and isinstance(expression.subject, Variable)

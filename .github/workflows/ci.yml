@@ -2,7 +2,8 @@
 #
 # SPEC-M1 TR-8 and decision D9: Windows and POSIX are equal citizens, so the whole bench runs on
 # both families and the aggregate is green only when BOTH are. SPEC-VEC TR-6 and VTS-9 add the
-# second axis: the suite must also run WITHOUT the optional extras, so four jobs -- two families
+# second axis: the suite must also run WITHOUT the optional extras (base acceleration remains
+# installed), so four jobs -- two families
 # times two installation profiles.
 #
 # The matrix is not only a way to run tests twice. It is the input to the cross-family coverage
@@ -95,7 +96,7 @@ jobs:
         shell: bash
         run: |
           python -m venv .venv-wheel
-          .venv-wheel/bin/python -m pip install --no-deps dist/*.whl
+          .venv-wheel/bin/python -m pip install dist/*.whl
           .venv-wheel/bin/python -m pip check
           .venv-wheel/bin/python tests/consumer/smoke.py
           python -m mypy --strict --follow-imports=silent \
@@ -105,7 +106,7 @@ jobs:
         shell: bash
         run: |
           python -m venv .venv-sdist
-          .venv-sdist/bin/python -m pip install --no-deps dist/*.tar.gz
+          .venv-sdist/bin/python -m pip install dist/*.tar.gz
           .venv-sdist/bin/python -m pip check
           .venv-sdist/bin/python tests/consumer/smoke.py
           python -m mypy --strict --follow-imports=silent \
@@ -130,7 +131,7 @@ jobs:
           - os: windows-latest
             family: windows
             profile: extras
-            extras: "accel,bench"
+            extras: "accel,bench,arrow,pandas,polars,networkx"
           - os: ubuntu-latest
             family: posix
             profile: bare
@@ -138,7 +139,7 @@ jobs:
           - os: ubuntu-latest
             family: posix
             profile: extras
-            extras: "accel,bench"
+            extras: "accel,bench,arrow,pandas,polars,networkx"
     steps:
       - uses: actions/checkout@v4
         with:

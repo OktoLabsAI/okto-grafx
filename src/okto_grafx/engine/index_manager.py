@@ -65,6 +65,7 @@ from okto_grafx.domain.errors import (
     GrafxCorruptionDetected,
     GrafxError,
     GrafxIndexError,
+    GrafxQueryBudgetExceeded,
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import (
@@ -135,6 +136,9 @@ from okto_grafx.domain.page import (
 )
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.txn.context import RowIntent, TransactionContext
+from okto_grafx.domain.index.fulltext import (
+    TextAnalysisMemo, is_fulltext, has_durable_statistics, decode_options as decode_text_options,
+)
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.wal.record import WalRecord
@@ -540,6 +544,7 @@ class IndexStore:
         "_replaying",
         "_table_high_water",
         "_tombstone_backlog_count",
+        "_key_page_memo",
     )
 
     def __init__(
@@ -609,6 +614,7 @@ class IndexStore:
         # walk. Thereafter successful logical changes maintain it in O(1), without adding a byte
         # to the index format or making this diagnostic state an authority for reads.
         self._tombstone_backlog_count: int | None = None
+        self._key_page_memo = None
         if metrics.enabled:
             for descriptor in INDEX_METRICS:
                 metrics.register(descriptor)
@@ -823,6 +829,8 @@ class IndexStore:
         storage = self._pool.storage
         header = FileHeader(kind=FileKind.INDEX, page_size=self._pool.page_size)
         index_header = IndexHeader(
+            format_version=4 if self._definition.layout is IndexLayout.SPARSE_HASH else 2,
+            layout=self._definition.layout,
             visibility=self._definition.visibility,
             table_id=self._definition.table_id,
             bucket_count=self._definition.bucket_count,
@@ -841,6 +849,9 @@ class IndexStore:
                     )
                 FileHeaderPage.initialize(page, header)
                 page.insert_slot(index_header.encode())
+                if has_durable_statistics(self._definition.key_derivation):
+                    from okto_grafx.engine.fulltext_durable import initial_statistics
+                    page.insert_slot(initial_statistics(self._definition.key_derivation))
             finally:
                 self._pool.unpin(self.file, HEADER_PAGE_INDEX, dirty=True)
             return
@@ -855,6 +866,9 @@ class IndexStore:
                 )
             FileHeaderPage.initialize(page, header)
             page.insert_slot(index_header.encode())
+            if has_durable_statistics(self._definition.key_derivation):
+                from okto_grafx.engine.fulltext_durable import initial_statistics
+                page.insert_slot(initial_statistics(self._definition.key_derivation))
 
     def _grow_buckets(self) -> None:
         """Give every bucket a head page, repairing a file a redo grew before this ran."""
@@ -886,6 +900,40 @@ class IndexStore:
         # diagnostic count across that boundary.
         self._invalidate_tombstone_backlog()
         header = self._read_header(proved_present=proved_present)
+        return self._finish_open(header)
+
+    def _open_existing(self, *, proved_present: bool) -> IndexHeader:
+        """Combine native creation-shape and open checks in one admission observation.
+
+        The file extent and pinned header are local to this call, never retained as
+        authority. Registration still performs its independent freshness and heap-view
+        certificates afterwards. Custom public admission hooks keep the canonical path.
+        """
+        present = _page_count_if_present(
+            self._pool.storage, self.file, proved_present=proved_present
+        )
+        header = None
+        if present:
+            with self._pool.pinned(self.file, HEADER_PAGE_INDEX) as page:
+                if (
+                    not page.is_pristine()
+                    and page.page_type == int(PageType.META)
+                    and page.slot_count > INDEX_HEADER_SLOT
+                ):
+                    header = self._decode_header_page(page)
+        if header is None:
+            raise GrafxIndexError(
+                f"Index {self.name!r} has no complete existing file to register without "
+                "creating or repairing one.",
+                field="file", file=self.file, index=self.name,
+            )
+        self._invalidate_tombstone_backlog()
+        return self._finish_open(header, page_count=present)
+
+    def _finish_open(
+        self, header: IndexHeader, *, page_count: int | None = None
+    ) -> IndexHeader:
+        """Finish one header admission; an optional extent belongs only to that call."""
         definition = self._definition
         if header.digest != self._definition_digest:
             raise GrafxIndexError(
@@ -917,12 +965,13 @@ class IndexStore:
                 expected=definition.artifact_nonce,
                 observed=header.artifact_nonce,
             )
-        wanted = 1 + header.bucket_count
-        if self._pool.storage.page_count(self.file) < wanted:
+        wanted = self._minimum_pages()
+        present = self._pool.storage.page_count(self.file) if page_count is None else page_count
+        if present < wanted:
             raise GrafxCorruptionDetected(
                 f"Index {definition.name!r} declares {header.bucket_count} buckets, which needs "
                 f"{wanted} pages; the file holds "
-                f"{self._pool.storage.page_count(self.file)}.",
+                f"{present}.",
                 file=self.file,
                 field="bucket_count",
                 value=header.bucket_count,
@@ -2768,7 +2817,7 @@ class IndexStore:
                 for slot, payload in page.iter_slot_views()
             )
 
-    def _entry_headers(self) -> tuple[_IndexEntryHeader, ...]:
+    def _entry_headers(self, *, max_entries: int | None = None) -> tuple[_IndexEntryHeader, ...]:
         """Materialise every validated entry header in canonical walk order.
 
         This is the build-only middle ground between scalar/ref-only scans and the public full
@@ -2792,6 +2841,11 @@ class IndexStore:
                             versioned,
                         ) = _validated_image(image)
                         _require_decodable_ref(encoded_ref)
+                        if max_entries is not None and len(headers) >= max_entries:
+                            raise GrafxQueryBudgetExceeded(
+                                "Index header materialization budget exceeded.",
+                                resource="index_entry_headers", limit=max_entries,
+                            )
                         headers.append(
                             _IndexEntryHeader(
                                 page=page_index,
@@ -3687,6 +3741,10 @@ class IndexStore:
         """Return the head page of a bucket: buckets follow the header page, in order."""
         return bucket + 1
 
+    def _minimum_pages(self) -> int:
+        """Return the mandatory physical directory extent for this layout."""
+        return 1 + self._definition.bucket_count
+
     def assisted_rehash_pressure(self) -> tuple[int, int]:
         """Return ``(head_entries, overflow_pages)`` without walking bucket chains.
 
@@ -3754,6 +3812,8 @@ class IndexStore:
         *,
         first_matching_page: bool = False,
         keys: frozenset[bytes] | None = None,
+        max_matches: int | None = None,
+        visit: Callable[[], None] | None = None,
     ) -> tuple[tuple[PageIndex, ...], tuple[IndexEntry, ...]]:
         """Validate one chain and optionally collect matches during that same page pass.
 
@@ -3793,6 +3853,8 @@ class IndexStore:
         limit: int | None = None
         index: PageIndex = self._bucket_head(bucket)
         while index != NO_PAGE:
+            if visit is not None:
+                visit()
             if limit is None and len(pages) >= lazy_bound_after:
                 limit = self._pool.storage.page_count(self.file) + 1
             if limit is not None:
@@ -3809,10 +3871,16 @@ class IndexStore:
             with self._pool.pinned(self.file, index) as page:
                 self._require_index_page(page, index)
                 if key is not None and not matching_complete:
-                    for slot, image in page.iter_slot_views():
-                        entry = IndexEntry.decode_if_matches(image, key, ref)
-                        if entry is not None:
-                            matches.append(entry.located_at(index, slot))
+                    if self._key_page_memo is None:
+                        from okto_grafx.engine.key_page_memo import KeyPageMemo
+                        self._key_page_memo = KeyPageMemo()
+                    for entry in self._key_page_memo.matches(page, key, ref):
+                        if max_matches is not None and len(matches) >= max_matches:
+                            raise GrafxQueryBudgetExceeded(
+                                "Exact candidate capture budget exceeded.",
+                                resource="index_candidates",
+                            )
+                        matches.append(entry)
                     if first_matching_page and matches:
                         # Scalar mutation historically stopped decoding after the first page
                         # with a match, while its preceding chain walk still validated every
@@ -3823,6 +3891,11 @@ class IndexStore:
                         raw, encoded_ref, born, dead, versioned = _validated_image(image)
                         stored_key = bytes(raw[INDEX_ENTRY_HEADER_SIZE:])
                         if stored_key in keys:
+                            if max_matches is not None and len(matches) >= max_matches:
+                                raise GrafxQueryBudgetExceeded(
+                                    "Exact candidate capture budget exceeded.",
+                                    resource="index_candidates",
+                                )
                             matches.append(IndexEntry(
                                 key=stored_key, ref=RecordRef.decode(encoded_ref),
                                 versioned=versioned, born_csn=born, dead_csn=dead,
@@ -4269,6 +4342,11 @@ def primary_key_index(
     )
 
 
+_NATIVE_ADMISSION_HOOKS = (
+    IndexStore.exists, IndexStore.is_created, IndexStore.open, IndexStore._read_header
+)
+
+
 class IndexManager:
     """The registry of the indexes of one database, and the door callers use (SPEC-M1 FR-12).
 
@@ -4294,6 +4372,7 @@ class IndexManager:
         "_definition_match",
         "_projection_context",
         "_live_commit_context",
+        "_key_cache_limits",
     )
 
     def __init__(
@@ -4305,6 +4384,8 @@ class IndexManager:
         artifact_nonce: Callable[[], int] | None = None,
         projection_context: ScopedValue | None = None,
         live_commit_context: ScopedValue | None = None,
+        key_cache_pages: int = 64,
+        key_cache_bytes: int = 1024 * 1024,
     ) -> None:
         """Build the registry over the pool and heap of one database.
 
@@ -4331,6 +4412,9 @@ class IndexManager:
                 )
         self._projection_context = projection_context
         self._live_commit_context = live_commit_context
+        from okto_grafx.engine.key_page_memo import KeyPageMemo
+        KeyPageMemo(key_cache_pages, key_cache_bytes)  # validate manual composition too
+        self._key_cache_limits = (key_cache_pages, key_cache_bytes)
         self._indexes: dict[str, IndexStore] = {}
         self._index_keys_by_table: dict[tuple[int, str], set[str]] = {}
         self._published_lsn: Lsn = NO_LSN
@@ -4359,6 +4443,9 @@ class IndexManager:
     def _publish_registered_index(self, index: IndexStore) -> None:
         """Publish one raw ownership entry and its table-local structural key."""
 
+        if index._key_page_memo is None:
+            from okto_grafx.engine.key_page_memo import KeyPageMemo
+            index._key_page_memo = KeyPageMemo(*self._key_cache_limits)
         key = index.definition.registry_key
         previous = self._indexes.get(key)
         if previous is not None and previous is not index:
@@ -4465,7 +4552,12 @@ class IndexManager:
             nonce = self._artifact_nonce()
         index._set_creation_nonce(nonce)
         header: IndexHeader
-        if existing_only:
+        if existing_only and (
+            type(index).exists, type(index).is_created,
+            type(index).open, type(index)._read_header,
+        ) == _NATIVE_ADMISSION_HOOKS:
+            header = index._open_existing(proved_present=proved_present)
+        elif existing_only:
             # A read-only composition may inspect an existing accelerator, but it must never
             # repair a zero-length/torn one as a side effect of opening the database. ``create``
             # deliberately repairs that shape, so the strict route proves the structure first
@@ -5805,6 +5897,7 @@ class IndexManager:
         """
 
         def belongs_to_requested_table(index: IndexStore) -> bool:
+            """Check that this index describes the requested table and schema."""
             definition = index.definition
             if definition.table_id != table_id or (
                 table_name is not None and definition.table_name != table_name
@@ -6215,6 +6308,27 @@ class IndexManager:
                 if table_id not in high_waters:
                     table = self._heap.catalog.catalog.table_by_id(table_id)
                     high_waters[table_id] = self._heap.committed_high_water(table)
+        # A future table write is not evidence of a write AT the checkpoint. Redo
+        # may already have installed future heap stamps; clamping max(stamps) to
+        # the checkpoint invented a missing index interval and poisoned sound
+        # baseline generations before their complete retained WAL was replayed.
+        # Native heaps derive the actual maximum at/below the checkpoint; unknown
+        # collaborators retain the previous conservative refusal.
+        if type(self._heap) is HeapStore and floor:
+            # A generation already covering the floor cannot be falsely shortened by
+            # this comparison. Only ambiguous older generations need a historical walk;
+            # healthy replay/checkpoint paths keep their established scoped photo cost.
+            historical_tables = {
+                index.definition.table_id
+                for index in indexes
+                if high_waters[index.definition.table_id] > floor
+                and index._fresh_certificate().header.built_through_lsn < floor
+            }
+            for table_id in historical_tables:
+                table = self._heap.catalog.catalog.table_by_id(table_id)
+                high_waters[table_id] = self._heap.committed_high_water(
+                    table, through_lsn=floor
+                )
         return tuple(
             index
             for index in indexes
@@ -6449,6 +6563,19 @@ class IndexManager:
 
     # --- staging ----------------------------------------------------------------------------
 
+    @staticmethod
+    def _row_keys(txn: StagingTransaction | None, definition: IndexDefinition,
+                  record_id: object, values: Sequence[object]) -> tuple[bytes, ...]:
+        """Share bounded pure text analysis within the transaction, never authority."""
+        if type(txn) is TransactionContext and is_fulltext(definition.key_derivation):
+            if txn._text_analysis_memo is None:
+                limit = txn._max_transaction_bytes
+                txn._text_analysis_memo = TextAnalysisMemo(
+                    min(1_048_576, limit // 8) if limit is not None else 1_048_576
+                )
+            return txn._text_analysis_memo.keys(values, definition.positions, definition.key_derivation)
+        return definition.entry_keys_for_record(record_id, values)
+
     def row_entry_count(
         self,
         table_id: int,
@@ -6479,9 +6606,10 @@ class IndexManager:
             else _active_indexes
         )
         return sum(
-            1
+            (len(self._row_keys(txn, index.definition, record_id, values))
+             if is_fulltext(index.definition.key_derivation)
+             else index.definition.entry_count_for_record(record_id, values))
             for index in indexes
-            if index.definition.owes_entry_for_record(record_id, values)
         )
 
     def stage_row_insert(
@@ -6511,14 +6639,8 @@ class IndexManager:
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
-                records.append(
-                    index.stage_insert(
-                        txn,
-                        definition.key_for_record(record_id, values),
-                        ref,
-                        csn,
-                    )
-                )
+                for key in self._row_keys(txn, definition, record_id, values):
+                    records.append(index.stage_insert(txn, key, ref, csn))
         return tuple(records)
 
     def stage_row_delete(
@@ -6548,14 +6670,8 @@ class IndexManager:
             if not definition.owes_entry_for_record(record_id, values):
                 index.stage_empty_observation(txn)
             else:
-                records.append(
-                    index.stage_delete(
-                        txn,
-                        definition.key_for_record(record_id, values),
-                        ref,
-                        csn,
-                    )
-                )
+                for key in self._row_keys(txn, definition, record_id, values):
+                    records.append(index.stage_delete(txn, key, ref, csn))
         return tuple(records)
 
     def stage_row_update(
@@ -6589,23 +6705,11 @@ class IndexManager:
             if not owes_old and not owes_new:
                 index.stage_empty_observation(txn)
             elif owes_old:
-                records.append(
-                    index.stage_delete(
-                        txn,
-                        definition.key_for_record(record_id, old_values),
-                        old_ref,
-                        csn,
-                    )
-                )
+                for key in self._row_keys(txn, definition, record_id, old_values):
+                    records.append(index.stage_delete(txn, key, old_ref, csn))
             if owes_new:
-                records.append(
-                    index.stage_insert(
-                        txn,
-                        definition.key_for_record(record_id, new_values),
-                        new_ref,
-                        csn,
-                    )
-                )
+                for key in self._row_keys(txn, definition, record_id, new_values):
+                    records.append(index.stage_insert(txn, key, new_ref, csn))
         return tuple(records)
 
     def _commit_under_write_authority(self, txn: StagingTransaction, csn: Csn) -> int:
@@ -6676,6 +6780,10 @@ class IndexManager:
         )
         for index in indexes:
             observed = observations[index]
+            statistics_changes = (
+                tuple(index.pending(txn)) if has_durable_statistics(index.definition.key_derivation)
+                else None
+            )
             if authorised_scope is not None:
                 authorised_scope.store = index
             try:
@@ -6695,6 +6803,10 @@ class IndexManager:
                     # Preserve custom store overrides and their existing two-arg
                     # contract. They keep scalar validation, not ambient authority.
                     moved = commit(txn, csn)
+                if statistics_changes is not None and observed:
+                    from okto_grafx.engine.fulltext_durable import finish_statistics
+                    finish_statistics(index, statistics_changes, csn)
+                    self._pool.flush(index.file)
             finally:
                 if authorised_scope is not None:
                     authorised_scope.store = None
@@ -7409,6 +7521,7 @@ class IndexManager:
             return ()
 
         def confirm(certificate: _IndexReadCertificate) -> tuple[int, ...]:
+            """Validate candidate groups against the selected index and heap view."""
             self._prepare_heap_view(index.file, certificate)
             answers: dict[bytes, int] = {}
             for wanted, candidates in index._candidate_groups_unchecked(distinct):
@@ -7559,6 +7672,7 @@ class IndexManager:
             bool,
             tuple[tuple[tuple[RecordRef, HeapVersion], ...], ...],
         ]:
+            """Validate candidate groups against the selected index and heap view."""
             reusable = (
                 type(generation) is _IndexReadCertificate
                 and certificate == generation
@@ -7782,14 +7896,12 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for_record(version.record_id, version.values)
-            if key is None:
-                continue
-            index.stage_insert(txn, key, ref, version.xmin)
-            staged += 1
-            if not is_open_end_csn(version.xmax):
-                index.stage_delete(txn, key, ref, version.xmax)
+            for key in definition.entry_keys_for_record(version.record_id, version.values):
+                index.stage_insert(txn, key, ref, version.xmin)
                 staged += 1
+                if not is_open_end_csn(version.xmax):
+                    index.stage_delete(txn, key, ref, version.xmax)
+                    staged += 1
         return staged
 
     def _allocate_detached_generation_nonce(self, occupied: Collection[int]) -> int:
@@ -7961,8 +8073,7 @@ class IndexManager:
                     )
                 ended_at = version.xmax
 
-            key = definition.entry_key_for_record(version.record_id, version.values)
-            if key is not None:
+            for key in definition.entry_keys_for_record(version.record_id, version.values):
                 yield ref, key, ended_at
 
     def _count_detached_exact_generation_entries(
@@ -8028,8 +8139,13 @@ class IndexManager:
             index: IndexStore = OrderedIndex(
                 definition, self._pool, self._metrics
             )
+        elif definition.layout is IndexLayout.SPARSE_HASH:
+            from okto_grafx.engine.sparse_hash import SparseHashIndex
+            index = SparseHashIndex(definition, self._pool, self._metrics)
         else:
             index = HashIndex(definition, self._pool, self._metrics)
+        from okto_grafx.engine.key_page_memo import KeyPageMemo
+        index._key_page_memo = KeyPageMemo(*self._key_cache_limits)
         index._set_creation_nonce(definition.artifact_nonce)
         collision = next(
             (
@@ -8084,9 +8200,18 @@ class IndexManager:
                 index.create(proved_present=True)
 
                 empty_build = _EmptyIndexBuild()
-                for ref, key, ended_at in self._detached_exact_generation_entries(
-                    definition, position, table
-                ):
+                text_statistics = None
+                if has_durable_statistics(definition.key_derivation):
+                    from okto_grafx.engine.fulltext_durable import (
+                        collect_build_statistics, publish_statistics,
+                    )
+                    text_statistics = (0, (0,) * len(definition.positions))
+                build_entries = self._detached_exact_generation_entries(definition, position, table)
+                if definition.layout is IndexLayout.SPARSE_HASH:
+                    build_entries = index._prepare_build_entries(build_entries, position)
+                for ref, key, ended_at in build_entries:
+                    if text_statistics is not None:
+                        text_statistics = collect_build_statistics(text_statistics, key, ended_at)
                     insert = IndexChange(
                         index=definition.name,
                         operation=IndexOperation.INSERT,
@@ -8111,6 +8236,8 @@ class IndexManager:
                         )
                         if accelerated is None:
                             index._apply_change(tombstone, position)
+                if text_statistics is not None:
+                    publish_statistics(index, position, *text_statistics)
 
             # The header claim is flushed before verification, and the final checkpoint below
             # then barriers the complete verified generation as one unreachable shadow.
@@ -8254,6 +8381,8 @@ class IndexManager:
     def _verify_entries(self, index: IndexStore) -> tuple[IndexFinding, ...]:
         """Check every stored entry against the heap version it points at."""
         findings: list[IndexFinding] = []
+        analysis = TextAnalysisMemo()
+        text_statistics = [0, [0] * len(index.definition.positions)] if has_durable_statistics(index.definition.key_derivation) else None
         entries: tuple[IndexEntry, ...]
         try:
             entries = index.walk()
@@ -8287,11 +8416,29 @@ class IndexManager:
                     )
                 )
                 continue
-            findings.extend(self._compare(index, entry, version))
+            findings.extend(self._compare(index, entry, version, analysis=analysis))
+            if (text_statistics is not None and entry.key.startswith(b"\x00")
+                    and is_committed_csn(version.xmin) and is_open_end_csn(version.xmax)
+                    and version.table_id == index.definition.table_id):
+                fields = analysis.fields(version.values, index.definition.positions,
+                                         decode_text_options(index.definition.key_derivation))
+                text_statistics[0] += 1
+                text_statistics[1] = [a + len(b) for a, b in zip(text_statistics[1], fields, strict=True)]
+        if text_statistics is not None:
+            from okto_grafx.engine.fulltext_durable import read_statistics
+            try:
+                _, count, totals = read_statistics(index)
+                if count != text_statistics[0] or totals != tuple(text_statistics[1]):
+                    findings.append(IndexFinding(kind="index_heap_divergence", index=index.name,
+                                                 detail="Durable text statistics differ from heap census.", file=index.file, page=0))
+            except GrafxCorruptionDetected as damaged:
+                findings.append(IndexFinding(kind="index_page_damaged", index=index.name,
+                                             detail=damaged.message, file=index.file, page=0))
         return tuple(findings)
 
     def _compare(
-        self, index: IndexStore, entry: IndexEntry, version: HeapVersion
+        self, index: IndexStore, entry: IndexEntry, version: HeapVersion,
+        *, analysis: TextAnalysisMemo | None = None,
     ) -> tuple[IndexFinding, ...]:
         """Compare one entry against the heap version it points at."""
         definition = index.definition
@@ -8317,8 +8464,9 @@ class IndexManager:
             # never have persisted its reserved birth stamp.
             return ()
         if (
-            definition.entry_key_for_record(version.record_id, version.values)
-            != entry.key
+            not (entry.key in analysis.keys(version.values, definition.positions, definition.key_derivation)
+                 if analysis is not None and is_fulltext(definition.key_derivation)
+                 else definition.entry_matches(entry.key, version.record_id, version.values))
         ):
             findings.append(
                 IndexFinding(
@@ -8403,10 +8551,8 @@ class IndexManager:
         for ref, version in self._heap.scan_all(table):
             if is_provisional_csn(version.xmin):
                 continue
-            key = definition.entry_key_for_record(version.record_id, version.values)
-            if key is None:
-                continue
-            if (key, ref) in stored:
+            keys = definition.entry_keys_for_record(version.record_id, version.values)
+            if all((key, ref) in stored for key in keys):
                 continue
             if not is_open_end_csn(version.xmax) and version.xmax <= reconciled:
                 # The entry was released by a reconciliation pass this index has recorded, so its

@@ -30,6 +30,7 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxTransactionStateError,
     GrafxUnsupportedOperation,
+    GrafxQueryBudgetExceeded,
 )
 from okto_grafx.domain.ids import (
     NO_CSN,
@@ -596,6 +597,8 @@ class HeapVacuumTablePlan:
     reclaimed_slot_bytes: int
     relinked_versions: int
     skipped_overflow_versions: int
+    eligible_overflow_versions: int = 0
+    reclaimed_overflow_pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,6 +642,8 @@ class HeapStore:
         "_bootstrapped_epoch",
         "_extent_proof_seal",
         "_tuple_encoding_proofs",
+        "_overflow_reuse_cursor",
+        "_free_index_cursor",
     )
 
     def __init__(
@@ -658,6 +663,8 @@ class HeapStore:
         self._catalog: CatalogStore = catalog
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._file: str = file
+        self._overflow_reuse_cursor: tuple[int, int, int] | None = None
+        self._free_index_cursor: tuple[int, int, int, int] | None = None
         # The resolved tail of each table, so an append stays O(1) after the first walk. It is a
         # cache of this instance and of nothing else: the durable hint on page 0 is what a cold
         # start and another process read (A40.3).
@@ -1204,12 +1211,13 @@ class HeapStore:
         *,
         max_versions: int | None = None,
     ) -> HeapVacuumPlan:
-        """Build copy-on-write images that reclaim eligible inline MVCC versions.
+        """Build copy-on-write images that reclaim horizon-eligible MVCC versions.
 
         The plan never mutates a resident frame.  Candidate discovery is header-only; a second
         deterministic pass rewrites retained chain links, frees selected slots, compacts each
-        touched page, and emits full page images for the ordinary WAL path.  Overflow versions
-        are counted but retained by vacuum v1.
+        touched page, and emits full page images for the ordinary WAL path. Overflow chains
+        are released only after a database-wide exclusive-ownership proof. Released pages
+        are marked FREE for subsequent guarded reuse, never truncated by this plan.
         """
 
         if (
@@ -1262,6 +1270,7 @@ class HeapStore:
         pages_by_table: dict[int, tuple[PageIndex, ...]] = {}
         reclaimed_bytes_by_table: dict[int, int] = {}
         selected_by_table: dict[int, int] = {}
+        overflow_eligible: dict[int, int] = {}
         remaining = max_versions
         for table in ordered:
             pages = self.pages_of(table)
@@ -1276,9 +1285,9 @@ class HeapStore:
                 ):
                     continue
                 if header.has_overflow:
-                    skipped += 1
-                    continue
-                eligible += 1
+                    overflow_eligible[table.table_id] = overflow_eligible.get(table.table_id, 0) + 1
+                else:
+                    eligible += 1
                 if remaining is None or remaining > 0:
                     selected[ref] = header
                     selected_table[ref] = table.table_id
@@ -1288,11 +1297,14 @@ class HeapStore:
                     )
                     if remaining is not None:
                         remaining -= 1
+                elif header.has_overflow:
+                    skipped += 1
             eligible_by_table[table.table_id] = eligible
             skipped_by_table[table.table_id] = skipped
 
+        overflow_images, overflow_counts = self._plan_overflow_reclaim(selected)
         relinked_by_table: dict[int, int] = {}
-        page_images: list[tuple[PageIndex, bytes]] = []
+        page_images: list[tuple[PageIndex, bytes]] = list(overflow_images)
         found: set[RecordRef] = set()
         for table in ordered:
             for page_index in pages_by_table[table.table_id]:
@@ -1398,6 +1410,8 @@ class HeapStore:
                 reclaimed_slot_bytes=reclaimed_bytes_by_table.get(table.table_id, 0),
                 relinked_versions=relinked_by_table.get(table.table_id, 0),
                 skipped_overflow_versions=skipped_by_table[table.table_id],
+                eligible_overflow_versions=overflow_eligible.get(table.table_id, 0),
+                reclaimed_overflow_pages=overflow_counts.get(table.table_id, 0),
             )
             for table in ordered
         )
@@ -1406,8 +1420,73 @@ class HeapStore:
             page_images=tuple(sorted(page_images)),
             tables=table_plans,
             complete=sum(plan.reclaimed_versions for plan in table_plans)
-            == sum(plan.eligible_inline_versions for plan in table_plans),
+            == sum(plan.eligible_inline_versions + plan.eligible_overflow_versions for plan in table_plans),
         )
+
+    def _plan_overflow_reclaim(
+        self, selected: Mapping[RecordRef, RecordHeader]
+    ) -> tuple[tuple[tuple[PageIndex, bytes], ...], dict[int, int]]:
+        """Prove unique ownership before releasing any selected overflow chain.
+
+        The caller holds the existing quiescent maintenance window. Inspect all
+        tables, including unselected ones: a corrupt retained record must never
+        lose its payload because a selected record aliases the same chain.
+        No resident page is changed and no payload is materialized here.
+        """
+        wanted = {ref for ref, header in selected.items() if header.has_overflow}
+        if not wanted:
+            return (), {}
+        owners: set[PageIndex] = set()
+        images: list[tuple[PageIndex, bytes]] = []
+        counts: dict[int, int] = {}
+        found: set[RecordRef] = set()
+        extent = self._pool.storage.page_count(self._file)
+        capacity = self._pool.page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE
+        for table in self._catalog.catalog.tables():
+            for ref, header, content in self._walk(table):
+                if not header.has_overflow:
+                    continue
+                assert content is not None
+                page_index = decode_overflow_pointer(content, RECORD_HEADER_SIZE)
+                remaining = header.payload_len
+                releasing = ref in wanted
+                if releasing:
+                    if header != selected[ref]:
+                        raise GrafxTransactionStateError(
+                            "Overflow reclaim candidate changed.", field="vacuum_candidate"
+                        )
+                    found.add(ref)
+                while page_index != NO_PAGE:
+                    if not 0 < page_index < extent or page_index in owners:
+                        raise GrafxCorruptionDetected(
+                            "Overflow reclaim found an invalid, cyclic or shared chain.",
+                            file=self._file, page=page_index, field="overflow_ownership",
+                        )
+                    owners.add(page_index)
+                    page = self._pool.read_fresh_page(self._file, page_index)
+                    if (page.page_type != int(PageType.OVERFLOW) or page.slot_count != 1
+                            or len(page.read_slot(0)) != min(remaining, capacity) or remaining <= 0):
+                        raise GrafxCorruptionDetected(
+                            "Overflow reclaim requires complete, well-formed payload coverage.",
+                            file=self._file, page=page_index, field="overflow_payload",
+                        )
+                    remaining -= len(page.read_slot(0))
+                    if releasing:
+                        blank = Page(int(PageType.FREE), page_size=self._pool.page_size,
+                                     page_index=page_index, page_lsn=page.page_lsn, seq=page.seq)
+                        images.append((page_index, self._pool.codec.encode_page(blank)))
+                        counts[table.table_id] = counts.get(table.table_id, 0) + 1
+                    page_index = page.next_page
+                if remaining:
+                    raise GrafxCorruptionDetected(
+                        "Overflow reclaim found an incomplete payload.",
+                        file=self._file, field="overflow_payload",
+                    )
+        if found != wanted:
+            raise GrafxTransactionStateError(
+                "Overflow reclaim candidates disappeared.", field="vacuum_candidate"
+            )
+        return tuple(images), counts
 
     def allocate_record_id(self, table: TableDef) -> RecordId:
         """Take the next row identity of this table and record that it is spent.
@@ -1832,7 +1911,7 @@ class HeapStore:
 
     # --- reading ---------------------------------------------------------------------------
 
-    def committed_high_water(self, table: TableDef) -> Lsn:
+    def committed_high_water(self, table: TableDef, *, through_lsn: Lsn | None = None) -> Lsn:
         """Return the highest committed birth or end stamp stored for ``table``.
 
         Index freshness is a property of the table an index covers, not of unrelated commits
@@ -1842,13 +1921,19 @@ class HeapStore:
 
         ``NO_CSN`` means that no committed version or end is present. Provisional stamps are
         abandoned, unpublished attempts and therefore cannot raise the committed watermark.
+        ``through_lsn`` includes only actual stamps at or before that replay ceiling;
+        a later stamp is excluded, never clamped to an invented earlier table write.
         """
+        if through_lsn is not None and (type(through_lsn) is not int or not 0 <= through_lsn < PROVISIONAL_CSN):
+            raise GrafxConfigurationError("Invalid historical watermark ceiling.", field="through_lsn")
         high_water: Lsn = NO_LSN
 
         def observe(record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Validate record lifetime coordinates and accumulate the committed high watermark."""
             nonlocal high_water
             if is_committed_csn(xmin):
-                high_water = max(high_water, xmin)
+                if through_lsn is None or xmin <= through_lsn:
+                    high_water = max(high_water, xmin)
             elif xmin != NO_CSN and not is_provisional_csn(xmin):
                 raise GrafxCorruptionDetected(
                     f"Record {record_id} of table {table.name!r} has invalid birth "
@@ -1861,7 +1946,8 @@ class HeapStore:
                     value=xmin,
                 )
             if is_committed_csn(xmax):
-                high_water = max(high_water, xmax)
+                if through_lsn is None or xmax <= through_lsn:
+                    high_water = max(high_water, xmax)
             elif xmax != NO_CSN and not is_provisional_csn(xmax):
                 raise GrafxCorruptionDetected(
                     f"Record {record_id} of table {table.name!r} has invalid end "
@@ -1912,6 +1998,29 @@ class HeapStore:
             return None
         return self._decode_version_with_header(
             table, RecordHeader._from_peek(fields), content
+        )
+
+    def _read_if_projected(
+        self,
+        ref: RecordRef,
+        accept: Callable[[RecordId, Csn, Csn], bool],
+        materialized_positions: frozenset[int],
+    ) -> HeapVersion | None:
+        """Validate the full accepted payload, allocating only proven required columns.
+
+        Specialized header-read hooks retain their canonical behavior. Visibility,
+        overflow traversal and schema validation are identical to ``read_if``.
+        """
+        if getattr(self.read_if, "__func__", None) is not _NATIVE_HEAP_READ_IF:
+            return self.read_if(ref, accept)
+        table_id, content = self._read_slot(ref)
+        table = self._catalog.catalog.table_by_id(table_id)
+        fields = RecordHeader.peek(content)
+        if not accept(fields[4], fields[5], fields[6]):
+            return None
+        return self._decode_version_with_header(
+            table, RecordHeader._from_peek(fields), content,
+            materialized_positions=materialized_positions,
         )
 
     def _revalidate_visible_ref(
@@ -2002,6 +2111,7 @@ class HeapStore:
         """
 
         def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Return visibility under the owning transaction snapshot."""
             return snapshot.visible(xmin, xmax)
 
         for ref, header, content in self._walk(table, accept=visible):
@@ -2051,6 +2161,9 @@ class HeapStore:
         *,
         limit: int,
         position: _HeapScanPosition | None = None,
+        materialized_positions: frozenset[int] | None = None,
+        max_batch_bytes: int | None = None,
+        check: Callable[[], None] | None = None,
     ) -> tuple[
         tuple[tuple[RecordRef, HeapVersion], ...],
         _HeapScanPosition | None,
@@ -2061,6 +2174,9 @@ class HeapStore:
         between calls.  It decodes at most ``limit`` row payloads.  Headers beyond the boundary
         may be inspected to locate the next visible row, so a non-terminal page never requires an
         empty follow-up call, but that look-ahead does not decode the row's values.
+        Optional materialized positions preserve full skipped-payload validation. A logical
+        byte cap stops before admitting the next row; a first row that cannot fit refuses.
+        The check callback observes read control at page, slot and decode boundaries.
         """
 
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -2116,13 +2232,18 @@ class HeapStore:
                 )
 
         selected: list[tuple[RecordRef, RecordHeader, bytes]] = []
+        charged = 0
         next_position: _HeapScanPosition | None = None
         while index != NO_PAGE:
+            if check is not None:
+                check()
             self._refuse_endless_chain(table, pages_walked, chain_limit)
             with self._pool.pinned(self._file, index) as page:
                 self._require_table_page(page, table)
                 following = page.next_page
                 for slot in page.live_slots():
+                    if check is not None:
+                        check()
                     if slot < max(start_slot, FIRST_RECORD_SLOT):
                         continue
                     view = page.slot_view(slot)
@@ -2140,7 +2261,14 @@ class HeapStore:
                     if not snapshot.visible(xmin, xmax):
                         continue
                     header = RecordHeader._from_peek(fields)
-                    if len(selected) == limit:
+                    row_charge = 0 if max_batch_bytes is None else 512 + 64 * len(table.columns) + 64 * header.payload_len
+                    over_bytes = max_batch_bytes is not None and charged + row_charge > max_batch_bytes
+                    if over_bytes and not selected:
+                        raise GrafxQueryBudgetExceeded(
+                            "A scan row exceeds the logical batch bound.", resource="scan_batch",
+                            requested=row_charge, limit=max_batch_bytes,
+                        )
+                    if len(selected) == limit or over_bytes:
                         next_position = _HeapScanPosition(
                             page=index,
                             slot=slot,
@@ -2148,6 +2276,7 @@ class HeapStore:
                             chain_limit=chain_limit,
                         )
                         break
+                    charged += row_charge
                     selected.append(
                         (RecordRef(page=index, slot=slot), header, bytes(view))
                     )
@@ -2182,11 +2311,16 @@ class HeapStore:
 
         # Decoding can follow overflow chains, so it happens only after every data-page pin above
         # has been released. ``selected`` contains at most ``limit`` payloads.
-        rows = tuple(
-            (ref, self._decode_version_with_header(table, header, content))
-            for ref, header, content in selected
-        )
-        return rows, next_position
+        rows = []
+        for ref, header, content in selected:
+            if check is not None:
+                check()
+            rows.append((ref, self._decode_version_with_header(table, header, content)
+                         if materialized_positions is None else self._decode_version_with_header(
+                             table, header, content, materialized_positions=materialized_positions)))
+        if check is not None:
+            check()
+        return tuple(rows), next_position
 
     def scan_all(self, table: TableDef) -> Iterator[tuple[RecordRef, HeapVersion]]:
         """Yield every stored version of the table, visible or not.
@@ -2530,8 +2664,10 @@ class HeapStore:
         if RECORD_HEADER_SIZE + len(payload) <= self.inline_capacity:
             content = header.encode() + payload
         else:
+            capacity = self._pool.page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE
             chain = write_chain(
-                self._pool, self._file, payload, page_type=int(PageType.OVERFLOW)
+                self._pool, self._file, payload, page_type=int(PageType.OVERFLOW),
+                reuse=self._retired_overflow_candidates((len(payload) + capacity - 1) // capacity),
             )
             overflowed = replace(header, flags=header.flags | RECORD_FLAG_HAS_OVERFLOW)
             content = overflowed.encode() + encode_overflow_pointer(chain[0])
@@ -2545,6 +2681,66 @@ class HeapStore:
             cursor.extent = settled_extent
             cursor.derived_epoch = self._derived_read_epoch()
         return reference
+
+    def _retired_overflow_candidates(self, count: int) -> tuple[PageIndex, ...]:
+        """Consume advisory candidates under the caller's ordinary commit fence.
+
+        Authority remains the current page image, not this cursor: only empty, terminal FREE
+        pages with a committed page LSN in a heap with a durable reclaim floor qualify.
+        Vacuum proved that no retained version owns those pages before publishing FREE and
+        the snapshot floor in the same WAL transaction. Unwritten/abandoned allocations with
+        LSN zero do not qualify. No mutable free-list head can escape before COMMIT.
+
+        Scan a fixed physical extent at most once per floor per participant, retaining O(1)
+        advisory state. A new vacuum floor restarts discovery; ordinary commits do not. A
+        failed attempt may burn a local candidate until that restart, but cannot create reuse
+        authority. The chain writer preserves page LSN/sequence and normal WAL/OCC/quota paths.
+        """
+        if HEAP_RECLAIM_V1_CAPABILITY not in self._catalog.catalog.required_capabilities():
+            return ()
+        floor = self.reclaim_floor()
+        if floor == NO_LSN:
+            return ()
+        token = self._pool.read_view_token()
+        horizon = getattr(token, "last_committed_lsn", None)
+        if type(horizon) is not int:
+            # Unqualified manual compositions have no current durable publication proof.
+            # They may append normally but cannot opt into persisted physical reuse.
+            return ()
+        from okto_grafx.engine.free_page_index import CAPABILITY, pop_candidates
+        if CAPABILITY in self._catalog.catalog.required_capabilities():
+            candidates = pop_candidates(self, count, horizon)
+            if candidates is not None:
+                return candidates
+        cursor = self._overflow_reuse_cursor
+        if cursor is None or cursor[0] != floor:
+            cursor = (floor, 1, self._pool.storage.page_count(self._file))
+        _, position, stop = cursor
+        selected: list[int] = []
+        while position < stop and len(selected) < count:
+            candidate = position
+            position += 1
+            # Advance even on refusal. The cursor is never a promise that a page is free.
+            self._overflow_reuse_cursor = (floor, position, stop)
+            with self._pool.pinned(self._file, candidate) as page:
+                if page.page_type != int(PageType.FREE):
+                    continue
+                if (page.slot_count != 0 or page.next_page != NO_PAGE
+                        or page.flags != 0 or page.header().reserved != 0):
+                    raise GrafxCorruptionDetected(
+                        "Overflow reuse found a malformed FREE page.",
+                        file=self._file, page=candidate, field="overflow_reuse",
+                    )
+                if page.page_lsn > horizon:
+                    raise GrafxCorruptionDetected(
+                        "Overflow reuse found a FREE page beyond the current committed view.",
+                        file=self._file, page=candidate, field="overflow_reuse_lsn",
+                        page_lsn=page.page_lsn, committed_lsn=horizon,
+                    )
+                if is_committed_csn(page.page_lsn):
+                    selected.append(candidate)
+        self._overflow_reuse_cursor = (floor, position, stop)
+        return tuple(selected)
 
     def _chain_limit(self) -> int:
         """Return the most hops any chain in this file can take before it must be a cycle.
@@ -3370,3 +3566,6 @@ class HeapStore:
 
     def __repr__(self) -> str:
         return f"HeapStore(file={self._file!r}, inline_capacity={self.inline_capacity})"
+
+
+_NATIVE_HEAP_READ_IF = HeapStore.read_if

@@ -1,7 +1,14 @@
 # SPEC-GX-CAP-5 — Native full-text search
 
-Status: specified / implementation not certified. Date: 2026-09-08.
+Status: v1 implemented and locally validated in the 0.0.5 development worktree.
+[Acceptance evidence and limits](../reports/V005_OPS2_FTS_CHECKPOINT.md). Date: 2026-09-08.
 Dependencies: Existing index lifecycle/freshness, budgets and planner; GX-CAP-0.
+
+Continuation after `69ed311`: bounded prefix expansion/postings and relationship
+STRING indexes are implemented; see [prefix bytes](FTS_PREFIX_V1.md),
+[relationship contract](FTS_RELATIONSHIPS_V1.md) and
+[acceptance receipt](../reports/V005_AFTER_69ED311.md). Phrase/position search and
+same-name analyzer replacement remain outside this slice.
 
 ## Normative scope
 
@@ -43,7 +50,10 @@ sections remain binding. Tests must include failing-before implementation cases 
 hostile inputs, not only happy paths. Publish operation counts and resource evidence
 when claiming complexity/performance improvements; no new marginal timing threshold.
 
-Execution status: **not implemented by GX-CAP-0**. No release, new on-disk capability,
-installed Pulse feature, or successful crash matrix is inferred from this document.
-Record immutable code SHA, test commands/results, audit and unresolved debt here when
-implemented. Next prerequisite is the first unmet dependency, not another scope expansion.
+Execution status: subsequently implemented as the operator-approved item 4, not by
+GX-CAP-0. [Consumer contracts/options](../FULL_TEXT_SEARCH.md) and the
+[exact persistent format](FULLTEXT_V1_FORMAT.md) describe v1. Complete-table build,
+multi-key WAL/quota accounting, updates/tombstones, fixed Unicode analyzer identity,
+weighted BM25, filters, typed/materialized procedure search and verification are wired.
+The [roadmap](../../ROADMAP.md) owns current acceptance status and residual limitations;
+no release, Pulse deployment or successful unrun platform matrix is inferred here.

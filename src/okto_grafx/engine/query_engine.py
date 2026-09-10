@@ -54,7 +54,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from heapq import heappop, heappush
+from heapq import heappop, heappush, heapreplace
 from types import MappingProxyType
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -142,6 +142,7 @@ from okto_grafx.domain.ports.query_spill import (
     QuerySpillWorkspace,
 )
 from okto_grafx.domain.query.memory import LogicalMemoryBudget
+from okto_grafx.domain.query.control import _ReadControl
 from okto_grafx.domain.txn.context import (
     SIZING_ENDPOINT,
     PendingRowRef,
@@ -252,6 +253,7 @@ from okto_grafx.domain.query.tokens import (
     TIMESTAMP_FUNCTION,
 )
 from okto_grafx.domain.vector.filter import CandidateFilter, RecordIdFilter
+from okto_grafx.domain.vector.space import require_space_identity
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.domain.model.catalog import (
     CATALOG_FORMAT_VERSION,
@@ -301,7 +303,12 @@ _STATEMENT_AUTHORITY_MEMO_MAX_ENTRIES: int = _PARSE_CACHE_MAX_ENTRIES
 # carries two of at most 500.  Beyond the ceiling the linear comparison stays the answer: the
 # memo is an accelerator over the same _freeze keys, never a second semantics.
 _IN_LIST_MEMO_MAX_TOTAL_ELEMENTS: int = 4_096
-_PLAN_CACHE_MAX_ENTRIES: int = 128
+_PLAN_CACHE_MAX_ENTRIES: int = 256
+# Optional retention limits, not query admission or process RSS guarantees. A layout-sized
+# working set must not cyclically thrash a smaller plan cache than the parsed statements.
+# Large texts still execute canonically, but do not retain AST/plan/authority graphs.
+_PREPARED_MAX_TEXT_CHARS: int = 16_384
+_PLAN_CACHE_MAX_BYTES: int = 32 * 1024 * 1024
 _PREPARED_PLAN_VERSION: int = 1
 _COMPILED_PREDICATE_MAX_ENTRIES: int = 256
 """Ceiling of the engine-local compiled WHERE predicates (EXEC-CSE).
@@ -309,7 +316,7 @@ _COMPILED_PREDICATE_MAX_ENTRIES: int = 256
 A compiled predicate is a tree of closures derived from one plan expression -- no row, no
 value, no snapshot, nothing a later statement could reuse as authority -- kept by the identity
 of the expression object of a cached plan, so a plan executed again never compiles again.  The
-oldest entry leaves when the ceiling is reached; the plan cache itself holds 128 plans.
+oldest entry leaves when the ceiling is reached; the plan cache itself holds at most 256 plans.
 """
 
 # An endpoint locator is derived, transaction-local acceleration.  These two ceilings are its
@@ -1052,10 +1059,12 @@ class _RevisionList(list[object]):
         self.rewrite_revision += 1
 
     def append(self, value: object) -> None:
+        """Append one value and advance the append revision."""
         super().append(value)
         self._appended()
 
     def extend(self, values: object) -> None:
+        """Extend the tracked list and account for any partial append."""
         before = len(self)
         try:
             super().extend(values)  # type: ignore[arg-type]
@@ -1064,6 +1073,7 @@ class _RevisionList(list[object]):
                 self._appended()
 
     def insert(self, index: int, value: object) -> None:
+        """Insert a value and invalidate retained rewrite-dependent state."""
         super().insert(index, value)
         self._rewritten()
 
@@ -1085,24 +1095,29 @@ class _RevisionList(list[object]):
         return self
 
     def pop(self, index: int = -1) -> object:
+        """Remove and return one value while advancing the rewrite revision."""
         value = super().pop(index)
         self._rewritten()
         return value
 
     def remove(self, value: object) -> None:
+        """Remove the requested value and advance the rewrite revision."""
         super().remove(value)
         self._rewritten()
 
     def clear(self) -> None:
+        """Clear nonempty tracked contents and invalidate the previous revision."""
         if self:
             super().clear()
             self._rewritten()
 
     def reverse(self) -> None:
+        """Reverse tracked contents and advance the rewrite revision."""
         super().reverse()
         self._rewritten()
 
     def sort(self, *args: object, **kwargs: object) -> None:
+        """Sort tracked contents and invalidate reuse even after a partial failure."""
         try:
             super().sort(*args, **kwargs)  # type: ignore[arg-type]
         finally:
@@ -1139,6 +1154,7 @@ class _PrimaryKeyFoldState:
     mutable_key_owners: dict[object, Value] = field(default_factory=dict)
 
     def reset(self, rewrite_revision: int) -> None:
+        """Reset the fold cursor and all outcomes for a new rewrite generation."""
         self.cursor = 0
         self.rewrite_revision = rewrite_revision
         self.generation += 1
@@ -1197,10 +1213,9 @@ class _PrimaryKeyStatementMemo:
 class _InListMemo:
     """Hashed picture of one detached IN parameter list, built at most once per statement.
 
-    Only an exact tuple whose elements are exact ``str``, exact ``bytes`` or ``None`` is
-    memoised: for those kinds ``_equal`` is nothing but ``_freeze`` key equality, so a set of
-    the same keys answers exactly what the linear walk answers.  Numbers stay on the walk
-    because ``1 = 1.0`` crosses Python types, and every other kind stays there too.  ``values``
+    Exact strings/bytes use their existing frozen keys; exact int64/float numbers use
+    the float-normalized equality of ``_equal`` (including its large-integer rounding).
+    NaN never contributes a hit, and booleans/custom values keep the walk. ``values``
     is the detached parameter object itself: an evaluation that meets a different object proves
     the memo stale instead of trusting the name.
     """
@@ -1208,6 +1223,7 @@ class _InListMemo:
     values: tuple[Value, ...]
     keys: frozenset[object]
     has_null: bool
+    has_numbers: bool = False
 
 
 @dataclass(slots=True)
@@ -1230,6 +1246,7 @@ class _Context:
     # tables and spaces from the same picture the planner did -- a row materialised for a table
     # whose vector space exists only in the working copy cannot ask the live catalog for it.
     catalog: Catalog | None = None
+    read_control: _ReadControl | None = None
     result_node: PlanNode | None = None
     union_coercions: tuple[bool, ...] = ()
     intermediate_rows: dict[int, int] = field(default_factory=dict)
@@ -1504,6 +1521,8 @@ class _Context:
 
     def count(self, name: str, amount: int = 1) -> None:
         """Add to one statistic of this statement."""
+        if self.read_control is not None:
+            self.read_control.step()
         self.statistics[name] = self.statistics.get(name, 0) + amount
 
     def admit_intermediate(self, node: PlanNode) -> None:
@@ -1526,6 +1545,8 @@ class _Context:
 
     def admit_traversal_expansion(self) -> None:
         """Charge one candidate edge before traversal performs work derived from it."""
+        if self.read_control is not None:
+            self.read_control.step()
         limit = self.engine._max_traversal_expansions
         if limit is None:
             return
@@ -1543,6 +1564,8 @@ class _Context:
 
     def admit_traversal_path(self) -> None:
         """Charge one visible path before retaining it in a frontier or returning it."""
+        if self.read_control is not None:
+            self.read_control.step()
         limit = self.engine._max_traversal_paths
         if limit is None:
             return
@@ -2860,6 +2883,7 @@ def _closed_statement_tables(
         bound: dict[str, set[str]] = {}
 
         def add_table(name: str) -> TableDef | None:
+            """Resolve a known table name into the operation-local selection."""
             if type(name) is not str:
                 return None
             try:
@@ -2870,6 +2894,7 @@ def _closed_statement_tables(
             return table
 
         def visit(pattern: PatternPath) -> bool:
+            """Visit the selected structure while enforcing its coverage and shape checks."""
             if (
                 type(pattern) is not PatternPath
                 or type(pattern.nodes) is not tuple
@@ -3016,6 +3041,7 @@ class _IndexAuthorityProjection:
         *,
         planning_indexes: tuple[object, ...] | None = None,
     ) -> _IndexAuthorityProjection:
+        """Build an operation-local projection of named index authority."""
         grouped: dict[str, list[object]] = {}
         for index in indexes:
             definition = getattr(index, "definition", None)
@@ -3166,6 +3192,7 @@ class QueryEngine:
     """
 
     __slots__ = (
+        "_extensions",
         "_catalog",
         "_heap",
         "_pool",
@@ -3199,7 +3226,10 @@ class QueryEngine:
         "_automatic_index_bucket_count",
         "_prepared_guard",
         "_parse_cache",
+        "_parsed_statement_texts",
         "_plan_cache",
+        "_plan_cache_bytes",
+        "_plan_cache_charges",
         "_owned_prepared_plans",
         "_statement_authority_memo",
         "_compiled_predicates",
@@ -3235,6 +3265,7 @@ class QueryEngine:
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
+        self._extensions = None
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._heap = heap
         self._pool = pool
@@ -3335,7 +3366,10 @@ class QueryEngine:
         # families under the same deliberately short, non-I/O critical sections.
         self._prepared_guard = self._endpoint_guard
         self._parse_cache: OrderedDict[str, Statement] = OrderedDict()
+        self._parsed_statement_texts: dict[int, str] = {}
         self._plan_cache: OrderedDict[_PreparedPlanKey, PlannedQuery] = OrderedDict()
+        self._plan_cache_bytes = 0
+        self._plan_cache_charges: dict[_PreparedPlanKey, int] = {}
         # Public result detachment may take its fast path only for a root retained here by this
         # exact engine. Counts handle one immutable plan admitted under more than one key.
         self._owned_prepared_plans: dict[int, tuple[PlanNode, int]] = {}
@@ -3368,12 +3402,17 @@ class QueryEngine:
         except GrafxError as failure:
             self._count_error(failure)
             raise
+        if len(text) > _PREPARED_MAX_TEXT_CHARS:
+            self._observe(PHASE_PARSE, started)
+            return statement
         with self._prepared_guard:
             existing = self._parse_cache.get(text)
             if existing is None:
                 self._parse_cache[text] = statement
+                self._parsed_statement_texts[id(statement)] = text
                 if len(self._parse_cache) > _PARSE_CACHE_MAX_ENTRIES:
                     _text, evicted = self._parse_cache.popitem(last=False)
+                    self._parsed_statement_texts.pop(id(evicted), None)
                     # The memo is keyed by the identity of a retained statement; a statement
                     # the parse cache no longer retains leaves the memo with it.
                     self._statement_authority_memo.pop(id(evicted), None)
@@ -3480,6 +3519,7 @@ class QueryEngine:
                 analysis = analyze(statement)
                 plan = build_plan(
                     statement,
+                    scalar_types=self._scalar_types(statement),
                     catalog=catalog,
                     indexes=self._index_definitions(
                         catalog=catalog,
@@ -3496,6 +3536,12 @@ class QueryEngine:
         self._observe(PHASE_PLAN, started)
         return plan
 
+    def _scalar_types(self, statement: Statement) -> dict[str, ValueType]:
+        """Supply immutable result-type declarations without invoking callbacks."""
+        return {} if self._extensions is None else {
+            fn.name: ValueType[fn.return_type] for fn in self._extensions.scalars
+        }
+
     def planned(self, statement: Statement) -> PlannedQuery:
         """Return the plan together with the analysis it was built from."""
         started = self._reading()
@@ -3505,6 +3551,7 @@ class QueryEngine:
             analysis = analyze(statement)
             plan = build_plan(
                 statement,
+                scalar_types=self._scalar_types(statement),
                 catalog=catalog,
                 indexes=self._index_definitions(catalog=catalog, authority=authority),
                 analysis=analysis,
@@ -3520,9 +3567,13 @@ class QueryEngine:
         text: str,
         txn: object,
         parameters: Mapping[str, object] | None = None,
+        *,
+        read_control: _ReadControl | None = None,
     ) -> QueryResult:
         """Run one statement inside a transaction and return its rows."""
-        return self._execute_parsed(self.parse(text), txn, parameters, cache_text=text)
+        return self._execute_parsed(
+            self.parse(text), txn, parameters, cache_text=text, read_control=read_control
+        )
 
     def create_index(
         self,
@@ -3556,6 +3607,7 @@ class QueryEngine:
         parameters: Mapping[str, object] | None = None,
         *,
         cache_text: str | None = None,
+        read_control: _ReadControl | None = None,
     ) -> QueryResult:
         """Run a parsed statement while still planning against current transaction state.
 
@@ -3563,6 +3615,13 @@ class QueryEngine:
         is intentionally repeated: earlier items can dirty tables, and their indexes must then be
         withheld so later items retain read-your-own-writes correctness.
         """
+        if read_control is not None:
+            mode = getattr(txn, "mode", None)
+            if getattr(mode, "value", mode) != "read":
+                raise GrafxUnsupportedOperation(
+                    "Execution control requires a read-only transaction.", field="mode"
+                )
+            read_control.check()
         working = self._working.get(getattr(txn, "txn_id", None))
         if working is not None and not self._txn_stages_catalog(txn):
             working = None
@@ -3579,13 +3638,18 @@ class QueryEngine:
         )
         started = self._reading()
         try:
+            if read_control is not None:
+                read_control.check()
             result = self._run(
                 plan,
                 txn,
                 self._bind_parameters(plan, parameters),
                 catalog=working,
                 index_authority=authority,
+                read_control=read_control,
             )
+            if read_control is not None:
+                read_control.check()
         except GrafxError as failure:
             self._count_error(failure)
             raise
@@ -3599,6 +3663,8 @@ class QueryEngine:
         text: str,
         txn: object,
         parameters: Mapping[str, object] | None = None,
+        *,
+        read_control: _ReadControl | None = None,
     ) -> _QueryResultCursor:
         """Open a pull-driven cursor for one read statement under ``txn``'s snapshot.
 
@@ -3664,6 +3730,7 @@ class QueryEngine:
                 timestamp_values={},
                 case_types=case_types,
                 catalog=working,
+                read_control=read_control,
                 result_node=root.child,
                 union_coercions=_bound_union_columns(plan, bound),
                 index_authority=authority,
@@ -3897,6 +3964,9 @@ class QueryEngine:
         """Retain one freshly proved projection for exactly this statement, bounded."""
         key = id(statement)
         with self._prepared_guard:
+            text = self._parsed_statement_texts.get(key)
+            if text is None or self._parse_cache.get(text) is not statement:
+                return
             self._statement_authority_memo[key] = _StatementAuthorityMemo(
                 statement=statement,
                 catalog=catalog,
@@ -3966,20 +4036,35 @@ class QueryEngine:
         self, key: _PreparedPlanKey, plan: PlannedQuery
     ) -> PlannedQuery:
         """Publish one immutable prepared plan, preserving a concurrent winner."""
+        # Conservative admission tariff for source-derived objects, catalog bytes and index
+        # definitions. Repeated catalog images are deliberately charged per key; this is not
+        # an RSS estimator. Capacity misses must never refuse execution or discard authority.
+        charge = (
+            4_096 + 128 * len(key.text) + len(key.catalog_image)
+            + 1_024 * len(key.index_picture) + 128 * len(key.dirty_tables)
+        )
+        if charge > _PLAN_CACHE_MAX_BYTES:
+            return plan
         with self._prepared_guard:
             existing = self._plan_cache.get(key)
             if existing is not None:
                 self._plan_cache.move_to_end(key)
                 return existing
             self._plan_cache[key] = plan
+            self._plan_cache_charges[key] = charge
+            self._plan_cache_bytes += charge
             marker = id(plan.root)
             owned = self._owned_prepared_plans.get(marker)
             if owned is None or owned[0] is not plan.root:
                 self._owned_prepared_plans[marker] = (plan.root, 1)
             else:
                 self._owned_prepared_plans[marker] = (owned[0], owned[1] + 1)
-            if len(self._plan_cache) > _PLAN_CACHE_MAX_ENTRIES:
+            while (
+                len(self._plan_cache) > _PLAN_CACHE_MAX_ENTRIES
+                or self._plan_cache_bytes > _PLAN_CACHE_MAX_BYTES
+            ):
                 _old_key, old_plan = self._plan_cache.popitem(last=False)
+                self._plan_cache_bytes -= self._plan_cache_charges.pop(_old_key)
                 old_marker = id(old_plan.root)
                 old_owned = self._owned_prepared_plans.get(old_marker)
                 if old_owned is not None and old_owned[0] is old_plan.root:
@@ -4037,6 +4122,7 @@ class QueryEngine:
         parameters: dict[str, Value],
         catalog: Catalog | None = None,
         index_authority: _IndexAuthorityProjection | None = None,
+        read_control: _ReadControl | None = None,
     ) -> QueryResult:
         """Walk the plan and produce the result."""
         root = plan.root
@@ -4064,6 +4150,7 @@ class QueryEngine:
             timestamp_values={},
             case_types=case_types,
             catalog=catalog,
+            read_control=read_control,
             result_node=root.child if root.columns else None,
             union_coercions=_bound_union_columns(plan, parameters),
             index_authority=index_authority,
@@ -4104,9 +4191,26 @@ class QueryEngine:
                 value=node.label,
             )
         rows = handler(self, node, context)
+        if context.read_control is not None:
+            rows = self._controlled_rows(rows, context.read_control)
         if self._max_intermediate_rows is None or node is context.result_node:
             return rows
         return self._admit_intermediate_rows(node, context, rows)
+
+    def _controlled_rows(self, rows: Iterator[_Row], control: _ReadControl) -> Iterator[_Row]:
+        """Check every operator stream, closing nested spill/scan iterators on refusal."""
+        failure: BaseException | None = None
+        try:
+            control.check()
+            for row in rows:
+                control.step()
+                yield row
+            control.check()
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            _close_iterator(rows, failure)
 
     def _spill_workspace(
         self, operator: str
@@ -5869,6 +5973,7 @@ def _index_seek(
         dict[object, tuple[Value, ...] | None],
         list[tuple[object, tuple[Value, ...]]],
     ]:
+        """Lazily capture the transaction's logical row overlay for this scan."""
         nonlocal logical_overlay
         if logical_overlay is None:
             logical_overlay = _transaction_row_view(
@@ -6053,10 +6158,18 @@ def _scalar_primary_key_group(
 
     A one-key batch validates the same candidate sequence as the scalar exact
     door. Reuse still opens a fresh stable index/heap view on every statement;
-    only bucket traversal and payload materialization may be reused. Writer
-    statements and specialized scalar collaborators keep their existing door.
+    only bucket traversal and payload materialization may be reused. An unstaged
+    native writer's read-only preflight has the same snapshot contract; writing
+    statements, staged owners and specialized scalar collaborators keep their door.
     """
-    if type(context.txn) is not TransactionContext or context.txn.mode is not TransactionMode.READ:
+    if type(context.txn) is not TransactionContext:
+        return None
+    if context.txn.mode is not TransactionMode.READ and (
+        context.txn.mode is not TransactionMode.WRITE
+        or context.txn.wrote
+        or context.result_node is None
+        or _plan_writes(context.result_node)
+    ):
         return None
     many = getattr(manager, "validated_versions_many", None)
     definition = getattr(store, "definition", None)
@@ -6276,7 +6389,8 @@ def _closed_node_scan_projections(
 
     Projection is declined unless the entire physical path is a linear combination of filters,
     result projection, ordering, DISTINCT and a window over exactly one NodeScan/AllNodesScan
-    driven by SingleRow. Every expression is walked: direct properties of the scan variable are
+    driven by SingleRow, or one certified OrderedNodeMerge. Ordered key columns are retained
+    for heap revalidation even when not returned. Every expression is walked: properties are
     retained, while a bare occurrence of that variable declines the optimization because it may
     expose or inspect the complete entity. Expressions over other computed aliases do not need
     stored columns. This makes the proof intentionally narrower than the query language.
@@ -6307,7 +6421,14 @@ def _closed_node_scan_projections(
             break
         planned = planned.child  # type: ignore[attr-defined]
 
-    if type(planned) is NodeScan:
+    required_properties: set[str] = set()
+    if type(planned) is OrderedNodeMerge:
+        variable = planned.variable
+        tables = planned.tables
+        required_properties.update((planned.timestamp_column, planned.string_column))
+        if planned.predicate is not None:
+            expressions.append(planned.predicate)
+    elif type(planned) is NodeScan:
         if type(planned.child) is not SingleRow:
             return {}
         variable = planned.variable
@@ -6320,7 +6441,7 @@ def _closed_node_scan_projections(
     else:
         return {}
 
-    property_names: set[str] = set()
+    property_names: set[str] = required_properties
     pending = list(expressions)
     while pending:
         expression = pending.pop()
@@ -6813,6 +6934,7 @@ def _traverse(
     batch_landings = vector_free and _admits_batched_landings(engine, node, context)
 
     def view_at(table: TableDef) -> _OwnerLandingView:
+        """Reuse one endpoint landing view per table within this operation."""
         view = landing_views.get(table.table_id)
         if view is None:
             view = _owner_landing_view(engine, context, table, ended)
@@ -7523,6 +7645,7 @@ def _node_multi_key_seek(
     allocated_upper = 0 if extent is None else extent.next_record_id - FIRST_RECORD_ID
 
     def small_table() -> Iterator[_Row]:
+        """Yield the canonical fallback when a table extent is available."""
         if extent is not None:
             yield from engine._rows(node.fallback, context)
 
@@ -7708,6 +7831,7 @@ def _ordered_node_merge(
     failure: BaseException | None = None
 
     def next_admitted(ordinal: int) -> _OrderedMergeCandidate | None:
+        """Return the next candidate satisfying this ordered branch's row constraints."""
         iterator = iterators[ordinal]
         table = node.tables[ordinal]
         for key, ref, version in iterator:
@@ -7732,12 +7856,24 @@ def _ordered_node_merge(
         for table, store, upper_key in zip(
             node.tables, stores, upper_keys, strict=True
         ):
-            iterator = store.iter_visible_desc(  # type: ignore[attr-defined]
-                engine.heap,
-                table,
-                context.snapshot,
-                upper_key=upper_key,
-            )
+            from okto_grafx.domain.index import SnapshotLike
+            from okto_grafx.engine.ordered_index import OrderedIndex, _NATIVE_ORDERED_DESC
+
+            positions = context.node_scan_projections.get(id(node), {}).get(table.table_id)
+            if (positions is not None and type(store) is OrderedIndex
+                    and getattr(store.iter_visible_desc, "__func__", None) is _NATIVE_ORDERED_DESC):
+                iterator = store._iter_visible_desc(
+                    engine.heap, table, cast(SnapshotLike, context.snapshot), upper_key=upper_key,
+                    materialized_positions=positions,
+                )
+                context.count("ordered_projected_tables")
+            else:
+                iterator = store.iter_visible_desc(  # type: ignore[attr-defined]
+                    engine.heap,
+                    table,
+                    context.snapshot,
+                    upper_key=upper_key,
+                )
             iterators.append(iter(iterator))
 
         queue: list[_OrderedMergeCandidate] = []
@@ -7815,6 +7951,7 @@ def _relationship_incident_seek(
         table: TableDef,
         positions: tuple[int, ...],
     ) -> object | None:
+        """Return the named exact index only when its table and columns match."""
         store = authority.named(name)
         definition = getattr(store, "definition", None)
         if (
@@ -7877,6 +8014,7 @@ def _relationship_incident_seek(
         table: TableDef,
         position: int,
     ) -> tuple[tuple[bytes, Value], ...] | None:
+        """Deduplicate supported exact-probe values by their canonical encoded keys."""
         unique: dict[bytes, Value] = {}
         for value in values:
             if value is None:
@@ -7965,6 +8103,7 @@ def _relationship_incident_seek(
         store: object,
         keys: tuple[bytes, ...],
     ) -> tuple[tuple[tuple[object, HeapVersion], ...], ...]:
+        """Validate batch cardinality before aligning groups with requested keys."""
         batches = tuple(many(store, keys, context.snapshot))
         if len(batches) != len(keys):
             raise GrafxIndexError(
@@ -7983,6 +8122,7 @@ def _relationship_incident_seek(
         table: TableDef,
         position: int,
     ) -> dict[RecordId, tuple[object, HeapVersion]]:
+        """Resolve grouped identity probes into validated visible node landings."""
         keys = tuple(key for key, _value in keyed)
         groups = _memoized_primary_key_groups(
             engine,
@@ -8042,6 +8182,7 @@ def _relationship_incident_seek(
         )
 
     def edge_keys(record_ids: Collection[RecordId], position: int) -> tuple[bytes, ...]:
+        """Encode endpoint identities for the selected relationship index position."""
         return tuple(
             index_key(
                 (record_id, None) if position == 0 else (None, record_id),
@@ -8163,6 +8304,7 @@ def _relationship_incident_seek(
         definitive: bool,
         record_id: RecordId,
     ) -> tuple[object, HeapVersion] | None:
+        """Use the captured endpoint landing or perform the canonical identity lookup."""
         found = cached.get(record_id)
         if found is not None or definitive:
             return found
@@ -8288,6 +8430,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
     coalesce_types = context.coalesce_types
 
     def key_of(node: Expression) -> tuple:
+        """Build a closed expression key without invoking caller value hooks."""
         known = keys.get(id(node))
         if known is not None:
             return known
@@ -8355,6 +8498,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
     def shared(
         node: Expression, function: Callable[..., object]
     ) -> Callable[..., object]:
+        """Memoize only subexpressions whose dependencies can be proved reusable."""
         kind = type(node)
         if kind is Literal or kind is Parameter or kind is Variable:
             return function
@@ -8369,6 +8513,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             slot = slot_of[key] = len(slot_of)
 
         def memoized(row: _Row, ctx: _Context, memo: list[object]) -> object:
+            """Reuse a subexpression only when its observed property dependencies permit it."""
             value = memo[slot]
             if value is _COMPILED_MISS:
                 reads_before = memo[-1]
@@ -8383,6 +8528,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         return memoized
 
     def compile_node(node: Expression) -> Callable[..., object]:
+        """Compile one expression and track whether its evaluation is fully instrumented."""
         fallbacks_before = fallbacks
         function = compile_kind(node)
         # Instrumented only when neither this node nor anything compiled below it fell back.
@@ -8390,23 +8536,27 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         return function
 
     def compile_kind(node: Expression) -> Callable[..., object]:
+        """Compile supported expression kinds or retain canonical evaluation semantics."""
         kind = type(node)
         if kind is Literal:
             constant = node.value
 
             def literal(row: _Row, ctx: _Context, memo: object) -> object:
+                """Return the captured literal without consulting row or parameter state."""
                 return constant
 
             return literal
         if kind is Parameter:
 
             def parameter(row: _Row, ctx: _Context, memo: object) -> object:
+                """Resolve the parameter through the canonical parameter evaluator."""
                 return _evaluate_parameter(node, row, ctx, None)
 
             return parameter
         if kind is Variable:
 
             def variable(row: _Row, ctx: _Context, memo: object) -> object:
+                """Read the named variable from the current row bindings."""
                 return _read_variable(node, row, None)
 
             return variable
@@ -8415,6 +8565,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             key = node.key
 
             def prop(row: _Row, ctx: _Context, memo: object) -> object:
+                """Read a property while preserving null and non-row mapping semantics."""
                 value = subject(row, ctx, memo)
                 if value is None:
                     return None
@@ -8432,6 +8583,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             negated = bool(node.negated)
 
             def null_check(row: _Row, ctx: _Context, memo: object) -> object:
+                """Apply the selected null predicate to the evaluated operand."""
                 value = operand(row, ctx, memo)
                 return (value is not None) if negated else (value is None)
 
@@ -8440,6 +8592,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             operand = shared(node.operand, compile_node(node.operand))
 
             def negation(row: _Row, ctx: _Context, memo: object) -> object:
+                """Negate a truth value while preserving unknown results."""
                 truth = _truth(operand(row, ctx, memo))
                 return None if truth is None else (not truth)
 
@@ -8452,6 +8605,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "AND":
 
                     def conjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Apply three-valued AND with its canonical short-circuit behavior."""
                         left_truth = _truth(left(row, ctx, memo))
                         if left_truth is False:
                             return False
@@ -8466,6 +8620,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "OR":
 
                     def disjunction(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Apply three-valued OR with its canonical short-circuit behavior."""
                         left_truth = _truth(left(row, ctx, memo))
                         if left_truth is True:
                             return True
@@ -8480,6 +8635,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "XOR":
 
                     def exclusive(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Apply three-valued XOR to the evaluated operands."""
                         left_value = left(row, ctx, memo)
                         right_value = right(row, ctx, memo)
                         left_truth, right_truth = (
@@ -8494,6 +8650,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "=":
 
                     def equality(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Compare non-null operands using canonical query equality."""
                         left_value = left(row, ctx, memo)
                         right_value = right(row, ctx, memo)
                         if left_value is None or right_value is None:
@@ -8504,6 +8661,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if operator == "<>":
 
                     def inequality(row: _Row, ctx: _Context, memo: object) -> object:
+                        """Negate canonical equality without turning unknown into true."""
                         left_value = left(row, ctx, memo)
                         right_value = right(row, ctx, memo)
                         if left_value is None or right_value is None:
@@ -8513,6 +8671,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                     return inequality
 
                 def ordering(row: _Row, ctx: _Context, memo: object) -> object:
+                    """Compare the evaluated operands using the query ordering rules."""
                     return _ordered(
                         operator, left(row, ctx, memo), right(row, ctx, memo)
                     )
@@ -8530,6 +8689,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
             )
 
             def coalesce(row: _Row, ctx: _Context, memo: object) -> object:
+                """Evaluate the selected arguments under canonical coalesce semantics."""
                 values = tuple(argument(row, ctx, memo) for argument in arguments)
                 return _coalesce_selected(node, values, ctx)
 
@@ -8539,6 +8699,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         fallbacks += 1
 
         def canonical(row: _Row, ctx: _Context, memo: object) -> object:
+            """Evaluate unsupported expression forms through the canonical query walker."""
             return _evaluate(node, row, ctx)
 
         return canonical
@@ -8561,6 +8722,7 @@ def _predicate_admitter(
     compiled: _CompiledPredicate | None = None
 
     def admits(row: _Row) -> bool:
+        """Evaluate the prepared predicate with the query's three-valued truth semantics."""
         nonlocal compiled
         if row.computed is None:
             if compiled is None:
@@ -9538,6 +9700,7 @@ def _spill_path_value(value: _PathValue) -> Value:
     """Encode one capability-free path DTO without collapsing its nominal validation."""
 
     def identity(item: _PathIdentity) -> Value:
+        """Expose the path identity as its canonical offset and table pair."""
         return (item.offset, item.table)
 
     nodes: tuple[Value, ...] = tuple(
@@ -10344,6 +10507,7 @@ def _batched_relationship_count(
     }
 
     def visible(table: TableDef, index: object, identities: Sequence[int]) -> tuple[bool, ...]:
+        """Return visibility under the owning transaction snapshot."""
         counts = views[table.table_id].counts_many(identities, context, index)
         if len(counts) != len(identities):
             raise GrafxIndexError(
@@ -10362,6 +10526,7 @@ def _batched_relationship_count(
         return tuple(count == 1 for count in counts)
 
     def count_frontier(frontier: list[tuple[int, int]]) -> int:
+        """Count visible endpoint pairs while preserving source-first short circuiting."""
         from_visible = visible(scan.from_table, from_index, [pair[0] for pair in frontier])
         # Preserve the scalar short circuit: a missing source never probes its target.
         targets = [pair[1] for pair, present in zip(frontier, from_visible) if present]
@@ -10719,6 +10884,7 @@ class _SpilledAggregateState:
         self._closed = False
 
     def add(self, entries: tuple[Value, ...], ordinal: int) -> None:
+        """Accumulate the selected values under this operation's ownership and budget checks."""
         if len(entries) != len(self._node.aggregations):
             raise GrafxCorruptionDetected(
                 "A temporary aggregate row disagrees with the plan arity.",
@@ -10831,6 +10997,7 @@ class _SpilledAggregateState:
         return payload
 
     def close(self) -> None:
+        """Release retained aggregate workspace allocations idempotently."""
         if self._closed:
             return
         for amount in self._extra:
@@ -11384,50 +11551,17 @@ class _TopCandidate:
 
 def _top_heap_push(heap: list[_TopCandidate], candidate: _TopCandidate) -> None:
     """Push one candidate while preserving the local worst-first binary heap."""
-    position = len(heap)
-    heap.append(candidate)
-    while position:
-        parent = (position - 1) // 2
-        incumbent = heap[parent]
-        if not candidate < incumbent:
-            break
-        heap[position] = incumbent
-        position = parent
-    heap[position] = candidate
+    heappush(heap, candidate)
 
 
 def _top_heap_replace(heap: list[_TopCandidate], candidate: _TopCandidate) -> None:
     """Replace the worst candidate and restore the binary heap in O(log K)."""
-    heap[0] = candidate
-    _top_heap_sift_down(heap, 0)
+    heapreplace(heap, candidate)
 
 
 def _top_heap_pop(heap: list[_TopCandidate]) -> _TopCandidate:
     """Remove and return the worst candidate in O(log K)."""
-    tail = heap.pop()
-    if not heap:
-        return tail
-    result = heap[0]
-    heap[0] = tail
-    _top_heap_sift_down(heap, 0)
-    return result
-
-
-def _top_heap_sift_down(heap: list[_TopCandidate], position: int) -> None:
-    """Move one rootward candidate down to its binary-heap position."""
-    length = len(heap)
-    candidate = heap[position]
-    while True:
-        left = position * 2 + 1
-        if left >= length:
-            break
-        right = left + 1
-        child = right if right < length and heap[right] < heap[left] else left
-        if not heap[child] < candidate:
-            break
-        heap[position] = heap[child]
-        position = child
-    heap[position] = candidate
+    return heappop(heap)
 
 
 def _top_rows(
@@ -13287,6 +13421,7 @@ def _primary_key_seek_candidates(
     selected: list[tuple[object, _PrimaryKeyOutcome]] = []
 
     def add(state: _PrimaryKeyFoldState, *, exclude: set[object]) -> bool:
+        """Collect current key owners while refusing ambiguous legacy ownership."""
         for owner, _observed in _primary_key_state_owners(state, key):
             if owner in exclude:
                 continue
@@ -14172,8 +14307,14 @@ def _stored_value(
     """
     if not column.is_vector or value is None:
         return value  # type: ignore[return-value]
+    space = context.schema().space(str(column.vector_space))
+    stored = value if type(value) is VectorValue else None
     if isinstance(value, VectorValue):
-        return value
+        require_space_identity(space, value.space_ref, origin="stored parameter")
+        if value.dtype != space.storage_dtype:
+            raise GrafxPlanError("Vector parameter precision differs from its target space.",
+                                 field="dtype", value=value.dtype)
+        value = value.values
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise GrafxPlanError(
             f"The column {table.name}.{column.name} stores an embedding, which is written as a "
@@ -14181,9 +14322,10 @@ def _stored_value(
             field="column",
             value=column.name,
         )
-    space = context.schema().space(str(column.vector_space))
     vectors = engine.require_vectors()
     validated = vectors.validate_vector(space, tuple(value))  # type: ignore[attr-defined]
+    if stored is not None and stored.values == tuple(validated):
+        return stored  # Preserve an already-canonical immutable value, after admission.
     return VectorValue(
         values=tuple(validated), space_ref=space.space_id, dtype=space.storage_dtype
     )
@@ -14748,7 +14890,7 @@ def _in_list_memo(name: str, value: object, context: _Context) -> _InListMemo | 
 
 
 def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
-    """Hash one detached list of strings, bytes and nulls, or decline to the linear walk.
+    """Hash supported detached scalars, or decline to the unchanged linear walk.
 
     Declining is silent and final for the statement: an exact list (not the detached tuple the
     facade hands over), any element of another kind, or a list that would carry the statement
@@ -14760,29 +14902,44 @@ def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
         return None
     keys: set[object] = set()
     has_null = False
+    has_numbers = False
     for element in value:
         kind = type(element)
         if element is None:
             has_null = True
         elif kind is str or kind is bytes:
             keys.add(_freeze(element))
+        elif kind is float or (kind is int and INT64_MIN <= element <= INT64_MAX):
+            has_numbers = True
+            number = float(element)
+            # Python set membership can match an identical NaN object; query equality cannot.
+            if not isnan(number):
+                keys.add(("in_numeric", number))
         else:
             return None
     context.in_list_memo_elements += len(value)
-    return _InListMemo(values=value, keys=frozenset(keys), has_null=has_null)
+    return _InListMemo(
+        values=value, keys=frozenset(keys), has_null=has_null, has_numbers=has_numbers,
+    )
 
 
 def _memo_membership(left: object, memo: _InListMemo) -> object:
     """Answer IN over a hashed list exactly as the linear walk over the same list would.
 
-    Only an exact ``str`` or ``bytes`` on the left consults the set: against a list of those
-    kinds ``_equal`` is ``_freeze`` key equality and nothing else.  Every other left value --
-    a binding, a list, a map, a number, a boolean -- takes the walk over the same detached
-    list, so the memo never decides a comparison it did not build for.
+    Exact text/bytes retain frozen-key equality. Supported numeric probes use the same
+    float normalization as the canonical comparison, not Python's int/float set equality.
+    Other values retain the walk, including custom conversion/comparison behavior.
     """
     if left is None:
         return None
     kind = type(left)
+    if memo.has_numbers and (
+        kind is float or (kind is int and INT64_MIN <= cast(int, left) <= INT64_MAX)
+    ):
+        number = float(cast(int | float, left))
+        if not isnan(number) and ("in_numeric", number) in memo.keys:
+            return True
+        return None if memo.has_null else False
     if kind is not str and kind is not bytes:
         return _membership(left, memo.values)
     if _freeze(left) in memo.keys:
@@ -14872,6 +15029,11 @@ def _validate_parameter_map_value(
     value: object, *, parameter: str, seen: set[int]
 ) -> None:
     """Validate every nested map carried by one referenced parameter."""
+    # Endpoint batches carry hundreds of scalar IDs per layout. Exact built-in
+    # leaves cannot contain map collisions; avoid dynamic Mapping checks for each
+    # one. Subclasses/custom containers still take the complete recursive path.
+    if value is None or type(value) in (str, int, float, bool):
+        return
     if not isinstance(value, (Mapping, list, tuple)):
         return
     marker = id(value)
@@ -16300,6 +16462,12 @@ def _coalesce_selected(
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name == "UDF":
+        registry = context.engine._extensions
+        if registry is None:
+            raise GrafxPlanError("No trusted scalar registry was supplied to connect.", field="udf_name")
+        arguments = tuple(_evaluate(argument, row, context) for argument in expression.arguments)
+        return registry.call_scalar(arguments[0], arguments[1:])
     if name == COALESCE_FUNCTION:
         return _coalesce(expression, row, context)
     if name == STRING_SPLIT_FUNCTION:

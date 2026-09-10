@@ -7,15 +7,15 @@ requirements remain in the [source archive](../archive/ROADMAP_SOURCES.md).
 | Milestone | Specification | Implementation status |
 |---|---|---|
 | GX-CAP-0 | [Boundaries/contracts](SPEC-GX-CAP-0.md) | Enforcement and contract checkpoint |
-| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | Partial: paged journal validation/replay/checkpoint integrated; automatic emission/public history API not enabled |
+| GX-CAP-1 | [Commit identity and provenance](SPEC-GX-CAP-1.md) | Bounded N4 implemented: opt-in native publication, metadata, snapshot history, verification and transfer hooks; [acceptance and limits](../reports/V005_N3_N4_ACCEPTANCE.md) |
 | GX-CAP-2 | [Catalog sessions and workspace scopes](SPEC-GX-CAP-2.md) | Not certified; contract routing only |
 | GX-CAP-3 | [Temporal system time](SPEC-GX-CAP-3.md) | Not certified; contract routing only |
 | GX-CAP-4 | [Valid time, bitemporal queries and graph diff](SPEC-GX-CAP-4.md) | Not certified; contract routing only |
-| GX-CAP-5 | [Native full-text search](SPEC-GX-CAP-5.md) | Not certified; contract routing only |
-| GX-CAP-6 | [Explainable hybrid retrieval](SPEC-GX-CAP-6.md) | Not certified; contract routing only |
-| GX-CAP-7 | [Extension SPI and UDFs](SPEC-GX-CAP-7.md) | Not certified; contract routing only |
-| GX-CAP-8 | [Arrow and external data](SPEC-GX-CAP-8.md) | Not certified; contract routing only |
-| GX-CAP-9 | [Graph projections and algorithms](SPEC-GX-CAP-9.md) | Not certified; contract routing only |
+| GX-CAP-5 | [Native full-text search](SPEC-GX-CAP-5.md) | FTS-v1 implemented; [consumer API and limits](../FULL_TEXT_SEARCH.md); [local acceptance](../reports/V005_OPS2_FTS_CHECKPOINT.md) |
+| GX-CAP-6 | [Explainable hybrid retrieval](SPEC-GX-CAP-6.md) | Bounded typed v1 implemented in 0.0.5 development; [contract](../HYBRID_SEARCH.md) and [acceptance receipt](../reports/V005_SEARCH_RESUME_CHECKPOINT.md) |
+| GX-CAP-7 | [Extension SPI and UDFs](SPEC-GX-CAP-7.md) | Partial: trusted typed scalar registry/UDFs implemented; broader SPI remains planned; [usage](../EXTENSIONS_AND_ARROW.md) |
+| GX-CAP-8 | [Arrow and external data](SPEC-GX-CAP-8.md) | Partial: scalar/vector Arrow, Pandas/Polars, local Parquet/CSV/JSONL and detached graph export implemented; external query scans/COPY and graph ingestion remain; [receipt](../reports/V005_AFTER_A4DD85A.md) |
+| GX-CAP-9 | [Graph projections and algorithms](SPEC-GX-CAP-9.md) | Partial: weighted graph, retained lookup/CSR/transitions/simple topology, degree/WCC/SCC, BFS/Dijkstra, PageRank, k-core and label propagation implemented; catalog/write-back/Louvain remain; [receipt](../reports/V005_AFTER_A4DD85A.md) |
 | GX-CAP-10 | [Application schema evolution and views](SPEC-GX-CAP-10.md) | Not certified; contract routing only |
 | GX-CAP-11 | [Database hardening and release](SPEC-GX-CAP-11.md) | Not certified; contract routing only |
 | GX-AGENT-0 | [Optional Agent/MCP preview](SPEC-GX-AGENT-0.md) | Not certified; contract routing only |

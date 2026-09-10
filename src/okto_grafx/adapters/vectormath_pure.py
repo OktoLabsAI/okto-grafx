@@ -324,6 +324,7 @@ class PureVectorMath:
         length_query: float | None = None
 
         def cosine(values: Sequence[float]) -> float:
+            """Compute cosine similarity using the retained query or candidate norm when available."""
             nonlocal length_query
             if length_query is None:
                 length_query = _require_finite(self.norm(query), "norm")
@@ -347,12 +348,14 @@ class PureVectorMath:
         length_query: float | None = None
 
         def query_length() -> float:
+            """Return the lazily validated and retained query norm."""
             nonlocal length_query
             if length_query is None:
                 length_query = _require_finite(self.norm(query), "norm")
             return length_query
 
         def measured(values: Sequence[float]) -> tuple[float, float]:
+            """Return cosine similarity together with the measured candidate norm."""
             left_norm = query_length()
             right_norm = _require_finite(self.norm(values), "norm")
             return (
@@ -361,6 +364,7 @@ class PureVectorMath:
             )
 
         def cosine(values: Sequence[float], right_norm: float) -> float:
+            """Compute cosine similarity using the retained query or candidate norm when available."""
             return self._cosine_from_lengths(
                 query, query_length(), values, right_norm
             )

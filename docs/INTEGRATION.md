@@ -1,5 +1,15 @@
 # Integration recipes
 
+For host-provided typed scalar functions and optional Arrow result batches, see
+[Extensions and Arrow](EXTENSIONS_AND_ARROW.md). The registry is explicitly
+per connection; cursor ownership and native transaction semantics remain unchanged.
+
+New 0.0.5 development integration recipes: [hybrid retrieval](HYBRID_SEARCH.md),
+[logical transfer and crash resumption](LOGICAL_TRANSFER.md)
+for verified fresh-store copies, and [full-text search](FULL_TEXT_SEARCH.md) for
+native lexical retrieval. Both use ordinary transaction ownership; FTS-specific
+options belong to the database integration layer, not a consumer's domain model.
+
 [Documentation index](README.md) · [Start here](GETTING_STARTED.md) · [Operations](OPERATIONS.md)
 
 This is the synchronous embedded API. Read the operational contract before deploying workers.
@@ -145,7 +155,7 @@ with db.begin("read") as txn:
     cursor = None
     while True:
         page = txn.scan_rows_v1("Chunk", limit=256, cursor=cursor)
-for row in page.rows:
+        for row in page.rows:
             print(row.record_id, row.values)  # values follow TableDef.columns
         cursor = page.next_cursor
         if cursor is None:
@@ -156,6 +166,34 @@ Relationship values start with `_from` and `_to`, and duplicate/parallel occurre
 separately. `ScanCursorV1` is opaque, non-serializable, single-use and cannot cross a transaction,
 table or database. This is a physical scan primitive for adapters, not a portable backup format
 or bulk import API.
+
+In 0.0.5 development, `scan_rows_v1(..., columns=None, max_batch_bytes=None,
+timeout_seconds=None, cancellation=None)` keeps that default full-row behavior.
+An explicit tuple selects at most 256 distinct column names in **requested order**;
+`columns=()` returns physical record IDs with empty values. Omitted payloads still
+undergo schema/encoding/overflow integrity validation; projection is not permission
+to ignore corruption. Cursor identity includes the exact projection (None differs
+from an explicit full column tuple); it cannot change mid-stream. A mismatched
+projection is refused before the token is consumed. A storage/budget refusal after
+claim consumes it: restart the scan explicitly, never reuse it as a retry token.
+
+`max_batch_bytes` is None or an exact integer 1..2^31. When bounded, `limit` must
+also be at most 65,536. Each admitted row is conservatively charged 512 + 64 per
+declared column + 64 per complete encoded payload byte, including omitted columns.
+The next row becomes the continuation when it would exceed the cap; a first row
+that cannot fit raises `GrafxQueryBudgetExceeded(resource="scan_batch")`. This is
+logical batch workspace, not RSS, process memory or zero-copy. Row and byte limits
+may change between calls without changing the projection/snapshot.
+
+Optional finite positive timeout and a `CancellationToken` check page/slot walks,
+decode boundaries and row detachment, without preempting OS I/O or a single decode.
+Cancellation/deadline refuses without closing the caller's transaction and returns
+no partial current page. Controls never interrupt a commit. Custom heap collaborators
+retain the legacy default call; new projection/budget/control options require the
+native heap and otherwise raise `GrafxUnsupportedOperation`.
+
+For topology capture and bounded detached graph algorithms, use
+[graph projections](GRAPH_PROJECTIONS.md), which batches this public scan door.
 
 ### Streaming query results
 

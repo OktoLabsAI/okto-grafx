@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import cast
 
 from okto_grafx.domain.errors import GrafxIndexError
+from okto_grafx.domain.index.fulltext import decode_options, entry_keys, is_fulltext
 from okto_grafx.domain.index.keys import (
     DEFAULT_BUCKET_COUNT,
     index_key,
@@ -242,6 +243,15 @@ class IndexDefinition:
         object.__setattr__(
             self, "bucket_count", validate_bucket_count(self.bucket_count)
         )
+        if self.layout is IndexLayout.SPARSE_HASH and (
+            self.visibility is not IndexVisibility.EXACT
+            or self.key_derivation != COLUMN_KEY_DERIVATION
+        ):
+            raise GrafxIndexError("Sparse hash requires an exact property index.", field="layout")
+        if is_fulltext(self.key_derivation):
+            options = decode_options(self.key_derivation)
+            if len(options.field_weights) != len(self.positions) or self.layout is not IndexLayout.HASH or self.visibility is not IndexVisibility.EXACT:
+                raise GrafxIndexError("Full-text fields/layout do not match their analyzer identity.", field="definition")
         if self.layout is IndexLayout.ORDERED:
             if self.visibility is not IndexVisibility.EXACT:
                 raise GrafxIndexError(
@@ -426,6 +436,25 @@ class IndexDefinition:
 
         return True
 
+    def entry_keys_for_record(self, record_id: object, values: Sequence[Value]) -> tuple[bytes, ...]:
+        """Return every owed key; scalar/sparse definitions keep their established rule."""
+        if is_fulltext(self.key_derivation):
+            return entry_keys(values, self.positions, self.key_derivation)
+        key = self.entry_key_for_record(record_id, values)
+        return () if key is None else (key,)
+
+    def entry_matches(self, key: bytes, record_id: object, values: Sequence[Value]) -> bool:
+        """Validate membership, including a full-text row's multiple distinct postings."""
+        if is_fulltext(self.key_derivation):
+            return key in self.entry_keys_for_record(record_id, values)
+        return self.entry_key_for_record(record_id, values) == key
+
+    def entry_count_for_record(self, record_id: object, values: Sequence[Value]) -> int:
+        """Size logical WAL effects without pretending a multi-term row owes one entry."""
+        if is_fulltext(self.key_derivation):
+            return len(self.entry_keys_for_record(record_id, values))
+        return int(self.owes_entry_for_record(record_id, values))
+
     def owes_entry_for_record(self, record_id: object, values: Sequence[Value]) -> bool:
         """Say whether the complete heap version owes an entry.
 
@@ -459,7 +488,7 @@ class IndexDefinition:
         )
         # Preserve every established HASH digest byte-for-byte. Ordered artifacts append their
         # physical layout so no file can be adopted under the other placement contract.
-        if self.layout is IndexLayout.ORDERED:
+        if self.layout is not IndexLayout.HASH:
             fields = (*fields, self.layout.value)
         material = "\n".join(fields)
         return hashlib.blake2b(

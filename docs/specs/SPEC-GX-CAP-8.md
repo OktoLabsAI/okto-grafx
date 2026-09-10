@@ -1,6 +1,32 @@
 # SPEC-GX-CAP-8 — Arrow and external data
 
-Status: specified / implementation not certified. Date: 2026-09-08.
+Status: scalar/vector Arrow, typed Pandas/Polars, local Parquet/CSV/JSONL and detached graph export implemented in 0.0.5 development; broader external-data scope remains planned. Date: 2026-09-09.
+
+The continuation after `a4dd85a` adds [NetworkX/projection Arrow export](../GRAPH_EXCHANGE.md),
+[metadata-bearing Polars frames](../TABULAR_AND_PARQUET.md) and
+[typed bounded local CSV/JSONL readers/import](../LOCAL_TEXT_IMPORT.md).
+Native staging remains whole-call atomic and caller-committed. No external query
+scans, COPY, arbitrary JSON arrays/nesting, remote sources or graph ingestion.
+Final regression status is tracked in the [roadmap](../../ROADMAP.md).
+
+The continuation after `970aa1e` adds explicit Arrow-backed DataFrames and local
+Parquet batches. [Types, bounds, NULL/NaN, directory trust and publication contract](../TABULAR_AND_PARQUET.md).
+Imports preserve whole-call staging atomicity; no commit or native format change.
+Parquet nullable vectors use tagged list-v1 physical encoding, normalized to the
+existing fixed-size-list API. At that checkpoint Polars, CSV/JSON scans, COPY and
+graph exchange remained; the subsequent bounded additions are described above.
+[Execution receipt](../reports/V005_AFTER_970AA1E.md).
+
+0.0.5 continuation: optional scalar Arrow **export** over native results/cursors is
+implemented; [consumer type/ownership contract](../EXTENSIONS_AND_ARROW.md) and
+[validation receipt](../reports/V005_NEXT_EIGHT_PROGRESS.md). The continuation after
+`69ed311` adds bounded typed batch import through one native executemany savepoint,
+with caller-owned commit and no partial staging on late failure; see the
+[round receipt](../reports/V005_AFTER_69ED311.md). The continuation after `7dde256`
+adds fixed-size-list float32/float64 vectors with mandatory space/dimension/precision
+metadata, native admission and whole-call atomicity; see the
+[acceptance receipt](../reports/V005_AFTER_7DDE256.md). Arbitrary nested/entity
+columns, external scans, COPY and other adapters below remain roadmap scope.
 Dependencies: GX-CAP-7; streaming cursor and existing bulk ingest.
 
 ## Normative scope

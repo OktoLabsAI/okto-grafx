@@ -288,11 +288,15 @@ class DatabaseConfig:
     metrics: str = "noop"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
-    codec: str = dataclass_field(default="pure", kw_only=True)
-    vector_math: str = "auto"
+    codec: str = dataclass_field(default="numpy", kw_only=True)
+    vector_math: str = "numpy"
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
     vector_ef_search: int = DEFAULT_EF_SEARCH
+    vector_hnsw_memory_budget_bytes: int | None = dataclass_field(default=None, kw_only=True)
+    vector_hnsw_total_memory_budget_bytes: int | None = dataclass_field(default=None, kw_only=True)
+    index_key_cache_pages: int = dataclass_field(default=64, kw_only=True)
+    index_key_cache_bytes: int = dataclass_field(default=1024 * 1024, kw_only=True)
     read_only: bool = False
     descriptor_revalidation: DescriptorRevalidationMode = "strict"
     max_query_value_characters: int = DEFAULT_MAX_QUERY_VALUE_CHARACTERS
@@ -368,6 +372,8 @@ class DatabaseConfig:
             "max_result_rows",
             "max_intermediate_rows",
             "query_memory_budget_bytes",
+            "vector_hnsw_memory_budget_bytes",
+            "vector_hnsw_total_memory_budget_bytes",
             "max_traversal_expansions",
             "max_traversal_paths",
             "max_transaction_rows",
@@ -393,6 +399,11 @@ class DatabaseConfig:
         threshold = _require_int(
             "vector_exact_scan_threshold", self.vector_exact_scan_threshold
         )
+        for name, ceiling in (("index_key_cache_pages", 65536), ("index_key_cache_bytes", 2**31)):
+            value = _require_int(name, getattr(self, name))
+            if not 0 <= value <= ceiling:
+                raise _reject(name, value, f"a value between zero and {ceiling} is required.")
+            object.__setattr__(self, name, value)
         object.__setattr__(self, "vector_exact_scan_threshold", threshold)
         if threshold < 0:
             raise _reject(

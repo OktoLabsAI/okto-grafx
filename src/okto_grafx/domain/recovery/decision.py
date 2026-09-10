@@ -89,6 +89,7 @@ def validate_commit_boundaries(replay: CommittedReplay) -> None:
     Projection may retain commits with no selected effects (page/index separation).
     """
     def refuse() -> NoReturn:
+        """Report invalid persisted state through the owning error taxonomy."""
         raise GrafxRecoveryRefused(
             "Replay commit boundaries do not match the selected effects and watermark.",
             field="commit_boundaries",

@@ -785,7 +785,8 @@ def test_foreign_commit_completion_is_counted_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     metrics = RecordingMetricsSink()
-    stack = build_stack(tmp_path, metrics=metrics, clock=StepClock())
+    # Recovery validates native COMMIT envelopes; LogWal returns LogRecord doubles.
+    stack = build_stack(tmp_path, metrics=metrics, clock=StepClock(), wal_factory=_real_wal)
     observed_phases: list[str | None] = []
     original = TransactionManager._complete_committed_gap
 
