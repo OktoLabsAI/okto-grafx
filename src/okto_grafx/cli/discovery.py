@@ -1,5 +1,15 @@
 """Read-only consumption of public Grafx metadata and search DTOs."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from okto_grafx.cli.commands import Report
+    from okto_grafx.cli.parser import Invocation
+    from okto_grafx.engine.database import Database
+
+__all__ = ["dto", "capabilities", "catalog_inventory", "workspace_resolution", "inspect_indexes", "search"]
+
 from dataclasses import fields, is_dataclass
 from enum import Enum
 import json
@@ -10,7 +20,7 @@ from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.vector.filter import RecordIdFilter
 
 
-def dto(value):
+def dto(value: object) -> object:
     """Encode engine-owned immutable DTOs explicitly, never their repr or private caches."""
     if isinstance(value, Enum):
         return value.value
@@ -25,7 +35,7 @@ def dto(value):
     return value
 
 
-def capabilities(invocation):
+def capabilities(invocation: Invocation) -> Report:
     """Report build-level CLI contracts without implying store activation."""
     from okto_grafx.cli.commands import Report
     from okto_grafx.cli.parser import COMMANDS
@@ -53,7 +63,51 @@ def capabilities(invocation):
     return Report(0, payload, (f"Okto Grafx {__version__}: build CLI contracts",))
 
 
-def inspect_indexes(invocation, database):
+def catalog_inventory(invocation: Invocation) -> Report:
+    """Inspect only explicit read-only attachments; session lifetime ends with this command."""
+    from okto_grafx.catalogs import CatalogPathPolicy, CatalogSession, _alias
+    from okto_grafx.cli.commands import Report
+    policy = CatalogPathPolicy(invocation.repeated("allow_root"))
+    attachments = invocation.repeated("attach")
+    if len(attachments) > 15:
+        raise GrafxConfigurationError("At most 15 attachments are accepted.", field="attach")
+    parsed = []
+    for item in attachments:
+        alias, separator, path = item.partition("=")
+        if not separator or not path:
+            raise GrafxConfigurationError("Expected ALIAS=PATH.", field="attach")
+        parsed.append((_alias(alias), policy.resolve(path)))
+    if len({alias for alias, _ in parsed}) != len(parsed):
+        raise GrafxConfigurationError("Duplicate attachment alias.", field="attach")
+    with CatalogSession.open(invocation.path, policy=policy, read_only=True) as session:
+        for alias, path in parsed:
+            session.attach(path, alias=alias, read_only=True)
+        inventory = session.catalogs()
+        limit = invocation.number("limit", 16)
+        entries = [dict(alias=item.alias, database_uuid=item.database_uuid.hex(), read_only=item.read_only,
+                        owned=item.owned, active_transactions=item.active_transactions) for item in inventory[:limit]]
+    return Report(0, dict(command="catalogs", schema_version=1, scope="explicit_invocation_attachments",
+                         read_only=True, catalogs=entries, total=len(inventory), truncated=len(inventory) > limit),
+                  (f"catalogs {len(entries)}/{len(inventory)} (read-only)",))
+
+
+def workspace_resolution(invocation: Invocation) -> Report:
+    """Expose explicit workspace precedence with no environment or home fallback."""
+    from okto_grafx.catalogs import CatalogPathPolicy
+    from okto_grafx.workspace import WorkspacePolicy, resolve_workspace
+    from okto_grafx.cli.commands import Report
+    paths = CatalogPathPolicy(invocation.repeated("allow_root"))
+    policy = WorkspacePolicy(paths, markers=invocation.repeated("marker") or (".git",),
+        max_parent_steps=invocation.number("max_parent_steps", 8), allow_cwd=invocation.flag("allow_cwd"),
+        allow_user_store=invocation.flag("allow_user_store"))
+    resolved = resolve_workspace(policy=policy, cwd=invocation.path,
+        explicit_store=invocation.text("store") or None, project_root=invocation.text("project_root") or None,
+        user_store=invocation.text("user_store") or None)
+    return Report(0, dict(command="workspace resolve", schema_version=1, scope="path_resolution_only",
+                         stores_opened=0, workspace=dto(resolved)), (f"workspace resolved ({resolved.source})",))
+
+
+def inspect_indexes(invocation: Invocation, database: Database) -> Report:
     """Return bounded read-only index metadata and explicit truncation counts."""
     from okto_grafx.cli.commands import Report
 
@@ -102,7 +156,7 @@ def _array(text, name):
     return value
 
 
-def search(invocation, database):
+def search(invocation: Invocation, database: Database) -> Report:
     """Validate CLI options and execute one snapshot-bound public search."""
     from okto_grafx.cli.commands import Report
 

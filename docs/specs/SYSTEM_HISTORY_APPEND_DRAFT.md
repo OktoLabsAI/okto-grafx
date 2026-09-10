@@ -1,5 +1,12 @@
 # Internal system-history append prototype — not an activated format
 
+**Historical checkpoint at `204bd2e`.** The restrictions below describe that
+prototype, not current 0.0.6 source. Native publication, required capability bit 15,
+temporal APIs and operator controls are now described in
+[native history v1](SYSTEM_HISTORY_V1.md) and the
+[consumer guide](../SYSTEM_TIME_HISTORY.md). Preserve this draft as format-design
+provenance, not as a competing current implementation status.
+
 September 10, 2026; continuation item 8, **partial implementation only**.
 Owning code: `engine/system_history_store.py`. This is an internal image planner
 and event codec, not a `Database` API, writable store, WAL extension or completed

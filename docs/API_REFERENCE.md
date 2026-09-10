@@ -274,6 +274,22 @@ execute(text: str, parameters: Mapping[str, object] | None=None, *, timeout_seco
 
 Run one statement inside this transaction and return its result.
 
+#### Transaction.system_as_of
+
+```python
+system_as_of(at: CommitId | Timestamp, *, tables: tuple[str, ...], limits: TemporalLimits=TemporalLimits()) -> TemporalGraph
+```
+
+Read durable system-time rows under this transaction's snapshot, excluding private writes.
+
+#### Transaction.system_versions
+
+```python
+system_versions(table: str, record_id: int, *, limits: TemporalLimits=TemporalLimits()) -> TemporalVersions
+```
+
+Read one logical row's intervals visible to this snapshot, not later commits.
+
 #### Transaction.commit_history
 
 ```python
@@ -866,6 +882,62 @@ ensure_identity_indexes() -> None
 
 Persist and activate every exact access path required by endpoint identities.
 
+#### Database.system_as_of
+
+```python
+system_as_of(at: CommitId | Timestamp, *, tables: tuple[str, ...], limits: TemporalLimits=TemporalLimits()) -> TemporalGraph
+```
+
+Return a bounded historical graph at a qualified commit or ordered timestamp.
+
+#### Database.system_versions
+
+```python
+system_versions(table: str, record_id: int, *, limits: TemporalLimits=TemporalLimits()) -> TemporalVersions
+```
+
+Return create/update/delete-bounded intervals for one logical row identity.
+
+#### Database.enable_system_history
+
+```python
+enable_system_history(tables: tuple[str, ...]) -> None
+```
+
+Atomically opt tables into durable system-time history with their current baseline.
+
+#### Database.pin_system_history
+
+```python
+pin_system_history(name: str, at: CommitId, *, tables: tuple[str, ...]) -> None
+```
+
+Persist named protection against retention beyond `at` for selected tables.
+
+#### Database.unpin_system_history
+
+```python
+unpin_system_history(name: str) -> None
+```
+
+Explicitly release a durable temporal pin; an absent valid name is a no-op.
+
+#### Database.system_history_pins
+
+```python
+system_history_pins() -> tuple[TemporalPin, ...]
+```
+
+List durable temporal pins in name order under a qualified publication read.
+
+#### Database.prune_system_history
+
+```python
+prune_system_history(before: CommitId, *, tables: tuple[str, ...], max_bytes: int=16 * 1024 * 1024) -> TemporalPruneReport
+```
+
+Atomically redact payloads of versions closed at/before a new retained horizon.
+
 #### Database.enable_commit_history
 
 ```python
@@ -1120,10 +1192,10 @@ Execute a validated read definition at one native snapshot, never open a writer.
 ### okto_grafx.catalog_copy.capture_copy
 
 ```python
-capture_copy(source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits=CopyLimits()) -> CopyPackage
+capture_copy(source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits=CopyLimits(), record_ids: dict[str, tuple[int, ...]] | None=None, history: str='refuse') -> CopyPackage
 ```
 
-Capture complete selected tables from one native read snapshot; no source writes.
+Capture tables or explicit RID subsets from one native read snapshot.
 
 ### okto_grafx.catalog_copy.prepare_copy_target
 
@@ -1336,7 +1408,7 @@ Verify and restore into a NEW directory for offline replacement, never a writabl
 ### okto_grafx.transfer.export_graph
 
 ```python
-export_graph(database: Database, destination: str | os.PathLike[str], *, limits: TransferLimits | None=None) -> TransferReport
+export_graph(database: Database, destination: str | os.PathLike[str], *, limits: TransferLimits | None=None, history: str='refuse') -> TransferReport
 ```
 
 Stream all current logical schema/rows/vectors from one fixed reader snapshot.
@@ -1356,6 +1428,90 @@ construct raw engine state. Consume returned instances and documented accessors.
 `Lsn`, `Csn` and record/table IDs are integer aliases, not wall-clock times.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
+
+### TemporalLimits fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalLimits`.
+
+Aggregate encoded-input, event and live/output-row bounds; not an RSS ceiling.
+
+```python
+max_events: int
+max_bytes: int
+max_rows: int
+```
+
+### TemporalVersion fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalVersion`.
+
+One row lineage interval [system_from, system_to); None is unbounded.
+
+```python
+table: str
+table_id: int
+record_id: int
+values: tuple[object, ...]
+schema_version: int
+system_from: CommitId
+system_to: CommitId | None
+```
+
+### TemporalGraph fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalGraph`.
+
+Complete bounded historical rows/schemas for a requested closed table set.
+
+```python
+as_of: CommitId
+schemas: tuple[TableDef, ...]
+rows: tuple[TemporalVersion, ...]
+events_scanned: int
+encoded_bytes_scanned: int
+```
+
+### TemporalVersions fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalVersions`.
+
+Versions visible to the owning read snapshot, never a claim beyond its boundary.
+
+```python
+read_commit: CommitId
+table: str
+record_id: int
+versions: tuple[TemporalVersion, ...]
+activation: CommitId
+retained_from: CommitId
+```
+
+### TemporalPin fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalPin`.
+
+Durable named retention protection; explicitly released, with no implicit TTL.
+
+```python
+name: str
+at: CommitId
+tables: tuple[str, ...]
+```
+
+### TemporalPruneReport fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalPruneReport`.
+
+Atomic retention result; payload redaction does not reclaim physical file space.
+
+```python
+before: CommitId
+tables: tuple[str, ...]
+commit: CommitId | None
+redacted_versions: int
+redacted_bytes: int
+physical_bytes_reclaimed: int
+```
 
 ### ViewParameter fields
 
@@ -1433,6 +1589,7 @@ target_commit: CommitId
 request_sha256: str
 rows: int
 replayed: bool
+skipped_rows: int
 ```
 
 ### CatalogPathPolicy fields
@@ -2160,6 +2317,7 @@ stemming: str
 statistics_mode: str
 statistics_history_entries: int
 prefix_max_characters: int
+positions: bool
 ```
 
 #### TextIndexOptions.derivation

@@ -104,7 +104,6 @@ from okto_grafx.domain.index.header import (
     IndexHeader,
 )
 from okto_grafx.domain.index.layout import IndexLayout
-from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.records import (
     IndexChange,
     IndexOperation,
@@ -1990,7 +1989,7 @@ class IndexStore:
             try:
                 moved: bool
                 hot_bucket = hot_buckets.get(
-                    bucket_of(change.key, self._definition.bucket_count)
+                    self._definition.bucket_for(change.key)
                 )
                 if hot_bucket is not None:
                     moved = self._apply_common_replay_hot_change(
@@ -2755,7 +2754,7 @@ class IndexStore:
     def _candidates_unchecked(self, wanted: bytes) -> tuple[IndexEntry, ...]:
         """Walk one already-validated key; the manager surrounds this with its view fence."""
         _pages, found = self._scan_bucket(
-            bucket_of(wanted, self._definition.bucket_count), wanted
+            self._definition.bucket_for(wanted), wanted
         )
         return found
 
@@ -2779,7 +2778,7 @@ class IndexStore:
             return
         buckets: dict[int, list[bytes]] = {}
         for key in keys:
-            buckets.setdefault(bucket_of(key, self._definition.bucket_count), []).append(key)
+            buckets.setdefault(self._definition.bucket_for(key), []).append(key)
         for bucket, wanted in buckets.items():
             if len(wanted) == 1:
                 yield wanted[0], self._candidates_unchecked(wanted[0])
@@ -3105,7 +3104,7 @@ class IndexStore:
 
         counts: dict[int, int] = {}
         for change in staged.changes:
-            bucket = bucket_of(change.key, self._definition.bucket_count)
+            bucket = self._definition.bucket_for(change.key)
             if bucket not in counts and len(counts) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT:
                 return {}
             counts[bucket] = counts.get(bucket, 0) + 1
@@ -3119,7 +3118,7 @@ class IndexStore:
             return {}
         retained_targets = 0
         for change in staged.changes:
-            bucket = bucket_of(change.key, self._definition.bucket_count)
+            bucket = self._definition.bucket_for(change.key)
             targets = targets_by_bucket.get(bucket)
             if targets is None:
                 continue
@@ -3473,7 +3472,7 @@ class IndexStore:
         """Apply against a batch proved empty, returning None when canonical fallback is needed."""
         if not build.valid or change.operation is IndexOperation.RESET:
             return None
-        bucket = bucket_of(change.key, self._definition.bucket_count)
+        bucket = self._definition.bucket_for(change.key)
         identity = (change.key, change.ref)
         located = build.entries.get(identity)
         if change.operation is IndexOperation.INSERT:
@@ -3549,7 +3548,7 @@ class IndexStore:
             if moved and self._metrics.enabled and self._definition.versioned:
                 self._tombstone_backlog_count = 0
             return moved
-        bucket = bucket_of(change.key, self._definition.bucket_count)
+        bucket = self._definition.bucket_for(change.key)
         pages, matches = self._scan_bucket(
             bucket, change.key, change.ref, first_matching_page=True
         )
@@ -6984,7 +6983,7 @@ class IndexManager:
                 store,
                 change,
                 lsn_of(record),
-                bucket_of(change.key, store.definition.bucket_count),
+                store.definition.bucket_for(change.key),
             )
             items.append(item)
             if store not in seen:

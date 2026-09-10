@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import struct
+from collections import OrderedDict
+from types import MappingProxyType
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
 from okto_grafx.domain.ids import NO_CSN, NO_PAGE, PROVISIONAL_CSN, RecordRef
-from okto_grafx.domain.index.definition import COLUMN_KEY_DERIVATION
+from okto_grafx.domain.index.definition import COLUMN_KEY_DERIVATION, IndexDefinition
+from okto_grafx.domain.ports.metrics import MetricsSink
+from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.keys import bucket_of
@@ -16,20 +20,51 @@ from okto_grafx.domain.page import PAGE_HEADER_SIZE, SLOT_ENTRY_SIZE
 from okto_grafx.engine.index_manager import HashIndex, IndexStore
 
 _POSTING = struct.Struct("<cHQQ")
+_DECODE_MEMO_MAX_BYTES = 1_048_576
+_DECODE_MEMO_MAX_PAGES = 64
+__all__ = ["PostingHashIndex"]
 
 
 class PostingHashIndex(HashIndex):
     """Opt-in property hash; keys are stored once per page, references retain slots."""
 
-    def __init__(self, definition, pool, metrics):
+    def __init__(self, definition: IndexDefinition, pool: BufferPool, metrics: MetricsSink) -> None:
         """Admit only the catalog-declared exact posting layout."""
         if (definition.layout is not IndexLayout.POSTING_HASH
                 or definition.visibility is not IndexVisibility.EXACT
                 or definition.key_derivation != COLUMN_KEY_DERIVATION):
             raise GrafxIndexError("Posting hash requires an exact property index.", field="layout")
         IndexStore.__init__(self, definition, pool, metrics)
+        self._decode_memo = OrderedDict()
+        self._decode_memo_bytes = 0
 
     def _decode_page(self, page):
+        """Reuse only a pure decode of identical complete bytes, never page/LSN authority.
+
+        Content-keying includes the entire canonical page image, not merely its
+        address or publication stamp. In-place mutation, reload, WAL apply and
+        slot reuse therefore cannot reuse stale results, even at the same LSN.
+        The store-local LRU is bounded by pages and conservative retained bytes.
+        Native index/heap certificates and CRC admission still run independently.
+        """
+        raw = page.to_bytes()
+        cached = self._decode_memo.get(raw)
+        if cached is not None:
+            self._decode_memo.move_to_end(raw)
+            return cached[0], cached[1]
+        keys, postings = self._decode_page_uncached(page)
+        keys, postings = MappingProxyType(keys), tuple(postings)
+        charge = len(raw) + 256 + sum(128 + len(key) for key in keys.values()) + 256 * len(postings)
+        if charge <= _DECODE_MEMO_MAX_BYTES and _DECODE_MEMO_MAX_PAGES > 0:
+            while self._decode_memo and (len(self._decode_memo) >= _DECODE_MEMO_MAX_PAGES
+                                         or self._decode_memo_bytes + charge > _DECODE_MEMO_MAX_BYTES):
+                _, evicted = self._decode_memo.popitem(last=False)
+                self._decode_memo_bytes -= evicted[2]
+            self._decode_memo[raw] = (keys, postings, charge)
+            self._decode_memo_bytes += charge
+        return keys, postings
+
+    def _decode_page_uncached(self, page):
         """Validate a complete bounded dictionary and all postings before using any."""
         keys = {}
         unique = set()
@@ -71,7 +106,7 @@ class PostingHashIndex(HashIndex):
                                  page=page.page_index, slot=slot)
 
     @property
-    def max_key_bytes(self):
+    def max_key_bytes(self) -> int:
         """Reserve a dictionary and one posting on an otherwise empty page."""
         return self._pool.page_size - PAGE_HEADER_SIZE - 2 * SLOT_ENTRY_SIZE - 1 - _POSTING.size
 
@@ -167,7 +202,7 @@ class PostingHashIndex(HashIndex):
         bucket = bucket_of(key, self.definition.bucket_count)
         # Refuse the accelerator, not the operation, before retaining an unbounded chain.
         pages = []
-        def visit():
+        def visit() -> None:
             """Decline optional batch preparation before its page-directory bound."""
             if len(pages) >= 512:
                 raise _DeclinePostingBatch()
@@ -208,7 +243,7 @@ class PostingHashIndex(HashIndex):
         hot["present"].add(change.ref)
         return True
 
-    def assisted_rehash_pressure(self):
+    def assisted_rehash_pressure(self) -> tuple[int, int]:
         """Count logical postings, excluding dictionary slots, for advisory sizing."""
         self.open()
         entries = sum(len(self._entries_on(self._bucket_head(bucket)))

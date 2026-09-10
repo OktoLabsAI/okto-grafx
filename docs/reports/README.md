@@ -1,5 +1,7 @@
 # Evidence and report index
 
+- [0.0.6 native history/catalog/search round: fixed eight-item scope and validation](V006_NATIVE_HISTORY_ROUND.md)
+
 [Documentation index](../README.md) · [Current performance](../PERFORMANCE.md) · [Roadmap](../../ROADMAP.md)
 
 Dated evidence, not active execution queues. Each report retains its original

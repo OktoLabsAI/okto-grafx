@@ -1,12 +1,13 @@
-"""Internal temporal append-image prototype, NOT connected to database publication.
+"""Pure temporal codecs and bounded image plans used by native history publication.
 
-This module performs no writes, acquires no authority and exposes no consumer API.
-Its caller must eventually supply a proved durable view and publish complete images
-through native OCC/WAL/redo. Until that integration is implemented, no database can
-activate or use this format. See SPEC-GX-CAP-3 and its explicit remaining work.
+This module performs no writes and acquires no authority. The native coordinator
+and recovery preflight own qualified views, both OCC checks, WAL and application.
+Applications consume Database's typed APIs, never these internal image helpers.
 """
 
 from __future__ import annotations
+
+__all__ = ["HistoryChange", "HistoryPageImage", "PreparedHistoryAppend", "SystemHistoryStore"]
 
 import hashlib
 import struct
@@ -23,7 +24,7 @@ from okto_grafx.domain.page import Page, PageType
 from okto_grafx.domain.page.layout import validate_page_size
 from okto_grafx.domain.txn.commit_identity import CommitId
 
-_FILE = "system-history.dat"  # Deliberately NOT an admitted native WRITE_PAGE target yet.
+_FILE = "system-history.dat"
 _HEAD = struct.Struct("<8s16sQQQQ32s")
 _BLOCK = struct.Struct("<8s16sQIIII32s32s")
 _ROW = struct.Struct("<BQII")
@@ -53,28 +54,34 @@ def _schema_bytes(table: TableDef) -> bytes:
 class HistoryChange:
     """Settled row effect; RecordId is lineage, not a reusable physical reference.
 
-    Operations: 1=create, 2=update, 3=delete. Update/delete interval closure and
-    endpoint lineage must be proved by the future native integration, not this codec.
+    Operations: 1=create, 2=update, 3=delete, 4=schema (RecordId zero),
+    5=redacted create, 6=redacted update. Interval closure and
+    endpoint lineage is proved by native publication/recovery and the temporal reader,
+    not by this codec in isolation.
     """
 
     table: TableDef
     record_id: int
     operation: int
     values: tuple[object, ...]
+    redacted_bytes: int = 0
 
     def encode(self) -> bytes:
         """Detach a full historical schema plus native values, with explicit bounds."""
         if (type(self.table) is not TableDef or type(self.record_id) is not int
-                or not 0 < self.record_id < 2**64 or type(self.operation) is not int
-                or self.operation not in (1, 2, 3) or type(self.values) is not tuple):
+                or not 0 <= self.record_id < 2**64 or type(self.operation) is not int
+                or self.operation not in (1, 2, 3, 4, 5, 6) or type(self.values) is not tuple
+                or (self.record_id == 0) != (self.operation == 4)
+                or type(self.redacted_bytes) is not int or not 0 <= self.redacted_bytes <= _MAX_ROW
+                or self.operation not in (5, 6) and self.redacted_bytes != 0):
             raise _invalid("change")
         schema = _schema_bytes(self.table)
         if len(schema) > _MAX_SCHEMA:
             raise _invalid("schema_bytes")
-        if self.operation == 3:
+        if self.operation in (3, 4, 5, 6):
             if self.values:
                 raise _invalid("delete_values")
-            payload = b""
+            payload = bytes(self.redacted_bytes)
         else:
             payload = encode_tuple(self.table, self.values)
         if len(payload) > _MAX_ROW:
@@ -102,7 +109,8 @@ def _decode_change(raw: bytes) -> HistoryChange:
             raise _corrupt("schema_framing")
         payload = raw[_ROW.size + schema_size:]
         change = HistoryChange(table, record_id, operation,
-                               () if operation == 3 else decode_tuple(table, payload))
+                               () if operation in (3, 4, 5, 6) else decode_tuple(table, payload),
+                               len(payload) if operation in (5, 6) else 0)
         if change.encode() != raw:
             raise _corrupt("change_framing")
         return change
@@ -180,7 +188,7 @@ class PreparedHistoryAppend:
     previous_digest: bytes
     payload: bytes
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Refuse forged/unbounded detached inputs; this still grants no write authority."""
         CommitId(self.database_uuid, self.activation)
         CommitId(self.database_uuid, self.previous_sequence)
@@ -231,9 +239,9 @@ def _image(page_size: int, number: int, sequence: int, payload: bytes) -> Histor
 
 
 class SystemHistoryStore:
-    """Pure bounded image planning/validation; not registered with Database or recovery."""
+    """Pure bounded image planning/validation consumed by native publication and recovery."""
 
-    def __init__(self, read_page: Callable[[str, int], bytes], *, database_uuid: bytes, page_size: int):
+    def __init__(self, read_page: Callable[[str, int], bytes], *, database_uuid: bytes, page_size: int) -> None:
         self.database_uuid = CommitId(database_uuid, 1).database_uuid
         self.page_size = validate_page_size(page_size)
         self.read_page = read_page
@@ -243,6 +251,19 @@ class SystemHistoryStore:
         CommitId(self.database_uuid, activation)
         return _image(self.page_size, 0, activation, _HEAD.pack(
             _HEAD_MAGIC, self.database_uuid, activation, activation, 0, 1, bytes(32)))
+
+    def activation_images(self, changes: Sequence[HistoryChange], sequence: int) -> tuple[HistoryPageImage, ...]:
+        """Plan the initial baseline at its actual activation COMMIT, without I/O."""
+        CommitId(self.database_uuid, sequence)
+        if sequence <= 1:
+            raise _invalid("activation_sequence")
+        plan = PreparedHistoryAppend(self.database_uuid, self.page_size, sequence - 1,
+                                     sequence - 1, 0, 1, bytes(32), _encode_changes(changes))
+        images = plan.bind(sequence)
+        page = Page.from_bytes(images[0].raw)
+        fields = list(_HEAD.unpack(page.read_slot(0)))
+        fields[2] = sequence
+        return (_image(self.page_size, 0, sequence, _HEAD.pack(*fields)), *images[1:])
 
     def _page(self, number: int) -> Page:
         raw = self.read_page(_FILE, number)
@@ -365,12 +386,29 @@ class SystemHistoryStore:
         if (type(max_bytes) is not int or not 1 <= max_bytes <= 2**31
                 or type(max_changes) is not int or not 1 <= max_changes <= 65536):
             raise _invalid("read_budget")
-        activation, _, batches, _, expected_digest = self._head(expected_sequence, page_count)
-        number = 1
-        previous_sequence = activation
-        chain = bytes(32)
         output = []
         captured_bytes = captured_changes = 0
+        for identity, changes, size in self._iter_batches(expected_sequence=expected_sequence, page_count=page_count):
+            captured_bytes += size
+            captured_changes += len(changes)
+            if captured_bytes > max_bytes:
+                raise GrafxQueryBudgetExceeded("History read byte budget exceeded.", resource="history_bytes")
+            if captured_changes > max_changes:
+                raise GrafxQueryBudgetExceeded("History change budget exceeded.", resource="history_changes")
+            output.append((identity, changes))
+        return tuple(output)
+
+    def _iter_batches(self, *, expected_sequence: int, page_count: int):
+        """Stream private validation work, bounded per batch, with terminal chain proof.
+
+        Exhaustion is mandatory: yielded batches are not a complete-history proof.
+        Public callers materialize under their own aggregate budgets; recovery
+        can validate arbitrary retained extent without keeping old events in RAM.
+        """
+        activation, _, batches, _, expected_digest = self._head(expected_sequence, page_count)
+        number = 1
+        previous_sequence = activation - 1 if batches else activation
+        chain = bytes(32)
         for ordinal in range(batches):
             pieces = []
             wanted = None
@@ -387,16 +425,12 @@ class SystemHistoryStore:
                 descriptor = (sequence, count, size, previous, digest)
                 if (magic != _BLOCK_MAGIC or identity != self.database_uuid or batch != ordinal
                         or position != part or not previous_sequence < sequence <= expected_sequence
-                        or page.page_lsn != sequence or previous != chain
+                        or not sequence <= page.page_lsn <= expected_sequence or previous != chain
                         or not 4 <= size <= _MAX_BATCH or count != (size + capacity - 1) // capacity
                         or len(raw) - _BLOCK.size != min(capacity, size - part * capacity)
                         or wanted is not None and descriptor != wanted):
                     raise _corrupt("chunk_coverage")
                 wanted = descriptor
-                if part == 0:
-                    captured_bytes += size
-                    if captured_bytes > max_bytes:
-                        raise GrafxQueryBudgetExceeded("History read byte budget exceeded.", resource="history_bytes")
                 pieces.append(raw[_BLOCK.size:])
                 number += 1
                 part += 1
@@ -405,13 +439,9 @@ class SystemHistoryStore:
             payload = b"".join(pieces)
             if hashlib.sha256(payload).digest() != digest:
                 raise _corrupt("batch_digest")
-            captured_changes += _U32.unpack_from(payload)[0]
-            if captured_changes > max_changes:
-                raise GrafxQueryBudgetExceeded("History change budget exceeded.", resource="history_changes")
             changes = _decode_changes(payload)
-            output.append((CommitId(self.database_uuid, sequence), changes))
+            yield CommitId(self.database_uuid, sequence), changes, len(payload)
             chain = hashlib.sha256(chain + struct.pack("<Q", sequence) + digest).digest()
             previous_sequence = sequence
         if number != page_count or chain != expected_digest or previous_sequence != expected_sequence:
             raise _corrupt("chain_coverage")
-        return tuple(output)

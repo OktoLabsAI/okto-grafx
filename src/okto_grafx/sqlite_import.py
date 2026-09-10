@@ -1,5 +1,8 @@
 """Bounded single SQLite SELECT snapshot, closed before atomic Grafx staging."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator
 from dataclasses import dataclass
 import os
 import sqlite3
@@ -28,7 +31,7 @@ class SQLiteImportLimits:
     max_field_bytes: int = 65536
     max_work: int = 1_000_000
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
             if (
                 type(getattr(self, name)) is not int
@@ -86,7 +89,7 @@ def read_sqlite_rows(
     connection = None
     interrupted = None
 
-    def progress():
+    def progress() -> int:
         """Translate cooperative cancellation or budget exhaustion to SQLite interruption."""
         nonlocal interrupted
         try:
@@ -96,7 +99,8 @@ def read_sqlite_rows(
             return 1
         return 0
 
-    def authorize(action, arg1, arg2, database, trigger):
+    def authorize(action: int, arg1: str | None, arg2: str | None,
+                  database: str | None, trigger: str | None) -> int:
         """Allow only the bounded read-only SQLite query surface."""
         allowed = (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_RECURSIVE)
         if action == sqlite3.SQLITE_FUNCTION:
@@ -217,7 +221,7 @@ def import_sqlite(
     )
     work = _Work(limits.max_work, cancellation)
 
-    def controlled_rows():
+    def controlled_rows() -> Iterator[dict[str, object]]:
         """Charge each source row before passing it to native atomic staging."""
         for row in rows:
             work.step()

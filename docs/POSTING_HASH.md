@@ -20,9 +20,16 @@ string in **4 bucket pages**. This is physical work evidence, not a wall-clock
 benchmark. Full enumeration still costs O(output + bucket pages). Unique keys can
 cost more because their dictionary entries are not shared. Do not choose this as
 a universal replacement for hash, ordered or full-text search.
-This first posting layout decodes dictionaries on each read; the existing
-decoded-page memo still accelerates the established HASH layout, not these new
-posting pages. Smaller cold reads do not guarantee lower warm-query CPU time.
+The store now memoizes complete successful decodes keyed by **identical complete
+canonical page bytes**, not page address or LSN alone. The LRU retains at most
+64 images and a conservative 1 MiB accounting per posting-index handle; oversized
+pages decode normally without caching. These fixed internal limits add no
+connection options. Outputs are immutable, failures are not cached, and changes
+at the same LSN, WAL application, slot reuse and page reload cannot reuse a stale
+decode. Native CRC admission, generation/certificate checks and heap visibility
+remain independent and mandatory. This is decoded structure, not authority.
+Tests count one decode for repeated equal bytes and new validation after same-LSN
+mutation; this is work reduction, not a claimed end-to-end latency ratio.
 
 Reference postings are 19 bytes plus the native slot directory; each distinct key
 also needs a dictionary slot per page. Native heap validation remains mandatory

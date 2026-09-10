@@ -1,5 +1,11 @@
 # Operations, concurrency and recovery
 
+Opt-in [native system history](SYSTEM_TIME_HISTORY.md) participates in the same
+COMMIT/recovery protocol and physical backup. Its named retention pins are
+independent of MVCC/WAL reader registration. Pruning is an explicit bounded
+payload-redaction operation, not disk compaction or autonomous recovery.
+See [0.0.6 wheel compatibility](V006_COMPATIBILITY.md) before enabling new bits.
+
 [Logical export/import](LOGICAL_TRANSFER.md) creates a separately writable fresh-UUID
 store; [physical restore](BACKUP_RESTORE.md) remains an offline same-UUID replacement.
 Neither copies live participants into a fork. [FTS operations](FULL_TEXT_SEARCH.md#operations-and-compatibility)

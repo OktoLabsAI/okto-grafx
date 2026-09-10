@@ -116,7 +116,7 @@ def test_a_directory_path_selects_the_local_device_at_the_configured_page_size(
 
 
 def test_the_codec_is_built_at_the_configured_page_size(tmp_path: Path) -> None:
-    registry = build_default_registry(_config(tmp_path / "db", page_size=2048))
+    registry = build_default_registry(_config(tmp_path / "db", page_size=2048, codec="pure"))
     try:
         codec = registry.get("codec")
         assert isinstance(codec, PageCodecV1)

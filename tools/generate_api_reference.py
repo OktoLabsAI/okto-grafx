@@ -15,6 +15,7 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "domain/temporal.py": {"TemporalGraph", "TemporalLimits", "TemporalPin", "TemporalPruneReport", "TemporalVersion", "TemporalVersions"},
     "views.py": {"ViewParameter", "ViewDefinition"},
     "catalog_copy.py": {"CopyLimits", "CopyTable", "CopyPackage", "CopyReceipt"},
     "catalogs.py": {"CatalogPathPolicy", "CatalogInfo"},

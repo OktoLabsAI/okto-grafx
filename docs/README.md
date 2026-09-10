@@ -8,6 +8,8 @@ publication or that the latest source is installed in a particular application.
 
 | Question | Read |
 | --- | --- |
+| How do I retain graph versions, query past commits and protect retention? | [System-time history](SYSTEM_TIME_HISTORY.md) |
+| How is the 0.0.6 wheel upgrade/old-reader boundary tested? | [0.0.6 compatibility](V006_COMPATIBILITY.md) |
 | How can repeated property keys share physical index storage? | [Posting hash](POSTING_HASH.md) |
 | How do I copy data into an existing catalog and safely retry? | [Atomic catalog copy](CATALOG_COPY.md) |
 | How do I persist and consume named, typed read queries? | [Logical views](LOGICAL_VIEWS.md) |

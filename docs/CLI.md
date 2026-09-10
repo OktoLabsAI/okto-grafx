@@ -8,6 +8,32 @@ you need long-lived snapshots, all connection settings or reusable handles.
 
 ## Commands
 
+### Explicit catalogs and workspace resolution (0.0.6 development)
+
+```sh
+oktografx catalogs /srv/project/main --allow-root /srv/project --attach archive=/srv/project/archive --json
+oktografx workspace resolve /srv/project/src --allow-root /srv/project --max-parent-steps 4 --json
+```
+
+`catalogs PATH` requires repeatable `--allow-root`, opens only explicit existing
+stores read-only and closes its session before returning. At most 15 `--attach
+ALIAS=PATH` values plus `main` are allowed. Aliases/paths/UUIDs use native session
+validation; no write/create switch is accepted. `--limit` defaults to 16; zero
+returns no entries and an honest truncation flag. JSON v1: `command`,
+`schema_version`, `scope="explicit_invocation_attachments"`, `read_only`,
+`catalogs`, `total`, `truncated`. Entries contain alias, UUID hex, read-only/owned
+flags and active transaction counts. This is not an inventory of other processes.
+
+`workspace resolve CWD` requires allowed roots but never opens or creates stores.
+Options: `--store`, `--project-root`, repeated `--marker` (default `.git`),
+`--max-parent-steps` (8, range 0–64), `--allow-cwd`, `--user-store`, and
+`--allow-user-store`. Resolution precedence and path refusals match the
+[workspace API](CATALOGS_AND_WORKSPACES.md). There is no implicit home/global
+store. JSON v1: `command`, `schema_version`, `scope="path_resolution_only"`,
+`stores_opened=0`, and `workspace={root, project_store, user_store, source}`.
+Machine errors use the existing exit/envelope contract; no failed source becomes
+an empty successful inventory.
+
 ### Table schema inventory (0.0.6 development)
 
 `oktografx schema PATH --json --limit 100` captures one immutable public catalog

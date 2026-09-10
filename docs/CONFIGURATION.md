@@ -1,5 +1,14 @@
 # Configuration reference
 
+0.0.6 adds explicit `enable_system_history(tables)`, temporal query limits,
+durable pins and bounded prune budgets; none is enabled by connecting. See the
+[temporal configuration table](SYSTEM_TIME_HISTORY.md#configuration-and-bounded-cost).
+`TextIndexOptions.positions=False` controls persisted positional postings; opting
+in is a required-capability upgrade, not a transient query flag. See
+[positional FTS](FULL_TEXT_SEARCH.md#durable-positional-postings-006-development).
+The posting-hash pure decode LRU has fixed 64-image/1 MiB per-handle bounds,
+documented in [posting hash](POSTING_HASH.md); it is not an authority cache.
+
 `Database.create_index(..., layout="posting_hash")` is an explicit per-index
 physical layout, not a connection flag. See [eligibility, limits and trade-offs](POSTING_HASH.md).
 
@@ -14,7 +23,8 @@ replacement, pagination and query-timeout options, not connection flags. See
 `Database.search_text(..., phrase=False)` is an operation-local boolean for
 [exact analyzed phrases](FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development).
 It reuses existing FTS limits and cannot be combined with prefix mode; it adds no
-persisted index/connection option.
+connection option. Persistent positional postings use the separate `positions`
+index option described above; phrase search itself also works without that opt-in.
 
 For whole-package copy bounds and idempotency/metadata options, see
 [CopyLimits and results](CATALOG_COPY.md#configuration-and-result-contracts).

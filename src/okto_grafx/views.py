@@ -87,7 +87,7 @@ class ViewParameter:
     type: ValueType
     nullable: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         _name(self.name)
         if (
             type(self.type) is not ValueType
@@ -272,7 +272,7 @@ def _get(tx, name):
 class LogicalViews:
     """Database-owned logical view operations; no separately closable resources or caches."""
 
-    def __init__(self, database: Database):
+    def __init__(self, database: Database) -> None:
         self._database = database
 
     @contextmanager

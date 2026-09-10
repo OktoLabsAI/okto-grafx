@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 from threading import RLock
+from types import TracebackType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -71,7 +72,7 @@ class CatalogPathPolicy:
     max_catalogs: int = 16
     max_active_transactions: int = 64
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if (
             type(self.allowed_roots) is not tuple
             or not 1 <= len(self.allowed_roots) <= 64
@@ -126,7 +127,7 @@ class _Attached:
     transactions: list[Transaction] = field(default_factory=list)
     pending: int = 0
 
-    def active(self):
+    def active(self) -> int:
         """Count live and pending transactions without retaining settled handles."""
         self.transactions[:] = [tx for tx in self.transactions if tx.active]
         return len(self.transactions) + self.pending
@@ -161,7 +162,7 @@ class CatalogSession:
         owned: bool,
         policy: CatalogPathPolicy,
         read_only: bool = True,
-    ):
+    ) -> None:
         if type(policy) is not CatalogPathPolicy:
             _refuse("Expected CatalogPathPolicy.", "policy")
         self._policy = policy
@@ -420,7 +421,7 @@ class CatalogSession:
                 )
             database = attached.database
 
-        def begin(mode, *, metadata):
+        def begin(mode: str, *, metadata: CommitMetadata | None) -> Transaction:
             """Pin copy work to this explicitly selected catalog alias."""
             return self.begin(mode, catalog=name, metadata=metadata)
 
@@ -490,12 +491,13 @@ class CatalogSession:
         if first is not None:
             raise first
 
-    def __enter__(self):
+    def __enter__(self) -> CatalogSession:
         with self._lock:
             self._open()
         return self
 
-    def __exit__(self, exc_type, exc, traceback):
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None,
+                 traceback: TracebackType | None) -> bool:
         try:
             self.close()
         except BaseException as cleanup:

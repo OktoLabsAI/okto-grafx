@@ -113,6 +113,7 @@ from okto_grafx.domain.txn.commit_metadata import CommitMetadata, capture_commit
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry
 from okto_grafx.domain.txn.commit_history import CommitHistoryPage
 from okto_grafx.engine.commit_history_reader import observe_commit_catalog
+from okto_grafx.domain.temporal import TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersions
 from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.verify.findings import VerificationReport, VerificationFinding, FindingKind, FindingLocation
@@ -1211,6 +1212,20 @@ class Transaction:
             )
         control = _read_control(self._database._clock, timeout_seconds, cancellation)
         return self._database._run_statement(self._context, text, parameters, control=control)
+
+    def system_as_of(self, at: CommitId | Timestamp, *, tables: tuple[str, ...],
+                     limits: TemporalLimits = TemporalLimits()) -> TemporalGraph:
+        """Read durable system-time rows under this transaction's snapshot, excluding private writes."""
+        self._require_active()
+        return self._database._read_system_history(self._context, at=at, tables=tables, limits=limits)
+
+    def system_versions(self, table: str, record_id: int, *,
+                        limits: TemporalLimits = TemporalLimits()) -> TemporalVersions:
+        """Read one logical row's intervals visible to this snapshot, not later commits."""
+        self._require_active()
+        return self._database._read_system_history(self._context,
+            at=CommitId(self._database.identity.database_uuid, self._context.snapshot.read_lsn),
+            tables=(table,), limits=limits, record_id=record_id)
 
     def commit_history(self, *, after: CommitId | None = None, limit: int = 100) -> CommitHistoryPage:
         """Read an ascending bounded history page under this transaction's snapshot."""
@@ -3417,7 +3432,31 @@ class Database:
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 if wanted_scope != "indexes" and self._catalog.catalog.commit_catalog_activation is not None:
                     report = self._verify_commit_history(report)
+                    if self._catalog.catalog.system_history_tables():
+                        report = self._verify_system_history(report)
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def _verify_system_history(self, report: VerificationReport) -> VerificationReport:
+        """Include complete temporal chain/interval validation and current-row agreement."""
+        try:
+            with self.begin("read") as tx:
+                catalog = self._catalog.catalog
+                tables = tuple(catalog.table_by_id(key) for key, _, _ in catalog.system_history_tables())
+                graph = tx.system_as_of(CommitId(self.identity.database_uuid, tx.snapshot.read_lsn),
+                    tables=tuple(table.name for table in tables))
+                current = {(table.table_id, version.record_id): tuple(version.values)
+                           for table in tables for _, version in self._heap.scan(table, tx._context.snapshot)}
+                historical = {(row.table_id, row.record_id): row.values for row in graph.rows}
+                if current != historical:
+                    raise GrafxCorruptionDetected("Current rows disagree with native history.", field="system_history_current")
+            return replace(report, records_checked=report.records_checked + graph.events_scanned,
+                pages_checked=report.pages_checked + self._storage.page_count("system-history.dat"),
+                files_checked=tuple(dict.fromkeys((*report.files_checked, "system-history.dat"))))
+        except GrafxError:
+            finding = VerificationFinding(kind=FindingKind.CATALOG_UNREADABLE,
+                location=FindingLocation(file="system-history.dat"),
+                detail="Temporal history verification refused; complete lineage/current-state agreement could not be proved.")
+            return replace(report, findings=(*report.findings, finding))
 
     def _verify_commit_history(self, report: VerificationReport) -> VerificationReport:
         """Include logical history in public verification, with no repair side effect."""
@@ -3782,6 +3821,78 @@ class Database:
 
             self._refresh_index_inventory()
             return None
+
+    def system_as_of(self, at: CommitId | Timestamp, *, tables: tuple[str, ...],
+                     limits: TemporalLimits = TemporalLimits()) -> TemporalGraph:
+        """Return a bounded historical graph at a qualified commit or ordered timestamp.
+
+        Include both endpoint tables when requesting relationships. Historical
+        identities never resolve through recreated primary keys. History before
+        activation or retention has distinct typed refusal, not an empty graph.
+        """
+        from okto_grafx.engine.system_history_reader import _inputs
+        at = _inputs(self, at, tables, limits, None)
+        with self.begin("read") as transaction:
+            return transaction.system_as_of(at, tables=tables, limits=limits)
+
+    def system_versions(self, table: str, record_id: int, *,
+                        limits: TemporalLimits = TemporalLimits()) -> TemporalVersions:
+        """Return create/update/delete-bounded intervals for one logical row identity."""
+        from okto_grafx.engine.system_history_reader import _inputs
+        _inputs(self, CommitId(self.identity.database_uuid, 1), (table,), limits, record_id)
+        with self.begin("read") as transaction:
+            return transaction.system_versions(table, record_id, limits=limits)
+
+    def _read_system_history(self, context, *, at, tables, limits, record_id=None):
+        from okto_grafx.engine.system_history_reader import read_system_history
+        with self._public_operation("read system history"):
+            return read_system_history(self, context, at=at, tables=tables, limits=limits, record_id=record_id)
+
+    def enable_system_history(self, tables: tuple[str, ...]) -> None:
+        """Atomically opt tables into durable system-time history with their current baseline.
+
+        Requires explicit identity-index and commit-history activation first.
+        Relationship history requires both endpoint tables enabled together or
+        previously. A baseline exceeding native history budgets refuses intact.
+        Activation is one-way; this is not retained MVCC or an automatic migration.
+        """
+        with self._public_operation("enable_system_history"):
+            self._require_writable("enable system history")
+            with self.begin("write") as transaction:
+                self._transactions._history_publication.stage_activation(transaction._context, tables)
+
+    def pin_system_history(self, name: str, at: CommitId, *, tables: tuple[str, ...]) -> None:
+        """Persist named protection against retention beyond ``at`` for selected tables.
+
+        Pins survive close/crash, have no TTL and require explicit unpinning. They
+        protect logical history only, not physical MVCC/WAL retention. Repeating an
+        identical binding is a no-op; rebinding an existing name refuses.
+        """
+        from okto_grafx.engine.system_history_operations import control
+        control(self, operation="pin system history", name=name, before=at, tables=tables)
+
+    def unpin_system_history(self, name: str) -> None:
+        """Explicitly release a durable temporal pin; an absent valid name is a no-op."""
+        from okto_grafx.engine.system_history_operations import control
+        control(self, operation="unpin system history", name=name)
+
+    def system_history_pins(self) -> tuple[TemporalPin, ...]:
+        """List durable temporal pins in name order under a qualified publication read."""
+        from okto_grafx.engine.system_history_operations import pins
+        return pins(self)
+
+    def prune_system_history(self, before: CommitId, *, tables: tuple[str, ...],
+                             max_bytes: int = 16 * 1024 * 1024) -> TemporalPruneReport:
+        """Atomically redact payloads of versions closed at/before a new retained horizon.
+
+        Explicit pins prevent incompatible pruning. Current versions, lineage,
+        schema and interval framing remain. The bounded rewrite uses native WAL,
+        OCC and COMMIT; a concurrent publication can require caller retry. This
+        does not shrink files or securely erase old WAL, backups or snapshots.
+        ``max_bytes`` caps captured history-file bytes, not process RSS.
+        """
+        from okto_grafx.engine.system_history_operations import control
+        return control(self, operation="prune system history", before=before, tables=tables, max_bytes=max_bytes)
 
     def enable_commit_history(self) -> None:
         """Activate one-way durable provenance after ensure_identity_indexes().

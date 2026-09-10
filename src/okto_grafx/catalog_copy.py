@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from collections.abc import Iterator
 import hashlib
 import json
 import re
@@ -79,7 +80,7 @@ class CopyLimits:
     max_row_bytes: int = 4 * 1024 * 1024
     max_tables: int = 64
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name, ceiling in (
             ("max_rows", 1_000_000),
             ("max_bytes", 2**30),
@@ -122,6 +123,7 @@ class CopyReceipt:
     request_sha256: str
     rows: int
     replayed: bool
+    skipped_rows: int = 0
 
 
 def _limits(limits):
@@ -152,7 +154,7 @@ def _digest(source, tables, spaces, limits):
     size = 0
     count = 0
 
-    def feed(raw):
+    def feed(raw: bytes) -> None:
         """Charge one length-delimited package component before hashing it."""
         nonlocal size
         size += len(raw) + 8
@@ -295,9 +297,17 @@ def _validate(package, limits):
 
 
 def capture_copy(
-    source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits = CopyLimits()
+    source: Transaction, *, tables: tuple[str, ...], limits: CopyLimits = CopyLimits(),
+    record_ids: dict[str, tuple[int, ...]] | None = None, history: str = "refuse",
 ) -> CopyPackage:
-    """Capture complete selected tables from one native read snapshot; no source writes."""
+    """Capture tables or explicit RID subsets from one native read snapshot.
+
+    A subset must name every selected table and include all selected relationship
+    endpoints. Node IDs use active identity indexes; other tables use a bounded
+    scan charged against the same row/byte limits. Missing IDs refuse. Empty tuples
+    select no rows. Native system history requires explicit
+    ``history='current-only'``; history is never copied or invented at the target.
+    """
     limits = _limits(limits)
     if type(source) is not Transaction or not source.active or source.mode != "read":
         raise GrafxTransactionStateError(
@@ -310,6 +320,19 @@ def capture_copy(
         or len(set(tables)) != len(tables)
     ):
         raise _invalid("tables")
+    if type(history) is not str or history not in ("refuse", "current-only"):
+        raise _invalid("history")
+    if record_ids is not None:
+        if type(record_ids) is not dict or set(record_ids) != set(tables):
+            raise _invalid("record_ids")
+        record_ids = dict(record_ids)
+        for ids in record_ids.values():
+            if (type(ids) is not tuple or len(ids) > limits.max_rows
+                    or any(type(rid) is not int or not 0 < rid < 2**64 for rid in ids)
+                    or len(set(ids)) != len(ids)):
+                raise _invalid("record_ids")
+        if sum(map(len, record_ids.values())) > limits.max_rows:
+            raise _invalid("max_rows")
     history = source.commit_history(limit=1)
     identity = CommitId(history.database_uuid, history.read_sequence)
     if source.lookup_commit(identity) is None:
@@ -321,13 +344,33 @@ def capture_copy(
         catalog = db._catalog.catalog
         schemas = tuple(_capture_schema(catalog.table(name)) for name in sorted(tables))
         spaces = tuple(replace(s) for s in catalog.spaces())
+        if history != "current-only" and any(s.table_id in {key for key, _, _ in catalog.system_history_tables()} for s in schemas):
+            raise GrafxUnsupportedOperation("Temporal tables require history='current-only' for logical copy.", operation="capture_copy")
     copied = []
     count = 0
     byte_count = 0
     for schema in schemas:
         rows = []
         cursor = None
+        from okto_grafx.domain.index.catalog import identity_index_name
+        from okto_grafx.domain.index.keys import record_id_key
+        if record_ids is not None and catalog.has_index_definition(identity_index_name(schema.table_id)):
+            with db._transactions.page_access_section(transaction=source._context):
+                for rid in sorted(record_ids[schema.name]):
+                    found = db._indexes.lookup_versions(identity_index_name(schema.table_id), record_id_key(rid), source.snapshot)
+                    if len(found) != 1:
+                        raise _invalid("missing_record_id")
+                    raw = encode_values(found[0][1].values)
+                    count += 1
+                    byte_count += len(raw)
+                    if count > limits.max_rows or len(raw) > limits.max_row_bytes or byte_count > limits.max_bytes:
+                        raise _invalid("row_limits")
+                    rows.append((rid, raw))
+            copied.append(CopyTable(schema, tuple(rows)))
+            continue
         while True:
+            if record_ids is not None and not record_ids[schema.name]:
+                break
             page = source.scan_rows_v1(
                 schema.name,
                 limit=min(256, limits.max_rows + 1 - count),
@@ -344,10 +387,13 @@ def capture_copy(
                     or byte_count > limits.max_bytes
                 ):
                     raise _invalid("row_limits")
-                rows.append((row.record_id, raw))
+                if record_ids is None or row.record_id in record_ids[schema.name]:
+                    rows.append((row.record_id, raw))
             cursor = page.next_cursor
             if cursor is None:
                 break
+        if record_ids is not None and {rid for rid, _ in rows} != set(record_ids[schema.name]):
+            raise _invalid("missing_record_id")
         copied.append(CopyTable(schema, tuple(sorted(rows))))
     with db._transactions.page_access_section(transaction=source._context):
         if (
@@ -430,7 +476,7 @@ def prepare_copy_target(database: Database) -> None:
         )
 
 
-def _request(package, target_uuid, key, metadata):
+def _request(package, target_uuid, key, metadata, conflict="fail"):
     if type(key) is not str or not re.fullmatch(
         r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}", key
     ):
@@ -440,7 +486,7 @@ def _request(package, target_uuid, key, metadata):
     if _PROOF in original.attributes:
         raise _invalid("metadata")
     digest = hashlib.sha256(
-        _json(("grafx-copy-request-v1", package.sha256, target_uuid.hex(), "fail", key))
+        _json(("grafx-copy-request-v1", package.sha256, target_uuid.hex(), conflict, key))
         + original.canonical_bytes
     ).hexdigest()
     recorded = CommitMetadata(
@@ -453,19 +499,22 @@ def _request(package, target_uuid, key, metadata):
     return digest, recorded
 
 
-def _receipt(tx, package, key, digest, recorded):
+def _receipt(tx, package, key, digest, recorded, conflict="fail"):
     _owner(tx)
     row = _row(tx, "request:" + key)
     if row is None:
         return None
     uuid = tx._database.identity.database_uuid
     count = sum(len(t.rows) for t in package.tables)
+    applied = row.values[4]
+    if type(applied) is not int or not 0 <= applied <= count or conflict == "fail" and applied != count:
+        raise _ledger_error("receipt_row_count")
     expected = (
         "request:" + key,
         digest,
         package.source_commit.to_token(),
         uuid.hex(),
-        count,
+        applied,
     )
     if row.values != expected:
         raise _ledger_error("idempotency_input_mismatch")
@@ -477,10 +526,10 @@ def _receipt(tx, package, key, digest, recorded):
         or evidence.metadata != recorded
     ):
         raise _ledger_error("commit_proof_mismatch")
-    return CopyReceipt(package.source_commit, identity, digest, count, True)
+    return CopyReceipt(package.source_commit, identity, digest, applied, True, count - applied)
 
 
-def _stage(tx, package):
+def _stage(tx, package, conflict="fail"):
     db = tx._database
     with db._transactions.page_access_section(transaction=tx._context):
         catalog = db._catalog.catalog
@@ -492,7 +541,7 @@ def _stage(tx, package):
             targets[item.schema.name] = target
         used = set()
 
-        def visit(value):
+        def visit(value: object) -> None:
             """Collect embedding-space references from all nested copied values."""
             if isinstance(value, VectorValue):
                 used.add(value.space_ref)
@@ -530,6 +579,7 @@ def _stage(tx, package):
     # All mutation goes through ordinary query statements: raw intent staging
     # alone does not perform query uniqueness checks or note OCC partitions.
     identities = {}
+    total_created = 0
     for item in sorted(package.tables, key=lambda t: t.schema.kind != "node"):
         table = item.schema
         offset = 0 if table.kind == "node" else 2
@@ -546,7 +596,20 @@ def _stage(tx, package):
                 f"CREATE (a)-[:{table.name} {{{props}}}]->(b)"
             )
 
-        def parameters():
+        skipped = set()
+        if conflict == "skip" and table.kind == "node":
+            seen_keys = set()
+            for rid, raw in item.rows:
+                values = _remap(_values(table, raw), mapping)
+                pk = values[table.column_index(table.primary_key)]
+                key = index_key((pk,), (0,))
+                present = key in seen_keys or bool(tx.execute(
+                    f"MATCH (n:{table.name}) WHERE n.{table.primary_key}=$key RETURN n.{table.primary_key}", {"key": pk}).rows)
+                seen_keys.add(key)
+                if present:
+                    skipped.add(rid)
+        admitted = []
+        def parameters() -> Iterator[dict[str, object]]:
             """Remap each detached row into the target statement's native parameters."""
             for rid, raw in item.rows:
                 values = _remap(_values(table, raw), mapping)
@@ -555,15 +618,20 @@ def _stage(tx, package):
                     identities[table.name, rid] = values[
                         table.column_index(table.primary_key)
                     ]
+                    if rid in skipped:
+                        continue
                 else:
                     row["source"] = identities[table.from_table, values[0]]
                     row["target"] = identities[table.to_table, values[1]]
+                admitted.append(rid)
                 yield row
 
         report = tx.executemany(statement, parameters())
         counter = "rows_created" if table.kind == "node" else "relationships_created"
-        if report.statistics.get(counter, 0) != len(item.rows):
+        if report.statistics.get(counter, 0) != len(admitted):
             raise _ledger_error("endpoint_or_row_count_mismatch")
+        total_created += len(admitted)
+    return total_created
 
 
 def copy_graph(
@@ -608,26 +676,25 @@ def _copy_with_begin(
     package = _validate(package, limits)
     if type(target) is not Database or target.closed or target.read_only:
         raise _invalid("target")
-    if type(conflict) is not str or conflict != "fail":
+    if type(conflict) is not str or conflict not in ("fail", "skip"):
         raise GrafxUnsupportedOperation(
-            "Copy v1 supports conflict='fail' only.", operation="catalog_copy"
+            "Copy supports conflict='fail' or 'skip'.", operation="catalog_copy"
         )
     if target.identity.database_uuid == package.source_commit.database_uuid:
         raise _invalid("same_store")
     digest, recorded = _request(
-        package, target.identity.database_uuid, idempotency_key, metadata
+        package, target.identity.database_uuid, idempotency_key, metadata, conflict
     )
     with begin("write", metadata=recorded) as tx:
         if tx._database is not target:
             raise GrafxTransactionStateError(
                 "Target attachment changed before copy began."
             )
-        prior = _receipt(tx, package, idempotency_key, digest, recorded)
+        prior = _receipt(tx, package, idempotency_key, digest, recorded, conflict)
         if prior is not None:
             tx.rollback()
             return prior
-        _stage(tx, package)
-        count = sum(len(t.rows) for t in package.tables)
+        count = _stage(tx, package, conflict)
         tx.execute(
             f"CREATE (:{_LEDGER} {{key:$k, digest:$d, source:$s, target:$t, rows:$n}})",
             {
@@ -646,4 +713,5 @@ def _copy_with_begin(
         digest,
         count,
         False,
+        sum(len(t.rows) for t in package.tables) - count,
     )

@@ -46,6 +46,8 @@ context exit commits, and an exceptional exit rolls back. See
 
 | Capability | Consumer documentation |
 | --- | --- |
+| Native opt-in system-time history, typed as-of/versions, pins and bounded retention (0.0.6 development) | [Temporal APIs and operations](docs/SYSTEM_TIME_HISTORY.md) |
+| Durable positional phrase postings and explicit catalog/workspace CLI inventory (0.0.6 development) | [FTS](docs/FULL_TEXT_SEARCH.md), [CLI](docs/CLI.md) |
 | Opt-in page-local repeated-key posting indexes (0.0.6 development) | [Posting hash](docs/POSTING_HASH.md) |
 | Exact analyzed phrase search with bounded same-snapshot candidate verification (0.0.6 development) | [Phrase semantics and limitations](docs/FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development) |
 | Bounded existing-target copy with atomic data/receipt and indexed idempotent replay (0.0.6 development) | [Catalog copy](docs/CATALOG_COPY.md) |
@@ -87,7 +89,7 @@ section, different rows can conflict on physical pages, and operations may wait 
 time out. Recovery repairs only states that the WAL and durable identity prove safe;
 it does not silently rebuild or discard damaged authoritative data.
 
-There is no native async/HTTP/MCP server, SQLAlchemy backend, public time-travel API
+There is no native async/HTTP/MCP server, SQLAlchemy backend, valid-time/bitemporal API
 or no-pause streaming hot-backup API in this release surface. Proposed capabilities
 are explicitly separated in the [roadmap](ROADMAP.md).
 

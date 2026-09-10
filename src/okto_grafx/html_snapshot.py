@@ -1,5 +1,7 @@
 """Offline, script-free graph pictures; no live database or browser authority."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from html import escape
 import math
@@ -21,7 +23,7 @@ class HtmlSnapshotLimits:
     max_bytes: int = 2 * 1024 * 1024
     max_work: int = 1_000_000
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
             if (
                 type(getattr(self, name)) is not int
@@ -51,7 +53,7 @@ def render_html_snapshot(
     work = _Work(limits.max_work, cancellation)
     parts, size = [], 0
 
-    def append(text):
+    def append(text: str) -> None:
         """Charge bounded encoded HTML before retaining the fragment."""
         nonlocal size
         work.step()
@@ -62,7 +64,7 @@ def render_html_snapshot(
             )
         parts.append(text)
 
-    def label(text):
+    def label(text: str) -> str:
         """Bound and escape a text label for safe HTML consumption."""
         # Check before escaping to avoid an unbounded temporary expansion.
         if len(text) > limits.max_bytes // 6:
@@ -89,7 +91,7 @@ def render_html_snapshot(
         'refX="14" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#777"/></marker></defs>'
     )
 
-    def position(i):
+    def position(i: int) -> tuple[float, float]:
         """Place a detached node on the bounded static circular layout."""
         return (
             500 + 400 * math.cos(i * 2 * math.pi / max(1, len(nodes))),

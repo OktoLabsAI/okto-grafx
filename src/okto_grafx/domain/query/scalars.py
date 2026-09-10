@@ -8,9 +8,10 @@ from okto_grafx.domain.errors import GrafxPlanError
 from okto_grafx.domain.model.value import INT64_MAX, ValueType
 
 NATIVE_SCALARS = frozenset(("LOWER", "UPPER", "TRIM", "ABS"))
+__all__ = ["NATIVE_SCALARS", "scalar_type", "scalar_value"]
 
 
-def scalar_type(name, argument):
+def scalar_type(name: str, argument: ValueType | None) -> ValueType | None:
     """Infer a closed native scalar's result type or refuse an incompatible input."""
     allowed = (
         (ValueType.INT64, ValueType.DOUBLE) if name == "ABS" else (ValueType.STRING,)
@@ -24,7 +25,7 @@ def scalar_type(name, argument):
     return argument if name == "ABS" else ValueType.STRING
 
 
-def scalar_value(name, value):
+def scalar_value(name: str, value: object) -> object:
     """Evaluate a validated native scalar, preserving null and numeric bounds."""
     if value is None:
         return None

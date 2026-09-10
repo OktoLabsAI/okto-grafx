@@ -46,9 +46,12 @@ independent source snapshot, not a distributed read/write transaction.
 
 ## Supported scope and refusals
 
-- Explicit tuples of complete table names, with all selected relationship
-  endpoints included in selected node tables. No arbitrary selection predicates
-  or induced-subgraph API is exposed in this first slice.
+- Explicit tables, optionally narrowed by `record_ids={"Person": (1, 2),
+  "Knows": (5,)}` on `capture_copy`. Every selected table must be present in the
+  mapping; an empty tuple selects no rows. Missing IDs, duplicate/bool IDs and
+  missing selected endpoints refuse. Node identity indexes are used when present;
+  remaining table selections use a bounded scan charged against the same row/byte
+  budgets. No implicit endpoint expansion, arbitrary predicate or unbounded scan.
 - Node tables require primary keys; anonymous nodes are explicitly unsupported.
 - Native typed/null properties and vector values are copied. Vector space IDs are
   remapped by compatible space names/definitions, including nested vector values;
@@ -57,8 +60,16 @@ independent source snapshot, not a distributed read/write transaction.
 - Target table names, kinds, columns, nullability, PK and endpoint declarations
   must match. The operation neither creates nor evolves application schemas or
   copies custom indexes. Existing target indexes participate through native writes.
-- `conflict="fail"` is the only v1 policy. An existing primary key aborts the
-  entire transaction; skip/merge and automatic retries are not silently selected.
+- `conflict="fail"` (default) aborts the entire transaction on an existing PK.
+  Explicit `conflict="skip"` preserves existing target **nodes** by PK and maps
+  copied relationship endpoints to them. It does not merge/update their properties.
+  Relationships have no deduplication identity here: selected relationships are
+  appended, and same-key receipt replay prevents duplicate effects for that request.
+  A different request key is a different copy, not implicit relationship deduplication.
+  Neither mode retries automatically or bypasses native OCC/uniqueness checks.
+- A source with selected native temporal tables requires explicit
+  `history="current-only"` on capture. Only current rows/schema are copied; no
+  temporal events, pins or history UUID authority transfer to the target.
 - The `_grafx_` source namespace is not copied by this API. Receipt infrastructure
   is separate from copied application data.
 
@@ -99,7 +110,7 @@ gain new fields. Revalidate limits on both capture and apply.
 
 | `CopyLimits` field | Default | Allowed range / meaning |
 | --- | --- | --- |
-| `max_rows` | 10,000 | 1–1,000,000; total selected rows |
+| `max_rows` | 10,000 | 1–1,000,000; captured rows, including rows inspected by a bounded selection scan |
 | `max_bytes` | 32 MiB | 1–1 GiB; encoded package/schema bound |
 | `max_row_bytes` | 4 MiB | 1–`max_bytes`; one encoded row |
 | `max_tables` | 64 | 1–256; selected tables |
@@ -116,7 +127,11 @@ revalidates definitions, types, bounds, uniqueness of source identities, endpoin
 closure and checksum before beginning the target transaction.
 
 `CopyReceipt` is frozen: `source_commit`, `target_commit`, `request_sha256`,
-`rows` and `replayed`. `metadata=CommitMetadata(...)` is optional. The reserved
+`rows`, `replayed` and `skipped_rows` (default 0). `rows` counts inserted application
+rows, excluding the receipt; skipped nodes are reported separately. Both counts
+are reconstructed from the durable receipt and bound package on replay. The
+conflict policy participates in the request digest, so switching it under an
+existing key refuses. `metadata=CommitMetadata(...)` is optional. The reserved
 attribute `grafx_copy_v1` carries request proof and cannot be supplied by callers.
 Ordinary metadata admission limits still apply to the resulting metadata.
 

@@ -281,7 +281,7 @@ def search_text(
                 if phrase:
                     check(128 + sum(64 + len(t.encode("utf-8")) for t in ordered_terms)
                           + 16 * len(ordered_terms) + 16 * len(definition.positions))
-                phrase_failure = _phrase_failure(ordered_terms) if phrase else ()
+                phrase_failure = _phrase_failure(ordered_terms) if phrase and not options.positions else ()
                 database._indexes._prepare_heap_view(store.file, certificate)
                 cache_key = (store.file, certificate, snapshot.read_lsn)
                 cached = database._text_stats_cache.get(cache_key)
@@ -382,11 +382,21 @@ def search_text(
                     terms = tuple(sorted(expanded))
                 frequencies = {}
                 matches = {}
+                phrase_positions = {}
                 for term in terms:
                     key = b"\x01" + term.encode("utf-8")
                     docs = set()
+                    documents = {}
+                    positional = None
+                    if phrase and options.positions:
+                        from okto_grafx.engine.fulltext_positions import PositionEvidence
+                        positional = PositionEvidence(term, check)
                     for entry in entries(bucket_of(key, definition.bucket_count)):
-                        if entry.key != key:
+                        position_key = False
+                        if positional is not None and entry.key[:1] == b"\x03":
+                            from okto_grafx.domain.index.text_positions import decode_position
+                            position_key = decode_position(entry.key)[0] == term
+                        if entry.key != key and not position_key:
                             continue
                         version = database._heap.read(entry.ref)
                         if version.table_id != definition.table_id:
@@ -398,6 +408,9 @@ def search_text(
                         fields = analysis.fields(
                             version.values, definition.positions, options
                         )
+                        if position_key:
+                            positional.add(entry, fields)
+                            continue
                         if not any(term in f for f in fields):
                             raise GrafxCorruptionDetected(
                                 "Full-text posting differs from its heap row.",
@@ -410,6 +423,9 @@ def search_text(
                             )
                         check(64)
                         docs.add(rid)
+                        if positional is not None:
+                            check(128)
+                            documents[rid] = (entry.ref, fields)
                         if allowed is not None and rid not in allowed:
                             continue
                         if rid not in matches:
@@ -428,6 +444,10 @@ def search_text(
                             )
                             matches[rid] = fields
                     frequencies[term] = len(docs)
+                    if positional is not None:
+                        for rid, positions in positional.finish(documents).items():
+                            if rid in matches:
+                                phrase_positions.setdefault(rid, {})[term] = positions
                     memory -= len(docs) * 64
                 if any(df > count for df in frequencies.values()):
                     raise GrafxCorruptionDetected(
@@ -435,7 +455,11 @@ def search_text(
                     )
                 hits = []
                 for rid, fields in matches.items():
-                    phrase_fields = tuple(_contains_phrase(tokens, ordered_terms, phrase_failure) for tokens in fields) if phrase else ()
+                    phrase_fields = tuple(_contains_phrase(tokens, ordered_terms, phrase_failure) for tokens in fields) if phrase and not options.positions else ()
+                    if phrase and options.positions:
+                        from okto_grafx.engine.fulltext_positions import phrase_fields as positional_phrase_fields
+                        check(128 + 64 * sum(len(field) for field in fields))
+                        phrase_fields = positional_phrase_fields(phrase_positions.get(rid, {}), ordered_terms, len(fields))
                     check()
                     if phrase and not any(phrase_fields):
                         continue
@@ -498,7 +522,7 @@ def search_text(
                 return (
                     TextSearchResult(
                         chosen,
-                        "phrase_verified" if phrase else ("prefix_index" if prefix else "exact_index"),
+                        ("phrase_positions" if options.positions else "phrase_verified") if phrase else ("prefix_index" if prefix else "exact_index"),
                         certificate.header.built_through_lsn,
                         snapshot.read_lsn,
                         visited,

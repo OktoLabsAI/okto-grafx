@@ -158,6 +158,8 @@ Concrete classes (`code`, `retryable`) — **exact names, en-US messages**:
 | `GrafxDurabilityBarrierFailed` | `durability_barrier_failed` | False |
 | `GrafxRecoveryRefused` | `recovery_refused` | False |
 | `GrafxSnapshotReclaimed` | `snapshot_reclaimed` | **True** |
+| `GrafxHistoryUnavailable` | `history_unavailable` | False |
+| `GrafxHistoryExpired` | `history_expired` | False |
 | `GrafxBufferBudgetExceeded` | `buffer_budget_exceeded` | **True** |
 | `GrafxTransactionBudgetExceeded` | `transaction_budget_exceeded` | False |
 | `GrafxSchemaVersionMismatch` | `schema_version_mismatch` | False |

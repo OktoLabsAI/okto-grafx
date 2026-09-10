@@ -30,6 +30,7 @@ from okto_grafx.domain.query.hybrid import HybridHit, HybridSearchOptions, Hybri
 from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.temporal import TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersion, TemporalVersions
 from okto_grafx.domain.txn.commit_metadata import CommitMetadata, MetadataLimits
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry, CommitKind
 from okto_grafx.domain.txn.commit_history import CommitHistoryPage
@@ -77,6 +78,12 @@ __all__ = [
     "ScanCursorV1",
     "ScanPageV1",
     "ScanRowV1",
+    "TemporalGraph",
+    "TemporalLimits",
+    "TemporalPin",
+    "TemporalPruneReport",
+    "TemporalVersion",
+    "TemporalVersions",
     "TextHit",
     "TextIndexOptions",
     "TextSearchLimits",

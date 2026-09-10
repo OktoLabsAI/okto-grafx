@@ -1,5 +1,8 @@
 # Full-text v1 persistent contract
 
+The additive 0.0.6 [positional extension](FTS_POSITIONAL_POSTINGS.md) uses a new
+derivation/capability and derivation-aware routing; existing v1–v4 bytes stay unchanged.
+
 This defines the 0.0.5 development implementation of [GX-CAP-5](SPEC-GX-CAP-5.md).
 Consumer semantics/options are in [full-text search](../FULL_TEXT_SEARCH.md).
 

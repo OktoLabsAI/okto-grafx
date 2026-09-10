@@ -36,6 +36,7 @@ from okto_grafx.domain.wal.record import (
     WAL_LEGACY_FORMAT_VERSION,
     WAL_V2_FLAG_PAGE_IMAGE_ZLIB1,
     WAL_V2_FLAG_COMMIT_CATALOG_V1,
+    WAL_V2_FLAG_SYSTEM_HISTORY_V1,
     WAL_V2_FLAG_REQUIRED,
     WalRecord,
     WalRecordType,
@@ -74,6 +75,8 @@ COMMIT_DIRECTORY_FILE: str = "commits.dir"
 COMMIT_STREAM_FILE: str = "commits.dat"
 COMMIT_CATALOG_PAGE_FILES: frozenset[str] = frozenset({COMMIT_DIRECTORY_FILE, COMMIT_STREAM_FILE})
 _COMMIT_CATALOG_FLAGS: int = WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_COMMIT_CATALOG_V1
+SYSTEM_HISTORY_FILE: str = "system-history.dat"
+_SYSTEM_HISTORY_FLAGS: int = WAL_V2_FLAG_REQUIRED | WAL_V2_FLAG_SYSTEM_HISTORY_V1
 
 
 def is_redoable_page_file(file: object) -> bool:
@@ -214,8 +217,9 @@ def encode_page_write_record(
         )
     legacy = encode_page_write(file, page_index, image)
     journal = file in COMMIT_CATALOG_PAGE_FILES
-    version = WAL_FORMAT_VERSION if journal else WAL_LEGACY_FORMAT_VERSION
-    flags = _COMMIT_CATALOG_FLAGS if journal else 0
+    history = file == SYSTEM_HISTORY_FILE
+    version = WAL_FORMAT_VERSION if journal or history else WAL_LEGACY_FORMAT_VERSION
+    flags = _COMMIT_CATALOG_FLAGS if journal else _SYSTEM_HISTORY_FLAGS if history else 0
     if not compress:
         return EncodedPageWrite(legacy, version, flags)
     raw_image = bytes(image)
@@ -307,7 +311,7 @@ def decode_page_write(
     raw, file, page_index, minimum = _decode_page_write_prefix(payload)
     if format_version == WAL_LEGACY_FORMAT_VERSION:
         # V1 flags were always opaque and must not acquire retrospective meaning.
-        if file in COMMIT_CATALOG_PAGE_FILES:
+        if file in COMMIT_CATALOG_PAGE_FILES or file == SYSTEM_HISTORY_FILE:
             raise GrafxSchemaVersionMismatch(
                 "Commit catalog pages require explicit WAL-v2 journal semantics.",
                 field="commit_catalog_grammar",
@@ -328,6 +332,10 @@ def decode_page_write(
             value=flags,
         )
     journal = bool(flags & WAL_V2_FLAG_COMMIT_CATALOG_V1)
+    history = bool(flags & WAL_V2_FLAG_SYSTEM_HISTORY_V1)
+    if history != (file == SYSTEM_HISTORY_FILE):
+        raise GrafxSchemaVersionMismatch("System history WAL target and required semantics differ.",
+                                         field="system_history_grammar")
     if journal and file not in COMMIT_CATALOG_PAGE_FILES:
         raise GrafxCorruptionDetected(
             "Commit catalog WAL semantics name a non-journal target.",

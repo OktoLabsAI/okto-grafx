@@ -1,5 +1,9 @@
 # Attached catalogs and bounded workspaces
 
+The 0.0.6 CLI now exposes explicit read-only `catalogs` inventory and no-open
+`workspace resolve` JSON contracts. See [CLI options and envelopes](CLI.md#explicit-catalogs-and-workspace-resolution-006-development).
+There is no daemon-wide catalog discovery or implicit global store.
+
 [Documentation index](README.md) · [API reference](API_REFERENCE.md) · [Roadmap](../ROADMAP.md)
 
 ## Delivery boundary

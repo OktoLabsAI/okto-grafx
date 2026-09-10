@@ -38,6 +38,8 @@ from okto_grafx.engine.buffer_pool import (
 from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore, read_catalog_page_images
 from okto_grafx.engine.commit_catalog_store import CommitCatalogPageImage, CommitCatalogStore
 from okto_grafx.engine.fulltext_durable import replay_statistics
+from okto_grafx.engine.system_history_recovery import validate_system_history
+from okto_grafx.domain.txn.records import SYSTEM_HISTORY_FILE
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -370,7 +372,11 @@ class CommitRedo:
         prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
         *, checkpoint_lsn: Lsn | None,
     ) -> None:
-        horizon = self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=checkpoint_lsn)
+        catalogs = []
+        horizon = self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=checkpoint_lsn,
+                                                       _catalogs=catalogs)
+        validate_system_history(self._pool, replay, prepared_pages, checkpoint_lsn=checkpoint_lsn,
+                                database_uuid=self._database_uuid, native_catalogs=catalogs)
         images = tuple(CommitCatalogPageImage(page.file, page.page_index, page.image)
                        for _position, page in prepared_pages if page.file in COMMIT_CATALOG_PAGE_FILES)
         if horizon is None:
@@ -404,7 +410,7 @@ class CommitRedo:
     def _validate_catalog_transitions(
         self, replay: CommittedReplay,
         prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
-        *, checkpoint_lsn: Lsn | None = None,
+        *, checkpoint_lsn: Lsn | None = None, _catalogs: list | None = None,
     ) -> int | None:
         """Prove complete schema-catalog snapshots before native replay can mutate.
 
@@ -414,14 +420,14 @@ class CommitRedo:
         must be introduced by its own complete schema snapshot in this range.
         """
         if not replay.commit_records:
-            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn, _catalogs=_catalogs)
         grouped: dict[tuple[int, int], list[tuple[int, bytes]]] = {}
         for _position, prepared in prepared_pages:
             if prepared.file == CATALOG_FILE:
                 record = prepared.record
                 grouped.setdefault((record.epoch, record.txn_id), []).append((prepared.page_index, prepared.image))
         if not grouped:
-            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn, _catalogs=_catalogs)
         seen = False
         previous_horizon: int | None = None
         for terminal in replay.commit_records:
@@ -429,6 +435,8 @@ class CommitRedo:
             if images is None:
                 continue
             catalog = read_catalog_page_images(tuple(images), page_size=self._pool.page_size, sequence=terminal.lsn)
+            if _catalogs is not None:
+                _catalogs.append((terminal.lsn, catalog))
             horizon = catalog.commit_catalog_activation
             if (
                 horizon is not None and horizon > terminal.lsn
@@ -446,7 +454,7 @@ class CommitRedo:
         return previous_horizon
 
     def _validate_catalog_without_schema_effects(
-        self, replay: CommittedReplay, checkpoint_lsn: Lsn | None,
+        self, replay: CommittedReplay, checkpoint_lsn: Lsn | None, *, _catalogs: list | None = None,
     ) -> int | None:
         """Use current pages, never a mutable/stale adopted catalog, for native gaps.
 
@@ -470,7 +478,10 @@ class CommitRedo:
             return None  # Uninitialized/legacy stack; no history may be inferred.
         if empty and checkpoint_lsn == 0 and not replay.commit_records:
             return None  # Fresh empty file, before bootstrap; no COMMIT is being certified.
-        horizon = CatalogStore(self._pool).read_from_pages().commit_catalog_activation
+        catalog = CatalogStore(self._pool).read_from_pages()
+        if _catalogs is not None:
+            _catalogs.append((None, catalog))
+        horizon = catalog.commit_catalog_activation
         if horizon is None:
             if any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
                 raise GrafxRecoveryRefused(
@@ -556,7 +567,7 @@ class CommitRedo:
         meta_baselines: dict[tuple[str, int], Page | None] | None = None,
     ) -> tuple[bool, frozenset[int]]:
         """Classify one decoded page without granting authority to manager lookalikes."""
-        if file in COMMIT_CATALOG_PAGE_FILES:
+        if file in COMMIT_CATALOG_PAGE_FILES or file == SYSTEM_HISTORY_FILE:
             # Full journal validation is mandatory before this fact is consumed.
             # Audit history changes no heap/MVCC table watermark; treating it as
             # unknown would make every journal append scan all indexed tables.
@@ -898,7 +909,7 @@ class CommitRedo:
                     format_version=record.format_version,
                     flags=record.flags,
                 )
-                journal = write.file in COMMIT_CATALOG_PAGE_FILES
+                journal = write.file in COMMIT_CATALOG_PAGE_FILES or write.file == SYSTEM_HISTORY_FILE
                 if journal and not allow_commit_catalog:
                     raise GrafxRecoveryRefused(
                         "Commit catalog replay is not enabled by this build; no effect was applied.",

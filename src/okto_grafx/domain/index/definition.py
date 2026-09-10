@@ -395,6 +395,14 @@ class IndexDefinition:
             )
         return index_key(values, self.positions)
 
+    def bucket_for(self, key: bytes) -> int:
+        """Route this persisted derivation; positional chunks share their term bucket."""
+        from okto_grafx.domain.index.keys import bucket_of
+        if self.key_derivation.startswith("fulltext_v5_"):
+            from okto_grafx.domain.index.text_positions import position_bucket_key
+            key = position_bucket_key(key)
+        return bucket_of(key, self.bucket_count)
+
     def key_for_record(self, record_id: object, values: Sequence[Value]) -> bytes:
         """Return this definition's key with the complete heap-version identity available.
 

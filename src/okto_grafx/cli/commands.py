@@ -1931,15 +1931,21 @@ def _write_evidence(output: str, body: bytes) -> dict[str, object]:
 
 
 def _discovery(invocation: Invocation) -> Report:
-    from okto_grafx.cli.discovery import capabilities, inspect_indexes, search
+    from okto_grafx.cli.discovery import capabilities, inspect_indexes, search, catalog_inventory, workspace_resolution
 
     if invocation.spec.name == "capabilities":
         return capabilities(invocation)
+    if invocation.spec.name == "catalogs":
+        return catalog_inventory(invocation)
+    if invocation.spec.name == "workspace":
+        return workspace_resolution(invocation)
     operation = inspect_indexes if invocation.spec.name == "indexes" else search
     return _on_database(invocation, lambda database: operation(invocation, database))
 
 
 _HANDLERS: Mapping[str, Callable[[Invocation], Report]] = {
+    "catalogs": _discovery,
+    "workspace resolve": _discovery,
     "capabilities": _discovery,
     "indexes": _discovery,
     "search text": _discovery,

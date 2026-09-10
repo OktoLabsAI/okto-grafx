@@ -1268,6 +1268,8 @@ class Verifier:
                 )
             ]
         covered: set[tuple[bytes, int]] = set()
+        from okto_grafx.domain.index.fulltext import is_fulltext
+        fts_seen = set() if is_fulltext(getattr(getattr(index, "definition", None), "key_derivation", "")) else None
         table_identity = _index_table_identity(index)
         resolved_refs = (
             shared.resolved_refs.setdefault(table_identity, set())
@@ -1306,6 +1308,12 @@ class Verifier:
                 continue
             if not getattr(entry, "dead_csn", NO_CSN):
                 covered.add((bytes(getattr(entry, "key", b"")), ref.encode()))
+            if fts_seen is not None:
+                identity = (bytes(getattr(entry, "key", b"")), ref.encode())
+                if identity in fts_seen:
+                    findings.append(VerificationFinding(kind=FindingKind.INDEX_ENTRY_MALFORMED,
+                        location=location, detail="Duplicate physical full-text posting for the same heap version."))
+                fts_seen.add(identity)
             if self._heap is None:
                 continue
             ref_identity = ref.encode() if type(ref) is RecordRef else None
@@ -1543,10 +1551,24 @@ class Verifier:
                     location=FindingLocation(index=name, file=_index_file(index), page=0),
                     detail=f"Durable text statistics could not be verified: {failure}",
                 ))
+        from okto_grafx.domain.index.fulltext import is_fulltext
+        fts_keys = None
+        if is_fulltext(getattr(definition, "key_derivation", "")):
+            fts_keys = {}
+            for stored_key, encoded_ref in covered:
+                fts_keys.setdefault(encoded_ref, set()).add(stored_key)
         for ref, version in versions:
             if not version.live:
                 continue
             try:
+                if fts_keys is not None:
+                    expected = set(definition.entry_keys_for_record(version.record_id, version.values))
+                    if fts_keys.get(ref.encode(), set()) == expected:
+                        continue
+                    findings.append(VerificationFinding(kind=FindingKind.INDEX_ENTRY_MISSING,
+                        location=FindingLocation(index=name, file=_index_file(index), page=ref.page, slot=ref.slot),
+                        detail="Full-text posting coverage differs from the live heap version (missing or extra keys)."))
+                    continue
                 key = _expected_key(definition, version.values, positions)
             except GrafxError:
                 continue

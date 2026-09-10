@@ -131,6 +131,9 @@ _FULLTEXT_PREFIX_BIT = 1 << 11
 _FULLTEXT_RELATIONSHIPS_BIT = 1 << 12
 _NULLABLE_COLUMNS_BIT = 1 << 13
 _POSTING_HASH_BIT = 1 << 14
+_SYSTEM_HISTORY_BIT = 1 << 15
+_FULLTEXT_POSITIONS_BIT = 1 << 16
+SYSTEM_HISTORY_CAPABILITY = "system_history_v1"
 
 
 _KNOWN_CAPABILITY_BITS = (
@@ -149,6 +152,8 @@ _KNOWN_CAPABILITY_BITS = (
     | _FULLTEXT_RELATIONSHIPS_BIT
     | _NULLABLE_COLUMNS_BIT
     | _POSTING_HASH_BIT
+    | _SYSTEM_HISTORY_BIT
+    | _FULLTEXT_POSITIONS_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -169,6 +174,8 @@ _CAPABILITY_TO_BIT = MappingProxyType(
         "fulltext_relationships_v1": _FULLTEXT_RELATIONSHIPS_BIT,
         "nullable_columns_v1": _NULLABLE_COLUMNS_BIT,
         "posting_hash_v1": _POSTING_HASH_BIT,
+        SYSTEM_HISTORY_CAPABILITY: _SYSTEM_HISTORY_BIT,
+        "fulltext_positions_v1": _FULLTEXT_POSITIONS_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -228,6 +235,9 @@ class Catalog:
         "_format_version",
         "_required_capabilities",
         "_commit_catalog_activation",
+        "_system_history",
+        "_system_history_revision",
+        "_system_history_pins",
         "_indexes",
         "_indexes_by_key",
         "_index_definitions_by_table",
@@ -244,6 +254,9 @@ class Catalog:
         self._format_version: int = CATALOG_LEGACY_FORMAT_VERSION
         self._required_capabilities: frozenset[str] = frozenset()
         self._commit_catalog_activation: int | None = None
+        self._system_history: dict[int, tuple[int, int]] = {}
+        self._system_history_revision = 0
+        self._system_history_pins: dict[str, tuple[int, tuple[int, ...]]] = {}
         self._indexes: dict[str, CatalogIndexDefinition] = {}
         self._indexes_by_key: dict[str, CatalogIndexDefinition] = {}
         self._index_definitions_by_table: dict[
@@ -306,6 +319,99 @@ class Catalog:
         if self._commit_catalog_activation != old_sequence or not self.requires_capability(COMMIT_CATALOG_V1_CAPABILITY):
             raise GrafxConfigurationError("Activation retarget baseline differs.", field="commit_catalog_activation")
         self._commit_catalog_activation = new_sequence
+        self._invalidate_derived()
+
+    def system_history_tables(self) -> tuple[tuple[int, int, int], ...]:
+        """Return table ID, activation COMMIT and retained horizon, ordered by ID."""
+        return tuple((key, *self._system_history[key]) for key in sorted(self._system_history))
+
+    def enable_system_history(self, table_ids: tuple[int, ...], sequence: int) -> Catalog:
+        """Opt detached table definitions into one-way temporal publication."""
+        self._require_index_catalog()
+        _require_commit_catalog_sequence(sequence)
+        if self._commit_catalog_activation is None:
+            raise GrafxConfigurationError("System history requires commit history.", field="commit_catalog_activation")
+        if type(table_ids) is not tuple or not table_ids or len(set(table_ids)) != len(table_ids):
+            raise GrafxConfigurationError("Specify distinct history tables.", field="tables")
+        for key in table_ids:
+            if type(key) is not int or key not in self._tables_by_id:
+                raise GrafxConfigurationError("Unknown history table.", field="tables")
+        for key in table_ids:
+            self._system_history.setdefault(key, (sequence, sequence))
+        self._required_capabilities = frozenset((*self._required_capabilities, SYSTEM_HISTORY_CAPABILITY))
+        self._invalidate_derived()
+        return self
+
+    def _retarget_system_history(self, table_ids: tuple[int, ...], old: int, new: int) -> None:
+        _require_commit_catalog_sequence(new)
+        if any(self._system_history.get(key) != (old, old) for key in table_ids):
+            raise GrafxConfigurationError("History activation retarget differs.", field="system_history")
+        for key in table_ids:
+            self._system_history[key] = (new, new)
+        self._invalidate_derived()
+
+    @property
+    def system_history_revision(self) -> int:
+        """Return the COMMIT of the latest native retention rewrite, or zero."""
+        return self._system_history_revision
+
+    def system_history_pins(self) -> tuple[tuple[str, int, tuple[int, ...]], ...]:
+        """Return durable explicit pins; they survive crashes until explicitly released."""
+        return tuple((name, *self._system_history_pins[name]) for name in sorted(self._system_history_pins))
+
+    def set_system_history_pin(self, name: str, sequence: int, tables: tuple[int, ...]) -> bool:
+        """Pin a detached catalog's table horizons without involving MVCC or WAL recycling."""
+        _require_commit_catalog_sequence(sequence)
+        if (type(name) is not str or not name or len(name.encode("utf-8")) > 128
+                or type(tables) is not tuple or not tables or any(type(key) is not int for key in tables)
+                or tuple(sorted(set(tables))) != tables
+                or any(key not in self._system_history or self._system_history[key][1] > sequence for key in tables)):
+            raise GrafxConfigurationError("Invalid history pin.", field="system_history_pin")
+        previous = self._system_history_pins.get(name)
+        if previous is not None:
+            if previous != (sequence, tables):
+                raise GrafxConfigurationError("History pin name is already bound.", field="system_history_pin")
+            return False
+        if len(self._system_history_pins) >= 1024:
+            raise GrafxConfigurationError("History pin limit is 1024.", field="system_history_pin")
+        self._system_history_pins[name] = (sequence, tables)
+        self._invalidate_derived()
+        return True
+
+    def remove_system_history_pin(self, name: str) -> bool:
+        """Explicitly release a detached durable pin; a missing name is a no-op."""
+        if type(name) is not str or not name:
+            raise GrafxConfigurationError("Invalid history pin name.", field="system_history_pin")
+        if self._system_history_pins.pop(name, None) is None:
+            return False
+        self._invalidate_derived()
+        return True
+
+    def advance_system_history(self, tables: tuple[int, ...], before: int, revision: int) -> bool:
+        """Advance retained horizons after proving all explicit pins permit pruning."""
+        _require_commit_catalog_sequence(before)
+        _require_commit_catalog_sequence(revision)
+        if (type(tables) is not tuple or not tables or any(type(key) is not int for key in tables)
+                or tuple(sorted(set(tables))) != tables or any(key not in self._system_history for key in tables)):
+            raise GrafxConfigurationError("Enable history on the selected tables first.", field="tables")
+        if any(before < self._system_history[key][1] for key in tables):
+            raise GrafxConfigurationError("History retention cannot move backwards.", field="before")
+        if any(sequence < before and set(tables).intersection(pinned)
+               for sequence, pinned in self._system_history_pins.values()):
+            raise GrafxConfigurationError("A durable history pin protects this interval.", field="system_history_pin")
+        if all(before == self._system_history[key][1] for key in tables):
+            return False
+        for key in tables:
+            self._system_history[key] = (self._system_history[key][0], before)
+        self._system_history_revision = revision
+        self._invalidate_derived()
+        return True
+
+    def _retarget_history_revision(self, old: int, new: int) -> None:
+        _require_commit_catalog_sequence(new)
+        if self._system_history_revision != old:
+            raise GrafxConfigurationError("Retention revision retarget differs.", field="system_history_revision")
+        self._system_history_revision = new
         self._invalidate_derived()
 
     def index_definitions(self) -> tuple[CatalogIndexDefinition, ...]:
@@ -533,6 +639,8 @@ class Catalog:
             capabilities.add(FULLTEXT_CAPABILITY)
         if any(d.key_derivation.startswith("fulltext_v4_") for d in validated.values()):
             capabilities.add("fulltext_prefixes_v1")
+        if any(d.key_derivation.startswith("fulltext_v5_") for d in validated.values()):
+            capabilities.add("fulltext_positions_v1")
         if any(is_fulltext(d.key_derivation) and self.table_by_id(d.table_id).kind == "rel" for d in validated.values()):
             capabilities.add("fulltext_relationships_v1")
         if any(has_durable_statistics(d.key_derivation) for d in validated.values()):
@@ -561,6 +669,8 @@ class Catalog:
             self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_CAPABILITY))
         if definition.key_derivation.startswith("fulltext_v4_"):
             self._required_capabilities = frozenset((*self._required_capabilities, "fulltext_prefixes_v1"))
+        if definition.key_derivation.startswith("fulltext_v5_"):
+            self._required_capabilities = frozenset((*self._required_capabilities, "fulltext_positions_v1"))
         if is_fulltext(definition.key_derivation) and self.table_by_id(definition.table_id).kind == "rel":
             self._required_capabilities = frozenset((*self._required_capabilities, "fulltext_relationships_v1"))
         if has_durable_statistics(definition.key_derivation):
@@ -803,6 +913,8 @@ class Catalog:
                 raise GrafxConfigurationError("Relationship FTS requires its capability.", field="required_capabilities")
             if any(d.key_derivation.startswith("fulltext_v4_") for d in indexes) and "fulltext_prefixes_v1" not in self._required_capabilities:
                 raise GrafxConfigurationError("Prefix postings require their capability.", field="required_capabilities")
+            if any(d.key_derivation.startswith("fulltext_v5_") for d in indexes) and "fulltext_positions_v1" not in self._required_capabilities:
+                raise GrafxConfigurationError("Positional postings require their capability.", field="required_capabilities")
             if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in self._required_capabilities:
                 raise GrafxConfigurationError("Full-text indexes require their capability.", field="required_capabilities")
             if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in self._required_capabilities:
@@ -845,6 +957,22 @@ class Catalog:
         if self._commit_catalog_activation is not None:
             _require_commit_catalog_sequence(self._commit_catalog_activation)
             parts.append(_U64.pack(self._commit_catalog_activation))
+        if bool(capability_bits & _SYSTEM_HISTORY_BIT) != bool(self._system_history):
+            raise GrafxConfigurationError("History tables and capability differ.", field="system_history")
+        if self._system_history:
+            if self._commit_catalog_activation is None:
+                raise GrafxConfigurationError("History requires commit provenance.", field="system_history")
+            parts.append(_U32.pack(len(self._system_history)))
+            for key, activation, horizon in self.system_history_tables():
+                if key not in self._tables_by_id or not 0 < activation <= horizon < PROVISIONAL_CSN:
+                    raise GrafxConfigurationError("Invalid history table horizon.", field="system_history")
+                parts.append(struct.pack("<IQQ", key, activation, horizon))
+            if not 0 <= self._system_history_revision < PROVISIONAL_CSN or len(self._system_history_pins) > 1024:
+                raise GrafxConfigurationError("Invalid history retention metadata.", field="system_history")
+            parts.append(struct.pack("<QH", self._system_history_revision, len(self._system_history_pins)))
+            for name, sequence, pinned in self.system_history_pins():
+                parts.extend((_encode_text(name), struct.pack("<QI", sequence, len(pinned))))
+                parts.extend(_U32.pack(key) for key in pinned)
         for table in self.tables():
             parts.append(_encode_table(table))
             if "nullable_columns_v1" in self._required_capabilities:
@@ -887,6 +1015,9 @@ class Catalog:
         clone._format_version = self._format_version
         clone._required_capabilities = self._required_capabilities
         clone._commit_catalog_activation = self._commit_catalog_activation
+        clone._system_history = dict(self._system_history)
+        clone._system_history_revision = self._system_history_revision
+        clone._system_history_pins = dict(self._system_history_pins)
         clone._indexes = dict(self._indexes)
         clone._indexes_by_key = dict(self._indexes_by_key)
         clone._index_definitions_by_table = dict(self._index_definitions_by_table)
@@ -984,6 +1115,43 @@ class Catalog:
                     raise GrafxCorruptionDetected("Invalid commit catalog horizon.", field="commit_catalog_activation") from None
                 catalog._commit_catalog_activation = sequence
                 offset += _U64.size
+            if SYSTEM_HISTORY_CAPABILITY in required_capabilities:
+                _require(raw, offset, 4, "history tables")
+                count = _U32.unpack_from(raw, offset)[0]
+                offset += 4
+                if not 0 < count <= table_count or catalog._commit_catalog_activation is None:
+                    raise GrafxCorruptionDetected("Invalid history table count.", field="system_history")
+                _require(raw, offset, count * 20, "history table horizons")
+                previous_id = 0
+                for _ in range(count):
+                    key, activation, horizon = struct.unpack_from("<IQQ", raw, offset)
+                    offset += 20
+                    if not previous_id < key or not 0 < activation <= horizon < PROVISIONAL_CSN:
+                        raise GrafxCorruptionDetected("Invalid history table horizon.", field="system_history")
+                    catalog._system_history[key] = (activation, horizon)
+                    previous_id = key
+                _require(raw, offset, 10, "history retention metadata")
+                revision, pin_count = struct.unpack_from("<QH", raw, offset)
+                offset += 10
+                if revision >= PROVISIONAL_CSN or pin_count > 1024:
+                    raise GrafxCorruptionDetected("Invalid history retention metadata.", field="system_history")
+                catalog._system_history_revision = revision
+                last_name = ""
+                for _ in range(pin_count):
+                    name, offset = _decode_text(raw, offset)
+                    _require(raw, offset, 12, "history pin")
+                    sequence, pinned_count = struct.unpack_from("<QI", raw, offset)
+                    offset += 12
+                    if name <= last_name or not 0 < pinned_count <= count:
+                        raise GrafxCorruptionDetected("Invalid history pin order/count.", field="system_history_pin")
+                    _require(raw, offset, pinned_count * 4, "history pin tables")
+                    pinned = tuple(_U32.unpack_from(raw, offset + index * 4)[0] for index in range(pinned_count))
+                    offset += pinned_count * 4
+                    try:
+                        catalog.set_system_history_pin(name, sequence, pinned)
+                    except GrafxConfigurationError as failure:
+                        raise GrafxCorruptionDetected("Invalid persisted history pin.", field="system_history_pin") from failure
+                    last_name = name
         tables: list[TableDef] = []
         spaces: list[EmbeddingSpaceDef] = []
         indexes: list[CatalogIndexDefinition] = []
@@ -1030,6 +1198,8 @@ class Catalog:
                 raise GrafxCorruptionDetected("Relationship FTS lacks its capability.", field="required_capabilities")
             if any(d.key_derivation.startswith("fulltext_v4_") for d in indexes) and "fulltext_prefixes_v1" not in required_capabilities:
                 raise GrafxCorruptionDetected("Prefix postings lack their capability.", field="required_capabilities")
+            if any(d.key_derivation.startswith("fulltext_v5_") for d in indexes) and "fulltext_positions_v1" not in required_capabilities:
+                raise GrafxCorruptionDetected("Positional postings lack their capability.", field="required_capabilities")
             if any(has_durable_statistics(d.key_derivation) for d in indexes) and FULLTEXT_STATISTICS_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Durable text statistics lack their capability.", field="required_capabilities")
             if any(has_historical_statistics(d.key_derivation) for d in indexes) and FULLTEXT_HISTORY_CAPABILITY not in required_capabilities:
@@ -1074,6 +1244,8 @@ class Catalog:
                 next_table_id=next_table,
                 next_space_id=next_space,
             )
+        if any(key not in catalog._tables_by_id for key in catalog._system_history):
+            raise GrafxCorruptionDetected("History references an unknown table.", field="system_history")
         return catalog
 
     # --- protocol --------------------------------------------------------------------------
@@ -1086,6 +1258,10 @@ class Catalog:
             and self._spaces == other._spaces
             and self._format_version == other._format_version
             and self._required_capabilities == other._required_capabilities
+            and self._commit_catalog_activation == other._commit_catalog_activation
+            and self._system_history == other._system_history
+            and self._system_history_revision == other._system_history_revision
+            and self._system_history_pins == other._system_history_pins
             and self._indexes_by_key == other._indexes_by_key
         )
 
@@ -1412,6 +1588,7 @@ def _encode_capabilities(capabilities: frozenset[str]) -> int:
     """Encode every required capability, refusing one this build cannot uphold."""
 
     for dependent, required in (
+        ("fulltext_positions_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),
         (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),
@@ -1447,6 +1624,7 @@ def _decode_capabilities(bits: int) -> frozenset[str]:
         capability for capability, bit in _CAPABILITY_TO_BIT.items() if bits & bit
     )
     for dependent, required in (
+        ("fulltext_positions_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_prefixes_v1", {FULLTEXT_CAPABILITY}),
         (FULLTEXT_HISTORY_CAPABILITY, {FULLTEXT_CAPABILITY, FULLTEXT_STATISTICS_CAPABILITY}),

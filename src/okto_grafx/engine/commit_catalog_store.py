@@ -884,6 +884,27 @@ class CommitCatalogStore:
                 hi, upper = middle, item.sequence
         return None
 
+    def resolve_time(self, instant: Timestamp, *, read_lsn: int) -> CommitCatalogEntry | None:
+        """Find the greatest visible commit whose monotonic ordered time is <= instant."""
+        if type(instant) is not Timestamp or type(read_lsn) is not int or not 0 <= read_lsn < PROVISIONAL_CSN:
+            raise _invalid("system_time")
+        head = self.read_head()
+        lo, hi = 0, head.entry_count
+        lower_sequence, upper_sequence = head.activation_sequence, head.last_sequence + 1
+        lower_time, upper_time = -(1 << 63) - 1, 1 << 63
+        found = None
+        while lo < hi:
+            middle = (lo + hi) // 2
+            item = self._item(middle, head)
+            if not lower_sequence < item.sequence < upper_sequence or not lower_time < item.ordered < upper_time:
+                raise _corrupt("time_search_order")
+            if item.sequence <= read_lsn and item.ordered <= instant.micros:
+                found = item
+                lo, lower_sequence, lower_time = middle + 1, item.sequence, item.ordered
+            else:
+                hi, upper_sequence, upper_time = middle, item.sequence, item.ordered
+        return None if found is None else self._record(found, head)
+
     def history(self, *, after: int, read_lsn: int, limit: int) -> tuple[CommitCatalogEntry, ...]:
         """Seek once, then read a bounded ascending page in a caller-proved view."""
         if type(after) is not int or not 0 <= after < PROVISIONAL_CSN:

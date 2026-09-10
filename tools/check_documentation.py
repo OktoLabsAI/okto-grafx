@@ -15,6 +15,14 @@ sys.path.insert(0, str(ROOT / "tools"))
 from generate_api_reference import MARKER, render  # noqa: E402
 
 CONSUMER_DOCS = (
+    "docs/SYSTEM_TIME_HISTORY.md",
+    "docs/V006_COMPATIBILITY.md",
+    "docs/CATALOG_COPY.md",
+    "docs/CATALOGS_AND_WORKSPACES.md",
+    "docs/POSTING_HASH.md",
+    "docs/specs/SYSTEM_HISTORY_V1.md",
+    "docs/specs/FTS_POSITIONAL_POSTINGS.md",
+    "docs/reports/V006_NATIVE_HISTORY_ROUND.md",
     "docs/GRAPH_PROJECTIONS.md",
     "docs/TABULAR_AND_PARQUET.md",
     "docs/GRAPH_EXCHANGE.md",

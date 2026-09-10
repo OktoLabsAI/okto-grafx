@@ -370,9 +370,11 @@ def test_every_path_command_refuses_a_path_that_is_not_a_database(
     spec: object, tmp_path: Path, cli: CliRunner
 ) -> None:
     argv = [*spec.label.split(" "), str(tmp_path / "absent")]
+    if spec.name == "catalogs":
+        argv.extend(("--allow-root", str(tmp_path)))
     run = cli(*argv)
     assert run.code == REFUSED, run.text
-    assert "no Okto Grafx database" in run.err
+    assert ("Expected existing directory" if spec.name == "catalogs" else "no Okto Grafx database") in run.err
     assert not (tmp_path / "absent").exists()
 
 

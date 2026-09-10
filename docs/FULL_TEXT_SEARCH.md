@@ -20,9 +20,9 @@ index's fixed analyzer/normalization/case rules, not byte offsets or literal
 substring matching. For `code_identifier`, positions follow the analyzer's
 emitted whole-token/component sequence; they are not source-code character offsets.
 
-The result regime is `phrase_verified`: existing whole-term postings nominate
+Without `TextIndexOptions.positions=True`, the result regime is `phrase_verified`: existing whole-term postings nominate
 candidates and their **same-snapshot heap tokens** verify contiguous positions.
-No positional-posting format, new capability bit, index rebuild, persisted
+That default mode adds no positional-posting format, new capability bit, index rebuild, persisted
 position list, term-offset response or write amplification is introduced. This
 is exact phrase semantics, not a claim of a durable positional index. Verification
 is linear in candidate field tokens, with O(query tokens) KMP state. It does not
@@ -245,7 +245,8 @@ procedure, not restarted inside it. FTS creation uses the typed API; proposed
 | --- | --- | --- |
 | `analyzer` | `standard` | `standard`, `keyword`, `code_identifier`, `whitespace`; see below. |
 | `analyzer_version` | `1` | Only 1. Unknown versions refuse, never silently map to latest. |
-| `prefix_max_characters` | `0` | Exact integer 0..32; positive values materialize distinct prefixes, activate bit 11 and increase write/storage cost. Zero disables prefix search and preserves prior bytes. |
+| `positions` | `False` | Exact boolean; opt-in persisted positional chunks and bit 16. Extra write/storage/query evidence cost; no implicit conversion. |
+| `prefix_max_characters` | `0` | Exact integer 0..32; positive values materialize distinct prefixes, activate bit 11 (or the encompassing positional bit 16) and increase write/storage cost. Zero disables prefix search. |
 | `statistics_mode` | `wal` | `wal` retains legacy index bytes and bounded memo/WAL/census statistics; `durable` explicitly activates a required format capability and persists corpus totals. See below. |
 | `statistics_history_entries` | `0` | Integer 0..32; positive values require `durable` and reserve this many historical summaries plus the current one. Page-size fit checked before creation; additional required capability bit 8. |
 | `normalization` | `NFC` | `none`, `NFC`, `NFKC` using the frozen Unicode 3.2 database. NFKC folds compatibility forms and may conflate distinctions; use none/NFC for identifiers where those distinctions matter. |
@@ -377,10 +378,53 @@ fresh postings. [Physical backup](BACKUP_RESTORE.md) preserves index/catalog byt
 UUID under its offline-restore contract. Both include verification. Required capability
 and wire layout are specified in [FTS-v1 format](specs/FULLTEXT_V1_FORMAT.md).
 
-This delivery does not implement phrase search, highlighting positions,
+This delivery does not implement highlighting/returned offsets or phrase slop,
 language stemming/stopwords, arbitrary CALL extensions, online
 generation deletion or automatic schema/format downgrade. Those remain explicit
 [roadmap](../ROADMAP.md) limitations rather than undocumented implied capabilities.
 
 [Hybrid search](HYBRID_SEARCH.md) composes this native source with vectors on one
 reader; it does not change BM25 or require an embedding provider inside Grafx.
+
+## Durable positional postings (0.0.6 development)
+
+```python
+from okto_grafx import connect, TextIndexOptions
+
+with connect(":memory:") as positional_db:
+    with positional_db.begin() as tx:
+        tx.execute("CREATE NODE TABLE Document(id INT64, body STRING, PRIMARY KEY(id))")
+        tx.execute("CREATE (:Document {id:1,body:'graph database'})")
+    positional_db.create_text_index("body_positions", "Document", ("body",),
+        options=TextIndexOptions(positions=True, statistics_mode="durable"))
+    hits = positional_db.search_text(index="body_positions", query="graph database", phrase=True)
+    assert hits.regime == "phrase_positions" and len(hits.hits) == 1
+```
+
+`TextIndexOptions.positions` is an opt-in persisted boolean, default `False`.
+It adds canonical field/term/position chunks of up to 32 occurrences, routed to
+the same bucket as that term's ordinary posting. Field-relative token positions
+are zero-based after the declared analyzer, not original character offsets.
+Repeated terms, token order and field boundaries are exact; fields never join
+into one phrase. Phrase/prefix combination and slop remain unsupported.
+
+Search intersects persisted relative positions, while validating every chunk's
+coverage against the native visible heap row under the existing pre/post index
+certificate. Missing/duplicate/foreign/incorrect chunks refuse rather than produce
+partial hits. This does **not** remove candidate heap validation or all text
+analysis; do not infer a measured query speedup. The ordinary non-positional
+`phrase_verified` path remains available and avoids additional write/storage cost.
+
+Creation, updates, deletes, rebuild, WAL replay, backup and logical transfer use
+the native generation/index protocols. Existing indexes do not silently change.
+Extra postings count against transaction limits and `max_postings`; positional
+query evidence counts against `max_memory_bytes`. Common/repeated long documents
+may increase write amplification significantly. Use the opt-in when persistent
+phrase positions are needed and benchmark the actual corpus; keep it off for
+term-only workloads with tight write/space budgets.
+
+The `fulltext_v5_` derivation preserves analyzer/statistics/prefix configuration
+and requires catalog bit **16**, `fulltext_positions_v1`, dependent on base FTS.
+Older builds refuse before using incompatible routing. No in-place downgrade or
+automatic conversion is provided. See [format](specs/FTS_POSITIONAL_POSTINGS.md)
+and [wheel compatibility](V006_COMPATIBILITY.md).

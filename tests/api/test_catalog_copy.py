@@ -54,6 +54,41 @@ def test_copy_remaps_edges_and_replay_is_read_only(setup):
     assert target.transactions.published_state().last_committed_lsn == before
 
 
+def test_selected_capture_uses_rid_index_and_checks_endpoint_closure(setup, monkeypatch):
+    from okto_grafx.engine.heap_store import HeapStore
+    source, target, package = setup
+    ids = {item.schema.name: tuple(rid for rid, _ in item.rows) for item in package.tables}
+    with source.begin("read") as tx:
+        monkeypatch.setattr(HeapStore, "scan", lambda *_a, **_k: pytest.fail("Selected capture must not scan heap"))
+        selected = capture_copy(tx, tables=("N", "R"), record_ids=ids)
+        assert selected == package
+        with pytest.raises(GrafxConfigurationError):
+            capture_copy(tx, tables=("N", "R"), record_ids={"N": ids["N"][:1], "R": ids["R"]})
+        with pytest.raises(GrafxConfigurationError):
+            capture_copy(tx, tables=("N",), record_ids={"N": (2**63,)})
+    monkeypatch.undo()
+    assert copy_graph(selected, target, idempotency_key="subset").rows == 3
+
+
+def test_skip_conflicts_preserves_existing_nodes_remaps_edges_and_replays(setup):
+    _, target, package = setup
+    with target.begin() as tx:
+        tx.execute("CREATE (:N {id:1, body:'keep-target'})")
+    receipt = copy_graph(package, target, idempotency_key="skip", conflict="skip")
+    assert receipt.rows == 2 and receipt.skipped_rows == 1
+    assert target.execute("MATCH (n:N {id:1}) RETURN n.body").rows == (("keep-target",),)
+    assert target.execute("MATCH (a:N)-[r:R]->(b:N) RETURN a.id,b.id").rows == ((1, 2),)
+    assert copy_graph(package, target, idempotency_key="skip", conflict="skip") == replace(receipt, replayed=True)
+    with pytest.raises(GrafxLedgerError):
+        copy_graph(package, target, idempotency_key="skip", conflict="fail")
+    target.checkpoint()
+    path = target.path
+    target.close()
+    with connect(path) as reopened:
+        assert copy_graph(package, reopened, idempotency_key="skip", conflict="skip") == replace(receipt, replayed=True)
+        assert reopened.verify().clean
+
+
 def test_same_key_different_request_and_mutated_package_refused(setup):
     _, target, package = setup
     copy_graph(package, target, idempotency_key="first")

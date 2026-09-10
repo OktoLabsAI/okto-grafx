@@ -1,5 +1,12 @@
 # Logical export and import
 
+**0.0.6 temporal-source rule:** `export_graph(..., history="refuse")` is the
+default. A database with native system-time history requires explicit
+`history="current-only"`. The manifest still declares current-state-only; rows
+and schema transfer, but temporal events, horizons and pins do not. No destination
+is promoted on refusal. Use [physical backup](BACKUP_RESTORE.md) to preserve full
+history for offline replacement; see [temporal operations](SYSTEM_TIME_HISTORY.md).
+
 [Documentation index](README.md) · [API reference](API_REFERENCE.md) · [Physical backup](BACKUP_RESTORE.md)
 
 Available in the **0.0.5 development source**, not a claim of a published release.

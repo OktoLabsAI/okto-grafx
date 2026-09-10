@@ -3,7 +3,8 @@
 **Single active product backlog — reconciled September 10, 2026.**
 Published/main baseline: `0.0.5`, tag `v0.0.5`, main merge
 `83cc3137bb7e95ad2a1ed9271b1a1134063097a8`. The `feature/v0.0.6` MP-1–MP-8
-checkpoint is implemented and locally validated, not released. Latest recorded Pulse measurement is a different build,
+checkpoint and the latest authorized native-history/catalog/search follow-up are
+implemented and locally validated, not released. Latest recorded Pulse measurement is a different build,
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
 
 This roadmap includes **new capabilities, corrective work, known limitations,
@@ -30,6 +31,8 @@ not a full release-wide regression. See [configuration](docs/CONFIGURATION.md).
 
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
+- [Latest authorized eight-item follow-up](#authorized-follow-up-after-204bd2e)
+- [Next proposed round after native-history closure](#next-proposed-round-after-native-history-closure)
 - [Approved capability continuation after 4ee4d2e](#approved-capability-continuation-after-4ee4d2e)
 - [Approved continuation after a4dd85a](#approved-continuation-after-a4dd85a)
 - [Approved continuation after 970aa1e](#approved-continuation-after-970aa1e)
@@ -79,6 +82,65 @@ not a full release-wide regression. See [configuration](docs/CONFIGURATION.md).
 
 ## Approved capability continuation after 4ee4d2e
 
+### Authorized follow-up after 204bd2e
+
+The operator approved the following fixed sequence with **one final delivery only
+after all eight meet feature tests, grouped regression and consumer documentation**.
+Interim observations are progress reports, not partial acceptance or new scope.
+
+| Order | Work | Status |
+| --- | --- | --- |
+| 1 | Native system-time activation, atomic current/history publication, WAL and recovery | Complete in development; native crash/repeated recovery and regression validated |
+| 2 | Typed as-of/versions and historical delete/recreate/relationship semantics | Complete in development; typed APIs, lineage/schema and snapshot tests validated |
+| 3 | History verify, backup/restore, explicit transfer rules and protected retention | Complete bounded payload-redaction slice; pins/backup/cuts validated; no physical compaction claim |
+| 4 | JSON CLI inventory for catalogs/workspaces | Complete in development; explicit-root/read-only CLI contracts validated |
+| 5 | Bounded selected catalog copy and explicit skip-conflict policy | Complete bounded slice; indexed node selection, bounded fallback and skip-node receipts validated |
+| 6 | Durable positional FTS postings for eligible phrase queries | Complete opt-in bit 16; phrase/snapshot/rebuild and damage/verification validated |
+| 7 | Bounded, correctly invalidated posting_hash decode memo | Complete; immutable content identity, mutation refusal and bounds validated |
+| 8 | 0.0.6 real-package upgrade/old-reader/accelerator compatibility matrix | Complete local ten-cell real-wheel matrix; 203 source modules match; remote platform workflow defined, not claimed executed |
+
+**DoD closed for all eight together.** Broad regression plus explicit corrective
+reconciliation: 16,828 distinct passing cases, 19 attributed skips, no unresolved
+failures. Final grouped delivery run: **1,306 passed, zero failures/skips** (151.05 s).
+Consumer documentation, generated API contracts, 39 connection fields, links and
+source/wheel parity passed validation. Overlapping test batches are not added.
+This closes the fixed round, not every remaining CAP-2/CAP-3/CAP-5 product ambition.
+
+No release, installation in Pulse or mutation of production stores is implied.
+Consumer docs: [system time](docs/SYSTEM_TIME_HISTORY.md), [CLI](docs/CLI.md),
+[copy](docs/CATALOG_COPY.md), [FTS](docs/FULL_TEXT_SEARCH.md),
+[posting memo](docs/POSTING_HASH.md), [matrix](docs/V006_COMPATIBILITY.md).
+[Round evidence](docs/reports/V006_NATIVE_HISTORY_ROUND.md) tracks final acceptance.
+
+### Next proposed round after native-history closure
+
+**Proposal only, not authorized or started.** These are remaining slices of the
+existing roadmap, not additional acceptance requirements for the completed round.
+Effort is relative; benefits below are expected, not measured speedups.
+
+| Order | Existing initiative | Finite proposed delivery | Effort / expected benefit |
+| --- | --- | --- | --- |
+| 1 / NHC-1 | GX-CAP-5 | Typed bounded return of matched token positions/field identities, using the existing positional evidence and owning snapshot. Token positions are not original-text character offsets. | Low–medium; enables explanations and consumer highlighting integrations without a second search. |
+| 2 / NHC-2 | GX-CAP-5 | Explicit ordered proximity/slop for phrase search, built on item 1 and durable positional chunks; fixed work/output bounds, repeated-term and field-boundary semantics. | Medium; more flexible text retrieval, no universal latency improvement promised. |
+| 3 / NHC-3 | GX-CAP-2 | Opt-in endpoint closure for explicitly selected relationship copies, within the same source snapshot and aggregate budgets; still one-store target COMMIT/receipt. No recursive arbitrary traversal or merge. | Medium; eliminates caller-side endpoint lookup/remapping orchestration and incomplete selections. |
+| 4 / NHC-4 | GX-CAP-4 on the delivered CAP-3 slice | Typed bounded same-store diff between two retained system-time commits: nodes, relationships, properties and explicit schema changes, preserving delete/recreate identity. No valid-time or bitemporal writes. | Medium; immediate audit/change inspection from existing history; initial scan cost remains explicit. |
+| 5 / NHC-5 | GX-CAP-3 / PERF-SCALE | Optional version access path keyed by table/record identity and commit, with activation/build, native update/recovery, verification and validated fallback contracts. First accelerate system_versions, not all temporal queries. | High; avoids whole-history decoding for one lineage when the access path is eligible. Operation-count evidence required. |
+| 6 / NHC-6 | GX-CAP-3 / PERF-SCALE | Bounded indexed as-of reconstruction, extending item 5 with a proved baseline/interval access path; preserve historical schema, endpoints, pins and fail-closed validation. | High; reduce repeated replay of irrelevant historical events; result-size and validation costs remain. |
+| 7 / NHC-7 | GX-CAP-5 / OPS-5 | Explicit same-name analyzer replacement through a prepared new index generation and atomic publication, retaining old-reader safety and crash recovery. No in-place reinterpretation of existing postings. | High; operational evolution of search without manual drop/recreate gaps. |
+| 8 / NHC-8 | GX-CAP-3 / OPS-3 | Explicit quiescent physical history compaction after retention, preserving horizons, pins and lineage with atomic replacement, recovery and backup rules. No online compaction or erasure of old WAL/backups. | High; reclaim history-file space that current payload redaction does not reclaim. |
+
+Items 1–4 consume the delivered foundations; 5–6 address history growth and depend
+on controlled persisted-format integration. Item 7 reuses index lifecycle; item 8
+requires its own replacement/recovery proof. None relaxes multi-reader/writer,
+both OCC checks, durability or consistency. Each implementation keeps the same
+feature/regression/documentation DoD; no marginal performance gate is introduced.
+
+### Previous checkpoint
+
+The subsection below records the historical state **at `204bd2e`**. Its pending
+native-history/CLI/selected-copy/positional-posting statements are superseded by
+the authorized follow-up above, not a second active delivery queue.
+
 Approved September 10, 2026, on `feature/v0.0.6`; these are **not** the already
 completed minimum-parity MP-1–MP-8. Fixed order and DoD: feature tests, grouped
 affected regression, roadmap plus capability/configuration/API docs. No Pulse
@@ -106,7 +168,7 @@ The item-7 checkpoint passed **6,830 affected regression tests**, followed by
 **1,314 final supplemental tests** after reference-preflight and documentation
 corrections. Item 8 has a tested internal prototype, not native history recording.
 [Exact build/test boundaries and remaining delivery](docs/reports/V006_POSTING_TEMPORAL_CHECKPOINT.md).
-The entire eight-item delivery remains **in progress**. Items 1–2 introduce no
+At that historical checkpoint, the entire eight-item delivery was **in progress**. Items 1–2 introduce no
 persistent format changes or new connection flags. Public consumption
 and limits: [catalogs/workspaces](docs/CATALOGS_AND_WORKSPACES.md). Their completion
 does not close the full CAP-2 spec: arbitrary subgraph selection and CLI inventory remain
@@ -124,6 +186,7 @@ prerequisite, not a new performance gate. No marginal timing target is added.
 
 | ID | Status | Deliverable / exit condition |
 | --- | --- | --- |
+| V006-HISTORY-CATALOG-SEARCH | All eight approved items complete in development | Native temporal publication/query/operations, explicit catalog/workspace CLI, selected copy/skip, positional FTS, posting decode memo and real-wheel matrix. Feature/regression/corrective tests and consumer documentation validated. [Exact evidence and limitations](docs/reports/V006_NATIVE_HISTORY_ROUND.md). Not published or installed in Pulse. |
 | REL-004 | Published September 8, 2026 | [PR #2](https://github.com/OktoLabsAI/okto-grafx/pull/2) merged; tag `v0.0.4` points to `425362a`. Wheel/sdist built from the tag, Twine validation, 149 package-file parity checks, isolated consumer smoke and public PyPI install smoke passed; remote SHA-256 values matched. [PyPI 0.0.4](https://pypi.org/project/okto-grafx/0.0.4/). GitHub Actions could not start because of account billing; local evidence does not certify the remote/platform matrix. |
 | DOC-1 | Implemented in this documentation refactor | One README entry point, public API/configuration/query/operations references, measured-performance table, one roadmap and a preserved source archive. Links, examples, API/config field coverage and preservation hashes are checked; [validation receipt](docs/reports/DOCUMENTATION_REFACTOR_2026_09_08.md). |
 | CAP-1B | Implemented checkpoint | `6b5163e`: native journal preflight is connected to page application/checkpoint; UUID, activation/COMMIT coverage, target/resident LSN and file extents validated. 2,433 tests / 77.27 s recorded; no new typing diagnostics in the isolated comparison. This is recovery correctness, not a latency benchmark. |
@@ -697,16 +760,16 @@ physical edges do not cross stores. Embedding generation stays outside the engin
 | --- | --- | --- |
 | GX-CAP-0 | Implemented checkpoint | Database-first boundaries, six ADRs, capability manifest, isolated package/import checks. [Spec](docs/specs/SPEC-GX-CAP-0.md). |
 | GX-CAP-1 | Implemented bounded N4 checkpoint | Qualified CommitId, opt-in durable metadata/history, monotonic logical commit time, lookup/pagination, verification and coordinated transfer/restore semantics. Not full temporal row history; logical graph v1 transfer excludes historical journal entries. [Evidence](docs/reports/V005_N3_N4_ACCEPTANCE.md), [usage](docs/COMMIT_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-1.md). |
-| GX-CAP-2 | Partial: session/workspace and bounded copy implemented | Explicit resolution/permissions, ownership, pinned one-store transactions, bounded workspace discovery and atomic PK-table copy/fail policy with indexed durable receipts. Arbitrary selection, skip/merge, anonymous-node copy, CLI inventory and federation remain open. [Spec](docs/specs/SPEC-GX-CAP-2.md), [evidence](docs/reports/V006_COPY_PHRASE_ACCEPTANCE.md). |
-| GX-CAP-3 | Partial internal prototype; native persistence not implemented | Typed event/image planning and append-transition validation tested, without runtime admission. Opt-in atomic history, historical schema/edge semantics, retention, indexes and typed time-travel API remain. [Spec](docs/specs/SPEC-GX-CAP-3.md), [exact prototype boundary](docs/specs/SYSTEM_HISTORY_APPEND_DRAFT.md). |
+| GX-CAP-2 | Partial: sessions/workspaces, CLI and selected bounded copy implemented | Explicit permissions/ownership and one-store transactions; JSON inventory/resolution; selected RIDs, skip-node/fail policies and atomic receipt replay. Arbitrary predicates, automatic subgraph closure, anonymous nodes, merge and federation remain open. [Spec](docs/specs/SPEC-GX-CAP-2.md), [current evidence](docs/reports/V006_NATIVE_HISTORY_ROUND.md). |
+| GX-CAP-3 | Native bounded system-time slice implemented and locally validated | Atomic activation/current/history WAL, typed as-of/versions, historical nullable schema/edges/delete-recreate, durable pins, bounded payload redaction, verification and physical backup. Temporal indexes, physical history compaction, full temporal logical export and embedding-space timelines remain open. [Usage](docs/SYSTEM_TIME_HISTORY.md), [spec](docs/specs/SPEC-GX-CAP-3.md), [acceptance](docs/reports/V006_NATIVE_HISTORY_ROUND.md). |
 | GX-CAP-4 | Planned | Valid time, bitemporal semantics and graph/version diff; builds on CAP-3. [Spec](docs/specs/SPEC-GX-CAP-4.md). |
-| GX-CAP-5 | Implemented v1 plus prefixes, relationship indexes, durable/history statistics and exact phrase verification | Native FTS, frozen analyzers, weighted BM25, snapshot scores and full lifecycle. Phrase positions are verified in same-snapshot heap candidates; durable positional postings, position-return/proximity APIs and same-name analyzer replacement remain open. Existing ineligible-statistics census remains linear. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [latest evidence](docs/reports/V006_COPY_PHRASE_ACCEPTANCE.md). |
+| GX-CAP-5 | Implemented v1 plus prefixes, relationship indexes, durable/history statistics and opt-in positional phrase postings | Native FTS, frozen analyzers, weighted BM25, snapshot scores and full lifecycle. Same-snapshot heap validation remains. Position-return/proximity APIs and same-name analyzer replacement remain open; ineligible-statistics census remains linear. [Usage](docs/FULL_TEXT_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-5.md), [current evidence](docs/reports/V006_NATIVE_HISTORY_ROUND.md). |
 | GX-CAP-6 | Implemented bounded v1 plus certified incident expansion and shared controls/memory | Weighted RRF, union/intersection, source explanations, graph boost/filter, explicit missing-source partial policy, indexed BFS and per-phase logical peaks. No embedding provider, cross-table fusion, graph-only candidate expansion or universal recall promise. [Usage](docs/HYBRID_SEARCH.md), [spec](docs/specs/SPEC-GX-CAP-6.md), [latest evidence](docs/reports/V005_EIGHT_ITEM_CHECKPOINT.md). |
 | GX-CAP-7 | Partial: trusted scalar SPI implemented | Explicit immutable per-handle registry, typed scalar UDFs/direct calls, NULL/value budgets and typed failures. Aggregate/table/procedure extensions, durable manifests and sandboxing are not implemented. [Usage](docs/EXTENSIONS_AND_ARROW.md), [remaining spec](docs/specs/SPEC-GX-CAP-7.md). |
 | GX-CAP-8 | Partial: scalar/vector Arrow, Pandas/Polars, local Parquet/CSV/JSONL and detached graph exchange implemented | Explicit native vector identity, nullable typed batches, atomic import staging and caller-owned commit; bounded local files and NetworkX/projection Arrow exports. External query scans/COPY, arbitrary nested/entity ingestion and graph import remain. [Usage](docs/TABULAR_AND_PARQUET.md), [text](docs/LOCAL_TEXT_IMPORT.md), [exchange](docs/GRAPH_EXCHANGE.md), [remaining spec](docs/specs/SPEC-GX-CAP-8.md). |
 | GX-CAP-9 | Partial: weighted projections, retained lookup/CSR/transitions/simple topology, degree/WCC/SCC, BFS/Dijkstra, PageRank, k-core and label propagation implemented | Bounded read-only algorithms, cancellation, explicit NumPy and independent/NetworkX oracles for declared algorithms. Persistent catalog, mutation/write modes, Louvain and broader algorithm packages remain. [Usage](docs/GRAPH_PROJECTIONS.md), [remaining spec](docs/specs/SPEC-GX-CAP-9.md). |
 | GX-CAP-10 | Partial: additive migrations, bounded logical views and nullable-column evolution | Atomic per-version CREATE DDL; typed persisted base-table read views; typed append-only nullable columns with exact old-row layouts. Arbitrary ALTER, other S1/S2/S3 migrations, nested views and derived/materialized graphs remain. [Migrations](docs/SCHEMA_MIGRATIONS.md), [views](docs/LOGICAL_VIEWS.md), [columns](docs/NULLABLE_COLUMNS.md), [remaining spec](docs/specs/SPEC-GX-CAP-10.md). |
-| GX-CAP-11 | Partial: 0.0.5 compatibility automation and local upgrade evidence implemented | Real-wheel upgrade/refusal, cross-selector reopen and Windows/Ubuntu × Python 3.11–3.13 workflow. Remote matrix runs and release acceptance are not implied. [Current evidence](docs/V005_COMPATIBILITY.md), [spec](docs/specs/SPEC-GX-CAP-11.md). |
+| GX-CAP-11 | Partial: 0.0.5 and 0.0.6 compatibility automation and local upgrade evidence implemented | Real-wheel upgrade/refusal, cross-selector reopen and Windows/Ubuntu × Python 3.11–3.13 workflows. Remote matrix runs and release acceptance are not implied. [Current evidence](docs/V006_COMPATIBILITY.md), [previous evidence](docs/V005_COMPATIBILITY.md), [spec](docs/specs/SPEC-GX-CAP-11.md). |
 
 Implementation precedence: close release boundary → complete CAP-1 → catalog/
 system-time/FTS foundations → bitemporal/hybrid → extension/interoperability/
@@ -715,6 +778,10 @@ shared WAL/format changes must be integrated in a controlled sequence, not compe
 branches that independently redefine the protocol.
 
 ## CAP-2 through CAP-4 opportunity assessment
+
+Historical assessment before the capability continuation. Current implemented
+slices and remaining limits are in the capability table immediately above and
+the authorized follow-up; do not read the original gap estimates as current status.
 
 0.0.6 consumption additions also extend the bounded CAP-8/9 surfaces above:
 [SQLite ingestion](docs/LOCAL_SQLITE_IMPORT.md), [offline HTML inspection](docs/HTML_SNAPSHOTS.md)

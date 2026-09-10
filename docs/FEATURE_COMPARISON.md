@@ -6,8 +6,11 @@ Reviewed September 10, 2026. This is a capability and integration comparison,
 not a benchmark, migration guarantee or product certification.
 
 Additional 0.0.6 development scope: explicit [posting-hash indexes](POSTING_HASH.md)
-share repeated keys per physical page. This does not change the snapshot/ACID
-claims below or imply that the planned system-time history API is available.
+share repeated keys per physical page. The later development continuation adds
+[native system-time APIs](SYSTEM_TIME_HISTORY.md) and
+[positional phrase postings](FULL_TEXT_SEARCH.md#durable-positional-postings-006-development).
+These do not change the **published 0.0.5 baseline** or snapshot/ACID claims below;
+the historical comparison table is not a release claim for 0.0.6.
 
 ## Scope and reading rules
 

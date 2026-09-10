@@ -404,6 +404,7 @@ def export_graph(
     destination: str | os.PathLike[str],
     *,
     limits: TransferLimits | None = None,
+    history: str = "refuse",
 ) -> TransferReport:
     """Stream all current logical schema/rows/vectors from one fixed reader snapshot.
 
@@ -413,6 +414,8 @@ def export_graph(
     index generations are not exported. Custom active index declarations are.
     """
     budget = _limits(limits)
+    if history not in ("refuse", "current-only") or type(history) is not str:
+        raise GrafxConfigurationError("history must be refuse or current-only.", field="history")
     source = (
         Path(database._storage.root).resolve(strict=True)
         if type(database._storage) is LocalStorageDevice
@@ -427,12 +430,16 @@ def export_graph(
     ):
         staging = Path(temp) / "artifact"
         with database._transactions.page_access_section(fresh_read_view=True):
+            if database._catalog.catalog.system_history_tables() and history != "current-only":
+                raise _refuse("system_history_requires_explicit_current_only")
             schema_before_snapshot = _schema(database._catalog.catalog)
         with LocalStorageDevice(staging) as artifact, database.begin("read") as reader:
             with database._transactions.page_access_section(
                 transaction=reader._context
             ):
                 catalog = database._catalog.catalog.copy()
+                if catalog.system_history_tables() and history != "current-only":
+                    raise _refuse("system_history_requires_explicit_current_only")
                 schema = _schema(catalog)
                 if schema != schema_before_snapshot:
                     raise _refuse("schema_changed")

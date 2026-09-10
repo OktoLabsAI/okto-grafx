@@ -22,7 +22,7 @@ class WorkspacePolicy:
     allow_user_store: bool = False
     project_store_name: str = ".grafx/store"
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.paths) is not CatalogPathPolicy:
             _refuse("Expected CatalogPathPolicy.", "paths")
         if type(self.markers) is not tuple or not 1 <= len(self.markers) <= 16:

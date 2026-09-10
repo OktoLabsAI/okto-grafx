@@ -1,6 +1,14 @@
 # SPEC-GX-CAP-3 — Temporal system time
 
-Status: specified / implementation not certified. Date: 2026-09-08.
+Status: native bounded system-time slice implemented and locally validated;
+full scope remains partial. Original specification: 2026-09-08.
+
+Current implementation: [typed consumer APIs](../SYSTEM_TIME_HISTORY.md),
+[native bytes/recovery](SYSTEM_HISTORY_V1.md) and
+[round acceptance](../reports/V006_NATIVE_HISTORY_ROUND.md). Atomic current/history,
+as-of/versions, historical schema/edges, pins, payload retention, verify and physical
+backup are delivered. Temporal indexes, physical compaction, complete temporal
+logical transfer and embedding-space timelines remain outside this slice.
 Dependencies: GX-CAP-1; capability manifest; maintenance baseline.
 
 ## Normative scope
@@ -49,6 +57,9 @@ Record immutable code SHA, test commands/results, audit and unresolved debt here
 implemented. Next prerequisite is the first unmet dependency, not another scope expansion.
 
 ## Continuation item 8: implementation handoff (September 10)
+
+**Historical boundary at `204bd2e`, superseded by the native follow-up linked above.**
+The statements below describe that earlier prototype, not the current implementation.
 
 The preceding repeated-key physical layout is not the history representation.
 Its entries are reclaimable, and exact candidates remain tied to heap visibility.

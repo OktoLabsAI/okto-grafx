@@ -13,8 +13,11 @@ same-name analyzer replacement remain outside this slice.
 September 10 continuation: typed `phrase=True` now verifies exact analyzed token
 positions in same-snapshot heap candidates under existing FTS certificates and
 budgets. [Contract](../FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development).
-This introduces no durable positional postings; position-return/proximity APIs
-and same-name analyzer replacement remain separate residual scope.
+That initial phrase slice introduced no durable positional postings. The subsequent
+native-history/catalog/search follow-up adds opt-in persisted positional chunks
+and validated phrase execution ([format](FTS_POSITIONAL_POSTINGS.md),
+[acceptance](../reports/V006_NATIVE_HISTORY_ROUND.md)). Position-return/proximity
+APIs and same-name analyzer replacement remain separate residual scope.
 
 ## Normative scope
 

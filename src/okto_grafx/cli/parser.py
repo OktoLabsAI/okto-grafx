@@ -276,6 +276,21 @@ def _database_command(
 
 
 COMMANDS: tuple[CommandSpec, ...] = (
+    CommandSpec("catalogs", "Inspect explicit read-only catalog attachments; never discover stores.",
+        positionals=("PATH",), force_read_only=True, options=(JSON_OPTION,
+            Option("--allow-root", "Existing allowed root (required; repeatable).", repeatable=True),
+            Option("--attach", "Explicit ALIAS=PATH attachment (repeatable, at most 15).", repeatable=True),
+            Option("--limit", "Maximum inventory entries (default 16).", integer=True, minimum=0))),
+    CommandSpec("workspace", "Resolve bounded workspace paths without opening or creating stores.",
+        subcommand="resolve", positionals=("CWD",), options=(JSON_OPTION,
+            Option("--allow-root", "Existing allowed root (required; repeatable).", repeatable=True),
+            Option("--store", "Explicit project store path; highest precedence."),
+            Option("--project-root", "Explicit project root; no marker discovery."),
+            Option("--marker", "Local marker name (repeatable; default .git).", repeatable=True),
+            Option("--max-parent-steps", "Bounded ancestor steps (default 8, maximum 64).", integer=True, minimum=0),
+            Option("--allow-cwd", "Opt into cwd fallback when no marker is found.", takes_value=False),
+            Option("--user-store", "Explicit additional user store path."),
+            Option("--allow-user-store", "Opt into additional user scope.", takes_value=False))),
     CommandSpec("capabilities", "Describe this build's CLI contracts, not store activation.",
                 options=(JSON_OPTION,)),
     _database_command("indexes", "Inspect secondary and vector index metadata.",

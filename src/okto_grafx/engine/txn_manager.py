@@ -727,6 +727,7 @@ class TransactionManager:
         "_commit_catalog_activation_plans",
         "_database_uuid",
         "_journal_attempt",
+        "_history_publication",
         "_maintenance_txns",
         "_commit_metadata",
         "_checksum_scope",
@@ -906,6 +907,8 @@ class TransactionManager:
         self._commit_catalog_activation_plans: dict[TxnId, tuple[bytes, Csn]] = {}
         self._database_uuid = database_uuid
         self._journal_attempt: tuple[int, PreparedCommitCatalogAppend, dict[tuple[str, int], bytes]] | None = None
+        from okto_grafx.engine.system_history_publication import HistoryPublication
+        self._history_publication = HistoryPublication(self)
         self._maintenance_txns: set[int] = set()
         self._commit_metadata: dict[int, bytes] = {}
         self._checksum_scope: Callable[[], AbstractContextManager[object]] = nullcontext
@@ -2495,7 +2498,9 @@ class TransactionManager:
                 page_partition(file, page) for file, page in journal_locations
             )
         self._validate_index_catalog_activation_plan(
-            txn, plan, journal_partitions=journal_partitions
+            txn, plan, journal_partitions=journal_partitions | frozenset(
+                page_partition(file, page) for file, page in self._history_publication.images(txn.txn_id, through_lsn + 1)
+            )
         )
         if plan.state == "built":
             return
@@ -3634,6 +3639,7 @@ class TransactionManager:
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._open.pop(txn.txn_id, None)
         self._commit_catalog_activation_plans.pop(txn.txn_id, None)
+        self._history_publication.forget(txn.txn_id)
         self._maintenance_txns.discard(int(txn.txn_id))
         self._commit_metadata.pop(int(txn.txn_id), None)
         if self._journal_attempt is not None and self._journal_attempt[0] == int(txn.txn_id):
@@ -4618,6 +4624,9 @@ class TransactionManager:
                         self._maintenance_txns.clear()
                         self._commit_metadata.clear()
                         self._journal_attempt = None
+                        self._history_publication.activations.clear()
+                        self._history_publication.controls.clear()
+                        self._history_publication.attempt = None
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -4962,6 +4971,7 @@ class TransactionManager:
                                 rows = self._write_rows(txn, identities)
                             materialized_pages = self._declare_page_interest(txn, rows)
                             materialized_pages = materialized_pages | self._prepare_journal(txn, current)
+                            materialized_pages = materialized_pages | self._history_publication.prepare(txn, current, rows)
                             journaled_commit = self._journal_attempt is not None
                             materialized_interest = self._materialized_page_delta(
                                 txn,
@@ -5022,7 +5032,8 @@ class TransactionManager:
                                 if commit_trace is not None:
                                     commit_trace.increment(COMMIT_RETARGETS_TOTAL)
                             self._materialized = None
-                            if not raw_batch_rolls and txn.txn_id not in self._commit_catalog_activation_plans:
+                            if (not raw_batch_rolls and txn.txn_id not in self._commit_catalog_activation_plans
+                                    and txn.txn_id not in self._history_publication.activations):
                                 records = self._compress_page_records(records, images)
                             self._validate_wal_batch_budget(txn, records)
                             if commit_trace is not None and (
@@ -5376,6 +5387,7 @@ class TransactionManager:
         # provenance hook below: a malformed pending identity must not reach any collaborator,
         # and certainly must not be mistaken for a physical RecordRef by the heap.
         self._validate_row_intents(txn)
+        self._history_publication.validate_staged(txn)
         activation = self._commit_catalog_activation_plans.get(txn.txn_id)
         if activation is not None:
             expected_catalog = Catalog.deserialize(activation[0])
@@ -5792,6 +5804,7 @@ class TransactionManager:
         journal = self._journal_attempt
         if self._commit_catalog_capable and (journal is None or journal[0] != int(txn.txn_id)):
             raise GrafxTransactionStateError("Journal was not prepared before physical validation.", field="commit_catalog_publication")
+        predicted += len(self._history_publication.images(txn.txn_id, predicted))
         if journal is not None and journal[0] == int(txn.txn_id):
             predicted += journal[1].image_count + len(journal[2])
             journal_images = dict(journal[2])
@@ -5800,6 +5813,8 @@ class TransactionManager:
             staged = sorted(set(staged) | journal_images.keys())
         else:
             journal_images = {}
+        journal_images.update(self._history_publication.images(txn.txn_id, predicted))
+        staged = sorted(set(staged) | journal_images.keys())
         if predicted >= PROVISIONAL_CSN:
             raise GrafxTransactionStateError(
                 "The write-ahead log has exhausted its usable commit-number space; the maximum "
@@ -5808,6 +5823,7 @@ class TransactionManager:
                 value=base,
             )
         self._rebind_commit_catalog_activation(txn, predicted)
+        self._history_publication.rebind_activation(txn, predicted)
         if uses_canonical_index_staging:
             # Count and staging run in this same COMMIT_SECTION against the same immutable
             # catalog authority.  Carry that one-shot observation into the verifier instead of
@@ -5959,10 +5975,12 @@ class TransactionManager:
         )
         self._materialized = None
         rebound_activation = self._rebind_commit_catalog_activation(txn, new_csn)
+        rebound_activation = self._history_publication.rebind_activation(txn, new_csn) or rebound_activation
         journal = self._journal_attempt
         journal_images = (dict(journal[2]) | {(item.file, item.page_index): item.raw
                            for item in journal[1].bind(new_csn).images}
                           if journal is not None and journal[0] == int(txn.txn_id) else {})
+        journal_images.update(self._history_publication.images(txn.txn_id, new_csn))
         for file, page_index, image in images:
             page = reusable.get((file, page_index))
             if (file, page_index) in journal_images:
@@ -6953,6 +6971,7 @@ class TransactionManager:
         epoch = lease.epoch
         try:
             self._prepare_journal(reservation, previous.last_committed_lsn)
+            self._history_publication.prepare(reservation, previous.last_committed_lsn)
             if trace is not None:
                 trace.phase("build_records")
             with self._close_wait_hazard():
@@ -8241,6 +8260,7 @@ class TransactionManager:
         final outcome non-retryable.
         """
         descriptor_failure = self._drain_transaction_descriptor_scope(txn.txn_id)
+        self._history_publication.forget(txn.txn_id)
         self._maintenance_txns.discard(int(txn.txn_id))
         self._commit_metadata.pop(int(txn.txn_id), None)
         if self._journal_attempt is not None and self._journal_attempt[0] == int(txn.txn_id):

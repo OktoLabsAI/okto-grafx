@@ -164,6 +164,9 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
     # to `from okto_grafx import *`, and it is exported code that no import ever exercises.
     assert okto_grafx.__all__ == [
         "CancellationToken",
+        "CatalogInfo",
+        "CatalogPathPolicy",
+        "CatalogSession",
         "CommitCatalogEntry",
         "CommitHistoryPage",
         "CommitId",
@@ -187,6 +190,12 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "ScanCursorV1",
         "ScanPageV1",
         "ScanRowV1",
+        "TemporalGraph",
+        "TemporalLimits",
+        "TemporalPin",
+        "TemporalPruneReport",
+        "TemporalVersion",
+        "TemporalVersions",
         "TextHit",
         "TextIndexOptions",
         "TextSearchLimits",
