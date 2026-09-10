@@ -2,10 +2,11 @@
 
 Embedded, local-first graph database for Python, with concurrent readers and writers,
 snapshot isolation, WAL-backed durability, verification and fail-closed recovery.
-No database server is required. The core has no third-party runtime dependencies.
+No database server is required. The base installation includes NumPy and native CRC-32C;
+engine/domain mechanisms remain isolated behind ports.
 
-**Source version: 0.0.5 development, pre-alpha.** This describes the checked-out source, not a
-claim that 0.0.5 is already published on PyPI. API and persistent-format compatibility
+**Version: 0.0.5, pre-alpha — published on PyPI.** See the
+[publication receipt](docs/reports/PYPI_0_0_5_PUBLICATION.md). API and persistent-format compatibility
 must be checked before upgrading; see [operations](docs/OPERATIONS.md).
 
 ## Install and start
@@ -13,14 +14,17 @@ must be checked before upgrading; see [operations](docs/OPERATIONS.md).
 Python 3.11–3.13; local Windows and POSIX filesystems.
 
 ```sh
-pip install "okto-grafx[accel]"
+pip install okto-grafx
 ```
 
 This installs the release available from your configured package index. For this
 source revision, use `pip install -e ".[dev,accel]"` in a checkout. `okto-grafx`
 is the distribution name; `okto_grafx` is the Python import; `oktografx` is the CLI.
-The `[accel]` extra adds native CRC-32C and NumPy. NumPy vector math/page codec
-require explicit selectors; installing the extra does not select them automatically.
+Since 0.0.5, native CRC-32C and NumPy are base dependencies.
+The `[accel]` name remains a compatibility alias. New connections default to
+`codec="numpy"`, `vector_math="numpy"` and `checksum="auto"`. Explicit `pure`
+selectors remain available; vector `auto` retains its existing pure semantics.
+Earlier published releases may still require `[accel]` and explicit NumPy selectors.
 
 ```python
 from okto_grafx import connect

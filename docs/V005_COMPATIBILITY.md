@@ -3,6 +3,15 @@
 This document is an execution matrix, not a claim of publication or release-wide
 certification. No existing Pulse data participates in these checks.
 
+September 10 default-acceleration amendment: the latest 0.0.5 revision installs
+NumPy and google-crc32c as base dependencies. `[accel]` remains an empty compatibility
+alias. New `DatabaseConfig` instances default to `codec="numpy"` and
+`vector_math="numpy"`; explicitly saved `pure` or `auto` values are preserved.
+This is a constructor/packaging default change, not a format migration. NumPy codec
+bytes remain interchangeable with the pure codec; vector arithmetic follows the
+existing tolerance contract (near-tie rankings can differ). Native checksum
+acceptance, WAL, OCC and multi-reader/writer guarantees are unchanged.
+
 The continuation after `970aa1e` adds detached weighted algorithms, opt-in NumPy
 PageRank and optional Pandas/Parquet adapters. Default Python algorithms and Arrow
 APIs remain; no connection field, WAL effect or required format bit is introduced.
@@ -24,10 +33,11 @@ Current Windows source, optional-Arrow and bare-source checks are recorded in th
 | Isolated real 0.0.4 wheel → current 0.0.5 source | Four upgrade cases passed; default reopened by 0.0.4, three new capability opt-ins refused by 0.0.4 | `python tools/check_v005_upgrade.py --legacy-wheel <0.0.4-wheel>` |
 | Windows / Python 3.11 and 3.12 | Not run locally | New CI compatibility workflow |
 | POSIX / Python 3.11, 3.12 and 3.13 | Not run locally | New CI compatibility workflow |
-| Bare installation without optional dependencies | Not run locally; selecting pure is not proof of dependency absence | CI bare profile |
+| Bare installation without optional dependencies | Fresh wheel and sdist installed-consumer smoke passed on Windows/Python 3.13; additional bare-wheel search/backup smoke passed. Full bare-profile suite not claimed | [Pre-Pulse receipt](reports/V005_PRE_PULSE_VALIDATION.md); CI bare profile remains separate |
 | Bare source, Windows / Python 3.13, `-I -S` with site packages disabled | Passed scalar/sparse/verification and typed missing-Arrow refusal; no optional imports | Local isolated source probe, recorded in round receipt |
 | Optional Arrow scalar batches | 3 local feature tests passed | `tests/api/test_arrow_export.py` |
 | Local regression coverage with corrective verifier reruns | 15,904 distinct passes, 18 platform skips, no unresolved failures; grouped runs, not one clean uninterrupted invocation | [Round receipt and exact reports](reports/V005_NEXT_EIGHT_PROGRESS.md) |
+| Latest pre-Pulse candidate, `8c3f6f2` | One complete local regression: 16,228 passed, 18 attributed POSIX skips, zero failures; installed-wheel recipes and cross-selector checks: 11 passed | [Exact artifacts, execution conditions and storage caveat](reports/V005_PRE_PULSE_VALIDATION.md) |
 
 `.github/workflows/v005-compatibility.yml` runs Windows/Ubuntu × Python 3.11–3.13 ×
 bare/extras. It retains JUnit evidence even on failure; extras installation fails

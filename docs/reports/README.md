@@ -6,6 +6,11 @@ Dated evidence, not active execution queues. Each report retains its original
 measurement conditions, source paths, limitations and checkpoint history.
 Private artifact/consumer-repository paths may not be available in this checkout.
 
+- [0.0.5 PyPI publication — exact installed wheel, default acceleration and registry verification](PYPI_0_0_5_PUBLICATION.md)
+
+- [Pulse adoption of advanced Grafx capabilities — assessment and agnostic Core boundary](PULSE_GRAFX_CAPABILITY_ADOPTION_ASSESSMENT.md)
+- [Pulse 0.0.5 adoption checkpoint — local installation, read lanes and Settings](PULSE_V005_ADOPTION_CHECKPOINT.md)
+- [0.0.5 pre-Pulse candidate validation — full regression and installed artifacts](V005_PRE_PULSE_VALIDATION.md)
 - [Reusable analytics and local ingestion after a4dd85a](V005_AFTER_A4DD85A.md)
 - [Weighted analytics and tabular interop after 970aa1e](V005_AFTER_970AA1E.md)
 - [Projection throughput and algorithms after 7dde256 — eight-item acceptance](V005_AFTER_7DDE256.md)

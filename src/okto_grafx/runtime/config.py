@@ -288,8 +288,8 @@ class DatabaseConfig:
     metrics: str = "noop"
     metrics_destination: str | None = None
     allow_remote_metrics: bool = False
-    codec: str = dataclass_field(default="pure", kw_only=True)
-    vector_math: str = "auto"
+    codec: str = dataclass_field(default="numpy", kw_only=True)
+    vector_math: str = "numpy"
     checksum: str = "auto"
     vector_exact_scan_threshold: int = 4096
     vector_ef_search: int = DEFAULT_EF_SEARCH

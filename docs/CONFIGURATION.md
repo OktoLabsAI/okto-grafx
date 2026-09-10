@@ -1,5 +1,14 @@
 # Configuration reference
 
+In the September 10, 2026 0.0.5 development revision, the base install includes
+NumPy and google-crc32c. New connections default to `codec="numpy"` and
+`vector_math="numpy"`; `checksum="auto"` still validates and selects native CRC.
+Explicit `pure` settings remain supported. Vector `auto` still selects pure;
+there is no silent NumPy fallback. Existing explicitly saved settings are not
+rewritten. Page bytes and transactional guarantees do not change. NumPy vector
+results follow the documented floating-point tolerances, not pure bit equality.
+Operation-local algorithm options (such as PageRank's `backend`) are unchanged.
+
 The continuation after `a4dd85a` adds only operation-local options: opt-in
 `with_pagerank(backend="python", weighted=False)`, `with_simple_topology()` and
 `label_propagation(max_iterations=100)` with existing projection work/memory and
@@ -151,8 +160,8 @@ custom provider registration and runtime configuration errors are unchanged.
 | `metrics` | `"noop"` | `"noop"`, `"openmetrics"`, `"json"` |
 | `metrics_destination` | `None` | Required file path for `"json"`; for `"openmetrics"`, `None` means `127.0.0.1:0` and an explicit IPv6 destination uses `[address]:port` |
 | `allow_remote_metrics` | `False` | Exact boolean, valid only for `"openmetrics"`; permits a hostname or non-loopback address when explicitly `True` |
-| `codec` | `"pure"` | `"pure"` binds the byte-contract oracle; `"numpy"` explicitly selects the NumPy-backed, byte-identical dense-directory codec and requires `[accel]` |
-| `vector_math` | `"auto"` | `"auto"` and `"pure"` both bind the pure oracle; `"numpy"` requires `[accel]` |
+| `codec` | `"numpy"` | NumPy-backed, byte-identical dense-directory codec; NumPy is a base dependency. `"pure"` selects the reference codec. |
+| `vector_math` | `"numpy"` | NumPy acceleration by default; `"auto"` and `"pure"` retain reference arithmetic. See vector tolerance/ranking contracts. |
 | `checksum` | `"auto"` | `"auto"` detects an accepted accelerator, `"pure"` selects the reference, `"native"` requires the native provider; 0.0.5 connections capture an isolated per-database selection |
 | `vector_exact_scan_threshold` | `4096` | Nonnegative candidate threshold for exact-vs-approximate selection; zero permits ANN whenever its other eligibility conditions hold. Inspect the returned regime, not just table size |
 | `vector_ef_search` | `320` | Base HNSW beam in the approximate regime; integer from 1 through 1,048,576 |

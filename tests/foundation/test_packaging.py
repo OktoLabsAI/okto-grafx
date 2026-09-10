@@ -1,4 +1,4 @@
-"""Packaging is part of the contract: pure Python, one wheel, zero runtime dependencies (TR-9)."""
+"""Packaging contract: one Grafx wheel with default acceleration dependencies."""
 
 from __future__ import annotations
 
@@ -57,22 +57,19 @@ def test_package_discovery_excludes_optional_sibling_wheels(
     assert set(actual) == {"okto_grafx", "okto_grafx.api"}
 
 
-def test_there_is_no_runtime_dependency(manifest: dict[str, Any]) -> None:
-    # G3: the wheel is pure Python and the stdlib is the only runtime requirement.
-    assert manifest["project"]["dependencies"] == []
+def test_acceleration_is_a_base_runtime_dependency(manifest: dict[str, Any]) -> None:
+    assert manifest["project"]["dependencies"] == ["numpy>=1.24", "google-crc32c>=1.5"]
 
 
 def test_optional_dependencies_are_the_declared_extras(manifest: dict[str, Any]) -> None:
-    # G3 holds because none of this is a RUNTIME dependency: the core computes every checksum and
-    # every distance in pure Python, and an extra only replaces an implementation with a faster
-    # one that had to reproduce the reference before it was allowed to run (D2).
+    # Acceleration is now base-installed; the old extra remains a no-op alias.
     extras = manifest["project"]["optional-dependencies"]
     assert extras == {
         "arrow": ["pyarrow>=14"],
         "pandas": ["pyarrow>=14", "pandas>=2"],
         "polars": ["pyarrow>=14", "polars>=1"],
         "networkx": ["networkx>=3"],
-        "accel": ["numpy>=1.24", "google-crc32c>=1.5"],
+        "accel": [],
         "bench": ["ladybug==0.16.0", "numpy>=1.24"],
         "dev": ["pytest>=8", "pytest-timeout", "ruff==0.15.1", "PyYAML>=6"],
     }
@@ -100,7 +97,7 @@ def test_every_accelerator_the_accel_extra_names_is_one_an_adapter_knows_how_to_
     """An extra that installs something nothing can bind is a dependency bought for nothing."""
     from okto_grafx.adapters.checksum_native import CRC32C_PROVIDERS
 
-    accel = manifest["project"]["optional-dependencies"]["accel"]
+    accel = manifest["project"]["dependencies"]
     distributions = {requirement.split(">=")[0].split("==")[0] for requirement in accel}
     known = {module.replace("_", "-") for module, _attribute in CRC32C_PROVIDERS}
     assert distributions & known, (
@@ -343,7 +340,7 @@ def test_a_built_wheel_ships_the_package_and_nothing_else(built_wheel: Path) -> 
 
 @pytest.mark.slow
 @pytest.mark.timeout(WHEEL_BUILD_TIMEOUT_SECONDS)
-def test_the_built_wheel_declares_no_runtime_dependency(built_wheel: Path) -> None:
+def test_the_built_wheel_declares_default_acceleration(built_wheel: Path) -> None:
     with zipfile.ZipFile(built_wheel) as archive:
         metadata_name = next(
             name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
@@ -354,7 +351,7 @@ def test_the_built_wheel_declares_no_runtime_dependency(built_wheel: Path) -> No
         for line in metadata.splitlines()
         if line.startswith("Requires-Dist:") and "extra ==" not in line
     ]
-    assert required == [], required
+    assert set(required) == {"Requires-Dist: numpy>=1.24", "Requires-Dist: google-crc32c>=1.5"}, required
     assert "Requires-Python: >=3.11" in metadata
 
 

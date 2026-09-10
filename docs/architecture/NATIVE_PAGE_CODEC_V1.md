@@ -4,16 +4,17 @@
 
 ## Decision
 
-Grafx keeps `PageCodecV1` as the default correctness oracle and adds the explicitly selected
-`NumpyPageCodecV1` adapter through `DatabaseConfig(codec="numpy")`. The adapter is shipped in the
-same pure-Python wheel, while NumPy remains optional under `okto-grafx[accel]`; no compiler or
+Grafx keeps `PageCodecV1` as the explicitly selectable correctness oracle. As of
+the September 10, 2026 0.0.5 revision, `NumpyPageCodecV1` is the default through
+`DatabaseConfig(codec="numpy")`, and NumPy is a base dependency. `[accel]` remains
+a compatibility alias. The adapter is shipped in the same Python wheel; no compiler or
 platform-specific Grafx wheel is introduced.
 
 Both adapters read and write page format version 1. The selector changes neither catalog nor page
 bytes, creates no capability bit and needs no migration. Pure and NumPy handles may therefore read
 and write the same database concurrently under the unchanged multiwriter/multireader protocol.
 
-There is deliberately no `"auto"` selector. The default is `"pure"`, and an explicit `"numpy"`
+There is deliberately no `"auto"` selector. The default is `"numpy"`, and a `"numpy"`
 request refuses with `GrafxConfigurationError` when NumPy is unavailable. This keeps measurement
 honest and prevents a host from changing execution merely by installing an unrelated package.
 

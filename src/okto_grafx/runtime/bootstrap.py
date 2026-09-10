@@ -407,8 +407,8 @@ def build_codec(context: PortContext) -> object:
         from okto_grafx.adapters.codec_numpy import NumpyPageCodecV1
     except ImportError as failure:
         raise GrafxConfigurationError(
-            "The NumPy page codec needs the optional 'accel' extra; install "
-            "okto-grafx[accel] or configure codec='pure'.",
+            "The NumPy page codec needs the base NumPy dependency; reinstall "
+            "okto-grafx (the accel alias is also supported) or configure codec='pure'.",
             field="codec",
             value=selector,
         ) from failure
@@ -447,12 +447,12 @@ def build_vector_math(context: PortContext) -> object:
     """Build the vector math adapter a configuration selects (C9, SPEC-VEC FR-7, A52).
 
     ``"pure"`` and ``"auto"`` both bind the pure oracle, and that is deliberate. SPEC-VEC FR-7
-    describes the accelerator as *selected by configuration*, TR-6 and IR-2 put numpy in the
-    optional ``[accel]`` extra, and the two adapters agree only to a stated tolerance -- so a
+    describes the accelerator as *selected by configuration*. NumPy is now a base dependency,
+    and the two adapters agree only to a stated tolerance -- so a
     selector that silently bound whichever adapter happened to be installed would make the
     ranking of a query depend on the machine it ran on. ``"auto"`` therefore means "let the
     composition root choose", and the composition root chooses the answer that is the same
-    everywhere. ``"numpy"`` binds the accelerator and refuses when the extra is not installed,
+    everywhere. The default ``"numpy"`` binds the accelerator and refuses when NumPy is missing,
     rather than falling back to something the caller did not ask for.
     """
     selector = context.config.vector_math
@@ -462,8 +462,8 @@ def build_vector_math(context: PortContext) -> object:
         from okto_grafx.adapters.vectormath_numpy import NumpyVectorMath
     except ImportError as failure:
         raise GrafxConfigurationError(
-            "The numpy vector math adapter needs the optional 'accel' extra; install "
-            "okto-grafx[accel] or configure vector_math='pure'.",
+            "The numpy vector math adapter needs the base NumPy dependency; reinstall "
+            "okto-grafx (the accel alias is also supported) or configure vector_math='pure'.",
             field="vector_math",
             value=selector,
         ) from failure
@@ -510,8 +510,8 @@ def install_checksum(config: DatabaseConfig) -> str:
     except ImportError as failure:
         if selector == "native":
             raise GrafxConfigurationError(
-                "The native CRC-32C adapter needs a provider from the optional 'accel' extra; "
-                "install okto-grafx[accel] or configure checksum='pure'.",
+                "The native CRC-32C adapter needs the base google-crc32c dependency; "
+                "reinstall okto-grafx (accel alias supported) or configure checksum='pure'.",
                 field="checksum",
                 value=selector,
             ) from failure

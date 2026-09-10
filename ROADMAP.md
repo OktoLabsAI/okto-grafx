@@ -12,6 +12,21 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## Index
 
+September 10, 2026 — `okto-grafx==0.0.5` published on PyPI using the same wheel
+validated and installed in Pulse. See the [publication receipt](docs/reports/PYPI_0_0_5_PUBLICATION.md).
+Publication does not imply a Git merge/tag; the historical baseline above remains
+the last recorded main/tag baseline.
+
+September 10, 2026 — approved 0.0.5 default-acceleration update: NumPy and
+google-crc32c move to base dependencies; `[accel]` remains a compatibility alias.
+New connection codec/vector-math defaults become `numpy`, with explicit pure
+overrides preserved. No persistent format or concurrency/durability change.
+Pulse Community Settings derives these defaults from Grafx; saved overrides
+are preserved. Targeted Windows validation: 574 regression tests, 50 bootstrap
+tests (including mixed pure/NumPy snapshots and durable reopen), and 370 initial
+configuration/codec/vector/packaging checks passed; these overlapping batches are
+not a full release-wide regression. See [configuration](docs/CONFIGURATION.md).
+
 - [Rules and status vocabulary](#rules-and-status-vocabulary)
 - [Current delivery boundary](#current-delivery-boundary)
 - [Approved continuation after a4dd85a](#approved-continuation-after-a4dd85a)
@@ -67,6 +82,8 @@ reopen completed work, authorize production data changes or imply release approv
 | DOC-1 | Implemented in this documentation refactor | One README entry point, public API/configuration/query/operations references, measured-performance table, one roadmap and a preserved source archive. Links, examples, API/config field coverage and preservation hashes are checked; [validation receipt](docs/reports/DOCUMENTATION_REFACTOR_2026_09_08.md). |
 | CAP-1B | Implemented checkpoint | `6b5163e`: native journal preflight is connected to page application/checkpoint; UUID, activation/COMMIT coverage, target/resident LSN and file extents validated. 2,433 tests / 77.27 s recorded; no new typing diagnostics in the isolated comparison. This is recovery correctness, not a latency benchmark. |
 | GX-CAP-1 remainder | Implemented and locally validated in 0.0.5 development | Metadata-at-begin/retry, qualified lookup/paging, full journal verification, metrics and coordinated transfer/restore/fork identity semantics. [Consumer contract](docs/COMMIT_HISTORY.md), [acceptance evidence and limits](docs/reports/V005_N3_N4_ACCEPTANCE.md). Opt-in activation is not a production rollout or release. |
+| PULSE-005 candidate | Local validation passed; product evolution paused by user | `8c3f6f2`: one complete Windows/Python 3.13 regression passed (16,228 passed, 18 POSIX skips, zero failures), plus clean wheel/sdist builds and isolated installed consumption. [Receipt and D: storage-latency caveat](docs/reports/V005_PRE_PULSE_VALIDATION.md). Next step is controlled Pulse installation/testing with the exact validated wheel and `[accel]`, not more Grafx capability work. No live installation, data operation or publication has occurred in this validation. |
+| PULSE-005 adoption | First Community batch installed; broader adoption pending | Exact candidate installed with `[accel]` in both local Pulse environments; bounded Board readers, scoped vector reads and the complete 0.0.5 Settings catalog. 350 backend + 20 UI tests passed, frontend rebuilt and isolated installed-consumer smoke passed. Core contracts remain neutral; no real-data backfill/consolidation, no publication. [Checkpoint and remaining scope](docs/reports/PULSE_V005_ADOPTION_CHECKPOINT.md). |
 | PULSE-BENCH | Reserved workload | Latest recorded authorized run consumed one spec; 19 remain reserved. Do not consolidate more, redrive, rebuild or reset data to improve this document. New live runs need a deliberate workload decision. |
 
 ## Search and resumable-transfer follow-up
