@@ -22,6 +22,8 @@ exists to forbid.
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.entity_scalars import ENTITY_SCALARS
+
 from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_arity
 
 from collections.abc import Iterator
@@ -301,6 +303,11 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
     nothing at all.
     """
     for relationship in _relationships_of(query):
+        if type(relationship.upper_bound_omitted) is not bool:
+            return (
+                "An omitted upper bound requires a written range and the execution ceiling.",
+                "upper_bound_omitted",
+            )
         if type(relationship.hop_range_written) is not bool:
             return (
                 "A relationship records whether a hop range was written as a boolean.",
@@ -327,6 +334,10 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
                 f"{MAX_TRAVERSAL_HOPS}, and starts at or below where it ends.",
                 "hops",
             )
+        if relationship.upper_bound_omitted and (
+            not relationship.hop_range_written or relationship.max_hops != MAX_TRAVERSAL_HOPS
+        ):
+            return ("An omitted upper bound requires the execution ceiling.", "upper_bound_omitted")
         if not relationship.hop_range_written and (
             relationship.min_hops != 1 or relationship.max_hops != 1
         ):
@@ -865,7 +876,7 @@ def named_path_refusal(query: Query) -> tuple[str, str] | None:
                 continue
             if not _is_written_path_name(pattern.variable):
                 return "A path needs a parser-compatible name.", "path"
-            if not pattern.relationships or len(pattern.nodes) != len(pattern.relationships) + 1:
+            if len(pattern.nodes) != len(pattern.relationships) + 1:
                 return "Named capture requires alternating nodes and relationship segments.", pattern.variable
             for node in pattern.nodes:
                 if (node.variable is not None and type(node.variable) is not str) or node.variable == pattern.variable:
@@ -1473,7 +1484,7 @@ class _Analyzer:
     def _check_call(self, call: FunctionCall, *, where: str) -> None:
         """Check one function call: aggregate nesting, the star form and the two extensions."""
         name = call.name.upper()
-        if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
+        if name in ENTITY_SCALARS or name in ("LENGTH", "NODES", "RELATIONSHIPS"):
             self._check_positional_call(call, arguments=1)
             return
         if name in NATIVE_SCALARS:

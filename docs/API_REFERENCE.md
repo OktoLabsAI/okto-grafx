@@ -2,7 +2,31 @@
 
 [Documentation index](README.md) · [Integration](INTEGRATION.md) · [Query types](QUERY_LANGUAGE.md)
 
+Typed omitted-upper traversals preserve `RelationshipPattern.upper_bound_omitted`
+and the matching `TraverseRelationship` plan flag. The numeric upper count is the
+fixed 30-hop resource ceiling, not a result-range promise. EXPLAIN retains
+`hops="n.."` and reports `max_traversal_hops=30`. A valid further extension raises
+`GrafxQueryBudgetExceeded` with `field="max_traversal_hops"`, `limit=30`,
+`observed=31`. Explicit ranges retain their requested stopping point. Streaming
+cursor exhaustion is required to establish completeness; closing early or LIMIT
+does not certify unexplored tails. See [query semantics](QUERY_LANGUAGE.md).
+
 ## Entry points and supported imports
+
+Native query functions `properties(value)`, `labels(node)` and `type(relationship)`
+return detached maps, singleton label tuples and physical table-name strings;
+NULL propagates. They consume query bindings, not external writable DTO handles.
+`properties()` excludes internal endpoints and NULL-valued entity columns, but
+preserves explicit NULLs in input maps. Type errors carry planning phase when
+statically known and execution phase when discovered during invocation. See the
+[entity scalar contract](QUERY_LANGUAGE.md#native-entity-scalar-consumption).
+
+`MATCH p=(n)` publishes the same detached `PathValue` as a zero-hop traversal:
+one native node, an empty relationship tuple and length zero. EXPLAIN exposes
+`CaptureNodePath(source, path)` above the ordinary node access plan. The public
+plan is independently cloned under the closed built-in operator grammar; neither
+the DTO nor that plan retains live transaction authority. See
+[node-path consumption](QUERY_LANGUAGE.md) and [entity ownership](ENTITY_VALUES.md).
 
 The 0.0.6 development result contract now returns `NodeValue`,
 `RelationshipValue` and typed bounded-walk `PathValue` from native `execute`/cursors,

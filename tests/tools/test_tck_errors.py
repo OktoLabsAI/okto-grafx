@@ -132,3 +132,29 @@ def test_path_mapping_requires_complete_native_evidence(overrides):
 
     details = {"field": "function", "value": "LENGTH", "reason": "path_argument_type", "query_phase": "planning"}
     assert native_error(GrafxPlanError("Path refusal", **(details | overrides))).phase == "unknown"
+
+
+@pytest.mark.parametrize("function", ["properties", "labels", "type"])
+@pytest.mark.parametrize("query,phase,error_type,detail", [
+    ("RETURN {function}(1)", "compile time", "SyntaxError", "InvalidArgumentType"),
+    ("UNWIND [null,1] AS value RETURN {function}(value)", "runtime", "TypeError", "InvalidArgumentValue"),
+])
+def test_entity_mapper_uses_native_phase_evidence(function, query, phase, error_type, detail):
+    backend = NativeScenarioBackend()
+    try:
+        backend.admit({"steps": []})
+        observed = backend.execute(query.format(function=function), {}, control=False)
+        assert (observed.error.type, observed.error.phase, observed.error.detail) == (error_type, phase, detail)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"query_phase": None}, {"field": "operator"}, {"value": "OTHER"}, {"reason": "other"},
+])
+def test_entity_mapping_requires_complete_native_evidence(overrides):
+    from okto_grafx.errors import GrafxPlanError
+    from tools.tck_errors import native_error
+
+    details = {"field": "function", "value": "PROPERTIES", "reason": "entity_function_argument_type", "query_phase": "execution"}
+    assert native_error(GrafxPlanError("Entity refusal", **(details | overrides))).phase == "unknown"

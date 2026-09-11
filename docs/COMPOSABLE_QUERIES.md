@@ -9,6 +9,13 @@ regression and affected Pulse migration tests passed; see the
 
 ## Clause order and scope
 
+Native `properties()`, `labels()` and `type()` consume entity bindings through
+aliases, returning subqueries, UNION, path components, list selection and CASE.
+Unknown entity elements remain part of heterogeneous list typing; they are not
+discarded to infer a misleading primitive type. Dynamic arguments are checked
+at invocation, preserving lazy CASE/zero-row behavior and statement rollback.
+See [signatures and NULL rules](QUERY_LANGUAGE.md#native-entity-scalar-consumption).
+
 Clauses execute in written order. `WITH` projects a new scope: omitted names are
 not available later. Its expressions all read the incoming scope, so aliases do
 not become visible to neighboring expressions in the same projection. Reusing a
@@ -189,7 +196,12 @@ WITH/UNWIND, DISTINCT/order/windows and typed OPTIONAL MATCH; optional failure
 extends the path as NULL. Within one MATCH, all relationship occurrences must be
 disjoint; separate MATCH clauses may reuse relationships. Typed zero-length and
 multiple captured segments concatenate without duplicating junction nodes.
-Untyped/type-alternative capture and the omitted-upper-bound policy remain pending.
+Untyped/type-alternative capture remains pending. Omitted upper bounds preserve
+omission. Node-only capture (`MATCH p=(n)`) is supported without a relationship
+schema, including polymorphic/anonymous nodes, optional null extension, returning
+subqueries and UNION/aggregate composition. Omitted-upper traversals retain
+omission and refuse a valid continuation beyond the 30-hop resource ceiling,
+instead of silently truncating at 20. See [traversal semantics](QUERY_LANGUAGE.md).
 All branches
 share one snapshot and existing resource limits, including the alias-expanded
 typing-depth ceiling. Column-name mismatches fail before execution with

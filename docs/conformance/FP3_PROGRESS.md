@@ -503,14 +503,200 @@ Documentation validation, Ruff on changed Python files and `git diff --check`
 also passed. This focused checkpoint does not replace full-profile conformance
 or the outstanding paired Pulse qualification.
 
+## Omitted-upper traversal resource contract (2026-09-11)
+
+This increment supersedes the implicit-20 limitation recorded above. Parser/AST
+and plan now preserve `upper_bound_omitted` for `*`, `*..`, `*n..` and `*0..`.
+The existing fixed 30-hop limit is an execution ceiling, not a substituted
+syntactic bound. EXPLAIN distinguishes omission from an explicit `*1..30`.
+The unused `DEFAULT_TRAVERSAL_HOPS` constant was removed; no legacy switch or new
+connection knob was introduced. The new exact-boolean field is checked at
+analysis, supplied-analysis planning and execution boundaries.
+
+At the ceiling, demand for continued enumeration probes one valid unused edge
+and its visible landing under the original reader snapshot or current owner
+overlay. A possible continuation raises `GrafxQueryBudgetExceeded` with
+`field=max_traversal_hops`, `limit=30`, `observed=31`. A dead end or only already-used
+reverse edges can finish. The probe shares expansion/path quotas and cancellation;
+smaller quotas may fail first. Filtering does not waive traversal work. Explicit
+LIMIT/cursor close may stop without probing unrequested tails; a blocking sort may
+need complete input and still fail. All probe/stack iterators close on failure.
+An error after range-driven SETs rolls back that statement, preserving earlier
+successful statements under the existing transaction contract.
+
+Evidence from the unchanged production implementation across these runs:
+
+| Receipt in `.grafx-tmp/` | Passed | Failures/errors/skips | Seconds | Coverage |
+| --- | ---: | --- | ---: | --- |
+| `fp3-omitted-upper-regression.xml` | 479 | 0/0/0 | 79.190 | Native/composed/generic/named paths, AST, parser, original implicit-bound guards, cancellation/deadlines and TCK error contracts |
+| `fp3-omitted-upper-safety.xml` | 92 | 0/0/0 | 47.136 | Batched/vector-free landings, cursors, query budgets, composed-write conflicts and native entity UNION |
+| `fp3-omitted-upper-boundaries.xml` | 64 | 0/0/0 | 15.974 | Expanded omitted-range cases, incoming/undirected continuation, per-query probe quotas and hostile supplied-analysis admission |
+
+These selections overlap; their counts are not a unique-test or full-profile
+total. Boundary tests were added after the 479-test selection; they are covered by
+the final 64-test receipt. Initial focused selection: 214 passing tests in 12.469 s.
+Independent chain expectations prove 31-edge failure, exact-30 completion,
+25-through-30 outputs, relationship uniqueness, snapshot retention across a writer
+commit, owner deletion, LIMIT versus ORDER BY, cursor cancellation/cleanup and
+rollback after instrumented observed writes. No expected-failure marker was added.
+
+SHA-256, in table order:
+
+- `64b99899c2013c56bcb114fa7387cbf0b6fbbdb49864f4cfa3f76c4202438690`
+- `c08847f5123295e0039b5a59aa9b24e9dcd46146ed81d61cf9690dc85981e604`
+- `0d9e5ed3bacdbdb203c02899a5a629c22ee892021eb00ce86cf33b5877a50df5`
+
+Consumer mapping, inspected read-only: Pulse Community integration worktree
+`a070e09`, `grafx_cypher_executor.py::_prepare`, still calls
+`auto_bound_var_length_path(cleaned, MAX_TRAVERSAL_DEPTH)` before native execution.
+Pulse Core `33e3a5f`, `tier_power.py`, defines that application policy at 20.
+Those explicit rewritten queries retain their requested bound under this change;
+they do not exercise native omission. Review the application policy during the
+already-required paired Pulse migration; no engine-specific Core condition or
+production installation change was made here. These reads are not Pulse runtime
+acceptance evidence.
+
+Public query/API/configuration/entity/composition/compatibility/comparison docs and
+ROADMAP were updated. Documentation validator, changed-file Ruff and whitespace
+checks pass. No new TCK full-profile result, package qualification, competitor
+parity or Pulse integration pass is claimed from this increment.
+
+## Node-only named capture (2026-09-11)
+
+`MATCH p=(n:Label)`, `MATCH p=(n)` and `MATCH p=()` now capture a native
+zero-edge path without requiring relationship schema. `CaptureNodePath` consumes
+the ordinary node plan (including index seeks), preserves qualified identity and
+snapshot, and shares path/row/cancellation budgets. It opens no new transaction.
+NULL/missing anchors are not fabricated paths; OPTIONAL null-extends normally.
+Aliases, WITH, returning/importing subqueries, UNION/ALL/DISTINCT, nested aggregate
+results, pending-owner observations and cursors are covered. Configured memory
+variants do not imply every small fixture actually spills.
+
+The operator is explicitly admitted to the closed public-plan grammar. Tests
+materialize independent plan clones and mutate one without affecting another or
+later execution. The initial 35-test selection had 31 failures because that
+registry entry was missing; it was corrected, not waived.
+
+A follow-up write probe found that after SET the detached path showed the new
+property but `nodes(p)[0].mark` still read the old internal binding.
+`_write_assignments` now refreshes live path components with the updated versions
+used for direct aliases. Tests cover node-only and one-edge paths plus observed
+writes before late failure, preserving earlier successful statements on rollback.
+A preliminary probe also encountered unimplemented `properties()`; that function
+remains assigned below. Passing direct-access tests do not claim function support.
+No original TCK query/expectation was rewritten.
+
+| Receipt in `.grafx-tmp/` | Passed | Failures/errors/skips | Seconds | Scope |
+| --- | ---: | --- | ---: | --- |
+| `fp3-node-path-contract.xml` | 147 | 0/0/0 | 45.664 | Node, named and composed captures after public-plan registration |
+| `fp3-node-path-safety.xml` | 188 | 0/0/0 | 51.349 | Capture, variable/omitted ranges, quotas, cursors, cancellation, AST and sealed plans; before SET fix |
+| `fp3-node-path-write-final.xml` | 94 | 0/0/0 | 38.187 | Final node tests including SET observation, composed-write conflicts, pending relationship overlays and entity UNION |
+| `fp3-node-path-spill-final.xml` | 63 | 0/0/0 | 23.896 | Final node tests plus existing blocking-operator spill regression; instrumented physical spill of 200 node paths |
+
+Counts overlap; these are not full-profile totals. SHA-256 in table order:
+
+- `e64a22a1c442f7706cfeb129895c21124003288149a3cb65a21c3e6236fdb904`
+- `8172598962530a9f343794cca84a4d19946dfb7034b37e3eba6cec146e429c92`
+- `14d5bc55cd9c88a9677925ef207432aea7412b7384cfcb6e9733eb9ee74aabc6`
+- `3414b6b38f4a17f4d6f6bb1559f91cc1af1f272a5ca39cc65266d615fafc07dd`
+
+The final spill test instruments actual `_Sorter._write_pair` writes, requires
+more than 8,192 payload bytes to have reached disk, then independently verifies
+200 descending ordinals, native one-node/zero-edge paths, one qualified identity
+and no remaining reader. This is actual spill evidence, unlike budget
+configuration alone. No production implementation changed between the final
+write and spill runs.
+
+Query/API/entity/configuration/composition/comparison docs and ROADMAP reflect
+this increment. No new knob, storage format, WAL policy, installed Pulse change,
+release or full-profile qualification is implied. The complete plan remains active.
+
+## Native entity scalar family (2026-09-11)
+
+Implemented `properties(node|relationship|map|NULL)`, `labels(node|NULL)` and
+`type(relationship|NULL)` in the native analyzer, signature/type inference,
+parameter/result metadata and executor. `properties(entity)` excludes physical
+edge endpoints and NULL-valued columns; user `_ID`/`_SRC` keys remain properties.
+Input maps retain explicit NULL entries. Public results are owned maps, singleton
+label tuples and physical table-name strings. No callback registry, adapter query
+rewrite, new option or storage format is required.
+
+The first tests found missing entity-kind admission and lost UNION export typing;
+both were corrected. Later adversarial tests exposed premature runtime-parameter
+refusal in an unselected CASE arm and incomplete typing of entity/scalar lists.
+Result type inference is now separate from runtime invocation checks, and an
+unknown entity element cannot be discarded to invent a homogeneous primitive list.
+Tests cover selected/unselected CASE, zero input rows, list selection, polymorphic
+nodes, path components, imported/UNION entities and dynamic invalid types.
+
+Property materialization shares the revision-cached owner overlay, avoiding a new
+intent scan per entity. Tests prove own-SET values, removal of NULL properties,
+pending nodes/relationships, unchanged independent readers, vector landing
+materialization and cursor snapshot retention. A late invalid dynamic argument
+after instrumented observed writes rolls back the whole statement while keeping
+earlier successful statements. Mutating a returned parameter-derived map cannot
+mutate the supplied parameter. New typed native error mappings require the exact
+function/reason/phase fields and do not consult expected TCK answers.
+
+| Receipt in `.grafx-tmp/` | Passed | Failures/errors/skips | Seconds | Scope |
+| --- | ---: | --- | ---: | --- |
+| `fp3-entity-scalars-final.xml` | 238 | 0/0/0 | 65.668 | Functions, native node paths/entity UNION, vector landings, read control and error mapping; before final heterogeneous-list inference fix |
+| `fp3-entity-scalars-final-regression.xml` | 630 | 0/0/0 | 82.892 | Final function cases plus analysis, query engine, list iteration, dispatch, spill, deferred projection, entity UNION and error mappings |
+
+Overlapping selections are not a unique-test/full-profile count. SHA-256 in order:
+
+- `7e4511ef3d6f39fa110a09447de5fff3a268917ee21ed5fdd744c9f8f8f225e1`
+- `7b5983c6076fdb5907d4eba95ddb0685812a24a454dbf1e49ac45c93d5072534`
+
+Final pinned TCK `expressions/graph` selection: **11 original passed, 1
+schema-adapted passed, 11 failed, 38 selected not-run**; 3,836 cases outside the
+selection. The 38 not-run fixtures require the recorded unlabeled/multilabel model
+review; they are not counted as passes. Specifically Graph9 (`properties`) has
+four original passes, one schema-adapted pass, one failure and one not-run. The
+remaining Graph9 NULL scenario references absent `DoesNotExist`/`NOT_THERE` tables:
+a read-only reproduction in the temporary native backend confirms schema `()`
+and `GrafxPlanError(field=label,value=DoesNotExist)` before function invocation.
+Absent-table OPTIONAL semantics remain assigned below; no reference query,
+expected result or frozen exclusion was changed. This is not full graph-function
+or Cypher conformance. Receipt `fp3-entity-scalars-tck-final.json`, SHA-256
+`fe7a50e612240ef6c693be5420b8f9ed5b9ddbf9e987f0235f7d4d74a6579f89`.
+
+Public query/API/configuration/entity/composition/comparison docs and ROADMAP now
+describe signatures, sparse property maps, lazy dynamic errors, isolation and
+physical versus logical names. No production Pulse installation or Core-specific
+dependency was changed. Documentation validation, changed-file Ruff and whitespace
+checks pass; the complete functional-parity plan remains active.
+
+## Publication checkpoint: absent-table reads in progress
+
+The development checkpoint also preserves the initial absent-table MATCH/OPTIONAL
+planner work and `ZeroHopRelationship` operator. An impossible positive-length
+pattern consumes its upstream input without fabricating catalog tables; an
+absent relationship type can still admit a zero-length range. This work is
+**not qualified for acceptance**: focused missing-schema, type/scope, zero-hop,
+public-plan, schema-cache and rollback tests remain pending. The historical TCK
+receipt above predates this work and must not be treated as its validation.
+
+Pre-commit regression of entity scalars, node paths, omitted bounds, parser and
+TCK error mapping: **375 passed, 0 failures/errors/skips in 58.376 s**.
+Receipt `.grafx-tmp/fp3-commit-checkpoint.xml`, SHA-256
+`d0aae278e995658762fccb9dbcb5ca8660bef7b86ee47dffa7d6ef30fab336f8`.
+This selection does not replace the pending absent-table tests or full parity
+regression. Documentation, changed-file Ruff and whitespace checks also pass.
+
+This checkpoint is on Grafx `feature/v0.0.6`. Pulse Community and Core remain
+published on `feature/v0.3.3`; no production installation or release is included.
+
 ## Remaining mandatory FP-3 work
 
-- Complete node-only capture, type alternatives and broader path expressions;
+- Complete type alternatives and broader path expressions;
   complete all hostile/public/budget and entity observation combinations.
+- Remaining entity-dependent scalar cases and absent-table OPTIONAL semantics
+  required by the FP-3 profile; the native function family alone is not full
+  upstream/profile qualification (including Graph9 NULL on absent tables).
 - Broader aggregate/spill and subsequent-clause combinations beyond the verified
   entity UNION cases; incompatible/missing-property and schema combinations.
-- Untyped/ambiguous relationship traversal and original fixture compatibility;
-  omitted-upper-bound semantics without silently truncating complete enumeration.
+- Untyped/ambiguous relationship traversal and original fixture compatibility.
 - Cross-table index access when compatible keys can anchor new polymorphic
   bindings, without skipping possible results or silently truncating scans.
 - All required original/supplemental scenarios, package regression and affected

@@ -32,6 +32,8 @@ Each is a refusal with a message that names the rule, never a silent partial ans
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.entity_scalars import ENTITY_SCALARS, entity_scalar_type
+
 from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_type
 from okto_grafx.domain.query.extensions import TabularProcedure
 
@@ -123,6 +125,8 @@ from okto_grafx.domain.query.plan import (
     CreatedNode,
     CreatedRelationship,
     CreateIndex,
+    CaptureNodePath,
+    ZeroHopRelationship,
     CreateNodeTable,
     CreateRelationships,
     CreateRelTable,
@@ -1312,7 +1316,10 @@ class _Planner:
                 pipeline = self._updating_clause(pipeline, clause)
                 pending_write = True
                 continue
-            if clause.optional and correlated and not any(pattern.variable in self.capture_paths for pattern in clause.patterns):
+            if clause.optional and correlated and not any(
+                pattern.variable in self.capture_paths or self._has_absent_table(pattern)
+                for pattern in clause.patterns
+            ):
                 pipeline = self._correlated_optional(pipeline, clause)
                 continue
             if clause.optional:
@@ -1480,7 +1487,7 @@ class _Planner:
                     binding = self.analysis.binding(node.arguments[0].name)
                     if binding is not None and binding.entity == "path":
                         raise GrafxPlanError("Use length() for paths; size() accepts strings/lists.", field="function", value=node.name)
-                if node.name.upper() in NATIVE_SCALARS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:
+                if node.name.upper() in NATIVE_SCALARS | ENTITY_SCALARS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:
                     self._pulse_expression_type(node, owner=node.name)
                 if node.name.upper() == "UDF":
                     if (not node.arguments or type(node.arguments[0]) is not Literal
@@ -1741,6 +1748,8 @@ class _Planner:
         if isinstance(expression, Variable):
             if expression.name in self.bound_paths:
                 return None  # Native path, never a scalar column or writable handle.
+            if expression.name in self.tables or expression.name in self.polymorphic_variables:
+                return None  # Qualified entities are not stored primitive ValueTypes.
             if expression.name in self.binding_types:
                 return self.binding_types[expression.name]
             definition = self.alias_definitions.get(expression.name)
@@ -1858,6 +1867,28 @@ class _Planner:
             )
         if isinstance(expression, FunctionCall):
             name = expression.name.upper()
+            if name in ENTITY_SCALARS:
+                argument = expression.arguments[0]
+                kind = None
+                value_type = None
+                if isinstance(argument, Variable):
+                    binding = self.analysis.binding(argument.name)
+                    if argument.name in self.bound_paths:
+                        kind = "path"
+                    elif argument.name in self.multi_hop_variables:
+                        value_type = ValueType.LIST
+                    elif argument.name in self.tables:
+                        kind = "relationship" if self.tables[argument.name].kind == "rel" else "node"
+                    elif argument.name in self.polymorphic_variables:
+                        kinds = {table.kind for table in self.polymorphic_tables.get(argument.name, ())}
+                        kind = "relationship" if kinds == {"rel"} else "node" if kinds == {"node"} else None
+                    elif binding is not None and binding.entity in {"node", "relationship", "path"}:
+                        kind = binding.entity
+                if kind is None and value_type is None and not (
+                    isinstance(argument, Variable) and argument.name in self.polymorphic_variables
+                ):
+                    value_type = self._pulse_expression_type(argument, owner=owner)
+                return entity_scalar_type(name, value_type, entity_kind=kind)
             if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
                 argument = expression.arguments[0]
                 if not isinstance(argument, Parameter):
@@ -1948,6 +1979,8 @@ class _Planner:
                     self._pulse_expression_type(element, owner=owner)
                     for element in subject.elements
                 )
+                if any(value_type is None for value_type in element_types):
+                    return None  # Unknown/entity elements cannot be erased from the union.
                 concrete = tuple(
                     value_type
                     for value_type in element_types
@@ -1993,7 +2026,10 @@ class _Planner:
         if not isinstance(source, ListExpression) or not source.elements:
             return None
         element_types = tuple(
-            self._pulse_expression_type(element, owner=owner)
+            None if isinstance(element, Variable) and (
+                element.name in self.tables or element.name in self.polymorphic_variables
+                or element.name in self.bound_paths
+            ) else self._pulse_expression_type(element, owner=owner)
             for element in source.elements
         )
         if any(value_type is None for value_type in element_types):
@@ -2238,10 +2274,44 @@ class _Planner:
 
     # --- patterns ----------------------------------------------------------------------------
 
+    def _has_absent_table(self, pattern: PatternPath) -> bool:
+        return any(not self.catalog.has_table(label) for node in pattern.nodes for label in node.labels) or any(
+            edge.types and all(not self.catalog.has_table(label) for label in edge.types)
+            for edge in pattern.relationships
+        )
+
+    def _empty_read_pattern(self, pipeline: PlanNode, pattern: PatternPath) -> PlanNode:
+        """Keep symbolic bindings for OPTIONAL/type checks; never fabricate tables."""
+        for entity in (*pattern.nodes, *pattern.relationships):
+            name = entity.variable
+            if name is None or self._matched_row(name):
+                continue
+            labels = entity.labels if isinstance(entity, NodePattern) else entity.types
+            if len(labels) == 1 and self.catalog.has_table(labels[0]):
+                table = self.catalog.table(labels[0])
+                expected = "node" if isinstance(entity, NodePattern) else "rel"
+                if table.kind != expected:
+                    raise GrafxPlanError("The pattern names the wrong table kind.", field="label", value=labels[0])
+                self.tables[name] = table
+            else:
+                self.polymorphic_variables.add(name)
+                self.polymorphic_tables[name] = ()
+            if isinstance(entity, RelationshipPattern) and entity.hop_range_written:
+                self.multi_hop_variables.add(name)
+        if pattern.variable in self.capture_paths:
+            self.bound_paths.add(pattern.variable)
+        # Consume upstream rows/effects, but do not scan nodes for an impossible pattern.
+        return FilterRows(child=pipeline, predicate=Literal(False))
+
     def _pattern(
         self, pipeline: PlanNode, pattern: PatternPath, terms: list[Expression]
     ) -> tuple[PlanNode, list[Expression]]:
         """Plan one connected path, taking index seeks from the predicate where it can."""
+        if (any(not self.catalog.has_table(label) for node in pattern.nodes for label in node.labels)
+                or any(edge.min_hops > 0 and edge.types
+                       and all(not self.catalog.has_table(label) for label in edge.types)
+                       for edge in pattern.relationships)):
+            return self._empty_read_pattern(pipeline, pattern), terms
         capturing = pattern.variable in self.capture_paths
         if capturing:
             self.path_projection = pattern
@@ -2284,6 +2354,8 @@ class _Planner:
                     self._property_terms(source, target_pattern.properties)
                 )
         if capturing:
+            if not pattern.relationships:
+                pipeline = CaptureNodePath(child=pipeline, source=source, path=pattern.variable)
             self.bound_paths.add(pattern.variable)
         return pipeline, terms
 
@@ -2803,6 +2875,26 @@ class _Planner:
                 field="types",
                 value=relationship.describe(),
             )
+        if not self.catalog.has_table(relationship.types[0]):
+            if relationship.min_hops != 0:
+                raise GrafxPlanError("A positive absent-table traversal must have an empty read plan.", field="plan")
+            target = target_pattern.variable or self._anonymous()
+            bound = self._matched_row(target) or target in self.binding_types
+            target_table = self._node_table_of(target_pattern) if target_pattern.labels else self.tables.get(target)
+            if not bound:
+                if target_table is not None:
+                    self.tables[target] = target_table
+                else:
+                    self.polymorphic_variables.add(target)
+                    self.polymorphic_tables[target] = self.polymorphic_tables.get(source, (
+                        (self.tables[source],) if source in self.tables else self._node_tables()))
+            if relationship.variable is not None:
+                self.multi_hop_variables.add(relationship.variable)
+                self.binding_types[relationship.variable] = ValueType.LIST
+                self.polymorphic_variables.add(relationship.variable)
+                self.polymorphic_tables[relationship.variable] = ()
+            return ZeroHopRelationship(pipeline, source, target, relationship.variable,
+                                       target_table, bound, path_variable, path_append), target
         table = self._relationship_table(relationship)
         if path_variable is not None and not relationship.variable_length:
             self._require_path_projection_schema(table)
@@ -2874,6 +2966,7 @@ class _Planner:
                 path_variable=path_variable,
                 path_append=path_append,
                 relationship_list=relationship.hop_range_written,
+                upper_bound_omitted=relationship.upper_bound_omitted,
             ),
             target_variable,
         )

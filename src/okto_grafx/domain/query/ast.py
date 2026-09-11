@@ -486,6 +486,9 @@ class RelationshipPattern:
     every existing constructor working, and this field never changes what a pattern matches.
     """
 
+    upper_bound_omitted: bool = False
+    """The upper count is an execution ceiling, not a syntactic result bound."""
+
     @property
     def variable_length(self) -> bool:
         """Return True when this relationship may match more than one hop."""
@@ -497,7 +500,8 @@ class RelationshipPattern:
         if self.types:
             inner += ":" + "|".join(self.types)
         if self.variable_length or self.hop_range_written:
-            inner += f"*{self.min_hops}..{self.max_hops}"
+            upper = "" if self.upper_bound_omitted else str(self.max_hops)
+            inner += f"*{self.min_hops}..{upper}"
         if self.properties is not None:
             inner += f" {self.properties.describe()}"
         body = f"[{inner}]"

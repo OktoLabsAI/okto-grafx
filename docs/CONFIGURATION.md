@@ -1,5 +1,11 @@
 # Configuration reference
 
+`properties()`, `labels()` and `type()` add no options. `properties()` demands all
+user property values (including vectors) under existing query value, memory, row
+and cancellation limits. Resource refusal does not return a partial property map.
+These functions share the current snapshot and transaction authority. See
+[native entity functions](QUERY_LANGUAGE.md#native-entity-scalar-consumption).
+
 Native node/relationship result DTOs introduce no new setting or legacy-output
 toggle. `max_query_value_characters` still governs string admission, including
 materialized entity properties; conversion failure does not commit partial writes.
@@ -10,8 +16,11 @@ UNION outputs. Entity aggregate values are charged for their encoded properties,
 not just their record IDs. The fixed alias-expanded expression-depth bound still
 applies to UNION typing; it introduces no new setting. See [entity results](ENTITY_VALUES.md).
 
-Native `PathValue` uses the same materialization and spill limits. Its owned
-representation admits at most 1,024 nodes and exactly one fewer relationships;
+Native `PathValue` uses the same materialization and spill limits. A
+node-only capture (`MATCH p=(n)`) adds no setting: each demanded capture consumes
+one `max_traversal_paths` unit, zero edge expansions, and shares cancellation and
+row/value/spill limits. Explicit LIMIT or cursor close stops unused input.
+Its owned representation admits at most 1,024 nodes and exactly one fewer relationships;
 typed explicit ranges accept zero through 30 hops per segment and can concatenate
 segments. Complete general path enumeration is not enabled by constructing the DTO.
 `nodes()`/`relationships()` return entity
@@ -21,8 +30,11 @@ configuration switch. They share traversal, cancellation and expression-work
 budgets, including list comparisons between variable-hop segments. Structural
 AST validation is independent of query syntax admission: mutable inventories,
 foreign AST subclasses and cycles are refused, not enabled by any compatibility flag.
-The legacy default of 20 for omitted syntactic upper bounds remains an assigned
-FP-3 limitation; it is not a proof of complete path enumeration. Depth-first
+Omitted upper bounds have a fixed 30-hop resource ceiling, not an implicit result
+bound. A valid extension beyond it raises `query_budget_exceeded` with
+`field=max_traversal_hops`; existing expansion/path quotas may fail first.
+No new connection option or legacy-20 switch is introduced. See
+[traversal semantics](QUERY_LANGUAGE.md) for LIMIT/cursor behavior. Depth-first
 streaming removes breadth-wide path retention. Existing adjacency fallback caches,
 result/spill limits, cancellation and path/expansion quotas still apply.
 

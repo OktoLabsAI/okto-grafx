@@ -2,6 +2,13 @@
 
 ## Reference and scope
 
+FP-3 adds native `properties(node|relationship|map|NULL)`, `labels(node|NULL)` and
+`type(relationship|NULL)`, with typed planning/runtime refusals and own-write
+visibility. Lists of labels are singleton under Grafx's typed table model.
+Original and schema-adapted graph-function TCK outcomes remain separate in
+[FP-3 evidence](conformance/FP3_PROGRESS.md); these functions do not imply support
+for nonexistent table references or arbitrary multi-label storage.
+
 FP-3 now returns qualified `NodeValue`/`RelationshipValue` objects from native
 execute/cursors, including nested values, entity UNION and aggregate/sort/DISTINCT
 spill. This changes
@@ -18,7 +25,12 @@ including path-or-NULL UNION exports. Reverse/undirected walks preserve physical
 endpoint identity. Explicit typed ranges now support zero length, cycles and
 multiple segments with relationship uniqueness, using depth-first streaming.
 Written range variables hold relationship tuples even for `*1..1`.
-Untyped/type-alternative capture and the legacy omitted-upper-bound policy remain pending.
+Untyped/type-alternative capture remains pending. Omitted upper bounds preserve
+omission. Node-only named capture (`MATCH p=(n)`) now produces a native zero-edge
+path with qualified node identity, including polymorphic/optional composition.
+Omitted-upper traversals preserve
+omission and refuse a valid continuation beyond the 30-hop resource ceiling,
+instead of silently truncating at 20. This is not unlimited traversal.
 The original expressions/path diagnostics remain
 in the working evidence rather than being presented as passed.
 

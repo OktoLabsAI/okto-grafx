@@ -235,6 +235,9 @@ not Python coercion of arbitrary objects. Unsupported operators/functions refuse
 | `split(text, separator)`, `string_split(...)` | Two strings, NULL propagates; all empty fields retained; empty separator splits code points; two empty inputs yield one empty string |
 | `size(value)` | One string/list; code-point/element count; null propagates |
 | `label(binding)` | One matched node/relationship; physical table name; null propagates; not a logical Pulse relationship type mapper |
+| `labels(node)` | Native node or NULL; singleton tuple containing its declared table label, or NULL; relationships and paths are not nodes |
+| `type(relationship)` | Native relationship or NULL; physical relationship-table name, or NULL; a written range binds a list, not one relationship |
+| `properties(value)` | Native node/relationship, map or NULL; owned property map or NULL; entity NULL columns are omitted, input-map NULL entries preserved |
 | `timestamp(value)` | Timestamp passthrough, null, or ISO-8601 string normalized to UTC; no zone means UTC; numeric epoch arguments refuse |
 | `similarity(n.embedding, $q, space => 'space')` | Planned vector-search extension, not an arbitrary scalar UDF; literal/bound space, declared vector column and supported query shape required |
 | `udf('app.name', value, ...)` | Optional trusted per-connection scalar registry; literal name, positional exact typed scalars, NULL propagation; [SPI and restrictions](EXTENSIONS_AND_ARROW.md) |
@@ -249,6 +252,38 @@ new query shape. There is no blanket `PROFILE`/arbitrary procedure or Neo4j func
 catalogue. Statistics show selected operators/work, not a comprehensive SQL profiler.
 
 ## OPTIONAL, UNION and traversal boundaries
+
+### Native entity scalar consumption
+
+```cypher
+MATCH p=(a:Person)-[r:Knows]->(b:Person)
+RETURN labels(a), type(r), properties(a), properties(r), properties(nodes(p)[0])
+```
+
+Each function takes exactly one positional argument; no DISTINCT, star or named
+argument form. `properties()` exposes user properties only, never physical edge
+endpoint columns or identity metadata. User properties named `_ID` or `_SRC` remain
+ordinary keys. All stored property values, including vectors, are materialized.
+NULL-valued entity columns represent absent graph properties and are omitted.
+For a supplied map all entries, including explicit NULLs, are preserved. The
+public map is detached: mutation cannot change the graph or a caller's parameter.
+It grants no write authority.
+
+`labels()` returns the single table label supported by this typed model, not
+arbitrary multi-label semantics. `type()` returns a physical name, not a Pulse
+logical relationship name; that mapping belongs to the consumer adapter.
+Aliases, polymorphic nodes, path components, returning subqueries, UNION,
+aggregation and cursors compose normally. NULL input, including OPTIONAL null
+extension, remains NULL rather than an empty map, list or name.
+
+Known invalid argument types fail in planning. Unknown row/parameter types are
+checked when invoked: non-selected CASE arms and zero-row input do not call the
+function. Native errors carry `field=function`, the uppercase function name,
+`reason=entity_function_argument_type` and `query_phase=planning` or `execution`.
+Late execution errors retain whole-statement rollback. Owner-visible SET changes
+are read under the existing transaction; independent readers retain their
+snapshot. Existing value, memory, row and cancellation budgets apply. No new
+connection option or storage format is introduced.
 
 `OPTIONAL MATCH (n:Person) RETURN n.id` produces a null-extended row when no
 candidate qualifies. Typed optional patterns can correlate with incoming values;
@@ -344,9 +379,10 @@ host decimal context or allocate integers proportional to a written exponent.
 These fixed bounds have no new connection option.
 
 Typed traversal supports bounded directions/ranges and preserves relationship
-isomorphism and parallel-edge multiplicity. Omitted upper bound means **20 hops**,
-not infinity; explicit upper bound can reach **30**; invalid/zero/reversed ranges
-refuse. Label-free typed endpoints and untyped relationships have closed forms,
+isomorphism and parallel-edge multiplicity. Explicit upper bounds can reach **30**;
+zero-length ranges are supported; negative/reversed/over-ceiling ranges refuse.
+Omitted upper bounds use the resource-failure policy below.
+Label-free typed endpoints and untyped relationships have closed forms,
 not permission for every arbitrary pattern. Independent traversal expansion/path
 budgets remain authoritative even with LIMIT.
 
@@ -378,6 +414,20 @@ ORDER BY length(p)
 ```
 
 An explicitly bounded typed segment accepts `0 <= minimum <= maximum <= 30`.
+Node-only named patterns also work: `MATCH p=(n:Person) RETURN p` captures one
+matched node with no relationships. `MATCH p=(n)` and `MATCH p=()` enumerate
+node tables under the ordinary typed/polymorphic node rules; no relationship table
+is needed. Inline node properties and WHERE retain normal node access paths,
+including available index seeks. `length(p)=0`, `nodes(p)` has one native node,
+and `relationships(p)` is empty. NULL or unmatched anchors produce no path;
+OPTIONAL may null-extend the result. These captures compose with aliases, WITH,
+returning subqueries, UNION/DISTINCT, aggregates and cursors. Each materialized
+capture consumes one configured traversal-path unit but no edge expansion.
+Unused decorative path names need not materialize a path.
+After SET, direct node/relationship components of a bound path use the refreshed
+versions, so property access through `nodes(p)[0]` agrees with the updated alias
+in that statement. Independent readers retain their own snapshots.
+
 `*0` returns its anchor as a path with one node and no relationships, including
 isolated nodes; the two endpoint variables name that same qualified node. A bound
 target still filters that identity. Zero-length matches need not belong to the
@@ -392,10 +442,26 @@ Depth-first execution streams paths without retaining a breadth-wide frontier;
 it is not a shortest-path ordering guarantee. Use ORDER BY where ordering matters.
 Cursor close/limits stop and close unconsumed expansion iterators.
 
-The legacy omitted-upper-bound policy (`*`, `*n..` → an upper bound of 20) has not
-yet been replaced in this increment. It remains an explicitly assigned FP-3 gap:
-full-profile completion requires budget-governed refusal rather than treating a
-truncated enumeration as complete. Prefer explicit bounds for the current contract.
+Omitting the upper bound (`*`, `*..`, `*n..`, including `*0..`) requests complete
+trail enumeration, not an implicit range of 20. The AST preserves
+`upper_bound_omitted`; EXPLAIN reports `hops: "n.."`, that flag and a fixed
+`max_traversal_hops: 30` resource ceiling. At depth 30 the executor probes for a
+further unused, snapshot-visible relationship and landing node. If one exists,
+it raises `GrafxQueryBudgetExceeded` (`field="max_traversal_hops"`, `limit=30`,
+`observed=31`) instead of returning an apparently complete truncated answer.
+Dead ends and reused-edge-only continuations can finish at the ceiling.
+
+The probe uses the same snapshot, pending-owner overlay, cancellation and
+expansion/path quotas as ordinary traversal. A smaller configured quota may fail
+first. Endpoint/WHERE filters do not exempt work needed to enumerate candidates.
+`*25..` is now legal; an explicit count above 30 still refuses before traversal.
+Write `*1..30` to deliberately restrict results to 30 hops. A streaming `LIMIT`
+or explicit cursor close can stop before complete enumeration/probing is needed;
+ORDER BY or another blocking operator may need full input and still refuse.
+Cursor rows already consumed are a prefix, not a completeness certificate: a
+later fetch can raise the resource error. Statement writes roll back on that
+error while earlier successful statements retain their normal isolation.
+This replaces the previous implicit-20 policy without a compatibility toggle.
 
 Within one MATCH clause, relationship occurrences across its patterns/segments
 must be disjoint, including anonymous relationships and variable-hop segments.

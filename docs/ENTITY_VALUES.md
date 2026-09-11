@@ -94,6 +94,31 @@ option is introduced by this internal model.
 
 ## Paths
 
+`properties()` consumes node/relationship bindings or maps, `labels()` consumes
+nodes, and `type()` consumes relationships. They also accept NULL and may be used
+on native path components. The sparse map from `properties(entity)` omits NULL
+columns, whereas the public entity DTO retains its declared property observation;
+neither API exposes a writable handle. See the
+[function contract](QUERY_LANGUAGE.md#native-entity-scalar-consumption).
+
+SET refreshes live path components as well as direct aliases before subsequent
+expression evaluation; this does not mutate previously detached public DTOs or
+another reader's snapshot.
+
+`MATCH p=(n:Person) RETURN p` captures an existing node as a path with one node
+and no relationships. Unlabelled or anonymous node-only patterns use normal node
+enumeration; equal local IDs in different tables remain distinct paths. Native
+components retain snapshot/pending provenance through aliases, UNION/DISTINCT,
+nested aggregate results and cursor detachment. A missing/NULL anchor is not a
+fabricated zero-node path. See [query examples](QUERY_LANGUAGE.md).
+
+Omitted-upper typed captures share the query's fixed 30-hop resource ceiling:
+a valid unused continuation beyond it raises an explicit budget error, not a
+successful truncated result. The `PathValue` DTO itself does not certify complete
+enumeration; previously consumed cursor rows can precede a later resource error.
+Explicit bounds, snapshot identity and component ordering remain unchanged. See
+[query semantics](QUERY_LANGUAGE.md) for LIMIT/close behavior.
+
 Native typed path capture returns `PathValue`, replacing
 the former `_NODES`/`_RELS` maps. There is no legacy map-result switch.
 `nodes(p)`/`relationships(p)` return native entity tuples with the same qualified

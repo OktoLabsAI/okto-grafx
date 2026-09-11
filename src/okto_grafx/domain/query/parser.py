@@ -76,7 +76,6 @@ from okto_grafx.domain.query.ast import (
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.scalars import NONDETERMINISTIC_SCALARS
 from okto_grafx.domain.query.limits import (
-    DEFAULT_TRAVERSAL_HOPS,
     MAX_CLAUSES,
     MAX_COLUMN_DEFINITIONS,
     MAX_EXPRESSION_DEPTH,
@@ -859,8 +858,9 @@ class _Parser:
         max_hops = 1
         properties: MapExpression | None = None
         starred = False
+        upper_omitted = False
         if self._match_symbol("["):
-            variable, types, min_hops, max_hops, properties, starred = (
+            variable, types, min_hops, max_hops, properties, starred, upper_omitted = (
                 self._relationship_detail()
             )
             self._take_symbol("]")
@@ -885,11 +885,12 @@ class _Parser:
             max_hops=max_hops,
             properties=properties,
             hop_range_written=starred,
+            upper_bound_omitted=upper_omitted,
         )
 
     def _relationship_detail(
         self,
-    ) -> tuple[str | None, tuple[str, ...], int, int, MapExpression | None, bool]:
+    ) -> tuple[str | None, tuple[str, ...], int, int, MapExpression | None, bool, bool]:
         """Parse the inside of ``[variable:TYPE|TYPE*1..3 {properties}]``."""
         variable: str | None = None
         if self._current.kind is TokenKind.NAME:
@@ -900,24 +901,14 @@ class _Parser:
             while self._match_symbol("|"):
                 types.append(self._take_name("a relationship type"))
         starred = self._at_symbol("*")
-        min_hops, max_hops = self._hop_range() if starred else (1, 1)
+        min_hops, max_hops, upper_omitted = self._hop_range() if starred else (1, 1, False)
         properties = self._map_literal() if self._at_symbol("{") else None
-        return variable, tuple(types), min_hops, max_hops, properties, starred
+        return variable, tuple(types), min_hops, max_hops, properties, starred, upper_omitted
 
-    def _hop_range(self) -> tuple[int, int]:
-        """Parse ``*``, ``*n``, ``*n..``, ``*..`` or ``*n..m``, always ending with a bound.
-
-        A traversal is never unbounded here: a bare ``*`` over a cyclic graph is the shape that
-        does not terminate, and CONTRACT.md section 13 item 3 makes a hang a blocking defect. An
-        OMITTED upper bound is not unbounded, though -- the public endpoint rewrites it to
-        twenty hops before any engine sees it, so the omission already has one meaning, and this
-        reads it the same way instead of refusing text the caller was told is legal.
-
-        The lower bound written beside an omitted upper is kept: ``*3..`` means three to twenty,
-        and if the lower is larger than the default the range is empty and refused below, which
-        is the same answer ``*3..2`` gets.
-        """
+    def _hop_range(self) -> tuple[int, int, bool]:
+        """Preserve omitted upper syntax separately from the execution safety ceiling."""
         self._take_symbol("*")
+        upper_omitted = False
         lower: int | None = None
         if self._current.kind is TokenKind.INTEGER:
             lower = self._hop_count()
@@ -925,19 +916,21 @@ class _Parser:
             if self._current.kind is TokenKind.INTEGER:
                 upper = self._hop_count()
             else:
-                upper = DEFAULT_TRAVERSAL_HOPS
+                upper = MAX_TRAVERSAL_HOPS
+                upper_omitted = True
             lower = 1 if lower is None else lower
         elif lower is not None:
             upper = lower
         else:
-            lower, upper = 1, DEFAULT_TRAVERSAL_HOPS
+            lower, upper = 1, MAX_TRAVERSAL_HOPS
+            upper_omitted = True
         if lower > upper:
             raise self._refuse(
                 f"A hop range starts at or below its upper bound; got {lower}..{upper}",
                 field="min_hops",
                 value=lower,
             )
-        return lower, upper
+        return lower, upper, upper_omitted
 
     def _hop_count(self) -> int:
         """Consume one hop count, refusing one beyond the traversal ceiling."""

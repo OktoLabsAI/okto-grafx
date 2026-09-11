@@ -49,6 +49,8 @@ __all__ = [
     "AllNodesScan",
     "ArgumentRows",
     "ApplyRows",
+    "CaptureNodePath",
+    "ZeroHopRelationship",
     "SubqueryRows",
     "ProcedureRows",
     "CreateIndex",
@@ -194,6 +196,46 @@ class SingleRow(PlanNode):
     def details(self) -> Mapping[str, object]:
         """Return nothing; this operator has no settings."""
         return {}
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureNodePath(PlanNode):
+    """Capture one already matched node as a zero-edge path in the same snapshot."""
+
+    child: PlanNode
+    source: str
+    path: str
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the matched input without opening another source."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Expose the anchor and captured variable."""
+        return {"source": self.source, "path": self.path, "hops": "0"}
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroHopRelationship(PlanNode):
+    """The zero-length branch of a range whose relationship table is absent."""
+
+    child: PlanNode
+    source: str
+    target: str
+    relationship: str | None
+    target_table: TableDef | None = None
+    target_bound: bool = False
+    path_variable: str | None = None
+    path_append: bool = False
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Retain the original input transaction and effects."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Expose the real source and zero-edge behavior without fake schema."""
+        return {"source": self.source, "target": self.target, "hops": "0",
+                "relationship": self.relationship, "path": self.path_variable}
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +478,8 @@ class TraverseRelationship(PlanNode):
     """Continue a previous segment of this same named pattern."""
     relationship_list: bool = False
     """A written range binds a list even when its bounds are exactly 1..1."""
+    upper_bound_omitted: bool = False
+    """Refuse an extendable trail at the ceiling instead of silently truncating it."""
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -457,6 +501,10 @@ class TraverseRelationship(PlanNode):
             details["path_append"] = True
         if self.relationship_list:
             details["relationship_list"] = True
+        if self.upper_bound_omitted:
+            details["hops"] = f"{self.min_hops}.."
+            details["max_traversal_hops"] = self.max_hops
+            details["upper_bound_omitted"] = True
         return details
 
 

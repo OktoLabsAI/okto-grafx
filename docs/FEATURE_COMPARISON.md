@@ -62,8 +62,19 @@ MATCH, windows and returning subqueries (including path-or-NULL UNION exports).
 Clause-level relationship uniqueness now spans separate patterns/segments, while
 separate MATCH clauses may reuse edges. The next increment adds explicit typed
 variable ranges, zero length, cycles and concatenated segments with streaming
-depth-first expansion. Untyped alternatives and the omitted-upper-bound policy
-remain incomplete; this is not complete path-language parity.
+depth-first expansion. Omitted upper bounds now fail explicitly on an extendable
+trail beyond the 30-hop resource ceiling, instead of silently truncating at 20.
+Untyped alternatives remain incomplete; this is not complete path-language parity.
+Node-only named patterns also publish zero-edge native paths without requiring a
+relationship schema; aliases, optional nulls, UNION and aggregates preserve their
+qualified identities. This development increment is not a published release or
+new competitor execution result.
+
+Native `properties()`, `labels()` and `type()` now expose property maps, the
+single declared node label and the physical relationship type, including NULL,
+polymorphic/UNION/path composition and owner writes. Graph-function typing keeps
+runtime checks lazy. This narrows the function gap but does not provide arbitrary
+multiple labels, absent-table pattern semantics or full graph-function parity.
 
 | Product | Baseline and evidence |
 | --- | --- |

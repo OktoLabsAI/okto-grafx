@@ -52,6 +52,8 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.entity_scalars import ENTITY_SCALARS, entity_scalar_error, entity_scalar_type
+
 from okto_grafx.domain.query.scalars import (
     MAX_GENERATED_LIST_ELEMENTS, NATIVE_SCALARS, range_values, scalar_type, scalar_value,
 )
@@ -214,6 +216,8 @@ from okto_grafx.domain.query.plan import (
     SubqueryRows,
     ProcedureRows,
     CreateIndex,
+    CaptureNodePath,
+    ZeroHopRelationship,
     CreateNodeTable,
     CreatedNode,
     CreatedRelationship,
@@ -5755,6 +5759,60 @@ def _single_row(
     yield _Row(bindings={})
 
 
+def _capture_node_path(engine: QueryEngine, node: CaptureNodePath, context: _Context) -> Iterator[_Row]:
+    """Capture an existing qualified binding; NULL is not a zero-edge path."""
+    if (type(node.source) is not str or not node.source
+            or type(node.path) is not str or not node.path or node.path == node.source):
+        raise GrafxPlanError("A node path requires distinct nonempty binding names.", field="path")
+    incoming = engine._rows(node.child, context)
+    try:
+        for row in incoming:
+            anchor = row.bindings.get(node.source)
+            if anchor is None:
+                continue
+            if not isinstance(anchor, RowBinding) or anchor.table.kind != "node":
+                raise GrafxPlanError("A node path requires a matched node binding.", field="path")
+            if node.path in row.bindings:
+                raise GrafxPlanError("A path capture cannot overwrite an existing binding.", field="path")
+            context.admit_traversal_path()
+            yield replace(row, bindings={**row.bindings, node.path: _PathValue((anchor,), ())})
+    finally:
+        _close_iterator(incoming, active_exception())
+
+
+def _zero_hop_relationship(engine: QueryEngine, node: ZeroHopRelationship, context: _Context) -> Iterator[_Row]:
+    """No relationship exists, but a zero-length range can still match its anchor."""
+    incoming = engine._rows(node.child, context)
+    try:
+        for row in incoming:
+            anchor = row.bindings.get(node.source)
+            if anchor is None:
+                continue
+            if not isinstance(anchor, RowBinding) or anchor.table.kind != "node":
+                raise GrafxPlanError("A zero-hop range requires a node anchor.", field="path")
+            if node.target_table is not None and anchor.table.table_id != node.target_table.table_id:
+                continue
+            target = row.bindings.get(node.target)
+            if node.target_bound and (not isinstance(target, RowBinding)
+                                      or _binding_identity(target) != _binding_identity(anchor)):
+                continue
+            context.admit_traversal_path()
+            bindings = {**row.bindings, node.target: anchor}
+            if node.relationship is not None:
+                bindings[node.relationship] = ()
+            if node.path_variable is not None:
+                prefix = row.bindings.get(node.path_variable)
+                if node.path_append:
+                    if type(prefix) is not _PathValue or _binding_identity(prefix.nodes[-1]) != _binding_identity(anchor):
+                        raise GrafxPlanError("A zero-hop continuation requires its original prefix.", field="path")
+                    bindings[node.path_variable] = prefix
+                else:
+                    bindings[node.path_variable] = _PathValue((anchor,), ())
+            yield replace(row, bindings=bindings)
+    finally:
+        _close_iterator(incoming, active_exception())
+
+
 def _argument_rows(engine: QueryEngine, node: ArgumentRows, context: _Context) -> Iterator[_Row]:
     """Read the current outer binding without creating a second snapshot or transaction."""
     if node.slot not in context.arguments:
@@ -7172,7 +7230,10 @@ def _traverse(
             )
     if (type(node.min_hops) is not int or type(node.max_hops) is not int
             or not 0 <= node.min_hops <= node.max_hops <= MAX_TRAVERSAL_HOPS
-            or type(node.path_append) is not bool or type(node.relationship_list) is not bool):
+            or type(node.path_append) is not bool or type(node.relationship_list) is not bool
+            or type(node.upper_bound_omitted) is not bool
+            or node.upper_bound_omitted and (
+                not node.relationship_list or node.max_hops != MAX_TRAVERSAL_HOPS)):
         raise GrafxPlanError("Traversal requires bounded exact hop counts and flags.", field="hops")
     catalog = context.schema()
     relationship = node.table
@@ -7333,6 +7394,21 @@ def _traverse(
                         yield extended, visited
                     if len(extended) < node.max_hops:
                         stack.append((iter(successors(target, extended)), extended, visited))
+                    elif node.upper_bound_omitted:
+                        # Probe only on demand, after yielding the ceiling-length row.
+                        # LIMIT/cursor close may legitimately stop without requesting
+                        # complete enumeration. A valid further edge disproves it.
+                        probe = iter(successors(target, extended))
+                        try:
+                            if next(probe, None) is not None:
+                                raise GrafxQueryBudgetExceeded(
+                                    "An omitted-upper traversal exceeds the hop resource ceiling.",
+                                    field="max_traversal_hops", limit=node.max_hops,
+                                    observed=len(extended) + 1,
+                                    operator="TraverseRelationship",
+                                )
+                        finally:
+                            _close_iterator(probe, active_exception())
             finally:
                 for iterator, _, _ in reversed(stack):
                     _close_iterator(iterator, active_exception())
@@ -12229,19 +12305,25 @@ def _write_assignments(
         )
         context.count("properties_set", len(node.assignments))
         context.count("rows_updated")
-    bindings = dict(row.bindings)
-    for name, current in bindings.items():
+    def refreshed(current: object) -> object:
+        if type(current) is _PathValue:
+            return _PathValue(
+                tuple(refreshed(item) for item in current.nodes),
+                tuple(refreshed(item) for item in current.relationships),
+            )
+        current = context.resolve_binding(current)
         if not isinstance(current, RowBinding):
-            continue
+            return current
         key = current.ref if current.ref is not None else ("pending", id(current.version))
         changed = updated.get(key)
         if changed is None:
-            continue
+            return current
         version = replace(current.version, values=tuple(changed[1]))
         token = context.pending_tokens.get(id(current.version))
         if token is not None:
             context.pending_tokens[id(version)] = token
-        bindings[name] = replace(current, version=version)
+        return replace(current, version=version)
+    bindings = {name: refreshed(current) for name, current in row.bindings.items()}
     return _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
 
@@ -14616,6 +14698,8 @@ _Handler = Callable[[QueryEngine, PlanNode, _Context], Iterator[_Row]]
 
 _HANDLERS: dict[type, _Handler] = {
     SingleRow: _single_row,  # type: ignore[dict-item]
+    CaptureNodePath: _capture_node_path,  # type: ignore[dict-item]
+    ZeroHopRelationship: _zero_hop_relationship,  # type: ignore[dict-item]
     ArgumentRows: _argument_rows,  # type: ignore[dict-item]
     ApplyRows: _apply_rows,  # type: ignore[dict-item]
     SubqueryRows: _subquery_rows,  # type: ignore[dict-item]
@@ -15623,6 +15707,10 @@ def _infer_bound_pulse_expression_type(
         )
     if isinstance(expression, FunctionCall):
         name = expression.name.upper()
+        if name in ENTITY_SCALARS:
+            # Result shape is known independently of its runtime argument. Do
+            # not evaluate/refuse an unselected CASE arm or a zero-row call.
+            return entity_scalar_type(name, None)
         argument_types = tuple(
             _bound_pulse_expression_type(
                 argument,
@@ -15917,7 +16005,7 @@ def _bound_case_types(
             _bound_pulse_expression_type(expression, static_types, parameters, owner="logical/membership operator")
         if isinstance(expression, (ListSlice, ListIteration)):
             _bound_pulse_expression_type(expression, static_types, parameters, owner="slice")
-        if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:
+        if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS | ENTITY_SCALARS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:
             _bound_pulse_expression_type(expression, static_types, parameters, owner=expression.name)
     resolved: dict[int, ValueType | None] = {}
     for expression, planned_results in plan.case_result_types:
@@ -16441,6 +16529,37 @@ def _coalesce_selected(
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name in ENTITY_SCALARS:
+        subject = _evaluate(expression.arguments[0], row, context)
+        if subject is None:
+            return None
+        if name == "PROPERTIES" and isinstance(subject, Mapping):
+            return dict(subject)
+        if not isinstance(subject, RowBinding):
+            raise entity_scalar_error(name, "execution")
+        kind = "relationship" if subject.table.kind == "rel" else "node"
+        entity_scalar_type(name, None, entity_kind=kind, phase="execution")
+        if name == "LABELS":
+            return (subject.table.name,)
+        if name == "TYPE":
+            return subject.table.name
+        # Use the revision-cached owner overlay, not an intent scan per entity.
+        subject = context.resolve_binding(subject)
+        state = _entity_overlay(context, subject.table)
+        values = state.get(subject.ref)
+        if values is None:
+            values = subject.version.values
+        first = ENDPOINT_COLUMN_COUNT if subject.table.kind == "rel" else 0
+        properties = {}
+        for position, column in enumerate(subject.table.columns):
+            if position < first:
+                continue
+            item = values[position] if position < len(values) else None
+            if _is_unmaterialized_column(item):
+                raise GrafxPlanError("properties() requires complete property projection.", field="projection")
+            if item is not None:
+                properties[column.name] = item
+        return properties
     if name == "RAND":
         source = context.engine._random_source
         if source is None:

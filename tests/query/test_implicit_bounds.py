@@ -1,16 +1,4 @@
-"""An omitted upper bound, read the way the endpoint already reads it.
-
-`*`, `*..` and `*n..` are legal at the public endpoint, which rewrites them to twenty hops from
-its own MAX_TRAVERSAL_DEPTH before any engine sees the text. Refusing them here meant refusing
-something a caller had been told was fine, and the refusal bought nothing: the rewrite had
-already happened. So the engine reads the omission the same way, and the accepted form is
-written back as the explicit range it became -- a canonicalisation, not a guess.
-
-The bound itself is not softened anywhere. A traversal is finite in every spelling, an explicit
-upper still reaches thirty and no further, and a hop range handed in by a caller rather than
-written by the parser is checked before anything walks it: a forged `max_hops` is not a wrong
-answer, it is unbounded work.
-"""
+"""Omitted ranges enumerate complete trails or explicitly exhaust resources."""
 
 from __future__ import annotations
 
@@ -37,7 +25,7 @@ from okto_grafx.domain.query.ast import (
     ReturnItem,
     Variable,
 )
-from okto_grafx.domain.query.limits import DEFAULT_TRAVERSAL_HOPS, MAX_TRAVERSAL_HOPS
+from okto_grafx.domain.query.limits import MAX_TRAVERSAL_HOPS
 from okto_grafx.domain.query.parser import parse
 from okto_grafx.domain.query.planner import build_plan
 
@@ -93,32 +81,33 @@ def _bounded_cycle(tmp_path: Path, **options: object) -> object:
     return handle
 
 
-# --- the three spellings the endpoint normalises ------------------------------------------------
+# --- omitted spellings retain intent ------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("spelling", "bounds"),
-    [("*", (1, 20)), ("*..", (1, 20)), ("*3..", (3, 20)), ("*1..", (1, 20))],
+    [("*", (1, 30)), ("*..", (1, 30)), ("*3..", (3, 30)), ("*25..", (25, 30))],
 )
-def test_an_omitted_upper_bound_takes_the_default(
+def test_an_omitted_upper_bound_preserves_intent_and_resource_ceiling(
     spelling: str, bounds: tuple[int, int]
 ) -> None:
     hop = _hop(f"MATCH (a:A)-[r:R{spelling}]->(b:A) RETURN a.id")
 
     assert (hop.min_hops, hop.max_hops) == bounds
-    assert hop.max_hops == DEFAULT_TRAVERSAL_HOPS
+    assert hop.max_hops == MAX_TRAVERSAL_HOPS
+    assert hop.upper_bound_omitted is True
     assert hop.variable_length is True
     assert hop.hop_range_written is True
 
 
-def test_the_accepted_form_is_written_back_as_the_range_it_became() -> None:
-    """Canonicalisation, not a guess: what it means is what it says once it is read."""
-    assert _hop("MATCH (a:A)-[r:R*]->(b:A) RETURN a.id").describe() == "-[r:R*1..20]->"
+def test_description_preserves_the_omitted_upper_bound() -> None:
+    """Normalizing the lower bound must not invent an explicit upper bound."""
+    assert _hop("MATCH (a:A)-[r:R*]->(b:A) RETURN a.id").describe() == "-[r:R*1..]->"
     assert (
-        _hop("MATCH (a:A)-[r:R*..]->(b:A) RETURN a.id").describe() == "-[r:R*1..20]->"
+        _hop("MATCH (a:A)-[r:R*..]->(b:A) RETURN a.id").describe() == "-[r:R*1..]->"
     )
     assert (
-        _hop("MATCH (a:A)-[r:R*3..]->(b:A) RETURN a.id").describe() == "-[r:R*3..20]->"
+        _hop("MATCH (a:A)-[r:R*3..]->(b:A) RETURN a.id").describe() == "-[r:R*3..]->"
     )
 
 
@@ -134,11 +123,8 @@ def test_a_range_that_writes_its_upper_bound_is_untouched(
     assert (hop.min_hops, hop.max_hops) == bounds
 
 
-def test_the_two_ceilings_are_different_numbers() -> None:
-    """One is what a query may WRITE; the other is what it gets when it writes nothing."""
-    assert DEFAULT_TRAVERSAL_HOPS == 20
-    assert MAX_TRAVERSAL_HOPS == 30
-    assert DEFAULT_TRAVERSAL_HOPS < MAX_TRAVERSAL_HOPS
+def test_explicit_ranges_do_not_claim_an_omitted_bound() -> None:
+    assert not _hop("MATCH (a:A)-[:R*1..30]->(b:A) RETURN a.id").upper_bound_omitted
 
 
 # --- what it answers ------------------------------------------------------------------------------
@@ -178,14 +164,14 @@ def test_the_walk_terminates_because_an_edge_is_not_walked_twice(
     assert len(rows) == 3
 
 
-def test_the_plan_is_the_plan_of_the_explicit_range(database: object) -> None:
+def test_the_plan_distinguishes_omission_from_explicit_truncation(database: object) -> None:
     def shape(query: str) -> tuple[tuple[str, object], ...]:
         return tuple(
             (node.label, dict(node.details()))
             for node in database.explain(query).walk()
         )
 
-    assert shape("MATCH (x:A)-[r:R*]->(y:A) RETURN y.id") == shape(
+    assert shape("MATCH (x:A)-[r:R*]->(y:A) RETURN y.id") != shape(
         "MATCH (x:A)-[r:R*1..20]->(y:A) RETURN y.id"
     )
 
@@ -297,7 +283,7 @@ def test_relationship_scan_charges_filtered_candidates_but_no_paths(tmp_path: Pa
 @pytest.mark.parametrize(
     ("spelling", "field"),
     [
-        ("*25..", "min_hops"),
+        ("*31..", "hops"),
         ("*3..2", "min_hops"),
         ("*1..31", "hops"),
         ("*31", "hops"),
@@ -306,7 +292,7 @@ def test_relationship_scan_charges_filtered_candidates_but_no_paths(tmp_path: Pa
 def test_the_shapes_that_were_refused_are_still_refused(
     spelling: str, field: str
 ) -> None:
-    """`*25..` is the interesting one: the default makes it 25..20, which is an empty range."""
+    """Reversed explicit ranges and lower bounds beyond resources are refused."""
     with pytest.raises(GrafxParseError) as raised:
         parse(f"MATCH (a:A)-[r:R{spelling}]->(b:A) RETURN a.id")
 
@@ -435,7 +421,7 @@ def test_a_forged_hop_range_is_refused_at_both_doors(
 @pytest.mark.parametrize("minimum", [0, 1])
 def test_a_legitimate_range_passes_both_doors(catalog: object, indexes: tuple, minimum: int) -> None:
     """The control: the guard refuses forged fields, not variable-length traversal."""
-    statement = _forged(min_hops=minimum, max_hops=DEFAULT_TRAVERSAL_HOPS)
+    statement = _forged(min_hops=minimum, max_hops=MAX_TRAVERSAL_HOPS)
 
     assert analyze(statement) is not None
     planned = build_plan(
@@ -445,3 +431,17 @@ def test_a_legitimate_range_passes_both_doors(catalog: object, indexes: tuple, m
         analysis=_supplied_analysis(statement),
     )
     assert "TraverseRelationship" in tuple(node.label for node in planned.root.walk())
+
+
+@pytest.mark.parametrize("fields", [
+    {"min_hops": 1, "max_hops": 30, "upper_bound_omitted": 1},
+    {"min_hops": 1, "max_hops": 20, "upper_bound_omitted": True},
+    {"min_hops": 1, "max_hops": 30, "upper_bound_omitted": True, "hop_range_written": False},
+])
+def test_forged_omission_cannot_bypass_supplied_analysis(catalog, indexes, fields):
+    statement = _forged(**fields)
+    with pytest.raises(GrafxPlanError):
+        analyze(statement)
+    with pytest.raises(GrafxPlanError):
+        build_plan(statement, catalog=catalog, indexes=indexes,
+                   analysis=_supplied_analysis(statement))
