@@ -63,12 +63,22 @@ def test_target_properties_no_longer_share_namespace_with_path_metadata(tmp_path
 
 
 @pytest.mark.parametrize("query", [
-    "MATCH journey = (x:Person)<-[edge:Knows]-(y:Person) RETURN journey",
-    "MATCH journey = (x:Person)-[edge:Knows]-(y:Person) RETURN journey",
-    "MATCH journey = (x:Person)-[edge:Knows*1..2]->(y:Person) RETURN journey",
-    "MATCH journey = (x:Person)-[edge:Knows]->(y:Person) WHERE x.id='x' RETURN journey",
     "MATCH journey = (journey:Person)-[edge:Knows]->(y:Person) RETURN journey",
 ])
-def test_generic_names_do_not_widen_direction_range_or_projection(query):
+def test_generic_names_do_not_hide_unimplemented_range_or_name_collisions(query):
     with pytest.raises(GrafxPlanError):
         analyze(parse(query))
+
+
+@pytest.mark.parametrize("query", [
+    "MATCH journey = (x:Person)<-[edge:Knows]-(y:Person) RETURN journey",
+    "MATCH journey = (x:Person)-[edge:Knows]-(y:Person) RETURN journey",
+    "MATCH journey = (x:Person)-[edge:Knows]->(y:Person) WHERE x.id='x' RETURN journey",
+])
+def test_generic_names_support_direction_and_predicates(query):
+    assert analyze(parse(query)).binding("journey").entity == "path"
+
+
+def test_generic_names_support_native_bounded_variable_capture():
+    query = "MATCH journey=(x:Person)-[edge:Knows*0..2]->(y:Person) RETURN journey"
+    assert analyze(parse(query)).binding("journey").entity == "path"

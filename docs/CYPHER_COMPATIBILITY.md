@@ -9,11 +9,17 @@ the Python result representation, not the schema-free storage policy or the
 remaining generalized path requirements. See [entity contracts](ENTITY_VALUES.md)
 and [working evidence](conformance/FP3_PROGRESS.md); this is not full conformance.
 
-The admitted one-hop named path now returns native `PathValue`, including through
+The admitted typed bounded named path now returns native `PathValue`, including through
 UNION and cursors. `nodes()`/`relationships()` return the same entity DTOs as
 direct projections. This removes the old metadata-map output and structural-key
-property restrictions, but does not yet enable general variable-length or
-OPTIONAL named-path composition. The original expressions/path diagnostics remain
+property restrictions. Single-hop captures now compose with predicates, WITH,
+UNWIND, row windows, DISTINCT/order, typed OPTIONAL MATCH and returning subqueries,
+including path-or-NULL UNION exports. Reverse/undirected walks preserve physical
+endpoint identity. Explicit typed ranges now support zero length, cycles and
+multiple segments with relationship uniqueness, using depth-first streaming.
+Written range variables hold relationship tuples even for `*1..1`.
+Untyped/type-alternative capture and the legacy omitted-upper-bound policy remain pending.
+The original expressions/path diagnostics remain
 in the working evidence rather than being presented as passed.
 
 The original 12 UNION-family cases now yield 10 original passes and 2 passes with

@@ -9,7 +9,7 @@ for typed and polymorphic nodes and `RelationshipValue` for relationships, also
 inside lists/maps. Both types, `EntityIdentity` and `EntityProvenance`, are exported
 from `okto_grafx`. UNION/UNION ALL now preserve these entities, including nested
 values and aggregate spill. `PathValue` is also exported and returned by the
-currently admitted one-hop capture, including UNION and cursors. General named
+currently admitted typed bounded capture, including UNION and cursors. Full named
 path traversal/composition and coordinated Pulse migration are still pending.
 
 This is an intentional breaking result change, with no legacy-result mode. Replace
@@ -94,7 +94,7 @@ option is introduced by this internal model.
 
 ## Paths
 
-The admitted outgoing typed one-hop capture now returns `PathValue`, replacing
+Native typed path capture returns `PathValue`, replacing
 the former `_NODES`/`_RELS` maps. There is no legacy map-result switch.
 `nodes(p)`/`relationships(p)` return native entity tuples with the same qualified
 identity and observed properties as direct node/edge returns. For example:
@@ -123,8 +123,19 @@ Path equality/hash use the ordered entity identities, not property observations.
 Repeated nodes and cycles are representable. The DTO represents a walk; the query
 executor must separately enforce the pattern's relationship-uniqueness/trail rules
 and traversal/cancellation budgets. Constructing this DTO does **not** implement
-general variable-length named traversal. The current native capture remains
-outgoing, typed and one-hop, with the existing projection/limit restrictions.
+general variable-length named traversal. Native capture currently supports typed
+bounded ranges (including zero), concatenated segments, either direction,
+WHERE/WITH/UNWIND, row windows,
+DISTINCT/order, typed OPTIONAL MATCH and returning subqueries. An unmatched
+optional capture is NULL, not a fabricated empty path. Path aliases and path-or-NULL
+UNION subquery exports retain their type for `length`/`nodes`/`relationships`.
+Unlabelled endpoints must still be schema-resolvable (zero-hop anchors may span all
+node tables); untyped/ambiguous alternatives and inline relationship maps remain pending.
+Zero length returns the anchor, not NULL: its path has one node and no relations.
+Concatenation does not duplicate junction nodes. Range variables hold relationship
+tuples even for a written `*1..1`; an unstarred hop returns one relationship.
+Relationships cannot be reused across segments/patterns within one MATCH clause;
+separate MATCH clauses may reuse them. This is distinct from node repetition.
 UNION/ALL and result cursors preserve path identity and snapshot. Temporary path
 spill uses the bounded row codec and refuses malformed cardinality, nonentity
 components, invalid endpoint connections and future source versions. Private

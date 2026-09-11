@@ -431,7 +431,11 @@ class TraverseRelationship(PlanNode):
     target_table: TableDef | None = None
     target_bound: bool = False
     path_variable: str | None = None
-    """The exact named path this hop binds, when the frozen path projection asks for one."""
+    """The named walk this segment captures."""
+    path_append: bool = False
+    """Continue a previous segment of this same named pattern."""
+    relationship_list: bool = False
+    """A written range binds a list even when its bounds are exactly 1..1."""
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -449,6 +453,10 @@ class TraverseRelationship(PlanNode):
         }
         if self.path_variable is not None:
             details["path"] = self.path_variable
+        if self.path_append:
+            details["path_append"] = True
+        if self.relationship_list:
+            details["relationship_list"] = True
         return details
 
 

@@ -64,6 +64,7 @@ from okto_grafx.domain.query.ast import (
     walk,
 )
 from okto_grafx.domain.query.lexer import tokenize
+from okto_grafx.domain.query.structure import validate_structure
 from okto_grafx.domain.query.limits import (
     MAX_CLAUSES,
     MAX_PARAMETERS,
@@ -106,12 +107,14 @@ __all__ = [
 
 ENTITY_NODE: str = "node"
 ENTITY_PATH: str = "path"
-"""The one exact named path this subset projects as a result value."""
+"""A named walk binding, materialized as an owned native path at output."""
 ENTITY_RELATIONSHIP: str = "relationship"
 ENTITY_UNWOUND: str = "unwound value"
 """What UNWIND binds: one element of a list, which is a value and not a matched row."""
 ENTITY_PROJECTED: str = "expression alias"
 """What a WITH item with AS binds: a value the projection computed for this row."""
+ENTITY_NULL: str = "null alias"
+"""A proven NULL alias can be a read-pattern anchor, but never a fresh scan."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,10 +281,10 @@ def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
 
 
 NAMED_PATH_SHAPE: str = (
-    "one MATCH of one named path over one named outgoing hop of one type, both ends named and "
-    "carrying exactly one label, no inline map and no written range, and a RETURN"
+    "composed MATCH/OPTIONAL MATCH captures over typed bounded segments, "
+    "including zero length, direction, aliases, predicates and subquery scope"
 )
-"""The only shape a named path is admitted in."""
+"""Current capture shape; untyped alternatives remain assigned to FP-3."""
 
 
 def hop_range_refusal(query: Query) -> tuple[str, str] | None:
@@ -314,13 +317,13 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
                 "max_hops",
             )
         if (
-            not 1
+            not 0
             <= relationship.min_hops
             <= relationship.max_hops
             <= MAX_TRAVERSAL_HOPS
         ):
             return (
-                "A hop range runs from at least one hop to at most "
+                "A hop range runs from zero hops to at most "
                 f"{MAX_TRAVERSAL_HOPS}, and starts at or below where it ends.",
                 "hops",
             )
@@ -845,16 +848,7 @@ def _is_written_path_name(value: object) -> bool:
     )
 
 
-def _named_path_detail(named: PatternPath) -> str:
-    """Return a refusal detail that is safe on a tree already known to be malformed.
 
-    The pattern is NOT written back here. By the time this is asked the shape has already been
-    judged wrong, and a wrong shape is exactly the one ``describe()`` cannot walk: a path with
-    one node and one relationship indexes past its own nodes. A refusal that raises while
-    building its own message is worse than the mistake it was reporting.
-    """
-    variable = named.variable
-    return variable if _is_written_path_name(variable) else "a named path"
 
 
 def named_path_refusal(query: Query) -> tuple[str, str] | None:
@@ -871,19 +865,18 @@ def named_path_refusal(query: Query) -> tuple[str, str] | None:
                 continue
             if not _is_written_path_name(pattern.variable):
                 return "A path needs a parser-compatible name.", "path"
-            if len(pattern.nodes) != 2 or len(pattern.relationships) != 1:
-                return "Named capture currently requires one relationship segment.", pattern.variable
+            if not pattern.relationships or len(pattern.nodes) != len(pattern.relationships) + 1:
+                return "Named capture requires alternating nodes and relationship segments.", pattern.variable
             for node in pattern.nodes:
                 if (node.variable is not None and type(node.variable) is not str) or node.variable == pattern.variable:
                     return "A path name must differ from its node variables.", pattern.variable
-            edge = pattern.relationships[0]
-            if (edge.variable is not None and type(edge.variable) is not str) or edge.variable == pattern.variable:
-                return "A path name must differ from its relationship variable.", pattern.variable
-            if (len(edge.types) != 1 or edge.min_hops != 1 or edge.max_hops != 1
-                    or edge.hop_range_written):
-                return "General relationship alternatives and variable-length capture remain pending.", pattern.variable
-            if edge.properties is not None:
-                return "Inline relationship property capture remains pending.", pattern.variable
+            for edge in pattern.relationships:
+                if (edge.variable is not None and type(edge.variable) is not str) or edge.variable == pattern.variable:
+                    return "A path name must differ from its relationship variable.", pattern.variable
+                if len(edge.types) != 1:
+                    return "General relationship alternatives remain pending.", pattern.variable
+                if edge.properties is not None:
+                    return "Inline relationship property capture remains pending.", pattern.variable
     return None
 
 
@@ -902,6 +895,7 @@ def contains_aggregate(expression: Expression) -> bool:
 
 def analyze(statement: Statement, *, bindings: tuple[Binding, ...] = (), depth: int = 0) -> QueryAnalysis:
     """Return what a statement means, refusing one that parses but cannot be answered."""
+    validate_structure(statement)
     if depth > 16:
         raise GrafxPlanError("Subqueries may nest at most 16 levels.", field="subquery_depth")
     if isinstance(
@@ -953,8 +947,6 @@ class _Analyzer:
         "_query",
         "_bindings",
         "_discarded",
-        "_projected_path",
-        "_path_names",
         "_parameters",
         "_similarity",
         "_scores",
@@ -968,10 +960,6 @@ class _Analyzer:
         # The names a WITH stopped carrying, kept only so that reading one below it
         # is refused for what it is rather than as a variable nothing ever bound.
         self._discarded: set[str] = set()
-        self._projected_path = exact_path_projection(query)
-        # Every other path name is recorded so a collision is a refusal and a read earns the
-        # established path-specific error rather than looking like an ordinary unbound name.
-        self._path_names: set[str] = set()
         self._parameters: list[str] = []
         self._similarity: SimilarityUse | None = None
         self._scores = False
@@ -1094,6 +1082,8 @@ class _Analyzer:
                 expression = clause.query.return_clause.items[position].expression
                 if isinstance(expression, Variable):
                     carried = inner.binding(expression.name)
+                elif isinstance(expression, Literal) and expression.value is None:
+                    carried = Binding(name=name, entity=ENTITY_NULL, labels=(), created=False)
             if carried is not None:
                 self._bindings.append(replace(carried, name=name))
             else:
@@ -1362,7 +1352,9 @@ class _Analyzer:
         # Aggregate calls are validated by _check_expression, exactly as in RETURN.
         # The planner inserts the same budgeted grouping operator before WITH.
         return Binding(
-            name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False
+            name=item.alias,
+            entity=ENTITY_NULL if isinstance(expression, Literal) and expression.value is None else ENTITY_PROJECTED,
+            labels=(), created=False
         )
 
     def _refuse_same_stage_alias(self, item: ReturnItem, created: set[str]) -> None:
@@ -1392,6 +1384,8 @@ class _Analyzer:
             )
             return
         if existing.entity != entity:
+            if existing.entity == ENTITY_NULL and entity == ENTITY_NODE and not created:
+                return
             raise self._refuse(
                 f"The variable {name!r} is bound to a {existing.entity} and used again as a "
                 f"{entity}.",
@@ -1430,7 +1424,7 @@ class _Analyzer:
                     field="types",
                     value=relationship.describe(),
                 )
-            if relationship.variable_length:
+            if relationship.variable_length or relationship.hop_range_written:
                 raise self._refuse(
                     f"{keyword} writes one relationship at a time, so a hop range has no "
                     f"meaning here; got {relationship.describe()}.",
@@ -1709,13 +1703,6 @@ class _Analyzer:
         """Refuse a variable no pattern bound."""
         if self._binding(name) is not None:
             return
-        if name in self._path_names:
-            raise self._refuse(
-                f"The path {name!r} is written and never read in this subset, so {where} "
-                "cannot ask what it contains.",
-                field="variable",
-                value=name,
-            )
         if name in self._discarded:
             raise self._refuse(
                 f"The variable {name!r} used in {where} was dropped by a WITH "

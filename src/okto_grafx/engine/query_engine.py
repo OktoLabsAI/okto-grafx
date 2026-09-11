@@ -66,10 +66,11 @@ from dataclasses import dataclass, field, replace
 from math import isnan
 from hashlib import blake2b
 from typing import cast
+from sys import exception as active_exception
 
 from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
 from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, PathValue, QueryValue
-from okto_grafx.domain.query.limits import MAX_LIST_ELEMENTS
+from okto_grafx.domain.query.limits import MAX_LIST_ELEMENTS, MAX_TRAVERSAL_HOPS
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -6919,6 +6920,8 @@ def _edge_steps(
                 owner = owner_version(ref, version)
                 if owner is None:
                     continue
+                if outgoing and from_table.table_id == to_table.table_id and owner.values[0] == owner.values[1]:
+                    continue  # The outgoing arm already emitted this self-loop.
                 yield ref, owner, from_table, owner.values[0]
 
     maps: list[tuple[dict, dict]] = []
@@ -6960,6 +6963,8 @@ def _edge_steps(
                 yield ref, version, to_table, version.values[1]
         if incoming:
             for ref, version in by_target.get(record_id, ()):
+                if outgoing and from_table.table_id == to_table.table_id and version.values[0] == version.values[1]:
+                    continue
                 yield ref, version, from_table, version.values[0]
 
     if not indexed or not bounded_frontier:
@@ -7165,15 +7170,10 @@ def _traverse(
                 field="path_variable",
                 value=repr(path_variable),
             )
-        if (
-            node.min_hops != 1
-            or node.max_hops != 1
-        ):
-            raise GrafxPlanError(
-                "A projected path currently spans exactly one typed relationship hop.",
-                field="path_variable",
-                value=path_variable,
-            )
+    if (type(node.min_hops) is not int or type(node.max_hops) is not int
+            or not 0 <= node.min_hops <= node.max_hops <= MAX_TRAVERSAL_HOPS
+            or type(node.path_append) is not bool or type(node.relationship_list) is not bool):
+        raise GrafxPlanError("Traversal requires bounded exact hop counts and flags.", field="hops")
     catalog = context.schema()
     relationship = node.table
     dirty_tables = _intent_table_ids(engine, context.txn)
@@ -7246,47 +7246,52 @@ def _traverse(
                 value=node.source,
             )
         bound_target = row.bindings.get(node.target) if node.target_bound else None
-        # (current record id, current table, edges taken so far)
-        frontier: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = [
-            (_overlay_identity(start), start.table, ())
-        ]
-        for depth in range(1, node.max_hops + 1):
-            reached: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = []
-            for record_id, _table, path in frontier:
-                taken = {edge.ref for edge in path}
-                candidates = steps(record_id)
-                resolved = (
-                    _batched_landing_steps(engine, context, iter(candidates), view_at)
-                    if batch_landings else
-                    ((*candidate, False, None) for candidate in candidates)
-                )
+        if node.target_bound and not isinstance(bound_target, RowBinding):
+            continue
+        prefix = row.bindings.get(path_variable) if node.path_append else None
+        if node.path_append:
+            if (type(prefix) is not _PathValue or not prefix.nodes
+                    or _binding_identity(prefix.nodes[-1]) != _binding_identity(start)):
+                raise GrafxPlanError("A continued path must start at its previous endpoint.", field="path_variable")
+        elif path_variable is not None and path_variable in row.bindings:
+            raise GrafxPlanError("A path cannot overwrite an existing binding.", field="path_variable")
+
+        def successors(current: RowBinding, path: tuple[RowBinding, ...]):
+            record_id, current_table = _overlay_identity(current), current.table
+            taken = {_binding_identity(edge) for edge in path}
+            if prefix is not None:
+                taken.update(_binding_identity(edge) for edge in prefix.relationships)
+            candidates = steps(record_id)
+            resolved = (
+                _batched_landing_steps(engine, context, iter(candidates), view_at)
+                if batch_landings else
+                ((*candidate, False, None) for candidate in candidates)
+            )
+            try:
                 for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
                     if charge_expansions:
                         context.admit_traversal_expansion()
-                    # Adjacency candidates use table-local record IDs. An ID
-                    # collision at the opposite table is not this frontier node.
+                    elif context.read_control is not None:
+                        context.read_control.step()
                     endpoints = version.values[:2]
                     if not (
-                        (outgoing and _table.table_id == from_table.table_id
+                        (outgoing and current_table.table_id == from_table.table_id
                          and endpoints[0] == record_id and next_table.table_id == to_table.table_id
                          and endpoints[1] == next_id)
-                        or (incoming and _table.table_id == to_table.table_id
+                        or (incoming and current_table.table_id == to_table.table_id
                             and endpoints[1] == record_id and next_table.table_id == from_table.table_id
                             and endpoints[0] == next_id)
                     ):
                         continue
-                    if ref in taken:
+                    edge = RowBinding(variable=node.relationship or "", table=relationship,
+                                      ref=ref, version=version)
+                    if _binding_identity(edge) in taken:
                         continue
                     if prevalidated:
                         landing = batch_landing
-                    elif (
-                        isinstance(bound_target, RowBinding)
-                        and _overlay_identity(bound_target) == next_id
-                        and bound_target.table.table_id == next_table.table_id
-                    ):
-                        # The landing IS the bound row, which arrived through operators that
-                        # already validated its visibility -- so even the lazy identity proof
-                        # node_at would take to re-prove it is not paid.
+                    elif (isinstance(bound_target, RowBinding)
+                          and _overlay_identity(bound_target) == next_id
+                          and bound_target.table.table_id == next_table.table_id):
                         landing = (bound_target.ref, bound_target.version)
                     else:
                         landing = node_at(next_table, next_id)
@@ -7294,55 +7299,69 @@ def _traverse(
                         continue
                     if charge_paths:
                         context.admit_traversal_path()
-                    edge = RowBinding(
-                        variable=node.relationship or "",
-                        table=relationship,
-                        ref=ref,
-                        version=version,
-                    )
-                    extended = (*path, edge)
-                    reached.append((next_id, next_table, extended))
-                    if depth < node.min_hops:
-                        continue
                     landing_ref, landing_version = landing
-                    if node.target_table is not None and node.target_table.table_id != next_table.table_id:
+                    target = RowBinding(variable=node.target, table=next_table,
+                                        ref=landing_ref, version=landing_version,
+                                        polymorphic=node.target_table is None)
+                    yield edge, target
+            finally:
+                _close_iterator(resolved, active_exception())
+                _close_iterator(candidates, active_exception())
+
+        def walks():
+            # Depth-first streaming retains one sibling iterator per depth, never a
+            # breadth-wide collection of complete paths. Unordered result order is
+            # not a shortest-path guarantee; ORDER BY defines caller-visible order.
+            if node.min_hops == 0:
+                if charge_paths:
+                    context.admit_traversal_path()
+                yield (), (start,)
+            stack = []
+            if node.max_hops:
+                stack.append((iter(successors(start, ())), (), (start,)))
+            try:
+                while stack:
+                    iterator, path, nodes = stack[-1]
+                    try:
+                        edge, target = next(iterator)
+                    except StopIteration:
+                        stack.pop()
+                        _close_iterator(iterator)
                         continue
-                    if isinstance(bound_target, RowBinding) and (
-                        _overlay_identity(bound_target) != next_id
-                        or bound_target.table.table_id != next_table.table_id
-                    ):
-                        continue
-                    bindings = dict(row.bindings)
-                    target_binding = RowBinding(
-                        variable=node.target,
-                        table=next_table,
-                        ref=landing_ref,
-                        version=landing_version,
+                    extended, visited = (*path, edge), (*nodes, target)
+                    if len(extended) >= node.min_hops:
+                        yield extended, visited
+                    if len(extended) < node.max_hops:
+                        stack.append((iter(successors(target, extended)), extended, visited))
+            finally:
+                for iterator, _, _ in reversed(stack):
+                    _close_iterator(iterator, active_exception())
+
+        iterator = walks()
+        try:
+            for path, visited in iterator:
+                target_binding = visited[-1]
+                if node.target_table is not None and node.target_table.table_id != target_binding.table.table_id:
+                    continue
+                if isinstance(bound_target, RowBinding) and _binding_identity(bound_target) != _binding_identity(target_binding):
+                    continue
+                bindings = dict(row.bindings)
+                bindings[node.target] = target_binding
+                if node.relationship is not None:
+                    bindings[node.relationship] = (
+                        path if node.relationship_list or node.min_hops != 1 or node.max_hops != 1 else path[0]
                     )
-                    bindings[node.target] = target_binding
-                    if node.relationship is not None:
-                        bindings[node.relationship] = (
-                            edge
-                            if node.max_hops == 1 and node.min_hops == 1
-                            else extended
-                        )
-                    if path_variable is not None:
-                        if path_variable in bindings:
-                            raise GrafxPlanError(
-                                "A projected path cannot reuse a node or relationship variable.",
-                                field="path_variable",
-                                value=path_variable,
-                            )
-                        bindings[path_variable] = _one_hop_path_value(
-                            context, start, edge, target_binding
-                        )
-                    context.count("rows_scanned")
-                    yield _Row(
-                        bindings=bindings, computed=row.computed, columns=row.columns
-                    )
-            frontier = reached
-            if not frontier:
-                break
+                if path_variable is not None:
+                    nodes = (*prefix.nodes, *visited[1:]) if prefix is not None else visited
+                    edges = (*prefix.relationships, *path) if prefix is not None else path
+                    if len(nodes) > MAX_LIST_ELEMENTS:
+                        raise GrafxQueryBudgetExceeded("A captured path exceeds the owned node limit.",
+                                                       field="path_nodes", limit=MAX_LIST_ELEMENTS)
+                    bindings[path_variable] = _PathValue(nodes=nodes, relationships=edges)
+                context.count("rows_scanned")
+                yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+        finally:
+            _close_iterator(iterator, active_exception())
 
 
 def _traverse_any(
@@ -16652,17 +16671,7 @@ def _binding_identity(binding: RowBinding) -> tuple[object, ...]:
     return ("stored", binding.table.table_id, binding.record_id)
 
 
-def _one_hop_path_value(
-    context: _Context,
-    source: RowBinding,
-    relationship: RowBinding,
-    target: RowBinding,
-) -> _PathValue:
-    """Retain one visible hop for native path/functions and final detachment."""
-    if (source.table.kind != "node" or target.table.kind != "node"
-            or relationship.table.kind != "rel"):
-        raise GrafxPlanError("A path requires node endpoints and a relationship.", field="path")
-    return _PathValue(nodes=(source, target), relationships=(relationship,))
+
 
 
 def _as_value(value: object) -> Value:

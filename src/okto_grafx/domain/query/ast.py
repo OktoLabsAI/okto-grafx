@@ -517,10 +517,9 @@ class PatternPath:
     variable: str | None = None
     """The name a MATCH gave this path, when it gave one.
 
-    Declared last, and defaulted, so every positional construction of a pattern keeps meaning
-    what it meant. The name is DECORATIVE in this subset: it is written, it is checked for
-    collisions, and nothing may read it -- so it changes what a query may SAY without changing
-    anything a query DOES.
+    An unused name is decorative and can retain the unnamed access path. A consumed
+    name captures the ordered walk under the query snapshot; its public result is
+    detached from live bindings. Names cannot collide with node/relationship bindings.
     """
 
     def describe(self) -> str:

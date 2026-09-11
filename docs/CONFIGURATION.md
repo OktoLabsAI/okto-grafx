@@ -12,9 +12,19 @@ applies to UNION typing; it introduces no new setting. See [entity results](ENTI
 
 Native `PathValue` uses the same materialization and spill limits. Its owned
 representation admits at most 1,024 nodes and exactly one fewer relationships;
-the currently executable named capture remains one-hop. General path enumeration
-is not enabled by constructing the DTO. `nodes()`/`relationships()` return entity
+typed explicit ranges accept zero through 30 hops per segment and can concatenate
+segments. Complete general path enumeration is not enabled by constructing the DTO.
+`nodes()`/`relationships()` return entity
 tuples rather than metadata maps; there is no path-output compatibility toggle.
+Composed bounded captures and clause-level relationship uniqueness add no
+configuration switch. They share traversal, cancellation and expression-work
+budgets, including list comparisons between variable-hop segments. Structural
+AST validation is independent of query syntax admission: mutable inventories,
+foreign AST subclasses and cycles are refused, not enabled by any compatibility flag.
+The legacy default of 20 for omitted syntactic upper bounds remains an assigned
+FP-3 limitation; it is not a proof of complete path enumeration. Depth-first
+streaming removes breadth-wide path retention. Existing adjacency fallback caches,
+result/spill limits, cancellation and path/expansion quotas still apply.
 
 The fixed numeric-token ceiling is 2,048 characters (excluding a unary sign),
 allowing long finite DOUBLE spellings. It is not a `connect()` setting. INT64
@@ -393,11 +403,12 @@ graph-pattern operator in one query. Variable and untyped traversal charge an ex
 candidate yielded by their selected endpoint source, before repeat-edge and landing checks; a
 fixed relationship scan charges each stored or pending relationship it encounters, before its
 pushed predicate and endpoint checks. A path is charged only after the applicable pushed predicate
-and landing visibility checks, immediately before the path can enter a variable-length frontier or
+and landing visibility checks, immediately before the path can enter variable-length expansion or
 be returned by a one-hop scan. The first over-limit unit is refused before it is retained or
 returned. These limits cover Cypher relationship traversal and scans, not the separate internal
 HNSW navigation performed by a vector-search operator. Physical rows read once to construct a
 grouped endpoint fallback are auxiliary scan work and are not charged as candidate expansions.
+Each zero-length anchor path consumes one path unit, but no expansion unit.
 When disabled the limits do not add traversal counters to `QueryResult.statistics`; when enabled,
 the corresponding `traversal_expansions` or `traversal_paths` statistic records admitted work on
 successful queries.

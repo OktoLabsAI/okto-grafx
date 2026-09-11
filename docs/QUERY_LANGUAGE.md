@@ -30,7 +30,7 @@ Python `execute()` call; CLI multi-statement arguments remain separate statement
 | `UNWIND $rows AS r` | repeated list expansion in ordered pipelines; NULL/empty carriers emit no rows |
 | `WITH` … `WHERE` | scalar/aggregate projection stages; `WITH *` carries the incoming named scope and can append explicit items; its WHERE runs after projection. Optional-hop aggregation has the closed forms below |
 | `MATCH (n)` | reads every node table as one set, including in composed read pipelines, inline maps and OPTIONAL MATCH; compatible-property checks, filters, aggregation and windows apply across the union; undeclared properties read as NULL |
-| Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
+| Traversal | one hop, bounded ranges including `[:REL*0..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | |
 | Aggregates | Exactly `count`, `sum`, `avg`, `min`, `max`, `collect`; scalar/aggregate type restrictions apply |
 | Scalar functions | text, numeric, conversion and list families below, plus graph/vector extensions |
@@ -40,7 +40,7 @@ Python `execute()` call; CLI multi-statement arguments remain separate statement
 | `UNION`, `UNION ALL` | Up to 64 read-only RETURN branches; same ordered column names, heterogeneous values and qualified node/edge entities, no implicit numeric conversion; one duplicate policy per chain |
 | CALL subqueries | Independent or explicitly imported returning read subqueries; maximum nesting 16 |
 | Typed CALL/YIELD | Trusted per-handle tabular registry, explicit permissions/budgets, composed execution |
-| Path projection | Native `PathValue` for outgoing typed one-hop capture, aliases, `length`, `nodes`, `relationships`; not general variable-length named paths |
+| Path projection | Native `PathValue` for typed bounded ranges, zero length and multiple segments in either direction; composed MATCH/OPTIONAL MATCH, aliases, subqueries, `length`, `nodes`, `relationships`. Untyped/type-alternative capture remains pending |
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
 dirty node table plans a scan plus the private overlay instead of consulting an index that only
@@ -350,20 +350,60 @@ refuse. Label-free typed endpoints and untyped relationships have closed forms,
 not permission for every arbitrary pattern. Independent traversal expansion/path
 budgets remain authoritative even with LIMIT.
 
-The narrow outgoing typed one-hop `MATCH p=(a:A)-[r:R]->(b:B) RETURN p`
+The typed one-hop `MATCH p=(a:A)-[r:R]->(b:B) RETURN p`
 returns a native `PathValue` with `nodes` and `relationships` tuples containing
 `NodeValue` and `RelationshipValue`. Components share the qualified identity,
 property and snapshot contract of direct entity returns. User properties live
 separately from metadata, so `_ID`/`_LABEL`/`_SRC`/`_DST` property names no longer
-conflict. The same one-hop capture supports aliases,
+conflict. Native typed capture supports aliases,
 multiple RETURN expressions and `length(p)`, `nodes(p)`, `relationships(p)`;
 NULL input returns NULL. Nodes/relationships return detached native components,
 which may be consumed by list expressions. Arbitrary maps are not accepted as
-paths. `size(p)` and `p.property` refuse. Other directions, variable-length named
-paths, WHERE/WITH, DISTINCT, ordering and SKIP remain outside this capture contract;
-a literal nonnegative LIMIT is supported. UNION and cursors preserve the captured
+paths. `size(p)` and `p.property` refuse. Captures compose with WHERE, WITH (including
+star expansion), UNWIND, DISTINCT, ordering, SKIP/LIMIT, typed OPTIONAL MATCH and
+returning subqueries. Incoming and undirected walks retain the physical relationship
+endpoints while ordering the path's nodes in walking order. An unmatched optional
+clause yields a NULL path. Schema-resolvable unlabelled endpoints and anonymous
+relationship variables are supported. Typed bounded ranges and multiple segments
+are also captured natively; fully untyped/ambiguous relationship alternatives and
+relationship inline maps remain pending.
+UNION and cursors preserve the captured
 path, including pending identity and spill metadata. See [native paths](ENTITY_VALUES.md#paths)
 for the breaking result/JSON contract. This is not a claim of general path algebra.
+
+```cypher
+MATCH p=(a:Person {id:$id})-[r:Knows*0..3]->(b:Person)
+RETURN p, length(p), nodes(p), relationships(p), r
+ORDER BY length(p)
+```
+
+An explicitly bounded typed segment accepts `0 <= minimum <= maximum <= 30`.
+`*0` returns its anchor as a path with one node and no relationships, including
+isolated nodes; the two endpoint variables name that same qualified node. A bound
+target still filters that identity. Zero-length matches need not belong to the
+relationship table's endpoints, since they traverse no edge. NULL anchors produce
+no path, and OPTIONAL may then null-extend the clause.
+
+Every written range binds its relationship variable to a tuple of relationships,
+including `*1..1` (one element) and `*0` (empty). An unstarred single hop binds one
+relationship entity. Adjacent captured segments concatenate at their common node
+without duplicating that junction. Their relations remain unique across the walk.
+Depth-first execution streams paths without retaining a breadth-wide frontier;
+it is not a shortest-path ordering guarantee. Use ORDER BY where ordering matters.
+Cursor close/limits stop and close unconsumed expansion iterators.
+
+The legacy omitted-upper-bound policy (`*`, `*n..` → an upper bound of 20) has not
+yet been replaced in this increment. It remains an explicitly assigned FP-3 gap:
+full-profile completion requires budget-governed refusal rather than treating a
+truncated enumeration as complete. Prefer explicit bounds for the current contract.
+
+Within one MATCH clause, relationship occurrences across its patterns/segments
+must be disjoint, including anonymous relationships and variable-hop segments.
+Qualified relationship identity keeps equal local IDs in different tables distinct.
+Separate MATCH clauses may observe the same relationship again. Repeated nodes
+alone do not violate trail uniqueness. The clause check runs before OPTIONAL null
+extension; it uses normal bounded expression evaluation, not a new transaction or
+an unbounded global graph scan.
 
 ## Schema, indexes and query costs
 

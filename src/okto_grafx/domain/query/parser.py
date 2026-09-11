@@ -937,17 +937,6 @@ class _Parser:
                 field="min_hops",
                 value=lower,
             )
-        if lower == 0:
-            # openCypher gives `*0..k` the start node itself as a zero-length path. This dialect's
-            # subset starts at one hop (`*1..3`), and the executor walks from depth 1 -- so an
-            # accepted zero was answered as `*1..k`, a third answer that is neither dialect's.
-            # Refusing at the door is the honest one of the two acceptable outcomes.
-            raise self._refuse(
-                "A variable-length relationship starts at one hop in this dialect; zero-length "
-                f"paths (*0..{upper}) are not supported",
-                field="min_hops",
-                value=0,
-            )
         return lower, upper
 
     def _hop_count(self) -> int:

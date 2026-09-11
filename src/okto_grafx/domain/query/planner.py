@@ -1237,7 +1237,10 @@ class _Planner:
                                  replace(binding, entity=("relationship" if self.polymorphic_tables.get(source)
                                          and self.polymorphic_tables[source][0].kind == "rel" else "node"))
                                  if source in self.polymorphic_variables else
-                                 replace(binding, entity="path") if source in self.bound_paths else binding
+                                 replace(binding, entity="path") if source in self.bound_paths else
+                                 replace(binding, entity="null alias")
+                                 if self._pulse_expression_type(Variable(source), owner="subquery import") is ValueType.NULL
+                                 else binding
                                  for source, binding in zip(outer, imported, strict=True))
                 sub = _Planner(
                     catalog=self.catalog, indexes=self.indexes, scalar_types=self.scalar_types,
@@ -2172,8 +2175,35 @@ class _Planner:
         original = list(conjuncts_of(clause.predicate))
         terms = list(original)
         self.seek_rechecks.clear()
+        prior_edges: list[tuple[str, bool]] = []
+        enforce_trail = sum(len(pattern.relationships) for pattern in clause.patterns) > 1
         for pattern in clause.patterns:
+            if enforce_trail:
+                pattern = replace(pattern, relationships=tuple(
+                    replace(edge, variable=edge.variable or self._anonymous())
+                    for edge in pattern.relationships
+                ))
             pipeline, terms = self._pattern(pipeline, pattern, terms)
+            if enforce_trail:
+                for edge in pattern.relationships:
+                    current = (edge.variable, edge.hop_range_written or edge.variable_length)
+                    for previous in prior_edges:
+                        left, right = Variable(previous[0]), Variable(current[0])
+                        distinct: Expression = BinaryOperation(operator="<>", left=left, right=right)
+                        if previous[1] or current[1]:
+                            left_name, right_name = self._anonymous(), self._anonymous()
+                            distinct = ListIteration(
+                                mode="all", variable=left_name,
+                                source=left if previous[1] else ListExpression(elements=(left,)),
+                                body=ListIteration(
+                                    mode="all", variable=right_name,
+                                    source=right if current[1] else ListExpression(elements=(right,)),
+                                    body=BinaryOperation(operator="<>", left=Variable(left_name),
+                                                         right=Variable(right_name)),
+                                ),
+                            )
+                        pipeline = FilterRows(child=pipeline, predicate=distinct)
+                    prior_edges.append(current)
         # A seek is only the access path that found a candidate.  When another term remains,
         # reconstruct the original conjunction around every equality the seek consumed.  A
         # residual such as ``p.name`` is UNKNOWN inside ``p.k = 1 AND p.name`` but is a refused
@@ -2220,17 +2250,21 @@ class _Planner:
             return fast
         first = pattern.nodes[0]
         inferred: TableDef | None = None
-        if pattern.relationships and not first.labels:
+        zero_anchor = bool(pattern.relationships and pattern.relationships[0].min_hops == 0 and not first.labels)
+        if pattern.relationships and not first.labels and not zero_anchor:
             inferred = self._typed_endpoint_source(pattern)
         pipeline, terms, source = self._match_node(
             pipeline,
             first,
             terms,
-            standalone=not pattern.relationships,
+            standalone=not pattern.relationships or zero_anchor,
             inferred_table=inferred,
         )
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
+            if capturing:
+                self.path_projection = replace(pattern, nodes=pattern.nodes[position:position + 2],
+                                               relationships=(relationship,))
             pipeline, source = self._traverse(
                 pipeline,
                 source,
@@ -2239,6 +2273,7 @@ class _Planner:
                 path_variable=(
                     pattern.variable if capturing else None
                 ),
+                path_append=capturing and position > 0,
             )
             if target_pattern.properties is not None:
                 # The inline map on a TARGET node is the same shorthand it is on the first node,
@@ -2269,6 +2304,16 @@ class _Planner:
         refusal it already earns for naming no label is the one to keep.
         """
         variable = pattern.variable or self._anonymous()
+        scalar_anchor = pattern.variable is not None and (
+            pattern.variable in self.binding_types or pattern.variable in self.alias_definitions
+        )
+        if scalar_anchor and self._pulse_expression_type(Variable(variable), owner="pattern anchor") is ValueType.NULL:
+            # A proven NULL is a failed rematch, not permission to enumerate nodes.
+            if pattern.labels:
+                self.tables[variable] = self._node_table_of(pattern)
+            elif inferred_table is not None:
+                self.tables[variable] = inferred_table
+            return FilterRows(child=pipeline, predicate=Literal(False)), terms, variable
         if pattern.variable is not None and pattern.variable in self.polymorphic_variables:
             # Re-matching an incoming entity is a test, not a new cross product.
             # Preserve its table-qualified binding and null-extension semantics.
@@ -2451,15 +2496,25 @@ class _Planner:
                 self._polymorphic_property_type(node.key, node.describe(), subject.name)
 
     def _typed_endpoint_source(self, pattern: PatternPath) -> TableDef | None:
-        """Return the table a label-free source reads, when the query is the one shape for it.
+        """Infer a typed capture's source when direction/schema determine it.
 
-        The FAR end of a hop already takes its table from the relationship: ``(a:X)-[r:T]->(b)``
-        binds b to T's TO table without b naming a label, because a relationship declares what
-        sits at each of its ends. This is that same rule applied to the NEAR end, and
-        deliberately nothing more -- it answers only for the exact frozen form, so no other
-        pattern in the language starts resolving a name from a schema it did not resolve it
-        from before.
+        Zero-hop unbound anchors are planned separately across node tables: they
+        need not belong to the relationship endpoints. Ambiguous undirected starts
+        still need broader alternatives. The older unnamed fast shape remains valid.
         """
+        if pattern.variable is not None and pattern.relationships:
+            relationship = pattern.relationships[0]
+            if len(relationship.types) == 1:
+                table = self._relationship_table(relationship)
+                if relationship.direction is Direction.OUTGOING:
+                    return self._table_named(str(table.from_table), "from_table")
+                if relationship.direction is Direction.INCOMING:
+                    return self._table_named(str(table.to_table), "to_table")
+                target_labels = pattern.nodes[-1].labels
+                if table.from_table == table.to_table or target_labels == (table.to_table,):
+                    return self._table_named(str(table.from_table), "from_table")
+                if target_labels == (table.from_table,):
+                    return self._table_named(str(table.to_table), "to_table")
         if not self.typed_endpoint_form:
             return None
         relationship = pattern.relationships[0]
@@ -2734,6 +2789,7 @@ class _Planner:
         target_pattern: NodePattern,
         *,
         path_variable: str | None = None,
+        path_append: bool = False,
     ) -> tuple[PlanNode, str]:
         """Plan one relationship hop, or a bounded range of them."""
         if self.untyped_one_hop_label is not None and not relationship.types:
@@ -2748,7 +2804,7 @@ class _Planner:
                 value=relationship.describe(),
             )
         table = self._relationship_table(relationship)
-        if path_variable is not None:
+        if path_variable is not None and not relationship.variable_length:
             self._require_path_projection_schema(table)
         if relationship.properties is not None:
             raise GrafxPlanError(
@@ -2757,8 +2813,9 @@ class _Planner:
                 field="properties",
                 value=relationship.describe(),
             )
-        self._require_endpoint(source, table, relationship.direction)
-        if relationship.variable is not None and relationship.variable_length:
+        if relationship.min_hops > 0:
+            self._require_endpoint(source, table, relationship.direction)
+        if relationship.variable is not None and (relationship.variable_length or relationship.hop_range_written):
             # `[r*1..3]` binds every hop it walked, so `r` is a tuple of bindings rather
             # than one row.  Recording that here is what lets label() refuse it while
             # planning instead of discovering the shape once a row arrives.
@@ -2773,6 +2830,19 @@ class _Planner:
         already_bound = named is not None and named in self.tables
         target_variable = named if named is not None else self._anonymous()
         target_table = self._target_table(table, relationship.direction, target_pattern)
+        zero_tables = (self.polymorphic_tables.get(source, self._node_tables()) if source in self.polymorphic_variables
+                       else (self.tables[source],) if source in self.tables else ())
+        if not target_pattern.labels and not already_bound and relationship.variable_length and (
+                table.from_table != table.to_table or (relationship.min_hops == 0 and
+                any(candidate.name != table.to_table for candidate in zero_tables))):
+            target_table = None
+            self.polymorphic_variables.add(target_variable)
+            candidates = tuple(
+                self._table_named(name, "endpoint") for name in (table.from_table, table.to_table)
+            )
+            if relationship.min_hops == 0:
+                candidates = (*candidates, *zero_tables)
+            self.polymorphic_tables[target_variable] = tuple({candidate.table_id: candidate for candidate in candidates}.values())
         if already_bound and named is not None:
             if target_pattern.labels:
                 self._require_same_table(named, target_pattern.labels)
@@ -2802,6 +2872,8 @@ class _Planner:
                 target_table=target_table,
                 target_bound=already_bound,
                 path_variable=path_variable,
+                path_append=path_append,
+                relationship_list=relationship.hop_range_written,
             ),
             target_variable,
         )

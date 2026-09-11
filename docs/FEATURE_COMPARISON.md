@@ -56,8 +56,14 @@ general query-language parity. See
 The existing typed one-hop named capture now returns native `PathValue` with
 qualified entity components, immutable observations and tagged JSON; UNION,
 spill and cursors preserve those observations. Metadata-named user properties
-no longer collide with result structure. This changes result quality and
-consumption, not the still-bounded set of executable path patterns.
+no longer collide with result structure. The subsequent FP-3 increment broadens
+single-hop captures to incoming/undirected walks, WHERE/WITH/UNWIND, typed OPTIONAL
+MATCH, windows and returning subqueries (including path-or-NULL UNION exports).
+Clause-level relationship uniqueness now spans separate patterns/segments, while
+separate MATCH clauses may reuse edges. The next increment adds explicit typed
+variable ranges, zero length, cycles and concatenated segments with streaming
+depth-first expansion. Untyped alternatives and the omitted-upper-bound policy
+remain incomplete; this is not complete path-language parity.
 
 | Product | Baseline and evidence |
 | --- | --- |

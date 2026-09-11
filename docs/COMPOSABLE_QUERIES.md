@@ -182,8 +182,15 @@ values, including nested and aggregate entities. Entity deduplication retains
 table/incarnation identity; two tables' local record ID 1 is not one entity.
 Returning subqueries export known same-kind entity table alternatives for later
 property access/grouping. [Entity results and JSON](ENTITY_VALUES.md) describe the
-breaking development contract. The admitted one-hop `PathValue` also survives
-UNION/ALL and cursors; general named-path traversal remains pending. All branches
+breaking development contract. The admitted typed bounded `PathValue` also survives
+UNION/ALL and cursors, including import/export through returning subqueries and
+path-or-NULL branches consumed by path functions. Captures also compose with
+WITH/UNWIND, DISTINCT/order/windows and typed OPTIONAL MATCH; optional failure
+extends the path as NULL. Within one MATCH, all relationship occurrences must be
+disjoint; separate MATCH clauses may reuse relationships. Typed zero-length and
+multiple captured segments concatenate without duplicating junction nodes.
+Untyped/type-alternative capture and the omitted-upper-bound policy remain pending.
+All branches
 share one snapshot and existing resource limits, including the alias-expanded
 typing-depth ceiling. Column-name mismatches fail before execution with
 `reason="different_columns_in_union"`, `query_phase="planning"`.

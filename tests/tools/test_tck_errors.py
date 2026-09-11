@@ -108,3 +108,27 @@ def test_membership_mapping_requires_full_evidence(details):
     from tools.tck_errors import native_error
 
     assert native_error(GrafxPlanError("IN refusal", **details)).phase == "unknown"
+
+
+@pytest.mark.parametrize("function", ["length", "nodes", "relationships"])
+def test_path_mapper_uses_actual_native_static_type_error(function):
+    backend = NativeScenarioBackend()
+    try:
+        backend.admit({"steps": []})
+        observed = backend.execute(f"RETURN {function}(1)", {}, control=False)
+        assert observed.error.type == "SyntaxError"
+        assert observed.error.phase == "compile time"
+        assert observed.error.detail == "InvalidArgumentType"
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"query_phase": None}, {"field": "operator"}, {"value": "SIZE"}, {"reason": "other"},
+])
+def test_path_mapping_requires_complete_native_evidence(overrides):
+    from okto_grafx.errors import GrafxPlanError
+    from tools.tck_errors import native_error
+
+    details = {"field": "function", "value": "LENGTH", "reason": "path_argument_type", "query_phase": "planning"}
+    assert native_error(GrafxPlanError("Path refusal", **(details | overrides))).phase == "unknown"

@@ -261,16 +261,11 @@ def test_every_hop_range_form_reads_its_bounds(
     assert (relationship.min_hops, relationship.max_hops) == expected
 
 
-@pytest.mark.parametrize("written", ["*0", "*0..2", "*0..0"])
-def test_a_zero_length_path_is_refused_rather_than_answered_as_one_hop(written: str) -> None:
-    """openCypher gives ``*0..k`` the start node itself; this dialect starts at one hop.
-
-    An accepted zero used to be executed from depth 1 -- ``*0..1`` answered as ``*1..1`` -- a
-    third answer that is neither dialect's. Refusing at the door is the honest outcome.
-    """
-    with pytest.raises(GrafxParseError) as refusal:
-        parse(f"MATCH (a:Person)-[:Knows{written}]->(b:Person) RETURN b.name")
-    assert refusal.value.details["field"] == "min_hops"
+@pytest.mark.parametrize("written,upper", [("*0", 0), ("*0..2", 2), ("*0..0", 0)])
+def test_zero_length_range_is_preserved_without_rewriting_to_one(written, upper):
+    statement = parse(f"MATCH (a:Person)-[:Knows{written}]->(b:Person) RETURN b.name")
+    hop = statement.match_clauses[0].patterns[0].relationships[0]
+    assert (hop.min_hops, hop.max_hops, hop.hop_range_written) == (0, upper, True)
 
 
 def test_a_pattern_may_carry_inline_properties() -> None:

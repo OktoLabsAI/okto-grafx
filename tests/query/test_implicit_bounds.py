@@ -297,8 +297,6 @@ def test_relationship_scan_charges_filtered_candidates_but_no_paths(tmp_path: Pa
 @pytest.mark.parametrize(
     ("spelling", "field"),
     [
-        ("*0..", "min_hops"),
-        ("*0..3", "min_hops"),
         ("*25..", "min_hops"),
         ("*3..2", "min_hops"),
         ("*1..31", "hops"),
@@ -387,7 +385,7 @@ def _supplied_analysis(statement: Query) -> QueryAnalysis:
         ("a lower bound that is a bool", {"min_hops": True, "max_hops": 3}),
         ("an upper bound that is a float", {"min_hops": 1, "max_hops": 2.5}),
         ("an upper bound past the ceiling", {"min_hops": 1, "max_hops": 10_000}),
-        ("a lower bound below one", {"min_hops": 0, "max_hops": 3}),
+        ("a negative lower bound", {"min_hops": -1, "max_hops": 3}),
         ("a lower bound above the upper", {"min_hops": 5, "max_hops": 2}),
         ("an object that refuses to be read", {"min_hops": 1, "max_hops": _Hostile()}),
         (
@@ -417,7 +415,9 @@ def test_a_forged_hop_range_is_refused_at_both_doors(
 
     with pytest.raises(GrafxPlanError) as analysed:
         analyze(statement)
-    assert analysed.value.details["field"] == "hops", name
+    expected_field = "ast" if any(type(value) is not (bool if key == "hop_range_written" else int)
+                                 for key, value in fields.items()) else "hops"
+    assert analysed.value.details["field"] == expected_field, name
 
     # The analysis is SUPPLIED, so build_plan does not fall back to analyze() -- without this
     # the assertion below would be re-testing the door above and proving nothing about the
@@ -429,12 +429,13 @@ def test_a_forged_hop_range_is_refused_at_both_doors(
             indexes=indexes,
             analysis=_supplied_analysis(statement),
         )
-    assert planned.value.details["field"] == "hops", name
+    assert planned.value.details["field"] == expected_field, name
 
 
-def test_a_legitimate_range_passes_both_doors(catalog: object, indexes: tuple) -> None:
+@pytest.mark.parametrize("minimum", [0, 1])
+def test_a_legitimate_range_passes_both_doors(catalog: object, indexes: tuple, minimum: int) -> None:
     """The control: the guard refuses forged fields, not variable-length traversal."""
-    statement = _forged(min_hops=1, max_hops=DEFAULT_TRAVERSAL_HOPS)
+    statement = _forged(min_hops=minimum, max_hops=DEFAULT_TRAVERSAL_HOPS)
 
     assert analyze(statement) is not None
     planned = build_plan(
