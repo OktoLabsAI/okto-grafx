@@ -7,8 +7,10 @@ This page documents the **0.0.6 development API**, not a published release or
 completed FP-3 acceptance. Native `execute` and cursors now return `NodeValue`
 for typed and polymorphic nodes and `RelationshipValue` for relationships, also
 inside lists/maps. Both types, `EntityIdentity` and `EntityProvenance`, are exported
-from `okto_grafx`. `PathValue` remains internal: native path-result integration,
-entity UNION and coordinated Pulse migration are still pending.
+from `okto_grafx`. UNION/UNION ALL now preserve these entities, including nested
+values and aggregate spill. `PathValue` is also exported and returned by the
+currently admitted one-hop capture, including UNION and cursors. General named
+path traversal/composition and coordinated Pulse migration are still pending.
 
 This is an intentional breaking result change, with no legacy-result mode. Replace
 assumptions that an entity is a table-local integer or a mutable `label/properties`
@@ -33,11 +35,12 @@ Root imports and fields:
 | `EntityProvenance` | `read_lsn: int`, `schema_version: int`, `version_lsn: int \| None`, `pending: bool` |
 | `NodeValue` | `identity: EntityIdentity`, `label: str`, `properties: Mapping[str, object]`, `provenance: EntityProvenance`; `labels: tuple[str, ...]` property |
 | `RelationshipValue` | Same observation fields, plus `source: EntityIdentity` and `target: EntityIdentity` |
+| `PathValue` | `nodes: tuple[NodeValue, ...]`, `relationships: tuple[RelationshipValue, ...]`; `len(path)` returns the relationship count |
 
 Each type offers `to_dict() -> dict[str, object]`. These are detached data values,
 not alternate mutation or parameter APIs. Query parameters still refuse entities.
 `QueryValue`, also exported from `okto_grafx`, annotates result scalars, nodes,
-relationships and recursive result lists/maps. It is distinct from the stored/
+relationships, paths and recursive result lists/maps. It is distinct from the stored/
 parameter `Value` grammar. QueryResult rows/dictionaries and cursor fetch methods
 use this result alias; it does not widen parameter or column-type admission.
 
@@ -91,6 +94,26 @@ option is introduced by this internal model.
 
 ## Paths
 
+The admitted outgoing typed one-hop capture now returns `PathValue`, replacing
+the former `_NODES`/`_RELS` maps. There is no legacy map-result switch.
+`nodes(p)`/`relationships(p)` return native entity tuples with the same qualified
+identity and observed properties as direct node/edge returns. For example:
+
+```python
+from okto_grafx import PathValue
+
+path = db.execute("MATCH p=(a:Person)-[r:Knows]->(b:Person) RETURN p").rows[0][0]
+assert isinstance(path, PathValue)
+assert path.relationships[0].source == path.nodes[0].identity
+serialized = path.to_dict()
+```
+
+User properties named `_ID`, `_LABEL`, `_SRC` or `_DST` are ordinary properties,
+separate from identity/endpoint attributes; the old structural-key ban is removed.
+Pending path components use the same authenticated opaque identities as returned
+nodes/edges, not execution-local negative numbers. Commit produces new durable
+identities without mutating already-returned paths.
+
 A path owns ordered node and relationship tuples. It has one more node than
 relationships; a zero-hop path owns one node. Each relationship must connect its
 adjacent nodes in either direction. Ordering distinguishes forward and reverse
@@ -100,7 +123,13 @@ Path equality/hash use the ordered entity identities, not property observations.
 Repeated nodes and cycles are representable. The DTO represents a walk; the query
 executor must separately enforce the pattern's relationship-uniqueness/trail rules
 and traversal/cancellation budgets. Constructing this DTO does **not** implement
-general variable-length named traversal.
+general variable-length named traversal. The current native capture remains
+outgoing, typed and one-hop, with the existing projection/limit restrictions.
+UNION/ALL and result cursors preserve path identity and snapshot. Temporary path
+spill uses the bounded row codec and refuses malformed cardinality, nonentity
+components, invalid endpoint connections and future source versions. Private
+execution bindings are materialized before the public result boundary; they
+cannot themselves be supplied as public path values or parameters.
 
 ## JSON grammar
 
@@ -142,8 +171,31 @@ state per table/revision instead of rescanning all transaction writes for each r
 `RETURN DISTINCT n ORDER BY n.id` can read a property of the returned entity;
 properties of discarded variables remain refused.
 
-Path output/functions, entity-valued UNION and all aggregate/spill combinations
-still need complete integration and frozen-case validation. Broader alias/scope
+UNION deduplicates by qualified entity identity, not properties or a table-local
+integer. UNION ALL retains duplicates. Returning UNION subqueries preserve known
+same-kind table alternatives for subsequent property access and grouping; a NULL
+branch does not discard the peer's entity type. `collect`, `collect(DISTINCT ...)`,
+`min` and `max` preserve entity observations through the bounded spill codec.
+Mixed scalar/entity results remain values, not a claim that every returned column
+has one entity kind. Different output headings are refused during planning with
+`reason="different_columns_in_union"`. Alias-expanded typing retains the existing
+expression-depth budget even when an entity is a legal output.
+One chain cannot mix UNION and UNION ALL; combine different policies in separate
+returning subquery scopes. This replaces the former mixed-chain extension without
+introducing a legacy mode or changing the transaction/snapshot boundary.
+
+```cypher
+CALL () {
+  MATCH (n:Person) RETURN n
+  UNION ALL
+  MATCH (n:Person) RETURN n
+}
+WITH n, count(*) AS copies
+RETURN n, copies ORDER BY n.id
+```
+
+General named-path execution and broader aggregate/spill combinations still need
+complete integration and frozen-case validation. Broader alias/scope
 composition, projection budgets, public adversarial tests and the full query/txn
 checkpoint remain open. Pulse result/JSON consumers must be mapped and tested
 before the public breaking change is accepted as a coordinated delivery.

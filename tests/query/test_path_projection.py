@@ -3,8 +3,8 @@
 The capability is deliberately bounded. It is not a general path value implementation:
 ``MATCH path = (a:Label)-[r:Type]->(b:Label) RETURN path`` admits caller-defined identifiers.
 It may carry only a terminal literal non-negative ``LIMIT``. These tests freeze both halves of
-that statement: the narrow parser/analyser/planner gate and the Kuzu/Ladybug-compatible public
-value produced for each matching edge.
+that statement: the narrow parser/analyser/planner gate and the native qualified
+PathValue produced for each matching edge.
 """
 
 from __future__ import annotations
@@ -58,7 +58,6 @@ from okto_grafx.domain.query.plan import (
     TraverseRelationship,
 )
 from okto_grafx.domain.query.planner import build_plan
-from okto_grafx.engine.query_engine import QueryEngine
 
 ADMITTED = "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path"
 
@@ -167,59 +166,23 @@ def database(tmp_path: Path) -> Iterator[object]:
         handle.close()
 
 
-def _identity(value: object) -> dict[str, int]:
-    """Check an opaque Kuzu-shaped identity without pinning physical numbers."""
-    assert type(value) is dict
-    assert tuple(value) == ("offset", "table")
-    assert type(value["offset"]) is int
-    assert type(value["table"]) is int
-    return value
-
-
-def _assert_path(
-    value: object,
-    *,
-    source: tuple[str, str],
-    target: tuple[str, str],
-    relationship: tuple[str, str],
-) -> dict[str, object]:
-    """Assert the exact public shape, order and endpoint correlations of one path."""
-    assert type(value) is dict
-    assert tuple(value) == ("_NODES", "_RELS")
-    nodes = value["_NODES"]
-    relationships = value["_RELS"]
-    assert type(nodes) is tuple
-    assert type(relationships) is tuple
-    assert len(nodes) == 2
-    assert len(relationships) == 1
-
-    source_node, target_node = nodes
-    assert type(source_node) is dict
-    assert type(target_node) is dict
-    assert tuple(source_node) == ("_ID", "_LABEL", "id", "title")
-    assert tuple(target_node) == ("_ID", "_LABEL", "id", "title")
-    source_identity = _identity(source_node["_ID"])
-    target_identity = _identity(target_node["_ID"])
-    assert source_node["_LABEL"] == "Decision"
-    assert target_node["_LABEL"] == "Decision"
-    assert (source_node["id"], source_node["title"]) == source
-    assert (target_node["id"], target_node["title"]) == target
-
-    edge = relationships[0]
-    assert type(edge) is dict
-    assert tuple(edge) == (
-        "_SRC",
-        "_DST",
-        "_LABEL",
-        "_ID",
-        "layer",
-        "note",
-    )
-    assert _identity(edge["_SRC"]) == source_identity
-    assert _identity(edge["_DST"]) == target_identity
-    assert edge["_LABEL"] == "supersedes"
-    _identity(edge["_ID"])
-    assert (edge["layer"], edge["note"]) == relationship
+def _assert_path(value: object, *, source: tuple[str, str], target: tuple[str, str],
+                 relationship: tuple[str, str]) -> okto_grafx.PathValue:
+    """Assert native qualified identity, materialized properties and endpoint order."""
+    assert type(value) is okto_grafx.PathValue
+    assert type(value.nodes) is tuple and type(value.relationships) is tuple
+    assert len(value.nodes) == 2 and len(value.relationships) == 1
+    source_node, target_node = value.nodes
+    assert type(source_node) is okto_grafx.NodeValue and type(target_node) is okto_grafx.NodeValue
+    assert source_node.label == target_node.label == "Decision"
+    assert (source_node.properties["id"], source_node.properties["title"]) == source
+    assert (target_node.properties["id"], target_node.properties["title"]) == target
+    edge = value.relationships[0]
+    assert type(edge) is okto_grafx.RelationshipValue
+    assert edge.source == source_node.identity and edge.target == target_node.identity
+    assert edge.label == "supersedes"
+    assert (edge.properties["layer"], edge.properties["note"]) == relationship
+    assert edge.provenance.read_lsn == source_node.provenance.read_lsn == target_node.provenance.read_lsn
     return value
 
 
@@ -231,7 +194,7 @@ def _paths(owner: object) -> tuple[dict[str, object], ...]:
 
 
 def _by_layer(paths: tuple[dict[str, object], ...]) -> dict[str, dict[str, object]]:
-    return {path["_RELS"][0]["layer"]: path for path in paths}
+    return {path.relationships[0].properties["layer"]: path for path in paths}
 
 
 # --- exact syntax, analysis and plan -------------------------------------------------------------
@@ -293,7 +256,7 @@ def test_lexical_trivia_does_not_change_the_exact_ast_gate(text: str) -> None:
     assert exact_path_projection(statement) is not None
 
 
-def test_one_edge_returns_one_correlated_kuzu_shaped_path(database: object) -> None:
+def test_one_edge_returns_one_correlated_native_path(database: object) -> None:
     paths = _paths(database)
     assert len(paths) == 1
     _assert_path(
@@ -308,7 +271,7 @@ def test_native_path_functions_return_owned_components(database: object) -> None
     prefix = "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN "
     path = database.execute(prefix + "path").rows[0][0]
     assert database.execute(prefix + "length(path), nodes(path), relationships(path)").rows == (
-        (1, path["_NODES"], path["_RELS"]),
+        (1, path.nodes, path.relationships),
     )
     assert database.execute(prefix + "[n IN nodes(path) | n.id]").rows == ((("d1", "d2"),),)
     assert database.execute(prefix + "head(relationships(path)).note").rows == (("primary",),)
@@ -367,20 +330,11 @@ def test_projected_path_refuses_a_catalog_with_the_wrong_target_endpoint() -> No
         ("supersedes", "_ID"),
     ),
 )
-def test_projected_path_refuses_properties_that_shadow_structural_keys_before_stream(
+def test_projected_path_properties_are_separate_from_structural_keys(
     table_name: str, property_name: str
 ) -> None:
     catalog = _catalog_with_path_reserved_property(table_name, property_name)
-
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(parse(ADMITTED), catalog=catalog)
-
-    assert raised.value.details == {
-        "field": "column",
-        "value": property_name,
-        "table": table_name,
-    }
-    assert property_name in str(raised.value)
+    build_plan(parse(ADMITTED), catalog=catalog)
 
 
 def test_physical_relationship_endpoints_do_not_shadow_path_keys() -> None:
@@ -398,8 +352,8 @@ def test_physical_relationship_endpoints_do_not_shadow_path_keys() -> None:
     )
 
 
-def test_public_execute_reports_a_reserved_path_property_as_a_plan_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_public_execute_keeps_metadata_named_user_properties_separate(
+    tmp_path: Path
 ) -> None:
     database = okto_grafx.connect(tmp_path / "reserved-path-property", page_size=512)
     try:
@@ -418,17 +372,9 @@ def test_public_execute_reports_a_reserved_path_property_as_a_plan_error(
                 "CREATE (a)-[:supersedes {reason: 'newer'}]->(b)"
             )
 
-        def fail_if_run(*_args: object, **_kwargs: object) -> object:
-            pytest.fail("query execution was reached after the planning refusal")
-
-        monkeypatch.setattr(QueryEngine, "_run", fail_if_run)
-        with pytest.raises(GrafxPlanError) as raised:
-            database.execute(ADMITTED)
-        assert raised.value.details == {
-            "field": "column",
-            "value": "_ID",
-            "table": "Decision",
-        }
+        path = database.execute(ADMITTED).rows[0][0]
+        assert [node.properties["_ID"] for node in path.nodes] == ["user-one", "user-two"]
+        assert path.relationships[0].source == path.nodes[0].identity
     finally:
         database.close()
 
@@ -470,9 +416,9 @@ def test_parallel_edges_are_distinct_paths_with_shared_endpoint_identities(
         target=("d2", "target"),
         relationship=("working", "parallel"),
     )
-    assert canonical["_NODES"][0]["_ID"] == working["_NODES"][0]["_ID"]
-    assert canonical["_NODES"][1]["_ID"] == working["_NODES"][1]["_ID"]
-    assert canonical["_RELS"][0]["_ID"] != working["_RELS"][0]["_ID"]
+    assert canonical.nodes[0].identity == working.nodes[0].identity
+    assert canonical.nodes[1].identity == working.nodes[1].identity
+    assert canonical.relationships[0].identity != working.relationships[0].identity
 
 
 def test_direction_and_self_loop_correlations_follow_the_stored_edge(
@@ -501,10 +447,10 @@ def test_direction_and_self_loop_correlations_follow_the_stored_edge(
         target=("d1", "source"),
         relationship=("loop", "self"),
     )
-    assert reverse["_RELS"][0]["_SRC"] == reverse["_NODES"][0]["_ID"]
-    assert reverse["_RELS"][0]["_DST"] == reverse["_NODES"][1]["_ID"]
-    assert loop["_NODES"][0]["_ID"] == loop["_NODES"][1]["_ID"]
-    assert loop["_RELS"][0]["_SRC"] == loop["_RELS"][0]["_DST"]
+    assert reverse.relationships[0].source == reverse.nodes[0].identity
+    assert reverse.relationships[0].target == reverse.nodes[1].identity
+    assert loop.nodes[0].identity == loop.nodes[1].identity
+    assert loop.relationships[0].source == loop.relationships[0].target
 
 
 # --- transactional visibility ------------------------------------------------------------------
@@ -715,45 +661,22 @@ def test_parallel_paths_trip_only_the_result_budget_when_work_fits(
         database.close()
 
 
-def test_public_path_is_json_serialisable_deeply_owned_and_capability_free(
-    database: object,
-) -> None:
+def test_public_path_is_json_serialisable_deeply_owned_and_capability_free(database: object) -> None:
     first = _paths(database)[0]
-    _assert_path(
-        first,
-        source=("d1", "source"),
-        target=("d2", "target"),
-        relationship=("canonical", "primary"),
-    )
-    assert json.loads(json.dumps(first))["_RELS"][0]["layer"] == "canonical"
-    assert "_Path" not in repr(first)
+    _assert_path(first, source=("d1", "source"), target=("d2", "target"), relationship=("canonical", "primary"))
+    detached = first.to_dict()
+    assert json.loads(json.dumps(detached))["relationships"][0]["properties"]["layer"] == "canonical"
     assert "RowBinding" not in repr(first)
-    committed_identities = (
-        dict(first["_NODES"][0]["_ID"]),
-        dict(first["_NODES"][1]["_ID"]),
-        dict(first["_RELS"][0]["_ID"]),
-    )
-
-    first["_NODES"][0]["id"] = "poisoned"
-    first["_NODES"][0]["_ID"]["offset"] = 999
-    first["_RELS"][0]["layer"] = "poisoned"
-
+    with pytest.raises(TypeError):
+        first.nodes[0].properties["id"] = "poisoned"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        first.nodes[0].identity.record_id = 999
+    detached["nodes"][0]["properties"]["id"] = "poisoned"
+    detached["relationships"][0]["properties"]["layer"] = "poisoned"
     second = _paths(database)[0]
-    _assert_path(
-        second,
-        source=("d1", "source"),
-        target=("d2", "target"),
-        relationship=("canonical", "primary"),
-    )
-    assert second is not first
-    assert second["_NODES"][0] is not first["_NODES"][0]
-    assert second["_NODES"][0]["_ID"] is not first["_NODES"][0]["_ID"]
-    assert second["_RELS"][0] is not first["_RELS"][0]
-    assert (
-        second["_NODES"][0]["_ID"],
-        second["_NODES"][1]["_ID"],
-        second["_RELS"][0]["_ID"],
-    ) == committed_identities
+    _assert_path(second, source=("d1", "source"), target=("d2", "target"), relationship=("canonical", "primary"))
+    assert second == first and hash(second) == hash(first)
+    assert second is not first and second.nodes[0] is not first.nodes[0]
 
 
 def test_public_plan_is_owned_and_keeps_only_the_explicit_path_marker(

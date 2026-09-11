@@ -37,10 +37,10 @@ Python `execute()` call; CLI multi-statement arguments remain separate statement
 | Conditional/list expressions | searched/simple `CASE`; zero-based/negative indexing and half-open slices; list comprehensions, all/any/none/single, reduce, concatenation; case-sensitive map access |
 | Parameters | `$name`, refused before anything runs if one is missing |
 | `OPTIONAL MATCH` | Correlated typed patterns and whole-clause null extension; optimized incident-hop execution retained |
-| `UNION`, `UNION ALL` | Up to 64 read-only RETURN branches; same ordered column names, heterogeneous values, no implicit numeric conversion |
+| `UNION`, `UNION ALL` | Up to 64 read-only RETURN branches; same ordered column names, heterogeneous values and qualified node/edge entities, no implicit numeric conversion; one duplicate policy per chain |
 | CALL subqueries | Independent or explicitly imported returning read subqueries; maximum nesting 16 |
 | Typed CALL/YIELD | Trusted per-handle tabular registry, explicit permissions/budgets, composed execution |
-| Path projection | Outgoing typed one-hop path map, aliases, `length`, `nodes`, `relationships`; not general variable-length named paths |
+| Path projection | Native `PathValue` for outgoing typed one-hop capture, aliases, `length`, `nodes`, `relationships`; not general variable-length named paths |
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
 dirty node table plans a scan plus the private overlay instead of consulting an index that only
@@ -68,7 +68,7 @@ In the 0.0.6 development line, returning a node (typed or polymorphic) yields
 lists/maps. Their properties are immutable observations and their identities
 include database/table/kind/incarnation. `to_dict()` provides owned tagged JSON.
 This replaces prior integer/mutable-map entity output, not scalar `n.id` values.
-See [entity result contract and remaining path/UNION work](ENTITY_VALUES.md).
+See [entity/UNION result contract and remaining path work](ENTITY_VALUES.md).
 
 Standalone label-free node patterns compose with preceding UNWIND/WITH, multiple
 MATCH clauses/patterns and returning read subqueries. `MATCH ()` preserves node
@@ -274,8 +274,9 @@ not removed merely by supporting clause composition.
 `RETURN 1 AS n UNION RETURN 1.0 AS n` returns one value, retaining the first
 occurrence's type. UNION ALL returns both `1` and `1.0` without conversion.
 Branches share a snapshot and budgets and must publish identical ordered column
-names. Branch-local DISTINCT/windows remain local. Multi-branch chains associate
-left-to-right; RETURN subqueries provide an explicit outer projection/sort.
+names. Branch-local DISTINCT/windows remain local. Each chain uses only UNION or
+only UNION ALL; mixed policies fail during planning. Returning subqueries provide
+separate scopes for combining policies and an explicit outer projection/sort.
 Write branches remain refused. See [composition, scopes and bounds](COMPOSABLE_QUERIES.md).
 
 ### Native scalar additions (0.0.6)
@@ -350,16 +351,19 @@ not permission for every arbitrary pattern. Independent traversal expansion/path
 budgets remain authoritative even with LIMIT.
 
 The narrow outgoing typed one-hop `MATCH p=(a:A)-[r:R]->(b:B) RETURN p`
-returns a map with `_NODES` and `_RELS`. Node maps carry `_ID`, `_LABEL` and
-properties; relation maps carry `_SRC`, `_DST`, `_LABEL`, `_ID` and properties.
-IDs are opaque backend-local numbers; lists are native tuples. Structural-key
-collisions refuse before streaming. The same one-hop capture supports aliases,
+returns a native `PathValue` with `nodes` and `relationships` tuples containing
+`NodeValue` and `RelationshipValue`. Components share the qualified identity,
+property and snapshot contract of direct entity returns. User properties live
+separately from metadata, so `_ID`/`_LABEL`/`_SRC`/`_DST` property names no longer
+conflict. The same one-hop capture supports aliases,
 multiple RETURN expressions and `length(p)`, `nodes(p)`, `relationships(p)`;
-NULL input returns NULL. Nodes/relationships return detached component maps,
+NULL input returns NULL. Nodes/relationships return detached native components,
 which may be consumed by list expressions. Arbitrary maps are not accepted as
 paths. `size(p)` and `p.property` refuse. Other directions, variable-length named
 paths, WHERE/WITH, DISTINCT, ordering and SKIP remain outside this capture contract;
-a literal nonnegative LIMIT is supported. This is not a claim of general path algebra.
+a literal nonnegative LIMIT is supported. UNION and cursors preserve the captured
+path, including pending identity and spill metadata. See [native paths](ENTITY_VALUES.md#paths)
+for the breaking result/JSON contract. This is not a claim of general path algebra.
 
 ## Schema, indexes and query costs
 

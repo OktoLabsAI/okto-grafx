@@ -34,7 +34,15 @@ def compile_error(error) -> ObservedError:
         elif field == "escape" and message.startswith("A numeric string escape needs "):
             detail = "InvalidUnicodeLiteral"
     elif isinstance(error, GrafxPlanError):
-        if (field == "variable" and error.details.get("reason") == "undefined_variable"
+        if (field == "union" and value == "columns"
+                and error.details.get("reason") == "different_columns_in_union"
+                and error.details.get("query_phase") == "planning"):
+            detail = "DifferentColumnsInUnion"
+        elif (field == "union" and value == "composition"
+                and error.details.get("reason") == "mixed_union_composition"
+                and error.details.get("query_phase") == "planning"):
+            detail = "InvalidClauseComposition"
+        elif (field == "variable" and error.details.get("reason") == "undefined_variable"
                 and error.details.get("query_phase") == "planning"):
             detail = "UndefinedVariable"
         elif (field in {"expression", "sort_item"} and error.details.get("reason") == "invalid_aggregation_context"
@@ -59,6 +67,8 @@ def native_error(error) -> ObservedError:
             if reason in {"range_argument_type", "range_argument_bounds"}:
                 return ObservedError("ArgumentError", phase,
                                      "InvalidArgumentType" if reason == "range_argument_type" else "NumberOutOfRange")
+        if field == "function" and error.details.get("value") in {"LENGTH", "NODES", "RELATIONSHIPS"} and reason == "path_argument_type":
+            return ObservedError("SyntaxError" if phase == "compile time" else "TypeError", phase, "InvalidArgumentType")
         if field == "operator" and reason == "boolean_operand_type":
             return ObservedError("SyntaxError" if phase == "compile time" else "TypeError",
                                  phase, "InvalidArgumentType")

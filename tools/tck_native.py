@@ -16,14 +16,14 @@ if __package__:
     from tools.tck_fixtures import infer_fixture_schema
     from tools.tck_errors import compile_error, native_error
     from tools.tck_procedures import procedure_registry
-    from tools.tck_values import ReferenceNode, ReferenceRelationship
+    from tools.tck_values import ReferenceNode, ReferenceRelationship, ReferencePath
 else:
     from check_opencypher import canonical_value
     from tck_stateful import GraphState, QueryObservation
     from tck_fixtures import infer_fixture_schema
     from tck_errors import compile_error, native_error
     from tck_procedures import procedure_registry
-    from tck_values import ReferenceNode, ReferenceRelationship
+    from tck_values import ReferenceNode, ReferenceRelationship, ReferencePath
 
 
 def _reference_result_value(value):
@@ -38,6 +38,11 @@ def _reference_result_value(value):
     if type(value) is okto_grafx.RelationshipValue:
         return ReferenceRelationship(value.label, tuple(sorted(
             (key, _reference_result_value(item)) for key, item in value.properties.items() if item is not None)))
+    if type(value) is okto_grafx.PathValue:
+        return ReferencePath(tuple(_reference_result_value(node) for node in value.nodes),
+                             tuple(_reference_result_value(edge) for edge in value.relationships),
+                             tuple("outgoing" if node.identity == edge.source else "incoming"
+                                   for node, edge in zip(value.nodes, value.relationships)))
     if isinstance(value, (list, tuple)):
         return tuple(_reference_result_value(item) for item in value)
     if isinstance(value, dict):

@@ -1,7 +1,7 @@
 """Owned entity materialization for FP-3; separate from executable row bindings.
 
-Nodes and relationships are public result observations, not stored column types
-or writable handles. The path model remains under native integration. Result-door
+Nodes, relationships and paths are public observations, not stored column types
+or writable handles. General named-path execution remains in progress. Result-door
 validation controls admission without widening parameter authority.
 """
 
@@ -236,6 +236,6 @@ class PathValue:
 
 QueryValue: TypeAlias = Union[
     None, bool, int, float, str, bytes, Timestamp, Uuid, VectorValue,
-    NodeValue, RelationshipValue, tuple["QueryValue", ...], dict["QueryValue", "QueryValue"],
+    NodeValue, RelationshipValue, PathValue, tuple["QueryValue", ...], dict["QueryValue", "QueryValue"],
 ]
 """Result-only values; the stored/parameter Value grammar does not admit entities."""

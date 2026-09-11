@@ -366,6 +366,8 @@ def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
         if type(branch) is UnionQuery:
             if type(branch.all) is not bool:
                 return ("UNION ALL selection must be a boolean.", "all")
+            if branch.all is not statement.all:
+                return ("A UNION chain cannot mix UNION and UNION ALL; use a separate subquery scope.", "composition")
             if len(seen) > MAX_CLAUSES * 2:
                 return ("Too many UNION branches.", "branch")
             pending.extend((branch.right, branch.left))
@@ -420,6 +422,12 @@ def analyze_union(statement: UnionQuery, bindings: tuple[Binding, ...] = (), dep
     refusal = union_refusal(statement)
     if refusal is not None:
         message, value = refusal
+        if value == "columns":
+            raise GrafxPlanError(message, field="union", value=value,
+                                 reason="different_columns_in_union", query_phase="planning")
+        if value == "composition":
+            raise GrafxPlanError(message, field="union", value=value,
+                                 reason="mixed_union_composition", query_phase="planning")
         raise GrafxPlanError(message, field="union", value=value)
     branches = statement.branches()
     analyses = tuple(_Analyzer(branch, bindings, depth).run() for branch in branches)
@@ -850,76 +858,32 @@ def _named_path_detail(named: PatternPath) -> str:
 
 
 def named_path_refusal(query: Query) -> tuple[str, str] | None:
-    """Return the refusal a named path earns outside its one shape, or None.
-
-    One function, asked by the analysis and asked again by the planner: a tree that never
-    passed the parser reaches the first, and a caller's own analysis walks past it to the
-    second. The name is decorative, so admitting it in one written form costs nothing at
-    runtime -- and admitting it anywhere else would mean deciding what READING one means.
-    """
-    named = named_path(query)
-    if named is None:
-        return None
-    reason = _named_path_shape_reason(query, named)
-    if reason is None:
-        return None
-    return (
-        "A named path is written and never read in this subset, and it is admitted in exactly "
-        f"one shape: {NAMED_PATH_SHAPE}. {reason}",
-        _named_path_detail(named),
-    )
-
-
-def _named_path_shape_reason(query: Query, named: PatternPath) -> str | None:
-    """Return what this statement does that the one shape does not allow, or None."""
-    if not _is_written_path_name(named.variable):
-        return "A path is named with a name the parser could have written."
-    for node in named.nodes:
-        if node.variable is not None and type(node.variable) is not str:
-            return "A node of a named path is named with a name the parser could have written."
-        if node.variable == named.variable:
-            return "The name of a path is not the name of a node in it."
-    for relationship in named.relationships:
-        if relationship.variable is not None and type(relationship.variable) is not str:
-            return (
-                "A relationship of a named path is named with a name the parser could have "
-                "written."
-            )
-        if relationship.variable == named.variable:
-            return "The name of a path is not the name of a relationship in it."
-    if query.unwind_clause is not None:
-        return "This one follows an UNWIND."
-    if query.with_clauses:
-        return "This query carries a WITH."
-    if query.updating_clauses:
-        return "This query writes, and a pattern being written is not one to refer back to."
-    if query.return_clause is None:
-        return "This query has no RETURN."
-    if len(query.match_clauses) != 1:
-        return f"This query has {len(query.match_clauses)} MATCH clauses."
-    patterns = query.match_clauses[0].patterns
-    if len(patterns) != 1:
-        return f"This MATCH carries {len(patterns)} patterns."
-    if patterns[0] is not named:
-        return "The named path is not the pattern this MATCH reads."
-    if len(named.relationships) != 1 or len(named.nodes) != 2:
-        return "A named path here spans exactly one hop between two nodes."
-    relationship = named.relationships[0]
-    if relationship.variable is None or len(relationship.types) != 1:
-        return "The hop of a named path is named and carries exactly one type."
-    if relationship.direction is not Direction.OUTGOING:
-        return "A named path points one way, from its first node to its second."
-    if relationship.variable_length or relationship.hop_range_written:
-        return "A named path spans one hop, so it carries no range."
-    if relationship.properties is not None:
-        return "The hop of a named path carries no inline property map."
-    for node in named.nodes:
-        if node.variable is None:
-            return "Both ends of a named path are named."
-        if len(node.labels) != 1:
-            return "Both ends of a named path name exactly one label."
-        if node.properties is not None:
-            return "Neither end of a named path carries an inline property map."
+    """Admit composed read captures; retain explicit bounds for unimplemented paths."""
+    for clause in query.updating_clauses:
+        patterns = clause.patterns if isinstance(clause, CreateClause) else (
+            (clause.pattern,) if isinstance(clause, MergeClause) else ())
+        for pattern in patterns:
+            if pattern.variable is not None:
+                return "Capturing a path in a writing pattern is not yet implemented.", "path"
+    for clause in query.match_clauses:
+        for pattern in clause.patterns:
+            if pattern.variable is None:
+                continue
+            if not _is_written_path_name(pattern.variable):
+                return "A path needs a parser-compatible name.", "path"
+            if len(pattern.nodes) != 2 or len(pattern.relationships) != 1:
+                return "Named capture currently requires one relationship segment.", pattern.variable
+            for node in pattern.nodes:
+                if (node.variable is not None and type(node.variable) is not str) or node.variable == pattern.variable:
+                    return "A path name must differ from its node variables.", pattern.variable
+            edge = pattern.relationships[0]
+            if (edge.variable is not None and type(edge.variable) is not str) or edge.variable == pattern.variable:
+                return "A path name must differ from its relationship variable.", pattern.variable
+            if (len(edge.types) != 1 or edge.min_hops != 1 or edge.max_hops != 1
+                    or edge.hop_range_written):
+                return "General relationship alternatives and variable-length capture remain pending.", pattern.variable
+            if edge.properties is not None:
+                return "Inline relationship property capture remains pending.", pattern.variable
     return None
 
 
@@ -1243,6 +1207,10 @@ class _Analyzer:
                     value=key.expression.describe(),
                     reason="invalid_aggregation_context", query_phase="planning",
                 )
+            if set(free_variables(key.expression)) <= projected_variables:
+                # A scalar expression over carried values can still be evaluated
+                # after deduplication; discarded bindings remain inaccessible.
+                continue
             if aggregated or clause.distinct:
                 raise self._refuse(
                     f"ORDER BY {key.expression.describe()} reads something this clause does not "
@@ -1282,16 +1250,9 @@ class _Analyzer:
         name = pattern.variable
         if name is None:
             return
-        if pattern is self._projected_path:
-            # The exact recogniser proved both the whole statement and that this name cannot be
-            # read anywhere except its sole RETURN item.  Giving it a real binding keeps the
-            # published analysis honest without making any decorative named path readable.
-            self._bind(name, ENTITY_PATH, (), created=False)
-            return
-        # A name shared with a node or a relationship is refused by the shape gate, over the
-        # STATEMENT and before any of this runs, so that a caller supplying its own analysis
-        # meets the same rule. Recording the name here is what makes reading it refusable.
-        self._path_names.add(name)
+        if self._binding(name) is not None:
+            raise self._refuse("A captured path needs a new variable in this scope.", field="variable", value=name)
+        self._bind(name, ENTITY_PATH, (), created=False)
 
     def _bind_pattern(self, pattern: PatternPath, *, created: bool) -> None:
         """Record every variable a pattern binds and check its inline property maps."""

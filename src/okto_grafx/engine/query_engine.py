@@ -68,7 +68,8 @@ from hashlib import blake2b
 from typing import cast
 
 from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
-from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, QueryValue
+from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, PathValue, QueryValue
+from okto_grafx.domain.query.limits import MAX_LIST_ELEMENTS
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -507,39 +508,11 @@ class RowBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class _PathIdentity:
-    """One capability-free, opaque identity carried by a projected path."""
-
-    offset: int
-    table: int
-
-
-@dataclass(frozen=True, slots=True)
-class _PathNodeValue:
-    """One detached node inside the engine's private path result marker."""
-
-    identity: _PathIdentity
-    label: str
-    properties: tuple[tuple[str, Value], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _PathRelationshipValue:
-    """One detached relationship inside the engine's private path result marker."""
-
-    source: _PathIdentity
-    target: _PathIdentity
-    label: str
-    identity: _PathIdentity
-    properties: tuple[tuple[str, Value], ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _PathValue:
-    """A nominal one-hop path marker consumed only by the public result snapshot."""
+    """An execution-private ordered path; detached only at the result boundary."""
 
-    nodes: tuple[_PathNodeValue, _PathNodeValue]
-    relationships: tuple[_PathRelationshipValue]
+    nodes: tuple[RowBinding, ...]
+    relationships: tuple[RowBinding, ...]
 
 
 @dataclass(slots=True)
@@ -1294,8 +1267,6 @@ class _Context:
     cancelled_insert_tokens: set[int] = field(default_factory=set)
     ends_held: set[object] = field(default_factory=set)
     _ends_staged: frozenset[object] | None = None
-    path_identities: dict[tuple[object, ...], int] = field(default_factory=dict)
-    path_identities_issued: int = 0
     entity_sequence: int = 0
     entity_overlays: dict[int, dict[object, tuple[Value, ...] | None]] = field(default_factory=dict)
     entity_overlay_revision: tuple[object, ...] | None = None
@@ -7197,11 +7168,9 @@ def _traverse(
         if (
             node.min_hops != 1
             or node.max_hops != 1
-            or node.direction is not Direction.OUTGOING
-            or node.relationship is None
         ):
             raise GrafxPlanError(
-                "A projected path is exactly one named, typed, outgoing relationship hop.",
+                "A projected path currently spans exactly one typed relationship hop.",
                 field="path_variable",
                 value=path_variable,
             )
@@ -7268,6 +7237,8 @@ def _traverse(
 
     for row in engine._rows(node.child, context):
         start = row.bindings.get(node.source)
+        if start is None and node.source in row.bindings:
+            continue  # An OPTIONAL null anchor cannot produce a real hop.
         if not isinstance(start, RowBinding):
             raise GrafxPlanError(
                 f"The traversal from {node.source!r} found no bound row to start from.",
@@ -7292,6 +7263,18 @@ def _traverse(
                 for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
                     if charge_expansions:
                         context.admit_traversal_expansion()
+                    # Adjacency candidates use table-local record IDs. An ID
+                    # collision at the opposite table is not this frontier node.
+                    endpoints = version.values[:2]
+                    if not (
+                        (outgoing and _table.table_id == from_table.table_id
+                         and endpoints[0] == record_id and next_table.table_id == to_table.table_id
+                         and endpoints[1] == next_id)
+                        or (incoming and _table.table_id == to_table.table_id
+                            and endpoints[1] == record_id and next_table.table_id == from_table.table_id
+                            and endpoints[0] == next_id)
+                    ):
+                        continue
                     if ref in taken:
                         continue
                     if prevalidated:
@@ -7322,6 +7305,8 @@ def _traverse(
                     if depth < node.min_hops:
                         continue
                     landing_ref, landing_version = landing
+                    if node.target_table is not None and node.target_table.table_id != next_table.table_id:
+                        continue
                     if isinstance(bound_target, RowBinding) and (
                         _overlay_identity(bound_target) != next_id
                         or bound_target.table.table_id != next_table.table_id
@@ -9997,41 +9982,16 @@ def _spill_signature(
     )
 
 
-def _spill_path_value(value: _PathValue) -> Value:
-    """Encode one capability-free path DTO without collapsing its nominal validation."""
-
-    def identity(item: _PathIdentity) -> Value:
-        """Expose the path identity as its canonical offset and table pair."""
-        return (item.offset, item.table)
-
-    nodes: tuple[Value, ...] = tuple(
-        (
-            identity(node.identity),
-            node.label,
-            tuple((name, _spill_detach_value(item)) for name, item in node.properties),
-        )
-        for node in value.nodes
-    )
-    relationships: tuple[Value, ...] = tuple(
-        (
-            identity(relationship.source),
-            identity(relationship.target),
-            relationship.label,
-            identity(relationship.identity),
-            tuple(
-                (name, _spill_detach_value(item))
-                for name, item in relationship.properties
-            ),
-        )
-        for relationship in value.relationships
-    )
-    return (_SPILL_VALUE_PATH, nodes, relationships)
+def _spill_path_value(value: _PathValue, codec: _SpillRowCodec) -> Value:
+    """Keep authenticated row identity and source versions in temporary paths."""
+    return (_SPILL_VALUE_PATH, tuple(codec._detach(node) for node in value.nodes),
+            tuple(codec._detach(edge) for edge in value.relationships))
 
 
 def _spill_detach_value(value: object) -> Value:
     """Remove row/page capabilities before a value crosses into the spill adapter."""
     if type(value) is _PathValue:
-        return _spill_path_value(value)
+        raise GrafxPlanError("Path spill requires an authenticated row codec.", field="query_spill.path")
     if isinstance(value, RowBinding):
         return _spill_detach_value(_as_value(value))
     if isinstance(value, (list, tuple)):
@@ -10050,110 +10010,25 @@ def _spill_detach_value(value: object) -> Value:
     return (_SPILL_VALUE_SCALAR, cast(Value, value))
 
 
-def _spill_restore_identity(value: Value, *, field: str) -> _PathIdentity:
-    if (
-        not isinstance(value, tuple)
-        or len(value) != 2
-        or type(value[0]) is not int
-        or type(value[1]) is not int
-    ):
-        raise GrafxCorruptionDetected(
-            "A temporary projected-path identity is malformed.",
-            field=field,
-            value="path_identity",
-        )
-    return _PathIdentity(offset=value[0], table=value[1])
-
-
-def _spill_restore_properties(
-    value: Value, *, field: str
-) -> tuple[tuple[str, Value], ...]:
-    if not isinstance(value, tuple):
-        raise GrafxCorruptionDetected(
-            "Temporary projected-path properties are malformed.",
-            field=field,
-            value="path_properties",
-        )
-    restored: list[tuple[str, Value]] = []
-    for position, pair in enumerate(value):
-        if (
-            not isinstance(pair, tuple)
-            or len(pair) != 2
-            or not isinstance(pair[0], str)
-        ):
-            raise GrafxCorruptionDetected(
-                "A temporary projected-path property is malformed.",
-                field=field,
-                value=position,
-            )
-        restored.append((pair[0], _spill_restore_value(pair[1])))
-    return tuple(restored)
-
-
-def _spill_restore_path(value: tuple[Value, ...]) -> _PathValue:
-    if (
-        len(value) != 3
-        or not isinstance(value[1], tuple)
-        or not isinstance(value[2], tuple)
-    ):
-        raise GrafxCorruptionDetected(
-            "A temporary projected path is malformed.",
-            field="query_spill.path",
-            value="path",
-        )
-    nodes: list[_PathNodeValue] = []
-    for position, item in enumerate(value[1]):
-        if (
-            not isinstance(item, tuple)
-            or len(item) != 3
-            or not isinstance(item[1], str)
-        ):
-            raise GrafxCorruptionDetected(
-                "A temporary projected path node is malformed.",
-                field="query_spill.path",
-                value=position,
-            )
-        nodes.append(
-            _PathNodeValue(
-                identity=_spill_restore_identity(
-                    item[0], field="query_spill.path.node_identity"
-                ),
-                label=item[1],
-                properties=_spill_restore_properties(
-                    item[2], field="query_spill.path.node_properties"
-                ),
-            )
-        )
-    relationships: list[_PathRelationshipValue] = []
-    for position, item in enumerate(value[2]):
-        if (
-            not isinstance(item, tuple)
-            or len(item) != 5
-            or not isinstance(item[2], str)
-        ):
-            raise GrafxCorruptionDetected(
-                "A temporary projected path relationship is malformed.",
-                field="query_spill.path",
-                value=position,
-            )
-        relationships.append(
-            _PathRelationshipValue(
-                source=_spill_restore_identity(
-                    item[0], field="query_spill.path.relationship_source"
-                ),
-                target=_spill_restore_identity(
-                    item[1], field="query_spill.path.relationship_target"
-                ),
-                label=item[2],
-                identity=_spill_restore_identity(
-                    item[3], field="query_spill.path.relationship_identity"
-                ),
-                properties=_spill_restore_properties(
-                    item[4], field="query_spill.path.relationship_properties"
-                ),
-            )
-        )
-    return _PathValue(nodes=tuple(nodes), relationships=tuple(relationships))  # type: ignore[arg-type]
+def _spill_restore_path(value: tuple[Value, ...], codec: _SpillRowCodec) -> _PathValue:
+    if (len(value) != 3 or type(value[1]) is not tuple or type(value[2]) is not tuple
+            or not 1 <= len(value[1]) <= MAX_LIST_ELEMENTS
+            or len(value[2]) != len(value[1]) - 1):
+        raise GrafxCorruptionDetected("A temporary path has invalid cardinality.", field="query_spill.path")
+    nodes = tuple(codec._restore(item) for item in value[1])
+    edges = tuple(codec._restore(item) for item in value[2])
+    if (any(type(node) is not RowBinding or node.table.kind != "node" for node in nodes)
+            or any(type(edge) is not RowBinding or edge.table.kind != "rel" for edge in edges)):
+        raise GrafxCorruptionDetected("A temporary path has invalid entity types.", field="query_spill.path")
+    for source, edge, target in zip(nodes, edges, nodes[1:]):
+        actual = ((source.table.name, _overlay_identity(source)), (target.table.name, _overlay_identity(target)))
+        endpoints = edge.version.values[:2]
+        if len(endpoints) != 2:
+            raise GrafxCorruptionDetected("A temporary path lacks endpoint identities.", field="query_spill.path")
+        declared = ((edge.table.from_table, endpoints[0]), (edge.table.to_table, endpoints[1]))
+        if actual not in (declared, declared[::-1]):
+            raise GrafxCorruptionDetected("A temporary path has disconnected endpoints.", field="query_spill.path")
+    return _PathValue(nodes=nodes, relationships=edges)
 
 
 def _spill_restore_value(value: Value) -> Value:
@@ -10190,7 +10065,7 @@ def _spill_restore_value(value: Value) -> Value:
                 ) from failure
         return restored
     if tag == _SPILL_VALUE_PATH:
-        return cast(Value, _spill_restore_path(value))
+        raise GrafxCorruptionDetected("Path spill requires an authenticated row codec.", field="query_spill.path")
     raise GrafxCorruptionDetected(
         "A temporary detached query value has an unknown tag or shape.",
         field="query_spill.value",
@@ -10393,7 +10268,7 @@ class _SpillRowCodec:
                 _spill_pack_internal(value.token),
             )
         if type(value) is _PathValue:
-            return _spill_path_value(value)
+            return _spill_path_value(value, self)
         if isinstance(value, (list, tuple)):
             return (
                 _SPILL_VALUE_SEQUENCE,
@@ -10453,7 +10328,7 @@ class _SpillRowCodec:
                     ) from failure
             return restored
         if tag == _SPILL_VALUE_PATH:
-            return _spill_restore_path(value)
+            return _spill_restore_path(value, self)
         raise GrafxCorruptionDetected(
             "A temporary detached operator value has an unknown tag or shape.",
             field="query_spill.value",
@@ -12614,7 +12489,8 @@ def _write_pattern(
                 context.count("rows_matched")
                 continue
         _require_unique_primary_key(
-            engine, written.table, values, context, also=[held[1] for held in staged]
+            engine, written.table, values, context,
+            also=[held[1] for held in staged if held[0].table_id == written.table.table_id],
         )
         pending = _pending_binding(written.variable, written.table, values)
         staged.append(
@@ -16565,10 +16441,7 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
             raise GrafxPlanError("Path functions require a bound path or NULL.", field="function", value=name)
         if name == "LENGTH":
             return len(path.relationships)
-        from okto_grafx.engine.public_views import _query_path_snapshot
-        detached = _query_path_snapshot(path, field="path", depth=0, active=set(),
-                                        max_string_characters=MAX_RENDERED_QUERY_CHARACTERS)
-        return detached["_NODES" if name == "NODES" else "_RELS"]
+        return path.nodes if name == "NODES" else path.relationships
     if name in NATIVE_SCALARS:
         return scalar_value(name, *(_evaluate(argument, row, context) for argument in expression.arguments))
     if name == "UDF":
@@ -16726,6 +16599,9 @@ def _qualified_entity_identity(context: _Context, binding: RowBinding) -> Entity
 
 def _entity_result_value(value: object, context: _Context) -> Value:
     """Materialize returned graph bindings, including nested entity-valued results."""
+    if type(value) is _PathValue:
+        return PathValue(tuple(_entity_result_value(item, context) for item in value.nodes),
+                         tuple(_entity_result_value(item, context) for item in value.relationships))  # type: ignore[return-value, arg-type]
     if isinstance(value, RowBinding):
         binding = context.resolve_binding(value)
         assert isinstance(binding, RowBinding)
@@ -16776,111 +16652,24 @@ def _binding_identity(binding: RowBinding) -> tuple[object, ...]:
     return ("stored", binding.table.table_id, binding.record_id)
 
 
-def _path_identity(context: _Context, binding: RowBinding) -> _PathIdentity:
-    """Return a public-shaped opaque identity without exposing a pending reference.
-
-    Durable identities already fit the query value domain in ordinary databases and remain
-    stable across executions. A pending row has only a transaction-private negative token, and
-    a theoretical durable u64 above the signed query domain cannot be published directly. Both
-    receive a collision-free negative identity allocated from this execution's context. The
-    allocation depends only on encounter order; it neither copies nor transforms the private
-    token.
-    """
-    if (
-        not isinstance(binding.ref, PendingRowRef)
-        and 1 <= binding.record_id <= INT64_MAX
-    ):
-        offset = binding.record_id
-    else:
-        logical = _binding_identity(binding)
-        offset = context.path_identities.get(logical)
-        if offset is None:
-            context.path_identities_issued += 1
-            offset = INT64_MIN + context.path_identities_issued - 1
-            context.path_identities[logical] = offset
-    return _PathIdentity(offset=offset, table=binding.table.table_id)
-
-
-def _path_properties(binding: RowBinding) -> tuple[tuple[str, Value], ...]:
-    """Return every user property in schema order, padding an old short version with nulls."""
-    first = ENDPOINT_COLUMN_COUNT if binding.table.kind == "rel" else 0
-    values = binding.version.values
-    return tuple(
-        (
-            column.name,
-            values[position] if position < len(values) else None,
-        )
-        for position, column in enumerate(binding.table.columns)
-        if position >= first
-    )
-
-
 def _one_hop_path_value(
     context: _Context,
     source: RowBinding,
     relationship: RowBinding,
     target: RowBinding,
 ) -> _PathValue:
-    """Detach the exact visible hop into a nominal, capability-free result marker."""
-    if source.table.kind != "node" or target.table.kind != "node":
-        raise GrafxPlanError(
-            "A projected path begins and ends at node tables.",
-            field="path",
-            value="non_node_endpoint",
-        )
-    if relationship.table.kind != "rel":
-        raise GrafxPlanError(
-            "A projected path carries a relationship table between its nodes.",
-            field="path",
-            value="non_relationship_hop",
-        )
-    if (
-        relationship.table.from_table != source.table.name
-        or relationship.table.to_table != target.table.name
-    ):
-        raise GrafxPlanError(
-            "A projected outgoing path must preserve its relationship table's endpoints.",
-            field="path",
-            value=relationship.table.name,
-        )
-
-    source_identity = _path_identity(context, source)
-    target_identity = _path_identity(context, target)
-    relationship_identity = _path_identity(context, relationship)
-    return _PathValue(
-        nodes=(
-            _PathNodeValue(
-                identity=source_identity,
-                label=source.table.name,
-                properties=_path_properties(source),
-            ),
-            _PathNodeValue(
-                identity=target_identity,
-                label=target.table.name,
-                properties=_path_properties(target),
-            ),
-        ),
-        relationships=(
-            _PathRelationshipValue(
-                source=source_identity,
-                target=target_identity,
-                label=relationship.table.name,
-                identity=relationship_identity,
-                properties=_path_properties(relationship),
-            ),
-        ),
-    )
+    """Retain one visible hop for native path/functions and final detachment."""
+    if (source.table.kind != "node" or target.table.kind != "node"
+            or relationship.table.kind != "rel"):
+        raise GrafxPlanError("A path requires node endpoints and a relationship.", field="path")
+    return _PathValue(nodes=(source, target), relationships=(relationship,))
 
 
 def _as_value(value: object) -> Value:
-    """Detach bindings recursively so no private pending reference reaches a result value.
+    """Adapt legacy internal scalar carriers, never the public entity result door.
 
-    A node matched WITHOUT a label detaches as a map of its label and its properties. It has to
-    carry the label: the caller asked across tables and the row alone would not say which one it
-    came from. It carries no identity at all -- no record id, no reference, no version, no table
-    id -- because those are owner-private and a caller who received one could do nothing correct
-    with it. A node matched under a label keeps answering the identity it always answered; this
-    path is additive rather than a change to what was already published.
+    Public entity/path results must use _entity_result_value with their owning
+    context. This helper remains for internal scalar/property operations.
     """
     if isinstance(value, RowBinding):
         if value.polymorphic:
@@ -16893,9 +16682,7 @@ def _as_value(value: object) -> Value:
             }
         return value.record_id
     if type(value) is _PathValue:
-        # The public result snapshot recognizes this exact nominal marker and rebuilds it into
-        # ordinary maps and tuples after page access has ended.
-        return value  # type: ignore[return-value]
+        raise GrafxPlanError("Path results require their owning materialization context.", field="path")
     if isinstance(value, (list, tuple)):
         return tuple(_as_value(item) for item in value)
     if isinstance(value, dict):
@@ -16913,6 +16700,9 @@ def _freeze(value: object) -> object:
     """
     if isinstance(value, RowBinding):
         return ("binding", _binding_identity(value))
+    if type(value) is _PathValue:
+        return ("path", tuple(_binding_identity(node) for node in value.nodes),
+                tuple(_binding_identity(edge) for edge in value.relationships))
     if type(value) in (int, float):
         # Equal numeric keys must have identical encodings in the byte-keyed spill store.
         # Never round an integer through float: convert only exactly integral floats.
@@ -16960,6 +16750,8 @@ def _sort_key(value: object) -> tuple[int, object]:
         return (0, tuple((key, _sort_key(item)) for key, item in sorted(value.items())))
     if isinstance(value, RowBinding):
         return (1 if value.table.kind == "node" else 2, _binding_identity(value))
+    if type(value) is _PathValue:
+        return (4, _freeze(value))
     if isinstance(value, (list, tuple)):
         return (3, tuple(_sort_key(item) for item in value))
     if isinstance(value, str):

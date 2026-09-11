@@ -3,10 +3,26 @@
 ## Reference and scope
 
 FP-3 now returns qualified `NodeValue`/`RelationshipValue` objects from native
-execute/cursors, including nested values and sort/DISTINCT spill. This changes
+execute/cursors, including nested values, entity UNION and aggregate/sort/DISTINCT
+spill. This changes
 the Python result representation, not the schema-free storage policy or the
-remaining entity UNION/path requirements. See [entity contracts](ENTITY_VALUES.md)
+remaining generalized path requirements. See [entity contracts](ENTITY_VALUES.md)
 and [working evidence](conformance/FP3_PROGRESS.md); this is not full conformance.
+
+The admitted one-hop named path now returns native `PathValue`, including through
+UNION and cursors. `nodes()`/`relationships()` return the same entity DTOs as
+direct projections. This removes the old metadata-map output and structural-key
+property restrictions, but does not yet enable general variable-length or
+OPTIONAL named-path composition. The original expressions/path diagnostics remain
+in the working evidence rather than being presented as passed.
+
+The original 12 UNION-family cases now yield 10 original passes and 2 passes with
+declared typed-fixture setup adaptation, zero selected failures/not-run. The
+reference's compile-time column mismatch and mixed-UNION-policy errors are
+explicit native refusals, not query rewrites. One chain now uses one duplicate
+policy; separate returning subqueries can compose UNION with UNION ALL. This is
+a documented breaking change from the earlier mixed-chain extension, not a
+full-profile acceptance claim.
 
 Current FP-2 development evidence additionally covers all 67 original List11
 range cases and all 27 Literals5 float cases: evaluation-phase argument errors,
@@ -141,7 +157,7 @@ still differ in unaliased expression-column spelling; use explicit aliases.
 | Model divergence | Typed schema/columns, immutable typed relationship endpoints, explicit tables and vector spaces; no arbitrary label sets/schema-free CREATE |
 | Explicit execution divergence | Finite arithmetic only; division by zero/domain errors refuse rather than publishing NaN/infinity; bounded traversal/list/query resources |
 | Missing expression syntax/functions | Reference temporal constructors/property syntax (`date`, `time`, `datetime`, local variants, `duration`), `rand`, hexadecimal/octal literal spellings and chained comparisons |
-| Public result divergence | Unaliased expressions use Grafx's normalized AST spelling; UNION graph-entity outputs are refused rather than exposing ambiguous table-local IDs |
+| Public result contract | Unaliased expressions preserve submitted source spelling; node/relationship UNION results use qualified detached identities instead of ambiguous table-local IDs. Native path migration remains pending. |
 | Missing query composition | Unit/writing subqueries, implicit WITH imports, unrestricted polymorphic patterns, general named variable-length paths and graph-writing callback procedures |
 | Unmeasured | TCK graph fixtures and negative error-phase/side-effect scenarios not implemented by the adapter; their `not_run` records remain explicit |
 

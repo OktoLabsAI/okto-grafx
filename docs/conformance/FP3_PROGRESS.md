@@ -1,4 +1,4 @@
-# FP-3 working evidence: composed polymorphic reads
+# FP-3 working evidence: polymorphic reads and native entity results
 
 [Roadmap](../../ROADMAP.md#functional-parity-expansion-plan) ·
 [Full acceptance requirements](../specs/FUNCTIONAL_PARITY_PLAN.md#fp-3--entity-identity-polymorphism-and-paths) ·
@@ -7,7 +7,7 @@
 September 11, 2026, `feature/v0.0.6` development. This is an implementation
 increment, **not FP-3 acceptance**, complete Cypher parity or a release.
 
-## Implemented scope
+## Initial composed-read increment (historical)
 
 Standalone label-free node reads now compose with multiple MATCH clauses and
 patterns, UNWIND, inline property maps, WITH aliases/star, OPTIONAL MATCH and
@@ -28,8 +28,8 @@ NULL; incompatible declared types remain a planning refusal.
 Polymorphic binding metadata crosses WITH aliases and explicit read-subquery
 imports/exports. Internal bindings retain the physical table/record identity;
 same user primary keys in different tables do not collapse in DISTINCT/grouping.
-This does **not** implement the new detached public database/table/incarnation
-identity representation required by FP-3.
+That initial increment did **not** implement the detached public identity model;
+subsequent sections record its native integration and UNION progress.
 
 ## Independent tests and original scenarios
 
@@ -210,7 +210,8 @@ The fresh combined checkpoint receipt `fp3-commit-checkpoint.xml` records
 `test_combined_alias_depth_is_refused_by_a_typed_budget_before_the_stack` and
 `test_alias_expansion_accepts_the_ceiling_and_refuses_the_next_level`, both in
 `tests/query/test_union.py`: the expected alias expansion budget refusal is
-missing. They remain open regressions, not exclusions or waived requirements.
+missing. They were open regressions at that checkpoint, not exclusions or waived
+requirements; the follow-up below fixes both.
 Documentation checks, Ruff on changed Python files and `git diff --check` pass.
 
 This is a development snapshot, not a completed FP-3 delivery or a release-ready
@@ -220,12 +221,145 @@ and budget corrections. No full repository regression or paired Pulse acceptance
 was performed for this snapshot. Pulse adapter migration described above remains
 mandatory before installing these breaking entity-result changes into Pulse.
 
+## Native UNION follow-up: alias admission and reference semantics
+
+The former entity-refusal call also enforced the alias-expanded typing depth.
+Allowing entity results accidentally removed that admission step. Planning now
+expands and validates the shared typing DAG without reinstating the scalar-only
+restriction. The inclusive depth ceiling and linear shared-alias traversal are
+covered by the existing regression cases, unchanged.
+
+Column mismatch now carries `different_columns_in_union` and `planning` at the
+native raise site. The reference mapper requires those fields plus the exact
+UNION/column classification; unproven messages or execution-phase errors do not
+map to the expected compile-time code. Tests prevent scanning before refusal.
+
+The two required `Union3` scenarios exposed a genuine policy divergence: the
+former extension admitted mixed UNION/UNION ALL chains. To implement the approved
+reference profile, each chain now has one duplicate policy, with an explicit
+`mixed_union_composition` planning refusal. Direct AST admission also checks
+right-nested trees. Different policies remain composable in separate returning
+subqueries; tests verify both combinations and exact entity multiplicities.
+There is no legacy toggle, changed ledger exclusion or rewritten upstream query.
+
+All 12 original UNION-family scenarios now execute: **10 original passes,
+2 typed-fixture-adapted passes, zero selected failures/not-run**. The full ledger
+still accounts for 3,897 cases, including 3,885 outside this selection. Receipt
+`fp3-native-union-profile.json`, SHA-256
+`ff7f6892ab603adca631c9072307bf2fa48712fcf28dea7f8232c24f794c0cf8`.
+The two adapted passes are not relabeled as original conformance.
+
+Native tests additionally cover grouping after UNION exports, overlapping local
+IDs, nested entities/aggregates, private updates/inserts, cursor old snapshots
+through concurrent commits, and early cursor close. Memory and spill paths are
+tested independently. Follow-up local receipts:
+
+| Receipt | Scope | Result |
+| --- | --- | --- |
+| `fp3-union-alias-budget-fixed.xml` | Existing UNION aliases/bounds and native entity UNION | 139 passed; zero failures/errors/skips; 34.998 s |
+| `fp3-union-grouped-regression.xml` | UNION/ALL, aggregate spill, optional aggregates, native identity/results and independent TCK oracles, before the mixed-chain policy correction | 302 passed; zero failures/errors/skips; 69.362 s |
+| `fp3-union-profile-final.xml` | Corrected policy with UNION/spill/grouping/reference regression | 309 passed; 1 outdated mixed-chain expectation failed; zero errors/skips; 70.907 s |
+| `fp3-union-public-final.xml` | Updated explicit-subquery migration examples, both mixed-chain refusals, all native entity UNION tests, cursors, composed polymorphism and hostile public boundaries | 297 passed; zero failures/errors/skips; 39.245 s |
+
+The single intermediate failure expected the deliberately removed mixed-chain
+extension. Its replacement explicitly nests the bag union before the outer set
+union and retains the same result, with the raw mixed syntax separately tested
+as a refusal. Both orderings pass in the final receipt. Test sets overlap; counts
+must not be added as a unique test total. Ruff on all changed Python files,
+documentation links/anchors/configuration/public contracts and diff whitespace
+checks also pass. This is not the full repository or checkpoint-B regression.
+
+Read-only inspection of the current Pulse Community/Core Python source found no
+built-in graph query template mixing the two policies; Community relational SQL
+unions are unrelated and unchanged. This is template inspection, not paired-wheel
+Pulse acceptance. The public entity normalization migration above remains open.
+
+## Native one-hop path result integration
+
+The existing outgoing typed one-hop capture now materializes `PathValue` through
+the same native entity boundary as nodes/relationships. `nodes()` and
+`relationships()` return the corresponding live query bindings during expression
+evaluation, then detached native entities at output. Their qualified identity,
+source version, read snapshot and pending status match direct entity projections.
+UNION, cursors and temporary spill retain those components; the owned public DTO
+keeps no transaction/page authority. `QueryValue` and CLI tagged JSON include paths.
+
+The former private detached-marker classes, execution-local negative path IDs and
+public `_NODES`/`_RELS` conversion were removed. Metadata-named user properties
+are now separate from identity/endpoint fields; their former planner ban is gone.
+Native path endpoint/schema validation remains. The temporary codec verifies path
+cardinality, row kinds, authenticated pending references, source-version bounds
+and adjacent endpoint connections. The public boundary rebuilds components and
+rejects forged/cyclic/disconnected values; path parameters remain refused.
+
+The cross-table path fixture exposed a native creation defect:
+`_write_pattern` passed all unstaged pattern rows into each table's PK check.
+It now filters those candidates by table ID. A1 and B1 can coexist within one
+created pattern, even when their key columns occupy different positions. A
+duplicate within A remains refused; tests prove whole-statement rollback retains
+earlier effects and survives commit/reopen. This does not change OCC, WAL or
+concurrent uniqueness guarantees.
+
+Local receipts (overlapping selections; not cumulative unique counts):
+
+| Receipt | Scope | Result |
+| --- | --- | --- |
+| `fp3-native-path-grouped.xml` | Existing path admission, native paths/entities/UNION, aggregate spill, composed write conflicts, hostile public boundaries and TCK oracle | 523 passed; zero failures/errors/skips; 70.457 s |
+| `fp3-native-path-final-boundaries.xml` | Final native path contract, malformed spill injection, public detachment and existing typed path schema/admission | 185 passed; zero failures/errors/skips; 21.102 s |
+
+The final boundary receipt additionally covers injected disconnected/empty path
+spill payloads and the refusal of context-free private path conversion. Native
+tests compare qualified components, private inserts, old/new snapshots, exact
+properties, immutable JSON ownership and independent reference directions.
+
+The unchanged original `expressions/path` selection is still **5 failed,
+2 selected not-run**, with 3,890 outside selection. Failures require OPTIONAL
+named paths with NULL anchors, general zero/variable-length capture, and exact
+compile-time errors for `length(node/relationship)`. The two fixture blockers
+use one relationship type across incompatible endpoint tables. Receipt
+`fp3-native-path-tck.json`, SHA-256
+`12ce19e1c7a8d5829ca1ee399b61c5692e8c081da5f2c3b24ae5995ece594639`.
+No query/expectation or ledger exclusion was changed. These remain FP-3 work,
+not a claim that path conformance passed. The DTO supports zero/reverse/multihop
+walk representation, but constructing it is not native traversal implementation.
+
+Pulse's Community `project_path_sequences` still consumes the old path map and
+must migrate alongside the shared entity normalizer before installation. The
+Core remains unchanged and provider-agnostic. No installed Pulse, graph or
+published package was modified.
+
+## Unqualified composed-path checkpoint (2026-09-11)
+
+This work-in-progress checkpoint also includes composed single-hop captures,
+reverse/undirected walking, nullable optional results, path aliases and subquery
+scope propagation. It is not a qualified release or a completed FP-3 delivery.
+The earlier passing receipts above predate these additional changes and must not
+be read as regression approval of this checkpoint.
+
+- `fp3-composed-paths-fixed.xml`: 32 passed, zero failures/errors/skips,
+  11.776 s (focused composed-path scenarios).
+- `fp3-composed-path-prior-contracts.xml`: 562 tests, 87 failures, zero errors
+  or skips, 64.344 s. Failures are in named-path (34), path-projection (50)
+  and generic-path (3) tests. Admission expectations and any genuine regressions
+  still require individual triage; these failures are not waived.
+- The subsequent UNION path-type propagation and typed path-argument diagnostic
+  changes have not yet received a new validating regression receipt.
+- Checkpoint lint reports four F811 fixture-name redefinitions in
+  `test_fp3_composed_paths.py`; documentation validation and `git diff --check`
+  pass. User-facing admission documentation still needs reconciliation with the
+  expanded composed-path contract before delivery.
+
+Pulse native entity/path consumer migration and paired integration validation
+remain pending. No installed runtime or production graph was changed. This
+checkpoint is retained on Grafx `feature/v0.0.6`; the existing Pulse Community
+and Core integration checkpoints remain on their remote `feature/v0.3.3`.
+
 ## Remaining mandatory FP-3 work
 
-- Finish native detached paths/functions on the shared identity/provenance model;
+- Extend native path capture/functions beyond the current one-hop shape;
   complete all hostile/public/budget and entity observation combinations.
-- Entity UNION, all aggregate/spill combinations and subsequent clauses using
-  entity bindings; broader incompatible/missing-property and schema combinations.
+- Broader aggregate/spill and subsequent-clause combinations beyond the verified
+  entity UNION cases; incompatible/missing-property and schema combinations.
 - Relationship-type alternatives and general named variable-length trails,
   directions, zero length/cycles, uniqueness, bounds and cancellation.
 - Cross-table index access when compatible keys can anchor new polymorphic

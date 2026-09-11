@@ -876,7 +876,7 @@ class Query(Statement):
 
 @dataclass(frozen=True, slots=True)
 class UnionQuery(Statement):
-    """A left-associated UNION tree; each operator owns its duplicate policy."""
+    """A UNION tree whose operators must share one duplicate policy per scope."""
 
     left: Query | UnionQuery
     right: Query | UnionQuery

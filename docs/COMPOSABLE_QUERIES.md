@@ -82,7 +82,7 @@ WHERE: missing keys yield NULL; incompatible declared families still refuse.
 These operators use the existing snapshot and transaction-private overlay; they
 do not create another participant/transaction or expose another writer's pending
 rows. Cursor/row budgets remain authoritative. Dynamic polymorphic writes,
-general path/relationship-alternative expansion and entity UNION remain pending
+general path/relationship-alternative expansion remains pending
 under [FP-3](conformance/FP3_PROGRESS.md). Native typed/polymorphic node and edge
 results now use [qualified detached values](ENTITY_VALUES.md), also through
 lists/maps, cursors, sorting and DISTINCT. This is a breaking development contract,
@@ -163,14 +163,30 @@ These are fixed safety bounds, not a compatibility switch.
 Up to 64 read-only RETURN branches can be combined. Every branch must publish
 the same column names in the same order (use explicit aliases). Values may differ
 in type: UNION ALL does not convert `1` into `1.0`. UNION deduplicates with numeric
-equality; ALL preserves multiplicity. Each branch's sort/window is local. Mixed
-UNION/ALL operators associate left-to-right; this mixed-chain policy is a Grafx
-extension, not blanket openCypher TCK conformance. No updating UNION branches.
+equality; ALL preserves multiplicity. Each branch's sort/window is local. A single
+chain must use only UNION or only UNION ALL. Mixing them is a compile-time
+`mixed_union_composition` refusal, including through direct AST admission. This
+intentionally replaces the earlier left-associated mixed-chain extension to meet
+the frozen reference profile; there is no legacy toggle. Different policies can
+still compose in separate returning subquery scopes:
 
-UNION currently publishes scalar/list/map values, not graph entities (including
-entities nested in lists/maps). Project stable application keys or properties
-instead. This prevents table-local record identifiers from being confused across
-tables at the public result boundary; list slicing does not bypass that check.
+```cypher
+CALL () { RETURN 1 AS x UNION RETURN 1 AS x }
+RETURN x UNION ALL RETURN 1 AS x
+```
+
+This returns two rows containing 1. No updating UNION branches in this increment.
+
+UNION publishes scalars, lists/maps and qualified detached node/relationship
+values, including nested and aggregate entities. Entity deduplication retains
+table/incarnation identity; two tables' local record ID 1 is not one entity.
+Returning subqueries export known same-kind entity table alternatives for later
+property access/grouping. [Entity results and JSON](ENTITY_VALUES.md) describe the
+breaking development contract. The admitted one-hop `PathValue` also survives
+UNION/ALL and cursors; general named-path traversal remains pending. All branches
+share one snapshot and existing resource limits, including the alias-expanded
+typing-depth ceiling. Column-name mismatches fail before execution with
+`reason="different_columns_in_union"`, `query_phase="planning"`.
 
 ```cypher
 RETURN 1 AS value

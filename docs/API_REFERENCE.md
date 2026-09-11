@@ -4,12 +4,17 @@
 
 ## Entry points and supported imports
 
-The 0.0.6 development result contract now returns `NodeValue` and
-`RelationshipValue` from native `execute`/cursors, including nested results.
+The 0.0.6 development result contract now returns `NodeValue`,
+`RelationshipValue` and one-hop `PathValue` from native `execute`/cursors,
+including nested results.
 Import them with `EntityIdentity` and `EntityProvenance` from `okto_grafx`.
 [Fields, ownership, equality, JSON and migration](ENTITY_VALUES.md) replace the
 former integer/label-map entity assumptions; scalar projections are unchanged.
-Paths, entity UNION and coordinated Pulse migration remain FP-3 work in progress.
+Entity UNION/UNION ALL, nested aggregates and returning UNION subqueries retain
+these values. General named-path traversal and coordinated Pulse migration remain
+FP-3 work in progress. `PathValue(nodes, relationships)` owns immutable component
+tuples; `len(path)` and `path.to_dict()` expose length and tagged JSON. These result
+DTOs remain invalid as query parameters or persistent column values.
 
 Unaliased `QueryResult.columns` preserve the expression's submitted source spelling;
 explicit aliases and logical variable names retain their existing meaning.

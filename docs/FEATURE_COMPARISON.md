@@ -44,10 +44,20 @@ membership cases pass. The first FP-3 increment also composes standalone
 polymorphic node reads, inline maps, rematches and optional/subquery pipelines.
 Native typed/polymorphic node and relationship output now carries qualified
 identity, immutable properties, snapshot provenance and tagged JSON, including
-pending identities and cursor/sort/DISTINCT output. [Result contract](ENTITY_VALUES.md).
-Public qualified entity UNION output and generalized named paths remain pending,
-so these additions do not establish general query-language parity. See
+pending identities and cursor/sort/DISTINCT output. Native entity UNION, nested
+aggregate spill and subsequent subquery/grouping scopes are now covered too.
+The 12 original UNION-family cases run with 10 original passes and 2 passes with
+declared typed-fixture adaptation; no selected failures/not-run. Mixed duplicate
+policies require separate subquery scopes. [Result contract](ENTITY_VALUES.md).
+Generalized named paths remain pending, so these additions do not establish
+general query-language parity. See
 [FP-3 evidence](conformance/FP3_PROGRESS.md) for exact remaining limits.
+
+The existing typed one-hop named capture now returns native `PathValue` with
+qualified entity components, immutable observations and tagged JSON; UNION,
+spill and cursors preserve those observations. Metadata-named user properties
+no longer collide with result structure. This changes result quality and
+consumption, not the still-bounded set of executable path patterns.
 
 | Product | Baseline and evidence |
 | --- | --- |

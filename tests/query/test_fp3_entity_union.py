@@ -98,3 +98,80 @@ def test_union_sees_private_updates_and_insertions_without_publishing_them(db):
         assert old.execute("MATCH (n:A) RETURN n.id,n.value ORDER BY n.id").rows == ((1, 10), (2, 20))
     finally:
         old.rollback()
+
+
+@pytest.mark.parametrize("operator", ["UNION", "UNION ALL"])
+def test_column_mismatch_has_structured_compile_time_evidence_before_scans(db, operator, monkeypatch):
+    from okto_grafx.engine.query_engine import QueryEngine
+    from okto_grafx.errors import GrafxPlanError
+    from tools.tck_errors import compile_error
+    from tools.tck_stateful import ObservedError
+
+    def no_rows(*args, **kwargs):
+        pytest.fail("Mismatched UNION headings must be rejected before execution")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(QueryEngine, "_rows", no_rows)
+        with pytest.raises(GrafxPlanError) as failure:
+            db.execute(f"MATCH (n:A) RETURN n AS a {operator} MATCH (n:B) RETURN n AS b")
+    assert failure.value.details["query_phase"] == "planning"
+    assert failure.value.details["reason"] == "different_columns_in_union"
+    assert compile_error(failure.value) == ObservedError("SyntaxError", "compile time", "DifferentColumnsInUnion")
+    for details in ({"field": "union", "value": "columns"},
+                    {"field": "union", "value": "columns", "reason": "different_columns_in_union",
+                     "query_phase": "execution"}):
+        assert compile_error(GrafxPlanError("unproven", **details)).detail == "plan_error"
+
+
+def test_union_entities_are_grouped_by_identity_in_later_clauses(db):
+    rows = db.execute("CALL () { MATCH (n:A) RETURN n UNION ALL MATCH (n:B) RETURN n "
+                      "UNION ALL MATCH (n:A) RETURN n } "
+                      "WITH n,count(*) AS copies RETURN n,copies ORDER BY label(n),n.id").rows
+    assert [(n.label, n.properties["id"], count) for n, count in rows] == [
+        ("A", 1, 2), ("A", 2, 2), ("B", 1, 1)]
+    assert len({n.identity for n, _ in rows}) == 3
+
+
+def test_union_cursor_keeps_snapshot_and_releases_after_partial_consumption(db):
+    with db.query("MATCH (n:A) RETURN n UNION ALL MATCH (n:B) RETURN n").cursor(batch_size=1) as cursor:
+        first = cursor.fetchone()[0]
+        with db.begin("write") as writer:
+            writer.execute("MATCH (n:B {id:1}) SET n.value=100")
+        remaining = cursor.fetchmany(10)
+        assert first.label == "A"
+        assert [(n.label, n.properties["value"]) for (n,) in remaining] == [("A", 20), ("B", 30)]
+    with db.query("MATCH (n:A) RETURN n UNION ALL MATCH (n:B) RETURN n").cursor(batch_size=1) as cursor:
+        assert cursor.fetchone()[0] == first
+    assert db.execute("MATCH (n:B) RETURN n.value").rows == ((100,),)
+
+
+@pytest.mark.parametrize("operators", [("UNION", "UNION ALL"), ("UNION ALL", "UNION")])
+def test_mixed_union_policy_is_rejected_before_rows_but_separate_scopes_compose(db, operators, monkeypatch):
+    from okto_grafx.domain.query.analysis import analyze
+    from okto_grafx.domain.query.parser import parse
+    from okto_grafx.domain.query.ast import UnionQuery
+    from okto_grafx.engine.query_engine import QueryEngine
+    from okto_grafx.errors import GrafxPlanError
+    from tools.tck_errors import compile_error
+    from tools.tck_stateful import ObservedError
+    left, right = operators
+    query = f"MATCH (n:A) RETURN n {left} MATCH (n:A) RETURN n {right} MATCH (n:A) RETURN n"
+
+    def no_rows(*args, **kwargs):
+        pytest.fail("Mixed UNION policy must be refused before scanning")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(QueryEngine, "_rows", no_rows)
+        with pytest.raises(GrafxPlanError) as failure:
+            db.execute(query)
+    assert compile_error(failure.value) == ObservedError("SyntaxError", "compile time", "InvalidClauseComposition")
+    # Direct AST admission must not depend on the parser's left-associated shape.
+    leaf = "RETURN 1 AS x"
+    forged = UnionQuery(parse(leaf), UnionQuery(parse(leaf), parse(leaf), all=True), all=False)
+    with pytest.raises(GrafxPlanError) as failure:
+        analyze(forged)
+    assert failure.value.details["reason"] == "mixed_union_composition"
+    rows = db.execute(f"CALL () {{ MATCH (n:A) RETURN n {left} MATCH (n:A) RETURN n }} "
+                      f"RETURN n {right} MATCH (n:A) RETURN n").rows
+    assert len(rows) == (4 if right == "UNION ALL" else 2)
+    assert {n.properties["id"] for (n,) in rows} == {1, 2}

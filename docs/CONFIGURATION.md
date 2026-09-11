@@ -4,8 +4,17 @@ Native node/relationship result DTOs introduce no new setting or legacy-output
 toggle. `max_query_value_characters` still governs string admission, including
 materialized entity properties; conversion failure does not commit partial writes.
 Returning an entire entity materializes its properties, whereas scalar projections
-can retain the closed-column fast paths. Sort/DISTINCT spill preserves identity
-and version metadata under `query_memory_budget_bytes`. See [entity results](ENTITY_VALUES.md).
+can retain the closed-column fast paths. Aggregate/sort/DISTINCT spill preserves
+identity and version metadata under `query_memory_budget_bytes`, including entity
+UNION outputs. Entity aggregate values are charged for their encoded properties,
+not just their record IDs. The fixed alias-expanded expression-depth bound still
+applies to UNION typing; it introduces no new setting. See [entity results](ENTITY_VALUES.md).
+
+Native `PathValue` uses the same materialization and spill limits. Its owned
+representation admits at most 1,024 nodes and exactly one fewer relationships;
+the currently executable named capture remains one-hop. General path enumeration
+is not enabled by constructing the DTO. `nodes()`/`relationships()` return entity
+tuples rather than metadata maps; there is no path-output compatibility toggle.
 
 The fixed numeric-token ceiling is 2,048 characters (excluding a unary sign),
 allowing long finite DOUBLE spellings. It is not a `connect()` setting. INT64

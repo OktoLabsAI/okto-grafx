@@ -62,7 +62,6 @@ from okto_grafx.domain.query.analysis import (
     analyze,
     exact_path_projection,
     hop_range_refusal,
-    named_path,
     named_path_refusal,
     optional_match_refusal,
     correlated_optional_pipeline,
@@ -199,8 +198,6 @@ It carries spaces on purpose. A user variable is an ASCII identifier and can nev
 so an anonymous binding can never be shadowed by, or shadow, something the caller wrote.
 """
 
-_PATH_PROJECTION_NODE_KEYS = frozenset({"_ID", "_LABEL"})
-_PATH_PROJECTION_RELATIONSHIP_KEYS = frozenset({"_SRC", "_DST", "_LABEL", "_ID"})
 """The catalog declaration required by the one projected path."""
 
 SCORE_COLUMN: str = "similarity score"
@@ -432,6 +429,8 @@ class _Planner:
     polymorphic_tables: dict[str, tuple[TableDef, ...]] = field(default_factory=dict)
     typed_endpoint_form: bool = False
     path_projection: PatternPath | None = None
+    capture_paths: set[str] = field(default_factory=set)
+    bound_paths: set[str] = field(default_factory=set)
     untyped_one_hop_label: str | None = None
     unwind_alias: str | None = None
     unwind_source: Expression | None = None
@@ -463,6 +462,7 @@ class _Planner:
     anonymous: int = 0
     apply_slot: int = 0
     union_entity_outputs: dict[str, tuple[TableDef, ...]] = field(default_factory=dict)
+    union_path_outputs: dict[str, bool] = field(default_factory=dict)
 
     # --- entry -------------------------------------------------------------------------------
 
@@ -492,6 +492,7 @@ class _Planner:
         columns = self.analysis.output_columns
         pipelines: list[PlanNode] = []
         entity_outputs: list[dict[str, tuple[TableDef, ...]]] = []
+        path_outputs: list[dict[str, bool]] = []
         for branch in (statement.left, statement.right):
             sub = _Planner(scalar_types=self.scalar_types, catalog=self.catalog,
                            procedures=self.procedures,
@@ -501,9 +502,18 @@ class _Planner:
                            polymorphic_variables=set(self.polymorphic_variables),
                            polymorphic_tables=dict(self.polymorphic_tables),
                            tables=dict(self.tables), alias_definitions=dict(self.alias_definitions),
+                           bound_paths=set(self.bound_paths),
                            apply_slot=self.apply_slot)
             planned = sub.run(branch)
+            if isinstance(planned.analysis.statement, Query):
+                output = planned.analysis.statement.return_clause
+                if output is not None:
+                    for item in output.items:
+                        # Entity outputs are legal; alias-expanded typing still
+                        # obeys the existing depth and shared-DAG budget.
+                        sub._union_type_expression(item.expression)
             entity_outputs.append(sub._entity_output_tables())
+            path_outputs.append(sub._path_output_columns())
             root = planned.root
             if not isinstance(root, ProduceResults):
                 raise GrafxPlanError("A UNION branch must produce rows.", field="union", value="branch")
@@ -512,6 +522,8 @@ class _Planner:
             self.apply_slot = max(self.apply_slot, sub.apply_slot)
         combined = UnionRows(left=pipelines[0], right=pipelines[1], columns=columns)
         for name in columns:
+            if all(name in branch for branch in path_outputs):
+                self.union_path_outputs[name] = any(branch[name] for branch in path_outputs)
             if all(name in branch for branch in entity_outputs):
                 tables = tuple({table.table_id: table for branch in entity_outputs for table in branch[name]}.values())
                 if tables and len({table.kind for table in tables}) == 1:
@@ -521,6 +533,20 @@ class _Planner:
                            columns=columns),
             columns=columns,
         )
+
+    def _path_output_columns(self) -> dict[str, bool]:
+        statement = self.analysis.statement
+        if isinstance(statement, UnionQuery):
+            return self.union_path_outputs
+        if not isinstance(statement, Query) or statement.return_clause is None:
+            return {}
+        result = {}
+        for item in statement.return_clause.items:
+            if isinstance(item.expression, Variable) and item.expression.name in self.bound_paths:
+                result[item.name] = True
+            elif isinstance(item.expression, Literal) and item.expression.value is None:
+                result[item.name] = False
+        return result
 
     def _entity_output_tables(self) -> dict[str, tuple[TableDef, ...]]:
         """Retain entity-table alternatives through UNION and returning subqueries."""
@@ -1129,7 +1155,12 @@ class _Planner:
         if refusal is not None:
             message, value = refusal
             raise GrafxPlanError(message, field="pattern", value=value)
-        self._refuse_named_path_reads(statement, projected_path=projected_path)
+        used = {item.name for expression in self._query_expressions(statement)
+                for item in walk(expression) if isinstance(item, Variable)}
+        used.update(name for clause in statement.ordered_clauses() if isinstance(clause, SubqueryClause)
+                    for name in (clause.outer_names or clause.imports))
+        self.capture_paths = {pattern.variable for clause in statement.match_clauses
+                              for pattern in clause.patterns if pattern.variable in used}
         refusal = polymorphic_node_refusal(statement)
         if refusal is not None:
             message, value = refusal
@@ -1205,13 +1236,15 @@ class _Planner:
                                  if source in self.tables else
                                  replace(binding, entity=("relationship" if self.polymorphic_tables.get(source)
                                          and self.polymorphic_tables[source][0].kind == "rel" else "node"))
-                                 if source in self.polymorphic_variables else binding
+                                 if source in self.polymorphic_variables else
+                                 replace(binding, entity="path") if source in self.bound_paths else binding
                                  for source, binding in zip(outer, imported, strict=True))
                 sub = _Planner(
                     catalog=self.catalog, indexes=self.indexes, scalar_types=self.scalar_types,
                     procedures=self.procedures,
                     analysis=analyze(clause.query, bindings=imported), imported_bindings=imported,
                     argument_slot=slot, apply_slot=slot,
+                    bound_paths={target for source, target in zip(outer, clause.imports) if source in self.bound_paths},
                     tables={target: self.tables[source] for source, target in zip(outer, clause.imports)
                             if source in self.tables},
                     polymorphic_variables={target for source, target in zip(outer, clause.imports)
@@ -1237,10 +1270,13 @@ class _Planner:
                         elif isinstance(expression, Variable) and expression.name in sub.polymorphic_variables:
                             self.polymorphic_variables.add(target)
                             self.polymorphic_tables[target] = sub.polymorphic_tables.get(expression.name, self._node_tables())
+                        elif isinstance(expression, Variable) and expression.name in sub.bound_paths:
+                            self.bound_paths.add(target)
                         else:
                             self.binding_types[target] = sub._pulse_expression_type(expression, owner="subquery output")
                 else:
                     entity_tables = sub._entity_output_tables()
+                    path_columns = sub._path_output_columns()
                     for source, target in zip(planned.columns, outputs, strict=True):
                         alternatives = entity_tables.get(source)
                         if alternatives:
@@ -1249,6 +1285,8 @@ class _Planner:
                             else:
                                 self.polymorphic_variables.add(target)
                                 self.polymorphic_tables[target] = alternatives
+                        elif path_columns.get(source):
+                            self.bound_paths.add(target)
                         else:
                             self.binding_types[target] = None
                 pipeline = SubqueryRows(child=pipeline, inner=planned.root.child, slot=slot,
@@ -1271,11 +1309,11 @@ class _Planner:
                 pipeline = self._updating_clause(pipeline, clause)
                 pending_write = True
                 continue
-            if clause.optional and correlated:
+            if clause.optional and correlated and not any(pattern.variable in self.capture_paths for pattern in clause.patterns):
                 pipeline = self._correlated_optional(pipeline, clause)
                 continue
             if clause.optional:
-                before = set(self.tables) | self.polymorphic_variables
+                before = set(self.tables) | self.polymorphic_variables | self.bound_paths
                 self.apply_slot += 1
                 slot = self.apply_slot
                 inner, deferred = self._match_clause(ArgumentRows(slot=slot), clause)
@@ -1286,7 +1324,7 @@ class _Planner:
                     # Root optional vector filtering must finish before null extension.
                     inner = self._similarity(inner, statement, deferred)
                     similarity_placed = True
-                introduced = (set(self.tables) | self.polymorphic_variables) - before
+                introduced = (set(self.tables) | self.polymorphic_variables | self.bound_paths) - before
                 pipeline = ApplyRows(child=pipeline, inner=inner, slot=slot,
                                      null_variables=tuple(sorted(introduced)))
                 continue
@@ -1385,6 +1423,8 @@ class _Planner:
                 original = item.expression.name
                 if original in self.tables:
                     self.tables[item.alias] = self.tables[original]
+                if original in self.bound_paths:
+                    self.bound_paths.add(item.alias)
                 if original in self.polymorphic_variables:
                     self.polymorphic_variables.add(item.alias)
                     if original in self.polymorphic_tables:
@@ -1421,48 +1461,7 @@ class _Planner:
             pipeline = FilterRows(child=pipeline, predicate=clause.predicate)
         return pipeline
 
-    def _refuse_named_path_reads(
-        self, statement: Query, *, projected_path: PatternPath | None
-    ) -> None:
-        """Refuse every path-name read except the one exact projected path.
 
-        The analysis refuses each of these where it is written, and says which clause asked.
-        This repeats the rule rather than the message, because ``build_plan`` accepts an
-        ANALYSIS from its caller, and an analysis that never looked is an analysis that never
-        refused. The shape gate above is not enough on its own: it decides what a query may
-        LOOK like, and this decides what the name inside it may be used for.
-
-        It also catches the collision case, and correctly: when the path shares a name with a
-        node, a read of that name cannot be told from a read of the path, so neither is allowed
-        to reach a row.
-        """
-        named = named_path(statement)
-        if named is None or named.variable is None:
-            return
-        if named is projected_path:
-            # The exact recogniser has checked every expression-bearing site and proved that
-            # the sole occurrence is the one unaliased RETURN item. Nothing wider is skipped.
-            return
-        for expression in self._query_expressions(statement):
-            for node in walk(expression):
-                if not isinstance(node, Variable):
-                    continue
-                if type(node.name) is not str:
-                    # ``build_plan`` accepts a caller-supplied analysis, so this AST boundary
-                    # must be checked independently.  Do it before equality: a hand-built
-                    # ``str`` subclass can make comparison execute arbitrary code.
-                    raise GrafxPlanError(
-                        "A variable is named with a name the parser could have written.",
-                        field="variable",
-                        value="a variable name",
-                    )
-                if node.name == named.variable:
-                    raise GrafxPlanError(
-                        f"The path {named.variable!r} is written and never read in this "
-                        "subset, so nothing may project it or filter on it.",
-                        field="variable",
-                        value=named.variable,
-                    )
 
     def _record_coalesce_types(self, statement: Query) -> None:
         """Resolve every COALESCE argument whose type the bound schema makes knowable."""
@@ -1737,6 +1736,8 @@ class _Planner:
         if isinstance(expression, Literal):
             return value_type_of(expression.value)
         if isinstance(expression, Variable):
+            if expression.name in self.bound_paths:
+                return None  # Native path, never a scalar column or writable handle.
             if expression.name in self.binding_types:
                 return self.binding_types[expression.name]
             definition = self.alias_definitions.get(expression.name)
@@ -1858,8 +1859,10 @@ class _Planner:
                 argument = expression.arguments[0]
                 if not isinstance(argument, Parameter):
                     binding = self.analysis.binding(argument.name) if isinstance(argument, Variable) else None
-                    if not (isinstance(argument, Literal) and argument.value is None) and not (binding is not None and binding.entity == "path"):
-                        raise GrafxPlanError("Path functions require a bound path or NULL.", field="function", value=name)
+                    path_variable = isinstance(argument, Variable) and argument.name in self.bound_paths
+                    if not (isinstance(argument, Literal) and argument.value is None) and not (binding is not None and binding.entity == "path") and not path_variable:
+                        raise GrafxPlanError("Path functions require a bound path or NULL.", field="function", value=name,
+                                             reason="path_argument_type", query_phase="planning")
                 return ValueType.INT64 if name == "LENGTH" else ValueType.LIST
             if name in NATIVE_SCALARS:
                 return scalar_type(name, *(self._pulse_expression_type(argument, owner=owner)
@@ -2209,6 +2212,9 @@ class _Planner:
         self, pipeline: PlanNode, pattern: PatternPath, terms: list[Expression]
     ) -> tuple[PlanNode, list[Expression]]:
         """Plan one connected path, taking index seeks from the predicate where it can."""
+        capturing = pattern.variable in self.capture_paths
+        if capturing:
+            self.path_projection = pattern
         fast = self._single_hop_fast_path(pipeline, pattern, terms)
         if fast is not None:
             return fast
@@ -2231,7 +2237,7 @@ class _Planner:
                 relationship,
                 target_pattern,
                 path_variable=(
-                    pattern.variable if pattern is self.path_projection else None
+                    pattern.variable if capturing else None
                 ),
             )
             if target_pattern.properties is not None:
@@ -2242,6 +2248,8 @@ class _Planner:
                 terms = terms + list(
                     self._property_terms(source, target_pattern.properties)
                 )
+        if capturing:
+            self.bound_paths.add(pattern.variable)
         return pipeline, terms
 
     def _match_node(
@@ -2831,7 +2839,7 @@ class _Planner:
         """
         if len(pattern.relationships) != 1 or len(pattern.nodes) != 2:
             return None
-        if pattern is self.path_projection:
+        if pattern.variable in self.capture_paths:
             # A projected named path needs the traversal to construct its public path value.
             # A decorative name is deliberately allowed below: the query analysis has already
             # proved nobody can read it, so it must not change the unnamed pattern's plan.
@@ -3166,12 +3174,15 @@ class _Planner:
         """
         pattern = self.path_projection
         assert pattern is not None  # Only the exact typed shape can publish a path value.
-        source_label, target_label = (node.labels[0] for node in pattern.nodes)
-        if not (
-            table.name == pattern.relationships[0].types[0]
-            and table.from_table == source_label
-            and table.to_table == target_label
-        ):
+        source_label, target_label = (node.labels[0] if node.labels else None for node in pattern.nodes)
+        direction = pattern.relationships[0].direction
+        candidates = [(table.from_table, table.to_table)]
+        if direction is Direction.INCOMING:
+            candidates = [(table.to_table, table.from_table)]
+        elif direction is Direction.UNDIRECTED:
+            candidates.append((table.to_table, table.from_table))
+        if not any((source_label is None or source_label == left)
+                   and (target_label is None or target_label == right) for left, right in candidates):
             raise GrafxPlanError(
                 "The projected path endpoint labels do not match the relationship's "
                 "catalog declaration.",
@@ -3181,25 +3192,7 @@ class _Planner:
                 to_table=table.to_table,
             )
 
-        for label in (source_label, target_label):
-            node_table = self._table_named(label, "label")
-            self._require_path_property_keys(node_table, _PATH_PROJECTION_NODE_KEYS)
-        self._require_path_property_keys(table, _PATH_PROJECTION_RELATIONSHIP_KEYS)
 
-    @staticmethod
-    def _require_path_property_keys(
-        table: TableDef, reserved_keys: frozenset[str]
-    ) -> None:
-        """Refuse properties that would replace structural keys in the public path value."""
-        for column in table.property_columns:
-            if column.name in reserved_keys:
-                raise GrafxPlanError(
-                    f"Table {table.name!r} declares path-reserved property {column.name!r}; "
-                    "the projected path reserves that key for structural metadata.",
-                    field="column",
-                    value=column.name,
-                    table=table.name,
-                )
 
     def _require_endpoint(
         self, source: str, table: TableDef, direction: Direction

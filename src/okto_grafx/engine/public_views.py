@@ -1882,274 +1882,22 @@ def _query_text_snapshot(value: object) -> str:
     return text
 
 
-def _path_exact_value(value: object, expected: type[object], *, field: str) -> Any:
-    """Return one exact private path DTO, refusing subclasses and forged nested shapes."""
-    if type(value) is not expected:
-        raise GrafxConfigurationError(
-            f"The {field} of a projected path must be {_builtin_class_name(expected)}; got "
-            f"{_builtin_type_name(value)}.",
-            field=field,
-            value=_builtin_type_name(value),
-        )
-    return value
-
-
-def _path_identity_snapshot(
-    value: object, expected: type[object], *, field: str
-) -> dict[Value, Value]:
-    """Rebuild one opaque path identity from exact signed integers."""
-    source = _path_exact_value(value, expected, field=field)
-    offset = _builtin_int(
-        _domain_field(source, expected, "offset"), field=f"{field}.offset"
-    )
-    table = _builtin_int(
-        _domain_field(source, expected, "table"), field=f"{field}.table"
-    )
-    if not INT64_MIN <= offset <= INT64_MAX:
-        raise GrafxConfigurationError(
-            "A projected path offset must fit in 64 signed bits.",
-            field=f"{field}.offset",
-            value=offset,
-            minimum=INT64_MIN,
-            maximum=INT64_MAX,
-        )
-    if not 1 <= table <= MAX_U32:
-        raise GrafxConfigurationError(
-            "A projected path table identity must fit in the catalog table domain.",
-            field=f"{field}.table",
-            value=table,
-            minimum=1,
-            maximum=MAX_U32,
-        )
-    return {"offset": offset, "table": table}
-
-
-def _path_label_snapshot(value: object, *, field: str) -> str:
-    """Return one exact bounded node label or relationship type."""
-    label = _builtin_text(value, field=field, empty=False)
-    if len(label) > MAX_NAME_CHARACTERS:
-        raise GrafxConfigurationError(
-            f"A projected path label may carry at most {MAX_NAME_CHARACTERS} characters.",
-            field=field,
-            value=len(label),
-            limit=MAX_NAME_CHARACTERS,
-        )
-    return label
-
-
-def _path_properties_snapshot(
-    value: object,
-    *,
-    field: str,
-    depth: int,
-    active: set[int],
-    detached: dict[Value, Value],
-    max_string_characters: int,
-) -> None:
-    """Append exact ordered user properties to one path entity map."""
-    pairs = _tuple_items(value, field=field)
-    if len(pairs) + len(detached) > MAX_MAP_ENTRIES:
-        raise GrafxConfigurationError(
-            f"The {field} mapping may hold at most {MAX_MAP_ENTRIES} entries.",
-            field=field,
-            value=len(pairs) + len(detached),
-            limit=MAX_MAP_ENTRIES,
-        )
-    for position, raw_pair in enumerate(pairs):
-        pair = _tuple_items(raw_pair, field=f"{field}[{position}]")
-        if len(pair) != 2:
-            raise GrafxConfigurationError(
-                "Every projected path property must be one name/value pair.",
-                field=f"{field}[{position}]",
-                value=len(pair),
-                expected=2,
-            )
-        name = _builtin_text(pair[0], field=f"{field}[{position}].name", empty=False)
-        if len(name) > MAX_NAME_CHARACTERS:
-            raise GrafxConfigurationError(
-                f"A projected path property name may carry at most "
-                f"{MAX_NAME_CHARACTERS} characters.",
-                field=f"{field}[{position}].name",
-                value=len(name),
-                limit=MAX_NAME_CHARACTERS,
-            )
-        if name in detached:
-            raise GrafxConfigurationError(
-                f"A projected path property cannot replace reserved or duplicate key "
-                f"{name!r}.",
-                field=f"{field}[{position}].name",
-                value=name,
-                reason="duplicate",
-            )
-        detached[name] = _query_value_snapshot(
-            pair[1],
-            field=f"{field}.{name}",
-            depth=depth,
-            active=active,
-            max_string_characters=max_string_characters,
-        )
-
-
-def _path_node_snapshot(
-    value: object,
-    *,
-    node_type: type[object],
-    identity_type: type[object],
-    field: str,
-    depth: int,
-    active: set[int],
-    max_string_characters: int,
-) -> dict[Value, Value]:
-    """Rebuild one node of a projected path in Kuzu-compatible key order."""
-    source = _path_exact_value(value, node_type, field=field)
-    detached: dict[Value, Value] = {
-        "_ID": _path_identity_snapshot(
-            _domain_field(source, node_type, "identity"),
-            identity_type,
-            field=f"{field}._ID",
-        ),
-        "_LABEL": _path_label_snapshot(
-            _domain_field(source, node_type, "label"), field=f"{field}._LABEL"
-        ),
-    }
-    _path_properties_snapshot(
-        _domain_field(source, node_type, "properties"),
-        field=f"{field}.properties",
-        depth=depth,
-        active=active,
-        detached=detached,
-        max_string_characters=max_string_characters,
-    )
-    return detached
-
-
-def _path_relationship_snapshot(
-    value: object,
-    *,
-    relationship_type: type[object],
-    identity_type: type[object],
-    field: str,
-    depth: int,
-    active: set[int],
-    max_string_characters: int,
-) -> dict[Value, Value]:
-    """Rebuild one relationship of a projected path in Kuzu-compatible key order."""
-    source = _path_exact_value(value, relationship_type, field=field)
-    detached: dict[Value, Value] = {
-        "_SRC": _path_identity_snapshot(
-            _domain_field(source, relationship_type, "source"),
-            identity_type,
-            field=f"{field}._SRC",
-        ),
-        "_DST": _path_identity_snapshot(
-            _domain_field(source, relationship_type, "target"),
-            identity_type,
-            field=f"{field}._DST",
-        ),
-        "_LABEL": _path_label_snapshot(
-            _domain_field(source, relationship_type, "label"),
-            field=f"{field}._LABEL",
-        ),
-        "_ID": _path_identity_snapshot(
-            _domain_field(source, relationship_type, "identity"),
-            identity_type,
-            field=f"{field}._ID",
-        ),
-    }
-    _path_properties_snapshot(
-        _domain_field(source, relationship_type, "properties"),
-        field=f"{field}.properties",
-        depth=depth,
-        active=active,
-        detached=detached,
-        max_string_characters=max_string_characters,
-    )
-    return detached
-
-
-def _query_path_snapshot(
-    value: object,
-    *,
-    field: str,
-    depth: int,
-    active: set[int],
-    max_string_characters: int,
-) -> dict[Value, Value]:
-    """Detach the engine's nominal one-hop path into maps and immutable sequences."""
-    from okto_grafx.engine.query_engine import (
-        _PathIdentity,
-        _PathNodeValue,
-        _PathRelationshipValue,
-        _PathValue,
-    )
-
-    if depth + 4 > MAX_VALUE_DEPTH:
-        raise GrafxConfigurationError(
-            f"A query value may nest at most {MAX_VALUE_DEPTH} levels deep.",
-            field=field,
-            value=depth + 4,
-            limit=MAX_VALUE_DEPTH,
-        )
-    source = _path_exact_value(value, _PathValue, field=field)
-    marker = id(source)
+def _native_path_snapshot(value: object, *, field: str, depth: int, active: set[int],
+                          max_string_characters: int) -> Value:
+    """Rebuild a result-only path through the same hostile entity admission."""
+    from okto_grafx.domain.query.entity_values import PathValue
+    marker = id(value)
     if marker in active:
-        raise GrafxConfigurationError(
-            "A query value cannot contain a recursive projected path.",
-            field=field,
-            value="cycle",
-        )
+        raise GrafxConfigurationError("A path result cannot contain cycles.", field=field)
     active.add(marker)
     try:
-        raw_nodes = _tuple_items(
-            _domain_field(source, _PathValue, "nodes"), field=f"{field}._NODES"
-        )
-        raw_relationships = _tuple_items(
-            _domain_field(source, _PathValue, "relationships"),
-            field=f"{field}._RELS",
-        )
-        if len(raw_nodes) != 2 or len(raw_relationships) != 1:
-            raise GrafxConfigurationError(
-                "A projected path must contain exactly two nodes and one relationship.",
-                field=field,
-                value={
-                    "nodes": len(raw_nodes),
-                    "relationships": len(raw_relationships),
-                },
-            )
-        nodes = tuple(
-            _path_node_snapshot(
-                raw_node,
-                node_type=_PathNodeValue,
-                identity_type=_PathIdentity,
-                field=f"{field}._NODES[{position}]",
-                depth=depth + 3,
-                active=active,
-                max_string_characters=max_string_characters,
-            )
-            for position, raw_node in enumerate(raw_nodes)
-        )
-        relationships = tuple(
-            _path_relationship_snapshot(
-                raw_relationship,
-                relationship_type=_PathRelationshipValue,
-                identity_type=_PathIdentity,
-                field=f"{field}._RELS[{position}]",
-                depth=depth + 3,
-                active=active,
-                max_string_characters=max_string_characters,
-            )
-            for position, raw_relationship in enumerate(raw_relationships)
-        )
-        if (
-            relationships[0]["_SRC"] != nodes[0]["_ID"]
-            or relationships[0]["_DST"] != nodes[1]["_ID"]
-        ):
-            raise GrafxConfigurationError(
-                "A projected relationship must identify the two nodes surrounding it.",
-                field=field,
-                value="endpoint_mismatch",
-            )
-        return {"_NODES": nodes, "_RELS": relationships}
+        parts = []
+        for name in ("nodes", "relationships"):
+            parts.append(_query_value_snapshot(
+                _domain_field(value, PathValue, name), field=field + "." + name,
+                depth=depth + 1, active=active, max_string_characters=max_string_characters,
+                allow_entities=True))
+        return PathValue(*parts)  # type: ignore[return-value, arg-type]
     finally:
         active.remove(marker)
 
@@ -2242,20 +1990,16 @@ def _query_value_snapshot(
     exact_float_sequence = _exact_float_sequence_snapshot(value, depth=depth)
     if exact_float_sequence is not None:
         return exact_float_sequence
-    # This is a result-only marker, not a storable Value. It is recognized nominally and
-    # rebuilt here, outside page access, before a private engine object can reach the caller.
-    from okto_grafx.engine.query_engine import _PathValue
+    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, PathValue
 
-    if value_type is _PathValue:
-        return _query_path_snapshot(
+    if allow_entities and value_type is PathValue:
+        return _native_path_snapshot(
             value,
             field=field,
             depth=depth,
             active=active,
             max_string_characters=max_string_characters,
         )
-    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue
-
     if allow_entities and value_type in (NodeValue, RelationshipValue):
         return _query_entity_snapshot(value, field=field, depth=depth, active=active,
                                       max_string_characters=max_string_characters)
