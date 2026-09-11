@@ -16,10 +16,9 @@ cursor keeps answering with the end token instead of raising ``IndexError``. Tru
 the single most common hostile shape a parser meets, and the ordinary way a hand-written one
 grows an ``IndexError`` is a bare ``tokens[position + 1]``.
 
-Comparison operators are deliberately NON-associative. ``a = b = c`` is refused rather than read
-as ``(a = b) = c``, because the two readings differ and a caller who wrote the first almost
-certainly did not mean the second -- and a query engine that quietly picks one returns rows that
-are wrong rather than a message that is clear.
+Equality/ordering chains denote adjacent-pair conjunctions: ``a = b = c`` means
+``a = b AND b = c``, not boolean-valued left association. Explicit grouping is
+preserved. Expansion reuses operand trees and the ordinary bounded AND evaluator.
 """
 
 from __future__ import annotations
@@ -75,6 +74,7 @@ from okto_grafx.domain.query.ast import (
     WithClause,
 )
 from okto_grafx.domain.query.lexer import tokenize
+from okto_grafx.domain.query.scalars import NONDETERMINISTIC_SCALARS
 from okto_grafx.domain.query.limits import (
     DEFAULT_TRAVERSAL_HOPS,
     MAX_CLAUSES,
@@ -161,16 +161,18 @@ def parse(text: str) -> Statement:
     contract of the function: a caller may hand it any string at all, including one built by an
     attacker, and the answer is either a statement or a located refusal.
     """
-    return _Parser(tokenize(text)).parse_statement()
+    tokens = tokenize(text)
+    return _Parser(tokens, str.__str__(text)).parse_statement()
 
 
 class _Parser:
     """A cursor over the tokens of one query, with a bounded recursion depth."""
 
-    __slots__ = ("_tokens", "_position", "_depth")
+    __slots__ = ("_tokens", "_position", "_depth", "_source")
 
-    def __init__(self, tokens: tuple[Token, ...]) -> None:
+    def __init__(self, tokens: tuple[Token, ...], source: str) -> None:
         self._tokens = tokens
+        self._source = source
         self._position = 0
         self._depth = 0
 
@@ -750,11 +752,15 @@ class _Parser:
 
     def _return_item(self) -> ReturnItem:
         """Parse one projected item and its optional alias."""
+        start = self._current.offset
         expression = self._expression()
+        end = self._tokens[self._position - 1].end_offset
+        assert end is not None
+        source_text = self._source[start:end]
         alias: str | None = None
         if self._match_keyword("AS"):
             alias = self._take_name("an alias")
-        return ReturnItem(expression=expression, alias=alias)
+        return ReturnItem(expression=expression, alias=alias, source_text=source_text)
 
     def _order_by(self) -> tuple[SortItem, ...]:
         """Parse ``ORDER BY key [ASC|DESC] [, ...]``."""
@@ -963,7 +969,7 @@ class _Parser:
     def _binary(self, minimum: int) -> Expression:
         """Parse an expression whose operators all bind at least as tightly as the minimum."""
         left = self._prefix()
-        compared = False
+        advanced_compared = False
         while True:
             if self._at_keyword("IS") and PRECEDENCE_NULL >= minimum:
                 left = self._null_check(left)
@@ -972,14 +978,15 @@ class _Parser:
             if operator is None or operator.precedence < minimum:
                 return left
             if operator.precedence == PRECEDENCE_COMPARISON:
-                if compared:
+                left = self._comparison_chain(left)
+                continue
+            if operator.text in ("IN", "CONTAINS", "STARTS WITH", "ENDS WITH"):
+                if advanced_compared:
                     raise self._refuse(
-                        "Comparisons do not chain in this dialect; write a AND b instead of "
-                        "a = b = c",
-                        field="operator",
-                        value=operator.text,
+                        "Only equality and ordering comparisons form an unparenthesized chain",
+                        field="operator", value=operator.text,
                     )
-                compared = True
+                advanced_compared = True
             for _ in range(operator.tokens):
                 self._advance()
             following = (
@@ -991,6 +998,30 @@ class _Parser:
             right = self._binary(following)
             self._ascend()
             left = BinaryOperation(operator=operator.text, left=left, right=right)
+
+    def _comparison_chain(self, first: Expression) -> Expression:
+        """Lower adjacent comparisons to conjunctions, as specified by the reference.
+
+        Reuse operand nodes, not evaluated values: ``a < b <= c`` has exactly the
+        existing ``a < b AND b <= c`` contract, including three-valued AND.
+        Explicit parentheses create a separate predicand and are never flattened.
+        """
+        previous = first
+        combined: Expression | None = None
+        while True:
+            operator = self._peek_operator()
+            if operator is None or operator.precedence != PRECEDENCE_COMPARISON:
+                assert combined is not None
+                return combined
+            self._advance()
+            self._descend()
+            following = self._binary(PRECEDENCE_COMPARISON + 1)
+            self._ascend()
+            comparison = BinaryOperation(operator=operator.text, left=previous, right=following)
+            combined = comparison if combined is None else BinaryOperation(
+                operator="AND", left=combined, right=comparison,
+            )
+            previous = following
 
     def _null_check(self, operand: Expression) -> NullCheck:
         """Parse the ``IS NULL`` and ``IS NOT NULL`` tests that follow an expression."""
@@ -1030,18 +1061,18 @@ class _Parser:
         if word == "AND":
             return _Operator(text="AND", precedence=PRECEDENCE_AND, tokens=1)
         if word == "IN":
-            return _Operator(text="IN", precedence=PRECEDENCE_COMPARISON, tokens=1)
+            return _Operator(text="IN", precedence=PRECEDENCE_NULL, tokens=1)
         if word == "CONTAINS":
             return _Operator(
-                text="CONTAINS", precedence=PRECEDENCE_COMPARISON, tokens=1
+                text="CONTAINS", precedence=PRECEDENCE_NULL, tokens=1
             )
         if word == "STARTS" and self._at_keyword("WITH", 1):
             return _Operator(
-                text="STARTS WITH", precedence=PRECEDENCE_COMPARISON, tokens=2
+                text="STARTS WITH", precedence=PRECEDENCE_NULL, tokens=2
             )
         if word == "ENDS" and self._at_keyword("WITH", 1):
             return _Operator(
-                text="ENDS WITH", precedence=PRECEDENCE_COMPARISON, tokens=2
+                text="ENDS WITH", precedence=PRECEDENCE_NULL, tokens=2
             )
         return None
 
@@ -1211,7 +1242,8 @@ class _Parser:
 
     def _function_call(self) -> Expression:
         """Parse ``name(arguments)``, including ``count(*)`` and ``count(DISTINCT x)``."""
-        name = self._advance().text
+        token = self._advance()
+        name = token.text
         self._take_symbol("(")
         if name.upper() in ("ALL", "ANY", "NONE", "SINGLE", "REDUCE"):
             self._descend()
@@ -1291,6 +1323,7 @@ class _Parser:
             arguments=tuple(arguments),
             named_arguments=tuple(named),
             distinct=distinct,
+            occurrence=token.offset if name.upper() in NONDETERMINISTIC_SCALARS else None,
         )
 
     def _list_literal(self) -> Expression:

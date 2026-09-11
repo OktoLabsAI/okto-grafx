@@ -385,8 +385,11 @@ def test_maximum_nonprintable_string_literal_fits_rendered_query_bound(
         result = database.execute(text)
 
     assert type(plan) is ProduceResults
-    assert plan.columns == (rendered,)
-    assert result.columns == (rendered,)
+    # Unaliased headings preserve the submitted spelling, while normalized
+    # rendering still fits its separate expansion budget.
+    assert plan.columns == (text[len("RETURN "):],)
+    assert result.columns == (text[len("RETURN "):],)
+    assert len(rendered) <= MAX_RENDERED_QUERY_CHARACTERS
     assert result.rows == ((literal,),)
 
 

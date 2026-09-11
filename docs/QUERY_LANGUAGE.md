@@ -70,6 +70,52 @@ underscores. Values remain exact signed INT64, including `-0x8000000000000000`;
 malformed digits and overflow refuse before statement effects. This introduces
 no new configuration, storage type or Python parameter contract.
 
+Unaliased expression headings preserve the original source spelling: `RETURN
+size(null)` produces the column `size(null)`, not `size(NULL)`. Spaces,
+parentheses and quoted literal spelling inside the expression are preserved;
+leading/trailing trivia outside its token span are not. A returned variable uses
+its logical name without backticks; explicit `AS` always takes precedence.
+Consumers needing stable dictionary keys should use explicit aliases. Normalized
+AST rendering/equality and prepared-cache keys are unchanged.
+
+Property and index postfixes compose on expression results, including functions,
+CASE, grouped operations and list comprehensions: `RETURN
+coalesce(null, {a: [{b: 7}]}).a[0].b AS value` returns `7`. Missing map keys and
+NULL subjects propagate NULL. Provably invalid subject/index types refuse before
+rows; unknown result types are checked when evaluated. Calls are not evaluated
+by planning/binding just to discover a field value.
+
+Property/subscript type refusals carry additive `GrafxPlanError.details` evidence:
+`query_phase="planning"` for statically proven invalid types and
+`query_phase="execution"` for parameter binding or row evaluation. Their `reason`
+is `property_subject_type`, `subscript_subject_type`, `map_key_type` or
+`list_index_type`. Parameter validation can precede the first row or write and is
+still execution, not static planning. This is a scoped contract for these
+refusals, not a promise that every error already carries phase evidence.
+
+Equality/ordering operators (`=`, `<>`, `<`, `<=`, `>`, `>=`, plus the `!=` alias)
+form adjacent-pair chains: `1 < x <= 5` means `1 < x AND x <= 5`, not a comparison
+of a boolean with 5. Explicit parentheses retain their meaning. Three-valued AND
+applies: a false pair decides false; otherwise any unknown pair makes the chain
+NULL. Predicates retain only true. The existing short-circuit and expression-depth
+budgets apply; operands are not granted a new single-evaluation guarantee. Bind
+a value with `WITH expression AS x` when it must be reused. IN, string predicates
+and null checks bind above simple comparisons; they are not themselves chainable
+equality/order operators. [Reference](https://neo4j.com/docs/cypher-manual/4.4/syntax/operators/#cypher-operations-chaining).
+
+`rand()` takes no arguments and returns a pseudorandom DOUBLE in `[0, 1)`. The
+composition root owns a random stream per handle; no seeding/configuration option
+is exposed. This is not cryptographic randomness or an identifier generator.
+Each evaluated occurrence draws a value: no constant folding, cross-execution
+result cache or common-subexpression memoization. Separate occurrences also stay
+distinct in grouping/aggregation; an explicit alias reuses its already drawn value.
+CASE/COALESCE and boolean short-circuiting do not evaluate unselected branches.
+An empty pipeline produces no projection draws. ORDER BY an alias sorts the drawn
+values; a write stores its drawn DOUBLE normally and recovery never redraws it.
+Rollback undoes graph writes, not the pseudorandom stream's consumption. Durable
+logical view definitions reject rand, including nested/unreachable occurrences;
+index definitions still accept declared properties, not random expressions.
+
 | Column/value | Python boundary / restrictions |
 | --- | --- |
 | `INT64` | Signed 64-bit integer; bool is not an integer substitute |

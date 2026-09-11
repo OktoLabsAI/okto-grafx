@@ -134,7 +134,11 @@ The [functional parity plan](specs/FUNCTIONAL_PARITY_PLAN.md) addresses the rema
 expression, subquery, pattern/path, entity-result, persisted-type and procedure
 capabilities together with stateful TCK execution. Implementation is authorized;
 FP-1 checkpoint A is recorded and FP-2 is in progress, with hexadecimal/octal
-INT64 literals implemented. Full functional parity is not yet accepted. The
+INT64 literals, source-faithful unaliased headings, expression-result postfix
+planning/binding, adjacent comparison chains and nondeterministic rand implemented.
+The four quantifier families involving rand passed all 64 original cases; remaining
+required negative contracts and cross-package dependencies still need work.
+Full functional parity is not yet accepted. The
 [working case ledger and stateful-runner contract](conformance/README.md) do not
 change the historical results or exclusions recorded above. Package status belongs
 to the [roadmap](../ROADMAP.md#functional-parity-expansion-plan).

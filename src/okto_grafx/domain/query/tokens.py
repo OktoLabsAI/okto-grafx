@@ -14,7 +14,7 @@ parser asks whether a name reads as a particular keyword. A back-quoted name car
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 __all__ = [
@@ -56,6 +56,7 @@ class Token:
     column: int
     value: object = None
     quoted: bool = False
+    end_offset: int | None = field(default=None, compare=False)
 
     @property
     def upper(self) -> str:

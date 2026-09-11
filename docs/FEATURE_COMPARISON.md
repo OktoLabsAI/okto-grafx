@@ -19,6 +19,13 @@ they do not retroactively change the NHC checkpoint's test evidence.
 
 ## Scope and reading rules
 
+September 11 FP-2 development update: focused native tests now also cover
+hexadecimal/octal INT64 literals, source-faithful headings, general expression
+postfix access, adjacent comparison chains and nondeterministic `rand()`. The
+[working conformance evidence](conformance/FP2_PROGRESS.md) separates these gains
+from still-failing required cases and later-package work. No new competitor
+execution, full regression or overall parity claim is implied by this update.
+
 | Product | Baseline and evidence |
 | --- | --- |
 | Okto Grafx | Published **0.0.5**, tag `v0.0.5`, merge `83cc313`. Local consumer contracts and implementation are the authority. [Publication receipt](reports/PYPI_0_0_5_PUBLICATION.md). |

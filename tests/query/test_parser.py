@@ -471,10 +471,10 @@ def test_the_unsupported_clause_is_named_rather_than_puzzled_over() -> None:
     assert failure.value.details["value"] == "LOAD"
 
 
-def test_comparisons_do_not_chain() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        parse("RETURN 1 = 2 = 3")
-    assert failure.value.details["field"] == "operator"
+def test_comparisons_chain_as_adjacent_conjunctions() -> None:
+    chained = parse("RETURN 1 = 2 = 3")
+    expanded = parse("RETURN 1 = 2 AND 2 = 3")
+    assert chained == expanded
 
 
 def test_an_integer_one_past_the_range_is_refused_when_it_carries_no_sign() -> None:

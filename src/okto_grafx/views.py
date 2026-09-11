@@ -24,6 +24,7 @@ from okto_grafx.domain.query.ast import (
 )
 from okto_grafx.domain.query.analysis import analyze
 from okto_grafx.domain.query.parser import parse
+from okto_grafx.domain.query.effects import is_deterministic
 from okto_grafx.domain.query.planner import build_plan
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -126,6 +127,10 @@ def _parsed(query, parameters):
     ):
         raise _bad("parameters_schema")
     statement = parse(query)
+    if not is_deterministic(statement):
+        raise GrafxUnsupportedOperation(
+            "Logical views require deterministic expressions.", operation="logical_view",
+        )
     # Audit every nested read, not just the outer RETURN branches. Otherwise a CALL
     # could hide an unlabelled scan whose dependencies expand after unrelated DDL.
     branches = []

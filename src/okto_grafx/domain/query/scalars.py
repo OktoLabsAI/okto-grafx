@@ -22,9 +22,11 @@ _CONVERSIONS = {"TOINTEGER", "TOFLOAT", "TOBOOLEAN", "TOSTRING"}
 _ARITIES = {**{name: (1, 1) for name in (*_STRING_UNARY, *_MATH_UNARY, *_CONVERSIONS,
                                       "HEAD", "LAST", "TAIL", "REVERSE", "KEYS")},
             "RANGE": (2, 3), "SUBSTRING": (2, 3), "LEFT": (2, 2), "RIGHT": (2, 2),
-            "REPLACE": (3, 3), "ROUND": (1, 1), "ATAN2": (2, 2), "PI": (0, 0), "E": (0, 0)}
+            "REPLACE": (3, 3), "ROUND": (1, 1), "ATAN2": (2, 2), "PI": (0, 0), "E": (0, 0),
+            "RAND": (0, 0)}
 NATIVE_SCALARS = frozenset(_ARITIES)
-__all__ = ["NATIVE_SCALARS", "MAX_GENERATED_LIST_ELEMENTS", "scalar_arity", "scalar_type", "scalar_value"]
+NONDETERMINISTIC_SCALARS = frozenset({"RAND"})
+__all__ = ["NATIVE_SCALARS", "NONDETERMINISTIC_SCALARS", "MAX_GENERATED_LIST_ELEMENTS", "scalar_arity", "scalar_type", "scalar_value"]
 
 
 def _bad(name: str, message: str = "Incompatible native function argument.") -> GrafxPlanError:
@@ -50,7 +52,7 @@ def scalar_type(name: str, *arguments: ValueType | None) -> ValueType | None:
     elif name in _MATH_UNARY or name in {"ROUND", "ATAN2"}:
         allowed = (number,) * len(arguments)
         result = arguments[0] if name == "ABS" else ValueType.INT64 if name == "SIGN" else ValueType.DOUBLE
-    elif name in {"PI", "E"}:
+    elif name in {"PI", "E", "RAND"}:
         allowed, result = (), ValueType.DOUBLE
     elif name == "RANGE":
         allowed, result = (integer,) * len(arguments), ValueType.LIST
@@ -129,6 +131,8 @@ def scalar_value(name: str, *arguments: object) -> object:
     """Evaluate a closed function, with output admission before large allocations."""
     scalar_arity(name, len(arguments))
     scalar_type(name, *(_kind(value) for value in arguments))
+    if name in NONDETERMINISTIC_SCALARS:
+        raise _bad(name, "Nondeterministic scalars require an execution source, not pure evaluation.")
     if any(value is None for value in arguments):
         return None
     value = arguments[0] if arguments else None

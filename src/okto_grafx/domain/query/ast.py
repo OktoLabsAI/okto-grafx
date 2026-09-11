@@ -312,6 +312,10 @@ class FunctionCall(Expression):
     named_arguments: tuple[NamedArgument, ...] = ()
     distinct: bool = False
     star: bool = False
+    # Volatile calls have source-occurrence identity so separate draws cannot
+    # collide in expression-keyed grouping/aggregate result maps. Scope rewrites
+    # retain this identity; it is not rendered and never contains a sampled value.
+    occurrence: int | None = None
 
     def children(self) -> tuple[Expression, ...]:
         """Return every positional argument and then every named argument value."""
@@ -672,11 +676,16 @@ class ReturnItem:
 
     expression: Expression
     alias: str | None = None
+    source_text: str | None = field(default=None, compare=False)
 
     @property
     def name(self) -> str:
         """Return the column name this item produces."""
-        return self.alias if self.alias is not None else self.expression.describe()
+        if self.alias is not None:
+            return self.alias
+        if isinstance(self.expression, Variable):
+            return self.expression.name
+        return self.source_text if self.source_text is not None else self.expression.describe()
 
     def describe(self) -> str:
         """Return the item as it would be written back."""

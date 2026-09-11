@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import struct
 import threading
 import uuid
@@ -239,6 +240,15 @@ def new_database_uuid() -> bytes:
     mechanism (G2b, A5): the pure core is handed the bytes and only ever stores and compares them.
     """
     return uuid.uuid4().bytes
+
+
+def _new_query_random_source() -> Callable[[], float]:
+    """Own one pseudorandom stream per handle; not identity/security entropy.
+
+    Construction and seeding belong to the composition root. Query semantics
+    receives only a callable, which focused tests replace with controlled draws.
+    """
+    return random.Random().random
 
 
 def _builtin_type_name(value: object) -> str:
@@ -570,6 +580,7 @@ def assemble_database(
             pool=pool,
             metrics=metrics,
             clock=clock,
+            random_source=_new_query_random_source(),
             indexes=indexes,
             vectors=vectors,
             page_stager=transactions._stage_page_image,

@@ -11,15 +11,15 @@ from okto_grafx.domain.query.parser import parse
 
 if __package__:
     from tools.check_opencypher import canonical_value
-    from tools.tck_stateful import GraphState, ObservedError, QueryObservation
+    from tools.tck_stateful import GraphState, QueryObservation
     from tools.tck_fixtures import infer_fixture_schema
-    from tools.tck_errors import compile_error
+    from tools.tck_errors import compile_error, native_error
     from tools.tck_procedures import procedure_registry
 else:
     from check_opencypher import canonical_value
-    from tck_stateful import GraphState, ObservedError, QueryObservation
+    from tck_stateful import GraphState, QueryObservation
     from tck_fixtures import infer_fixture_schema
-    from tck_errors import compile_error
+    from tck_errors import compile_error, native_error
     from tck_procedures import procedure_registry
 
 
@@ -96,7 +96,7 @@ class NativeScenarioBackend:
                 observed = QueryObservation(tuple(result.columns), tuple(result.rows))
             return observed
         except GrafxError as exc:
-            return QueryObservation(error=ObservedError(type(exc).__name__, "unknown", exc.code))
+            return QueryObservation(error=native_error(exc))
 
     def snapshot(self) -> GraphState:
         """Read stored rows, not count queries whose evaluator is under test."""

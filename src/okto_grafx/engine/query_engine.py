@@ -53,6 +53,7 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 from __future__ import annotations
 
 from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_type, scalar_value
+from okto_grafx.domain.query.effects import is_deterministic
 
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -3290,6 +3291,7 @@ class QueryEngine:
         "_compiled_predicates",
         "_compiled_predicates_lock",
         "_tuple_encoding_proofs",
+        "_random_source",
     )
 
     def __init__(
@@ -3300,6 +3302,7 @@ class QueryEngine:
         pool: BufferPool,
         metrics: MetricsSink,
         clock: Clock,
+        random_source: Callable[[], float] | None = None,
         indexes: object = None,
         vectors: object = None,
         page_stager: Callable[[object, str, int, bytes], None] | None = None,
@@ -3320,6 +3323,7 @@ class QueryEngine:
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
+        self._random_source = random_source
         self._extensions = None
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._heap = heap
@@ -8764,7 +8768,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         # A subtree that reaches the canonical walk anywhere is never memoized: the walk does
         # not count the mapping reads it performs, so a repeated fallback could turn two
         # observable reads into one.
-        if counts.get(key, 0) < 2 or not instrumented[id(node)]:
+        if counts.get(key, 0) < 2 or not instrumented[id(node)] or not is_deterministic(node):
             return function
         slot = slot_of.get(key)
         if slot is None:
@@ -14821,6 +14825,7 @@ def _property_of(subject: object, expression: Property) -> object:
             f"{type(subject).__name__}.",
             field="property",
             value=expression.key,
+            reason="property_subject_type", query_phase="execution",
         )
     return subject.value(expression.key)
 
@@ -15027,7 +15032,8 @@ def _subscript_value(expression: Subscript, subject: object, index: object) -> o
         return None
     if isinstance(subject, Mapping):
         if not isinstance(index, str):
-            raise GrafxPlanError("A map subscript needs a string key.", field="subscript", value=expression.describe())
+            raise GrafxPlanError("A map subscript needs a string key.", field="subscript", value=expression.describe(),
+                                 reason="map_key_type", query_phase="execution")
         return subject.get(index)
     if not isinstance(subject, (list, tuple)):
         message = f"A subscript extracts from a list; got {type(subject).__name__}."
@@ -15035,6 +15041,7 @@ def _subscript_value(expression: Subscript, subject: object, index: object) -> o
             message,
             field="subscript",
             value=expression.describe(),
+            reason="subscript_subject_type", query_phase="execution",
         )
     if isinstance(index, bool) or not isinstance(index, int):
         message = (
@@ -15044,6 +15051,7 @@ def _subscript_value(expression: Subscript, subject: object, index: object) -> o
             message,
             field="subscript",
             value=expression.describe(),
+            reason="list_index_type", query_phase="execution",
         )
     if not -len(subject) <= index < len(subject):
         return None
@@ -15542,6 +15550,17 @@ def _infer_bound_pulse_expression_type(
             )
         if any(isinstance(node, Variable) for node in walk(expression.subject)):
             return static_type
+        if not _binder_resolvable(expression):
+            subject_type = _bound_pulse_expression_type(
+                expression.subject, static_types, parameters, owner=owner, _resolved=resolved,
+            )
+            if subject_type not in (None, ValueType.NULL, ValueType.MAP):
+                raise GrafxPlanError("Property access requires a map, graph entity or NULL.",
+                                     field="property", value=expression.key,
+                                     reason="property_subject_type", query_phase="execution")
+            # A row-independent expression is not necessarily bind-time evaluable:
+            # calls/CASE must execute at their actual query position, not as probes.
+            return ValueType.NULL if subject_type is ValueType.NULL else static_type
         value = _bound_postfix_value(expression, parameters, owner=owner)
         return _bound_value_type(expression, value, owner=owner)
     if isinstance(expression, NullCheck):
@@ -15796,7 +15815,7 @@ def _infer_bound_pulse_expression_type(
             owner=owner,
             _resolved=resolved,
         )
-        subscript_argument_types(expression, subject_type, index_type)
+        subscript_argument_types(expression, subject_type, index_type, phase="execution")
         # Only shapes the binder can actually evaluate are materialized here.  Absence of a
         # Variable is not the same question: string_split('a,b', ',')[1] has none and is still
         # outside the postfix vocabulary, so the old guard sent it to _bound_postfix_value and
@@ -16012,7 +16031,7 @@ def _validate_bound_subscript_types(
             parameters,
             owner=expression.describe(),
         )
-        subscript_argument_types(expression, subject_type, index_type)
+        subscript_argument_types(expression, subject_type, index_type, phase="execution")
         if _binder_resolvable(expression):
             # Evaluating it here is what turns "zero rows" back into a refusal: the position
             # and the list are both bound, so an out-of-range subscript is already wrong
@@ -16457,6 +16476,17 @@ def _coalesce_selected(
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name == "RAND":
+        source = context.engine._random_source
+        if source is None:
+            raise GrafxPlanError("No random source was supplied to this query engine.", field="function", value=name)
+        try:
+            value = source()
+        except Exception as error:
+            raise GrafxPlanError("The random source failed.", field="function", value=name) from error
+        if type(value) is not float or not 0.0 <= value < 1.0:
+            raise GrafxPlanError("The random source must return a finite DOUBLE in [0, 1).", field="function", value=name)
+        return value
     if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
         path = _evaluate(expression.arguments[0], row, context)
         if path is None:

@@ -4,6 +4,18 @@
 
 ## Entry points and supported imports
 
+Unaliased `QueryResult.columns` preserve the expression's submitted source spelling;
+explicit aliases and logical variable names retain their existing meaning.
+`dictionaries()` uses these names as keys. Prefer `AS` for application-stable
+keys. See [query value and heading contracts](QUERY_LANGUAGE.md#values-and-python-mapping)
+for numeric literal and expression-result postfix rules. No signature or
+configuration change is introduced by this FP-2 checkpoint.
+
+Native query text also supports adjacent comparison chains and `rand()`; the
+[query contract](QUERY_LANGUAGE.md#values-and-python-mapping) specifies NULL,
+evaluation placement, random range and durable-view refusal. Randomness is
+injected internally by assembly, not a new `connect()` setting or public seed API.
+
 0.0.6 NHC adds `TextMatchPositions` and `TemporalCompactionReport` at the root.
 `okto_grafx.temporal_diff` exports `diff_graph`, `TemporalDiff`,
 `TemporalSchemaChange`, `TemporalRowChange` and `TemporalPropertyChange`.

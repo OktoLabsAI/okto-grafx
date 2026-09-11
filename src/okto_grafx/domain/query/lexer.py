@@ -170,6 +170,7 @@ def tokenize(text: str) -> tuple[Token, ...]:
         Token(
             kind=TokenKind.END,
             text="",
+            end_offset=scanner.index,
             offset=scanner.index,
             line=scanner.line,
             column=scanner.column,
@@ -274,6 +275,7 @@ def _read_name(scanner: _Scanner) -> Token:
     return Token(
         kind=TokenKind.NAME,
         text=name,
+        end_offset=scanner.index,
         offset=offset,
         line=line,
         column=column,
@@ -328,6 +330,7 @@ def _read_quoted_name(scanner: _Scanner) -> Token:
         column=column,
         value=name,
         quoted=True,
+        end_offset=scanner.index,
     )
 
 
@@ -353,6 +356,7 @@ def _read_parameter(scanner: _Scanner) -> Token:
         return Token(
             kind=TokenKind.PARAMETER,
             text=inner.text,
+            end_offset=scanner.index,
             offset=offset,
             line=line,
             column=column,
@@ -378,6 +382,7 @@ def _read_parameter(scanner: _Scanner) -> Token:
     return Token(
         kind=TokenKind.PARAMETER,
         text=name,
+        end_offset=scanner.index,
         offset=offset,
         line=line,
         column=column,
@@ -446,6 +451,7 @@ def _double_token(literal: str, *, line: int, column: int, offset: int) -> Token
     return Token(
         kind=TokenKind.DOUBLE,
         text=literal,
+        end_offset=offset + len(literal),
         offset=offset,
         line=line,
         column=column,
@@ -494,6 +500,7 @@ def _integer_token(literal: str, *, line: int, column: int, offset: int, base: i
     return Token(
         kind=TokenKind.INTEGER,
         text=literal,
+        end_offset=offset + len(literal),
         offset=offset,
         line=line,
         column=column,
@@ -536,6 +543,7 @@ def _read_string(scanner: _Scanner) -> Token:
     return Token(
         kind=TokenKind.STRING,
         text=body,
+        end_offset=scanner.index,
         offset=offset,
         line=line,
         column=column,
@@ -637,6 +645,7 @@ def _read_symbol(scanner: _Scanner) -> Token:
             return Token(
                 kind=TokenKind.SYMBOL,
                 text=symbol,
+                end_offset=scanner.index,
                 offset=offset,
                 line=line,
                 column=column,

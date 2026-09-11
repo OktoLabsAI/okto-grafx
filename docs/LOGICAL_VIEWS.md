@@ -25,6 +25,9 @@ with connect("graph") as db:
 
 ## Semantics and limits
 
+- Definitions must be deterministic. `rand()` is refused anywhere in the query,
+  including nested subqueries, UNION branches and unreachable CASE arms, before
+  persisting or replacing metadata. There is no random-result materialization mode.
 - `prepare` is explicit; `create` never implicitly creates the registry. Repeating
   preparation validates ownership and adds no commit. It requires a writable handle.
 - Names are case-sensitive ASCII identifiers, letter first, <=64 characters.

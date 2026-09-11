@@ -33,6 +33,20 @@ MATCH does not turn a NULL entity binding into a new unbound scan.
 
 ## Values and breaking semantics
 
+The FP-2 development checkpoint additionally preserves unaliased expression
+headings from source text and admits general expression-result postfix composition
+through planning and binding. See [query value and heading contracts](QUERY_LANGUAGE.md#values-and-python-mapping).
+Previously synthesized headings such as `size(NULL)` now retain `size(null)` when
+written that way. Use explicit aliases for application keys and UNION branches
+whose source spellings differ. This does not change value evaluation or scoped
+variable names, and does not imply completion of the remaining functional-parity plan.
+
+FP-2 also adds adjacent-pair equality/order chains and nondeterministic `rand()`.
+Use `WITH rand() AS r` to draw once for each incoming row and reuse `r`; separate
+written calls remain separate, including when nested in aggregates or grouping
+keys. No random result is cached across executions. Existing clause cardinality,
+short-circuit, statement rollback and resource bounds remain in effect.
+
 | Construct | Contract |
 |---|---|
 | `xs[i]` | Zero based, negative from end, out-of-range/NULL yields NULL; BOOL is not an integer index |

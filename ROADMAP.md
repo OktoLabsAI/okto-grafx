@@ -24,7 +24,7 @@ No release number, branch change or publication is implied by plan approval.
 | Order | ID | Planned delivery | Status |
 |---|---|---|---|
 | 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Checkpoint A: 3,897 cases bound, 3,470 required / 427 explicit model divergences; compatible runner paths tested; later-package blockers retained |
-| 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | In progress |
+| 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | In progress: all five implementation fronts have focused tests; required negative contracts and cross-package case closure pending |
 | 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | Planned |
 | 4 | FP-4 | Returning/unit read-write subqueries and variable-import rules | Planned |
 | 5 | FP-5 | Temporal functions/operations and exact native stored values | Planned |
@@ -52,6 +52,23 @@ zero failures/errors/skips. Actual CALL reference diagnostic: 19 passed, 25 fail
 8 not run; named-tree diagnostic: 10 failed after fixture load, 9 not run for
 incompatible endpoint-table families. Failures remain visible. Neo4j CE 5.26.0 image
 digests are pinned for later comparison, not claimed as executed comparative evidence.
+
+FP-2 [working evidence](docs/conformance/FP2_PROGRESS.md): all five original
+column-heading failures now pass unchanged expectations; combined numeric,
+heading/postfix, cache and public-boundary checkpoint passed 187 tests. Required
+negative-contract failures and cross-package case closure remain open; this is
+not package acceptance or a full regression of the current development line.
+
+The subsequent combined FP-2 checkpoint passed **728 tests** (zero failures,
+errors or skips), including comparison chains, rand occurrence identity and
+architecture boundaries. All **64 original Quantifier9–12 cases** also passed
+stateful execution after the rand grouping fix. Precise negative contracts and
+later-package dependencies still prevent FP-2/full-profile acceptance.
+
+The publication checkpoint combines the feature and error-phase suites:
+**1,048 passed**, zero failures/errors/skips. All **44 original map cases** now
+pass with explicit native type-error phase evidence; other required-case gaps
+remain open. See the working evidence above for scope and receipts.
 
 ## Authorized query-language compatibility round
 

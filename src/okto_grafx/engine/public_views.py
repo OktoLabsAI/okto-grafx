@@ -2846,7 +2846,7 @@ def _query_plan_dataclass_snapshot(
                         expected in (ProduceResults, UnionRows)
                         and declared.name == "columns"
                     )
-                    or (expected is ReturnItem and declared.name == "alias")
+                    or (expected is ReturnItem and declared.name in ("alias", "source_text"))
                     else None
                 ),
             )

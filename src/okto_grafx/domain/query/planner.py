@@ -281,7 +281,8 @@ def case_comparison_type(
 
 
 def subscript_argument_types(
-    expression: Subscript, subject_type: ValueType | None, index_type: ValueType | None
+    expression: Subscript, subject_type: ValueType | None, index_type: ValueType | None,
+    *, phase: str = "planning",
 ) -> None:
     """Validate the statically or runtime-resolved arguments of one list extraction."""
     if subject_type not in (None, ValueType.NULL, ValueType.LIST, ValueType.MAP):
@@ -290,6 +291,7 @@ def subscript_argument_types(
             message,
             field="subscript",
             value=expression.describe(),
+            reason="subscript_subject_type", query_phase=phase,
         )
     allowed = ((ValueType.STRING,) if subject_type is ValueType.MAP else
                (ValueType.INT64,) if subject_type is ValueType.LIST else
@@ -300,6 +302,8 @@ def subscript_argument_types(
             message,
             field="subscript",
             value=expression.describe(),
+            reason="map_key_type" if subject_type is ValueType.MAP else "list_index_type",
+            query_phase=phase,
         )
 
 
@@ -1667,6 +1671,23 @@ class _Planner:
             # result type to an enclosing CASE and STRING_SPLIT(...)[n] exposes STRING.
             for node in reversed(tuple(walk(expression))):
                 marker = id(node)
+                if isinstance(node, Property):
+                    subject = node.subject
+                    # Graph bindings have their schema/property validation path.
+                    # Projected scalar aliases, unlike live entities, can already
+                    # prove that this access could never yield a property.
+                    if isinstance(subject, Variable):
+                        subject_type = self.binding_types.get(subject.name)
+                        if (subject.name in self.alias_definitions
+                                and subject.name not in self.tables
+                                and subject.name not in self.polymorphic_variables):
+                            subject_type = self._pulse_expression_type(subject, owner=node.describe())
+                    else:
+                        subject_type = self._pulse_expression_type(subject, owner=node.describe())
+                    if subject_type not in (None, ValueType.NULL, ValueType.MAP):
+                        raise GrafxPlanError("Property access requires a map, graph entity or NULL.",
+                                             field="property", value=node.key,
+                                             reason="property_subject_type", query_phase="planning")
                 if isinstance(node, (ListSlice, ListIteration)):
                     self._pulse_expression_type(node, owner=node.describe())
                     continue
@@ -1814,15 +1835,15 @@ class _Planner:
                 if entry is None:
                     return ValueType.NULL
                 return self._pulse_expression_type(entry, owner=owner)
-            if any(
-                isinstance(node, Parameter) for node in walk(expression.subject)
-            ) and not any(
-                isinstance(node, Variable) for node in walk(expression.subject)
-            ):
-                # A parameter may carry a map directly or after one or more list extractions.
-                # Its selected value is deliberately resolved by the binder, where the actual
-                # parameter value exists, rather than guessed from a row.
-                return None
+            subject_type = self._pulse_expression_type(expression.subject, owner=owner)
+            if subject_type not in (None, ValueType.NULL, ValueType.MAP):
+                raise GrafxPlanError("Property access requires a map, graph entity or NULL.",
+                                     field="property", value=expression.key,
+                                     reason="property_subject_type", query_phase="planning")
+            # Calls, CASE and extracts can produce maps without a statically known
+            # field layout. Unknown field type is not invalid syntax. Do not execute
+            # these expressions during planning to discover their values.
+            return ValueType.NULL if subject_type is ValueType.NULL else None
         if isinstance(expression, NullCheck):
             return ValueType.BOOL
         if isinstance(expression, UnaryOperation):

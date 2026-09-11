@@ -32,3 +32,23 @@ def compile_error(error) -> ObservedError:
         if field == "function" and message.startswith("There is no function named "):
             detail = "UnknownFunction"
     return ObservedError("SyntaxError", "compile time", detail)
+
+
+def native_error(error) -> ObservedError:
+    """Map only explicitly typed native refusals with raise-site phase evidence.
+
+    A message, error class, or the fact that execute raised is not phase proof.
+    Parameter binding is runtime; schema/static type validation is compile time.
+    """
+    phase = {"planning": "compile time", "execution": "runtime"}.get(error.details.get("query_phase"))
+    reason = error.details.get("reason")
+    field = error.details.get("field")
+    if isinstance(error, GrafxPlanError) and phase is not None:
+        if field == "property" and reason == "property_subject_type":
+            return ObservedError("TypeError", phase, "InvalidArgumentType")
+        if field == "subscript" and reason in {"subscript_subject_type", "map_key_type", "list_index_type"}:
+            detail = ("MapElementAccessByNonString" if reason == "map_key_type" and phase == "runtime"
+                      else "ListElementAccessByNonInteger" if reason == "list_index_type" and phase == "runtime"
+                      else "InvalidArgumentType")
+            return ObservedError("TypeError", phase, detail)
+    return ObservedError(type(error).__name__, "unknown", error.code)
