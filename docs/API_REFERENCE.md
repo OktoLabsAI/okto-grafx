@@ -156,13 +156,15 @@ execution; write transactions refuse the options. `Maintenance.cleanup_indexes`
 provides an independently revalidated dry-run/removal census under explicit
 whole-store quiescence. See [contracts, examples, errors and limits](READ_CONTROL_AND_INDEX_CLEANUP.md).
 
-## Trusted scalar extensions and Arrow interop
+## Trusted scalar/tabular extensions and Arrow interop
 
-Use `from okto_grafx.extensions import ExtensionRegistry, ScalarFunction` and
+Use `from okto_grafx.extensions import ExtensionRegistry, ScalarFunction, TabularProcedure` and
 `connect(..., extensions=registry)` for the explicit per-handle allowlist.
 `registry.call_scalar(name, arguments_tuple)` supports direct invocation; the query
 door is `udf('namespace.name', ...)`. Registration, value budgets, NULL/type/error
 semantics and trust limits are in [Extensions and Arrow](EXTENSIONS_AND_ARROW.md).
+Typed tabular CALL/YIELD, permissions, per-invocation budgets, cleanup and
+subquery composition are specified in [Composable queries](COMPOSABLE_QUERIES.md).
 `from okto_grafx.arrow import to_arrow_batches` provides optional copied scalar/vector
 batches over a materialized result or caller-owned cursor. The same guide defines
 all type mappings, budget tariffs, snapshot and close obligations.
@@ -2126,6 +2128,31 @@ invoke(arguments: tuple[object, ...]) -> object
 
 Call with scalar values only; NULL propagates and callback failures are typed.
 
+### TabularProcedure fields
+
+Annotation location: `okto_grafx.domain.query.extensions.TabularProcedure`.
+
+Trusted pure tabular callback: no database handle or implicit write capability.
+
+```python
+name: str
+argument_types: tuple[str, ...]
+columns: tuple[tuple[str, str], ...]
+implementation: Callable[..., Iterable[tuple[object, ...]]]
+required_permissions: frozenset[str]
+max_rows: int
+max_result_bytes: int
+max_value_bytes: int
+```
+
+#### TabularProcedure.invoke
+
+```python
+invoke(arguments: tuple[object, ...]) -> Iterator[tuple[object, ...]]
+```
+
+Validate inputs/results and close the callback stream on exhaustion or cancellation.
+
 ### ExtensionRegistry fields
 
 Annotation location: `okto_grafx.domain.query.extensions.ExtensionRegistry`.
@@ -2135,6 +2162,8 @@ Per-handle immutable trusted allowlist; not a sandbox or a plugin loader.
 ```python
 scalars: tuple[ScalarFunction, ...]
 trusted: bool
+procedures: tuple[TabularProcedure, ...]
+procedure_permissions: frozenset[str]
 ```
 
 #### ExtensionRegistry.call_scalar

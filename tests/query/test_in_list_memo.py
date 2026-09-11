@@ -450,4 +450,5 @@ def test_equal_fast_path_keeps_the_value_matrix() -> None:
     assert _equal(True, True) is True
     assert _equal("a", b"a") is False
     assert _equal(["a"], ("a",)) is True
-    assert _equal({"k": 1}, {"k": 1.0}) is False
+    assert _equal({"k": 1}, {"k": 1.0}) is True
+    assert _equal({"k": True}, {"k": 1}) is False

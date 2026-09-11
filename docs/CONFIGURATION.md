@@ -1,5 +1,10 @@
 # Configuration reference
 
+Query-language semantics have no legacy compatibility switch. Host-owned tabular
+procedure settings (`required_permissions`, `max_rows`, `max_result_bytes`,
+`max_value_bytes`) belong to each immutable `ExtensionRegistry`, not persisted
+database configuration. See [procedure configuration and safety limits](COMPOSABLE_QUERIES.md#typed-tabular-procedures).
+
 NHC operation-local additions (no new `connect` defaults):
 
 | Option / operation | Default | Consumer contract |
@@ -402,5 +407,15 @@ enabled. This first byte-budget boundary does not cover `EagerRows`, vector-sear
 materialisation, deadlines, RSS or public result retention; use the row limits and cursor API for
 those separate boundaries. It changes no snapshot, transaction, WAL, OCC, durable format,
 multiwriter or multireader rule.
+
+The 0.0.6 language round adds no legacy compatibility switch. List iteration and
+concatenation have fixed 100,000-element limits; nested iterations share a
+100,000-step statement ceiling. Native range generation has the same element cap.
+These limits are independent of spill accounting, which does not cover arbitrary
+expression temporaries. Composed write phases share `max_statement_writes` and
+transaction quotas; obtaining private endpoint identities never resets a quota
+or makes an intermediate commit. UNION is bounded to 64 read branches and
+returning subquery nesting to 16. Procedure registration adds explicit per-call
+row/value/result-byte budgets, detailed in [composable queries](COMPOSABLE_QUERIES.md).
 
 ---

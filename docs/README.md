@@ -22,6 +22,10 @@ publication or that the latest source is installed in a particular application.
 | How do I opt into commit provenance and page its history? | [Commit history](COMMIT_HISTORY.md) |
 | Which settings exist, what are their defaults and risks? | [Configuration](CONFIGURATION.md) |
 | Which Cypher constructs and value types are supported? | [Query language](QUERY_LANGUAGE.md) |
+| How do ordered clauses, subqueries and typed CALL/YIELD compose? | [Composable queries](COMPOSABLE_QUERIES.md) |
+| What is the fixed language target and what has been tested? | [Cypher compatibility](CYPHER_COMPATIBILITY.md) |
+| What is planned for the remaining language, stored-type and TCK gaps? | [Functional parity plan — not implemented](specs/FUNCTIONAL_PARITY_PLAN.md) |
+| Where is the eight-item language round's regression and Pulse migration evidence? | [Language acceptance record](reports/V006_QUERY_LANGUAGE_ROUND.md) |
 | How do indexes, vectors and explicit growth work? | [Indexes and vectors](INDEXES_AND_VECTORS.md) |
 | How do I index text and search with BM25, filters and snapshot consistency? | [Native full-text search](FULL_TEXT_SEARCH.md) |
 | How do I combine lexical, vector and bounded graph evidence? | [Hybrid search](HYBRID_SEARCH.md) |

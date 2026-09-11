@@ -79,6 +79,7 @@ dev = [
     "pytest-timeout",
     "ruff==0.15.1",
     "PyYAML>=6",
+    "gherkin-official==37.0.0",
 ]
 
 [project.scripts]

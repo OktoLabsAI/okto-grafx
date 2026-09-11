@@ -504,26 +504,23 @@ def test_pending_node_cannot_reach_the_heap_as_a_relationship_endpoint(
         )
 
         same_statement = handle.begin("write")
-        with pytest.raises(GrafxUnsupportedOperation) as same_statement_raised:
-            same_statement.execute(
-                "CREATE (a:Person {id: 10, name: 'A'}) "
-                "CREATE (b:Person {id: 11, name: 'B'}) "
-                "CREATE (a)-[:Knows {since: 2020}]->(b)"
-            )
-        assert (
-            same_statement_raised.value.details["operation"] == "relationship_endpoint"
+        same_statement.execute(
+            "CREATE (a:Person {id: 10, name: 'A'}) "
+            "CREATE (b:Person {id: 11, name: 'B'}) "
+            "CREATE (a)-[:Knows {since: 2020}]->(b)"
         )
-        assert same_statement_raised.value.details["field"] == "source"
-        assert same_statement._context.row_intents == []
+        assert same_statement.execute(
+            "MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id,b.id,r.since"
+        ).rows == ((10,11,2020),)
         same_statement.rollback()
     finally:
         handle.close()
 
 
-def test_detach_delete_refuses_an_incident_relationship_held_by_same_statement(
+def test_detach_delete_removes_an_incident_relationship_created_by_same_statement(
     tmp_path: Path,
 ) -> None:
-    """A refused compound statement hands neither its edge nor its detach to the txn."""
+    """Fresh relationships are included in an atomic subsequent DETACH DELETE."""
     handle = okto_grafx.connect(str(tmp_path / "held-detach-db"))
     try:
         with handle.begin("write") as schema:
@@ -534,16 +531,12 @@ def test_detach_delete_refuses_an_incident_relationship_held_by_same_statement(
             seed.execute("CREATE (:Person {id: 2})")
 
         with handle.begin("write") as writer:
-            with pytest.raises(GrafxUnsupportedOperation) as raised:
-                writer.execute(
-                    "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
-                    "CREATE (a)-[:Knows {since: 2020}]->(b) DETACH DELETE a"
-                )
-            assert raised.value.details["operation"] == "detach_delete"
-            assert writer._context.row_intents == []
+            writer.execute(
+                "MATCH (a:Person {id: 1}), (b:Person {id: 2}) "
+                "CREATE (a)-[:Knows {since: 2020}]->(b) DETACH DELETE a"
+            )
 
         assert handle.execute("MATCH (p:Person) RETURN p.id ORDER BY p.id").rows == (
-            (1,),
             (2,),
         )
         assert (

@@ -515,7 +515,7 @@ def test_a_table_whose_rows_were_all_deleted_keeps_the_selector(
 ) -> None:
     """Ids once allocated are not the empty proof: the rule and its scan still run."""
     with database.begin("write") as transaction:  # type: ignore[attr-defined]
-        transaction.execute("MATCH (n:A) DELETE n")
+        transaction.execute("MATCH (n:A) DETACH DELETE n")
     counts = _doors(monkeypatch)
     assert database.execute(QUERY, {"ids": ["a1"]}).rows == ()  # type: ignore[attr-defined]
     assert counts["many"] == 1 and counts["scans"] == 0

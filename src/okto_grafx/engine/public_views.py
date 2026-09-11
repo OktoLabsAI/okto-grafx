@@ -90,6 +90,8 @@ from okto_grafx.domain.query.ast import (
     ReturnItem,
     SortItem,
     Subscript,
+    ListSlice,
+    ListIteration,
     UnaryOperation,
     Variable,
 )
@@ -107,6 +109,10 @@ from okto_grafx.domain.query.limits import (
 )
 from okto_grafx.domain.query.plan import (
     AllNodesScan,
+    ArgumentRows,
+    ApplyRows,
+    SubqueryRows,
+    ProcedureRows,
     MAX_PLAN_DEPTH,
     AggregateRows,
     CreateIndex,
@@ -2437,6 +2443,10 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
     {
         AggregateRows,
         AllNodesScan,
+        ArgumentRows,
+        ApplyRows,
+        SubqueryRows,
+        ProcedureRows,
         CreateIndex,
         CreateNodeTable,
         CreateRelationships,
@@ -2484,6 +2494,8 @@ _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
         Parameter,
         Property,
         Subscript,
+        ListSlice,
+        ListIteration,
         UnaryOperation,
         Variable,
     }

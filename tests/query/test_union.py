@@ -1,11 +1,4 @@
-"""Two reading queries answered as one result, and everything that must not be one.
-
-The pair is deliberately narrow: two branches, both read-only, both ending in RETURN, the same
-arity, and column names taken from the left branch alone. What makes it worth its own file is
-not the happy path but the edges around it -- a word that only looks like the keyword, a tree
-nobody parsed, a type the two sides cannot agree about, and a budget that has to count the rows
-BEFORE the duplicates are removed rather than after.
-"""
+"""Read-only set composition: column identity, heterogeneous values, scope and shared budgets."""
 
 from __future__ import annotations
 
@@ -66,7 +59,7 @@ def database(tmp_path: Path) -> Iterator[object]:
 def test_the_plan_is_the_pair_of_pipelines_under_one_distinct() -> None:
     """The union is one tree: the branches lose their own results and gain a shared one."""
     plan = build_plan(
-        parse("MATCH (n:Person) RETURN n.id UNION MATCH (m:Doc) RETURN m.id"),
+        parse("MATCH (n:Person) RETURN n.id UNION MATCH (m:Doc) RETURN m.id AS `n.id`"),
         catalog=build_catalog(),
     )
     assert [line.split("(")[0].strip() for line in plan.root.render()[:3]] == [
@@ -82,17 +75,17 @@ def test_the_plan_is_the_pair_of_pipelines_under_one_distinct() -> None:
 
 def test_the_admitted_pair_round_trips_through_its_description() -> None:
     statement = parse(
-        "MATCH (n:Person) RETURN n.id AS left UNION MATCH (m:Doc) RETURN m.id AS right"
+        "MATCH (n:Person) RETURN n.id AS left UNION MATCH (m:Doc) RETURN m.id AS left"
     )
     assert type(statement) is UnionQuery
     assert parse(statement.describe()) == statement
 
 
-def test_public_names_come_from_the_left_branch_alone(database: object) -> None:
-    """The right branch may spell its aliases differently; a reader never sees them."""
-    found = database.execute(
-        "MATCH (n:A) RETURN n.id AS left_name UNION MATCH (m:B) RETURN m.id AS other"
-    )
+def test_public_names_must_agree_in_both_branches(database: object) -> None:
+    """Column names are a set-operation contract, not positional silent renaming."""
+    with pytest.raises(GrafxPlanError, match="same column names"):
+        database.execute("MATCH (n:A) RETURN n.id AS left_name UNION MATCH (m:B) RETURN m.id AS other")
+    found = database.execute("MATCH (n:A) RETURN n.id AS left_name UNION MATCH (m:B) RETURN m.id AS left_name")
     assert found.columns == ("left_name",)
     assert sorted(row[0] for row in found.rows) == ["x", "y"]
 
@@ -102,15 +95,15 @@ def test_public_names_come_from_the_left_branch_alone(database: object) -> None:
     (
         (
             "MATCH (n:A) WHERE false RETURN n.id UNION "
-            "MATCH (m:B) WHERE false RETURN m.id",
+            "MATCH (m:B) WHERE false RETURN m.id AS `n.id`",
             (),
         ),
         (
-            "RETURN 'one' AS id UNION MATCH (m:B) WHERE false RETURN m.id",
+            "RETURN 'one' AS `n.id` UNION MATCH (m:B) WHERE false RETURN m.id AS `n.id`",
             (("one",),),
         ),
         (
-            "MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id",
+            "MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id AS `n.id`",
             (("x",), ("y",)),
         ),
     ),
@@ -132,7 +125,7 @@ def test_duplicates_inside_and_across_branches_are_removed_once(
         writer.execute("CREATE (:A {id: 'z', n: 1})")
         writer.execute("CREATE (:B {id: 'w', n: 1})")
 
-    found = database.execute("MATCH (n:A) RETURN n.n UNION MATCH (m:B) RETURN m.n")
+    found = database.execute("MATCH (n:A) RETURN n.n UNION MATCH (m:B) RETURN m.n AS `n.n`")
     assert found.rows == ((1,), (2,), (3,))
 
 
@@ -147,7 +140,7 @@ def test_an_int_and_a_double_widen_before_the_duplicates_are_removed(
     This single case proves three things at once -- the coercion happens, it happens BEFORE the
     distinct, and the published name is the left branch's.
     """
-    found = database.execute("RETURN 1 AS left UNION RETURN 1.0 AS right")
+    found = database.execute("RETURN 1 AS left UNION RETURN 1.0 AS left")
     assert found.columns == ("left",)
     assert found.rows == ((1.0,),)
 
@@ -155,20 +148,18 @@ def test_an_int_and_a_double_widen_before_the_duplicates_are_removed(
 @pytest.mark.parametrize(
     ("text", "left_type", "right_type"),
     (
-        ("RETURN true AS a UNION RETURN 1 AS b", "BOOL", "INT64"),
-        ("RETURN 'a' AS a UNION RETURN 1 AS b", "STRING", "INT64"),
-        ("RETURN 1 AS a UNION RETURN 'a' AS b", "INT64", "STRING"),
+        ("RETURN true AS a UNION RETURN 1 AS a", "BOOL", "INT64"),
+        ("RETURN 'a' AS a UNION RETURN 1 AS a", "STRING", "INT64"),
+        ("RETURN 1 AS a UNION RETURN 'a' AS a", "INT64", "STRING"),
     ),
 )
-def test_families_this_engine_does_not_read_as_one_are_refused(
+def test_union_preserves_distinct_scalar_families(
     text: str, left_type: str, right_type: str
 ) -> None:
-    """BOOL beside INT64 is the one some dialects merge; this one names both and refuses."""
-    with pytest.raises(GrafxPlanError) as failure:
-        build_plan(parse(text), catalog=build_catalog())
-    assert left_type in str(failure.value)
-    assert right_type in str(failure.value)
-    assert failure.value.details["field"] == "union"
+    with okto_grafx.connect(":memory:") as db:
+        values = db.execute(text).rows
+    kinds = {"BOOL": bool, "INT64": int, "STRING": str}
+    assert tuple(type(row[0]) for row in values) == (kinds[left_type], kinds[right_type])
 
 
 def test_a_provable_disagreement_is_refused_before_anything_runs() -> None:
@@ -182,11 +173,11 @@ def test_a_provable_disagreement_is_refused_before_anything_runs() -> None:
 
 def test_null_takes_the_other_side_and_two_nulls_are_one_row(database: object) -> None:
     """A column that is null on one side says nothing about what the column IS."""
-    assert database.execute("RETURN null AS a UNION RETURN 1 AS b").rows == (
+    assert database.execute("RETURN null AS a UNION RETURN 1 AS a").rows == (
         (None,),
         (1,),
     )
-    assert database.execute("RETURN null AS a UNION RETURN null AS b").rows == (
+    assert database.execute("RETURN null AS a UNION RETURN null AS a").rows == (
         (None,),
     )
 
@@ -196,25 +187,26 @@ def test_aggregates_and_labels_are_typed_by_the_engine_that_already_types_them(
 ) -> None:
     """count and label carry a type, so a pair of them is a pair the engine can judge."""
     counted = database.execute(
-        "MATCH (n:A) RETURN count(n) AS c UNION MATCH (m:B) RETURN count(m) AS d"
+        "MATCH (n:A) RETURN count(n) AS c UNION MATCH (m:B) RETURN count(m) AS c"
     )
     assert counted.rows == ((2,), (1,))
     labelled = database.execute(
-        "MATCH (n:A) RETURN label(n) AS l UNION MATCH (m:B) RETURN label(m) AS k"
+        "MATCH (n:A) RETURN label(n) AS l UNION MATCH (m:B) RETURN label(m) AS l"
     )
     assert sorted(row[0] for row in labelled.rows) == ["A", "B"]
     with pytest.raises(GrafxPlanError):
         database.execute(
-            "MATCH (n:A) RETURN count(n) AS c UNION MATCH (m:B) RETURN label(m) AS k"
+            "MATCH (n:A) RETURN count(n) AS c UNION MATCH (m:B) RETURN label(m) AS l"
         )
 
 
-def test_sum_widens_an_integer_peer_before_global_distinct(database: object) -> None:
-    """SUM already returns DOUBLE, so its logical type must make the integer peer widen."""
+def test_sum_preserves_integer_type_and_deduplicates_equal_peer(database: object) -> None:
+    """SUM no longer rounds integer inputs through DOUBLE; UNION never coerces its peer."""
     found = database.execute(
-        "MATCH (n:A) RETURN sum(n.n) AS total UNION RETURN 3 AS other"
+        "MATCH (n:A) RETURN sum(n.n) AS total UNION RETURN 3 AS total"
     )
-    assert found.rows == ((3.0,),)
+    assert found.rows == ((3,),)
+    assert type(found.rows[0][0]) is int
 
 
 def test_a_logically_double_column_normalises_runtime_ints_before_distinct(
@@ -222,7 +214,7 @@ def test_a_logically_double_column_normalises_runtime_ints_before_distinct(
 ) -> None:
     """A mixed numeric list is DOUBLE even when the selected element happens to be int."""
     found = database.execute(
-        "MATCH (n:A) RETURN [1, 2.0][n.n] AS value UNION RETURN 1.0 AS other"
+        "MATCH (n:A) RETURN [1, 2.0][n.n - 1] AS value UNION RETURN 1.0 AS value"
     )
     assert found.rows == ((1.0,), (2.0,))
 
@@ -237,7 +229,7 @@ def test_parameter_aggregate_types_are_resolved_at_the_bind(
     expected: object,
 ) -> None:
     found = database.execute(
-        f"RETURN {aggregate}($p) AS value UNION RETURN 1 AS other",
+        f"RETURN {aggregate}($p) AS value UNION RETURN 1 AS value",
         {"p": 1},
     )
     assert found.rows == ((expected,),)
@@ -249,7 +241,7 @@ def test_parameters_behind_branch_local_with_aliases_resolve_at_one_bind(
     """Typing follows each branch alias while execution still reads its projected value."""
     found = database.execute(
         "WITH $left AS first WITH first + 1 AS x RETURN x AS value "
-        "UNION WITH $right AS x RETURN x AS other",
+        "UNION WITH $right AS x RETURN x AS value",
         {"left": 1, "right": 2},
     )
     assert found.rows == ((2,),)
@@ -258,7 +250,7 @@ def test_parameters_behind_branch_local_with_aliases_resolve_at_one_bind(
 def test_a_literal_map_remains_typed_behind_a_with_alias(database: object) -> None:
     """Typing expands the alias while execution still reads the WITH-projected map."""
     found = database.execute(
-        "WITH {x: 2} AS m RETURN m.x AS value UNION RETURN 2 AS other"
+        "WITH {x: 2} AS m RETURN m.x AS value UNION RETURN 2 AS value"
     )
     assert found.rows == ((2,),)
 
@@ -268,7 +260,7 @@ def test_a_parameter_map_postfix_behind_with_is_resolved_at_the_bind(
 ) -> None:
     """The one pre-stream bind sees through the alias before either branch is read."""
     found = database.execute(
-        "WITH $m AS m RETURN m.x AS value UNION RETURN 2 AS other",
+        "WITH $m AS m RETURN m.x AS value UNION RETURN 2 AS value",
         {"m": {"x": 2}},
     )
     assert found.rows == ((2,),)
@@ -286,7 +278,7 @@ def test_union_types_only_the_selected_computed_map_entry_at_bind_time(
     database: object, left: str
 ) -> None:
     """A map selector does not require the postfix binder to execute its scalar entry."""
-    found = database.execute(f"{left} UNION RETURN 2 AS other", {"p": 1})
+    found = database.execute(f"{left} UNION RETURN 2 AS value", {"p": 1})
     assert found.rows == ((2,),)
 
 
@@ -295,10 +287,10 @@ def test_a_shared_alias_dag_never_expands_into_a_rendered_bind_error(
 ) -> None:
     stages = ["WITH $p AS a0"]
     stages.extend(f"WITH a{i - 1} + a{i - 1} AS a{i}" for i in range(1, 21))
-    text = " ".join((*stages, "RETURN {v: a20}.v AS value UNION RETURN 1 AS other"))
+    text = " ".join((*stages, "RETURN {v: a20}.v AS value UNION RETURN 1 AS value"))
 
     with pytest.raises(GrafxPlanError) as failure:
-        database.execute(text, {"p": []})
+        database.execute(text, {"p": True})
     assert len(str(failure.value)) < 1024
 
 
@@ -315,7 +307,7 @@ def test_bound_alias_type_replaces_its_provisional_static_type(
 ) -> None:
     """A parameter can widen an alias whose non-parameter arm looked statically integral."""
     found = database.execute(
-        f"WITH {source} AS x RETURN x AS value UNION RETURN 1 AS other",
+        f"WITH {source} AS x RETURN x AS value UNION RETURN 1 AS value",
         {"p": 2.5},
     )
     assert found.rows == ((2.5,), (1.0,))
@@ -325,7 +317,7 @@ def test_an_alias_inside_a_case_remains_typed_for_union(database: object) -> Non
     """The typing-only CASE clone is inferred independently of executable metadata ids."""
     found = database.execute(
         "WITH 2 AS x RETURN CASE WHEN true THEN x ELSE 1 END AS value "
-        "UNION RETURN 2 AS other"
+        "UNION RETURN 2 AS value"
     )
     assert found.rows == ((2,),)
 
@@ -335,10 +327,12 @@ def test_typing_aliases_form_a_linear_dag_instead_of_an_exponential_tree() -> No
     stages = ["WITH $p AS a0"]
     stages.extend(f"WITH a{i - 1} + a{i - 1} AS a{i}" for i in range(1, 25))
     statement = parse(
-        " ".join((*stages, "RETURN a24 AS value UNION RETURN 1 AS other"))
+        " ".join((*stages, "RETURN a24 AS value UNION RETURN 1 AS value"))
     )
-    plan = build_plan(statement, catalog=build_catalog())
-    expression = plan.union_columns[0][1]
+    from okto_grafx.domain.query.planner import _Planner
+    planner = _Planner(catalog=build_catalog(), indexes=(), analysis=analyze(statement.left))
+    planner.run(statement.left)
+    expression = planner._union_type_expression(planner.analysis.statement.return_clause.items[0].expression)
 
     depth = 0
     while isinstance(expression, BinaryOperation):
@@ -355,7 +349,7 @@ def test_bound_typing_visits_each_shared_alias_node_once(
     """The bind keeps the planner's DAG sharing instead of walking both arms repeatedly."""
     stages = ["WITH $p AS a0"]
     stages.extend(f"WITH a{i - 1} + a{i - 1} AS a{i}" for i in range(1, 21))
-    text = " ".join((*stages, "RETURN a20 AS value UNION RETURN 1 AS other"))
+    text = " ".join((*stages, "RETURN a20 AS value UNION RETURN 1 AS value"))
     calls = 0
     original = query_engine._infer_bound_pulse_expression_type
 
@@ -375,7 +369,7 @@ def test_combined_alias_depth_is_refused_by_a_typed_budget_before_the_stack() ->
     stages = ["WITH $p AS a0"]
     stages.extend(f"WITH {unary}a{i - 1} AS a{i}" for i in range(1, 56))
     statement = parse(
-        " ".join((*stages, "RETURN a55 AS value UNION RETURN 1 AS other"))
+        " ".join((*stages, "RETURN a55 AS value UNION RETURN 1 AS value"))
     )
 
     with pytest.raises(GrafxPlanError) as failure:
@@ -391,7 +385,7 @@ def test_union_typing_accepts_the_same_live_expression_depth_as_an_ordinary_quer
 
     build_plan(parse(f"RETURN {expression} AS value"), catalog=build_catalog())
     build_plan(
-        parse(f"RETURN {expression} AS value UNION RETURN 1 AS other"),
+        parse(f"RETURN {expression} AS value UNION RETURN 1 AS value"),
         catalog=build_catalog(),
     )
 
@@ -402,7 +396,7 @@ def test_alias_expansion_accepts_the_ceiling_and_refuses_the_next_level() -> Non
     def query(depth: int) -> str:
         stages = ["WITH 1 AS a0"]
         stages.extend(f"WITH -a{i - 1} AS a{i}" for i in range(1, depth + 1))
-        return " ".join((*stages, f"RETURN a{depth} AS value UNION RETURN 1 AS other"))
+        return " ".join((*stages, f"RETURN a{depth} AS value UNION RETURN 1 AS value"))
 
     build_plan(parse(query(MAX_EXPRESSION_DEPTH)), catalog=build_catalog())
     with pytest.raises(GrafxPlanError) as failure:
@@ -414,21 +408,21 @@ def test_union_types_a_literal_unwind_source_from_all_its_elements(
     database: object,
 ) -> None:
     found = database.execute(
-        "UNWIND [1, 2] AS x RETURN x AS value UNION RETURN 1 AS other"
+        "UNWIND [1, 2] AS x RETURN x AS value UNION RETURN 1 AS value"
     )
     assert found.rows == ((1,), (2,))
 
 
 def test_union_types_a_parameter_unwind_source_at_the_bind(database: object) -> None:
     found = database.execute(
-        "UNWIND $items AS x RETURN x AS value UNION RETURN 1.0 AS other",
+        "UNWIND $items AS x RETURN x AS value UNION RETURN 1.0 AS value",
         {"items": [1, 2.0]},
     )
     assert found.rows == ((1.0,), (2.0,))
 
 
 @pytest.mark.parametrize("items", ([1, "bad"], "not-a-list"))
-def test_invalid_bound_unwind_types_are_refused_before_any_rows(
+def test_unwind_carrier_validation_does_not_require_homogeneous_elements(
     database: object,
     monkeypatch: pytest.MonkeyPatch,
     items: object,
@@ -442,33 +436,32 @@ def test_invalid_bound_unwind_types_are_refused_before_any_rows(
         return original(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(query_engine.QueryEngine, "_rows", counted)
-    with pytest.raises(GrafxPlanError):
-        database.execute(
-            "UNWIND $items AS x RETURN x AS value UNION RETURN 1 AS other",
-            {"items": items},
-        )
-    assert calls == 0
+    text = "UNWIND $items AS x RETURN x AS value UNION RETURN 1 AS value"
+    if isinstance(items, list):
+        assert database.execute(text, {"items": items}).rows == ((1,), ("bad",))
+    else:
+        with pytest.raises(GrafxPlanError, match="list"):
+            database.execute(text, {"items": items})
+    assert calls > 0  # Row-dependent carriers are validated by their UNWIND operator.
 
 
 @pytest.mark.parametrize(
     ("source", "parameters"),
     (("[]", None), ("$items", {"items": []})),
 )
-def test_an_empty_unwind_source_remains_fail_closed_without_type_evidence(
+def test_an_empty_unwind_branch_contributes_no_rows(
     database: object,
     source: str,
     parameters: dict[str, object] | None,
 ) -> None:
-    with pytest.raises(GrafxPlanError):
-        database.execute(
-            f"UNWIND {source} AS x RETURN x AS value UNION RETURN 1 AS other",
-            parameters,
-        )
+    assert database.execute(
+        f"UNWIND {source} AS x RETURN x AS value UNION RETURN 1 AS value", parameters,
+    ).rows == ((1,),)
 
 
 def test_an_all_null_unwind_source_has_the_null_type(database: object) -> None:
     found = database.execute(
-        "UNWIND $items AS x RETURN x AS value UNION RETURN 1 AS other",
+        "UNWIND $items AS x RETURN x AS value UNION RETURN 1 AS value",
         {"items": [None, None]},
     )
     assert found.rows == ((None,), (1,))
@@ -487,7 +480,7 @@ def test_string_split_unwind_elements_keep_their_known_string_type(
     parameters: dict[str, object] | None,
 ) -> None:
     found = database.execute(
-        f"UNWIND {source} AS x RETURN x AS value UNION RETURN 'a' AS other",
+        f"UNWIND {source} AS x RETURN x AS value UNION RETURN 'a' AS value",
         parameters,
     )
     assert found.rows == (("a",), ("b",))
@@ -506,7 +499,7 @@ def test_unwind_map_property_types_are_proven_across_every_element(
     parameters: dict[str, object] | None,
 ) -> None:
     found = database.execute(
-        f"UNWIND {source} AS x RETURN x.id AS value UNION RETURN 1 AS other",
+        f"UNWIND {source} AS x RETURN x.id AS value UNION RETURN 1 AS value",
         parameters,
     )
     assert found.rows == ((1,), (2,))
@@ -517,7 +510,7 @@ def test_a_statically_typed_unwind_subscript_keeps_its_dynamic_index(
 ) -> None:
     """UNION typing does not eagerly evaluate an index whose result family is already known."""
     found = database.execute(
-        "UNWIND [[10, 20]] AS x RETURN x[$i + 1] AS value UNION RETURN 20 AS other",
+        "UNWIND [[10, 20]] AS x RETURN x[$i] AS value UNION RETURN 20 AS value",
         {"i": 1},
     )
     assert found.rows == ((20,),)
@@ -528,8 +521,8 @@ def test_an_invariant_outer_type_does_not_materialise_its_unwind_postfix(
 ) -> None:
     """IS NULL is BOOL without asking UNION to evaluate the row's dynamic subscript."""
     found = database.execute(
-        "UNWIND [[10, 20]] AS x RETURN x[$i + 1] IS NULL AS value "
-        "UNION RETURN false AS other",
+        "UNWIND [[10, 20]] AS x RETURN x[$i] IS NULL AS value "
+        "UNION RETURN false AS value",
         {"i": 1},
     )
     assert found.rows == ((False,),)
@@ -539,12 +532,12 @@ def test_an_invariant_outer_type_does_not_materialise_its_unwind_postfix(
     ("projection", "peer", "expected"),
     (
         (
-            "CASE WHEN x[$i + 1] IS NULL THEN 1 ELSE 2 END",
+            "CASE WHEN x[$i] IS NULL THEN 1 ELSE 2 END",
             "2",
             ((2,),),
         ),
-        ("[x[$i + 1]]", "[20]", (((20,),),)),
-        ("{v: x[$i + 1]}", "{v: 20}", (({"v": 20},),)),
+        ("[x[$i]]", "[20]", (((20,),),)),
+        ("{v: x[$i]}", "{v: 20}", (({"v": 20},),)),
     ),
 )
 def test_structurally_fixed_outputs_do_not_materialise_dynamic_unwind_postfixes(
@@ -555,19 +548,19 @@ def test_structurally_fixed_outputs_do_not_materialise_dynamic_unwind_postfixes(
 ) -> None:
     found = database.execute(
         f"UNWIND [[10, 20]] AS x RETURN {projection} AS value "
-        f"UNION RETURN {peer} AS other",
+        f"UNION RETURN {peer} AS value",
         {"i": 1},
     )
     assert found.rows == expected
 
 
-@pytest.mark.parametrize("projection", ("[x][1]", "{v: x}.v"))
+@pytest.mark.parametrize("projection", ("[x][0]", "{v: x}.v"))
 def test_postfix_over_a_container_around_unwind_is_typed_per_element(
     database: object,
     projection: str,
 ) -> None:
     found = database.execute(
-        f"UNWIND $items AS x RETURN {projection} AS value UNION RETURN 1 AS other",
+        f"UNWIND $items AS x RETURN {projection} AS value UNION RETURN 1 AS value",
         {"items": [1, 2]},
     )
     assert found.rows == ((1,), (2,))
@@ -577,7 +570,7 @@ def test_dynamic_postfix_over_a_container_around_unwind_keeps_element_type(
     database: object,
 ) -> None:
     found = database.execute(
-        "UNWIND $items AS x RETURN [x][$i + 1] AS value UNION RETURN 2 AS other",
+        "UNWIND $items AS x RETURN [x][$i] AS value UNION RETURN 2 AS value",
         {"items": [1, 2], "i": 0},
     )
     assert found.rows == ((1,), (2,))
@@ -587,7 +580,7 @@ def test_direct_unwind_subscript_is_typed_from_every_list_element(
     database: object,
 ) -> None:
     found = database.execute(
-        "UNWIND [[1], [2]] AS x RETURN x[1] AS value UNION RETURN 1 AS other"
+        "UNWIND [[1], [2]] AS x RETURN x[0] AS value UNION RETURN 1 AS value"
     )
     assert found.rows == ((1,), (2,))
 
@@ -608,7 +601,7 @@ def test_heterogeneous_unwind_values_are_allowed_when_the_output_type_is_invaria
     items: list[object] = ["a", [1]] if projection == "size(x)" else [1, "bad"]
     peer = "false" if projection == "x IS NULL" else "1"
     found = database.execute(
-        f"UNWIND $items AS x RETURN {projection} AS value UNION RETURN {peer} AS other",
+        f"UNWIND $items AS x RETURN {projection} AS value UNION RETURN {peer} AS value",
         {"items": items},
     )
     assert found.rows == expected
@@ -631,13 +624,11 @@ def test_coalesce_metadata_does_not_cross_branch_schema_contexts(
             seed.execute("CREATE (:Number {id: 'n', x: 1})")
             seed.execute("CREATE (:Word {id: 'w', x: 'text'})")
 
-        with pytest.raises(GrafxPlanError):
-            handle.execute(
-                "MATCH (n:Number) WHERE coalesce(n.x, $p) = $p RETURN 1 AS v "
-                "UNION "
-                "MATCH (n:Word) WHERE coalesce(n.x, $p) = $p RETURN 2 AS v",
-                {"p": "fallback"},
-            )
+        text = ("MATCH (n:Number) WHERE coalesce(n.x, $p) = $p RETURN 1 AS v "
+                "UNION MATCH (n:Word) WHERE coalesce(n.x, $p) = $p RETURN 2 AS v")
+        assert handle.execute(text, {"p": "fallback"}).rows == ()
+        assert handle.execute(text, {"p": 1}).rows == ((1,),)
+        assert handle.execute(text, {"p": "text"}).rows == ((2,),)
     finally:
         handle.close()
 
@@ -657,9 +648,15 @@ def test_a_column_with_no_type_at_all_is_refused_before_the_stream(
         "[$v]",
         "{x: $v}",
         "collect($v)",
-        "[$v, 1][1]",
+        "[$v, 1][0]",
         "{bad: $v}.bad",
         "{outer: {bad: $v}}.outer.bad",
+        "[$v][..]",
+        "head([$v])",
+        "last([$v])",
+        "tail([0, $v])",
+        "[x IN [$v] | x]",
+        "[] + $v",
     ),
 )
 def test_an_entity_cannot_hide_inside_a_union_value(
@@ -672,7 +669,7 @@ def test_an_entity_cannot_hide_inside_a_union_value(
     with pytest.raises(GrafxPlanError) as failure:
         database.execute(
             f"MATCH (n:A) RETURN {left} AS value "
-            f"UNION MATCH (m:B) RETURN {right} AS other"
+            f"UNION MATCH (m:B) RETURN {right} AS value"
         )
     assert failure.value.details["field"] == "union"
 
@@ -680,11 +677,11 @@ def test_an_entity_cannot_hide_inside_a_union_value(
 @pytest.mark.parametrize(
     ("projection", "expected"),
     (
-        ("[$v, 1][2]", ((1,),)),
+        ("[$v, 1][1]", ((1,),)),
         ("{bad: $v, safe: $v.id}.safe", (("x",), ("y",))),
         ("{outer: {bad: $v, safe: $v.id}}.outer.safe", (("x",), ("y",))),
-        ("[[$v, $v.id]][1][2]", (("x",), ("y",))),
-        ("{outer: [$v, $v.id]}.outer[2]", (("x",), ("y",))),
+        ("[[$v, $v.id]][0][1]", (("x",), ("y",))),
+        ("{outer: [$v, $v.id]}.outer[1]", (("x",), ("y",))),
         ("size([$v])", ((1,),)),
     ),
 )
@@ -697,7 +694,7 @@ def test_a_scalar_derived_from_an_entity_remains_a_valid_union_value(
     right = projection.replace("$v", "m")
 
     found = database.execute(
-        f"MATCH (n:A) RETURN {left} AS value UNION MATCH (m:B) RETURN {right} AS other"
+        f"MATCH (n:A) RETURN {left} AS value UNION MATCH (m:B) RETURN {right} AS value"
     )
     assert found.rows == expected
 
@@ -710,7 +707,7 @@ def test_a_parameter_is_judged_at_the_bind_and_before_any_row_is_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The type nobody could prove at planning is proven once, by the call that supplies it."""
-    widened = database.execute("RETURN 1 AS a UNION RETURN $p AS b", {"p": 2.5})
+    widened = database.execute("RETURN 1 AS a UNION RETURN $p AS a", {"p": 2.5})
     assert widened.rows == ((1.0,), (2.5,))
 
     scans = 0
@@ -723,17 +720,14 @@ def test_a_parameter_is_judged_at_the_bind_and_before_any_row_is_read(
 
     monkeypatch.setattr(HeapStore, "scan", recording_scan)
     with pytest.raises(GrafxPlanError):
-        database.execute(
-            "MATCH (n:A) RETURN n.n AS a UNION RETURN $p AS b",
-            {"p": "text"},
-        )
+        database.execute("MATCH (n:A) RETURN n.n AS a UNION RETURN abs($p) AS a", {"p": "text"})
     assert scans == 0
 
 
 def test_a_parameter_the_call_did_not_supply_is_refused(database: object) -> None:
     """One call binds the pair, so a name either branch reads must arrive with it."""
     with pytest.raises(GrafxPlanError):
-        database.execute("RETURN 1 AS a UNION RETURN $p AS b", {})
+        database.execute("RETURN 1 AS a UNION RETURN $p AS a", {})
 
 
 @pytest.mark.parametrize(("per_branch", "accepted"), ((128, True), (129, False)))
@@ -743,7 +737,7 @@ def test_the_parameter_limit_applies_to_the_combined_statement(
 ) -> None:
     """Two individually bounded branches cannot double the one-statement bind ceiling."""
     left = ", ".join(f"$left_{index} AS c{index}" for index in range(per_branch))
-    right = ", ".join(f"$right_{index} AS d{index}" for index in range(per_branch))
+    right = ", ".join(f"$right_{index} AS c{index}" for index in range(per_branch))
     statement = parse(f"RETURN {left} UNION RETURN {right}")
 
     if accepted:
@@ -789,15 +783,18 @@ def test_a_quoted_name_spelled_like_the_keyword_stays_a_name(database: object) -
         "MATCH (n:A) RETURN n.id UNION",
         "UNION MATCH (n:A) RETURN n.id",
         "MATCH (n:A) RETURN n.id UNION CREATE (:B {id: 'z'})",
-        "MATCH (n:A) RETURN n.id UNION MATCH (m:B) SET m.n = 1 RETURN m.id",
+        "MATCH (n:A) RETURN n.id UNION MATCH (m:B) SET m.n = 1 RETURN m.id AS `n.id`",
     ),
 )
-def test_the_parser_refuses_every_shape_that_is_not_the_admitted_pair(
+def test_incomplete_syntax_and_semantically_invalid_unions_are_distinct(
     text: str,
 ) -> None:
-    """Each of these is refused where the text is read, with a message that names the word."""
-    with pytest.raises(GrafxParseError):
-        parse(text)
+    if text.endswith("UNION") or text.startswith("UNION"):
+        with pytest.raises(GrafxParseError):
+            parse(text)
+    else:
+        with pytest.raises(GrafxPlanError):
+            analyze(parse(text))
 
 
 def test_branches_may_reuse_one_name_for_different_tables(database: object) -> None:
@@ -809,7 +806,7 @@ def test_branches_may_reuse_one_name_for_different_tables(database: object) -> N
 def test_each_branch_keeps_its_own_window(database: object) -> None:
     """A LIMIT belongs to the branch that wrote it; the pair adds no ordering of its own."""
     found = database.execute(
-        "MATCH (n:A) RETURN n.id ORDER BY n.id LIMIT 1 UNION MATCH (m:B) RETURN m.id"
+        "MATCH (n:A) RETURN n.id ORDER BY n.id LIMIT 1 UNION MATCH (m:B) RETURN m.id AS `n.id`"
     )
     assert found.rows == (("x",),)
 
@@ -842,7 +839,7 @@ def _branch(table: str, variable: str) -> Query:
 FORGED: dict[str, UnionQuery] = {
     "a branch that is not a query": UnionQuery(
         left=_branch("Person", "n"),
-        right="MATCH (m:Doc) RETURN m.id",  # type: ignore[arg-type]
+        right="MATCH (m:Doc) RETURN m.id AS `n.id`",  # type: ignore[arg-type]
     ),
     "a branch with no RETURN": UnionQuery(
         left=_branch("Person", "n"),
@@ -908,7 +905,7 @@ def test_a_forged_union_is_refused_at_both_doors(name: str, door: str) -> None:
 
 def test_supplied_incomplete_analysis_cannot_hide_either_branch_parameters() -> None:
     """The optional analysis argument is a cache, not authority over the statement."""
-    statement = parse("RETURN $left AS a UNION RETURN $right AS b")
+    statement = parse("RETURN $left AS a UNION RETURN $right AS a")
     assert type(statement) is UnionQuery
 
     planned = build_plan(
@@ -933,7 +930,7 @@ def test_the_intermediate_budget_counts_the_rows_before_the_duplicates_go(
     )
     try:
         with pytest.raises(GrafxQueryBudgetExceeded) as exceeded:
-            handle.execute("RETURN 1 AS left UNION RETURN 1.0 AS right")
+            handle.execute("RETURN 1 AS left UNION RETURN 1.0 AS left")
         assert "UnionRows" in str(exceeded.value)
     finally:
         handle.close()
@@ -943,7 +940,7 @@ def test_the_result_budget_counts_what_the_caller_receives(tmp_path: Path) -> No
     """One row survives the distinct, so a limit of one is enough for the pair."""
     handle = okto_grafx.connect(tmp_path / "one", page_size=512, max_result_rows=1)
     try:
-        assert handle.execute("RETURN 1 AS left UNION RETURN 1.0 AS right").rows == (
+        assert handle.execute("RETURN 1 AS left UNION RETURN 1.0 AS left").rows == (
             (1.0,),
         )
     finally:
@@ -955,7 +952,7 @@ def test_the_result_budget_counts_what_the_caller_receives(tmp_path: Path) -> No
 
 def test_the_pair_writes_nothing_and_reports_no_statistics(database: object) -> None:
     """A union only reads, so there is nothing for it to count."""
-    found = database.execute("RETURN 1 AS a UNION RETURN 2 AS b")
+    found = database.execute("RETURN 1 AS a UNION RETURN 2 AS a")
     assert dict(found.statistics) == {}
 
 
@@ -965,7 +962,7 @@ def test_a_reader_inside_a_write_transaction_sees_its_own_rows(
     """The pair runs in the transaction that asked, so RYOW holds across both branches."""
     with database.begin("write") as txn:
         txn.execute("CREATE (:B {id: 'z', n: 9})")
-        found = txn.execute("MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id")
+        found = txn.execute("MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id AS `n.id`")
         assert sorted(row[0] for row in found.rows) == ["x", "y", "z"]
 
 
@@ -975,7 +972,7 @@ def test_an_outsider_keeps_one_old_snapshot_for_both_branches(database: object) 
     with database.begin("write") as writer:
         writer.execute("CREATE (:A {id: 'z', n: 9})")
 
-    text = "MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id"
+    text = "MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id AS `n.id`"
     assert outsider.execute(text).rows == (("x",), ("y",))
     outsider.commit()
     assert database.execute(text).rows == (("x",), ("y",), ("z",))
@@ -987,7 +984,7 @@ def test_a_failure_in_the_right_branch_returns_no_partial_result(
     """Rows already pulled from the left never escape when the second pipeline refuses."""
     reader = database.begin("read")
     with pytest.raises(GrafxPlanError):
-        reader.execute("RETURN 1 AS value UNION RETURN 1 / 0 AS other")
+        reader.execute("RETURN 1 AS value UNION RETURN 1 / 0 AS value")
     assert reader.active
     assert reader.execute("RETURN 7 AS value").rows == ((7,),)
     reader.rollback()
@@ -1001,5 +998,5 @@ def test_a_rolled_back_write_leaves_the_pair_as_it_was(database: object) -> None
             raise RuntimeError("undo this")
     except RuntimeError:
         pass
-    found = database.execute("MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id")
+    found = database.execute("MATCH (n:A) RETURN n.id UNION MATCH (m:B) RETURN m.id AS `n.id`")
     assert sorted(row[0] for row in found.rows) == ["x", "y"]

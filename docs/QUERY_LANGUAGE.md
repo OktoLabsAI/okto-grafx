@@ -2,8 +2,10 @@
 
 The closed read-only `CALL grafx.search_text(index, query, k [, record_ids])`
 procedure is supported through materialized `execute`; see [FTS procedure syntax](FULL_TEXT_SEARCH.md#procedure-query).
-This does not enable arbitrary CALL/YIELD, suffix composition, cursor/explain support
-or textual full-text DDL. Use `Database.create_text_index` to create FTS indexes.
+That specialized procedure does not support suffix composition or cursor/explain.
+Separately, trusted typed `CALL app.name(...) YIELD ...` supports composition;
+see [composable queries](COMPOSABLE_QUERIES.md). Use `Database.create_text_index`
+to create FTS indexes; textual full-text DDL is not supported.
 
 [Documentation index](README.md) · [Python API](API_REFERENCE.md)
 
@@ -25,18 +27,20 @@ Python `execute()` call; CLI multi-statement arguments remain separate statement
 | `SET` | on node properties and matched relationship properties; relationship endpoints are immutable |
 | `DELETE` | nodes, and relationships a `MATCH` bound |
 | `DETACH DELETE` | ends every relationship incident on the node together with it |
-| `UNWIND $rows AS r` | one leading list source, followed directly by `RETURN` or by one single-node `MATCH` and `SET` |
+| `UNWIND $rows AS r` | repeated list expansion in ordered pipelines; NULL/empty carriers emit no rows |
 | `WITH` … `WHERE` | scalar/aggregate projection stages; each replaces scope with projected names; its WHERE runs after projection. Optional-hop aggregation has the closed forms below |
 | `MATCH (n)` | a node with no label reads every node table as one set; filters, `label(n)`, aggregates, `ORDER BY` and windows apply to the union, and an undeclared property reads as null |
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | |
 | Aggregates | Exactly `count`, `sum`, `avg`, `min`, `max`, `collect`; scalar/aggregate type restrictions apply |
-| Scalar functions | `coalesce`, `string_split`, `size`, `label`, `timestamp`; 0.0.6 adds `lower`, `upper`, `trim`, `abs` |
-| Conditional/list expressions | searched and simple `CASE`; one-based and negative `list[index]` |
+| Scalar functions | text, numeric, conversion and list families below, plus graph/vector extensions |
+| Conditional/list expressions | searched/simple `CASE`; zero-based/negative indexing and half-open slices; list comprehensions, all/any/none/single, reduce, concatenation; case-sensitive map access |
 | Parameters | `$name`, refused before anything runs if one is missing |
-| `OPTIONAL MATCH` | Root labelled node or correlated incident-hop pipeline, as detailed below; not arbitrary optional joins |
-| `UNION`, `UNION ALL` | Exactly two top-level read-only RETURN branches, equal arity; UNION deduplicates, ALL preserves duplicates (0.0.6); no chains/nesting |
-| Path projection | Narrow outgoing typed one-hop path map; no arbitrary path functions/projection shapes |
+| `OPTIONAL MATCH` | Correlated typed patterns and whole-clause null extension; optimized incident-hop execution retained |
+| `UNION`, `UNION ALL` | Up to 64 read-only RETURN branches; same ordered column names, heterogeneous values, no implicit numeric conversion |
+| CALL subqueries | Independent or explicitly imported returning read subqueries; maximum nesting 16 |
+| Typed CALL/YIELD | Trusted per-handle tabular registry, explicit permissions/budgets, composed execution |
+| Path projection | Outgoing typed one-hop path map, aliases, `length`, `nodes`, `relationships`; not general variable-length named paths |
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
 dirty node table plans a scan plus the private overlay instead of consulting an index that only
@@ -48,9 +52,10 @@ and self-loops preserved. Pending relationship inserts force one grouped scan pl
 because endpoint indexes contain only committed edges; update/delete-only overlays can still use
 fresh indexes and validate or suppress their candidates. A start node created by this transaction
 takes the scan path even when the relationship table has no pending insert, because its private
-identity has no index encoding. Two same-statement shapes stay refused rather than guessed: an edge
-whose endpoint that very statement is creating, and a `DETACH DELETE` of a node an edge held by
-that same statement points at. Vector search over a dirty table is fail-closed. Updates of
+identity has no index encoding. A statement can create endpoints and their relationships,
+and subsequently SET or delete them. Endpoint identities are authenticated transaction-private
+intents, not intermediate commits; a later statement failure discards its earlier phases.
+Vector search over a dirty table is fail-closed. Updates of
 relationship properties are owner-visible, while their `_from`/`_to` layout columns remain
 immutable. A table declared inside a transaction is usable by that transaction's own later
 statements and becomes visible to every other transaction when it commits — schema changes are
@@ -85,7 +90,9 @@ query-path restrictions above.
 `WHERE` retains true predicates; null is not true. `IS NULL`/`IS NOT NULL` test
 null explicitly. Missing properties on polymorphic label-free reads are null;
 incompatible declared property families refuse before streaming. Parameter-map
-keys are case-insensitive for dot access, and colliding keys refuse at binding.
+keys are case-sensitive for dot and string-key bracket access; missing keys return
+null. `a` and `A` are distinct keys. See the breaking-language migration in
+[the compatibility contract](CYPHER_COMPATIBILITY.md).
 
 ## Expressions and functions
 
@@ -97,18 +104,20 @@ not Python coercion of arbitrary objects. Unsupported operators/functions refuse
 | Function / expression | Semantics important to an integrator |
 | --- | --- |
 | `count(*)`, `count(expr)`, aggregate `DISTINCT` | Counts rows / non-null values respectively; duplicate removal follows the typed value rules |
-| `sum(expr)`, `avg(expr)` | Numeric aggregates; null inputs do not become zeros merely because the caller expects a number |
+| `sum(expr)`, `avg(expr)` | Ignore NULL inputs and refuse other nonnumeric values; integer-only SUM preserves integer precision; empty/all-NULL SUM is 0, AVG is NULL |
 | `min(expr)`, `max(expr)`, `collect(expr)` | Typed aggregation; collect creates a real public tuple, not a lazy/disk proxy; memory/row budgets can refuse |
-| `coalesce(value, ...)` | At least one positional argument; all evaluated left-to-right before selecting first non-null. Scalar families must agree, numeric INT64/DOUBLE promotes; no general map/list coalesce |
-| `string_split(text, separator)` | Two strings, null propagates; repeated separators compress internal empty fields, final empty field retained; empty separator splits code points; both inputs empty refuses |
+| `coalesce(value, ...)` | At least one positional argument; evaluate only until first non-null; heterogeneous/list/map values allowed; chosen value retains its type |
+| `split(text, separator)`, `string_split(...)` | Two strings, NULL propagates; all empty fields retained; empty separator splits code points; two empty inputs yield one empty string |
 | `size(value)` | One string/list; code-point/element count; null propagates |
 | `label(binding)` | One matched node/relationship; physical table name; null propagates; not a logical Pulse relationship type mapper |
 | `timestamp(value)` | Timestamp passthrough, null, or ISO-8601 string normalized to UTC; no zone means UTC; numeric epoch arguments refuse |
 | `similarity(n.embedding, $q, space => 'space')` | Planned vector-search extension, not an arbitrary scalar UDF; literal/bound space, declared vector column and supported query shape required |
 | `udf('app.name', value, ...)` | Optional trusted per-connection scalar registry; literal name, positional exact typed scalars, NULL propagation; [SPI and restrictions](EXTENSIONS_AND_ARROW.md) |
 | `similarity_score()` | Zero arguments; only where a similarity operator has supplied a score |
-| `CASE WHEN ... THEN ... ELSE ... END` / simple CASE | Eager written-expression evaluation, first match, absent ELSE null; scalar-family checks and numeric promotion; do not depend on short-circuiting to hide an invalid expression |
-| `list[index]` | One-based positive index, negative from end; null propagates; zero/out-of-range/noninteger refuses. Not map-key bracket access |
+| `CASE WHEN ... THEN ... ELSE ... END` / simple CASE | Evaluate conditions in order and only the chosen result; absent ELSE null; `CASE null WHEN null` does not match. Static scope/type checks still cover all arms |
+| `list[index]` | Zero-based positive index, negative from end; null and out-of-range return null; noninteger indices refuse |
+| `list[start..end]` | Half-open slice, negative/clipped/omitted bounds; an explicit NULL bound yields NULL |
+| `map[key]`, `map.key` | Case-sensitive string keys; absent keys return null; integer map keys refuse |
 
 Use `db.explain(text)` and actual execution on representative values to validate a
 new query shape. There is no blanket `PROFILE`/arbitrary procedure or Neo4j function
@@ -116,9 +125,10 @@ catalogue. Statistics show selected operators/work, not a comprehensive SQL prof
 
 ## OPTIONAL, UNION and traversal boundaries
 
-`OPTIONAL MATCH (n:Person) RETURN n.id` admits the narrow root labelled-node
-form: no qualifying candidates gives a null-extended row. For correlated optional
-relations, begin with a mandatory labelled node and expand incident hops:
+`OPTIONAL MATCH (n:Person) RETURN n.id` produces a null-extended row when no
+candidate qualifies. Typed optional patterns can correlate with incoming values;
+all new bindings are NULL only if the complete optional clause fails. The existing
+optimized incident-hop path is also retained:
 
 ```cypher
 MATCH (d:Decision)
@@ -132,19 +142,16 @@ forward. Aggregate one degree before the next expansion to avoid a cross-product
 Fresh aliases, direction, optional WHERE and target-label checks apply. No matching
 edge yields `count(r)=0`, `count(*)=1`; an empty mandatory root yields no anchor.
 An undirected self-loop has two directional matches (`count(r)=2`,
-`count(DISTINCT r)=1`). Optional ranges/maps/named paths, extra mandatory MATCH,
-UNWIND, writes or vector predicates inside that optional pipeline remain restricted.
+`count(DISTINCT r)=1`). Generic typed optional application is separate from that
+specialized fast path. Untyped multi-hop, named-path and vector restrictions are
+not removed merely by supporting clause composition.
 
-`RETURN 1 AS n UNION RETURN 1.0 AS n` returns one numerically promoted value.
-Both branches share a snapshot and budgets, names come from the left, and each
-branch's ORDER BY/SKIP/LIMIT is local. No post-UNION sort/window, chaining, nested
-UNION or write branches. Incompatible/unprovable result families refuse.
-Since 0.0.6, `RETURN 1 AS n UNION ALL RETURN 1.0 AS n` instead returns two
-`1.0` rows. ALL removes only the global deduplication step: branch-local DISTINCT
-and windows still apply, types/NULL promotion and shared budgets are unchanged.
-Rows from the left branch precede rows from the right, but order inside an
-unsorted branch is not a substitute for ORDER BY. ALL does not admit additional
-branches, nested set operators, OPTIONAL composition or writes.
+`RETURN 1 AS n UNION RETURN 1.0 AS n` returns one value, retaining the first
+occurrence's type. UNION ALL returns both `1` and `1.0` without conversion.
+Branches share a snapshot and budgets and must publish identical ordered column
+names. Branch-local DISTINCT/windows remain local. Multi-branch chains associate
+left-to-right; RETURN subqueries provide an explicit outer projection/sort.
+Write branches remain refused. See [composition, scopes and bounds](COMPOSABLE_QUERIES.md).
 
 ### Native scalar additions (0.0.6)
 
@@ -162,6 +169,29 @@ before rows, including empty matches; row-dependent numeric overflow is checked
 when evaluated. Composed expressions remain subject to the existing query subset
 and budgets. These functions are built in, not trusted host UDFs.
 
+Additional native families in this development round:
+
+| Family | Functions / contract |
+|---|---|
+| String | `ltrim`, `rtrim`, `toLower`, `toUpper`, `substring(text, start [, length])`, `left(text, count)`, `right(text, count)`, `replace(text, search, replacement)` |
+| Numeric | `ceil`/`ceiling`, `floor`, `sqrt`, `exp`, `log`, `log10`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `degrees`, `radians`, `sign`, unary `round`; `pi()` and `e()` |
+| Conversion | `toInteger`, `toFloat`, `toBoolean`, `toString`; explicit scalar conversion, not implicit result-column coercion |
+| List/map | `head`, `last`, `tail`, `reverse` (also STRING), `keys(map)`, inclusive `range(start, end [, step])` |
+
+NULL propagates through these functions. Empty head/last returns NULL; empty tail
+is empty. Bounds/counts require integers (not BOOL); negative substring/count
+arguments and zero range step refuse. Generated ranges have a hard cap of 100,000
+elements, checked before allocation. Replacement output is bounded by the 1 MiB
+hard query-value character ceiling, with the configured public value limit still
+applied at the boundary. Math domain errors/non-finite results refuse; Grafx does
+not promise the reference engine's NaN/infinity behavior. ROUND currently accepts
+one argument only. Invalid textual numeric conversions return NULL; boolean/string
+conversion uses explicit supported scalar families, not arbitrary Python objects.
+`toInteger` parses ASCII decimal/exponent strings exactly and truncates toward zero;
+the original value must fit INT64. It does not round through DOUBLE, depend on a
+host decimal context or allocate integers proportional to a written exponent.
+These fixed bounds have no new connection option.
+
 Typed traversal supports bounded directions/ranges and preserves relationship
 isomorphism and parallel-edge multiplicity. Omitted upper bound means **20 hops**,
 not infinity; explicit upper bound can reach **30**; invalid/zero/reversed ranges
@@ -173,16 +203,21 @@ The narrow outgoing typed one-hop `MATCH p=(a:A)-[r:R]->(b:B) RETURN p`
 returns a map with `_NODES` and `_RELS`. Node maps carry `_ID`, `_LABEL` and
 properties; relation maps carry `_SRC`, `_DST`, `_LABEL`, `_ID` and properties.
 IDs are opaque backend-local numbers; lists are native tuples. Structural-key
-collisions refuse before streaming. Wider path aliases/functions/directions,
-filters/projections/windows and UNION path outputs remain outside this contract.
+collisions refuse before streaming. The same one-hop capture supports aliases,
+multiple RETURN expressions and `length(p)`, `nodes(p)`, `relationships(p)`;
+NULL input returns NULL. Nodes/relationships return detached component maps,
+which may be consumed by list expressions. Arbitrary maps are not accepted as
+paths. `size(p)` and `p.property` refuse. Other directions, variable-length named
+paths, WHERE/WITH, DISTINCT, ordering and SKIP remain outside this capture contract;
+a literal nonnegative LIMIT is supported. This is not a claim of general path algebra.
 
 ## Schema, indexes and query costs
 
 Create tables and spaces inside write transactions. A node PK is automatically
 indexed. Relationship endpoints are immutable; use a new relationship to change
-them. `DELETE` ends the node without physically ending its incident relationships;
-traversal cannot land on the invisible node. `DETACH DELETE` also ends incident
-relations atomically and retains broader corruption checks, so it may scan.
+them. `DELETE` refuses a node with surviving incident relationships; explicitly
+delete those relationships in the same statement or use `DETACH DELETE`, which
+ends incident relations atomically and retains broader corruption checks, so it may scan.
 
 Custom index DDL/Python maintenance is detailed in [indexes](INDEXES_AND_VECTORS.md).
 General ALTER/DROP/migration/view APIs are roadmap work, not implied by transactional

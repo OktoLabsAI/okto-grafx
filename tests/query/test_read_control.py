@@ -60,6 +60,8 @@ def test_precancelled_does_not_open_snapshot(database, door):
         "MATCH (n:N) RETURN n.id ORDER BY n.id DESC",
         "MATCH (n:N) RETURN count(n)",
         "MATCH (n:N), (m:N) RETURN n.id, m.id",
+        "RETURN [x IN range(1,1000) | x+1]",
+        "RETURN reduce(total=0, x IN range(1,1000) | total+x)",
     ],
 )
 @pytest.mark.parametrize("cursor", [False, True])

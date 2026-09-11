@@ -45,10 +45,10 @@ I06 = (
     "AND n.revocation_reason IS NULL "
     "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
     "WHERE size(parts) >= 2 "
-    "WITH n, CASE parts[1] WHEN 'card' THEN 'card' "
+    "WITH n, CASE parts[0] WHEN 'card' THEN 'card' "
     "WHEN 'card_relationship_target' THEN 'card' WHEN 'task' THEN 'card' "
-    "WHEN 'test' THEN 'card' WHEN 'bug' THEN 'card' ELSE parts[1] END AS owner_type, "
-    "parts[2] AS owner_id "
+    "WHEN 'test' THEN 'card' WHEN 'bug' THEN 'card' ELSE parts[0] END AS owner_type, "
+    "parts[1] AS owner_id "
     "WHERE owner_type = $owner_type AND owner_id = $owner_id "
     "SET n.pre_cancellation_relevance_score = n.relevance_score, "
     "n.relevance_score = CASE WHEN n.relevance_score - $penalty < 0.0 THEN 0.0 "
@@ -62,10 +62,10 @@ I07 = (
     "AND (n.superseded_by IS NULL OR n.superseded_by = $reason) "
     "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
     "WHERE size(parts) >= 2 "
-    "WITH n, CASE parts[1] WHEN 'card' THEN 'card' "
+    "WITH n, CASE parts[0] WHEN 'card' THEN 'card' "
     "WHEN 'card_relationship_target' THEN 'card' WHEN 'task' THEN 'card' "
-    "WHEN 'test' THEN 'card' WHEN 'bug' THEN 'card' ELSE parts[1] END AS owner_type, "
-    "parts[2] AS owner_id "
+    "WHEN 'test' THEN 'card' WHEN 'bug' THEN 'card' ELSE parts[0] END AS owner_type, "
+    "parts[1] AS owner_id "
     "WHERE owner_type = $owner_type AND owner_id = $owner_id "
     "SET n.relevance_score = CASE WHEN n.pre_cancellation_relevance_score IS NULL "
     "THEN n.relevance_score + $penalty ELSE n.pre_cancellation_relevance_score END, "
@@ -88,12 +88,12 @@ RESTORE = {
     "penalty": 0.25,
     "reason": "cancelled",
 }
-# The same two stages with the guard removed: every row reaches parts[2], including the one
+# The same two stages with the guard removed: every row reaches parts[1], including the one
 # whose reference carries no colon at all.
 UNGUARDED = (
     "MATCH (n:Decision) "
     "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
-    "WITH n, parts[2] AS owner_id "
+    "WITH n, parts[1] AS owner_id "
     "SET n.superseded_by = owner_id "
     "RETURN n.id"
 )
@@ -173,23 +173,29 @@ def test_each_where_belongs_to_the_stage_it_was_written_under() -> None:
 @pytest.mark.parametrize(
     ("query", "value"),
     [
-        ("MATCH (n:Decision) WITH DISTINCT n RETURN n.id", "WITH DISTINCT"),
-        ("MATCH (n:Decision) WITH n ORDER BY n.id RETURN n.id", "ORDER"),
-        ("MATCH (n:Decision) WITH n SKIP 1 RETURN n.id", "SKIP"),
-        ("MATCH (n:Decision) WITH n LIMIT 1 RETURN n.id", "LIMIT"),
         ("MATCH (n:Decision) WITH n WHERE n.id = 'd1' LIMIT 1 RETURN n.id", "LIMIT"),
         ("MATCH (n:Decision) WITH n MATCH (m:Decision) RETURN n.id", "MATCH"),
         ("MATCH (n:Decision) SET n.relevance_score = 1.0 WITH n RETURN n.id", "WITH"),
         ("UNWIND $rows AS r WITH r RETURN r", "WITH"),
     ],
 )
-def test_the_shapes_outside_this_subset_are_refused_by_name(
-    query: str, value: str
+def test_clause_order_admits_composition_but_not_misplaced_windows(
+    database: object, query: str, value: str
 ) -> None:
-    with pytest.raises(GrafxParseError) as raised:
-        parse(query)
-    assert raised.value.details["field"] == "clause"
-    assert raised.value.details["value"] == value
+    if value == "LIMIT":
+        with pytest.raises(GrafxParseError, match="LIMIT"):
+            parse(query)
+        return
+    tx = database.begin("write")
+    try:
+        result = tx.execute(query, {"rows": [1]} if query.startswith("UNWIND") else None)
+        if query.startswith("UNWIND"):
+            assert result.rows == ((1,),)
+        else:
+            assert result.columns == ("n.id",)
+            assert len(result.rows) == (25 if value == "MATCH" else 5)
+    finally:
+        tx.rollback()
 
 
 # --- the scope -------------------------------------------------------------------------------
@@ -224,8 +230,7 @@ def test_a_variable_a_stage_dropped_is_refused_for_being_dropped() -> None:
     [
         ("MATCH (n:Decision) WITH n, n.id RETURN n.id", "item", "n.id"),
         ("WITH 1 AS a, 2 AS a RETURN a", "item", "a"),
-        ("MATCH (n:Decision) WITH n, n.id AS n RETURN n", "item", "n.id AS n"),
-        ("MATCH (n:Decision) WITH n AS m RETURN m.id", "item", "n AS m"),
+        ("MATCH (n:Decision) WITH n, n.id AS n RETURN n", "item", "n"),
         ("WITH 1 AS a, a + 1 AS b RETURN b", "variable", "a"),
         (
             "MATCH (n:Decision) WITH n WHERE count(n) > 1 RETURN n.id",
@@ -349,14 +354,14 @@ def test_every_set_value_reads_the_row_as_the_statement_matched_it(
 def test_a_reference_the_first_stage_filtered_never_reaches_the_second(
     database: object,
 ) -> None:
-    """d5 splits into one part, so parts[2] would refuse -- and the guard is what stops it."""
+    """The guard preserves a short source reference; an unguarded lookup returns null."""
     with database.begin("write") as transaction:
         transaction.execute(I06, CANCEL)
     assert _scores(database)[4] == ("d5", 0.8, None, None, None)
 
-    with pytest.raises(GrafxPlanError) as raised:
-        database.execute(UNGUARDED)
-    assert raised.value.details["field"] == "subscript"
+    with database.begin("write") as transaction:
+        transaction.execute(UNGUARDED)
+    assert database.execute("MATCH (n:Decision {id: 'd5'}) RETURN n.superseded_by").rows == ((None,),)
 
     # The same statement over the rows that DO carry an owner is accepted, so what the guard
     # protects against is the one short reference and not the shape of the query.
@@ -379,7 +384,11 @@ def test_a_late_refusal_releases_the_rows_the_stages_had_already_written(
     accepted = tuple(transaction._context.row_intents)
 
     with pytest.raises(GrafxPlanError):
-        transaction.execute(UNGUARDED)
+        transaction.execute(UNGUARDED.replace(
+            "SET n.superseded_by = owner_id ",
+            "SET n.superseded_by = owner_id, "
+            "n.relevance_score = 1 / (size(string_split(n.source_artifact_ref, ':')) - 1) ",
+        ))
 
     assert tuple(transaction._context.row_intents) == accepted
     assert transaction.commit().wrote is True
@@ -397,7 +406,7 @@ def test_a_late_refusal_releases_the_rows_the_stages_had_already_written(
 BUDGETED = (
     "MATCH (n:Decision) "
     "WITH n, string_split(n.source_artifact_ref, ':') AS parts "
-    "WITH n, parts[2] AS owner_id "
+    "WITH n, parts[1] AS owner_id "
     "SET n.superseded_by = owner_id"
 )
 
@@ -486,7 +495,7 @@ def test_a_carried_variable_is_still_the_row_it_was_matched_from(
 
 
 def _unwound_then_projected() -> Query:
-    """Return the tree for UNWIND $rows AS r WITH r RETURN r, which no parser would produce."""
+    """Construct a valid composed query independently of the text parser."""
     return Query(
         unwind_clause=UnwindClause(expression=Parameter(name="rows"), alias="r"),
         with_clauses=(WithClause(items=(ReturnItem(expression=Variable(name="r")),)),),
@@ -506,15 +515,15 @@ def test_a_query_built_positionally_still_means_what_it_meant() -> None:
     assert statement.with_clauses == ()
 
 
-def test_unwind_beside_with_is_refused_by_the_analysis_of_a_tree_nobody_parsed() -> (
+def test_unwind_beside_with_is_analyzed_from_a_tree_nobody_parsed() -> (
     None
 ):
-    with pytest.raises(GrafxPlanError) as raised:
-        analyze(_unwound_then_projected())
-    assert raised.value.details == {"field": "clause", "value": "WITH"}
+    result = analyze(_unwound_then_projected())
+    assert result.parameters == ("rows",)
+    assert result.output_columns == ("r",)
 
 
-def test_unwind_beside_with_is_refused_by_the_planner_given_an_analysis_of_its_own(
+def test_unwind_beside_with_is_revalidated_despite_supplied_analysis(
     catalog: object, indexes: tuple
 ) -> None:
     """build_plan accepts a caller's analysis, so the shape has to hold at that door too."""
@@ -522,13 +531,13 @@ def test_unwind_beside_with_is_refused_by_the_planner_given_an_analysis_of_its_o
     supplied = QueryAnalysis(
         statement=statement,
         bindings=(Binding(name="r", entity=ENTITY_UNWOUND, labels=(), created=False),),
-        parameters=("rows",),
+        parameters=(),
         output_columns=("r",),
     )
 
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(statement, catalog=catalog, indexes=indexes, analysis=supplied)
-    assert raised.value.details == {"field": "clause", "value": "WITH"}
+    planned = build_plan(statement, catalog=catalog, indexes=indexes, analysis=supplied)
+    assert planned.analysis.parameters == ("rows",)
+    assert planned.columns == ("r",)
 
 
 # --- a name means one thing per query -----------------------------------------------------------
@@ -541,23 +550,12 @@ def test_unwind_beside_with_is_refused_by_the_planner_given_an_analysis_of_its_o
         "WITH ['x'] AS a WITH a AS b WITH b AS a RETURN a[1]",
     ],
 )
-def test_a_name_a_stage_dropped_is_never_given_to_something_else(
+def test_a_dropped_name_can_be_reused_without_a_type_resolution_cycle(
     database: object, query: str
 ) -> None:
-    """Reusing a dropped name would make one name answer for two stages at once.
-
-    The second shape is the one that shows why this is a correctness rule and not tidiness:
-    a -> b -> a is a cycle, and resolving the type of ``a[1]`` through it never terminates.
-    Both refuse before anything runs, as a plan error rather than as a crash dressed up as a
-    configuration problem.
-    """
-
-    with pytest.raises(GrafxPlanError) as raised:
-        analyze(parse(query))
-    assert raised.value.details["field"] == "item"
-
-    with pytest.raises(GrafxPlanError):
-        database.execute(query)
+    """Lexical lowering gives each occurrence its own identity; index one is out of range."""
+    analyze(parse(query))
+    assert database.execute(query).rows == ((None,),)
 
 
 def test_a_dropped_name_may_return_when_nothing_else_claims_it() -> None:

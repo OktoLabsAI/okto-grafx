@@ -556,10 +556,9 @@ def test_a_target_bound_upstream_is_a_filter_not_a_new_binding(graph: object) ->
 
 
 def test_an_edge_to_a_node_the_snapshot_cannot_see_is_not_followed(graph: object) -> None:
-    """The edge survives its endpoint's deletion (W5c carries RecordIds, not refs), and a walk
-    under a snapshot that no longer sees the endpoint does not land on it."""
+    """A walk after a committed detach never returns the deleted endpoint or its edges."""
     with graph.begin("write") as txn:
-        txn.execute("MATCH (p:Person {id: 3}) DELETE p")
+        txn.execute("MATCH (p:Person {id: 3}) DETACH DELETE p")
     assert _rows(graph, "MATCH (a:Person {id: 2})-[:Knows]->(b:Person) RETURN b.id") == []
     assert _rows(graph, "MATCH (a:Person)-[:Knows]->(b:Person) RETURN a.id, b.id") == [(1, 2)]
 

@@ -182,8 +182,11 @@ from okto_grafx.domain.query.ast import (
     SortItem,
     Statement,
     Subscript,
+    ListSlice,
+    ListIteration,
     UnaryOperation,
     UnionQuery,
+    SubqueryClause,
     Variable,
     free_variables,
     walk,
@@ -197,6 +200,10 @@ from okto_grafx.domain.query.parser import parse as parse_text
 from okto_grafx.domain.query.plan import (
     AggregateRows,
     AllNodesScan,
+    ApplyRows,
+    ArgumentRows,
+    SubqueryRows,
+    ProcedureRows,
     CreateIndex,
     CreateNodeTable,
     CreatedNode,
@@ -235,7 +242,6 @@ from okto_grafx.domain.query.plan import (
 )
 from okto_grafx.domain.query.planner import (
     RELATIONSHIP_LOOKUP_FRONTIER_LIMIT,
-    union_common_type,
     SCORE_COLUMN,
     PlannedQuery,
     build_plan,
@@ -1259,15 +1265,21 @@ class _Context:
     catalog: Catalog | None = None
     read_control: _ReadControl | None = None
     result_node: PlanNode | None = None
-    union_coercions: tuple[bool, ...] = ()
     intermediate_rows: dict[int, int] = field(default_factory=dict)
     traversal_expansions: int = 0
     traversal_paths: int = 0
     staged_rows: list[_HeldRow] = field(default_factory=_RevisionList)  # type: ignore[arg-type]
+    phase_rows: tuple[_HeldRow, ...] = ()
+    plain_node_deletes: list[tuple[TableDef, object]] = field(default_factory=list)
+    phase_results: dict[int, tuple[_Row, ...]] = field(default_factory=dict)
+    arguments: dict[int, _Row] = field(default_factory=dict)
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     staged_reads: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
     pending_tokens: dict[int, int] = field(default_factory=dict)
+    published_refs: dict[int, PendingRowRef] = field(default_factory=dict)
+    released_writes: int = 0
+    atomic_staging: bool = False
     cancelled_insert_tokens: set[int] = field(default_factory=set)
     ends_held: set[object] = field(default_factory=set)
     _ends_staged: frozenset[object] | None = None
@@ -1439,7 +1451,7 @@ class _Context:
     def _require_statement_write_capacity(self) -> None:
         """Refuse the next logical write before this statement retains it."""
         limit = self.engine._max_statement_writes
-        observed = len(self.staged_rows) + 1
+        observed = self.released_writes + len(self.staged_rows) + 1
         if limit is None or observed <= limit:
             return
         raise GrafxTransactionBudgetExceeded(
@@ -1481,16 +1493,18 @@ class _Context:
                         transaction, "_stage_row_insert_with_encoding_proof", None
                     )
                     if held.encoding_proof is not None and callable(proved_stage):
-                        proved_stage(
+                        pending = proved_stage(
                             held.table,
                             held.values or (),
                             record_id=held.identity,
                             encoding_proof=held.encoding_proof,
                         )
                     else:
-                        transaction.stage_row_insert(
+                        pending = transaction.stage_row_insert(
                             held.table, held.values or (), record_id=held.identity
                         )
+                    if held.token is not None and isinstance(pending, PendingRowRef):
+                        self.published_refs[held.token] = pending
                 elif held.operation is _HELD_UPDATE:
                     transaction.stage_row_update(
                         held.table, held.reference, held.values or ()
@@ -1512,10 +1526,28 @@ class _Context:
                 discard(mark)
             raise
         moved = len(self.staged_rows)
+        self.released_writes += moved
         self.staged_rows.clear()
         self.staged_partitions.clear()
         self.staged_reads.clear()
+        self.phase_rows = ()
+        self._ends_staged = None
         return moved
+
+    def resolve_binding(self, value: object) -> object:
+        """Replace an execution-local insert token with its authenticated staged identity."""
+        if isinstance(value, RowBinding) and value.ref is None:
+            token = self.pending_tokens.get(id(value.version))
+            reference = self.published_refs.get(token) if token is not None else None
+            if reference is not None:
+                return replace(value, ref=reference)
+        return value
+
+    def publish_phase(self) -> None:
+        """Expose held intents only inside the enclosing rollback-capable statement mark."""
+        if not self.atomic_staging:
+            raise GrafxUnsupportedOperation("Composed endpoint writes require atomic statement staging.", operation="relationship_endpoint")
+        self.release()
 
     @property
     def snapshot(self) -> object:
@@ -2893,6 +2925,10 @@ def _closed_statement_tables(
 
     selected: dict[tuple[int, str], TableDef] = {}
     for query in queries:
+        if any(isinstance(clause, SubqueryClause) for clause in query.clause_pipeline):
+            # Nested table dependencies require the full authority picture until the closed
+            # projection proves the complete imported scope, not merely the outer patterns.
+            return None
         if (
             type(query.match_clauses) is not tuple
             or type(query.updating_clauses) is not tuple
@@ -3539,6 +3575,7 @@ class QueryEngine:
                 plan = build_plan(
                     statement,
                     scalar_types=self._scalar_types(statement),
+                    procedures=self._procedure_types(),
                     catalog=catalog,
                     indexes=self._index_definitions(
                         catalog=catalog,
@@ -3561,6 +3598,30 @@ class QueryEngine:
             fn.name: ValueType[fn.return_type] for fn in self._extensions.scalars
         }
 
+    def _validate_procedure_parameters(self, plan: PlannedQuery, parameters: Mapping[str, object]) -> None:
+        """Check bound procedure signatures before any operator or callback is entered."""
+        if self._extensions is None or not self._extensions.procedures:
+            return
+        procedures = self._procedure_types()
+        static_types = _bound_static_types(plan, parameters)
+        for node in plan.root.walk():
+            if not isinstance(node, ProcedureRows):
+                continue
+            procedure = procedures.get(node.name)
+            if procedure is None:
+                raise GrafxPlanError("Procedure permissions are not granted.", field="procedure")
+            for expression, expected in zip(node.arguments, procedure.argument_types, strict=True):
+                actual = _bound_pulse_expression_type(expression, static_types, parameters, owner="procedure argument")
+                if actual not in (None, ValueType.NULL, ValueType[expected]):
+                    raise GrafxPlanError("Procedure argument type mismatch.", field="procedure_type")
+
+    def _procedure_types(self) -> dict:
+        """Expose only registrations whose explicit permission set the host granted."""
+        return {} if self._extensions is None else {
+            item.name: item for item in self._extensions.procedures
+            if item.required_permissions <= self._extensions.procedure_permissions
+        }
+
     def planned(self, statement: Statement) -> PlannedQuery:
         """Return the plan together with the analysis it was built from."""
         started = self._reading()
@@ -3571,6 +3632,7 @@ class QueryEngine:
             plan = build_plan(
                 statement,
                 scalar_types=self._scalar_types(statement),
+                procedures=self._procedure_types(),
                 catalog=catalog,
                 indexes=self._index_definitions(catalog=catalog, authority=authority),
                 analysis=analysis,
@@ -3738,6 +3800,7 @@ class QueryEngine:
             bound = self._bind_parameters(plan, parameters)
             coalesce_types = _bound_coalesce_types(plan, bound)
             case_types = _bound_case_types(plan, bound)
+            self._validate_procedure_parameters(plan, bound)
             statistics: dict[str, int] = {}
             context = _Context(
                 engine=self,
@@ -3751,7 +3814,6 @@ class QueryEngine:
                 catalog=working,
                 read_control=read_control,
                 result_node=root.child,
-                union_coercions=_bound_union_columns(plan, bound),
                 index_authority=authority,
                 node_scan_projections=_closed_node_scan_projections(root.child),
                 vector_free_landings=_closed_vector_free_landings(root.child),
@@ -4129,7 +4191,6 @@ class QueryEngine:
                     value=name,
                 )
             bound[name] = supplied[name]  # type: ignore[assignment]
-        _validate_parameter_maps(bound)
         return bound
 
     # --- running -----------------------------------------------------------------------------
@@ -4143,7 +4204,36 @@ class QueryEngine:
         index_authority: _IndexAuthorityProjection | None = None,
         read_control: _ReadControl | None = None,
     ) -> QueryResult:
-        """Walk the plan and produce the result."""
+        """Run a logical statement under one rollback boundary, including early intent phases."""
+        statement = plan.analysis.statement
+        writing = isinstance(statement, Query) and statement.writes
+        take_mark = getattr(txn, "staging_mark", None)
+        discard = getattr(txn, "discard_since", None)
+        settle = getattr(txn, "settle_staging_mark", None)
+        atomic = writing and all(callable(method) for method in (take_mark, discard, settle))
+        mark = take_mark() if atomic else None
+        try:
+            result = self._run_unpublished(plan, txn, parameters, catalog, index_authority, read_control,
+                                           atomic_staging=atomic)
+            if atomic:
+                settle(mark)
+            return result
+        except BaseException as failure:
+            if atomic:
+                try:
+                    discard(mark)
+                except BaseException as cleanup:
+                    failure.add_note(f"Statement rollback failed: {type(cleanup).__name__}")
+                    raise cleanup from failure
+            raise
+
+    def _run_unpublished(
+        self, plan: PlannedQuery, txn: object, parameters: dict[str, Value],
+        catalog: Catalog | None = None,
+        index_authority: _IndexAuthorityProjection | None = None,
+        read_control: _ReadControl | None = None, *, atomic_staging: bool = False,
+    ) -> QueryResult:
+        """Evaluate and validate; staged intents remain invisible to other participants."""
         root = plan.root
         statistics: dict[str, int] = {}
         if isinstance(
@@ -4159,6 +4249,7 @@ class QueryEngine:
             )
         coalesce_types = _bound_coalesce_types(plan, parameters)
         case_types = _bound_case_types(plan, parameters)
+        self._validate_procedure_parameters(plan, parameters)
         context = _Context(
             engine=self,
             txn=txn,
@@ -4171,15 +4262,30 @@ class QueryEngine:
             catalog=catalog,
             read_control=read_control,
             result_node=root.child if root.columns else None,
-            union_coercions=_bound_union_columns(plan, parameters),
             index_authority=index_authority,
             short_circuit_traversals=_short_circuit_traversals(root.child),
             node_scan_projections=_closed_node_scan_projections(root.child),
             vector_free_landings=_closed_vector_free_landings(root.child),
+            atomic_staging=atomic_staging,
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
         _validate_bound_label_arguments(plan, parameters)
+        # Prepare explicit write/read boundaries bottom-up before any parent scan
+        # captures its owner overlay. Native transaction intents remain private and
+        # the enclosing statement mark rolls all phases back on any later failure.
+        for boundary, _depth in reversed(tuple(root.child.traverse())):
+            if isinstance(boundary, EagerRows) and boundary.publish_read_phase:
+                phase = tuple(self._rows(boundary.child, context))
+                if context.atomic_staging:
+                    context.publish_phase()
+                    phase = tuple(_Row(
+                        bindings={name: context.resolve_binding(value) for name, value in row.bindings.items()},
+                        computed=row.computed, columns=row.columns,
+                    ) for row in phase)
+                else:
+                    context.phase_rows = tuple(context.staged_rows)
+                context.phase_results[id(boundary)] = phase
         stream = self._rows(root.child, context)
         stream_failure: BaseException | None = None
         try:
@@ -4189,16 +4295,26 @@ class QueryEngine:
             raise
         finally:
             _close_iterator(stream, stream_failure)
-        context.release()
         produced: tuple[tuple[Value, ...], ...] = ()
         if root.columns:
             produced = tuple(_projected(row, root.columns) for row in rows)
-        return _owned_query_result(
+        result = _owned_query_result(
             columns=root.columns,
             rows=produced,
             plan=root,
             statistics=dict(statistics),
         )
+        for table, identity in context.plain_node_deletes:
+            for edge_table, edge_ref, _endpoints in _incident_edges(self, context, table, identity):
+                if not context.already_ended(edge_ref):
+                    raise GrafxQueryError(
+                        "DELETE cannot remove a node with live relationships; use DETACH DELETE or delete the edges.",
+                        reason="connected_node_delete", table=table.name, relationship_table=edge_table.name,
+                    )
+        # Publishing to the transaction is the final fallible phase: output detachment and
+        # referential checks must not fail after a caught statement error has staged effects.
+        context.release()
+        return result
 
     def _rows(self, node: PlanNode, context: _Context) -> Iterator[_Row]:
         """Return the rows one operator produces."""
@@ -5634,6 +5750,117 @@ def _single_row(
     yield _Row(bindings={})
 
 
+def _argument_rows(engine: QueryEngine, node: ArgumentRows, context: _Context) -> Iterator[_Row]:
+    """Read the current outer binding without creating a second snapshot or transaction."""
+    if node.slot not in context.arguments:
+        raise GrafxPlanError("A correlated argument has no active outer row.", field="plan")
+    yield context.arguments[node.slot]
+
+
+def _apply_rows(engine: QueryEngine, node: ApplyRows, context: _Context) -> Iterator[_Row]:
+    """Correlate a complete inner read and close both streams even on cancellation."""
+    outer_stream = engine._rows(node.child, context)
+    outer_failure: BaseException | None = None
+    try:
+        for outer in outer_stream:
+            previous = context.arguments.get(node.slot)
+            context.arguments[node.slot] = outer
+            stream = engine._rows(node.inner, context)
+            failure: BaseException | None = None
+            found = False
+            try:
+                for row in stream:
+                    found = True
+                    yield row
+                if not found:
+                    yield replace(
+                        outer,
+                        bindings={**outer.bindings, **dict.fromkeys(node.null_variables)},
+                    )
+            except BaseException as caught:
+                failure = caught
+                raise
+            finally:
+                try:
+                    _close_iterator(stream, failure)
+                finally:
+                    if previous is None:
+                        context.arguments.pop(node.slot, None)
+                    else:
+                        context.arguments[node.slot] = previous
+    except BaseException as caught:
+        outer_failure = caught
+        raise
+    finally:
+        _close_iterator(outer_stream, outer_failure)
+
+
+def _procedure_rows(engine: QueryEngine, node: ProcedureRows, context: _Context) -> Iterator[_Row]:
+    """Compose typed rows without supplying any database write authority to the callback."""
+    incoming = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    procedure = engine._procedure_types().get(node.name)
+    if procedure is None:
+        raise GrafxPlanError("Procedure is no longer authorized on this handle.", field="procedure")
+    positions = {name: position for position, (name, _kind) in enumerate(node.columns)}
+    try:
+        for row in incoming:
+            arguments = tuple(_evaluate(argument, row, context) for argument in node.arguments)
+            stream = procedure.invoke(arguments)
+            inner_failure: BaseException | None = None
+            try:
+                for values in stream:
+                    yield _Row(bindings={**row.bindings, **{
+                        item.name: values[positions[item.expression.name]] for item in node.yields
+                    }})
+            except BaseException as caught:
+                inner_failure = caught
+                raise
+            finally:
+                _close_iterator(stream, inner_failure)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(incoming, failure)
+
+
+def _subquery_rows(engine: QueryEngine, node: SubqueryRows, context: _Context) -> Iterator[_Row]:
+    """Execute each subquery in the current statement, closing both sides on every exit."""
+    outer_stream = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    try:
+        for outer in outer_stream:
+            previous = context.arguments.get(node.slot)
+            context.arguments[node.slot] = _Row(bindings={
+                target: outer.bindings[source] for source, target in node.imports
+            })
+            inner = engine._rows(node.inner, context)
+            inner_failure: BaseException | None = None
+            try:
+                for row in inner:
+                    values = tuple((row.columns or {}).values())
+                    if len(values) != len(node.outputs):
+                        raise GrafxPlanError("Subquery result arity differs from its plan.", field="subquery")
+                    yield _Row(bindings={**outer.bindings, **dict(zip(node.outputs, values, strict=True))})
+            except BaseException as caught:
+                inner_failure = caught
+                raise
+            finally:
+                try:
+                    _close_iterator(inner, inner_failure)
+                finally:
+                    if previous is None:
+                        context.arguments.pop(node.slot, None)
+                    else:
+                        context.arguments[node.slot] = previous
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(outer_stream, failure)
+
+
 def _unwind_rows(
     engine: QueryEngine, node: UnwindRows, context: _Context
 ) -> Iterator[_Row]:
@@ -5652,6 +5879,8 @@ def _unwind_rows(
 
     for row in engine._rows(node.child, context):
         carrier = _evaluate(node.expression, row, context)
+        if carrier is None:
+            continue
         if not isinstance(carrier, (list, tuple)):
             named = "null" if carrier is None else type(carrier).__name__
             message = (
@@ -5685,7 +5914,7 @@ def _with_rows(
         projected = {
             item.name: _evaluate(item.expression, row, context) for item in node.items
         }
-        yield _Row(bindings=projected)
+        yield _Row(bindings=projected, columns=projected)
 
 
 def _scanned_node_versions(
@@ -8719,8 +8948,11 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
 
             def coalesce(row: _Row, ctx: _Context, memo: object) -> object:
                 """Evaluate the selected arguments under canonical coalesce semantics."""
-                values = tuple(argument(row, ctx, memo) for argument in arguments)
-                return _coalesce_selected(node, values, ctx)
+                for argument in arguments:
+                    value = argument(row, ctx, memo)
+                    if value is not None:
+                        return _coalesce_selected(node, (value,), ctx)
+                return None
 
             return coalesce
 
@@ -10647,7 +10879,7 @@ class _Accumulator:
         self._seen: set[object] | None = set() if aggregation.call.distinct else None
         self._values: list[object] | None = [] if self._function == "COLLECT" else None
         self._count = 0
-        self._total: float = 0.0
+        self._total: int | float = 0
         self._extreme: object = None
         self._extreme_key: tuple[int, object] | None = None
 
@@ -10692,12 +10924,11 @@ class _Accumulator:
             ):
                 self._extreme = value
                 self._extreme_key = key
-        elif (
-            name in ("SUM", "AVG")
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-        ):
-            self._total += float(value)
+        elif name in ("SUM", "AVG"):
+            if type(value) not in (int, float):
+                raise GrafxPlanError("Numeric aggregates require numeric values or NULL.",
+                                     field="function", value=name)
+            self._total += value
 
     def result(self) -> object:
         """Return what this aggregate reports for its group."""
@@ -10708,10 +10939,10 @@ class _Accumulator:
             values = self._values
             assert values is not None
             return tuple(values)
-        if not self._count:
-            return None
         if name == "SUM":
             return self._total
+        if not self._count:
+            return None
         if name == "AVG":
             return self._total / self._count
         return self._extreme
@@ -11247,7 +11478,12 @@ def _eager_rows(
     engine: QueryEngine, node: EagerRows, context: _Context
 ) -> Iterator[_Row]:
     """Draw every row of the child before yielding the first, so nothing above can stop it."""
-    yield from tuple(engine._rows(node.child, context))
+    if node.publish_read_phase:
+        if id(node) not in context.phase_results:
+            raise GrafxPlanError("A write/read phase must be prepared before a downstream scan.", field="plan")
+        yield from context.phase_results[id(node)]
+    else:
+        yield from tuple(engine._rows(node.child, context))
 
 
 def _optional_rows(
@@ -11270,33 +11506,21 @@ def _optional_rows(
 def _union_rows(
     engine: QueryEngine, node: UnionRows, context: _Context
 ) -> Iterator[_Row]:
-    """Yield the left branch's rows and then the right branch's, under one set of names.
-
-    Position, not name, is what joins the two: the right branch may have written different
-    aliases, and its projection produced them in the order it wrote them. Each branch ends in a
-    projection of exactly this arity, so the values of a row arrive in column order and the
-    mapping is exact.
-
-    Widening happens HERE, before the distinct above can look at anything, because 1 and 1.0
-    are the same row of a widened column and two different rows of an unwidened one. Doing it
-    after the distinct would answer both.
-    """
-    coercions = context.union_coercions
+    """Stream branches with validated common columns and no lossy coercion."""
     for child in (node.left, node.right):
-        for row in engine._rows(child, context):
-            values = tuple((row.columns or {}).values())
-            columns = {
-                name: (
-                    float(value)
-                    if position < len(coercions)
-                    and coercions[position]
-                    and isinstance(value, int)
-                    and not isinstance(value, bool)
-                    else value
-                )
-                for position, (name, value) in enumerate(zip(node.columns, values))
-            }
-            yield _Row(bindings={}, computed=None, columns=columns)
+        stream = engine._rows(child, context)
+        failure: BaseException | None = None
+        try:
+            for row in stream:
+                values = tuple((row.columns or {}).values())
+                if len(values) != len(node.columns):
+                    raise GrafxPlanError("UNION row arity differs from its plan.", field="union")
+                yield _Row(bindings={}, columns=dict(zip(node.columns, values, strict=True)))
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            _close_iterator(stream, failure)
 
 
 def _distinct_rows(
@@ -11945,22 +12169,17 @@ def _window(expression: Expression, context: _Context, keyword: str) -> int:
 def _write_rows(
     engine: QueryEngine, node: PlanNode, context: _Context
 ) -> Iterator[_Row]:
-    """Build every row a write operator would store, then refuse for the seam that is missing.
-
-    The ORDER is the whole point and it is the shape the finished write path will keep. Every
-    refusal a write can produce -- a property the table does not declare, a null in a column that
-    forbids one, a value of the wrong type, a vector of the wrong dimension or one that names a
-    retired space -- happens HERE, against rows that exist only in memory, before anything is
-    handed to a transaction. Nothing becomes reachable in the heap, in an index or in a counter
-    until every step that can still refuse has succeeded, which is the constraint C1 and C4 were
-    each rejected for missing.
-
-    When the two seams this refusal names arrive, the ``raise`` at the end is replaced by the
-    staging call and NOTHING ELSE MOVES: the materialised rows are already validated, so the
-    handover cannot be the step that discovers a problem.
-    """
-    for row in engine._rows(node.child, context):
-        yield _write_one(engine, node, row, context)
+    """Validate and stage each input under the enclosing logical-statement boundary."""
+    source = engine._rows(node.child, context)
+    failure = None
+    try:
+        for row in source:
+            yield _write_one(engine, node, row, context)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(source, failure)
 
 
 def _write_one(
@@ -11968,13 +12187,12 @@ def _write_one(
 ) -> _Row:
     """Materialise everything one write operator stores for one row, then stage it.
 
-    Two phases, in this order and never interleaved. Everything that can still refuse -- a
-    property the table does not declare, a null in a column that forbids one, a value of the
-    wrong type, a vector of the wrong dimension, an edge naming a row this snapshot cannot see --
-    happens against values held in memory. Only when the whole set is built does anything reach
-    the transaction. So a statement that refuses has staged nothing at all, rather than half of
-    itself.
+    Validation precedes private staging. Early endpoint/read phases never commit;
+    the enclosing statement mark discards every phase if later validation fails.
     """
+    if context.published_refs:
+        row = _Row(bindings={name: context.resolve_binding(value) for name, value in row.bindings.items()},
+                   computed=row.computed, columns=row.columns)
     if isinstance(node, (CreateRelationships, MergePattern)):
         return _write_pattern(engine, node, row, context)
     if isinstance(node, SetProperties):
@@ -11998,9 +12216,8 @@ def _write_assignments(
     and two assignments to the same row must both land -- writing one version per assignment
     would make the last one win and silently drop the others.
 
-    The row that leaves here still carries the binding it arrived with, so a RETURN above a SET
-    projects the values the statement matched. That is openCypher's rule: the projection reads
-    the row as the statement saw it, and the new version becomes visible at the commit number.
+    The outgoing row carries the updated values for subsequent clauses and RETURN. Other
+    participants still see their own snapshot until this transaction durably commits.
     """
     # Keyed by the stored ROW, not by the variable: `MATCH (n {id:1}), (m {id:1}) SET n.a = 1,
     # m.b = 2` names one row twice, and one version per variable made the last one win (C10
@@ -12044,7 +12261,20 @@ def _write_assignments(
         )
         context.count("properties_set", len(node.assignments))
         context.count("rows_updated")
-    return row
+    bindings = dict(row.bindings)
+    for name, current in bindings.items():
+        if not isinstance(current, RowBinding):
+            continue
+        key = current.ref if current.ref is not None else ("pending", id(current.version))
+        changed = updated.get(key)
+        if changed is None:
+            continue
+        version = replace(current.version, values=tuple(changed[1]))
+        token = context.pending_tokens.get(id(current.version))
+        if token is not None:
+            context.pending_tokens[id(version)] = token
+        bindings[name] = replace(current, version=version)
+    return _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
 
 def _rewrite_held_insert(
@@ -12165,6 +12395,7 @@ def _incident_edges(
                 )
 
     for candidate, leaves, lands in candidates:
+        engine._declare_complete_table_read(context.txn, candidate)
         # The edges earlier statements created come first, and ending one CANCELS it: the
         # transaction's own reducer folds an insert followed by a delete into no row at all, so
         # the node and everything hanging from it leave together with nothing to publish.
@@ -12187,6 +12418,7 @@ def _incident_edges(
         for ref, endpoints in engine.heap.scan_relationship_endpoints(
             candidate, snapshot
         ):
+            context.count("delete_edge_checks")
             incident = (leaves and endpoints[0] == endpoint_identity) or (
                 lands and endpoints[1] == endpoint_identity
             )
@@ -12206,14 +12438,17 @@ def _write_deletions(
     number the version had already stopped at, which is not a stronger statement of the same fact
     but a second fact that is not true.
 
-    DETACH is what decides the fate of the relationships hanging from a node. With the keyword
-    they end WITH it, physically, in the same statement. Without it only the node ends, and its
-    edges stay on the pages as rows no traversal will follow: a landing whose snapshot cannot see
-    the node is not reached, so the absence an ordinary DELETE promises is a logical one. Ending
-    those edges anyway without being asked would turn a tombstone into a cascade.
+    DETACH explicitly ends incident edges. A plain node DELETE is validated after the complete
+    statement, so DELETE n, r is independent of target order and live dangling edges are refused.
     """
+    if context.atomic_staging and any(held.table.kind == "rel" for held in context.staged_rows):
+        context.publish_phase()
+        row = _Row(bindings={name: context.resolve_binding(value) for name, value in row.bindings.items()},
+                   computed=row.computed, columns=row.columns)
     for variable in node.variables:
         binding = row.bindings.get(variable)
+        if binding is None and variable in row.bindings:
+            continue  # DELETE of a null-extended OPTIONAL binding has no effect.
         if not isinstance(binding, RowBinding):
             raise GrafxPlanError(
                 f"DELETE names {variable!r}, which the rows reaching it do not carry.",
@@ -12247,6 +12482,9 @@ def _write_deletions(
         if context.already_ended(binding.ref):
             continue
         context.note_ended(binding.ref)
+        if not node.detach and binding.table.kind != "rel":
+            context.plain_node_deletes.append((binding.table, binding.ref if isinstance(binding.ref, PendingRowRef)
+                                              else binding.record_id))
         if node.detach and binding.table.kind != "rel":
             # Incident edges are settled BEFORE the node they hang from is held, so the whole
             # detach is one statement's worth of staged work: either every edge and the node
@@ -12287,7 +12525,6 @@ def _write_pattern(
     merging = isinstance(node, MergePattern)
     bindings = dict(row.bindings)
     staged: list[tuple[TableDef, tuple[Value, ...], int | None, int, object]] = []
-    fresh: set[str] = set()
     for written in node.nodes:
         if written.variable is None:
             continue
@@ -12315,34 +12552,42 @@ def _write_pattern(
                 encoding_proof,
             )
         )
-        fresh.add(written.variable)
         bindings[written.variable] = pending
-    edges: list[tuple[TableDef, tuple[Value, ...], object]] = []
-    for edge in node.relationships:
-        table, values, encoding_proof = _materialise_edge(
-            engine, edge, bindings, fresh, row, context
-        )
-        if merging and _matching_edge(engine, edge, (table, values), context):
-            context.count("relationships_matched")
-            continue
-        edges.append((table, values, encoding_proof))
     _require_write_transaction(context.txn)
     for table, values, identity, token, encoding_proof in staged:
-        context.hold(
-            table,
-            values,
-            _partition_key(table, values),
-            identity,
-            token=token,
-            encoding_proof=encoding_proof,
-        )
+        context.hold(table, values, _partition_key(table, values), identity,
+                     token=token, encoding_proof=encoding_proof)
         context.count("rows_created")
-    for table, values, encoding_proof in edges:
+    if node.relationships and any(
+        isinstance(bindings.get(variable), RowBinding) and bindings[variable].ref is None
+        for edge in node.relationships for variable in (edge.source, edge.target)
+    ):
+        context.publish_phase()
+        bindings = {name: context.resolve_binding(value) for name, value in bindings.items()}
+    edges: list[tuple[TableDef, tuple[Value, ...], object, int | None]] = []
+    for edge in node.relationships:
+        table, values, encoding_proof = _materialise_edge(
+            engine, edge, bindings, row, context
+        )
+        if merging:
+            existing_edge = _matching_edge(engine, edge, (table, values), context)
+            if existing_edge is not None:
+                if edge.variable is not None:
+                    bindings[edge.variable] = existing_edge
+                context.count("relationships_matched")
+                continue
+        pending_edge = _pending_binding(edge.variable or "\x00created_edge", table, values)
+        edge_token = context.token_for(pending_edge)
+        if edge.variable is not None:
+            bindings[edge.variable] = pending_edge
+        edges.append((table, values, encoding_proof, edge_token))
+    for table, values, encoding_proof, edge_token in edges:
         context.hold(
             table,
             values,
             _partition_key(table, values),
             None,
+            token=edge_token,
             encoding_proof=encoding_proof,
         )
         context.count("relationships_created")
@@ -12753,29 +12998,15 @@ def _materialise_edge(
     engine: QueryEngine,
     edge: CreatedRelationship,
     bindings: dict[str, object],
-    fresh: set[str],
     row: _Row,
     context: _Context,
 ) -> tuple[TableDef, tuple[Value, ...], object]:
-    """Return the stored tuple of one edge, refusing endpoints that cannot be named yet.
+    """Validate committed or authenticated owner-private identities for both endpoints.
 
-    An endpoint is a RecordId, and the identity of a row created by THIS statement does not
-    exist until the commit allocates it -- so an edge to a node the same statement creates is
-    refused rather than staged against a number nobody has issued. It is a refusal with a
-    remedy: match the endpoints first.
-
-    The visibility of both endpoints is then the heap's own door, asked BEFORE anything is
-    staged, so an edge naming a row this snapshot cannot see leaves nothing behind.
+    Fresh endpoints carry PendingRowRef issued by this transaction's staging door;
+    commit resolves them before applying heap pages. An arbitrary guessed identity
+    or an endpoint not visible to this owner is refused.
     """
-    for end, variable in (("source", edge.source), ("target", edge.target)):
-        if variable in fresh:
-            raise GrafxUnsupportedOperation(
-                f"The {end} of a {edge.table.name!r} edge is {variable!r}, which this statement "
-                "is creating: its row identity is allocated by the commit and does not exist "
-                "yet. Create the nodes first and match them, then create the edge.",
-                field=end,
-                value=variable,
-            )
     catalog = context.schema()
     endpoint_specs = (
         ("source", edge.source, edge.table.from_table, ENDPOINT_COLUMNS[0]),
@@ -12953,6 +13184,24 @@ def _pending_binding(
     )
 
 
+def _matched_pending_binding(context: _Context, variable: str, table: TableDef,
+                             values: tuple[Value, ...], reference: object) -> RowBinding:
+    """Keep a matched private row's identity, without equating unrelated equal tuples."""
+    binding = _pending_binding(variable, table, values, reference=reference)
+    if reference is None:
+        for held in context.staged_rows:
+            if (held.operation is _HELD_INSERT and held.table.table_id == table.table_id
+                    and held.values is values and held.token is not None):
+                context.pending_tokens[id(binding.version)] = held.token
+                # Reusing an unpublished entity needs one authenticated identity
+                # for every alias. Unique MERGE insertions do not flush here.
+                if context.atomic_staging:
+                    context.publish_phase()
+                    binding = context.resolve_binding(binding)
+                break
+    return binding
+
+
 def _transaction_row_view(
     context: _Context, table: TableDef, *, include_held: bool = True
 ) -> tuple[
@@ -13004,8 +13253,8 @@ def _transaction_row_view(
             logical_intents.append(intent)
     else:
         logical_intents = list(indexed)
-    if include_held:
-        for held in context.staged_rows:
+    if include_held or context.phase_rows:
+        for held in context.staged_rows if include_held else context.phase_rows:
             if held.table.table_id != table.table_id:
                 continue
             operation = {
@@ -14062,9 +14311,7 @@ def _matching_row(
         if len(pending) == len(values) and all(
             _equal(pending[at], values[at]) for at in positions
         ):
-            return _pending_binding(
-                written.variable, table, pending, reference=reference
-            )
+            return _matched_pending_binding(context, written.variable, table, pending, reference)
     for reference, latest in state.items():
         if latest is None or len(latest) != len(values):
             continue
@@ -14096,8 +14343,8 @@ def _matching_edge(
     edge: CreatedRelationship,
     materialised: tuple[TableDef, tuple[Value, ...]],
     context: _Context,
-) -> bool:
-    """Return True when the edge a MERGE names already exists.
+) -> RowBinding | None:
+    """Return the latest owner-visible edge a MERGE names, if it exists.
 
     An edge is identified by the pair it connects, which leads its stored tuple, plus whatever
     properties the pattern named -- so ``MERGE (a)-[:KNOWS]->(b)`` matches any KNOWS edge between
@@ -14112,15 +14359,23 @@ def _matching_edge(
             table.column_index(entry.key) for entry in edge.properties.entries
         )
     wanted = tuple(positions)
-    for pending in _uncommitted_rows(context, table):
+    variable = edge.variable or "\x00merged_edge"
+    state, inserted = _transaction_row_view(context, table)
+    for reference, pending in inserted:
         if len(pending) == len(values) and all(
             _equal(pending[at], values[at]) for at in wanted
         ):
-            return True
-    for _ref, version in engine.heap.scan(table, context.snapshot):
+            return _matched_pending_binding(context, variable, table, pending, reference)
+    for reference, latest in state.items():
+        if latest is not None and all(_equal(latest[at], values[at]) for at in wanted):
+            return RowBinding(variable=variable, table=table, ref=reference,
+                              version=replace(engine.heap.read(reference), values=latest))
+    for ref, version in engine.heap.scan(table, context.snapshot):
+        if ref in state:
+            continue
         if all(_equal(version.values[at], values[at]) for at in wanted):
-            return True
-    return False
+            return RowBinding(variable=variable, table=table, ref=ref, version=version)
+    return None
 
 
 def _require_write_transaction(txn: object) -> object:
@@ -14392,6 +14647,10 @@ _Handler = Callable[[QueryEngine, PlanNode, _Context], Iterator[_Row]]
 
 _HANDLERS: dict[type, _Handler] = {
     SingleRow: _single_row,  # type: ignore[dict-item]
+    ArgumentRows: _argument_rows,  # type: ignore[dict-item]
+    ApplyRows: _apply_rows,  # type: ignore[dict-item]
+    SubqueryRows: _subquery_rows,  # type: ignore[dict-item]
+    ProcedureRows: _procedure_rows,  # type: ignore[dict-item]
     UnwindRows: _unwind_rows,  # type: ignore[dict-item]
     WithRows: _with_rows,  # type: ignore[dict-item]
     AllNodesScan: _all_nodes_scan,  # type: ignore[dict-item]
@@ -14481,6 +14740,19 @@ def _evaluate_by_kind(
         return _case(expression, row, context)
     if isinstance(expression, Subscript):
         return _subscript(expression, row, context)
+    if isinstance(expression, ListIteration):
+        return _evaluate_list_iteration(expression, row, context)
+    if isinstance(expression, ListSlice):
+        subject = _evaluate(expression.subject, row, context)
+        start = None if expression.start is None else _evaluate(expression.start, row, context)
+        end = None if expression.end is None else _evaluate(expression.end, row, context)
+        if subject is not None and type(subject) not in (list, tuple):
+            raise GrafxPlanError("A list slice requires a list.", field="slice")
+        if any(value is not None and type(value) is not int for value in (start, end)):
+            raise GrafxPlanError("List slice bounds require integers.", field="slice")
+        if subject is None or (expression.start is not None and start is None) or (expression.end is not None and end is None):
+            return None
+        return tuple(subject[start:end])
     if isinstance(expression, FunctionCall):
         return _call(expression, row, context)
     raise GrafxPlanError(
@@ -14520,7 +14792,7 @@ def _evaluate_variable(
     context: _Context,
     computed: Mapping[Expression, object] | None,
 ) -> object:
-    return _read_variable(expression, row, computed)
+    return context.resolve_binding(_read_variable(expression, row, computed))
 
 
 def _evaluate_property(
@@ -14561,6 +14833,57 @@ def _evaluate_null_check(
 ) -> object:
     value = _evaluate(expression.operand, row, context)
     return (value is not None) if expression.negated else (value is None)
+
+
+def _evaluate_list_iteration(expression: ListIteration, row: _Row, context: _Context) -> object:
+    """Run a lexical list scope with three-valued predicates and cooperative limits."""
+    from okto_grafx.domain.query.scalars import MAX_GENERATED_LIST_ELEMENTS
+
+    source = _evaluate(expression.source, row, context)
+    initial = None if expression.initial is None else _evaluate(expression.initial, row, context)
+    if source is None:
+        return None
+    if type(source) not in (list, tuple):
+        raise GrafxPlanError("List iteration requires a list.", field="iteration")
+    if len(source) > MAX_GENERATED_LIST_ELEMENTS:
+        raise GrafxQueryBudgetExceeded("List iteration exceeds its element budget.", resource="generated_list")
+    values = []
+    matched = 0
+    unknown = False
+    accumulator = initial
+    for value in source:
+        context.count("list_iterations")
+        if context.statistics["list_iterations"] > MAX_GENERATED_LIST_ELEMENTS:
+            raise GrafxQueryBudgetExceeded("Nested list iteration exceeds the statement element budget.", resource="generated_list")
+        local = _Row(bindings={**row.bindings, expression.variable: value})
+        if expression.accumulator is not None:
+            local.bindings[expression.accumulator] = accumulator
+        if expression.mode == "reduce":
+            accumulator = _evaluate(expression.body, local, context)
+            continue
+        predicate = expression.predicate if expression.mode == "map" else expression.body
+        selected = True if predicate is None else _evaluate(predicate, local, context)
+        if selected is not None and type(selected) is not bool:
+            raise GrafxPlanError("List predicates require booleans.", field="iteration")
+        if expression.mode == "map":
+            if selected is True:
+                values.append(_evaluate(expression.body, local, context))
+            continue
+        unknown = unknown or selected is None
+        matched += selected is True
+        if expression.mode == "all" and selected is False:
+            return False
+        if expression.mode in ("any", "none") and selected is True:
+            return expression.mode == "any"
+        if expression.mode == "single" and matched > 1:
+            return False
+    if expression.mode == "map":
+        return tuple(values)
+    if expression.mode == "reduce":
+        return accumulator
+    if unknown:
+        return None
+    return (matched == 1 if expression.mode == "single" else expression.mode in ("all", "none"))
 
 
 def _evaluate_list(
@@ -14651,26 +14974,20 @@ _EXACT_EVALUATORS: Mapping[type, Callable[..., object]] = MappingProxyType(
 
 
 def _case(expression: CaseExpression, row: _Row, context: _Context) -> object:
-    """Evaluate every CASE expression eagerly, then select its first matching arm."""
+    """Evaluate conditions in order and only the selected result arm.
+
+    Static scope/type checking still covers every branch. Runtime effects and errors
+    of an unselected expression must not escape a conditional expression.
+    """
     operand = (
         _evaluate(expression.operand, row, context)
         if expression.operand is not None
         else None
     )
-    alternatives: list[tuple[object, object]] = []
+    chosen = expression.fallback
     for alternative in expression.alternatives:
         condition = _evaluate(alternative.condition, row, context)
-        result = _evaluate(alternative.result, row, context)
-        alternatives.append((condition, result))
-    fallback = (
-        _evaluate(expression.fallback, row, context)
-        if expression.fallback is not None
-        else None
-    )
-
-    selected = fallback
-    if expression.operand is None:
-        for condition, result in alternatives:
+        if expression.operand is None:
             if condition is not None and not isinstance(condition, bool):
                 message = (
                     f"A searched CASE tests booleans or nulls; got "
@@ -14681,30 +14998,24 @@ def _case(expression: CaseExpression, row: _Row, context: _Context) -> object:
                     field="case",
                     value=expression.describe(),
                 )
-            if condition is True:
-                selected = result
-                break
-    else:
-        for condition, result in alternatives:
-            equal = (
-                operand is None
-                and condition is None
-                or operand is not None
+            matches = condition is True
+        else:
+            matches = (
+                operand is not None
                 and condition is not None
-                and _equal(operand, condition)
+                and _query_equal(operand, condition) is True
             )
-            if equal:
-                selected = result
-                break
+        if matches:
+            chosen = alternative.result
+            break
 
-    result_type = context.case_types.get(id(expression))
-    if result_type is ValueType.DOUBLE and selected is not None:
-        return float(selected)
+    selected = _evaluate(chosen, row, context) if chosen is not None else None
+
     return selected
 
 
 def _subscript(expression: Subscript, row: _Row, context: _Context) -> object:
-    """Extract one element with Ladybug's one-based positive and negative positions."""
+    """Extract a zero-based position, or a negative position counted from the end."""
     subject = _evaluate(expression.subject, row, context)
     index = _evaluate(expression.index, row, context)
     return _subscript_value(expression, subject, index)
@@ -14714,6 +15025,10 @@ def _subscript_value(expression: Subscript, subject: object, index: object) -> o
     """Extract one already evaluated list element under the public subscript contract."""
     if subject is None or index is None:
         return None
+    if isinstance(subject, Mapping):
+        if not isinstance(index, str):
+            raise GrafxPlanError("A map subscript needs a string key.", field="subscript", value=expression.describe())
+        return subject.get(index)
     if not isinstance(subject, (list, tuple)):
         message = f"A subscript extracts from a list; got {type(subject).__name__}."
         raise GrafxPlanError(
@@ -14730,52 +15045,16 @@ def _subscript_value(expression: Subscript, subject: object, index: object) -> o
             field="subscript",
             value=expression.describe(),
         )
-    if index == 0:
-        message = "A list subscript uses one-based positions; zero is not a position."
-        raise GrafxPlanError(
-            message,
-            field="subscript",
-            value=index,
-        )
-    offset = index - 1 if index > 0 else index
-    if not -len(subject) <= offset < len(subject):
-        message = (
-            f"The list subscript {index} is out of range for {len(subject)} elements."
-        )
-        raise GrafxPlanError(
-            message,
-            field="subscript",
-            value=index,
-        )
-    return subject[offset]
+    if not -len(subject) <= index < len(subject):
+        return None
+    return subject[index]
 
 
 def _map_property_value(
     subject: Mapping[object, object], expression: Property
 ) -> object:
-    """Read one case-insensitive map key, refusing an ambiguous parameter map."""
-    folded = expression.key.lower()
-    matches = tuple(
-        (key, value)
-        for key, value in subject.items()
-        if isinstance(key, str) and key.lower() == folded
-    )
-    if len(matches) > 1:
-        keys = ", ".join(repr(key) for key, _value in sorted(matches))
-        message = f"The map in {expression.describe()} has colliding keys {keys}."
-        raise GrafxPlanError(
-            message,
-            field="property",
-            value=expression.key,
-        )
-    if matches:
-        return matches[0][1]
-    message = f"The map in {expression.describe()} has no key {expression.key!r}."
-    raise GrafxPlanError(
-        message,
-        field="property",
-        value=expression.key,
-    )
+    """Read one case-sensitive map key, returning NULL when it does not exist."""
+    return subject.get(expression.key)
 
 
 def _read_variable(
@@ -14830,9 +15109,10 @@ def _binary(expression: BinaryOperation, row: _Row, context: _Context) -> object
             return None
         return left_truth != right_truth
     if operator == "=":
-        return None if left is None or right is None else _equal(left, right)
+        return _query_equal(left, right)
     if operator == "<>":
-        return None if left is None or right is None else not _equal(left, right)
+        equal = _query_equal(left, right)
+        return None if equal is None else not equal
     if operator in ("<", "<=", ">", ">="):
         return _ordered(operator, left, right)
     if operator == "IN":
@@ -14867,6 +15147,19 @@ def _logical(
 
 def _ordered(operator: str, left: object, right: object) -> object:
     """Return an ordering comparison, which is unknown across kinds that have no order."""
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        # Lexicographic comparison decides at the first unequal element. An
+        # unknown later element cannot erase a decision made by an earlier one.
+        for lhs, rhs in zip(left, right):
+            if _query_equal(lhs, rhs) is True:
+                continue
+            less = _ordered("<", lhs, rhs)
+            greater = _ordered(">", lhs, rhs)
+            if less is None or greater is None:
+                return None
+            if less or greater:
+                return less if operator in ("<", "<=") else greater
+        return _ordered(operator, len(left), len(right))
     if left is None or right is None or not _comparable(left, right):
         return None
     if isinstance(left, Timestamp) and isinstance(right, Timestamp):
@@ -14881,6 +15174,31 @@ def _ordered(operator: str, left: object, right: object) -> object:
     return left >= right  # type: ignore[operator]
 
 
+def _query_equal(left: object, right: object) -> bool | None:
+    """Compare query values with recursive three-valued equality, distinct from grouping.
+
+    A known difference dominates an unknown element. Two nulls are grouped together
+    by DISTINCT but never become TRUE through the query equality operator.
+    """
+    pending = [(left, right)]
+    unknown = False
+    while pending:
+        lhs, rhs = pending.pop()
+        if lhs is None or rhs is None:
+            unknown = True
+        elif isinstance(lhs, (list, tuple)) and isinstance(rhs, (list, tuple)):
+            if len(lhs) != len(rhs):
+                return False
+            pending.extend(zip(lhs, rhs, strict=True))
+        elif isinstance(lhs, Mapping) and isinstance(rhs, Mapping):
+            if lhs.keys() != rhs.keys():
+                return False
+            pending.extend((lhs[key], rhs[key]) for key in lhs)
+        elif not _equal(lhs, rhs):
+            return False
+    return None if unknown else True
+
+
 def _membership(left: object, right: object) -> object:
     """Return whether a value appears in a list, which is unknown when either side is null."""
     if right is None:
@@ -14891,14 +15209,13 @@ def _membership(left: object, right: object) -> object:
             field="operator",
             value="IN",
         )
-    if left is None:
-        return None
     unknown = False
     for element in right:
-        if element is None:
+        equal = _query_equal(left, element)
+        if equal is None:
             unknown = True
             continue
-        if _equal(left, element):
+        if equal:
             # A match decides the answer whatever follows: a later null only matters when
             # nothing matched, so the walk ends here rather than comparing the rest.
             return True
@@ -14940,7 +15257,7 @@ def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
             keys.add(_freeze(element))
         elif kind is float or (kind is int and INT64_MIN <= element <= INT64_MAX):
             has_numbers = True
-            number = float(element)
+            number = element
             # Python set membership can match an identical NaN object; query equality cannot.
             if not isnan(number):
                 keys.add(("in_numeric", number))
@@ -14956,16 +15273,16 @@ def _memo_membership(left: object, memo: _InListMemo) -> object:
     """Answer IN over a hashed list exactly as the linear walk over the same list would.
 
     Exact text/bytes retain frozen-key equality. Supported numeric probes use the same
-    float normalization as the canonical comparison, not Python's int/float set equality.
+    exact int/float comparison as the canonical comparator, without losing INT64 bits.
     Other values retain the walk, including custom conversion/comparison behavior.
     """
     if left is None:
-        return None
+        return None if memo.values else False
     kind = type(left)
     if memo.has_numbers and (
         kind is float or (kind is int and INT64_MIN <= cast(int, left) <= INT64_MAX)
     ):
-        number = float(cast(int | float, left))
+        number = cast(int | float, left)
         if not isnan(number) and ("in_numeric", number) in memo.keys:
             return True
         return None if memo.has_null else False
@@ -14993,6 +15310,13 @@ def _arithmetic(operator: str, left: object, right: object) -> object:
     """Return the value of an arithmetic operation, refusing one that has no meaning."""
     if left is None or right is None:
         return None
+    if operator == "+" and (type(left) in (list, tuple) or type(right) in (list, tuple)):
+        from okto_grafx.domain.query.scalars import MAX_GENERATED_LIST_ELEMENTS
+        lhs = left if type(left) in (list, tuple) else (left,)
+        rhs = right if type(right) in (list, tuple) else (right,)
+        if len(lhs) + len(rhs) > MAX_GENERATED_LIST_ELEMENTS:
+            raise GrafxQueryBudgetExceeded("List concatenation exceeds its element budget.", resource="generated_list")
+        return (*lhs, *rhs)
     if operator == "+" and isinstance(left, str) and isinstance(right, str):
         return left + right
     if not _numbers(left, right):
@@ -15046,60 +15370,6 @@ def _coalesce_value_type(expression: FunctionCall, value: object) -> ValueType:
             field="function",
             value=expression.name,
         ) from failure
-
-
-def _validate_parameter_maps(parameters: Mapping[str, object]) -> None:
-    """Refuse case-insensitive map-key collisions deterministically during binding."""
-    for name in sorted(parameters):
-        _validate_parameter_map_value(parameters[name], parameter=name, seen=set())
-
-
-def _validate_parameter_map_value(
-    value: object, *, parameter: str, seen: set[int]
-) -> None:
-    """Validate every nested map carried by one referenced parameter."""
-    # Endpoint batches carry hundreds of scalar IDs per layout. Exact built-in
-    # leaves cannot contain map collisions; avoid dynamic Mapping checks for each
-    # one. Subclasses/custom containers still take the complete recursive path.
-    if value is None or type(value) in (str, int, float, bool):
-        return
-    if not isinstance(value, (Mapping, list, tuple)):
-        return
-    marker = id(value)
-    if marker in seen:
-        return
-    seen.add(marker)
-    if isinstance(value, Mapping):
-        by_folded: dict[str, list[str]] = {}
-        for key in value:
-            if isinstance(key, str):
-                by_folded.setdefault(key.lower(), []).append(key)
-        collisions = tuple(
-            sorted(
-                (folded, tuple(sorted(keys)))
-                for folded, keys in by_folded.items()
-                if len(keys) > 1
-            )
-        )
-        if collisions:
-            keys = ", ".join(repr(key) for key in collisions[0][1])
-            message = (
-                f"Parameter ${parameter} contains map keys {keys} that collide "
-                "case-insensitively."
-            )
-            raise GrafxPlanError(
-                message,
-                field="parameter",
-                value=parameter,
-            )
-        ordered = sorted(
-            value.items(), key=lambda item: (type(item[0]).__name__, repr(item[0]))
-        )
-        for _key, item in ordered:
-            _validate_parameter_map_value(item, parameter=parameter, seen=seen)
-        return
-    for item in value:
-        _validate_parameter_map_value(item, parameter=parameter, seen=seen)
 
 
 def _bound_value_type(
@@ -15159,20 +15429,26 @@ def _static_postfix_target_expression(expression: Expression) -> Expression | No
         subject = _static_postfix_target_expression(expression.subject)
         if not isinstance(subject, MapExpression):
             return None
-        return subject.entry(expression.key)
+        entry = subject.entry(expression.key)
+        return entry if entry is not None else Literal(value=None)
     if isinstance(expression, Subscript):
         subject = _static_postfix_target_expression(expression.subject)
+        if isinstance(subject, MapExpression) and isinstance(expression.index, Literal):
+            key = expression.index.value
+            if isinstance(key, str):
+                entry = subject.entry(key)
+                return entry if entry is not None else Literal(value=None)
         if not isinstance(subject, ListExpression):
             return None
         index = expression.index
         if not isinstance(index, Literal):
             return None
         value = index.value
-        if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+        if isinstance(value, bool) or not isinstance(value, int):
             return None
-        offset = value - 1 if value > 0 else value
+        offset = value
         if not -len(subject.elements) <= offset < len(subject.elements):
-            return None
+            return Literal(value=None)
         return subject.elements[offset]
     return expression
 
@@ -15340,6 +15616,8 @@ def _infer_bound_pulse_expression_type(
             return static_type
         if ValueType.NULL in (left, right):
             return ValueType.NULL
+        if expression.operator == "+" and ValueType.LIST in (left, right):
+            return ValueType.LIST
         if (
             expression.operator == "+"
             and left is ValueType.STRING
@@ -15381,9 +15659,13 @@ def _infer_bound_pulse_expression_type(
             ):
                 return ValueType.NULL
             return result_type
+        if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
+            if argument_types[0] not in (None, ValueType.NULL):
+                raise GrafxPlanError("Path functions require a bound path or NULL.", field="function", value=name)
+            return ValueType.INT64 if name == "LENGTH" else ValueType.LIST
         if name in NATIVE_SCALARS:
-            return scalar_type(name, argument_types[0])
-        if name == STRING_SPLIT_FUNCTION:
+            return scalar_type(name, *argument_types)
+        if name in (STRING_SPLIT_FUNCTION, "SPLIT"):
             wrong = tuple(
                 value_type
                 for value_type in argument_types
@@ -15452,13 +15734,33 @@ def _infer_bound_pulse_expression_type(
             return ValueType.INT64
         if name == "COUNT":
             return ValueType.INT64
-        if name in ("AVG", "SUM"):
-            return ValueType.DOUBLE
+        if name in ("SUM", "AVG"):
+            if argument_types[0] not in (None, ValueType.NULL, ValueType.INT64, ValueType.DOUBLE):
+                raise GrafxPlanError("Numeric aggregates require numeric values or NULL.",
+                                     field="function", value=name)
+            return (ValueType.DOUBLE if name == "AVG" else
+                    ValueType.INT64 if argument_types[0] is ValueType.NULL else argument_types[0])
         if name in ("MIN", "MAX"):
             return argument_types[0]
         if name == "COLLECT":
             return ValueType.LIST
         return static_type
+    if isinstance(expression, ListIteration):
+        source_type = _bound_pulse_expression_type(expression.source, static_types, parameters, owner=owner, _resolved=resolved)
+        if source_type not in (None, ValueType.NULL, ValueType.LIST):
+            raise GrafxPlanError("List iteration requires a list.", field="iteration")
+        predicate = expression.body if expression.mode in ("all", "any", "none", "single") else expression.predicate
+        if predicate is not None and _bound_pulse_expression_type(predicate, static_types, parameters, owner=owner, _resolved=resolved) not in (None, ValueType.NULL, ValueType.BOOL):
+            raise GrafxPlanError("List predicates require booleans.", field="iteration")
+        return ValueType.LIST if expression.mode == "map" else None if expression.mode == "reduce" else ValueType.BOOL
+    if isinstance(expression, ListSlice):
+        subject_type = _bound_pulse_expression_type(expression.subject, static_types, parameters, owner=owner, _resolved=resolved)
+        if subject_type not in (None, ValueType.NULL, ValueType.LIST):
+            raise GrafxPlanError("A list slice requires a list.", field="slice")
+        for bound in (expression.start, expression.end):
+            if bound is not None and _bound_pulse_expression_type(bound, static_types, parameters, owner=owner, _resolved=resolved) not in (None, ValueType.NULL, ValueType.INT64):
+                raise GrafxPlanError("List slice bounds require integers.", field="slice")
+        return ValueType.LIST
     if isinstance(expression, ListExpression):
         for element in expression.elements:
             _bound_pulse_expression_type(
@@ -15588,7 +15890,8 @@ def _bound_list_element_type(
     assert common is not None  # narrowed by the guard above
     for value_type in element_types[1:]:
         assert value_type is not None  # narrowed by the guard above
-        common, _normalise = union_common_type(0, common, value_type)
+        if common is not value_type:
+            return None
     return common
 
 
@@ -15598,354 +15901,24 @@ def _required_bound_expression_type(
     parameters: Mapping[str, object],
     *,
     owner: str,
-) -> ValueType:
-    """Return a fully bound scalar type, refusing metadata that still depends on a row."""
+) -> ValueType | None:
+    """Resolve parameter types, leaving heterogeneous row-dependent types for evaluation."""
     value_type = _bound_pulse_expression_type(
         expression, static_types, parameters, owner=owner
     )
-    if value_type is not None:
-        return value_type
-    message = (
-        f"The plan left the type of {expression.describe()} in {owner} unresolved."
-    )
-    raise GrafxPlanError(
-        message,
-        field="expression",
-        value=expression.describe(),
-    )
+    return value_type
 
 
-def _bound_union_columns(
-    plan: PlannedQuery, parameters: Mapping[str, object]
-) -> tuple[bool, ...]:
-    """Prove the two branches agree about every column, and say which ones must widen.
-
-    Run once, before the first row, because a pair that disagrees about a column disagrees
-    whether or not anything matched: discovering it mid-stream would mean a caller had already
-    read rows from a result that was never coherent.
-
-    The compatibility rule lives in :func:`union_common_type`, so planning and bound parameters
-    cannot drift: an identical pair keeps its type, NULL takes the other side's, and INT64 beside
-    DOUBLE widens to DOUBLE. Anything else is refused -- notably BOOL beside INT64, which some
-    dialects treat as one family and this one does not.
-    """
-    static_types = {
-        id(expression): value_type
-        for expression, value_type in plan.pulse_expression_types
-    }
-    if plan.union_columns and len(plan.union_unwind_sources) != 2:
-        raise GrafxPlanError(
-            "A UNION plan carries the UNWIND source metadata of exactly two branches.",
-            field="plan",
-            value="union_unwind_sources",
+def _bound_static_types(plan: PlannedQuery, parameters: Mapping[str, object]) -> dict[int, ValueType | None]:
+    """Resolve parameter-derived WITH aliases without evaluating the query's row pipeline."""
+    types = {id(expression): value_type for expression, value_type in plan.pulse_expression_types}
+    for expression, source in plan.type_alias_sources:
+        types[id(expression)] = _bound_pulse_expression_type(
+            source, types, parameters, owner=expression.describe(),
         )
-    unwind_carriers = tuple(
-        None
-        if unwind is None
-        else _bound_unwind_carrier(
-            unwind[1],
-            parameters,
-            owner="a UNION branch",
-        )
-        for unwind in plan.union_unwind_sources
-    )
-    coercions: list[bool] = []
-    for position, left, _left_type, right, _right_type in plan.union_columns:
-        owner = f"column {position + 1} of a UNION"
-        # The same door the rest of the engine uses to turn a planned type into a bound one,
-        # and the same refusal when the bind cannot finish it. Asking it here is what makes the
-        # parameter case work without this function knowing anything about parameters.
-        resolved: list[ValueType] = []
-        for expression, unwind, carrier in zip(
-            (left, right),
-            plan.union_unwind_sources,
-            unwind_carriers,
-            strict=True,
-        ):
-            resolved.append(
-                _required_bound_union_branch_type(
-                    expression,
-                    static_types,
-                    parameters,
-                    unwind=unwind,
-                    carrier=carrier,
-                    owner=owner,
-                )
-            )
-        first, second = resolved
-        _common, normalise_double = union_common_type(position, first, second)
-        coercions.append(normalise_double)
-    return tuple(coercions)
+    return types
 
 
-def _bound_unwind_carrier(
-    source: Expression,
-    parameters: Mapping[str, object],
-    *,
-    owner: str,
-) -> tuple[object, ...] | None:
-    """Materialise the finite binder vocabulary for one UNWIND source, validating its shape."""
-    if not _binder_resolvable(source):
-        # A row-independent literal/function shape may already have a static type in the plan.
-        # This helper materialises only the binder's deliberately finite postfix vocabulary.
-        return None
-    carrier = _bound_postfix_value(source, parameters, owner=owner)
-    if not isinstance(carrier, (list, tuple)):
-        named = "null" if carrier is None else type(carrier).__name__
-        raise GrafxPlanError(
-            f"UNWIND reads a list or tuple; got {named}.",
-            field="unwind",
-            value=named,
-        )
-    return tuple(carrier)
-
-
-def _required_bound_union_branch_type(
-    expression: Expression,
-    static_types: Mapping[int, ValueType | None],
-    parameters: Mapping[str, object],
-    *,
-    unwind: tuple[str, Expression] | None,
-    carrier: tuple[object, ...] | None,
-    owner: str,
-) -> ValueType:
-    """Resolve one branch column, using each UNWIND element only when the column reads it."""
-    if unwind is None or carrier is None:
-        return _required_bound_expression_type(
-            expression,
-            static_types,
-            parameters,
-            owner=owner,
-        )
-    alias, _source = unwind
-    if not _union_output_depends_on_alias(expression, alias, static_types):
-        return _required_bound_expression_type(
-            expression,
-            static_types,
-            parameters,
-            owner=owner,
-        )
-    if not carrier:
-        # An invariant outer type such as ``x IS NULL`` remains provable without a row.  A bare
-        # ``x`` stays unresolved and therefore fail-closed, since an empty carrier supplies no
-        # evidence about the column's type.
-        return _required_bound_expression_type(
-            expression,
-            static_types,
-            parameters,
-            owner=owner,
-        )
-
-    output_types: list[ValueType] = []
-    for element in carrier:
-        typed_expression = _replace_bound_unwind_alias(
-            expression,
-            alias=alias,
-            element=element,
-        )
-        output_types.append(
-            _required_bound_expression_type(
-                typed_expression,
-                static_types,
-                parameters,
-                owner=owner,
-            )
-        )
-    common = output_types[0]
-    for value_type in output_types[1:]:
-        common, _normalise = union_common_type(0, common, value_type)
-    return common
-
-
-def _union_output_depends_on_alias(
-    expression: Expression,
-    alias: str,
-    static_types: Mapping[int, ValueType | None],
-) -> bool:
-    """Whether this column's ValueType still needs the runtime UNWIND element."""
-    static_type = static_types.get(id(expression))
-    if isinstance(expression, Variable):
-        return expression.name == alias and static_type is None
-    if isinstance(expression, (Property, Subscript)):
-        return static_type is None and any(
-            isinstance(node, Variable) and node.name == alias
-            for node in walk(expression.subject)
-        )
-    if isinstance(expression, NullCheck):
-        return False
-    if isinstance(expression, UnaryOperation):
-        return expression.operator != "NOT" and _union_output_depends_on_alias(
-            expression.operand,
-            alias,
-            static_types,
-        )
-    if isinstance(expression, BinaryOperation):
-        invariant = expression.operator in (
-            "AND",
-            "OR",
-            "XOR",
-            "=",
-            "<>",
-            "<",
-            "<=",
-            ">",
-            ">=",
-            "IN",
-            "STARTS WITH",
-            "ENDS WITH",
-            "CONTAINS",
-        )
-        return not invariant and (
-            _union_output_depends_on_alias(expression.left, alias, static_types)
-            or _union_output_depends_on_alias(expression.right, alias, static_types)
-        )
-    if isinstance(expression, (ListExpression, MapExpression)):
-        return False
-    if isinstance(expression, CaseExpression):
-        return any(
-            _union_output_depends_on_alias(result, alias, static_types)
-            for result in expression.result_expressions()
-        )
-    if isinstance(expression, FunctionCall):
-        fixed = expression.name.upper() in (
-            STRING_SPLIT_FUNCTION,
-            LABEL_FUNCTION,
-            TIMESTAMP_FUNCTION,
-            SIZE_FUNCTION,
-            SIMILARITY_FUNCTION,
-            SIMILARITY_SCORE_FUNCTION,
-            "COUNT",
-            "AVG",
-            "SUM",
-            "COLLECT",
-        )
-        return not fixed and any(
-            _union_output_depends_on_alias(child, alias, static_types)
-            for child in expression.children()
-        )
-    return False
-
-
-def _replace_bound_unwind_alias(
-    expression: Expression,
-    *,
-    alias: str,
-    element: object,
-) -> Expression:
-    """Substitute one UNWIND element into a non-executable branch typing expression."""
-    if isinstance(expression, Variable):
-        return Literal(value=element) if expression.name == alias else expression
-
-    def substituted(child: Expression) -> Expression:
-        """Substitute the bound UNWIND alias recursively in one child."""
-        return _replace_bound_unwind_alias(child, alias=alias, element=element)
-
-    if isinstance(expression, Property):
-        subject = substituted(expression.subject)
-        return (
-            expression
-            if subject is expression.subject
-            else replace(expression, subject=subject)
-        )
-    if isinstance(expression, UnaryOperation):
-        operand = substituted(expression.operand)
-        return (
-            expression
-            if operand is expression.operand
-            else replace(expression, operand=operand)
-        )
-    if isinstance(expression, BinaryOperation):
-        left = substituted(expression.left)
-        right = substituted(expression.right)
-        if left is expression.left and right is expression.right:
-            return expression
-        return replace(expression, left=left, right=right)
-    if isinstance(expression, NullCheck):
-        operand = substituted(expression.operand)
-        return (
-            expression
-            if operand is expression.operand
-            else replace(expression, operand=operand)
-        )
-    if isinstance(expression, Subscript):
-        subject = substituted(expression.subject)
-        index = substituted(expression.index)
-        if subject is expression.subject and index is expression.index:
-            return expression
-        return replace(expression, subject=subject, index=index)
-    if isinstance(expression, FunctionCall):
-        arguments = tuple(substituted(argument) for argument in expression.arguments)
-        named_arguments = tuple(
-            argument
-            if (value := substituted(argument.value)) is argument.value
-            else replace(argument, value=value)
-            for argument in expression.named_arguments
-        )
-        if all(
-            new is old for new, old in zip(arguments, expression.arguments, strict=True)
-        ) and all(
-            new is old
-            for new, old in zip(
-                named_arguments, expression.named_arguments, strict=True
-            )
-        ):
-            return expression
-        return replace(
-            expression,
-            arguments=arguments,
-            named_arguments=named_arguments,
-        )
-    if isinstance(expression, ListExpression):
-        elements = tuple(substituted(item) for item in expression.elements)
-        if all(
-            new is old for new, old in zip(elements, expression.elements, strict=True)
-        ):
-            return expression
-        return replace(expression, elements=elements)
-    if isinstance(expression, MapExpression):
-        entries = tuple(
-            entry
-            if (value := substituted(entry.value)) is entry.value
-            else replace(entry, value=value)
-            for entry in expression.entries
-        )
-        if all(
-            new is old for new, old in zip(entries, expression.entries, strict=True)
-        ):
-            return expression
-        return replace(expression, entries=entries)
-    if isinstance(expression, CaseExpression):
-        operand = (
-            None if expression.operand is None else substituted(expression.operand)
-        )
-        alternatives = []
-        for alternative in expression.alternatives:
-            condition = substituted(alternative.condition)
-            result = substituted(alternative.result)
-            alternatives.append(
-                alternative
-                if condition is alternative.condition and result is alternative.result
-                else replace(alternative, condition=condition, result=result)
-            )
-        fallback = (
-            None if expression.fallback is None else substituted(expression.fallback)
-        )
-        if (
-            operand is expression.operand
-            and fallback is expression.fallback
-            and all(
-                new is old
-                for new, old in zip(alternatives, expression.alternatives, strict=True)
-            )
-        ):
-            return expression
-        return replace(
-            expression,
-            operand=operand,
-            alternatives=tuple(alternatives),
-            fallback=fallback,
-        )
-    return expression
 
 
 def _bound_case_types(
@@ -15956,12 +15929,11 @@ def _bound_case_types(
         id(expression): planned_types
         for expression, planned_types in plan.case_comparison_types
     }
-    static_types = {
-        id(expression): value_type
-        for expression, value_type in plan.pulse_expression_types
-    }
+    static_types = _bound_static_types(plan, parameters)
     for expression, _value_type in plan.pulse_expression_types:
-        if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS:
+        if isinstance(expression, (ListSlice, ListIteration)):
+            _bound_pulse_expression_type(expression, static_types, parameters, owner="slice")
+        if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:
             _bound_pulse_expression_type(expression, static_types, parameters, owner=expression.name)
     resolved: dict[int, ValueType | None] = {}
     for expression, planned_results in plan.case_result_types:
@@ -16026,10 +15998,7 @@ def _validate_bound_subscript_types(
     plan: PlannedQuery, parameters: Mapping[str, object]
 ) -> None:
     """Complete list and index parameter types before the first row is read."""
-    static_types = {
-        id(expression): value_type
-        for expression, value_type in plan.pulse_expression_types
-    }
+    static_types = _bound_static_types(plan, parameters)
     for expression, planned_types in plan.subscript_types:
         subject_type = _required_bound_expression_type(
             expression.subject,
@@ -16378,7 +16347,7 @@ def _timestamp_bindable(expression: Expression) -> bool:
     if isinstance(expression, FunctionCall):
         return expression.name.upper() in (
             COALESCE_FUNCTION,
-            STRING_SPLIT_FUNCTION,
+            STRING_SPLIT_FUNCTION, "SPLIT",
         ) and all(_timestamp_bindable(argument) for argument in expression.arguments)
     if isinstance(expression, CaseExpression):
         compared = (
@@ -16459,12 +16428,9 @@ def _bound_coalesce_types(
                     argument, static_types, parameters, owner=expression.name))
                 continue
             if not isinstance(argument, Parameter):
-                message = f"{expression.name} could not resolve the type of {argument.describe()}."
-                raise GrafxPlanError(
-                    message,
-                    field="function",
-                    value=expression.name,
-                )
+                # A heterogeneous expression is valid; its selected value is runtime typed.
+                argument_types.append(None)
+                continue
             argument_types.append(
                 _coalesce_value_type(expression, parameters[argument.name])
             )
@@ -16473,36 +16439,38 @@ def _bound_coalesce_types(
 
 
 def _coalesce(expression: FunctionCall, row: _Row, context: _Context) -> object:
-    """Return the first non-null scalar after eagerly evaluating every argument."""
-    values = tuple(
-        _evaluate(argument, row, context) for argument in expression.arguments
-    )
-    return _coalesce_selected(expression, values, context)
+    """Return the first non-null value without executing later arguments."""
+    for argument in expression.arguments:
+        value = _evaluate(argument, row, context)
+        if value is not None:
+            return _coalesce_selected(expression, (value,), context)
+    return None
 
 
 def _coalesce_selected(
     expression: FunctionCall, values: tuple[object, ...], context: _Context
 ) -> object:
-    """Select and coerce the coalesce answer from already evaluated arguments."""
-    selected = next((value for value in values if value is not None), None)
-    if selected is None:
-        return None
-    result_type = context.coalesce_types.get(id(expression))
-    if result_type is None:
-        runtime_types = tuple(
-            _coalesce_value_type(expression, value) for value in values
-        )
-        result_type = coalesce_result_type(expression.name, runtime_types)
-    if result_type is ValueType.DOUBLE:
-        return float(selected)
-    return selected
+    """Preserve the selected value and its exact type; storage coercion is a separate boundary."""
+    return next((value for value in values if value is not None), None)
 
 
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
+        path = _evaluate(expression.arguments[0], row, context)
+        if path is None:
+            return None
+        if type(path) is not _PathValue:
+            raise GrafxPlanError("Path functions require a bound path or NULL.", field="function", value=name)
+        if name == "LENGTH":
+            return len(path.relationships)
+        from okto_grafx.engine.public_views import _query_path_snapshot
+        detached = _query_path_snapshot(path, field="path", depth=0, active=set(),
+                                        max_string_characters=MAX_RENDERED_QUERY_CHARACTERS)
+        return detached["_NODES" if name == "NODES" else "_RELS"]
     if name in NATIVE_SCALARS:
-        return scalar_value(name, _evaluate(expression.arguments[0], row, context))
+        return scalar_value(name, *(_evaluate(argument, row, context) for argument in expression.arguments))
     if name == "UDF":
         registry = context.engine._extensions
         if registry is None:
@@ -16511,7 +16479,7 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
         return registry.call_scalar(arguments[0], arguments[1:])
     if name == COALESCE_FUNCTION:
         return _coalesce(expression, row, context)
-    if name == STRING_SPLIT_FUNCTION:
+    if name in (STRING_SPLIT_FUNCTION, "SPLIT"):
         text = _evaluate(expression.arguments[0], row, context)
         separator = _evaluate(expression.arguments[1], row, context)
         if text is None or separator is None:
@@ -16527,22 +16495,8 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
                 value=expression.name,
             )
         if not separator:
-            if not text:
-                message = f"{expression.name} cannot split an empty string with an empty separator."
-                raise GrafxPlanError(
-                    message,
-                    field="function",
-                    value=expression.name,
-                )
-            return tuple(text)
-        pieces = str.split(text, separator)
-        if len(pieces) == 1:
-            return tuple(pieces)
-        trailing_empty = pieces[-1] == ""
-        result = [piece for piece in pieces if piece]
-        if trailing_empty:
-            result.append("")
-        return tuple(result)
+            return tuple(text) if text else ("",)
+        return tuple(str.split(text, separator))
     if name == TIMESTAMP_FUNCTION:
         if expression in context.timestamp_values:
             return context.timestamp_values[expression]
@@ -16766,13 +16720,17 @@ def _freeze(value: object) -> object:
 
     The kind tag is what makes this usable for equality as well as for duplicates: ``1`` and
     ``"1"`` carry different tags and can never collide, while a dictionary and any other mapping
-    of the same pairs carry the same tag and do. The scalar tag keeps the Python class name, so
-    an integer and a double stay distinguishable for DISTINCT even though ``=`` treats them as
-    one number -- those are two different questions and the numeric branch of :func:`_equal`
-    answers the second one before it ever reaches here.
+    of the same pairs carry the same tag and do. Numeric values share a key without converting
+    INT64 to DOUBLE; booleans stay distinct. Nested NULLs group together, unlike query equality.
     """
     if isinstance(value, RowBinding):
         return ("binding", _binding_identity(value))
+    if type(value) in (int, float):
+        # Equal numeric keys must have identical encodings in the byte-keyed spill store.
+        # Never round an integer through float: convert only exactly integral floats.
+        if type(value) is float and value.is_integer():
+            value = int(value)
+        return ("number", value)
     if isinstance(value, (bytes, bytearray)):
         return ("bytes", bytes(value))
     if isinstance(value, (list, tuple)):
@@ -16809,22 +16767,26 @@ def _sort_key(value: object) -> tuple[int, object]:
     direction is reversed.
     """
     if value is None:
-        return (6, 0)
+        return (12, 0)
+    if isinstance(value, Mapping):
+        return (0, tuple((key, _sort_key(item)) for key, item in sorted(value.items())))
+    if isinstance(value, RowBinding):
+        return (1 if value.table.kind == "node" else 2, _binding_identity(value))
+    if isinstance(value, (list, tuple)):
+        return (3, tuple(_sort_key(item) for item in value))
+    if isinstance(value, str):
+        return (5, value)
     if isinstance(value, bool):
-        return (0, int(value))
+        return (6, int(value))
     if isinstance(value, (int, float)):
         if isinstance(value, float) and isnan(value):
-            return (1, (1, 0.0))
-        return (1, (0, value))
-    if isinstance(value, str):
-        return (2, value)
+            return (7, (1, 0.0))
+        return (7, (0, value))
     if isinstance(value, (bytes, bytearray)):
-        return (3, bytes(value))
+        return (9, bytes(value))
     if isinstance(value, Timestamp):
-        return (4, value.micros)
-    if isinstance(value, RowBinding):
-        return (5, _binding_identity(value))
-    return (7, repr(value))
+        return (8, value.micros)
+    return (10, repr(value))
 
 
 def _truth(value: object) -> bool | None:
@@ -16897,7 +16859,7 @@ def _equal(left: object, right: object) -> bool:
         # the payloads, so the payload comparison is the same answer without two tuples.
         return left == right
     if _numbers(left, right):
-        return float(left) == float(right)
+        return left == right
     if isinstance(left, RowBinding) or isinstance(right, RowBinding):
         return (
             isinstance(left, RowBinding)

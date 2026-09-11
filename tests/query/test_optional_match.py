@@ -1,10 +1,4 @@
-"""The deliberately narrow root ``OPTIONAL MATCH`` required by Pulse 1.0.
-
-This increment admits one shape only: one labelled, named node as the first and only match
-clause of a read-only query.  Its WHERE belongs inside the optional operation, so a scan that
-finds nothing and a predicate that removes every candidate both produce one null-extended row.
-Everything wider remains a typed refusal before a row is streamed.
-"""
+"""Optional null extension, composed syntax, budgets and untrusted AST validation."""
 
 from __future__ import annotations
 
@@ -53,7 +47,10 @@ def _force_optional(text: str) -> Query:
     statement = _query(text)
     assert statement.match_clauses
     first = replace(statement.match_clauses[0], optional=True)
-    return replace(statement, match_clauses=(first, *statement.match_clauses[1:]))
+    pipeline = tuple(first if clause is statement.match_clauses[0] else clause
+                     for clause in statement.clause_pipeline)
+    return replace(statement, match_clauses=(first, *statement.match_clauses[1:]),
+                   clause_pipeline=pipeline)
 
 
 def _forged_analysis(statement: Query) -> QueryAnalysis:
@@ -84,12 +81,13 @@ def test_plan_places_null_extension_above_the_complete_match(database: object) -
     assert operators == (
         "ProduceResults",
         "ProjectRows",
-        "OptionalRows",
-        "NodeScan",
+        "ApplyRows",
         "SingleRow",
+        "NodeScan",
+        "ArgumentRows",
     )
-    optional = next(node for node in plan.walk() if node.label == "OptionalRows")
-    assert optional.details() == {"alias": "p"}
+    optional = next(node for node in plan.walk() if node.label == "ApplyRows")
+    assert optional.null_variables == ("p",)
 
 
 def test_empty_match_extends_one_null_row_for_properties_label_and_counts(
@@ -148,7 +146,7 @@ def test_deferred_similarity_filter_is_inside_the_optional_extension() -> None:
 
     assert result.rows == ((None,),)
     labels = tuple(node.label for node in result.plan.walk())
-    assert labels.index("OptionalRows") < labels.index("VectorSearch")
+    assert labels.index("ApplyRows") < labels.index("VectorSearch")
 
 
 # --- isolation and budgets --------------------------------------------------------------------
@@ -247,9 +245,13 @@ def test_existing_query_budgets_apply_to_optional_rows(
         "ＭＡＴＣＨ (p:Person) RETURN p",
     ],
 )
-def test_parser_refuses_every_shape_outside_the_root_single_node(text: str) -> None:
-    with pytest.raises(GrafxParseError):
-        parse(text)
+def test_composable_optional_syntax_is_distinct_from_semantic_admission(text: str) -> None:
+    if text.startswith("ＭＡＴＣＨ"):
+        with pytest.raises(GrafxParseError):
+            parse(text)
+    else:
+        statement = parse(text)
+        assert parse(statement.describe()) == statement
 
 
 FORGED_TEXTS: tuple[str, ...] = (
@@ -268,20 +270,28 @@ FORGED_TEXTS: tuple[str, ...] = (
 
 
 @pytest.mark.parametrize("text", FORGED_TEXTS)
-def test_analysis_and_planner_repeat_the_gate_for_injected_trees(
+def test_analysis_and_planner_revalidate_composed_optional_trees(
     catalog: object, indexes: tuple, text: str
 ) -> None:
     statement = _force_optional(text)
 
-    with pytest.raises(GrafxPlanError):
-        analyze(statement)
-    with pytest.raises(GrafxPlanError):
-        build_plan(
-            statement,
-            catalog=catalog,  # type: ignore[arg-type]
-            indexes=indexes,
-            analysis=_forged_analysis(statement),
-        )
+    if "MATCH path" in text:
+        with pytest.raises(GrafxPlanError):
+            analyze(statement)
+        with pytest.raises(GrafxPlanError):
+            build_plan(statement, catalog=catalog, indexes=indexes,
+                       analysis=_forged_analysis(statement))
+        return
+    actual = analyze(statement)
+    if ":Person:Chunk" in text:
+        with pytest.raises(GrafxPlanError):
+            build_plan(statement, catalog=catalog, indexes=indexes,
+                       analysis=_forged_analysis(statement))
+    else:
+        planned = build_plan(statement, catalog=catalog, indexes=indexes,
+                             analysis=_forged_analysis(statement))
+        assert planned.writes == actual.statement.writes
+        assert planned.columns == actual.output_columns
 
 
 @pytest.mark.parametrize("door", ["analysis", "planner"])

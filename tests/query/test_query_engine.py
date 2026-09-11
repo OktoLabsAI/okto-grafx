@@ -129,6 +129,7 @@ def test_a_scan_rooted_at_single_row_does_not_copy_its_empty_bindings() -> None:
         snapshot = object()
         txn = SimpleNamespace(row_intents=())
         staged_rows: tuple[()] = ()
+        phase_rows: tuple[()] = ()
 
         def count(self, name: str, amount: int = 1) -> None:
             return None
@@ -220,29 +221,21 @@ def test_coalesce_preserves_falsey_values_and_returns_null_when_all_are_null(
     assert found.rows == ((False, 0, "", None),)
 
 
-@pytest.mark.parametrize(
-    "expression",
-    (
-        "coalesce(7, 1 / 0)",
-        "coalesce(null, 1 / 0, 7)",
-    ),
-)
-def test_coalesce_evaluates_every_argument_and_propagates_errors(
-    stack: QueryStack, expression: str
-) -> None:
-    # Ladybug 0.16.0 eagerly evaluates even arguments after the selected value.
+def test_coalesce_short_circuits_but_propagates_errors_before_selection(stack: QueryStack) -> None:
+    """Only arguments needed to select the first non-null result execute."""
+    assert run(stack, "RETURN coalesce(7, 1 / 0) AS value").rows == ((7,),)
     with pytest.raises(GrafxPlanError):
-        run(stack, f"RETURN {expression} AS value")
+        run(stack, "RETURN coalesce(null, 1 / 0, 7) AS value")
 
 
-def test_coalesce_promotes_mixed_width_numbers_to_double(stack: QueryStack) -> None:
+def test_coalesce_preserves_the_selected_numeric_width(stack: QueryStack) -> None:
     found = run(
         stack,
         "RETURN coalesce(1, 2.5) AS integer_first, "
         "coalesce(null, 2.5, 1) AS double_first, coalesce(1, 2) AS integers",
     )
-    assert found.rows == ((1.0, 2.5, 1),)
-    assert type(found.rows[0][0]) is float
+    assert found.rows == ((1, 2.5, 1),)
+    assert type(found.rows[0][0]) is int
     assert type(found.rows[0][1]) is float
     assert type(found.rows[0][2]) is int
 
@@ -278,64 +271,55 @@ def test_coalesce_uses_declared_column_types_even_when_values_are_null(
         "RETURN coalesce(t.i, t.d) AS numeric, coalesce(t.i, 0) AS integer "
         "ORDER BY t.id",
     )
-    assert found.rows == ((1.0, 1), (2.5, 0))
-    assert all(type(row[0]) is float for row in found.rows)
+    assert found.rows == ((1, 1), (2.5, 0))
+    assert tuple(type(row[0]) for row in found.rows) == (int, float)
     assert all(type(row[1]) is int for row in found.rows)
 
 
-def test_coalesce_refuses_declared_families_hidden_by_alternating_nulls(
+def test_coalesce_accepts_declared_families_with_alternating_nulls(
     stack: QueryStack,
 ) -> None:
     _add_coalesce_type_table(stack)
-    with pytest.raises(GrafxPlanError) as failure:
-        run(stack, "MATCH (t:ScalarTypes) RETURN coalesce(t.s, t.i)")
-    assert failure.value.details == {"field": "function", "value": "coalesce"}
+    assert run(stack, "MATCH (t:ScalarTypes) RETURN coalesce(t.s, t.i) ORDER BY t.id").rows == (("one",), (None,))
 
 
-def test_coalesce_refuses_known_mismatch_while_planning_a_zero_row_query(
+def test_coalesce_accepts_heterogeneous_types_while_planning_a_zero_row_query(
     stack: QueryStack,
 ) -> None:
     _add_coalesce_type_table(stack)
-    with pytest.raises(GrafxPlanError) as failure:
-        stack.engine.explain(
-            "MATCH (t:ScalarTypes) WHERE t.id = -1 RETURN coalesce(t.s, t.i)"
-        )
-    assert failure.value.details == {"field": "function", "value": "coalesce"}
+    text = "MATCH (t:ScalarTypes) WHERE t.id = -1 RETURN coalesce(t.s, t.i)"
+    stack.engine.explain(text)
+    assert run(stack, text).rows == ()
 
 
 def test_coalesce_resolves_parameter_types_before_reading_zero_rows(
     stack: QueryStack,
 ) -> None:
     _add_coalesce_type_table(stack)
-    with pytest.raises(GrafxPlanError) as failure:
-        run(
-            stack,
-            "MATCH (t:ScalarTypes) WHERE t.id = -1 RETURN coalesce(t.s, $fallback)",
-            {"fallback": 0},
-        )
-    assert failure.value.details == {"field": "function", "value": "coalesce"}
+    assert run(stack, "MATCH (t:ScalarTypes) WHERE t.id = -1 RETURN coalesce(t.s, $fallback)",
+               {"fallback": 0}).rows == ()
 
     promoted = run(stack, "RETURN coalesce(1, $fallback)", {"fallback": 2.5})
-    assert promoted.rows == ((1.0,),)
-    assert type(promoted.rows[0][0]) is float
+    assert promoted.rows == ((1,),)
+    assert type(promoted.rows[0][0]) is int
 
 
 @pytest.mark.parametrize(
-    "expression",
+    ("expression", "expected"),
     (
-        "coalesce(true, 1)",
-        "coalesce(1, true)",
-        "coalesce('text', 1)",
-        "coalesce([1], [2])",
-        "coalesce({a: 1}, {a: 2})",
+        ("coalesce(true, 1)", True),
+        ("coalesce(1, true)", 1),
+        ("coalesce('text', 1)", "text"),
+        ("coalesce([1], [2])", (1,)),
+        ("coalesce({a: 1}, {a: 2})", {"a": 1}),
     ),
 )
-def test_coalesce_refuses_mixed_or_non_scalar_families(
-    stack: QueryStack, expression: str
+def test_coalesce_accepts_mixed_and_container_families(
+    stack: QueryStack, expression: str, expected: object,
 ) -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        run(stack, f"RETURN {expression}")
-    assert failure.value.details == {"field": "function", "value": "coalesce"}
+    actual = run(stack, f"RETURN {expression}").rows[0][0]
+    assert actual == expected
+    assert type(actual) is type(expected)
 
 
 def test_coalesce_works_in_filters_projections_and_sort_keys(stack: QueryStack) -> None:
@@ -395,8 +379,7 @@ def test_string_split_and_size_propagate_null(stack: QueryStack) -> None:
 def test_string_split_and_size_pin_delimiters_collections_and_unicode(
     stack: QueryStack,
 ) -> None:
-    # Ladybug 0.16.0 is the oracle for leading/intermediate compression, trailing preservation
-    # and the non-empty text/empty separator code-point split.
+    # The compatibility profile preserves every token, including empty source identifiers.
     found = run(
         stack,
         "RETURN string_split('plain', ':') AS absent, "
@@ -407,7 +390,7 @@ def test_string_split_and_size_pin_delimiters_collections_and_unicode(
     assert found.rows == (
         (
             ("plain",),
-            ("spec", "abc", ""),
+            ("", "spec", "", "abc", ""),
             ("á", "🐍"),
             2,
             3,
@@ -415,14 +398,10 @@ def test_string_split_and_size_pin_delimiters_collections_and_unicode(
     )
 
 
-def test_empty_text_with_an_empty_separator_is_a_typed_refusal(
+def test_empty_text_with_an_empty_separator_preserves_the_empty_token(
     stack: QueryStack,
 ) -> None:
-    # Ladybug 0.16.0 reports this exact pair as an invalid string position. Grafx keeps the same
-    # refusal boundary but translates it into the public query-error taxonomy.
-    with pytest.raises(GrafxPlanError) as failure:
-        run(stack, "RETURN string_split('', '')")
-    assert failure.value.details == {"field": "function", "value": "string_split"}
+    assert run(stack, "RETURN split('', '')").rows == ((("",),),)
 
 
 def test_size_of_string_split_filters_a_typed_node_property(stack: QueryStack) -> None:
@@ -464,7 +443,7 @@ def test_searched_and_simple_case_select_the_first_match_and_default_to_null(
         "ELSE 'other' END, CASE WHEN null THEN 1 END, "
         "CASE null WHEN null THEN 'null-matches-null' ELSE 'no' END",
     )
-    assert found.rows == (("yes", "card", None, "null-matches-null"),)
+    assert found.rows == (("yes", "card", None, "no"),)
 
 
 @pytest.mark.parametrize(
@@ -476,15 +455,13 @@ def test_searched_and_simple_case_select_the_first_match_and_default_to_null(
         "CASE 1 WHEN 1 THEN 1 WHEN 2 THEN 1 / 0 ELSE 3 END",
     ),
 )
-def test_case_eagerly_evaluates_every_condition_and_result_arm(
+def test_case_does_not_evaluate_unselected_conditions_and_result_arms(
     stack: QueryStack, expression: str
 ) -> None:
-    # Ladybug 0.16.0 evaluates all WHEN, THEN and ELSE expressions before choosing an arm.
-    with pytest.raises(GrafxPlanError):
-        run(stack, f"RETURN {expression}")
+    assert run(stack, f"RETURN {expression}").rows == ((1,),)
 
 
-def test_case_promotes_declared_numeric_arms_before_reading_rows(
+def test_case_preserves_selected_declared_numeric_arms(
     stack: QueryStack,
 ) -> None:
     _add_coalesce_type_table(stack)
@@ -493,17 +470,16 @@ def test_case_promotes_declared_numeric_arms_before_reading_rows(
         "MATCH (t:ScalarTypes) RETURN CASE WHEN t.id = 1 THEN t.i ELSE t.d END "
         "ORDER BY t.id",
     )
-    assert found.rows == ((1.0,), (2.5,))
-    assert all(type(row[0]) is float for row in found.rows)
+    assert found.rows == ((1,), (2.5,))
+    assert tuple(type(row[0]) for row in found.rows) == (int, float)
 
-    # A zero-row plan still resolves both declared types and keeps the DOUBLE result contract.
+    # All arms are checked even if the source emits no rows.
     stack.engine.explain(
         "MATCH (t:ScalarTypes) WHERE t.id = -1 "
         "RETURN CASE WHEN true THEN t.i ELSE t.d END"
     )
 
-    # Deliberate Ladybug 0.16.0 divergence: the reference lets the first arm choose INT64 and
-    # truncates a later DOUBLE. Grafx uses the common numeric type in either written order.
+    # Selection preserves the runtime type without truncation or numeric widening.
     reordered = run(
         stack,
         "RETURN CASE WHEN true THEN 1 ELSE 2.5 END, "
@@ -511,21 +487,18 @@ def test_case_promotes_declared_numeric_arms_before_reading_rows(
         "CASE WHEN true THEN $number ELSE 1 END",
         {"number": 2.5},
     )
-    assert reordered.rows == ((1.0, 1.0, 2.5),)
-    assert all(type(value) is float for value in reordered.rows[0])
+    assert reordered.rows == ((1, 1, 2.5),)
+    assert tuple(type(value) for value in reordered.rows[0]) == (int, int, float)
 
 
 @pytest.mark.parametrize(
     "expression",
     (
-        "CASE WHEN true THEN 1 ELSE 'text' END",
         "CASE WHEN 1 THEN 1 ELSE 2 END",
-        "CASE 1 WHEN '1' THEN 1 ELSE 2 END",
-        "CASE WHEN true THEN [1] ELSE [2] END",
-        "CASE WHEN true THEN {a: 1} ELSE {a: 2} END",
+        "CASE WHEN 'true' THEN 1 ELSE 2 END",
     ),
 )
-def test_case_refuses_non_boolean_conditions_and_incompatible_or_non_scalar_arms(
+def test_case_refuses_non_boolean_conditions(
     stack: QueryStack, expression: str
 ) -> None:
     with pytest.raises(GrafxPlanError) as failure:
@@ -563,9 +536,7 @@ def test_case_parameter_types_are_resolved_before_a_zero_row_stream(
     with pytest.raises(GrafxPlanError) as wrong_condition:
         run(stack, query, {"condition": 1, "fallback": 2})
     assert wrong_condition.value.details["field"] == "case"
-    with pytest.raises(GrafxPlanError) as wrong_result:
-        run(stack, query, {"condition": True, "fallback": "text"})
-    assert wrong_result.value.details["field"] == "case"
+    assert run(stack, query, {"condition": True, "fallback": "text"}).rows == ()
 
 
 def test_case_binds_a_nested_parameter_expression_even_when_its_arm_is_not_selected(
@@ -573,8 +544,8 @@ def test_case_binds_a_nested_parameter_expression_even_when_its_arm_is_not_selec
 ) -> None:
     query = "RETURN CASE WHEN false THEN $number + 0 ELSE 1 END"
     found = run(stack, query, {"number": 2.5})
-    assert found.rows == ((1.0,),)
-    assert type(found.rows[0][0]) is float
+    assert found.rows == ((1,),)
+    assert type(found.rows[0][0]) is int
 
     with pytest.raises(GrafxPlanError) as invalid:
         run(stack, query, {"number": "bad"})
@@ -728,9 +699,7 @@ def test_label_composes_with_case_and_coalesce_as_a_string(stack: QueryStack) ->
     )
     assert found.rows == (("Person", "Person"),)
 
-    with pytest.raises(GrafxPlanError) as mixed:
-        run(stack, "MATCH (p:Person) RETURN coalesce(label(p), 1)")
-    assert mixed.value.details["field"] == "function"
+    assert run(stack, "MATCH (p:Person) RETURN coalesce(label(p), 1) LIMIT 1").rows == (("Person",),)
 
 
 
@@ -1011,9 +980,9 @@ def test_timestamp_refuses_before_any_row_is_read(
         ("$a + $b", {"a": 1, "b": 1}),
         ("coalesce($bad, null)", {"bad": "not-a-date"}),
         ("coalesce($bad, null)", {"bad": 1}),
-        ("string_split('not-a-date', ',')[1]", {}),
+        ("string_split('not-a-date', ',')[0]", {}),
         (
-            "CASE WHEN true THEN string_split('not-a-date', ',')[1] "
+            "CASE WHEN true THEN string_split('not-a-date', ',')[0] "
             "ELSE '2024-01-02' END",
             {},
         ),
@@ -1087,7 +1056,7 @@ def test_timestamp_leaves_aggregate_arguments_for_the_grouped_row(
 def test_timestamp_composes_with_case_and_coalesce_as_its_own_family(
     stack: QueryStack,
 ) -> None:
-    """TIMESTAMP unifies with TIMESTAMP and with nothing else."""
+    """Timestamp values retain their type inside heterogeneous selection."""
 
     found = run(
         stack,
@@ -1102,13 +1071,9 @@ def test_timestamp_composes_with_case_and_coalesce_as_its_own_family(
         ),
     )
 
-    with pytest.raises(GrafxPlanError) as mixed:
-        run(
-            stack,
-            "MATCH (p:Person) RETURN coalesce(timestamp($a), 'text')",
-            {"a": "2024-01-02"},
-        )
-    assert mixed.value.details["field"] == "function"
+    selected = run(stack, "MATCH (p:Person) RETURN coalesce(timestamp($a), 'text') LIMIT 1",
+                   {"a": "2024-01-02"})
+    assert isinstance(selected.rows[0][0], Timestamp)
 
 
 def test_a_refused_timestamp_stages_nothing(labelled_graph) -> None:
@@ -1131,55 +1096,41 @@ def test_a_refused_timestamp_stages_nothing(labelled_graph) -> None:
     assert after == before
 
 
-def test_list_subscript_matches_ladybug_one_based_and_negative_positions(
+def test_list_subscript_uses_zero_based_and_negative_positions(
     stack: QueryStack,
 ) -> None:
     found = run(
         stack,
-        "RETURN [10, 20][1], [10, 20][2], [10, 20][-1], [10, 20][-2], "
-        "[10, null][2], [10, 20][null], null[1]",
+        "RETURN [10, 20][0], [10, 20][1], [10, 20][-1], [10, 20][-2], "
+        "[10, null][1], [10, 20][null], null[0]",
     )
     assert found.rows == ((10, 20, 20, 10, None, None, None),)
 
 
-@pytest.mark.parametrize("index", (0, 3, -3))
-def test_zero_and_out_of_range_list_positions_are_typed_refusals(
+@pytest.mark.parametrize("index", (2, 3, -3))
+def test_out_of_range_list_positions_return_null(
     stack: QueryStack, index: int
 ) -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        run(stack, f"RETURN [10, 20][{index}]")
-    assert failure.value.details == {"field": "subscript", "value": index}
+    assert run(stack, f"RETURN [10, 20][{index}]").rows == ((None,),)
 
 
 @pytest.mark.parametrize("index", (0, 3, -3))
-def test_out_of_range_list_positions_are_refused_when_no_row_matches(
+def test_out_of_range_list_positions_do_not_create_rows_for_empty_matches(
     stack: QueryStack, index: int
 ) -> None:
-    """An empty match must not swallow a subscript that is already wrong.
-
-    The list and the position are both bound, so the query is invalid whatever the pattern
-    finds.  Leaving the check to row evaluation meant an off-by-one returned an empty result
-    and only surfaced once the board happened to hold data.
-    """
-
-    with pytest.raises(GrafxPlanError) as failure:
-        run(stack, f"MATCH (p:Person) WHERE p.id = 99 RETURN $items[{index}]",
-            {"items": [10, 20]})
-    assert failure.value.details == {"field": "subscript", "value": index}
+    """Valid and out-of-range indices must both preserve an empty row stream."""
+    assert run(stack, f"MATCH (p:Person) WHERE p.id = 99 RETURN $items[{index}]",
+               {"items": [10, 20]}).rows == ()
 
 
-def test_an_empty_match_refuses_an_out_of_range_subscript_in_a_predicate(
+def test_an_empty_match_with_out_of_range_subscript_in_a_predicate_stays_empty(
     stack: QueryStack,
 ) -> None:
-    """The same holds in WHERE, where an empty result is even easier to mistake for success."""
-
-    with pytest.raises(GrafxPlanError) as failure:
-        run(
-            stack,
-            "MATCH (p:Person) WHERE p.id = 99 AND $items[0] = 10 RETURN p.id",
-            {"items": [10, 20]},
-        )
-    assert failure.value.details == {"field": "subscript", "value": 0}
+    """WHERE consumes NULL without turning a non-match into a runtime error."""
+    assert run(
+        stack, "MATCH (p:Person) WHERE p.id = 99 AND $items[2] = 10 RETURN p.id",
+        {"items": [10, 20]},
+    ).rows == ()
 
 
 def test_subscripts_the_binder_cannot_resolve_still_run_per_row(
@@ -1217,7 +1168,7 @@ def test_a_scalar_call_subscript_inside_case_is_not_refused_at_bind_time(
 
     text = (
         "MATCH (p:Person) WHERE p.id = {chosen} "
-        "RETURN CASE WHEN true THEN string_split('a,b', ',')[1] ELSE 'z' END AS part"
+        "RETURN CASE WHEN true THEN string_split('a,b', ',')[0] ELSE 'z' END AS part"
     )
 
     empty = run(stack, text.format(chosen=99))
@@ -1247,17 +1198,12 @@ def test_string_split_and_map_dot_compose_with_list_subscript(
 ) -> None:
     found = run(
         stack,
-        "RETURN string_split('spec:abc:fr', ':')[2], {parts: [[10, 20]]}.PARTS[1][2]",
+        "RETURN string_split('spec:abc:fr', ':')[1], {parts: [[10, 20]]}.parts[0][1]",
     )
     assert found.rows == (("abc", 20),)
 
-    with pytest.raises(GrafxPlanError) as map_bracket:
-        run(stack, "RETURN {a: 1}['a']")
-    assert map_bracket.value.details["field"] == "subscript"
-
-    with pytest.raises(GrafxPlanError) as missing_key:
-        run(stack, "RETURN {a: 1}.missing")
-    assert missing_key.value.details == {"field": "property", "value": "missing"}
+    assert run(stack, "RETURN {a: 1}['a']").rows == ((1,),)
+    assert run(stack, "RETURN {a: 1}.missing").rows == ((None,),)
 
 
 def test_parameter_map_dot_and_nested_list_subscripts_compose_in_a_batch(
@@ -1270,39 +1216,29 @@ def test_parameter_map_dot_and_nested_list_subscripts_compose_in_a_batch(
     }
     found = run(
         stack,
-        "RETURN $m.items[1], $matrix[1][2], $rows[1].ID, "
-        "CASE $rows[1].ID WHEN 'x' THEN $m.items[2] ELSE $matrix[2][1] END",
+        "RETURN $m.items[0], $matrix[0][1], $rows[0].id, "
+        "CASE $rows[0].id WHEN 'x' THEN $m.items[1] ELSE $matrix[1][0] END",
         parameters,
     )
     assert found.rows == ((10, 20, "x", 20),)
 
-    with pytest.raises(GrafxPlanError) as map_bracket:
-        run(stack, "RETURN $m['items']", parameters)
-    assert map_bracket.value.details["field"] == "subscript"
+    assert run(stack, "RETURN $m['items']", parameters).rows == (((10, 20),),)
 
 
-def test_parameter_map_key_collisions_are_refused_independently_of_order(
+def test_parameter_map_keys_are_case_sensitive_independently_of_order(
     stack: QueryStack,
 ) -> None:
-    failures: list[tuple[str, dict[str, object]]] = []
     for value in ({"a": 1, "A": 2}, {"A": 2, "a": 1}):
-        with pytest.raises(GrafxPlanError) as collision:
-            run(stack, "RETURN $m.a", {"m": value})
-        failures.append((str(collision.value), collision.value.details))
-
-    assert failures[0] == failures[1]
-    assert failures[0][1] == {"field": "parameter", "value": "m"}
+        assert run(stack, "RETURN $m.a, $m.A, $m.missing", {"m": value}).rows == ((1, 2, None),)
 
 
 @pytest.mark.parametrize(
     "row", ({"id": "x", "ID": "y"}, {"ID": "y", "id": "x"})
 )
-def test_nested_batch_map_key_collisions_are_refused_at_bind(
+def test_nested_batch_map_keys_preserve_case(
     stack: QueryStack, row: dict[str, str]
 ) -> None:
-    with pytest.raises(GrafxPlanError) as collision:
-        run(stack, "RETURN $rows[1].id", {"rows": [row]})
-    assert collision.value.details == {"field": "parameter", "value": "rows"}
+    assert run(stack, "RETURN $rows[0].id, $rows[0].ID", {"rows": [row]}).rows == (("x", "y"),)
 
 
 def test_and_is_false_as_soon_as_either_side_is(stack: QueryStack) -> None:
@@ -1540,14 +1476,16 @@ def _fold_values(
     ("function", "expected"),
     (
         ("COUNT", 130),
-        ("SUM", 8128.0),
-        ("AVG", 8128.0 / 130),
+        ("SUM", 8128),
+        ("AVG", 8128.0 / 128),
     ),
 )
 def test_count_sum_and_avg_keep_constant_state_per_group(
     function: str, expected: object
 ) -> None:
-    values = (*range(128), None, True, "not numeric")
+    values = (*range(128), None)
+    if function == "COUNT":
+        values = (*values, True, "not numeric")
     accumulator = _fold_values(function, values)
 
     assert accumulator.result() == expected
@@ -2246,13 +2184,13 @@ def test_distinct_still_tells_an_integer_from_a_double(stack: QueryStack) -> Non
     assert [type(item).__name__ for item in found.rows[0][0]] == ["int", "float"]
 
 
-def test_the_freeze_keeps_an_integer_apart_from_a_double(stack: QueryStack) -> None:
-    # Equality treats 1 and 1.0 as one number, and DISTINCT must not: they are two values of the
-    # value system. The scalar tag is what keeps them apart, so it is pinned directly.
+def test_the_freeze_groups_equal_numbers_without_rounding_large_integers(stack: QueryStack) -> None:
     from okto_grafx.engine.query_engine import _equal, _freeze
 
     assert _equal(1, 1.0) is True
-    assert _freeze(1) != _freeze(1.0)
+    assert _freeze(1) == _freeze(1.0)
+    assert _freeze(9007199254740993) != _freeze(9007199254740992.0)
+    assert _freeze(True) != _freeze(1)
     assert _freeze(1) == _freeze(1)
 
 

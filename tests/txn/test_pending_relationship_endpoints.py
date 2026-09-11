@@ -165,6 +165,24 @@ def test_a_pending_identity_is_refused_outside_a_relationship_endpoint() -> None
     assert in_an_update.value.details["field"] == "values"
 
 
+def test_pending_edge_property_updates_retain_authenticated_endpoints():
+    transaction = _context()
+    person, company, works_at = _person(), _person(COMPANY_ID, "Company"), _works_at()
+    source = transaction.stage_row_insert(person, (1,))
+    target = transaction.stage_row_insert(company, (2,))
+    edge = transaction.stage_row_insert(works_at, (source, target, 2020))
+    transaction.stage_row_update(works_at, edge, (source, target, 2021))
+    transaction.stage_row_update(works_at, edge, (source, target, 2022))
+    before = len(transaction.row_intents)
+    for endpoints in ((target, source), (replace(source), target)):
+        with pytest.raises(GrafxTransactionStateError):
+            transaction.stage_row_update(works_at, edge, (*endpoints, 2023))
+    assert len(transaction.row_intents) == before
+    transaction.stage_row_delete(works_at, edge)
+    with pytest.raises(GrafxTransactionStateError):
+        transaction.stage_row_update(works_at, edge, (source, target, 2024))
+
+
 def test_staging_refuses_an_endpoint_this_transaction_never_issued() -> None:
     """A reference from elsewhere is refused where it is offered, not later."""
     transaction = _context()

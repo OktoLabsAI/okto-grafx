@@ -297,13 +297,13 @@ def test_a_written_hop_range_is_outside_the_form_even_when_it_means_one_hop() ->
 def test_unwind_before_the_form_is_refused_for_the_clause_it_is(
     database: object,
 ) -> None:
-    """UNWIND names its own tail rule, and that refusal arrives first; it is not widened here."""
+    """Clause composition does not silently widen the current unlabelled endpoint contract."""
     with pytest.raises(GrafxPlanError) as raised:
         database.execute(
             "UNWIND $rows AS x MATCH (a)-[r:R]->(b) RETURN r.layer", {"rows": [1]}
         )
 
-    assert raised.value.details["field"] == "clause"
+    assert raised.value.details["field"] == "labels"
 
 
 def test_a_labelled_source_keeps_the_small_frontier_traversal(database: object) -> None:
@@ -395,7 +395,7 @@ def test_a_caller_supplying_its_own_analysis_cannot_widen_the_form(
             analysis=_supplied_analysis(statement),
         )
 
-    assert raised.value.details["field"] == "labels", name
+    assert raised.value.details["field"] == ("clause" if name == "no RETURN at all" else "labels"), name
 
 
 def test_the_analysis_admits_what_the_planner_refuses(catalog: object) -> None:

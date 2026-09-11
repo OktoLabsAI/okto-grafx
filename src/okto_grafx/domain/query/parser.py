@@ -24,7 +24,7 @@ are wrong rather than a message that is clear.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from okto_grafx.domain.errors import GrafxParseError
 from okto_grafx.domain.model.value import INT64_MAX, INT64_MIN
@@ -43,6 +43,7 @@ from okto_grafx.domain.query.ast import (
     Expression,
     FunctionCall,
     ListExpression,
+    ListIteration,
     Literal,
     MapEntry,
     MapExpression,
@@ -63,13 +64,15 @@ from okto_grafx.domain.query.ast import (
     SortItem,
     Statement,
     Subscript,
+    ListSlice,
     UnaryOperation,
     UnwindClause,
     UnionQuery,
+    SubqueryClause,
+    ProcedureCall,
     UpdatingClause,
     Variable,
     WithClause,
-    optional_clause_defect,
 )
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
@@ -106,9 +109,10 @@ PRECEDENCE_XOR: int = 2
 PRECEDENCE_AND: int = 3
 PRECEDENCE_NOT: int = 4
 PRECEDENCE_COMPARISON: int = 5
-PRECEDENCE_SUM: int = 6
-PRECEDENCE_PRODUCT: int = 7
-PRECEDENCE_POWER: int = 8
+PRECEDENCE_NULL: int = 6
+PRECEDENCE_SUM: int = 7
+PRECEDENCE_PRODUCT: int = 8
+PRECEDENCE_POWER: int = 9
 
 VECTOR_TYPE_NAME: str = "VECTOR"
 """The column type that names an embedding space instead of a width.
@@ -301,46 +305,18 @@ class _Parser:
         return self._union(left)
 
     def _union(self, left: Query) -> UnionQuery:
-        """Parse ``UNION right``, having already read the left branch.
-
-        The left branch stopped at the word rather than consuming it, because whether UNION may
-        appear at all is a question about the STATEMENT and the clause loop only knows about
-        clauses.
-        """
-        self._take_keyword("UNION")
-        keep_duplicates = self._at_keyword("ALL")
-        if keep_duplicates:
-            self._take_keyword("ALL")
-        right = self._query()
-        for branch in (left, right):
-            if any(clause.optional for clause in branch.match_clauses):
-                # The narrow root OPTIONAL form deliberately excludes composition with UNION.
-                # Keep that old parser-phase refusal even though UNION itself now has a tree.
-                raise self._refuse(
-                    "An OPTIONAL MATCH is not composed with UNION in this subset",
-                    field="clause",
-                    value="UNION",
-                )
-            if branch.updating_clauses:
-                # Refused HERE and not only by the union gate above, because this text earned a
-                # parse refusal before a union could be written at all: moving it to the
-                # analysis would change the phase a caller sees for a query nobody asked to
-                # change.
-                raise self._refuse(
-                    "A UNION joins two queries that only read; neither branch may write",
-                    field="clause",
-                    value="UNION",
-                )
-        if self._at_keyword("UNION"):
-            # The third branch is refused HERE, where the word is, rather than by the statement
-            # gate above: a message that points at the second UNION is the one a caller can act
-            # on, and the recursion this avoids is what would otherwise nest.
-            raise self._refuse(
-                "A UNION in this subset joins exactly two queries",
-                field="clause",
-                value="UNION",
-            )
-        return UnionQuery(left=left, right=right, all=keep_duplicates)
+        """Parse a bounded left-associated sequence with a per-operator duplicate policy."""
+        combined: Query | UnionQuery = left
+        branches = 1
+        while self._match_keyword("UNION"):
+            if branches >= MAX_CLAUSES:
+                raise self._refuse("Too many UNION branches.", field="clauses", value=MAX_CLAUSES)
+            keep_duplicates = self._match_keyword("ALL")
+            right = self._query()
+            combined = UnionQuery(left=combined, right=right, all=keep_duplicates)
+            branches += 1
+        assert isinstance(combined, UnionQuery)
+        return combined
 
     def _create_index(self) -> CreateIndexStatement:
         """Parse the P2-ID custom exact-index declaration."""
@@ -536,144 +512,116 @@ class _Parser:
     # --- queries -----------------------------------------------------------------------------
 
     def _query(self) -> Query:
-        """Parse a reading and updating query: MATCH clauses, updating clauses, then RETURN."""
-        unwind_clause: UnwindClause | None = None
-        match_clauses: list[MatchClause] = []
-        with_clauses: list[WithClause] = []
-        updating_clauses: list[UpdatingClause] = []
-        return_clause: ReturnClause | None = None
-        clauses = 0
-        optional_root = False
-        read_order: list[str] = []
-        interleaved = False
-        while (
-            self._current.kind is not TokenKind.END
-            and not self._at_symbol(";")
-            and not self._at_keyword("UNION")
-        ):
-            clauses += 1
-            if clauses > MAX_CLAUSES:
-                raise self._refuse(
-                    f"A query may chain at most {MAX_CLAUSES} clauses",
-                    field="clauses",
-                    value=MAX_CLAUSES,
-                )
-            if optional_root and len(match_clauses) == 1 and not self._at_keyword("RETURN"):
-                # WHERE was already taken by the clause itself, so RETURN is the only word that
-                # may follow an OPTIONAL MATCH here. One guard answers every trailing clause at
-                # once -- a second MATCH, a WITH, an UNWIND, anything that writes -- and answers
-                # it where the text is read, which is where each of them was refused before.
-                raise self._refuse(
-                    "An OPTIONAL MATCH is followed only by WHERE and RETURN in this subset",
-                    field="clause",
-                    value="OPTIONAL MATCH",
-                )
-            if self._at_keyword("UNWIND"):
-                if clauses != 1:
-                    raise self._refuse(
-                        "UNWIND begins a query in this subset, so no clause may come before it",
-                        field="clause",
-                        value="UNWIND",
-                    )
-                unwind_clause = self._unwind_clause()
-                continue
-            if (
-                self._at_keyword("OPTIONAL")
-                and self._at_keyword("MATCH", ahead=1)
-            ):
-                # Root optional nodes and correlated one-hop optional expansions have
-                # distinct shape checks. Validate the latter once RETURN is available.
-                if updating_clauses or return_clause is not None or unwind_clause is not None:
-                    raise self._refuse("OPTIONAL MATCH must precede projection and writes", field="clause")
-                self._advance()
-                clause = self._match_clause(optional=True)
-                defect = optional_clause_defect(clause) if clauses == 1 else None
-                if defect is not None:
-                    message, value = defect
-                    raise self._refuse(message, field="pattern", value=value)
-                optional_root = True
-                match_clauses.append(clause)
-                read_order.append("match")
-                interleaved = interleaved or bool(with_clauses)
-                continue
-            if self._at_keyword("MATCH"):
-                if with_clauses:
-                    raise self._refuse(
-                        "A MATCH clause reads the graph, and in this subset it reads before "
-                        "the first WITH; none may follow one",
-                        field="clause",
-                        value="MATCH",
-                    )
-                if updating_clauses or return_clause is not None:
-                    raise self._refuse(
-                        "A MATCH clause comes before every clause that writes and before RETURN",
-                        field="clause",
-                        value="MATCH",
-                    )
-                match_clauses.append(self._match_clause())
-                read_order.append("match")
-                continue
-            if return_clause is not None:
-                raise self._refuse(
-                    "RETURN ends a query, so no clause may follow it",
-                    field="clause",
-                    value=self._current.text,
-                )
+        """Parse clauses in written order, keeping WITH as the write/read boundary."""
+        pipeline: list[MatchClause | WithClause | UnwindClause | SubqueryClause | ProcedureCall | UpdatingClause] = []
+        returned: ReturnClause | None = None
+        writing = False
+        while (self._current.kind is not TokenKind.END
+               and not self._at_symbol(";") and not self._at_symbol("}")
+               and not self._at_keyword("UNION")):
+            if len(pipeline) >= MAX_CLAUSES:
+                raise self._refuse(f"A query may chain at most {MAX_CLAUSES} clauses",
+                                   field="clauses", value=MAX_CLAUSES)
+            if returned is not None:
+                raise self._refuse("RETURN ends a query, so no clause may follow it",
+                                   field="clause", value=self._current.text)
             if self._at_keyword("RETURN"):
-                return_clause = self._return_clause()
+                returned = self._return_clause()
                 continue
             if self._at_keyword("WITH"):
-                if updating_clauses:
-                    raise self._refuse(
-                        "WITH shapes the rows a write reads, so it comes before every clause "
-                        "that writes and not after one",
-                        field="clause",
-                        value="WITH",
-                    )
-                if unwind_clause is not None:
-                    raise self._refuse(
-                        "UNWIND hands its elements straight to the clauses below it in this "
-                        "subset; WITH may not reshape them",
-                        field="clause",
-                        value="WITH",
-                    )
-                with_clauses.append(self._with_clause())
-                read_order.append("with")
+                pipeline.append(self._with_clause())
+                writing = False
                 continue
-            updating_clauses.append(self._updating_clause())
-        if (
-            unwind_clause is None
-            and not match_clauses
-            and not with_clauses
-            and not updating_clauses
-            and return_clause is None
-        ):
-            raise self._refuse("A query may not be empty", field="text")
-        if return_clause is None and not updating_clauses:
-            raise self._refuse(
-                "A query that only reads must end with RETURN",
-                field="clause",
-                value="RETURN",
-            )
+            if self._at_keyword("CALL"):
+                if writing:
+                    raise self._refuse("A WITH separates writes from a CALL subquery", field="clause")
+                pipeline.append(self._call_subquery())
+                continue
+            if self._at_keyword("MATCH") or self._at_keyword("OPTIONAL") or self._at_keyword("UNWIND"):
+                if writing:
+                    raise self._refuse("A WITH separates writes from subsequent reads",
+                                       field="clause", value=self._current.text)
+                if self._at_keyword("UNWIND"):
+                    pipeline.append(self._unwind_clause())
+                else:
+                    optional = self._match_keyword("OPTIONAL")
+                    pipeline.append(self._match_clause(optional=optional))
+                continue
+            pipeline.append(self._updating_clause())
+            writing = True
+        updates = tuple(clause for clause in pipeline
+                        if isinstance(clause, (CreateClause, MergeClause, SetClause, DeleteClause)))
+        if returned is None and len(pipeline) == 1 and isinstance(pipeline[0], ProcedureCall):
+            returned = ReturnClause(items=tuple(ReturnItem(expression=Variable(item.name))
+                                                for item in pipeline[0].yields))
+        if returned is None and not updates:
+            raise self._refuse("A query that only reads must end with RETURN",
+                               field="clause", value="RETURN")
+        unwinds = tuple(clause for clause in pipeline if isinstance(clause, UnwindClause))
+        matches = tuple(clause for clause in pipeline if isinstance(clause, MatchClause))
+        projections = tuple(clause for clause in pipeline if isinstance(clause, WithClause))
+        read_order = tuple("match" if isinstance(clause, MatchClause) else "with"
+                           for clause in pipeline if isinstance(clause, (MatchClause, WithClause)))
         query = Query(
-            unwind_clause=unwind_clause,
-            match_clauses=tuple(match_clauses),
-            with_clauses=tuple(with_clauses),
-            updating_clauses=tuple(updating_clauses),
-            return_clause=return_clause,
-            read_clause_order=tuple(read_order) if interleaved else (),
+            unwind_clause=unwinds[0] if unwinds else None,
+            match_clauses=matches, with_clauses=projections,
+            updating_clauses=updates, return_clause=returned,
         )
-        if any(c.optional for c in match_clauses) and len(match_clauses) > 1:
-            from okto_grafx.domain.query.analysis import correlated_optional_pipeline
-
-            if not correlated_optional_pipeline(query):
-                raise self._refuse(
-                    "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop",
-                    field="clause", value="OPTIONAL MATCH",
-                )
-        elif optional_root and (unwind_clause is not None or with_clauses):
-            raise self._refuse("An OPTIONAL MATCH cannot follow UNWIND or WITH", field="clause")
+        # Store order only when it conveys information absent from the grouped
+        # fields. All queries still execute through ordered_clauses().
+        if query.ordered_clauses() != tuple(pipeline):
+            query = replace(query, read_clause_order=read_order, clause_pipeline=tuple(pipeline))
         return query
+
+    def _call_subquery(self) -> SubqueryClause | ProcedureCall:
+        """Parse explicit imports and a bounded nested query, without implicit outer scope."""
+        self._take_keyword("CALL")
+        if not self._at_symbol("(") and not self._at_symbol("{"):
+            name = self._take_name("a registered procedure name")
+            while self._match_symbol("."):
+                name += "." + self._take_name("a procedure name component")
+            self._take_symbol("(")
+            arguments = []
+            if not self._at_symbol(")"):
+                while True:
+                    if len(arguments) >= 32:
+                        raise self._refuse("Too many procedure arguments", field="arguments")
+                    arguments.append(self._expression())
+                    if not self._match_symbol(","):
+                        break
+            self._take_symbol(")")
+            self._take_keyword("YIELD")
+            yielded = []
+            while True:
+                if len(yielded) >= MAX_PROJECTION_ITEMS:
+                    raise self._refuse("Too many YIELD columns", field="yields")
+                column = self._take_name("a procedure output column")
+                alias = self._take_name("a YIELD alias") if self._match_keyword("AS") else None
+                yielded.append(ReturnItem(expression=Variable(column), alias=alias))
+                if not self._match_symbol(","):
+                    break
+            predicate = self._expression() if self._match_keyword("WHERE") else None
+            return ProcedureCall(name, tuple(arguments), tuple(yielded), predicate)
+        imports: list[str] = []
+        if self._match_symbol("("):
+            if not self._at_symbol(")"):
+                while True:
+                    if len(imports) >= MAX_PROJECTION_ITEMS:
+                        raise self._refuse("Too many imported variables", field="imports")
+                    imports.append(self._take_name("an imported variable"))
+                    if not self._match_symbol(","):
+                        break
+            self._take_symbol(")")
+        self._take_symbol("{")
+        self._descend()
+        try:
+            query: Query | UnionQuery = self._query()
+            if self._at_keyword("UNION"):
+                query = self._union(query)
+        finally:
+            self._ascend()
+        self._take_symbol("}")
+        return SubqueryClause(query=query, imports=tuple(imports))
 
     def _unwind_clause(self) -> UnwindClause:
         """Parse ``UNWIND <expression> AS <alias>``."""
@@ -684,15 +632,9 @@ class _Parser:
         return UnwindClause(expression=expression, alias=alias)
 
     def _with_clause(self) -> WithClause:
-        """Parse ``WITH items [WHERE predicate]``."""
+        """Parse a projection with DISTINCT, ordering, row window and a scoped WHERE."""
         self._take_keyword("WITH")
-        if self._at_keyword("DISTINCT"):
-            raise self._refuse(
-                "WITH DISTINCT removes duplicate rows, and in this subset only RETURN "
-                "DISTINCT removes any",
-                field="clause",
-                value="WITH DISTINCT",
-            )
+        distinct = self._match_keyword("DISTINCT")
         items: list[ReturnItem] = []
         while True:
             if len(items) >= MAX_PROJECTION_ITEMS:
@@ -704,27 +646,14 @@ class _Parser:
             items.append(self._return_item())
             if not self._match_symbol(","):
                 break
-        # ORDER BY, SKIP and LIMIT are looked for on BOTH sides of the WHERE, because both are
-        # where a caller would write them: the language puts them before it, and someone who
-        # has only ever written them on a RETURN reaches for them after.
-        self._refuse_with_row_window()
+        sort_items = self._order_by() if self._at_keyword("ORDER") else ()
+        skip = self._expression() if self._match_keyword("SKIP") else None
+        limit = self._expression() if self._match_keyword("LIMIT") else None
         predicate: Expression | None = None
         if self._match_keyword("WHERE"):
             predicate = self._expression()
-            self._refuse_with_row_window()
-        return WithClause(items=tuple(items), predicate=predicate)
-
-    def _refuse_with_row_window(self) -> None:
-        """Refuse the ordering and the windowing a WITH does not carry in this subset."""
-        for keyword in ("ORDER", "SKIP", "LIMIT"):
-            if not self._at_keyword(keyword):
-                continue
-            raise self._refuse(
-                f"{keyword} shapes a result and only RETURN shapes one here; a WITH carries "
-                "its items and an optional WHERE",
-                field="clause",
-                value=keyword,
-            )
+        return WithClause(items=tuple(items), predicate=predicate, distinct=distinct,
+                          sort_items=sort_items, skip=skip, limit=limit)
 
     def _updating_clause(self) -> UpdatingClause:
         """Parse one clause that writes."""
@@ -738,7 +667,8 @@ class _Parser:
             return self._set_clause()
         if self._at_keyword("DETACH") or self._at_keyword("DELETE"):
             return self._delete_clause()
-        raise self._unexpected("a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN")
+        raise self._refuse(f"Unsupported query clause {self._current.text.upper()}",
+                           field="clause", value=self._current.text.upper())
 
     def _match_clause(self, *, optional: bool = False) -> MatchClause:
         """Parse ``[OPTIONAL] MATCH patterns [WHERE predicate]``.
@@ -1035,9 +965,8 @@ class _Parser:
         left = self._prefix()
         compared = False
         while True:
-            if self._at_keyword("IS") and PRECEDENCE_COMPARISON >= minimum:
+            if self._at_keyword("IS") and PRECEDENCE_NULL >= minimum:
                 left = self._null_check(left)
-                compared = True
                 continue
             operator = self._peek_operator()
             if operator is None or operator.precedence < minimum:
@@ -1088,7 +1017,7 @@ class _Parser:
                     text="^",
                     precedence=PRECEDENCE_POWER,
                     tokens=1,
-                    right_associative=True,
+                    right_associative=False,
                 )
             return None
         if token.kind is not TokenKind.NAME or token.quoted:
@@ -1130,7 +1059,7 @@ class _Parser:
             if folded is not None:
                 return folded
             self._descend()
-            operand = self._binary(PRECEDENCE_POWER)
+            operand = self._binary(PRECEDENCE_POWER + 1)
             self._ascend()
             return UnaryOperation(operator=operator, operand=operand)
         return self._postfix()
@@ -1141,13 +1070,10 @@ class _Parser:
         Folding here rather than after the operand is parsed is what makes the most negative
         64-bit integer writable at all: its magnitude is one past the positive range, so it
         exists only as a sign applied to a literal and the range check has to see the signed
-        value. The lookahead for ``^`` is the price of doing it early -- exponentiation binds
-        more tightly than a sign, so ``-2^2`` is the negation of four and not the square of
-        minus two, and folding it would quietly change the answer.
+        value. Signs bind more tightly than exponentiation under the fixed language
+        reference, so ``-2^2`` denotes the square of minus two.
         """
         if self._current.kind not in (TokenKind.INTEGER, TokenKind.DOUBLE):
-            return None
-        if self._at_symbol("^", 1):
             return None
         token = self._advance()
         magnitude = token.value
@@ -1178,9 +1104,17 @@ class _Parser:
             if self._at_symbol("["):
                 self._advance()
                 self._descend()
-                index = self._expression()
+                index = None if self._at_symbol("..") else self._expression()
+                if self._at_symbol(".."):
+                    self._advance()
+                    end = None if self._at_symbol("]") else self._expression()
+                    self._ascend()
+                    self._take_symbol("]")
+                    expression = ListSlice(subject=expression, start=index, end=end)
+                    continue
                 self._ascend()
                 self._take_symbol("]")
+                assert index is not None
                 expression = Subscript(subject=expression, index=index)
                 continue
             return expression
@@ -1275,10 +1209,31 @@ class _Parser:
         self._advance()
         return Variable(name=token.text)
 
-    def _function_call(self) -> FunctionCall:
+    def _function_call(self) -> Expression:
         """Parse ``name(arguments)``, including ``count(*)`` and ``count(DISTINCT x)``."""
         name = self._advance().text
         self._take_symbol("(")
+        if name.upper() in ("ALL", "ANY", "NONE", "SINGLE", "REDUCE"):
+            self._descend()
+            accumulator = None
+            initial = None
+            if name.upper() == "REDUCE":
+                accumulator = self._take_name("a reduction accumulator")
+                self._take_symbol("=")
+                initial = self._expression()
+                self._take_symbol(",")
+            variable = self._take_name("a list variable")
+            self._take_keyword("IN")
+            source = self._expression()
+            if name.upper() == "REDUCE":
+                self._take_symbol("|")
+            else:
+                self._take_keyword("WHERE")
+            body = self._expression()
+            self._take_symbol(")")
+            self._ascend()
+            return ListIteration(name.lower(), variable, source, body,
+                                 accumulator=accumulator, initial=initial)
         if self._at_symbol("*"):
             self._advance()
             self._take_symbol(")")
@@ -1338,9 +1293,19 @@ class _Parser:
             distinct=distinct,
         )
 
-    def _list_literal(self) -> ListExpression:
+    def _list_literal(self) -> Expression:
         """Parse ``[element, ...]``."""
         self._take_symbol("[")
+        if self._current.kind is TokenKind.NAME and self._at_keyword("IN", 1):
+            self._descend()
+            variable = self._advance().text
+            self._take_keyword("IN")
+            source = self._expression()
+            predicate = self._expression() if self._match_keyword("WHERE") else None
+            body = self._expression() if self._match_symbol("|") else Variable(variable)
+            self._take_symbol("]")
+            self._ascend()
+            return ListIteration("map", variable, source, body, predicate=predicate)
         elements: list[Expression] = []
         if not self._at_symbol("]"):
             while True:
@@ -1372,14 +1337,13 @@ class _Parser:
                         value=MAX_MAP_ENTRIES,
                     )
                 key = self._take_name("a map key")
-                folded = key.lower()
-                if folded in seen:
+                if key in seen:
                     raise self._refuse(
                         f"The map key {key!r} is written more than once",
                         field="key",
                         value=key,
                     )
-                seen.add(folded)
+                seen.add(key)
                 self._take_symbol(":")
                 self._descend()
                 entries.append(MapEntry(key=key, value=self._expression()))

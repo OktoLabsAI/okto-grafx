@@ -580,7 +580,7 @@ def test_an_untyped_hop_is_a_whole_query_and_not_a_union_branch(text: str) -> No
 
 def test_an_ordinary_union_is_untouched() -> None:
     """The pair still works when neither branch reaches for an untyped hop."""
-    statement = parse("MATCH (a:Decision) RETURN a.id UNION MATCH (b:Bug) RETURN b.id")
+    statement = parse("MATCH (a:Decision) RETURN a.id AS id UNION MATCH (b:Bug) RETURN b.id AS id")
     assert analyze(statement) is not None
     assert build_plan(statement, catalog=_catalog()) is not None
 

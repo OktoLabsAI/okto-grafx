@@ -323,11 +323,11 @@ class _CountingMap(dict):
         self.reads = 0
         self.answers: list[object] = []
 
-    def items(self):
+    def get(self, key, default=None):
         self.reads += 1
-        if self.answers:
-            return [(self.key, self.answers.pop(0))]
-        return super().items()
+        if self.answers and key == self.key:
+            return self.answers.pop(0)
+        return super().get(key, default)
 
     key = "k"
 

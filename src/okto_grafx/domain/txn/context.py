@@ -705,7 +705,21 @@ class TransactionContext:
         accepted_reference = self._require_row_reference(accepted_table, reference)
         self._require_row_count_capacity()
         accepted_values = tuple(values)
-        self._require_stageable_values(accepted_table, accepted_values, inserting=False)
+        retained_pending_endpoints = False
+        if isinstance(accepted_reference, PendingRowRef) and _is_relationship(accepted_table):
+            for intent in reversed(self.row_intents):
+                if intent.reference is not accepted_reference:
+                    continue
+                if intent.operation is RowOperation.DELETE:
+                    break
+                if intent.operation is RowOperation.INSERT:
+                    # Updating properties of an uncommitted edge reduces back to
+                    # this INSERT. It may retain, never replace, its endpoint promises.
+                    retained_pending_endpoints = (
+                        accepted_values[:ENDPOINT_COLUMN_COUNT] == intent.values[:ENDPOINT_COLUMN_COUNT]
+                    )
+                    break
+        self._require_stageable_values(accepted_table, accepted_values, inserting=retained_pending_endpoints)
         payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
         self._require_payload_capacity(payload_bytes)
         self.row_intents.append(
@@ -988,7 +1002,8 @@ class TransactionContext:
     ) -> None:
         """Refuse a pending identity anywhere it cannot be resolved into a stored value.
 
-        Only the two endpoint columns of a relationship INSERT may carry one, and only when this
+        Only the two endpoint columns of a relationship INSERT (including a property-only
+        update reducing back into that pending insert) may carry one, and only when this
         transaction emitted it and still holds it. Everything deeper -- that the insert it names
         comes first, is a node, and belongs to the side that slot declares -- is proven from the
         REDUCED intents by the commit path, because a later statement can still cancel the insert

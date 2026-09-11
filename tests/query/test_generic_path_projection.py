@@ -66,7 +66,6 @@ def test_target_properties_cannot_shadow_path_metadata(tmp_path):
     "MATCH journey = (x:Person)<-[edge:Knows]-(y:Person) RETURN journey",
     "MATCH journey = (x:Person)-[edge:Knows]-(y:Person) RETURN journey",
     "MATCH journey = (x:Person)-[edge:Knows*1..2]->(y:Person) RETURN journey",
-    "MATCH journey = (x:Person)-[edge:Knows]->(y:Person) RETURN journey AS renamed",
     "MATCH journey = (x:Person)-[edge:Knows]->(y:Person) WHERE x.id='x' RETURN journey",
     "MATCH journey = (journey:Person)-[edge:Knows]->(y:Person) RETURN journey",
 ])

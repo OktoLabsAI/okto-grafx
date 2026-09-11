@@ -1,5 +1,8 @@
 # Evidence and report index
 
+- [Pulse / Grafx 0.0.6 integration follow-up](PULSE_V006_INTEGRATION_REGRESSION.md)
+- [0.0.6 query-language round: fixed scope, full regression and consumer migration](V006_QUERY_LANGUAGE_ROUND.md)
+
 - [0.0.6 NHC-1–8: positional search, selected copy, temporal diff/index/compaction and analyzer replacement](V006_NHC_ROUND.md)
 - [0.0.6 native history/catalog/search round: fixed eight-item scope and validation](V006_NATIVE_HISTORY_ROUND.md)
 

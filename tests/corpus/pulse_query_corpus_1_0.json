@@ -258,8 +258,8 @@
       "YIELD"
     ],
     "probe_count": 87,
-    "engine_accepted": 79,
-    "engine_refused": 8,
+    "engine_accepted": 78,
+    "engine_refused": 9,
     "contract_refused": 14,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -825,9 +825,9 @@
         "contract_disposition": "allowed",
         "contract_error_code": null,
         "contract_reason": null,
-        "acceptance_phase": "planned",
-        "engine_verdict": "accepted",
-        "error": null
+        "acceptance_phase": "analysis_error",
+        "engine_verdict": "refused",
+        "error": "GrafxPlanError: UNION branches must return the same column names in the same order. [code=plan_error retryable=False]"
       },
       {
         "category": "clause",
@@ -1463,9 +1463,9 @@
         "contract_disposition": "refused",
         "contract_error_code": "unsupported_operation",
         "contract_reason": "root operation CALL",
-        "acceptance_phase": "parse_error",
+        "acceptance_phase": "plan_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'CALL' (line 1, column 1). [code=parse_error retryable=False]"
+        "error": "GrafxPlanError: Procedure is not registered or its permissions were not granted. [code=plan_error retryable=False]"
       },
       {
         "category": "taxonomy",
@@ -1474,9 +1474,9 @@
         "contract_disposition": "refused",
         "contract_error_code": "unsupported_operation",
         "contract_reason": "unsupported public token CALL",
-        "acceptance_phase": "parse_error",
+        "acceptance_phase": "plan_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'CALL' (line 1, column 20). [code=parse_error retryable=False]"
+        "error": "GrafxPlanError: Procedure is not registered or its permissions were not granted. [code=plan_error retryable=False]"
       },
       {
         "category": "limits",
@@ -1608,7 +1608,7 @@
         "contract_reason": "blacklisted keyword REMOVE",
         "acceptance_phase": "parse_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'REMOVE' (line 1, column 20). [code=parse_error retryable=False]"
+        "error": "GrafxParseError: Unsupported query clause REMOVE (line 1, column 20). [code=parse_error retryable=False]"
       },
       {
         "category": "forbidden_write",
@@ -1619,7 +1619,7 @@
         "contract_reason": "blacklisted keyword DROP",
         "acceptance_phase": "parse_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'DROP' (line 1, column 1). [code=parse_error retryable=False]"
+        "error": "GrafxParseError: Unsupported query clause DROP (line 1, column 1). [code=parse_error retryable=False]"
       },
       {
         "category": "forbidden_write",
@@ -1630,7 +1630,7 @@
         "contract_reason": "blacklisted keyword ALTER",
         "acceptance_phase": "parse_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'ALTER' (line 1, column 1). [code=parse_error retryable=False]"
+        "error": "GrafxParseError: Unsupported query clause ALTER (line 1, column 1). [code=parse_error retryable=False]"
       },
       {
         "category": "forbidden_write",
@@ -1641,7 +1641,7 @@
         "contract_reason": "blacklisted keyword LOAD",
         "acceptance_phase": "parse_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'LOAD' (line 1, column 1). [code=parse_error retryable=False]"
+        "error": "GrafxParseError: Unsupported query clause LOAD (line 1, column 1). [code=parse_error retryable=False]"
       },
       {
         "category": "forbidden_write",
@@ -1652,7 +1652,7 @@
         "contract_reason": "root operation COPY",
         "acceptance_phase": "parse_error",
         "engine_verdict": "refused",
-        "error": "GrafxParseError: Expected a clause: MATCH, CREATE, MERGE, SET, DELETE or RETURN but found name 'COPY' (line 1, column 1). [code=parse_error retryable=False]"
+        "error": "GrafxParseError: Unsupported query clause COPY (line 1, column 1). [code=parse_error retryable=False]"
       }
     ]
   },
@@ -6713,8 +6713,8 @@
         "min_confidence"
       ],
       "classification": "generic_gap",
-      "acceptance_phase": "parse_error",
-      "parse_error": "GrafxParseError: A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop (line 22, column 1). [code=parse_error retryable=False]",
+      "acceptance_phase": "plan_error",
+      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (center). [code=plan_error retryable=False]",
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6776,10 +6776,10 @@
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
         "error": {
-          "phase": "parse_error",
-          "code": "parse_error",
-          "type": "GrafxParseError",
-          "message": "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop (line 22, column 1). [code=parse_error retryable=False]"
+          "phase": "plan_error",
+          "code": "plan_error",
+          "type": "GrafxPlanError",
+          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (center). [code=plan_error retryable=False]"
         }
       }
     },
@@ -7718,5 +7718,5 @@
       }
     }
   ],
-  "digest": "50d2dfc6edc1942440f5adea93bf383879bd8a9e972ce1f8db3e2c3fcdfbe634"
+  "digest": "1adf6a7fab9452290aae97f317a2ae2ddf9cfec164195626f8e54abb430c4075"
 }

@@ -681,7 +681,6 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "named path",
         "unbounded variable length",
         "OPTIONAL MATCH",
-        "UNION",
         "untyped relationship",
         "path projection",
         "map batch",
@@ -703,9 +702,14 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
     # follow the public NFKC execution path and closes the unsupported trailing-clause hole in
     # the Core authority, and M-PULSE-2M moves UNION. M-PULSE-2N then moves the untyped hop and
     # M-PULSE-2O moves the one exact path projection, closing the finite raw-contract debt.
-    assert len(accepted) == 79
-    assert len(refused) == 8
-    assert owed == []
+    # The authorized language replacement now requires identical output names.
+    # Preserve the historical probe text (n.id vs m.id) and record its refusal,
+    # rather than rewriting the baseline to hide this intentional breaking change.
+    assert len(accepted) == 78
+    assert len(refused) == 9
+    assert owed == ["UNION"]
+    assert by_construct["UNION"]["acceptance_phase"] == "analysis_error"
+    assert "same column names" in by_construct["UNION"]["error"]
     assert raw["contract_refused"] == 14
     assert raw["contract_error_codes"] == {
         "unsafe_cypher": 10,

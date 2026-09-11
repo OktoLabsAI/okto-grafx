@@ -2581,44 +2581,81 @@ class Database:
             call = text_call(statement, detached_parameters)
             if call is not None:
                 return self._run_text_procedure(context, call, control)
-            with self._transactions.page_access_section(transaction=context):
-                self._require_open()
-                if not context.active:
-                    raise GrafxTransactionStateError(
-                        f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
-                        "another statement.",
-                        txn_id=context.txn_id,
-                        state=context.state.value,
-                    )
-                # Registration and statement execution share the participant section. Close can
-                # therefore neither miss a context that may have acquired a schema journal nor
-                # release storage while the statement is installing one.
-                self._public_contexts.setdefault(context.txn_id, context)
+            # Keep native logical writes reversible until the public result and deadline
+            # have both passed validation. Schema statements have their own catalog/artifact
+            # journal and must not be unwound with a row-only staging snapshot.
+            with self._logical_statement_publication(context, engine, statement):
+                with self._transactions.page_access_section(transaction=context):
+                    self._require_open()
+                    if not context.active:
+                        raise GrafxTransactionStateError(
+                            f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
+                            "another statement.",
+                            txn_id=context.txn_id,
+                            state=context.state.value,
+                        )
+                    # Registration and statement execution share the participant section. Close can
+                    # therefore neither miss a context that may have acquired a schema journal nor
+                    # release storage while the statement is installing one.
+                    self._public_contexts.setdefault(context.txn_id, context)
+                    if control is not None:
+                        control.check()
+                        raw_result = engine.execute(statement, context, detached_parameters, read_control=control)  # type: ignore[attr-defined]
+                        control.check()
+                    else:
+                        raw_result = engine.execute(statement, context, detached_parameters)  # type: ignore[attr-defined]
+                # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
+                # after leaving page access, while _public_operation still translates ordinary host
+                # failures and deliberately lets process-control signals pass unchanged.
+                result = _query_result_view(
+                    raw_result,
+                    max_string_characters=self._max_query_value_characters,
+                    internally_owned_plan=(
+                        type(raw_result) is QueryResult
+                        and _engine_owns_prepared_plan(
+                            engine,
+                            _domain_field(raw_result, QueryResult, "plan"),
+                        )
+                    ),
+                    plan_memo=self._plan_view_memo,
+                    plan_guard_factory=self._plan_guard_factory,
+                )
                 if control is not None:
                     control.check()
-                    raw_result = engine.execute(statement, context, detached_parameters, read_control=control)  # type: ignore[attr-defined]
-                    control.check()
-                else:
-                    raw_result = engine.execute(statement, context, detached_parameters)  # type: ignore[attr-defined]
-            # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
-            # after leaving page access, while _public_operation still translates ordinary host
-            # failures and deliberately lets process-control signals pass unchanged.
-            result = _query_result_view(
-                raw_result,
-                max_string_characters=self._max_query_value_characters,
-                internally_owned_plan=(
-                    type(raw_result) is QueryResult
-                    and _engine_owns_prepared_plan(
-                        engine,
-                        _domain_field(raw_result, QueryResult, "plan"),
-                    )
-                ),
-                plan_memo=self._plan_view_memo,
-                plan_guard_factory=self._plan_guard_factory,
-            )
-            if control is not None:
-                control.check()
-            return result
+                return result
+
+    @contextmanager
+    def _logical_statement_publication(
+        self, context: TransactionContext, engine: object, statement: str,
+    ) -> Iterator[None]:
+        """Hold native row effects through public result canonicalization."""
+        mark = None
+        if context.mode is TransactionMode.WRITE and type(engine) is QueryEngine:
+            parsed = engine.parse(statement)
+            if isinstance(parsed, QueryStatement) and parsed.writes:
+                with self._transactions.page_access_section(transaction=context):
+                    self._require_open()
+                    mark = context.staging_mark()
+        try:
+            yield
+            if mark is not None:
+                with self._transactions.page_access_section(transaction=context):
+                    self._require_open()
+                    context.settle_staging_mark(mark)
+        except BaseException as failure:
+            if mark is not None and context.active:
+                try:
+                    with self._transactions.page_access_section(transaction=context):
+                        context.discard_since(mark)
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(failure, cleanup_failure)
+                    # If statement rollback cannot be proved, no later commit is safe.
+                    try:
+                        if context.active:
+                            self._transactions.rollback(context)
+                    except BaseException as rollback_failure:
+                        _note_cleanup_failure(failure, rollback_failure)
+            raise
 
     def _run_text_procedure(self, context: TransactionContext, call: tuple[object, ...], control: _ReadControl | None) -> QueryResult:
         """Run the closed FTS read procedure, sharing the calling statement's deadline."""

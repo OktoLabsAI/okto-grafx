@@ -42,6 +42,31 @@ def _run(stack: QueryStack, text: str):
     return stack.engine.execute(text, stack.transaction())
 
 
+@pytest.mark.parametrize("query", (
+    "UNWIND $xs AS x RETURN DISTINCT x",
+    "UNWIND $xs AS x RETURN x, count(*) AS n",
+    "UNWIND $xs AS x RETURN count(DISTINCT x)",
+    "UNWIND $xs AS x RETURN x ORDER BY x",
+    "UNWIND $xs AS x RETURN min(x), max(x)",
+))
+def test_numeric_equivalence_is_identical_in_memory_and_spill(query, monkeypatch):
+    values = ([1, 1.0, 0, -0.0, True, False, 9007199254740992, 9007199254740993,
+               9007199254740992.0, {"v": 1}, {"v": 1.0}, [1, None], [1.0, None]] * 10)
+    values.extend(f"unique-{index}" for index in range(120))
+    ordinary = build_query_stack(query_memory_budget_bytes=None)
+    spilled = build_query_stack(query_memory_budget_bytes=4096)
+    expected = ordinary.engine.execute(query, ordinary.transaction(), {"xs": values})
+    opened = []
+    original_open = LocalQuerySpillFactory.open
+    def record_open(factory, budget):
+        opened.append(True)
+        return original_open(factory, budget)
+    monkeypatch.setattr(LocalQuerySpillFactory, "open", record_open)
+    actual = spilled.engine.execute(query, spilled.transaction(), {"xs": values})
+    assert actual.rows == expected.rows
+    assert opened, "The equivalence test must actually exercise external spill."
+
+
 def test_external_sort_matches_the_unbounded_stable_result() -> None:
     ordinary = _filled(budget=None)
     spilled = _filled(budget=2_048)

@@ -47,6 +47,10 @@ __all__ = [
     "MAX_PLAN_DEPTH",
     "AggregateRows",
     "AllNodesScan",
+    "ArgumentRows",
+    "ApplyRows",
+    "SubqueryRows",
+    "ProcedureRows",
     "CreateIndex",
     "CreateNodeTable",
     "CreateRelTable",
@@ -190,6 +194,65 @@ class SingleRow(PlanNode):
     def details(self) -> Mapping[str, object]:
         """Return nothing; this operator has no settings."""
         return {}
+
+
+@dataclass(frozen=True, slots=True)
+class ArgumentRows(PlanNode):
+    """The current outer row of one explicitly correlated apply operator."""
+
+    slot: int
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyRows(PlanNode):
+    """Run an inner read per outer row, null-extending its new bindings when empty."""
+
+    child: PlanNode
+    inner: PlanNode
+    slot: int
+    null_variables: tuple[str, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose both plans to budget, shape and explain validation."""
+        return self.child, self.inner
+
+
+@dataclass(frozen=True, slots=True)
+class ProcedureRows(PlanNode):
+    """A trusted, explicitly authorized tabular call in the normal row pipeline."""
+
+    child: PlanNode
+    name: str
+    columns: tuple[tuple[str, str], ...]
+    max_rows: int
+    max_result_bytes: int
+    arguments: tuple[Expression, ...]
+    yields: tuple[ReturnItem, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the incoming rows to standard planner and budget validation."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Expose the signature, never callback identity or executable implementation."""
+        return {"procedure": self.name, "access": "pure_tabular",
+                "columns": tuple(item.name for item in self.yields),
+                "max_rows": self.max_rows, "max_result_bytes": self.max_result_bytes}
+
+
+@dataclass(frozen=True, slots=True)
+class SubqueryRows(PlanNode):
+    """Apply a returning subquery per input row with explicitly mapped imports/exports."""
+
+    child: PlanNode
+    inner: PlanNode
+    slot: int
+    imports: tuple[tuple[str, str], ...]
+    outputs: tuple[str, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose both sides to explain and resource-bound traversal."""
+        return self.child, self.inner
 
 
 @dataclass(frozen=True, slots=True)
@@ -731,6 +794,7 @@ class EagerRows(PlanNode):
     """
 
     child: PlanNode
+    publish_read_phase: bool = False
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are drawn in full."""

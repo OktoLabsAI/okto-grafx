@@ -40,6 +40,8 @@ __all__ = [
     "Expression",
     "FunctionCall",
     "ListExpression",
+    "ListSlice",
+    "ListIteration",
     "Literal",
     "MapEntry",
     "MapExpression",
@@ -52,6 +54,9 @@ __all__ = [
     "PatternPath",
     "Property",
     "Query",
+    "ProcedureCall",
+    "SubqueryClause",
+    "UnionQuery",
     "RelationshipPattern",
     "ReturnClause",
     "ReturnItem",
@@ -232,7 +237,7 @@ class CaseExpression(Expression):
 
 @dataclass(frozen=True, slots=True)
 class Subscript(Expression):
-    """A one-based list extraction written as ``subject[index]``."""
+    """A zero-based list extraction written as ``subject[index]``."""
 
     subject: Expression
     index: Expression
@@ -244,6 +249,25 @@ class Subscript(Expression):
     def describe(self) -> str:
         """Return the postfix list extraction."""
         return f"{self.subject.describe()}[{self.index.describe()}]"
+
+
+@dataclass(frozen=True, slots=True)
+class ListSlice(Expression):
+    """A half-open list slice; omitted bounds differ from explicitly NULL bounds."""
+
+    subject: Expression
+    start: Expression | None = None
+    end: Expression | None = None
+
+    def children(self) -> tuple[Expression, ...]:
+        """Return only the written operands, in evaluation order."""
+        return (self.subject, *(x for x in (self.start, self.end) if x is not None))
+
+    def describe(self) -> str:
+        """Render a slice without turning absent bounds into NULL values."""
+        start = "" if self.start is None else self.start.describe()
+        end = "" if self.end is None else self.end.describe()
+        return f"{self.subject.describe()}[{start}..{end}]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +350,34 @@ class ListExpression(Expression):
 
 
 @dataclass(frozen=True, slots=True)
+class ListIteration(Expression):
+    """Lexically scoped list mapping, predicates and reduction (no row aggregate)."""
+
+    mode: str
+    variable: str
+    source: Expression
+    body: Expression
+    predicate: Expression | None = None
+    accumulator: str | None = None
+    initial: Expression | None = None
+
+    def children(self) -> tuple[Expression, ...]:
+        """Include all written expressions for validation and budget accounting."""
+        return (self.source, *(x for x in (self.initial, self.predicate) if x is not None), self.body)
+
+    def describe(self) -> str:
+        """Render the lexical binder without exposing any runtime environment."""
+        binding = f"{self.variable} IN {self.source.describe()}"
+        if self.mode == "map":
+            predicate = "" if self.predicate is None else f" WHERE {self.predicate.describe()}"
+            return f"[{binding}{predicate} | {self.body.describe()}]"
+        if self.mode == "reduce":
+            initial = "NULL" if self.initial is None else self.initial.describe()
+            return f"reduce({self.accumulator} = {initial}, {binding} | {self.body.describe()})"
+        return f"{self.mode}({binding} WHERE {self.body.describe()})"
+
+
+@dataclass(frozen=True, slots=True)
 class MapEntry:
     """One key and value of a map."""
 
@@ -348,9 +400,9 @@ class MapExpression(Expression):
         return tuple(entry.value for entry in self.entries)
 
     def entry(self, key: str) -> Expression | None:
-        """Return the value stored under one key, comparing the key without case."""
+        """Return the value stored under one exact, case-sensitive key."""
         for candidate in self.entries:
-            if candidate.key.lower() == key.lower():
+            if candidate.key == key:
                 return candidate.value
         return None
 
@@ -689,6 +741,10 @@ class WithClause:
 
     items: tuple[ReturnItem, ...]
     predicate: Expression | None = None
+    distinct: bool = False
+    sort_items: tuple[SortItem, ...] = ()
+    skip: Expression | None = None
+    limit: Expression | None = None
 
     def column_names(self) -> tuple[str, ...]:
         """Return the names this stage leaves in scope, in written order."""
@@ -697,9 +753,46 @@ class WithClause:
     def describe(self) -> str:
         """Return the clause as it would be written back."""
         body = ", ".join(item.describe() for item in self.items)
-        if self.predicate is None:
-            return f"WITH {body}"
-        return f"WITH {body} WHERE {self.predicate.describe()}"
+        text = f"WITH {'DISTINCT ' if self.distinct else ''}{body}"
+        if self.sort_items:
+            text += " ORDER BY " + ", ".join(item.describe() for item in self.sort_items)
+        if self.skip is not None:
+            text += f" SKIP {self.skip.describe()}"
+        if self.limit is not None:
+            text += f" LIMIT {self.limit.describe()}"
+        if self.predicate is not None:
+            text += f" WHERE {self.predicate.describe()}"
+        return text
+
+
+@dataclass(frozen=True, slots=True)
+class ProcedureCall:
+    """An explicitly registered tabular CALL and named YIELD projection."""
+
+    name: str
+    arguments: tuple[Expression, ...]
+    yields: tuple[ReturnItem, ...]
+    predicate: Expression | None = None
+
+    def describe(self) -> str:
+        """Render a procedure call without conflating it with a subquery."""
+        body = f"CALL {self.name}({', '.join(arg.describe() for arg in self.arguments)})"
+        body += " YIELD " + ", ".join(item.describe() for item in self.yields)
+        return body if self.predicate is None else body + f" WHERE {self.predicate.describe()}"
+
+
+@dataclass(frozen=True, slots=True)
+class SubqueryClause:
+    """A returning subquery with explicitly imported variables (language extension)."""
+
+    query: Query | UnionQuery
+    imports: tuple[str, ...] = ()
+    outer_names: tuple[str, ...] = ()
+    output_aliases: tuple[str, ...] = ()
+
+    def describe(self) -> str:
+        """Render a CALL subquery, distinct from procedure CALL/YIELD."""
+        return f"CALL ({', '.join(self.imports)}) {{ {self.query.describe()} }}"
 
 
 class Statement:
@@ -729,6 +822,14 @@ class Query(Statement):
     # Only needed when reads and projections interleave. Older programmatic trees
     # retain their MATCH-then-WITH meaning without a new positional argument.
     read_clause_order: tuple[str, ...] = ()
+    clause_pipeline: tuple[MatchClause | WithClause | UnwindClause | SubqueryClause | ProcedureCall | UpdatingClause, ...] = ()
+
+    def ordered_clauses(self) -> tuple[MatchClause | WithClause | UnwindClause | SubqueryClause | ProcedureCall | UpdatingClause, ...]:
+        """Return the complete clause pipeline, preserving each projection/write boundary."""
+        if self.clause_pipeline:
+            return self.clause_pipeline
+        leading = () if self.unwind_clause is None else (self.unwind_clause,)
+        return (*leading, *self.ordered_read_clauses(), *self.updating_clauses)
 
     def ordered_read_clauses(self) -> tuple[MatchClause | WithClause, ...]:
         """Return the reading pipeline (validated by analysis before planning)."""
@@ -745,9 +846,7 @@ class Query(Statement):
 
     def describe(self) -> str:
         """Return the query as it would be written back."""
-        parts = [] if self.unwind_clause is None else [self.unwind_clause.describe()]
-        parts.extend(clause.describe() for clause in self.ordered_read_clauses())
-        parts.extend(clause.describe() for clause in self.updating_clauses)
+        parts = [clause.describe() for clause in self.ordered_clauses()]
         if self.return_clause is not None:
             parts.append(self.return_clause.describe())
         return " ".join(parts)
@@ -755,24 +854,26 @@ class Query(Statement):
 
 @dataclass(frozen=True, slots=True)
 class UnionQuery(Statement):
-    """Two reading queries; duplicates removed unless explicit ALL is selected.
+    """A left-associated UNION tree; each operator owns its duplicate policy."""
 
-    Exactly two branches, and deliberately not a list. A list would say that three branches
-    are the same shape as two, and they are not: the second UNION would have to decide whether
-    it deduplicates against the first pair's output or against its own input, and answering
-    that question is a different milestone from admitting the pair.
-
-    The column NAMES come from the left branch alone. The right branch may spell its aliases
-    differently -- a caller reading the result never sees them -- but it must produce the same
-    number of columns, and each position must carry a type the pair can agree on.
-    """
-
-    left: Query
-    right: Query
+    left: Query | UnionQuery
+    right: Query | UnionQuery
     all: bool = False
 
+    def branches(self) -> tuple[Query, ...]:
+        """Return leaves in execution order after analysis validates the tree."""
+        pending: list[Query | UnionQuery] = [self]
+        leaves: list[Query] = []
+        while pending:
+            branch = pending.pop()
+            if type(branch) is UnionQuery:
+                pending.extend((branch.right, branch.left))
+            else:
+                leaves.append(branch)
+        return tuple(leaves)
+
     def describe(self) -> str:
-        """Return the statement as it would be written back."""
+        """Render the operator sequence."""
         operator = "UNION ALL" if self.all else "UNION"
         return f"{self.left.describe()} {operator} {self.right.describe()}"
 
@@ -914,8 +1015,25 @@ def free_variables(expression: Expression) -> tuple[str, ...]:
     """Return the variable names one expression reads, in first-appearance order."""
     found: list[str] = []
     seen: set[str] = set()
-    for node in walk(expression):
-        if isinstance(node, Variable) and node.name not in seen:
+    pending = [(expression, frozenset(), 0)]
+    while pending:
+        node, bound, depth = pending.pop()
+        if not isinstance(node, Expression) or depth > MAX_EXPRESSION_DEPTH:
+            raise GrafxPlanError("An expression exceeds its type/depth boundary.", field="depth", value=MAX_EXPRESSION_DEPTH)
+        if isinstance(node, Variable) and node.name not in bound and node.name not in seen:
             seen.add(node.name)
             found.append(node.name)
+        if isinstance(node, ListIteration):
+            local = bound | {node.variable}
+            if node.accumulator is not None:
+                local = local | {node.accumulator}
+            children = [(node.source, bound)]
+            if node.initial is not None:
+                children.append((node.initial, bound))
+            if node.predicate is not None:
+                children.append((node.predicate, local))
+            children.append((node.body, local))
+            pending.extend((child, scope, depth + 1) for child, scope in reversed(children))
+        else:
+            pending.extend((child, bound, depth + 1) for child in reversed(node.children()))
     return tuple(found)

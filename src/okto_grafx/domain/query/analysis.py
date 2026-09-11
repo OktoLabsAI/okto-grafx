@@ -22,13 +22,14 @@ exists to forbid.
 
 from __future__ import annotations
 
-from okto_grafx.domain.query.scalars import NATIVE_SCALARS
+from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_arity
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
 from okto_grafx.domain.query.ast import (
+    ListIteration,
     CaseExpression,
     CreateClause,
     CreateIndexStatement,
@@ -51,6 +52,8 @@ from okto_grafx.domain.query.ast import (
     RelationshipPattern,
     ReturnClause,
     UnionQuery,
+    SubqueryClause,
+    ProcedureCall,
     ReturnItem,
     SetClause,
     Statement,
@@ -58,11 +61,11 @@ from okto_grafx.domain.query.ast import (
     Variable,
     WithClause,
     free_variables,
-    optional_clause_defect,
     walk,
 )
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
+    MAX_CLAUSES,
     MAX_PARAMETERS,
     MAX_TRAVERSAL_HOPS,
 )
@@ -354,79 +357,37 @@ def _relationships_of(query: Query) -> Iterator[RelationshipPattern]:
 
 
 def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
-    """Return the refusal a union earns outside the one admitted shape, or None.
-
-    Asked wherever a union is about to be given a meaning, and for a tree nobody parsed as
-    readily as for one that was. The parser can only build the admitted shape, so for parsed
-    text this asks a question already answered; a caller who hands ``analyze`` or ``build_plan``
-    a statement of its own has answered nothing.
-
-    Nothing is interpolated into the message. A branch of a forged type would be asked to render
-    itself while the refusal was being built, and a refusal that raises reports nothing at all.
-    """
-    if type(statement.all) is not bool:
-        return ("UNION ALL selection must be a boolean.", "all")
-    for branch in (statement.left, statement.right):
+    """Validate the bounded tree before traversing potentially forged ASTs."""
+    pending: list[object] = [statement]
+    seen: set[int] = set()
+    columns: tuple[str, ...] | None = None
+    leaves = 0
+    while pending:
+        branch = pending.pop()
+        if id(branch) in seen:
+            return ("A UNION tree cannot contain cycles or shared branch occurrences.", "branch")
+        seen.add(id(branch))
+        if type(branch) is UnionQuery:
+            if type(branch.all) is not bool:
+                return ("UNION ALL selection must be a boolean.", "all")
+            if len(seen) > MAX_CLAUSES * 2:
+                return ("Too many UNION branches.", "branch")
+            pending.extend((branch.right, branch.left))
+            continue
         if type(branch) is not Query:
-            return (
-                "A UNION joins two reading queries; each branch is a query.",
-                "branch",
-            )
-    for branch in (statement.left, statement.right):
-        if branch.updating_clauses:
-            return (
-                "A UNION joins two queries that only read; neither branch may write.",
-                "branch",
-            )
-        if any(clause.optional for clause in branch.match_clauses):
-            return (
-                "An OPTIONAL MATCH is not composed with UNION in this subset.",
-                "branch",
-            )
-        if any(
-            not hop.types
-            for clause in branch.match_clauses
-            for pattern in clause.patterns
-            for hop in pattern.relationships
-        ):
-            # An untyped hop is admitted as a whole TOP-LEVEL statement and nothing smaller.
-            # Without this a union branch would smuggle it in, because each branch is planned
-            # by a planner of its own that sees only the branch -- and the pair would then
-            # answer for a composition this subset never froze.
-            return (
-                "A relationship without a type is read as a whole query in this subset, not "
-                "as a branch of a UNION.",
-                "branch",
-            )
-        if exact_path_projection(branch) is not None:
-            # Path projection is admitted only as the whole frozen query.  A branch is planned
-            # by a planner of its own, which otherwise sees the branch as a whole statement and
-            # would admit a composition this milestone never measured.
-            return (
-                "A path is projected as a whole query in this subset, not as a branch of a "
-                "UNION.",
-                "branch",
-            )
+            return ("Each UNION branch must be a query.", "branch")
+        leaves += 1
+        if leaves > MAX_CLAUSES:
+            return ("Too many UNION branches.", "branch")
+        if branch.writes:
+            return ("UNION write branches are not yet supported.", "branch")
         if branch.return_clause is None:
-            return (
-                "Each branch of a UNION ends with RETURN, because a union is made of rows.",
-                "branch",
-            )
-    left = statement.left.return_clause
-    right = statement.right.return_clause
-    if left is None or right is None:  # pragma: no cover - the loop above settled this
-        return (
-            "Each branch of a UNION ends with RETURN, because a union is made of rows.",
-            "branch",
-        )
-    if len(left.items) != len(right.items):
-        # The arity is the first thing a reader of the result relies on, and two branches that
-        # disagree about it cannot be reconciled by any rule about types: there is no column to
-        # compare against.
-        return (
-            "Both branches of a UNION return the same number of columns.",
-            "columns",
-        )
+            return ("Each UNION branch must end with RETURN.", "branch")
+        names = branch.return_clause.column_names()
+        if columns is None:
+            columns = names
+        elif names != columns:
+            return ("UNION branches must return the same column names in the same order.", "columns")
     return None
 
 
@@ -438,7 +399,7 @@ def _union_parameters(statement: UnionQuery) -> tuple[str, ...]:
     statement rather than two that happen to run together.
     """
     seen: list[str] = []
-    for branch in (statement.left, statement.right):
+    for branch in statement.branches():
         for name in _Analyzer(branch).run().parameters:
             if name not in seen:
                 if len(seen) >= MAX_PARAMETERS:
@@ -451,7 +412,7 @@ def _union_parameters(statement: UnionQuery) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def analyze_union(statement: UnionQuery) -> QueryAnalysis:
+def analyze_union(statement: UnionQuery, bindings: tuple[Binding, ...] = (), depth: int = 0) -> QueryAnalysis:
     """Return what a union means, refusing one this engine cannot answer.
 
     Each branch is analysed on its own, because each is a whole query: its own bindings, its own
@@ -464,12 +425,15 @@ def analyze_union(statement: UnionQuery) -> QueryAnalysis:
     if refusal is not None:
         message, value = refusal
         raise GrafxPlanError(message, field="union", value=value)
-    left = _Analyzer(statement.left).run()
-    _Analyzer(statement.right).run()
+    branches = statement.branches()
+    analyses = tuple(_Analyzer(branch, bindings, depth).run() for branch in branches)
+    parameters = tuple(dict.fromkeys(name for item in analyses for name in item.parameters))
+    if len(parameters) > MAX_PARAMETERS:
+        raise GrafxPlanError("Too many parameters across UNION branches.", field="parameters")
     return QueryAnalysis(
         statement=statement,
-        parameters=_union_parameters(statement),
-        output_columns=left.output_columns,
+        parameters=parameters,
+        output_columns=analyses[0].output_columns,
     )
 
 
@@ -624,11 +588,12 @@ def exact_path_projection(query: Query) -> PatternPath | None:
     """Return the path when ``query`` is a typed one-hop path projection, else None.
 
     The admitted shape is ``MATCH path = (a:Label)-[r:Type]->``
-    ``(b:Label) RETURN path`` at the AST boundary, optionally followed by ``LIMIT`` and a
-    literal non-negative integer.  Lexical trivia the parser discards --
+    ``(b:Label) RETURN expression`` at the AST boundary, with at least one expression
+    using the path. Aliases and native path functions are permitted, optionally followed
+    by ``LIMIT`` and a literal non-negative integer. Lexical trivia the parser discards --
     whitespace, keyword case and a trailing semicolon -- is deliberately not reconstructed.
     Every semantic field, class, container, flag and identifier is checked exactly so a tree a
-    caller built cannot widen it into ranges, arbitrary joins or path expressions.
+    caller built cannot widen it into ranges or arbitrary joins.
     Names and schema identifiers are caller-defined; catalog binding proves both endpoints.
 
     This recognises and never refuses.  A miss reaches the pre-existing named-path refusal, which
@@ -703,15 +668,23 @@ def exact_path_projection(query: Query) -> PatternPath | None:
         return None
     if returned.limit is not None and not _is_literal_row_count(returned.limit):
         return None
-    if type(returned.items) is not tuple or len(returned.items) != 1:
+    if type(returned.items) is not tuple or not returned.items:
         return None
-    item = returned.items[0]
-    if type(item) is not ReturnItem or item.alias is not None:
+    if any(type(item) is not ReturnItem for item in returned.items):
         return None
-    expression = item.expression
-    if type(expression) is not Variable or type(expression.name) is not str:
+    for item in returned.items:
+        for expression in walk(item.expression):
+            if (isinstance(expression, Property) and isinstance(expression.subject, Variable)
+                    and expression.subject.name == pattern.variable):
+                return None
+            if (isinstance(expression, FunctionCall) and expression.name.upper() == SIZE_FUNCTION
+                    and any(isinstance(arg, Variable) and arg.name == pattern.variable
+                            for arg in expression.arguments)):
+                return None
+    if any(isinstance(node, Variable) and (type(node) is not Variable or type(node.name) is not str)
+           for item in returned.items for node in walk(item.expression)):
         return None
-    if expression.name != pattern.variable:
+    if not any(pattern.variable in free_variables(item.expression) for item in returned.items):
         return None
     return pattern
 
@@ -767,45 +740,32 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
     asked to render itself while the refusal was being built, and a refusal that raises reports
     nothing at all.
     """
+    pipeline = query.clause_pipeline
+    if type(pipeline) is not tuple:
+        return "A query pipeline is an immutable tuple of clauses.", "pipeline"
+    if pipeline:
+        accepted = (MatchClause, WithClause, UnwindClause, SubqueryClause, ProcedureCall,
+                    CreateClause, MergeClause, SetClause, DeleteClause)
+        if any(type(clause) not in accepted for clause in pipeline):
+            return "A query pipeline contains an unknown clause.", "pipeline"
+        if (tuple(c for c in pipeline if isinstance(c, MatchClause)) != query.match_clauses
+                or tuple(c for c in pipeline if isinstance(c, WithClause)) != query.with_clauses
+                or tuple(c for c in pipeline if isinstance(c, (CreateClause, MergeClause, SetClause, DeleteClause))) != query.updating_clauses
+                or next((c for c in pipeline if isinstance(c, UnwindClause)), None) != query.unwind_clause):
+            return "A query pipeline must agree with its clause inventory and write classification.", "pipeline"
     order = query.read_clause_order
     if type(order) is not tuple or any(type(kind) is not str or kind not in ("match", "with") for kind in order):
         return "A reading pipeline records only MATCH and WITH clause kinds.", "clause"
     if order and (order.count("match") != len(query.match_clauses)
                   or order.count("with") != len(query.with_clauses)):
         return "A reading pipeline must include each MATCH and WITH exactly once.", "clause"
-    if order and not correlated_optional_pipeline(query):
-        return "Interleaved projections require correlated optional incident reads.", "clause"
     for clause in query.match_clauses:
         if type(clause.optional) is not bool:
             return (
                 "A MATCH clause records whether it was written OPTIONAL as a boolean.",
                 "optional",
             )
-    optional = [clause for clause in query.match_clauses if clause.optional]
-    if not optional:
-        return None
-    if correlated_optional_pipeline(query):
-        return None
-    if len(query.match_clauses) != 1:
-        return (
-            "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop.",
-            "clause",
-        )
-    if query.unwind_clause is not None or query.with_clauses or query.updating_clauses:
-        return (
-            "An OPTIONAL MATCH begins a query that only reads: no UNWIND, WITH or writing "
-            "clause may accompany it.",
-            "clause",
-        )
-    if query.return_clause is None:
-        # The admitted form is a query that ANSWERS. A statement that only reads and returns
-        # nothing has no rows to extend, and admitting it would make the extension a write the
-        # caller never sees rather than a row it reads.
-        return (
-            "An OPTIONAL MATCH belongs to a query that ends with RETURN.",
-            "clause",
-        )
-    return optional_clause_defect(optional[0])
+    return None
 
 
 def correlated_optional_pipeline(query: Query) -> bool:
@@ -980,8 +940,10 @@ def contains_aggregate(expression: Expression) -> bool:
     return any(is_aggregate(node) for node in walk(expression))
 
 
-def analyze(statement: Statement) -> QueryAnalysis:
+def analyze(statement: Statement, *, bindings: tuple[Binding, ...] = (), depth: int = 0) -> QueryAnalysis:
     """Return what a statement means, refusing one that parses but cannot be answered."""
+    if depth > 16:
+        raise GrafxPlanError("Subqueries may nest at most 16 levels.", field="subquery_depth")
     if isinstance(
         statement,
         (
@@ -995,14 +957,14 @@ def analyze(statement: Statement) -> QueryAnalysis:
             statement=statement, parameters=_parameters_of_schema(statement)
         )
     if type(statement) is UnionQuery:
-        return analyze_union(statement)
+        return analyze_union(statement, bindings, depth)
     if not isinstance(statement, Query):
         raise GrafxPlanError(
             f"A statement of type {type(statement).__name__} cannot be planned.",
             field="statement",
             value=type(statement).__name__,
         )
-    return _Analyzer(statement).run()
+    return _Analyzer(statement, bindings, depth).run()
 
 
 def _parameters_of_schema(statement: Statement) -> tuple[str, ...]:
@@ -1036,11 +998,13 @@ class _Analyzer:
         "_parameters",
         "_similarity",
         "_scores",
+        "_depth",
     )
 
-    def __init__(self, query: Query) -> None:
+    def __init__(self, query: Query, bindings: tuple[Binding, ...] = (), depth: int = 0) -> None:
         self._query = query
-        self._bindings: list[Binding] = []
+        self._bindings: list[Binding] = list(bindings)
+        self._depth = depth
         # The names a WITH stopped carrying, kept only so that reading one below it
         # is refused for what it is rather than as a variable nothing ever bound.
         self._discarded: set[str] = set()
@@ -1070,32 +1034,31 @@ class _Analyzer:
         if refusal is not None:
             message, value = refusal
             raise self._refuse(message, field="clause", value=value)
-        if self._query.unwind_clause is not None and self._query.with_clauses:
-            # The parser refuses this text, but the parser is one door and not the only one:
-            # a tree handed straight to analyze() never passed it, and the meaning of a
-            # statement is decided here.
-            raise self._refuse(
-                "UNWIND hands its elements straight to the clauses below it in this subset; "
-                "WITH may not reshape them.",
-                field="clause",
-                value="WITH",
-            )
-        if self._query.unwind_clause is not None:
-            self._unwind_clause(self._query.unwind_clause)
-        for clause in self._query.ordered_read_clauses():
+        for clause in self._query.ordered_clauses():
+            if isinstance(clause, UnwindClause):
+                self._unwind_clause(clause)
+                continue
             if isinstance(clause, MatchClause):
-                if clause.optional and len(self._query.match_clauses) > 1:
-                    source = clause.patterns[0].nodes[0].variable
-                    self._require_bound(source, "a correlated OPTIONAL MATCH")
-                    for name in (clause.patterns[0].nodes[1].variable,
-                                 clause.patterns[0].relationships[0].variable):
-                        if name and (self._binding(name) is not None or name in self._discarded):
-                            raise self._refuse("An optional incident hop introduces fresh endpoint and relationship names.", field="variable", value=name)
                 self._match_clause(clause)
-            else:
+            elif isinstance(clause, WithClause):
                 self._with_clause(clause)
-        for clause in self._query.updating_clauses:
-            self._updating_clause(clause)
+            elif isinstance(clause, SubqueryClause):
+                self._subquery_clause(clause)
+            elif isinstance(clause, ProcedureCall):
+                for argument in clause.arguments:
+                    self._check_expression(argument, where="a procedure argument")
+                    self._refuse_aggregate(argument, "CALL")
+                for item in clause.yields:
+                    if not isinstance(item.expression, Variable) or self._binding(item.name) is not None:
+                        raise self._refuse("YIELD must bind a new name to a declared output column.", field="yield")
+                    self._bind(item.name, ENTITY_PROJECTED, (), created=False)
+                if clause.predicate is not None:
+                    self._check_expression(clause.predicate, where="YIELD WHERE")
+                    self._refuse_aggregate(clause.predicate, "YIELD WHERE")
+            else:
+                self._updating_clause(clause)
+        if self._query.return_clause is None and not self._query.writes:
+            raise self._refuse("A read query must end in RETURN.", field="clause", value="RETURN")
         grouping, aggregations = self._return_clause()
         if (self._similarity is not None and self._query.with_clauses
                 and any(clause.optional for clause in self._query.match_clauses)):
@@ -1141,6 +1104,45 @@ class _Analyzer:
                     field="predicate",
                     value=clause.predicate.describe(),
                 )
+
+    def _subquery_clause(self, clause: SubqueryClause) -> None:
+        """Check imported scope independently and publish only explicit RETURN columns."""
+        if (type(clause.imports) is not tuple or len(set(clause.imports)) != len(clause.imports)
+                or any(type(name) is not str for name in clause.imports)):
+            raise self._refuse("Subquery imports must be unique variable names.", field="imports")
+        outer = clause.outer_names or clause.imports
+        if len(outer) != len(clause.imports):
+            raise self._refuse("Subquery import mapping has wrong arity.", field="imports")
+        imported = []
+        for source, target in zip(outer, clause.imports, strict=True):
+            self._require_bound(source, "a subquery import")
+            binding = self._binding(source)
+            assert binding is not None
+            imported.append(replace(binding, name=target))
+        inner = analyze(clause.query, bindings=tuple(imported), depth=self._depth + 1)
+        branches = clause.query.branches() if isinstance(clause.query, UnionQuery) else (clause.query,)
+        if any(branch.writes or branch.return_clause is None for branch in branches):
+            raise self._refuse("A returning subquery must be read-only.", field="subquery")
+        exported = clause.output_aliases or inner.output_columns
+        if len(exported) != len(inner.output_columns):
+            raise self._refuse("Subquery output mapping has wrong arity.", field="subquery")
+        for position, name in enumerate(exported):
+            if self._binding(name) is not None:
+                raise self._refuse("A subquery cannot overwrite an outer variable.", field="variable", value=name)
+            carried = None
+            if isinstance(clause.query, Query) and clause.query.return_clause is not None:
+                expression = clause.query.return_clause.items[position].expression
+                if isinstance(expression, Variable):
+                    carried = inner.binding(expression.name)
+            if carried is not None:
+                self._bindings.append(replace(carried, name=name))
+            else:
+                self._bind(name, ENTITY_PROJECTED, (), created=False)
+        for name in inner.parameters:
+            if name not in self._parameters:
+                self._parameters.append(name)
+        if len(self._parameters) > MAX_PARAMETERS:
+            raise self._refuse("Too many parameters across subqueries.", field="parameters")
 
     def _updating_clause(self, clause: object) -> None:
         """Bind and check one clause that writes."""
@@ -1354,6 +1356,11 @@ class _Analyzer:
             binding.name for binding in incoming if binding.name not in names
         )
         self._discarded.difference_update(names)
+        for key in clause.sort_items:
+            self._check_expression(key.expression, where="the ORDER BY of a WITH")
+            self._refuse_aggregate(key.expression, "the ORDER BY of a WITH")
+        self._check_row_window(clause.skip, "SKIP")
+        self._check_row_window(clause.limit, "LIMIT")
         if clause.predicate is not None:
             self._check_expression(clause.predicate, where="the WHERE of a WITH")
             self._refuse_aggregate(clause.predicate, "the WHERE of a WITH")
@@ -1368,19 +1375,8 @@ class _Analyzer:
             assert carried is not None  # _require_bound refused when nothing bound it
             if item.alias is None or item.alias == expression.name:
                 return carried
-            if carried.entity in (ENTITY_NODE, ENTITY_RELATIONSHIP):
-                # A matched row keeps the name its pattern gave it. The planner resolved that
-                # name to a table when the pattern bound it, and a rename here would leave the
-                # scope and the tables disagreeing about which variable names which row.
-                raise self._refuse(
-                    f"WITH carries a matched {carried.entity} under the name its pattern gave "
-                    f"it; {expression.name!r} cannot be renamed to {item.alias!r}.",
-                    field="item",
-                    value=item.describe(),
-                )
-            self._refuse_shadowed_alias(item)
             return Binding(
-                name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False
+                name=item.alias, entity=carried.entity, labels=carried.labels, created=carried.created
             )
         if item.alias is None:
             raise self._refuse(
@@ -1392,7 +1388,6 @@ class _Analyzer:
         self._check_expression(expression, where="a WITH item")
         # Aggregate calls are validated by _check_expression, exactly as in RETURN.
         # The planner inserts the same budgeted grouping operator before WITH.
-        self._refuse_shadowed_alias(item)
         return Binding(
             name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False
         )
@@ -1409,33 +1404,6 @@ class _Analyzer:
                 value=name,
             )
 
-    def _refuse_shadowed_alias(self, item: ReturnItem) -> None:
-        """Refuse an alias that reuses a name this query has already given something.
-
-        Not only a name still in scope: a name an earlier stage DROPPED cannot come back
-        either. One name would then stand for two different things in one query, and everything
-        that answers a question about a name -- the type of ``parts[1]``, say -- would have to
-        know which stage it was standing in before it could answer correctly.
-        """
-
-        if item.alias is None:
-            return
-        existing = self._binding(item.alias)
-        if existing is not None:
-            raise self._refuse(
-                f"WITH would bind {item.alias!r} to {item.expression.describe()} while it "
-                f"already names {existing.describe()}; a stage renames nothing it carries.",
-                field="item",
-                value=item.describe(),
-            )
-        if item.alias in self._discarded:
-            raise self._refuse(
-                f"WITH would bind {item.alias!r} to {item.expression.describe()}, and an "
-                "earlier stage already used that name for something else; a name a stage "
-                "dropped is not reused.",
-                field="item",
-                value=item.describe(),
-            )
 
     def _bind(
         self, name: str | None, entity: str, labels: tuple[str, ...], *, created: bool
@@ -1507,9 +1475,21 @@ class _Analyzer:
 
     def _check_expression(self, expression: Expression, *, where: str) -> None:
         """Check one expression: its variables are bound and its aggregates are not nested."""
+        for name in free_variables(expression):
+            self._require_bound(name, where)
         for node in walk(expression):
-            if isinstance(node, Variable):
-                self._require_bound(node.name, where)
+            if isinstance(node, ListIteration):
+                if node.mode not in ("map", "all", "any", "none", "single", "reduce"):
+                    raise self._refuse("Unknown list iteration mode.", field="iteration")
+                if (node.mode == "reduce") != (node.accumulator is not None and node.initial is not None):
+                    raise self._refuse("A reduction needs an accumulator and initial value.", field="iteration")
+                if node.mode != "reduce" and (node.accumulator is not None or node.initial is not None):
+                    raise self._refuse("Only a reduction declares an accumulator and initial value.", field="iteration")
+                if node.accumulator == node.variable or (node.mode != "map" and node.predicate is not None):
+                    raise self._refuse("Invalid list iteration bindings.", field="iteration")
+                for body in (node.predicate, node.body):
+                    if body is not None and contains_aggregate(body):
+                        raise self._refuse("List-local expressions cannot contain row aggregates.", field="iteration")
             elif isinstance(node, Parameter):
                 self._note_parameter(node.name)
             elif isinstance(node, FunctionCall):
@@ -1525,8 +1505,12 @@ class _Analyzer:
     def _check_call(self, call: FunctionCall, *, where: str) -> None:
         """Check one function call: aggregate nesting, the star form and the two extensions."""
         name = call.name.upper()
-        if name in NATIVE_SCALARS:
+        if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
             self._check_positional_call(call, arguments=1)
+            return
+        if name in NATIVE_SCALARS:
+            scalar_arity(name, len(call.arguments))
+            self._check_positional_call(call, arguments=len(call.arguments))
             return
         if name == "UDF":
             if call.star or call.distinct or call.named_arguments or not 1 <= len(call.arguments) <= 33:
@@ -1586,7 +1570,7 @@ class _Analyzer:
                     value=call.name,
                 )
             return
-        if name == STRING_SPLIT_FUNCTION:
+        if name in (STRING_SPLIT_FUNCTION, "SPLIT"):
             self._check_positional_call(call, arguments=2)
             return
         if name == LABEL_FUNCTION:
@@ -1602,12 +1586,10 @@ class _Analyzer:
             self._check_similarity_call(call)
             return
         raise self._refuse(
-            f"There is no function named {call.name!r} in this dialect; it reads "
-            f"{', '.join(sorted(function.lower() for function in AGGREGATE_FUNCTIONS))}, "
-            f"{COALESCE_FUNCTION.lower()}, {LABEL_FUNCTION.lower()}, "
-            f"{SIZE_FUNCTION.lower()}, "
-            f"{SIMILARITY_FUNCTION.lower()}, {SIMILARITY_SCORE_FUNCTION.lower()} and "
-            f"{STRING_SPLIT_FUNCTION.lower()} and {TIMESTAMP_FUNCTION.lower()}.",
+            f"There is no function named {call.name!r} in the native query catalog. "
+            "Native functions include coalesce, lower, split, abs and similarity. "
+            "See QUERY_LANGUAGE.md for supported functions and COMPOSABLE_QUERIES.md "
+            "for separately registered tabular CALL/YIELD procedures.",
             field="function",
             value=call.name,
             where=where,

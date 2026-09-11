@@ -17,11 +17,9 @@ end, so walking ``scan_all`` and keeping the live versions of the relationship t
 from storage instead of asking the planner and the executor whether they believe they removed
 something.
 
-That distinction is the contract, not an implementation detail. A plain DELETE of a node ends the
-NODE and leaves its edges standing as rows no traversal will follow -- a landing whose snapshot
-cannot see the node is not reached, so the absence it promises is a logical one. DETACH DELETE
-promises the stronger thing: the edges end too, physically, in the same commit. Both are tested
-here, and ``_live_edges`` is what tells them apart.
+The current language contract refuses plain DELETE of a connected node without effects.
+DETACH DELETE ends both the node and its incident edges atomically. Inspecting physical live
+versions proves that refusal did not silently orphan or cascade relationships.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ from collections.abc import Iterator
 import pytest
 
 import okto_grafx
-from okto_grafx.errors import GrafxWriteConflict
+from okto_grafx.errors import GrafxWriteConflict, GrafxQueryError
 
 SCHEMA: tuple[str, ...] = (
     "CREATE NODE TABLE Person(id INT64, tag INT64, PRIMARY KEY(id))",
@@ -178,28 +176,19 @@ def test_a_matched_relationship_can_be_deleted_on_its_own(database: object) -> N
     assert _nodes(database) == (1, 2, 3)
 
 
-def test_a_plain_delete_ends_the_node_and_leaves_its_relationships_standing(
+def test_a_plain_delete_refuses_connected_nodes_without_ending_anything(
     database: object,
 ) -> None:
-    """Without DETACH the absence is logical: the node goes, the edge stays on the pages.
-
-    This is the semantics the engine already had and that DETACH exists to strengthen. It is
-    asserted rather than assumed, because a cascade sneaking into the plain path would be
-    invisible to every query -- the join drops the edge either way.
-    """
+    """Catching a refused DELETE and committing cannot orphan or silently cascade edges."""
     _people(database, 1, 2)
     _knows(database, 1, 2)
 
     with database.begin("write") as transaction:
-        statistics = transaction.execute(
-            "MATCH (p:Person) WHERE p.id = 1 DELETE p"
-        ).statistics
+        with pytest.raises(GrafxQueryError, match="live relationships"):
+            transaction.execute("MATCH (p:Person) WHERE p.id = 1 DELETE p")
 
-    assert statistics["rows_deleted"] == 1
-    assert _nodes(database) == (2,)
-    # Unreachable through the traversal...
-    assert database.execute("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id").rows == ()
-    # ...but still a live row, which is precisely what DETACH would have changed.
+    assert _nodes(database) == (1, 2)
+    assert database.execute("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id").rows == ((1,),)
     assert _live_edges(database) == ((1, 2),)
     assert database.verify("all").findings == ()
 

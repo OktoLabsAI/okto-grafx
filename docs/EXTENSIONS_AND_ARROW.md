@@ -1,5 +1,10 @@
 # Trusted extensions and Arrow import/export
 
+The 0.0.6 development line also supports trusted typed tabular procedures through
+`ExtensionRegistry(procedures=..., procedure_permissions=...)`. See the complete
+[CALL/YIELD contract and example](COMPOSABLE_QUERIES.md#typed-tabular-procedures).
+This is distinct from graph-writing procedures and from read CALL subqueries.
+
 For typed DataFrames and local Parquet files, see [Pandas/Parquet](TABULAR_AND_PARQUET.md).
 Those optional adapters reuse this native batch contract and whole-call savepoint;
 they do not add Cypher external scans or a second graph backup format.

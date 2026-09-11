@@ -1,8 +1,8 @@
 """The query language of Okto Grafx: lexer, parser, syntax, meaning and plan (D3).
 
-The dialect is openCypher as the Kuzu engine spells it, and that choice is the compatibility
-promise this project makes to anyone migrating off the reference engine -- so it is a fixed
-target rather than a design space. What lives here is only the language and the plan: reading
+The fixed semantic reference is openCypher TCK 2024.3, with Grafx's documented typed-table
+model, bounded execution and explicit extensions; full engine compatibility is not promised.
+What lives here is only the language and the plan: reading
 text into a statement, deciding what the statement means, and choosing the operator tree that
 answers it. Nothing in this package opens a page, holds a snapshot or touches a port; the engine
 module :mod:`okto_grafx.engine.query_engine` does that, and it is the only thing that does.
@@ -65,6 +65,10 @@ from okto_grafx.domain.query.ast import (
     SortItem,
     Statement,
     Subscript,
+    ListSlice,
+    ListIteration,
+    ProcedureCall,
+    SubqueryClause,
     UnaryOperation,
     UpdatingClause,
     UnionQuery,
@@ -257,6 +261,10 @@ __all__ = [
     "SortRows",
     "Statement",
     "Subscript",
+    "ListSlice",
+    "ListIteration",
+    "ProcedureCall",
+    "SubqueryClause",
     "Token",
     "TokenKind",
     "TraverseRelationship",

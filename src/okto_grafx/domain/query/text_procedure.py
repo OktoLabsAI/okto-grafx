@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from okto_grafx.domain.errors import GrafxParseError, GrafxUnsupportedOperation
+from okto_grafx.domain.errors import GrafxParseError
 from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.tokens import TokenKind
 
@@ -25,9 +25,7 @@ def text_call(text: str, parameters: Mapping[str, object]) -> tuple[object, ...]
         "search_text",
         "(",
     ):
-        raise GrafxUnsupportedOperation(
-            "Only CALL grafx.search_text is supported.", operation="procedure"
-        )
+        return None  # All other CALL forms belong to the composable query parser.
     position = 5
     arguments = []
     while position < len(tokens):

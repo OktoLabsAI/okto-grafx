@@ -132,11 +132,9 @@ def test_forged_reading_order_is_refused(order):
         analyze(replace(parse(QUERY), read_clause_order=order))
 
 
-def test_dropped_anchor_and_reused_edge_names_are_refused():
-    with pytest.raises(GrafxPlanError):
-        analyze(parse(QUERY.replace("WITH n, COUNT", "WITH COUNT", 1)))
-    with pytest.raises(GrafxPlanError):
-        analyze(parse(QUERY.replace("r_in", "r_out")))
+def test_dropped_names_can_bind_new_entities_in_later_clauses():
+    analyze(parse(QUERY.replace("WITH n, COUNT", "WITH COUNT", 1)))
+    analyze(parse(QUERY.replace("r_in", "r_out")))
 
 
 def test_vector_search_does_not_cross_new_optional_projection_barriers():

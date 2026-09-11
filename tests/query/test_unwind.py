@@ -87,12 +87,12 @@ def test_unwind_returns_scalars_nulls_and_detached_maps_in_written_order(
     )
 
 
-def test_unwind_map_access_is_case_insensitive_and_empty_is_a_noop(
+def test_unwind_map_access_is_case_sensitive_and_empty_is_a_noop(
     database: object,
 ) -> None:
     assert database.execute(
         "UNWIND $rows AS r RETURN r.id", {"rows": [{"ID": "d1"}]}
-    ).rows == (("d1",),)
+    ).rows == ((None,),)
     assert database.execute("UNWIND $rows AS r RETURN r", {"rows": []}).rows == ()
 
 
@@ -103,17 +103,12 @@ def test_unwind_source_uses_the_same_eager_type_resolution_as_other_clauses(
         "UNWIND [CASE WHEN true THEN 1 ELSE 2.5 END] AS r RETURN r"
     ).rows == ((1.0,),)
 
-    with pytest.raises(GrafxPlanError) as raised:
-        database.execute("UNWIND CASE WHEN true THEN [1] ELSE [2] END AS r RETURN r")
-    assert raised.value.details == {
-        "field": "case",
-        "value": "CASE WHEN true THEN [1] ELSE [2] END",
-    }
+    assert database.execute("UNWIND CASE WHEN true THEN [1] ELSE [2] END AS r RETURN r").rows == ((1,),)
 
 
 @pytest.mark.parametrize(
     "carrier",
-    [None, {"id": "d1"}, "d1", b"d1", 7],
+    [{"id": "d1"}, "d1", b"d1", 7],
 )
 def test_unwind_refuses_every_non_list_carrier(
     database: object, carrier: object
@@ -124,17 +119,12 @@ def test_unwind_refuses_every_non_list_carrier(
     assert raised.value.details == {"field": "unwind", "value": "r"}
 
 
-def test_unwind_refuses_missing_and_colliding_map_keys(database: object) -> None:
-    with pytest.raises(GrafxPlanError) as missing:
-        database.execute("UNWIND $rows AS r RETURN r.id", {"rows": [{}]})
-    assert missing.value.details == {"field": "property", "value": "id"}
-
-    with pytest.raises(GrafxPlanError) as collision:
-        database.execute(
-            "UNWIND $rows AS r RETURN r.id",
-            {"rows": [{"id": "d1", "nested": {"x": 1, "X": 2}}]},
-        )
-    assert collision.value.details == {"field": "parameter", "value": "rows"}
+def test_unwind_missing_keys_are_null_and_case_distinct_keys_coexist(database: object) -> None:
+    assert database.execute("UNWIND $rows AS r RETURN r.id", {"rows": [{}]}).rows == ((None,),)
+    assert database.execute(
+        "UNWIND $rows AS r RETURN r.id, r.nested.x, r.nested.X",
+        {"rows": [{"id": "d1", "nested": {"x": 1, "X": 2}}]},
+    ).rows == (("d1", 1, 2),)
 
 
 def test_unwind_alias_is_a_value_and_never_a_set_or_delete_target() -> None:
@@ -160,12 +150,17 @@ def test_unwind_alias_is_a_value_and_never_a_set_or_delete_target() -> None:
         "MATCH (n:Decision) SET n.relevance_score = 1.0 SET n.relevance_score = 2.0",
     ],
 )
-def test_unwind_refuses_every_tail_outside_the_two_frozen_shapes(
+def test_unwind_composes_with_read_and_write_clauses(
     database: object, tail: str
 ) -> None:
-    with pytest.raises(GrafxPlanError) as raised:
-        database.explain(f"UNWIND [1] AS r {tail}")
-    assert raised.value.details == {"field": "clause", "value": "UNWIND"}
+    query = f"UNWIND [1] AS r {tail}"
+    assert "UnwindRows" in _operators(database.explain(query))
+    # Exercise all admitted write forms without retaining mutations across test cases.
+    tx = database.begin("write")
+    try:
+        tx.execute(query)
+    finally:
+        tx.rollback()
 
 
 def test_pulse_batches_plan_a_correlated_primary_key_seek(database: object) -> None:

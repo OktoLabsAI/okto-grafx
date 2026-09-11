@@ -1,4 +1,4 @@
-"""The finite Pulse-corpus ratchet produced by M-PULSE-2O and nothing else."""
+"""The pinned Pulse callsites, with explicit current-language verdict changes."""
 
 from __future__ import annotations
 
@@ -16,10 +16,11 @@ STILL_REFUSED = {
     "ALTER",
     "LOAD CSV",
     "COPY",
+    "UNION",  # Historical probe returns n.id vs m.id, now a deliberate name mismatch.
 }
 
 
-def test_only_path_projection_moves_in_the_frozen_pulse_corpus() -> None:
+def test_path_projection_stays_admitted_and_union_name_change_is_explicit() -> None:
     frozen = json.loads(CORPUS.read_text(encoding="utf-8"))
     raw = frozen["public_raw_contract"]
     probes = raw["probes"]
@@ -28,8 +29,8 @@ def test_only_path_projection_moves_in_the_frozen_pulse_corpus() -> None:
 
     assert frozen["entry_count"] == len(frozen["entries"]) == 97
     assert raw["probe_count"] == len(probes) == 87
-    assert raw["engine_accepted"] == 79
-    assert raw["engine_refused"] == 8
+    assert raw["engine_accepted"] == 78
+    assert raw["engine_refused"] == 9
     assert raw["contract_refused"] == 14
     assert sum(probe["contract_disposition"] == "allowed" for probe in probes) == 73
     assert sum(probe["contract_disposition"] == "refused" for probe in probes) == 14
@@ -41,7 +42,9 @@ def test_only_path_projection_moves_in_the_frozen_pulse_corpus() -> None:
         for probe in probes
         if probe["contract_disposition"] == "allowed"
         and probe["engine_verdict"] == "refused"
-    ] == []
+    ] == ["UNION"]
+    assert by_construct["UNION"]["acceptance_phase"] == "analysis_error"
+    assert "same column names" in by_construct["UNION"]["error"]
     assert projected["probe"] == ADMITTED
     assert projected["contract_disposition"] == "allowed"
     assert projected["engine_verdict"] == "accepted"

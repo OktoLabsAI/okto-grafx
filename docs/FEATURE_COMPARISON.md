@@ -11,6 +11,12 @@ Section 5 identifies the development additions; release availability must be
 checked separately. Local feature/regression/documentation acceptance is recorded
 in the [delivery evidence](reports/V006_NHC_ROUND.md), not inferred from feature names.
 
+The query-language rows additionally identify the **locally validated, unreleased**
+language round. Its [acceptance evidence](reports/V006_QUERY_LANGUAGE_ROUND.md),
+[separate contract](CYPHER_COMPATIBILITY.md) and
+remaining reference divergences supersede the older two-branch query description;
+they do not retroactively change the NHC checkpoint's test evidence.
+
 ## Scope and reading rules
 
 | Product | Baseline and evidence |
@@ -88,7 +94,7 @@ not the same deployment model or isolation contract as Grafx.
 | Capability | Grafx 0.0.6 development | Ladybug | Neo4j |
 | --- | --- | --- | --- |
 | Property graph/schema | Typed node/relationship tables, declared endpoints and primary keys. [Query reference](QUERY_LANGUAGE.md). | Structured property graph with typed tables. [Overview](https://docs.ladybugdb.com/). | Labels/types and property graphs with configurable constraints. [Constraints](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
-| Query language | Bounded Cypher-inspired subset: limited `OPTIONAL MATCH`, two-branch `UNION`/`UNION ALL`, `lower`/`upper`/`trim`/`abs`; no arbitrary `CALL/YIELD`. [Exact surface](QUERY_LANGUAGE.md). | Cypher surface includes subqueries and macros beyond Grafx's closed subset. [Macros](https://docs.ladybugdb.com/cypher/macro/). | Broad Cypher language and procedure ecosystem; queries still need dialect/version validation. [Cypher manual](https://neo4j.com/docs/cypher-manual/current/). |
+| Query language | Typed tables and a bounded language, not full Cypher. The validated 0.0.6 development round adds ordered clauses, correlated typed `OPTIONAL MATCH`, up to 64 `UNION`/`UNION ALL` branches, returning read subqueries, native scalar/list families and trusted typed `CALL/YIELD`. The complete local Grafx regression passed; this does not establish full TCK conformance. No arbitrary graph-writing callbacks. [Exact surface](QUERY_LANGUAGE.md), [fixed compatibility contract](CYPHER_COMPATIBILITY.md). | Cypher surface includes subqueries and macros beyond Grafx's closed subset. [Macros](https://docs.ladybugdb.com/cypher/macro/). | Broad Cypher language and procedure ecosystem; queries still need dialect/version validation. [Cypher manual](https://neo4j.com/docs/cypher-manual/current/). |
 | Stored value breadth | INT64, DOUBLE, STRING, BOOL, BLOB, UUID, TIMESTAMP and declared vectors. Query lists/maps do not imply general nested-column support. [Types](QUERY_LANGUAGE.md#values-and-python-mapping). | Additional integer widths, DECIMAL, DATE/INTERVAL and nested LIST/ARRAY/STRUCT/MAP/UNION families. [Types](https://docs.ladybugdb.com/cypher/data-types/). | A different property/constraint model; do not port typed table DDL unchanged. [Schema](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
 | Scalar/structural indexes | PK, endpoint and identity indexes; custom equality/hash and ordered indexes; optional repeated-key `posting_hash`, explicit sizing and maintenance. [Indexes](INDEXES_AND_VECTORS.md), [posting hash](POSTING_HASH.md). | PK hash/ART indexes and automatic column zone maps; not an identical secondary-index API. [Indexes](https://docs.ladybugdb.com/cypher/indexes/). | Range, text, point and token-lookup indexes, with planner integration. [Index families](https://neo4j.com/docs/cypher-manual/current/indexes/search-performance-indexes/). |
 | Bulk and streamed consumption | Atomic `executemany`, bounded physical scans, cursor ownership and typed batch import/export. [Integration](INTEGRATION.md). | `COPY FROM` and Python data-frame interoperability. [Python](https://docs.ladybugdb.com/client-apis/python/). | Driver transactions/results and server import tooling; boundaries differ from an embedded transaction. [Python driver](https://neo4j.com/docs/python-manual/current/). |
@@ -152,7 +158,7 @@ customer outcomes or new engine guarantees.
 | Posting-hash indexes | Share repeated property keys per physical page and bound repeated-key decoding. | Opt-in index layout; preserves WAL/OCC/verification. Not a universal throughput or write-amplification improvement. [Posting hash](POSTING_HASH.md). |
 | CLI inventories and text/vector/hybrid search | Inspect local schemas, indexes, catalogs and bounded search results from scripts. | Machine-readable local CLI; JS/TS subprocess recipe is not a native network driver. [CLI](CLI.md). |
 | Local SQLite ingestion and offline HTML snapshots | Bring data from a closed local SQLite source into Grafx and inspect/export a graph picture. | Bounded whole-call atomic staging; script-free static HTML, not an interactive graph console. [SQLite](LOCAL_SQLITE_IMPORT.md), [HTML](HTML_SNAPSHOTS.md). |
-| Scalar functions, UNION ALL and topological ordering | Normalize simple values, preserve duplicate rows across two branches and examine directed dependency order. | Closed scalar set; exactly two UNION ALL branches; topological result explicitly reports blocked nodes when cycles prevent a full order. [Queries](QUERY_LANGUAGE.md), [algorithms](GRAPH_PROJECTIONS.md). |
+| Scalar functions, UNION ALL and topological ordering | Normalize values, preserve duplicate rows across branches and examine directed dependency order. | The validated development language round broadens native functions/list expressions and supports up to 64 read branches with identical ordered column names. Topological results explicitly report blocked nodes when cycles prevent a full order. [Queries](QUERY_LANGUAGE.md), [algorithms](GRAPH_PROJECTIONS.md). |
 
 ### Competitor interpretation of these additions
 

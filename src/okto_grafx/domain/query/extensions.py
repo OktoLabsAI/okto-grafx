@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from math import isfinite
 
@@ -10,7 +10,7 @@ from okto_grafx.domain.errors import GrafxConfigurationError, GrafxPlanError, Gr
 from okto_grafx.domain.model.schema import is_identifier
 from okto_grafx.domain.model.value import Timestamp, Uuid, encode_value
 
-__all__ = ["ScalarFunction", "ExtensionRegistry"]
+__all__ = ["ScalarFunction", "TabularProcedure", "ExtensionRegistry"]
 
 _TYPES = {"BOOL": bool, "INT64": int, "DOUBLE": float, "STRING": str,
           "BYTES": bytes, "TIMESTAMP": Timestamp, "UUID": Uuid}
@@ -74,11 +74,93 @@ class ScalarFunction:
 
 
 @dataclass(frozen=True, slots=True)
+class TabularProcedure:
+    """Trusted pure tabular callback: no database handle or implicit write capability.
+
+    The host is responsible for callback purity, just as for ScalarFunction. CALL never
+    imports code, grants filesystem/network access, or makes callback side effects transactional.
+    NULL cells are allowed; every non-NULL cell must have its exact declared scalar type.
+    """
+
+    name: str
+    argument_types: tuple[str, ...]
+    columns: tuple[tuple[str, str], ...]
+    implementation: Callable[..., Iterable[tuple[object, ...]]]
+    required_permissions: frozenset[str] = frozenset()
+    max_rows: int = 10_000
+    max_result_bytes: int = 8 * 1024 * 1024
+    max_value_bytes: int = 1024 * 1024
+
+    def __post_init__(self) -> None:
+        """Validate the complete immutable signature and budgets before registration."""
+        ScalarFunction(self.name, self.argument_types, "BOOL", self.implementation, self.max_value_bytes)
+        if (type(self.columns) is not tuple or not 1 <= len(self.columns) <= 64
+                or any(type(item) is not tuple or len(item) != 2
+                       or type(item[0]) is not str or not is_identifier(item[0])
+                       or type(item[1]) is not str or item[1] not in _TYPES for item in self.columns)
+                or len({item[0] for item in self.columns}) != len(self.columns)):
+            raise GrafxConfigurationError("Invalid tabular output schema.", field="columns")
+        if (type(self.required_permissions) is not frozenset
+                or any(type(item) is not str or not is_identifier(item) for item in self.required_permissions)):
+            raise GrafxConfigurationError("Permissions must be an immutable set of names.", field="required_permissions")
+        for field_name in ("max_rows", "max_result_bytes"):
+            if type(getattr(self, field_name)) is not int or not 1 <= getattr(self, field_name) <= 2**31:
+                raise GrafxConfigurationError("Invalid procedure budget.", field=field_name)
+
+    def invoke(self, arguments: tuple[object, ...]) -> Iterator[tuple[object, ...]]:
+        """Validate inputs/results and close the callback stream on exhaustion or cancellation."""
+        checker = ScalarFunction(self.name, self.argument_types, "BOOL", self.implementation, self.max_value_bytes)
+        if type(arguments) is not tuple or len(arguments) != len(self.argument_types):
+            raise GrafxPlanError("Procedure argument count mismatch.", field="procedure_arity", procedure=self.name)
+        for value, kind in zip(arguments, self.argument_types, strict=True):
+            checker._check(value, kind)
+        stream = None
+        primary_failure: BaseException | None = None
+        try:
+            stream = iter(self.implementation(*arguments))
+            used = 0
+            for count, row in enumerate(stream, start=1):
+                if count > self.max_rows:
+                    raise GrafxQueryBudgetExceeded("Procedure row budget exceeded.", resource="procedure_rows")
+                if type(row) is not tuple or len(row) != len(self.columns):
+                    raise GrafxPlanError("Procedure returned the wrong row shape.", field="procedure_result", procedure=self.name)
+                for value, (_column, kind) in zip(row, self.columns, strict=True):
+                    checker._check(value, kind)
+                    used += len(encode_value(value))
+                if used > self.max_result_bytes:
+                    raise GrafxQueryBudgetExceeded("Procedure result byte budget exceeded.", resource="procedure_bytes")
+                yield row
+        except (GrafxPlanError, GrafxQueryBudgetExceeded) as failure:
+            primary_failure = failure
+            raise
+        except Exception as failure:
+            primary_failure = GrafxPlanError("Trusted procedure callback failed.", field="procedure_callback", procedure=self.name)
+            raise primary_failure from failure
+        except GeneratorExit:
+            raise
+        except BaseException as failure:
+            primary_failure = failure
+            raise
+        finally:
+            try:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+            except Exception as failure:
+                if primary_failure is not None:
+                    primary_failure.add_note(f"Procedure stream cleanup also failed: {type(failure).__name__}.")
+                else:
+                    raise GrafxPlanError("Trusted procedure stream cleanup failed.", field="procedure_cleanup", procedure=self.name) from failure
+
+
+@dataclass(frozen=True, slots=True)
 class ExtensionRegistry:
     """Per-handle immutable trusted allowlist; not a sandbox or a plugin loader."""
 
     scalars: tuple[ScalarFunction, ...] = ()
     trusted: bool = False
+    procedures: tuple[TabularProcedure, ...] = ()
+    procedure_permissions: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         """Require explicit host trust and unique exact names; reject mutable registrations."""
@@ -89,6 +171,13 @@ class ExtensionRegistry:
             raise GrafxConfigurationError("Invalid scalar registry.", field="scalars")
         if len({fn.name for fn in self.scalars}) != len(self.scalars):
             raise GrafxConfigurationError("Duplicate scalar name.", field="scalars")
+        if (type(self.procedures) is not tuple or len(self.procedures) > 128
+                or any(type(item) is not TabularProcedure for item in self.procedures)
+                or len({item.name for item in self.procedures}) != len(self.procedures)):
+            raise GrafxConfigurationError("Invalid procedure registry.", field="procedures")
+        if (type(self.procedure_permissions) is not frozenset
+                or any(type(item) is not str or not is_identifier(item) for item in self.procedure_permissions)):
+            raise GrafxConfigurationError("Invalid procedure permissions.", field="procedure_permissions")
 
     def call_scalar(self, name: str, arguments: tuple[object, ...]) -> object:
         """Invoke only an exact registered name; no module/path or builtin resolution."""

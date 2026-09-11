@@ -6,18 +6,20 @@ from okto_grafx.errors import GrafxError
 from okto_grafx.domain.query.parser import parse
 
 
-def test_duplicates_nulls_widening_and_parameters():
+def test_duplicates_nulls_exact_types_and_parameters():
     with connect(":memory:") as db:
-        assert db.execute("RETURN 1 AS x UNION ALL RETURN 1.0 AS y").rows == (
-            (1.0,),
+        values = db.execute("RETURN 1 AS x UNION ALL RETURN 1.0 AS x").rows
+        assert values == (
+            (1,),
             (1.0,),
         )
-        assert db.execute("RETURN null AS x UNION ALL RETURN null AS y").rows == (
+        assert tuple(type(row[0]) for row in values) == (int, float)
+        assert db.execute("RETURN null AS x UNION ALL RETURN null AS x").rows == (
             (None,),
             (None,),
         )
         result = db.execute(
-            "UNWIND $v AS n RETURN n AS a UNION ALL RETURN $x AS b",
+            "UNWIND $v AS n RETURN n AS a UNION ALL RETURN $x AS a",
             {"v": [1, 1], "x": 2},
         )
         assert result.rows == ((1,), (1,), (2,))
@@ -46,7 +48,7 @@ def test_branch_windows_and_snapshot(tmp_path):
             tx.execute("CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))")
             for i in range(3):
                 tx.execute("CREATE (:N {id:$id})", {"id": i})
-        query = "MATCH (n:N) RETURN n.id AS x ORDER BY x LIMIT 1 UNION ALL MATCH (m:N) RETURN m.id AS y ORDER BY y DESC LIMIT 1"
+        query = "MATCH (n:N) RETURN n.id AS x ORDER BY x LIMIT 1 UNION ALL MATCH (m:N) RETURN m.id AS x ORDER BY x DESC LIMIT 1"
         with db.begin("read") as old:
             with connect(tmp_path / "db") as other, other.begin() as tx:
                 tx.execute("CREATE (:N {id:3})")

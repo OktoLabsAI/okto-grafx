@@ -20,6 +20,7 @@ from okto_grafx.domain.query.ast import (
     UnionQuery,
     NodePattern,
     RelationshipPattern,
+    SubqueryClause,
 )
 from okto_grafx.domain.query.analysis import analyze
 from okto_grafx.domain.query.parser import parse
@@ -125,11 +126,19 @@ def _parsed(query, parameters):
     ):
         raise _bad("parameters_schema")
     statement = parse(query)
-    branches = (
-        (statement.left, statement.right)
-        if isinstance(statement, UnionQuery)
-        else (statement,)
-    )
+    # Audit every nested read, not just the outer RETURN branches. Otherwise a CALL
+    # could hide an unlabelled scan whose dependencies expand after unrelated DDL.
+    branches = []
+    pending = [statement]
+    while pending:
+        branch = pending.pop()
+        if isinstance(branch, UnionQuery):
+            pending.extend(reversed(branch.branches()))
+        else:
+            branches.append(branch)
+            if isinstance(branch, Query):
+                pending.extend(clause.query for clause in branch.ordered_clauses()
+                               if isinstance(clause, SubqueryClause))
     if any(
         not isinstance(b, Query) or b.writes or b.return_clause is None
         for b in branches

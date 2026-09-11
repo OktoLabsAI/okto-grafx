@@ -142,7 +142,6 @@ def test_the_owner_sees_its_own_edge_and_a_rollback_removes_it(
     "query",
     [
         "MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length",
-        "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id, path",
         "MATCH path = (a:A)-[r:R]->(b:B) WHERE path IS NULL RETURN a.id",
         "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id ORDER BY path",
         "MATCH path = (a:A)-[r:R]->(b:B) RETURN size(path) AS n",

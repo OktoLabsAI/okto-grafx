@@ -194,7 +194,7 @@ def test_maximum_string_literal_keeps_its_query_derived_result_column() -> None:
 
 
 def test_case_and_subscript_survive_the_detached_public_plan_boundary() -> None:
-    text = "RETURN CASE WHEN true THEN [10, 20][2] ELSE 0 END AS selected"
+    text = "RETURN CASE WHEN true THEN [10, 20][1] ELSE 0 END AS selected"
     with connect(":memory:") as database:
         plan = database.explain(text)
         result = database.execute(text)

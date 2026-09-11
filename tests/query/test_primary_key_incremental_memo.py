@@ -41,6 +41,7 @@ def _context(stack: QueryStack, txn: TransactionDouble) -> SimpleNamespace:
         engine=stack.engine,
         txn=txn,
         staged_rows=_RevisionList(),
+        phase_rows=(),
         primary_key_memos={},
     )
 
@@ -177,6 +178,7 @@ def test_statement_savepoint_rollback_rebuilds_the_incremental_fold(
         engine=stack.engine,
         txn=txn,
         staged_rows=_RevisionList(),
+        phase_rows=(),
         primary_key_memos={},
     )
     txn.stage_row_insert(table, (1, None, None, None))
@@ -278,6 +280,7 @@ def test_seeded_incremental_fold_matches_the_canonical_reducer(stack: QueryStack
         engine=stack.engine,
         txn=txn,
         staged_rows=_RevisionList(),
+        phase_rows=(),
         primary_key_memos={},
     )
     stored = {
@@ -401,6 +404,7 @@ def test_invalid_sequences_raise_the_same_canonical_exception(
         engine=stack.engine,
         txn=txn,
         staged_rows=_RevisionList(),
+        phase_rows=(),
         primary_key_memos={},
     )
 

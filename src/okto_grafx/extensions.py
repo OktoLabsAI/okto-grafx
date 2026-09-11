@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from okto_grafx.domain.query.extensions import ExtensionRegistry, ScalarFunction
+from okto_grafx.domain.query.extensions import ExtensionRegistry, ScalarFunction, TabularProcedure
 
-__all__ = ["ExtensionRegistry", "ScalarFunction"]
+__all__ = ["ExtensionRegistry", "ScalarFunction", "TabularProcedure"]

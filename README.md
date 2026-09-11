@@ -83,7 +83,7 @@ context exit commits, and an exceptional exit rolls back. See
 | Cooperative read cancellation/deadlines and quiescent orphan-index inventory/removal (0.0.5 development) | [Read control and cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | Embedded Python, machine-readable CLI, configurable ports/adapters | [API](docs/API_REFERENCE.md), [CLI](docs/CLI.md), [ports](docs/PORTS.md) |
 | 0.0.6: CLI schema/index inventory and text/vector/hybrid search; JS/TS recipe | [CLI and contracts](docs/CLI.md) |
-| 0.0.6: native lower/upper/trim/abs and two-branch UNION ALL | [Query language](docs/QUERY_LANGUAGE.md) |
+| 0.0.6: native scalar/list expressions, ordered clauses, multi-branch UNION, returning subqueries and typed CALL/YIELD (locally validated development) | [Composable queries](docs/COMPOSABLE_QUERIES.md), [compatibility](docs/CYPHER_COMPATIBILITY.md) |
 | 0.0.6: bounded SQLite ingestion, offline HTML viewer, topological ordering | [SQLite](docs/LOCAL_SQLITE_IMPORT.md), [HTML](docs/HTML_SNAPSHOTS.md), [algorithms](docs/GRAPH_PROJECTIONS.md) |
 
 Concurrent transactions do not imply lock-free commits: publication has an exclusive
@@ -125,6 +125,8 @@ historical evidence; integrating the library does not require reading the latter
 - [Public API and result types](docs/API_REFERENCE.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [Query language](docs/QUERY_LANGUAGE.md)
+- [Composable queries, CALL/YIELD and migration semantics](docs/COMPOSABLE_QUERIES.md)
+- [Fixed Cypher compatibility target and TCK evidence](docs/CYPHER_COMPATIBILITY.md)
 - [Operations, concurrency, errors and upgrades](docs/OPERATIONS.md)
 - [Performance and measurement boundaries](docs/PERFORMANCE.md)
 - [Feature comparison: Grafx vs Ladybug vs Neo4j](docs/FEATURE_COMPARISON.md)

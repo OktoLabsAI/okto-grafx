@@ -9,6 +9,18 @@ including the on-disk format.
 
 ### Added (0.0.6 development)
 
+- Authorized eight-item language round (locally validated): fixed openCypher
+  TCK 2024.3 inventory; ordered clauses and lexical scopes; correlated typed OPTIONAL
+  MATCH; up to 64 UNION branches; returning read subqueries; native scalar/list and
+  one-hop path functions; atomic composed writes; trusted typed CALL/YIELD.
+  Breaking semantics include zero-based indexing, case-sensitive map keys, lazy
+  CASE/COALESCE without implicit result coercion, exact integer SUM, list ordering,
+  operator precedence and connected-node DELETE refusal. Pulse owner-reference
+  queries migrate together, with Community pinned to Grafx 0.0.6. Persistent formats,
+  multi-reader/writer OCC and WAL durability are unchanged. See the
+  [compatibility contract](docs/CYPHER_COMPATIBILITY.md) and
+  [consumer contracts](docs/COMPOSABLE_QUERIES.md); full Cypher is not claimed.
+
 - Refreshed the Ladybug/Neo4j comparison against the validated 0.0.6 development
   capabilities, with explicit release, concurrency, temporal/search and evidence
   boundaries; the comparison is included in the consumer documentation checks.

@@ -12,7 +12,68 @@ operational hardening and developer experience**. It replaces the execution
 authority of the former evolution/agent/performance/round plans. It does not
 reopen completed work, authorize production data changes or imply release approval.
 
+## Functional parity expansion plan
+
+**Planned; implementation not started.** The user requested a concrete plan for
+the six remaining functional fronts plus the unresolved TCK inventory. The
+[functional parity specification](docs/specs/FUNCTIONAL_PARITY_PLAN.md) defines
+scope, dependencies, acceptance, Pulse migration and checkpoints. This section is
+the single status authority; the specification is not a second execution backlog.
+No release number, branch change or publication is implied by plan approval.
+
+| Order | ID | Planned delivery | Status |
+|---|---|---|---|
+| 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Planned |
+| 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | Planned |
+| 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | Planned |
+| 4 | FP-4 | Returning/unit read-write subqueries and variable-import rules | Planned |
+| 5 | FP-5 | Temporal functions/operations and exact native stored values | Planned |
+| 6 | FP-6 | DECIMAL and typed LIST/MAP/ARRAY/STRUCT persistence and interoperability | Planned |
+| 7 | FP-7 | Authorized transaction-scoped writing procedures | Planned |
+| 8 | FP-8 | Final conformance accounting, paired Pulse validation and public contracts | Planned |
+
+These packages detail CMP-Q/T and the existing extension/type contracts; they do
+not reopen completed bounded rounds or silently add HA, server security, drivers
+or schema-free storage. Multi-reader/multi-writer, WAL/durability and agnostic Pulse
+Core boundaries remain mandatory. Checkpoints: matrix freeze after FP-1; grouped
+query/transaction validation after FP-4; format/upgrade validation after FP-6;
+final severe regression after FP-8. Focused tests run throughout. No moving
+percentage performance gate or rewriting TCK expectations to obtain a pass.
+
+## Authorized query-language compatibility round
+
+Status: **all eight implemented, tested and documented in development; not released**.
+The user authorized items 1–8 in order,
+including breaking query semantics with coordinated Pulse migration and no legacy
+mode. The fixed reference, scope, item-by-item acceptance criteria and reproducible
+TCK inventory are in [the compatibility contract](docs/CYPHER_COMPATIBILITY.md).
+No item is considered closed by parser acceptance alone. Final DoD includes feature
+tests, severe regression of Grafx and affected Pulse consumers, and updated roadmap,
+capabilities, configuration and API documentation.
+
+Validated implementation and consumer contracts: [ordered pipelines, scope, lists,
+UNION/subqueries, tabular procedures and write boundaries](docs/COMPOSABLE_QUERIES.md).
+Added failure evidence covers logical-statement rollback through public result
+validation and independent procedure-stream cleanup. The final complete Grafx
+regression passed **17,174 tests, zero failures/errors, 19 attributed skips** in
+2,545.47 s. Installed-wheel validation passed 150 feature tests, plus four real
+Pulse owner-query tests; 208 Python files matched source/wheel/installed bytes.
+The affected Community regression passed 191 tests and Core stale-sweep units
+passed 23 tests. Pulse's source-reference queries and Community dependency migrate
+together, without Grafx imports in Core or a legacy semantics switch.
+The [consumer integration follow-up](docs/reports/PULSE_V006_INTEGRATION_REGRESSION.md)
+removes the shared Core bootstrap's legacy dependency and validates actual source
+lifecycle writes and routed natural search: **1,575 Community, 111 Core and 252
+frontend tests passed**, plus six repeated cases against the installed paired
+wheels. No failures/errors/skips in those final batches. Remaining direct legacy test-helper
+imports are not a claimed full Core-suite pass. This closes the documented finite round, **not full
+Cypher/TCK conformance**. See the [acceptance record](docs/reports/V006_QUERY_LANGUAGE_ROUND.md)
+for exact receipts, scope, reference failures and remaining language limitations.
+
 ## Index
+
+- [Functional parity expansion plan](#functional-parity-expansion-plan)
+- [Authorized query-language compatibility round](#authorized-query-language-compatibility-round)
 
 September 10, 2026 — `okto-grafx==0.0.5` published on PyPI using the same wheel
 validated and installed in Pulse. See the [publication receipt](docs/reports/PYPI_0_0_5_PUBLICATION.md).

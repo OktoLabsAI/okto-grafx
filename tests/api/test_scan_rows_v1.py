@@ -17,7 +17,7 @@ import pytest
 
 import okto_grafx.engine.database as database_module
 from okto_grafx import ScanCursorV1, ScanPageV1, ScanRowV1, VectorValue, connect
-from okto_grafx.errors import GrafxConfigurationError, GrafxTransactionStateError
+from okto_grafx.errors import GrafxConfigurationError, GrafxQueryError, GrafxTransactionStateError
 from okto_grafx.engine.heap_store import HeapStore
 
 
@@ -337,10 +337,10 @@ def test_scan_is_read_only_and_cursors_are_nominal_scoped_capabilities(
             source.scan_rows_v1("Item", limit=1)
 
 
-def test_relationship_scan_keeps_a_row_hidden_by_a_plain_deleted_endpoint(
+def test_relationship_scan_survives_refused_plain_delete_and_detach_removes_it(
     tmp_path: Path,
 ) -> None:
-    """C5: the physical scan is not a traversal and therefore does not join endpoints."""
+    """Plain DELETE preserves both endpoints/edge; DETACH removes the physical edge too."""
     with connect(tmp_path / "db", page_size=512) as database:
         with database.begin("write") as schema:
             schema.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
@@ -358,7 +358,14 @@ def test_relationship_scan_keeps_a_row_hidden_by_a_plain_deleted_endpoint(
         assert len(original) == 1
 
         with database.begin("write") as writer:
-            writer.execute("MATCH (p:Person {id: 1}) DELETE p")
+            with pytest.raises(GrafxQueryError, match="live relationships"):
+                writer.execute("MATCH (p:Person {id: 1}) DELETE p")
+
+        with database.begin("read") as after_refusal:
+            assert after_refusal.scan_rows_v1("Knows", limit=1).rows == original
+        assert database.execute("MATCH (a:Person)-[r:Knows]->(b:Person) RETURN a.id,b.id").rows == ((1, 2),)
+        with database.begin("write") as writer:
+            writer.execute("MATCH (p:Person {id: 1}) DETACH DELETE p")
 
         assert (
             database.execute(
@@ -368,5 +375,5 @@ def test_relationship_scan_keeps_a_row_hidden_by_a_plain_deleted_endpoint(
         )
         with database.begin("read") as after_delete:
             physical = after_delete.scan_rows_v1("Knows", limit=1)
-        assert physical.rows == original
+        assert physical.rows == ()
         assert physical.next_cursor is None

@@ -304,6 +304,25 @@ def test_one_edge_returns_one_correlated_kuzu_shaped_path(database: object) -> N
     )
 
 
+def test_native_path_functions_return_owned_components(database: object) -> None:
+    prefix = "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN "
+    path = database.execute(prefix + "path").rows[0][0]
+    assert database.execute(prefix + "length(path), nodes(path), relationships(path)").rows == (
+        (1, path["_NODES"], path["_RELS"]),
+    )
+    assert database.execute(prefix + "[n IN nodes(path) | n.id]").rows == ((("d1", "d2"),),)
+    assert database.execute(prefix + "head(relationships(path)).note").rows == (("primary",),)
+    with database.query(prefix + "length(path) AS length").cursor(batch_size=1) as cursor:
+        assert tuple(cursor) == ((1,),)
+
+
+@pytest.mark.parametrize("name", ("length", "nodes", "relationships"))
+def test_path_functions_refuse_forged_values_even_before_empty_stream(database: object, name: str) -> None:
+    assert database.execute(f"RETURN {name}(NULL)").rows == ((None,),)
+    with pytest.raises(GrafxPlanError):
+        database.execute(f"UNWIND [] AS x RETURN {name}($fake)", {"fake": {"_NODES": [], "_RELS": []}})
+
+
 def test_projected_path_refuses_a_catalog_with_the_wrong_target_endpoint() -> None:
     catalog = Catalog()
     for table_id, name in ((1, "Decision"), (2, "Bug")):
@@ -603,7 +622,7 @@ def test_old_snapshot_keeps_path_after_committed_edge_delete(database: object) -
 @pytest.mark.parametrize(
     ("identity", "delete"),
     (
-        ("d1", "DELETE p"),
+        ("d1", "DETACH DELETE p"),
         ("d2", "DETACH DELETE p"),
     ),
 )
@@ -846,10 +865,6 @@ NEAR_MISSES = (
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) MATCH (c:Decision) RETURN path",
     "UNWIND $rows AS x MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) WHERE a.id = 'd1' RETURN path",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path.id",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN size(path)",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path AS p",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path, a.id",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN DISTINCT path",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path ORDER BY a.id",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path SKIP 0",
@@ -885,7 +900,6 @@ REFUSED_ROW_BOUNDS = (
     "RETURN DISTINCT path LIMIT 1",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
     "RETURN path ORDER BY a.id LIMIT 1",
-    "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path AS p LIMIT 1",
     "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) "
     "WHERE a.id = 'd1' RETURN path LIMIT 1",
 )
@@ -1002,13 +1016,11 @@ def test_every_near_miss_stays_outside_the_literal_recogniser(text: str) -> None
     (
         "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path.id",
         "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN size(path)",
-        "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path AS p",
-        "MATCH path = (a:Decision)-[r:supersedes]->(b:Decision) RETURN path, a.id",
     ),
 )
 def test_a_near_miss_that_reads_its_path_keeps_the_typed_refusal(text: str) -> None:
     with pytest.raises(GrafxPlanError):
-        analyze(parse(text))
+        build_plan(parse(text), catalog=_catalog())
 
 
 def test_decorative_path_remains_accepted_without_materialising_a_path() -> None:

@@ -217,10 +217,10 @@ def test_an_item_that_can_refuse_is_still_evaluated_on_the_row_it_refuses(
     assert deferred[0] == "erro"
 
 
-def test_a_map_subject_and_a_missing_column_keep_their_refusals_on_discarded_rows(
+def test_map_missing_keys_and_typed_missing_columns_keep_their_distinct_semantics(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The proof fails for a map binding and for an undeclared column of a labelled match."""
+    """Missing map keys yield NULL; undeclared typed columns still refuse on both paths."""
     unwind = "UNWIND $maps AS m RETURN m.k AS k, m.o AS o ORDER BY m.o ASC LIMIT 1"
     maps = {"maps": [{"k": 1, "o": 1}, {"o": 2}]}
     labelled = "MATCH (n:Doc) RETURN n.id, n.nope ORDER BY n.created_at LIMIT 2"
@@ -230,7 +230,7 @@ def test_a_map_subject_and_a_missing_column_keep_their_refusals_on_discarded_row
             _canonical(scoped)
             canonical = _outcome(database, text, parameters)
         assert deferred == canonical, text
-        assert deferred[0] == "erro", text
+        assert deferred[0] == ("linhas" if text == unwind else "erro"), text
     # A polymorphic match answers null for the undeclared column, on both paths.
     polymorphic = "MATCH (n) RETURN n.id, n.nope ORDER BY n.created_at LIMIT 2"
     assert _outcome(database, polymorphic, {})[0] == "linhas"

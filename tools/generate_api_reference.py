@@ -28,7 +28,7 @@ DTO_SOURCES = {
     "text_import.py": {"TextImportLimits"},
     "parquet.py": {"ParquetExportReport"},
     "arrow.py": {"ArrowVectorType"},
-    "domain/query/extensions.py": {"ScalarFunction", "ExtensionRegistry"},
+    "domain/query/extensions.py": {"ScalarFunction", "TabularProcedure", "ExtensionRegistry"},
     "engine/vector_memory.py": {"VectorMemoryUsage", "VectorTotalMemoryUsage"},
     "engine/key_page_memo.py": {"KeyPageCacheUsage"},
     "migrations.py": {"SchemaMigration", "MigrationReport"},

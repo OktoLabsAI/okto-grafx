@@ -24,7 +24,6 @@ from okto_grafx.domain.query.ast import (
     Query,
     SetClause,
     Subscript,
-    UnaryOperation,
     Variable,
 )
 from okto_grafx.domain.query.limits import (
@@ -314,9 +313,9 @@ def test_multiplication_binds_more_tightly_than_addition() -> None:
     assert expression.describe() == "(1 + (2 * 3))"
 
 
-def test_exponentiation_is_right_associative() -> None:
+def test_exponentiation_is_left_associative() -> None:
     expression = only_item("RETURN 2 ^ 3 ^ 2")
-    assert expression.describe() == "(2 ^ (3 ^ 2))"
+    assert expression.describe() == "((2 ^ 3) ^ 2)"
 
 
 def test_addition_is_left_associative() -> None:
@@ -338,11 +337,10 @@ def test_a_sign_in_front_of_a_number_folds_into_the_literal() -> None:
     assert only_item("RETURN -5") == Literal(value=-5)
 
 
-def test_exponentiation_binds_more_tightly_than_a_sign() -> None:
-    # Folding "-2" first would make this the square of minus two, which is a different number.
+def test_sign_binds_more_tightly_than_exponentiation() -> None:
     expression = only_item("RETURN -2 ^ 2")
-    assert isinstance(expression, UnaryOperation)
-    assert expression.describe() == "-(2 ^ 2)"
+    assert isinstance(expression, BinaryOperation)
+    assert expression.describe() == "(-2 ^ 2)"
 
 
 def test_the_most_negative_integer_is_writable() -> None:
@@ -467,11 +465,10 @@ def test_a_match_after_a_write_is_refused() -> None:
 
 
 def test_the_unsupported_clause_is_named_rather_than_puzzled_over() -> None:
-    # A plain WITH is part of the subset now; the deduplicating one is not, and the refusal
-    # names the clause it read rather than the token it happened to stop on.
+    # WITH DISTINCT is now supported; external LOAD remains outside the language contract.
     with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person) WITH DISTINCT a RETURN a.id")
-    assert failure.value.details["value"] == "WITH DISTINCT"
+        parse("LOAD CSV FROM 'file.csv' AS row RETURN row")
+    assert failure.value.details["value"] == "LOAD"
 
 
 def test_comparisons_do_not_chain() -> None:
@@ -604,7 +601,7 @@ def test_set_must_assign_to_a_property() -> None:
     [
         "RETURN " + "(" * 400 + "1" + ")" * 400,
         "RETURN " + "NOT " * 400 + "true",
-        "RETURN " + "2^" * 400 + "2",
+        "RETURN " + "2^(" * 400 + "2" + ")" * 400,
         "RETURN " + "-" * 400 + "2",
         "RETURN " + "[" * 400 + "1" + "]" * 400,
         "RETURN " + "{a: " * 400 + "1" + "}" * 400,
@@ -623,10 +620,17 @@ def test_nesting_at_the_ceiling_still_parses() -> None:
     assert isinstance(parse("RETURN " + "(" * depth + "1" + ")" * depth), Query)
 
 
-def test_a_long_flat_chain_costs_no_depth_at_all() -> None:
+@pytest.mark.parametrize("operator", ("+", "^"))
+def test_a_long_flat_chain_costs_no_parser_recursion(operator) -> None:
     # Precedence climbing consumes same-precedence operators in a loop, so this is the property
     # that makes an ordinary long predicate parse at all.
-    assert isinstance(parse("RETURN " + " + ".join(["1"] * 2000)), Query)
+    from okto_grafx.domain.query.analysis import analyze
+    from okto_grafx.domain.errors import GrafxPlanError
+    statement = parse("RETURN " + f" {operator} ".join(["1"] * 2000))
+    assert isinstance(statement, Query)
+    with pytest.raises(GrafxPlanError) as failure:
+        analyze(statement)
+    assert failure.value.details["field"] == "depth"
 
 
 def test_too_many_clauses_are_refused() -> None:
