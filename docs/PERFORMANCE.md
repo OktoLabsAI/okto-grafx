@@ -2,12 +2,28 @@
 
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 10, 2026. “Current” means the **latest recorded observation for
+Updated September 11, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
 Current development source is 0.0.6; published baseline is 0.0.5.
 The latest live measurement used
 `0.0.4@fa8f188`, not that later recovery checkpoint. No new live benchmark or
 spec consolidation was performed for this documentation refactor.
+
+## Latest 0.0.6 native range-prefix observation
+
+Windows/Python 3.13, September 11, current development source; one in-memory handle,
+five consecutive `db.execute()` calls, timing only execute (first call includes
+planning, later calls reuse the prepared cache). No machine-idle certification.
+
+| Operation | Latest measured median |
+|---|---:|
+| `UNWIND range(1000000,2000000) AS i WITH i LIMIT 3000 RETURN sum(i)` | 14.03 ms |
+
+The exact result is `3004498500`; only 3,000 input values are consumed, with no
+million-element list allocation. Raw samples: 17.821, 14.734, 14.030, 13.156,
+12.785 ms. This is a scalar query observation, not a Pulse/graph-write benchmark
+or a performance gate. Tests in `tests/query/test_fp2_streamed_range.py` verify
+the carrier path, exact LIMIT pulls, budgets, rollback/reopen and cursor cleanup.
 
 ## Latest 0.0.6 physical posting evidence
 

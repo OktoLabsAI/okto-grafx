@@ -136,6 +136,17 @@ capabilities together with stateful TCK execution. Implementation is authorized;
 FP-1 checkpoint A is recorded and FP-2 is in progress, with hexadecimal/octal
 INT64 literals, source-faithful unaliased headings, expression-result postfix
 planning/binding, adjacent comparison chains and nondeterministic rand implemented.
+The next correction adds strict BOOL/NULL logical operands and type-distinct
+scalar literal expression identity in aggregate projections. It also proves
+native grammar/type error phases and durable reopen for zero-effect write attempts.
+The boolean family has 141 original passes with nine remaining failures; the
+[FP-2 evidence](conformance/FP2_PROGRESS.md) records exact remaining causes,
+owner-wide diagnostic counts and the unresolved NaN profile decision.
+Empty map keys now close the remaining required boolean cases (149 passes; the
+one excluded unlabeled fixture remains unexecuted). Bounded direct UNWIND range
+also passes the original million-span/3,000-row sum without a larger allocation
+quota. Scope/aggregation context errors now have native planning evidence;
+entity-dependent and other required families still prevent package acceptance.
 The four quantifier families involving rand passed all 64 original cases; remaining
 required negative contracts and cross-package dependencies still need work.
 Full functional parity is not yet accepted. The

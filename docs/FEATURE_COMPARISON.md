@@ -25,6 +25,13 @@ postfix access, adjacent comparison chains and nondeterministic `rand()`. The
 [working conformance evidence](conformance/FP2_PROGRESS.md) separates these gains
 from still-failing required cases and later-package work. No new competitor
 execution, full regression or overall parity claim is implied by this update.
+Subsequent focused corrections enforce BOOL/NULL logical operands and preserve
+BOOL/INT64/DOUBLE literal types in aggregate projections. These improve native
+semantics without changing the product-level parity claim or storage guarantees;
+the linked working evidence retains all unresolved cases.
+Empty map keys and bounded streaming direct `UNWIND range` are additionally
+covered by native tests and unchanged reference cases; they introduce neither
+a general unbounded sequence API nor a new cross-product parity claim.
 
 | Product | Baseline and evidence |
 | --- | --- |

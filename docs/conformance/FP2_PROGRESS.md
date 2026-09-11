@@ -102,10 +102,116 @@ deduplicated by test module, not a full-repository or Pulse regression.
 
 ## Remaining work and consumer impact
 
+### Subsequent owner-wide diagnostic and boolean correction
+
+`fp2-owner-current.json` executed the frozen **1,976 FP-2-owned cases**, retaining
+all 3,897 inventory entries. Its pre-boolean/pre-grammar-fix baseline is **1,210
+passed / 24 adapted_passed / 455 failed / 287 not_run within the selection**;
+the other 1,921 cases were outside execution. This is not package acceptance.
+SHA-256: `7760456ba659a4e1a93abbbca4490f00feb61d7825c73522ebc54863a6a1b05d`.
+
+The diagnostic exposed actual non-boolean operands silently becoming UNKNOWN.
+Native AND/OR/XOR/NOT now validate proven static types and bound parameters;
+dynamic operand checks preserve evaluation-time short-circuiting. Explicit
+`boolean_operand_type` and `query_phase` evidence distinguishes planning from
+execution. Late failure retains proven statement isolation. A separate reproduced
+grouping bug returned INT64 for a projected `true` (or BOOL for `1`, depending on
+column order): scalar literal expression identity now includes its type. Numeric
+value equality/grouping is not changed by expression identity.
+
+`fp2-boolean-regression.xml` passed **667 tests**, no failures/errors/skips,
+40.958 s, covering the new contract, comparisons/rand, compiled predicates,
+equality pushdown, query engine, planner and parser. Two former pushdown tests
+expected a statically invalid STRING boolean operand to survive a false prefix;
+they now require planning refusal. Dynamic short-circuit remains separately tested.
+The computed-row fallback test still proves canonical evaluation, now using a
+legitimate computed NULL rather than relying on the fixed BOOL/INT64 collision.
+An additional **400 tests** passed with no failures/errors/skips in
+`fp2-error-boundaries-final.xml` (21.321 s): runner/selection/error evidence,
+public result boundaries, prepared cache, expression dispatch, original headings
+and import/architecture boundaries. Lint and documentation validation passed.
+
+`fp2-boolean-upstream.json` records **141 passed / 9 failed** across the original
+150-case boolean family, before the literal-identity correction. Eight failures
+require empty quoted map keys; one uses an excluded unlabeled fixture. The earlier
+owner diagnostic had 31 boolean passes, 118 failures and one unexecuted fixture.
+No original expectation or exclusion was changed. SHA-256:
+`4cf0928bfbdeff1a9176e369fd5af8633976592bd9b4259df7319700ff6676b2`.
+
+Grammar-token errors now have explicit native evidence; the focused grammar/phase
+suite passed **187 tests** (`fp2-grammar-error-evidence.xml`). The original List6
+family subsequently records **11 passed / 2 failed / 4 not_run** in
+`fp2-list6-grammar-phase.json`: remaining native blockers are stored list-property
+assignment and named variable-length path admission. Those require FP-6 and FP-3;
+the four fixture refusals remain visible, not inferred passes.
+
+The runner also verifies durable reopen after a parsed write attempt with zero
+observed effects, including failed/zero-row writes without setup. An injected
+effect appearing only after reopen fails the verifier. **43 tests** passed in
+`fp2-runner-durable-final.xml`; package selection now requires a verified ledger
+and never drops inventory or filters by observed failure.
+
+One profile inconsistency needs an explicit decision, not a silent exception:
+`Comparison1.feature#0028`–`#0031` and `Comparison2.feature#0012`–`#0015` remain
+required but compare NaN from `0.0 / 0.0`, contrary to checkpoint A's finite
+arithmetic policy. The user has been asked whether to retain that policy with an
+explicit eight-case divergence decision or support NaN expression values without
+storage. Until a decision is recorded, these eight cases stay required and failing;
+neither the ledger nor numeric semantics has been changed to waive them.
+
 All five implementation fronts now have focused feature evidence. Remaining
 required-case failures and cross-package dependencies remain open. General temporal property values and
 entity identity/graph scalars belong to FP-5 and FP-3 respectively. No current
 result justifies claiming all FP-2-owned cases pass.
+
+### Empty keys, scope evidence and streamed ranges
+
+Native map expressions now support empty quoted string keys, indexed/dotted reads,
+parameter maps, NULL/missing-key behavior and source-faithful headings. Empty
+variable/alias/function/schema names still refuse, as do duplicate map keys.
+The lexical test now checks the quoted token and its extent; contextual refusal
+is verified at the parser. Two initial test expectations used mutable lists where
+the public API returns tuples; corrected tests preserve the existing result API.
+An initial missing check for empty node variables was fixed, along with the other
+direct token-to-name paths, rather than accepting empty symbols accidentally.
+
+`fp2-empty-map-keys-final.xml`: **331 passed**, zero failures/errors/skips,
+7.579 s. `fp2-boolean-emptykeys-final.json`: **149 passed**, one unexecuted
+unlabeled fixture already excluded by FP-A-20260911, and 3,747 cases outside
+the family filter. Every required case in this boolean family now passes; that
+does not certify the rest of FP-2 or alter any exclusion.
+
+Analysis records explicit `undefined_variable` and `invalid_aggregation_context`
+reasons with planning-phase proof. Invalid WITH sort aggregation is checked over
+all sort keys before argument scope resolution, so a dropped name cannot mask
+the invalid aggregation. The actual `WithOrderBy2` family has **25 passed / 20
+failed / 38 not_run within the family** in `fp2-withorderby2-context-final.json`;
+remaining row mismatches include the missing detached entity result contract
+(FP-3), and fixture admission remains recorded. They are not evidence that sorting
+has been independently qualified. Source cases/expectations are unchanged.
+
+Direct `UNWIND range(...)` now consumes an allocation-free inclusive sequence;
+the existing 100,000-element cap bounds consumption per incoming row, while
+materialized range results retain total-size admission before allocation. LIMIT
+does not pull an extra discarded row and closes its input on every exit. Existing
+eager write barriers remain authoritative, including final LIMIT 0. Tests prove
+all preceding writes survive output limiting, and a late quota failure rolls back
+the complete statement while preserving an earlier successful statement.
+
+The original `Aggregation3.feature#0002` passes unchanged in
+`fp2-streamed-range-upstream.json`: a 1,000,001-element potential span, only 3,000
+consumed values, exact sum `3004498500`. No query/expected-value substitution or
+budget increase was used. `fp2-streamed-range-focused.xml`: **162 passed**;
+`fp2-map-scope-range-regression.xml`: **587 passed**, zero failures/errors/skips,
+52.312 s, including cursors, early close, rollback/reopen, primary/cleanup failure,
+query engine, aliases, boolean/rand and parser/analysis evidence.
+`fp2-range-query-boundaries.xml` adds **472 passed**, zero failures/errors/skips,
+45.755 s: deferred projection, compiled/equality predicates, path projection,
+optional aggregation, prepared cache and architecture/import boundaries. Lint,
+documentation links/anchors, configuration inventory and public API validation
+also pass. These focused selections are not a new full-repository/Pulse regression.
+The [latest performance observation](../PERFORMANCE.md#latest-006-native-range-prefix-observation)
+records only the current 14.03 ms median, not a comparative speedup or timing gate.
 
 Pulse consumers using explicit `AS`, simple `n.id` headings or positional rows
 retain their contract. Consumers keyed by normalized expression spelling must use

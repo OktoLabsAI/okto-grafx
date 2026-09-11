@@ -221,7 +221,8 @@ def test_a_variable_a_stage_dropped_is_refused_for_being_dropped() -> None:
     with pytest.raises(GrafxPlanError) as raised:
         analyze(parse("MATCH (n:Decision) WITH n.id AS kept RETURN n.id"))
 
-    assert raised.value.details == {"field": "variable", "value": "n"}
+    assert raised.value.details == {"field": "variable", "value": "n",
+                                    "reason": "undefined_variable", "query_phase": "planning"}
     assert "dropped by a WITH clause" in str(raised.value)
 
 
@@ -244,7 +245,11 @@ def test_a_stage_refuses_the_projections_that_have_no_single_meaning(
 ) -> None:
     with pytest.raises(GrafxPlanError) as raised:
         analyze(parse(query))
-    assert raised.value.details == {"field": field, "value": value}
+    expected = {"field": field, "value": value}
+    if field in {"variable", "expression"}:
+        expected.update(reason="undefined_variable" if field == "variable" else "invalid_aggregation_context",
+                        query_phase="planning")
+    assert raised.value.details == expected
 
 
 @pytest.mark.parametrize("keyword", ["SET ref.x = 1", "DELETE ref"])

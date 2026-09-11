@@ -230,10 +230,10 @@ class _Parser:
             return True
         return False
 
-    def _take_name(self, what: str) -> str:
+    def _take_name(self, what: str, *, allow_empty: bool = False) -> str:
         """Consume one name token and return its text, refusing anything else."""
         token = self._current
-        if token.kind is not TokenKind.NAME:
+        if token.kind is not TokenKind.NAME or (not token.text and not allow_empty):
             raise self._unexpected(what)
         self._advance()
         return token.text
@@ -249,6 +249,8 @@ class _Parser:
             offset=token.offset,
             expected=expected,
             found=token.text,
+            reason="unexpected_syntax",
+            query_phase="planning",
         )
 
     def _refuse(self, message: str, **details: object) -> GrafxParseError:
@@ -811,7 +813,7 @@ class _Parser:
         """
         variable: str | None = None
         if named and self._current.kind is TokenKind.NAME and self._at_symbol("=", 1):
-            variable = self._advance().text
+            variable = self._take_name("a path variable")
             self._take_symbol("=")
         nodes = [self._node_pattern()]
         relationships: list[RelationshipPattern] = []
@@ -835,7 +837,7 @@ class _Parser:
         self._take_symbol("(")
         variable: str | None = None
         if self._current.kind is TokenKind.NAME:
-            variable = self._advance().text
+            variable = self._take_name("a node variable")
         labels: list[str] = []
         while self._match_symbol(":"):
             labels.append(self._take_name("a node label"))
@@ -889,7 +891,7 @@ class _Parser:
         """Parse the inside of ``[variable:TYPE|TYPE*1..3 {properties}]``."""
         variable: str | None = None
         if self._current.kind is TokenKind.NAME:
-            variable = self._advance().text
+            variable = self._take_name("a relationship variable")
         types: list[str] = []
         if self._match_symbol(":"):
             types.append(self._take_name("a relationship type"))
@@ -1224,6 +1226,8 @@ class _Parser:
 
     def _name_expression(self, token: Token) -> Expression:
         """Parse a name, which may be a constant, a function call or a variable."""
+        if not token.text:
+            raise self._unexpected("a non-empty variable or function name")
         if not token.quoted:
             word = token.text.upper()
             if word == "TRUE":
@@ -1298,7 +1302,7 @@ class _Parser:
                     and not self._current.quoted
                     and self._at_symbol("=>", 1)
                 ):
-                    argument_name = self._advance().text
+                    argument_name = self._take_name("an argument name")
                     self._advance()
                     self._descend()
                     named.append(
@@ -1331,7 +1335,7 @@ class _Parser:
         self._take_symbol("[")
         if self._current.kind is TokenKind.NAME and self._at_keyword("IN", 1):
             self._descend()
-            variable = self._advance().text
+            variable = self._take_name("a list variable")
             self._take_keyword("IN")
             source = self._expression()
             predicate = self._expression() if self._match_keyword("WHERE") else None
@@ -1369,7 +1373,7 @@ class _Parser:
                         field="entries",
                         value=MAX_MAP_ENTRIES,
                     )
-                key = self._take_name("a map key")
+                key = self._take_name("a map key", allow_empty=True)
                 if key in seen:
                     raise self._refuse(
                         f"The map key {key!r} is written more than once",

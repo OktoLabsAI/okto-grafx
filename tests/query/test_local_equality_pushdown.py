@@ -234,34 +234,35 @@ def test_optional_local_equality_keeps_one_null_extended_row_on_a_miss(
     assert database.execute(statement, {"key": 99}).rows == ((None,),)
 
 
-def test_optional_short_circuit_keeps_the_non_boolean_term_unobserved(
+def test_optional_short_circuit_cannot_hide_a_statically_non_boolean_term(
     database,
 ) -> None:
-    """A false equality retains OPTIONAL's null row without evaluating its right term."""
+    """Known schema types are validated before runtime short-circuiting."""
 
     _create_short_circuit_schema(database)
     with database.begin("write") as txn:
         txn.execute("CREATE (:P {k: 2, name: 'x'})")
 
-    assert database.execute(
-        "OPTIONAL MATCH (p:P) WHERE p.k = 1 AND p.name RETURN p.k, p.name"
-    ).rows == ((None, None),)
+    with pytest.raises(GrafxPlanError) as caught:
+        database.execute("OPTIONAL MATCH (p:P) WHERE p.k = 1 AND p.name RETURN p.k, p.name")
+    assert caught.value.details["query_phase"] == "planning"
+    assert caught.value.details["reason"] == "boolean_operand_type"
 
 
-def test_cartesian_short_circuit_keeps_later_non_boolean_term_unobserved(
+def test_cartesian_short_circuit_cannot_hide_a_statically_non_boolean_term(
     database,
 ) -> None:
-    """A false outer equality is evaluated before a non-boolean inner property."""
+    """An empty join is not evidence that the declared boolean expression is valid."""
 
     _create_short_circuit_schema(database)
     with database.begin("write") as txn:
         txn.execute("CREATE (:P {k: 2, name: 'x'})")
         txn.execute("CREATE (:Q {tag: 'x'})")
 
-    assert (
-        database.execute("MATCH (p:P), (q:Q) WHERE p.k = 1 AND q.tag RETURN p.k").rows
-        == ()
-    )
+    with pytest.raises(GrafxPlanError) as caught:
+        database.execute("MATCH (p:P), (q:Q) WHERE p.k = 1 AND q.tag RETURN p.k")
+    assert caught.value.details["query_phase"] == "planning"
+    assert caught.value.details["reason"] == "boolean_operand_type"
 
 
 def test_a_refusing_term_before_an_equality_cannot_be_optimised_away(

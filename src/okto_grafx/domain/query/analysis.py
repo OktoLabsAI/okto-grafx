@@ -1239,6 +1239,7 @@ class _Analyzer:
                     f"name; {key.expression.describe()} is not one of the returned items.",
                     field="sort_item",
                     value=key.expression.describe(),
+                    reason="invalid_aggregation_context", query_phase="planning",
                 )
             if aggregated or clause.distinct:
                 raise self._refuse(
@@ -1357,8 +1358,12 @@ class _Analyzer:
         )
         self._discarded.difference_update(names)
         for key in clause.sort_items:
-            self._check_expression(key.expression, where="the ORDER BY of a WITH")
+            # No aggregate is valid in this normalized, non-grouped sort context.
+            # Prove that before resolving arguments against the projected scope;
+            # otherwise a dropped argument masks the real invalid aggregation.
             self._refuse_aggregate(key.expression, "the ORDER BY of a WITH")
+        for key in clause.sort_items:
+            self._check_expression(key.expression, where="the ORDER BY of a WITH")
         self._check_row_window(clause.skip, "SKIP")
         self._check_row_window(clause.limit, "LIMIT")
         if clause.predicate is not None:
@@ -1402,6 +1407,7 @@ class _Analyzer:
                 "read it; a WITH below this one can.",
                 field="variable",
                 value=name,
+                reason="undefined_variable", query_phase="planning",
             )
 
 
@@ -1706,6 +1712,7 @@ class _Analyzer:
                 "result rows and nothing here has produced one.",
                 field="expression",
                 value=expression.describe(),
+                reason="invalid_aggregation_context", query_phase="planning",
             )
 
     # --- variables ---------------------------------------------------------------------------
@@ -1747,6 +1754,7 @@ class _Analyzer:
                 "clause; only the names a WITH projects stay in scope below it.",
                 field="variable",
                 value=name,
+                reason="undefined_variable", query_phase="planning",
             )
         known = ", ".join(binding.name for binding in self._bindings) or "none"
         raise self._refuse(
@@ -1754,6 +1762,7 @@ class _Analyzer:
             f"query binds are {known}.",
             field="variable",
             value=name,
+            reason="undefined_variable", query_phase="planning",
         )
 
     def _require_bound_subject(self, target: Property, keyword: str) -> None:

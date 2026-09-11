@@ -69,12 +69,22 @@ present and non-null properties. Endpoint storage columns are not graph properti
 Before/after multiset differences detect additions/removals and changed values,
 not just net object counts. A failed operation must leave the same observed graph.
 Mutation scenarios close and reopen the database and compare its durable state.
+This includes parsed write attempts that fail or affect zero rows, even without
+a setup fixture. The native backend inspects updating clauses, UNION branches and
+nested subqueries; procedure calls conservatively request the same durable check.
+The flag is observation metadata, not permission to write. Parser-refused text
+never opens an execution transaction. Scalar read-only cases do not incur this
+additional reopen. Tests inject effects appearing only after reopen and require
+the verifier to fail rather than accept the earlier empty in-memory observation.
 
 Error equivalence is intentionally strict: lexer/parser/analysis boundaries establish
 compile phase. A narrow mapper covers proven invalid Unicode, integer/float overflow,
 malformed Unicode escapes and unknown functions, using actual native fields/signatures,
 never the expected scenario error. Unmapped details retain their native code. Other
-engine failures report phase `unknown` and cannot satisfy an expected runtime error.
+proven mappings include grammar-token mismatches and property/subscript type errors
+with explicit native reason/phase evidence. Parameter binding belongs to execution
+even when it precedes rows/effects. Unmapped engine failures report phase `unknown`
+and cannot satisfy an expected runtime error.
 Broader phase/detail mapping remains work assigned to the affected packages. Unexpected execution/observation
 exceptions fail the scenario; they are not retrospectively changed to `not_run`.
 
@@ -169,10 +179,16 @@ described in the compatibility document. From the repository root:
 python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp1-inventory.json --ledger-output .grafx-tmp/fp1-draft-ledger.json
 python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp1-check.json --verify-ledger docs/conformance/FP_CASE_LEDGER_V1.json
 python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp1-stateful.json --verify-ledger docs/conformance/FP_CASE_LEDGER_V1.json --execute-stateful --infer-fixture-schema --feature-prefix clauses/call/
+python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp2-owner-current.json --verify-ledger docs/conformance/FP_CASE_LEDGER_V1.json --execute-stateful --infer-fixture-schema --owner FP-2
 python -m pytest tests/tools/test_tck_ledger.py tests/tools/test_tck_stateful.py tests/query/test_compatibility_profile.py
 ```
 
 Execution filters restrict only execution, never inventory. Failed executed cases
+are never excluded based on the owner filter. `--owner FP-1` through `FP-8`
+requires `--verify-ledger` and uses its recorded ownership, intersected with any
+`--feature-prefix`. `execution_selection` records the filters and selected count;
+all 3,897 source cases remain in the report. This filter does not omit declared
+model divergences or turn unexecuted cases into passes. Failed executed cases
 produce a nonzero exit; unexecuted cases remain counted separately. `--execute-reads`
 retains the historical read-only diagnostic; it cannot be combined with
 `--execute-stateful`. These are development tools, not new database settings or

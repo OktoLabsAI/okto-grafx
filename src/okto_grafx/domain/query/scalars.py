@@ -127,6 +127,27 @@ def _decimal_int64(text: str) -> int | None:
     return -integral if negative else integral
 
 
+def range_values(*arguments: object) -> range | None:
+    """Validate range operands and expose an allocation-free inclusive sequence.
+
+    Internal consumers must bound what they materialize or enumerate. This helper
+    never exposes a new stored/public value type or changes the scalar list cap.
+    """
+    scalar_arity("RANGE", len(arguments))
+    scalar_type("RANGE", *(_kind(value) for value in arguments))
+    if any(value is None for value in arguments):
+        return None
+    if any(type(item) is not int for item in arguments):
+        raise _bad("RANGE")
+    start, end = arguments[:2]
+    step = arguments[2] if len(arguments) == 3 else 1
+    if step == 0:
+        raise _bad("RANGE", "range step must not be zero.")
+    if any(not -INT64_MAX - 1 <= item <= INT64_MAX for item in arguments):
+        raise _bad("RANGE", "range operands must fit INT64.")
+    return range(start, end + (1 if step > 0 else -1), step)
+
+
 def scalar_value(name: str, *arguments: object) -> object:
     """Evaluate a closed function, with output admission before large allocations."""
     scalar_arity(name, len(arguments))
@@ -157,18 +178,13 @@ def scalar_value(name: str, *arguments: object) -> object:
     if name in {"PI", "E"}:
         return math.pi if name == "PI" else math.e
     if name == "RANGE":
-        if any(type(item) is not int for item in arguments):
-            raise _bad(name)
-        start, end = arguments[:2]
-        step = arguments[2] if len(arguments) == 3 else 1
-        if step == 0:
-            raise _bad(name, "range step must not be zero.")
-        count = max(0, (end - start) // step + 1) if (end - start) * step >= 0 else 0
+        values = range_values(*arguments)
+        assert values is not None  # NULL propagation already returned above.
+        distance, step = values.stop - values.start, values.step
+        count = max(0, (abs(distance) + abs(step) - 1) // abs(step)) if distance * step > 0 else 0
         if count > MAX_GENERATED_LIST_ELEMENTS:
             raise GrafxQueryBudgetExceeded("Generated list exceeds its element budget.", resource="generated_list")
-        if any(not -INT64_MAX - 1 <= item <= INT64_MAX for item in arguments):
-            raise _bad(name, "range operands must fit INT64.")
-        return tuple(range(start, end + (1 if step > 0 else -1), step))
+        return tuple(values)
     if name in {"HEAD", "LAST", "TAIL", "REVERSE"}:
         if not isinstance(value, (list, tuple)) and not (name == "REVERSE" and type(value) is str):
             raise _bad(name)

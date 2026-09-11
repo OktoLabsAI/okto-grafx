@@ -75,8 +75,9 @@ size(null)` produces the column `size(null)`, not `size(NULL)`. Spaces,
 parentheses and quoted literal spelling inside the expression are preserved;
 leading/trailing trivia outside its token span are not. A returned variable uses
 its logical name without backticks; explicit `AS` always takes precedence.
-Consumers needing stable dictionary keys should use explicit aliases. Normalized
-AST rendering/equality and prepared-cache keys are unchanged.
+Consumers needing stable dictionary keys should use explicit aliases. Source
+spelling metadata does not participate in AST equality or normalized rendering;
+prepared-cache keys continue to use exact query text.
 
 Property and index postfixes compose on expression results, including functions,
 CASE, grouped operations and list comprehensions: `RETURN
@@ -85,6 +86,18 @@ NULL subjects propagate NULL. Provably invalid subject/index types refuse before
 rows; unknown result types are checked when evaluated. Calls are not evaluated
 by planning/binding just to discover a field value.
 
+Map expressions accept the empty string as a key, with both indexed and dotted
+access:
+
+```cypher
+WITH {``: {``: 7}} AS m
+RETURN m[''][''] AS value, m.``.`` AS same_value
+```
+
+Missing empty keys propagate NULL just like other missing map keys. Duplicate
+keys still refuse. This does not permit empty variable, alias, function or schema
+identifiers, and does not change stored column-name validation.
+
 Property/subscript type refusals carry additive `GrafxPlanError.details` evidence:
 `query_phase="planning"` for statically proven invalid types and
 `query_phase="execution"` for parameter binding or row evaluation. Their `reason`
@@ -92,6 +105,32 @@ is `property_subject_type`, `subscript_subject_type`, `map_key_type` or
 `list_index_type`. Parameter validation can precede the first row or write and is
 still execution, not static planning. This is a scoped contract for these
 refusals, not a promise that every error already carries phase evidence.
+Grammar-token mismatches raised by the parser expose
+`GrafxParseError.details.reason="unexpected_syntax"` and
+`query_phase="planning"`, alongside `expected`, `found` and the source location.
+Other parse refusals (such as a resource limit) are not mislabeled as token mismatches.
+Analysis also emits `undefined_variable` for missing/dropped/same-WITH aliases
+and `invalid_aggregation_context` for an aggregate in a non-grouped clause
+context, with `query_phase="planning"`. An invalid WITH sort aggregation is
+checked across all sort keys before resolving those keys against the new scope.
+Other unsupported capabilities are not mislabeled with these reasons.
+
+`AND`, `OR`, `XOR` and `NOT` accept only BOOL or NULL operands. Numbers, strings,
+lists and maps are neither truthy/falsy nor silently converted to unknown. Known
+invalid types refuse at planning, including an otherwise short-circuited branch
+or an empty scan. Bound invalid parameters refuse during execution before rows
+or writes. Unknown row-dependent types are checked only when evaluated: runtime
+short-circuiting still skips an unneeded operand. Refusals carry
+`reason="boolean_operand_type"`, `field="operator"` and the corresponding
+`query_phase`. A late failure rolls back the statement, not earlier successful
+statements in the same transaction. This replaces the previous non-boolean-to-NULL
+behavior; consumers must write explicit predicates instead of implicit truthiness.
+
+Scalar literal expression identity distinguishes BOOL, INT64 and DOUBLE. A
+grouped projection of `true`, `1` and `1.0` preserves their respective result types;
+one literal cannot overwrite another in an expression memo. This does not change
+value comparison: `1 = 1.0` is true and `true = 1` is false, nor does it change the
+documented numeric grouping equivalence for data values.
 
 Equality/ordering operators (`=`, `<>`, `<`, `<=`, `>`, `>=`, plus the `!=` alias)
 form adjacent-pair chains: `1 < x <= 5` means `1 < x AND x <= 5`, not a comparison
@@ -233,8 +272,22 @@ Additional native families in this development round:
 
 NULL propagates through these functions. Empty head/last returns NULL; empty tail
 is empty. Bounds/counts require integers (not BOOL); negative substring/count
-arguments and zero range step refuse. Generated ranges have a hard cap of 100,000
-elements, checked before allocation. Replacement output is bounded by the 1 MiB
+arguments and zero range step refuse. Materialized ranges have a hard cap of
+100,000 elements, checked before allocation. Direct `UNWIND range(...)` uses an
+allocation-free sequence and the same cap on **consumed elements per incoming
+row**; exceeding it fails explicitly. A downstream LIMIT can therefore consume a
+bounded prefix of a larger range. Aliasing/materializing the list first still
+uses the full-list cap. Existing intermediate/result/write budgets and cursor
+cancellation remain authoritative. No new configuration is introduced.
+
+For example, `UNWIND range(1000000,2000000) AS i WITH i LIMIT 3000 RETURN sum(i)`
+returns `3004498500` without allocating a million-element carrier. LIMIT does not
+pull an extra discarded read row, including at zero, and closes its input on
+exhaustion/failure/early close. Final RETURN LIMIT still preserves **all** writes
+before it, including LIMIT 0; a WITH LIMIT before a write controls input rows.
+If the consumed-range or write budget fails, the entire statement rolls back.
+
+Replacement output is bounded by the 1 MiB
 hard query-value character ceiling, with the configured public value limit still
 applied at the boundary. Math domain errors/non-finite results refuse; Grafx does
 not promise the reference engine's NaN/infinity behavior. ROUND currently accepts

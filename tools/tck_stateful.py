@@ -63,6 +63,8 @@ class QueryObservation:
     columns: tuple[str, ...] = ()
     rows: tuple[tuple, ...] = ()
     error: ObservedError | None = None
+    # A zero-effect or failed write still needs durable re-open verification.
+    attempted_write: bool = False
 
 
 class ScenarioBackend(Protocol):
@@ -177,7 +179,7 @@ def run_stateful_case(case: dict, backend: ScenarioBackend) -> dict:
                                               control=family == "control_query")
                 after = backend.snapshot()
                 changed = not after.equivalent(before)
-                mutations |= changed
+                mutations |= changed or observation.attempted_write
                 if observation.error and changed:
                     raise AssertionError("Failed statement leaked graph effects")
                 if family == "control_query" and changed:

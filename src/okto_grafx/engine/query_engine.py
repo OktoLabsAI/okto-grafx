@@ -52,7 +52,9 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
-from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_type, scalar_value
+from okto_grafx.domain.query.scalars import (
+    MAX_GENERATED_LIST_ELEMENTS, NATIVE_SCALARS, range_values, scalar_type, scalar_value,
+)
 from okto_grafx.domain.query.effects import is_deterministic
 
 from collections import OrderedDict
@@ -246,6 +248,7 @@ from okto_grafx.domain.query.planner import (
     SCORE_COLUMN,
     PlannedQuery,
     build_plan,
+    boolean_argument_types,
     case_comparison_type,
     case_result_type,
     coalesce_result_type,
@@ -5881,23 +5884,30 @@ def _unwind_rows(
     writes nothing rather than failing.
     """
 
-    for row in engine._rows(node.child, context):
-        carrier = _evaluate(node.expression, row, context)
-        if carrier is None:
-            continue
-        if not isinstance(carrier, (list, tuple)):
-            named = "null" if carrier is None else type(carrier).__name__
-            message = (
-                f"{node.expression.describe()} is expanded by UNWIND, so it has to be a "
-                f"list; got {named}."
-            )
-            raise GrafxPlanError(
-                message,
-                field="unwind",
-                value=node.alias,
-            )
-        for element in carrier:
-            yield _Row(bindings={**row.bindings, node.alias: element})
+    incoming = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    streamed_range = isinstance(node.expression, FunctionCall) and node.expression.name.upper() == "RANGE"
+    try:
+        for row in incoming:
+            carrier = (range_values(*(_evaluate(argument, row, context) for argument in node.expression.arguments))
+                       if streamed_range else _evaluate(node.expression, row, context))
+            if carrier is None:
+                continue
+            if not isinstance(carrier, (list, tuple, range) if streamed_range else (list, tuple)):
+                raise GrafxPlanError(
+                    f"{node.expression.describe()} is expanded by UNWIND, so it has to be a "
+                    f"list; got {type(carrier).__name__}.", field="unwind", value=node.alias,
+                )
+            for index, element in enumerate(carrier):
+                if streamed_range and index >= MAX_GENERATED_LIST_ELEMENTS:
+                    raise GrafxQueryBudgetExceeded("UNWIND range exceeds its consumed element budget.",
+                                                   resource="generated_list")
+                yield _Row(bindings={**row.bindings, node.alias: element})
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(incoming, failure)
 
 
 def _with_rows(
@@ -12144,12 +12154,26 @@ def _limit_rows(
 ) -> Iterator[_Row]:
     """Produce at most the number of rows the query asked for."""
     wanted = _window(node.count, context, "LIMIT")
-    produced = 0
-    for row in engine._rows(node.child, context):
-        if produced >= wanted:
-            return
-        produced += 1
-        yield row
+    incoming = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    try:
+        # Final RETURN LIMIT 0 cannot suppress preceding writes. The planner's
+        # eager barrier normally runs on the first pull; preserve it explicitly
+        # when no output row is wanted. Read-only LIMIT 0 does not pull at all.
+        if wanted == 0 and _plan_writes(node.child):
+            for _row in incoming:
+                pass
+        for _index in range(wanted):
+            try:
+                row = next(incoming)
+            except StopIteration:
+                return
+            yield row
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(incoming, failure)
 
 
 def _window(expression: Expression, context: _Context, keyword: str) -> int:
@@ -15581,6 +15605,7 @@ def _infer_bound_pulse_expression_type(
             _resolved=resolved,
         )
         if expression.operator == "NOT":
+            boolean_argument_types("NOT", operand_type, phase="execution")
             return ValueType.BOOL
         if operand_type in (ValueType.NULL, ValueType.INT64, ValueType.DOUBLE):
             return operand_type
@@ -15607,10 +15632,10 @@ def _infer_bound_pulse_expression_type(
             owner=owner,
             _resolved=resolved,
         )
+        if expression.operator in ("AND", "OR", "XOR"):
+            boolean_argument_types(expression.operator, left, right, phase="execution")
+            return ValueType.BOOL
         if expression.operator in (
-            "AND",
-            "OR",
-            "XOR",
             "=",
             "<>",
             "<",
@@ -15950,6 +15975,9 @@ def _bound_case_types(
     }
     static_types = _bound_static_types(plan, parameters)
     for expression, _value_type in plan.pulse_expression_types:
+        if (isinstance(expression, UnaryOperation) and expression.operator == "NOT"
+                or isinstance(expression, BinaryOperation) and expression.operator in {"AND", "OR", "XOR"}):
+            _bound_pulse_expression_type(expression, static_types, parameters, owner="boolean operator")
         if isinstance(expression, (ListSlice, ListIteration)):
             _bound_pulse_expression_type(expression, static_types, parameters, owner="slice")
         if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:
@@ -16825,7 +16853,8 @@ def _truth(value: object) -> bool | None:
         return None
     if isinstance(value, bool):
         return value
-    return None
+    raise GrafxPlanError("Boolean operators require BOOL or NULL operands.",
+                         field="operator", reason="boolean_operand_type", query_phase="execution")
 
 
 def _numbers(left: object, right: object) -> bool:

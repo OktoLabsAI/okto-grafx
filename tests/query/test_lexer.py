@@ -254,10 +254,12 @@ def test_a_back_quoted_name_longer_than_the_bound_is_refused() -> None:
     assert failure.value.details["field"] == "name"
 
 
-def test_an_empty_back_quoted_name_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        tokenize("``")
-    assert failure.value.details["field"] == "name"
+def test_an_empty_quoted_token_retains_its_extent_for_contextual_admission() -> None:
+    token = tokenize("``")[0]
+    assert token.text == ""
+    assert token.quoted
+    assert token.offset == 0
+    assert token.end_offset == 2
 
 
 def test_a_name_outside_ascii_is_refused_and_names_the_remedy() -> None:

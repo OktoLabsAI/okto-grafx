@@ -7,6 +7,7 @@ import hashlib
 import okto_grafx
 from okto_grafx.errors import GrafxError, GrafxParseError, GrafxPlanError
 from okto_grafx.domain.query.analysis import analyze
+from okto_grafx.domain.query.ast import ProcedureCall, Query, SubqueryClause, UnionQuery
 from okto_grafx.domain.query.parser import parse
 
 if __package__:
@@ -21,6 +22,31 @@ else:
     from tck_fixtures import infer_fixture_schema
     from tck_errors import compile_error, native_error
     from tck_procedures import procedure_registry
+
+
+def _attempts_write(statement) -> bool:
+    """Conservative AST evidence, including rejected nested/union write shapes.
+
+    CALL is conservatively checked durably; a host registration can acquire write
+    capability as the procedure profile grows. This does not grant permission.
+    Non-query statements are schema operations, not scalar read fast paths.
+    """
+    pending = [statement]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, UnionQuery):
+            pending.extend((node.left, node.right))
+        elif isinstance(node, Query):
+            if node.writes:
+                return True
+            for clause in node.ordered_clauses():
+                if isinstance(clause, ProcedureCall):
+                    return True
+                if isinstance(clause, SubqueryClause):
+                    pending.append(clause.query)
+        else:
+            return True
+    return False
 
 
 class NativeScenarioBackend:
@@ -86,17 +112,19 @@ class NativeScenarioBackend:
             statement = parse(query)
         except GrafxParseError as exc:
             return QueryObservation(error=compile_error(exc))
+        attempted_write = _attempts_write(statement)
         try:
             analyze(statement)
         except (GrafxParseError, GrafxPlanError) as exc:
-            return QueryObservation(error=compile_error(exc))
+            return QueryObservation(error=compile_error(exc), attempted_write=attempted_write)
         try:
             with self.database.begin("read" if control else "write") as transaction:
                 result = transaction.execute(query, parameters)
-                observed = QueryObservation(tuple(result.columns), tuple(result.rows))
+                observed = QueryObservation(tuple(result.columns), tuple(result.rows),
+                                            attempted_write=attempted_write)
             return observed
         except GrafxError as exc:
-            return QueryObservation(error=native_error(exc))
+            return QueryObservation(error=native_error(exc), attempted_write=attempted_write)
 
     def snapshot(self) -> GraphState:
         """Read stored rows, not count queries whose evaluator is under test."""

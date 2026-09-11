@@ -57,6 +57,9 @@ short-circuit, statement rollback and resource bounds remain in effect.
 | CASE/COALESCE | Lazy runtime selection, heterogeneous results allowed, no implicit conversion of the chosen INT64 to DOUBLE |
 | Equality | Recursive three-valued list/map equality; NULL is not equal to NULL in predicates |
 | DISTINCT/grouping | NULLs group together; numerically equal integers/floats share a key; BOOL remains distinct; spill uses the same equality |
+| Boolean operands | AND/OR/XOR/NOT require BOOL or NULL; invalid known/bound types refuse before rows, evaluated dynamic invalid types refuse with statement rollback |
+| Empty map keys | Empty quoted keys and empty string indexing work; missing keys yield NULL; duplicate keys and empty schema/variable names still refuse |
+| Direct UNWIND range | Constant-size carrier; 100,000 consumed elements per input row, with existing row/cancellation budgets; LIMIT may consume a bounded prefix |
 | List ordering | Lexicographic; an earlier unequal element decides before later NULLs; an undecidable compared element yields NULL |
 | Heterogeneous sorting | Lists precede strings, then booleans, then numbers; NULL sorts last ascending; min/max use the same total keys, not Python container repr |
 | Operator precedence | IS NULL/IS NOT NULL bind above comparison and below arithmetic; exponentiation associates left-to-right, with signs binding above exponentiation |

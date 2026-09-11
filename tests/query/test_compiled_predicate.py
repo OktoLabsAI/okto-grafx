@@ -273,8 +273,8 @@ def test_a_computed_row_takes_the_canonical_walk_not_the_closures(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rows, context = _capture(database, monkeypatch)
-    computed_row = _Row(bindings=dict(rows[0].bindings), computed={Literal(value=1): 1})
-    # _evaluate consults the aggregation memo at every node: Literal(True) == Literal(1) there.
+    computed_row = _Row(bindings=dict(rows[0].bindings), computed={Literal(value=True): None})
+    # The canonical path must honor a computed value; closures would read literal True.
     expression = B("AND", LIT[True], LIT[True])
     assert _evaluate(expression, computed_row, context) is None
     assert query_engine_module._predicate_admits(expression, computed_row, context) is False

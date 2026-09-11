@@ -89,11 +89,21 @@ class Expression:
         return type(self).__name__
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class Literal(Expression):
     """A constant written in the query."""
 
     value: Value
+
+    def __eq__(self, other: object) -> bool:
+        """Expression identity preserves literal type, unlike numeric value equality."""
+        if type(other) is not Literal:
+            return NotImplemented
+        return type(self.value) is type(other.value) and self.value == other.value
+
+    def __hash__(self) -> int:
+        """Keep BOOL/INT64/DOUBLE apart in expression-keyed aggregation maps."""
+        return hash((type(self.value), self.value))
 
     def describe(self) -> str:
         """Return the literal as it would be written back."""
@@ -143,7 +153,8 @@ class Property(Expression):
 
     def describe(self) -> str:
         """Return the dotted property reference."""
-        return f"{self.subject.describe()}.{self.key}"
+        key = self.key if self.key else "``"
+        return f"{self.subject.describe()}.{key}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,7 +401,8 @@ class MapEntry:
 
     def describe(self) -> str:
         """Return the entry as it was written."""
-        return f"{self.key}: {self.value.describe()}"
+        key = self.key if self.key else "``"
+        return f"{key}: {self.value.describe()}"
 
 
 @dataclass(frozen=True, slots=True)

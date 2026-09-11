@@ -18,7 +18,12 @@ def compile_error(error) -> ObservedError:
     message = error.message
     detail = error.code
     if isinstance(error, GrafxParseError):
-        if field == "character" and isinstance(value, str) and len(value) == 1 and not value.isascii():
+        if (error.details.get("reason") == "unexpected_syntax"
+                and error.details.get("query_phase") == "planning"
+                and isinstance(error.details.get("expected"), str)
+                and isinstance(error.details.get("found"), str)):
+            detail = "UnexpectedSyntax"
+        elif field == "character" and isinstance(value, str) and len(value) == 1 and not value.isascii():
             detail = "InvalidUnicodeCharacter"
         elif field in {"number", "integer"} and "outside the range a 64-bit integer can hold" in message:
             detail = "IntegerOverflow"
@@ -29,7 +34,13 @@ def compile_error(error) -> ObservedError:
         elif field == "escape" and message.startswith("A numeric string escape needs "):
             detail = "InvalidUnicodeLiteral"
     elif isinstance(error, GrafxPlanError):
-        if field == "function" and message.startswith("There is no function named "):
+        if (field == "variable" and error.details.get("reason") == "undefined_variable"
+                and error.details.get("query_phase") == "planning"):
+            detail = "UndefinedVariable"
+        elif (field in {"expression", "sort_item"} and error.details.get("reason") == "invalid_aggregation_context"
+                and error.details.get("query_phase") == "planning"):
+            detail = "InvalidAggregation"
+        elif field == "function" and message.startswith("There is no function named "):
             detail = "UnknownFunction"
     return ObservedError("SyntaxError", "compile time", detail)
 
@@ -44,6 +55,9 @@ def native_error(error) -> ObservedError:
     reason = error.details.get("reason")
     field = error.details.get("field")
     if isinstance(error, GrafxPlanError) and phase is not None:
+        if field == "operator" and reason == "boolean_operand_type":
+            return ObservedError("SyntaxError" if phase == "compile time" else "TypeError",
+                                 phase, "InvalidArgumentType")
         if field == "property" and reason == "property_subject_type":
             return ObservedError("TypeError", phase, "InvalidArgumentType")
         if field == "subscript" and reason in {"subscript_subject_type", "map_key_type", "list_index_type"}:

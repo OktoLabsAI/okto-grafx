@@ -314,14 +314,8 @@ def _read_quoted_name(scanner: _Scanner) -> Token:
             )
         characters.append(character)
     name = "".join(characters)
-    if not name:
-        raise _refuse(
-            "A back-quoted name may not be empty",
-            line=line,
-            column=column,
-            offset=offset,
-            field="name",
-        )
+    # Empty quoted text is a legitimate map key. Whether this token names a
+    # variable, schema object or map key belongs to parsing/semantic admission.
     return Token(
         kind=TokenKind.NAME,
         text=name,

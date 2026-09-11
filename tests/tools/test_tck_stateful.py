@@ -100,6 +100,49 @@ def test_changed_property_has_removal_and_addition_not_zero_net_effect():
     assert delta["+nodes"] == delta["-nodes"] == 0
 
 
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("durable_leak", [False, True])
+def test_zero_effect_write_attempt_still_checks_reopen(failed, durable_leak):
+    class ZeroEffectBackend(FakeBackend):
+        def execute(self, query, parameters, *, control):
+            return QueryObservation(attempted_write=True, error=(
+                ObservedError("TypeError", "runtime", "InvalidArgumentType") if failed else None))
+
+        def reopen(self):
+            self.calls.append("reopen")
+            if durable_leak:
+                self.current = state(99)
+
+    case = {"steps": [
+        {"text": "an empty graph"},
+        {"text": "executing query:", "argument": {"docString": {"content": "MATCH (n:N) DELETE n"}}},
+        {"text": ("a TypeError should be raised at runtime: InvalidArgumentType" if failed
+                  else "the result should be empty")},
+        {"text": "no side effects"},
+    ]}
+    backend = ZeroEffectBackend()
+    result = run_stateful_case(case, backend)
+    assert result["conformance"] == ("failed" if durable_leak else "passed"), result
+    assert backend.calls == ["admit", "reopen"]
+    if durable_leak:
+        assert "Durable reopen changed graph state" in result["reason"]
+
+
+@pytest.mark.parametrize("query,writes", [
+    ("RETURN 1", False),
+    ("RETURN 1 UNION RETURN 2", False),
+    ("MATCH (n:N) DELETE n", True),
+    ("CREATE (:N) RETURN 1 UNION RETURN 2", True),
+    ("CALL () { CREATE (:N) RETURN 1 AS x } RETURN x", True),
+    ("CREATE NODE TABLE N(id INT64)", True),
+])
+def test_native_write_attempt_classification_covers_composed_queries(query, writes):
+    from okto_grafx.domain.query.parser import parse
+    from tools.tck_native import _attempts_write
+
+    assert _attempts_write(parse(query)) is writes
+
+
 def test_schema_adaptation_never_counts_as_upstream_pass():
     backend = FakeBackend()
     backend.adaptations = ("explicit typed schema",)
@@ -161,10 +204,46 @@ def test_native_late_write_failure_is_observed_through_independent_scan():
         before = backend.snapshot()
         result = backend.execute("CREATE (:N {id: 1}) WITH 1 AS x RETURN x / 0", {}, control=False)
         assert result.error is not None
+        assert result.attempted_write
         assert result.error.phase == "unknown"  # Do not invent TCK runtime equivalence.
         assert backend.snapshot().equivalent(before)
         backend.reopen()
         assert backend.snapshot().equivalent(before)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("query,expectation", [
+    ("CREATE (:N {id:1}) RETURN noSuchFunction(1)",
+     "a SyntaxError should be raised at compile time: UnknownFunction"),
+    ("CREATE (:N {id:1}) WITH $m AS m RETURN m[1]",
+     "a TypeError should be raised at runtime: MapElementAccessByNonString"),
+    ("MATCH (n:N) DELETE n", "the result should be empty"),
+])
+def test_native_zero_effect_write_reopens_even_without_a_fixture(monkeypatch, query, expectation):
+    backend = NativeScenarioBackend(schema=("CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))",))
+    reopened = []
+    original = backend.reopen
+
+    def record_reopen():
+        original()
+        reopened.append(True)
+
+    monkeypatch.setattr(backend, "reopen", record_reopen)
+    case = {"steps": [
+        {"text": "an empty graph"},
+        {"text": "parameters are:", "argument": {"dataTable": {"rows": [
+            {"cells": [{"value": "m"}, {"value": "{a: 1}"}]},
+        ]}}},
+        {"text": "executing query:", "argument": {"docString": {"content": query}}},
+        {"text": expectation},
+        {"text": "no side effects"},
+    ]}
+    try:
+        observed = run_stateful_case(case, backend)
+        assert observed["conformance"] == "adapted_passed", observed
+        assert reopened == [True]
+        assert backend.snapshot() == GraphState()
     finally:
         backend.close()
 

@@ -16,6 +16,22 @@ Native query text also supports adjacent comparison chains and `rand()`; the
 evaluation placement, random range and durable-view refusal. Randomness is
 injected internally by assembly, not a new `connect()` setting or public seed API.
 
+The [boolean/error contract](QUERY_LANGUAGE.md#values-and-python-mapping) now
+rejects non-BOOL/non-NULL logical operands rather than silently yielding NULL.
+Known types are checked at planning, bound parameters before execution effects,
+and dynamic values when evaluated. Additive error details expose the proven phase
+for these refusals. Scalar literal projection identity also preserves BOOL/INT64/
+DOUBLE independently in aggregate results. No new public signature or setting is
+introduced; callers relying on non-boolean operands must supply explicit predicates.
+
+Empty string map keys are supported in native expressions, parameter maps and
+result maps; returned list/key collections keep their existing immutable tuple
+representation. Direct `UNWIND range(...)` streams a bounded prefix without a new
+public value type. Materialized range results still have their list cap. Scope
+and invalid-aggregation refusals have additive planning-phase evidence. See the
+[query contract](QUERY_LANGUAGE.md#values-and-python-mapping) for examples,
+per-carrier consumption limits and LIMIT/write behavior.
+
 0.0.6 NHC adds `TextMatchPositions` and `TemporalCompactionReport` at the root.
 `okto_grafx.temporal_diff` exports `diff_graph`, `TemporalDiff`,
 `TemporalSchemaChange`, `TemporalRowChange` and `TemporalPropertyChange`.

@@ -70,6 +70,22 @@ The publication checkpoint combines the feature and error-phase suites:
 pass with explicit native type-error phase evidence; other required-case gaps
 remain open. See the working evidence above for scope and receipts.
 
+The next FP-2 correction makes boolean operand types strict (known types at
+planning, parameters before effects, dynamic types at evaluation) and prevents
+BOOL/INT64/DOUBLE literal memo collisions in grouped projections. The focused
+query/planner/compiled-predicate regression passed **667 tests**; the original
+boolean family records **141 passes**, with remaining cases/dependencies retained.
+The owner-wide diagnostic, durable zero-effect-write checks and the unresolved
+eight-case NaN policy inconsistency are recorded in the FP-2 working evidence.
+
+Further FP-2 closure: empty map keys, explicit scope/aggregation error evidence
+and bounded streaming `UNWIND range` are implemented. All **149 required boolean
+family cases** pass; the original million-span/3,000-row sum also passes without
+materializing the full list or raising its quota. The combined map/scope/range
+regression passed **587 tests**, including cursor cleanup and write rollback.
+This does not close the full FP-2 package: entity/value dependencies and remaining
+required cases stay tracked in the same working evidence.
+
 ## Authorized query-language compatibility round
 
 Status: **all eight implemented, tested and documented in development; not released**.

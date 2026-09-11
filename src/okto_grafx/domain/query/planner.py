@@ -280,6 +280,14 @@ def case_comparison_type(
     return
 
 
+def boolean_argument_types(operator: str, *types: ValueType | None, phase: str = "planning") -> None:
+    """Reject proven non-boolean operands, without evaluating unknown values."""
+    if any(kind not in (None, ValueType.NULL, ValueType.BOOL) for kind in types):
+        raise GrafxPlanError("Boolean operators require BOOL or NULL operands.",
+                             field="operator", value=operator,
+                             reason="boolean_operand_type", query_phase=phase)
+
+
 def subscript_argument_types(
     expression: Subscript, subject_type: ValueType | None, index_type: ValueType | None,
     *, phase: str = "planning",
@@ -1671,6 +1679,9 @@ class _Planner:
             # result type to an enclosing CASE and STRING_SPLIT(...)[n] exposes STRING.
             for node in reversed(tuple(walk(expression))):
                 marker = id(node)
+                if (isinstance(node, UnaryOperation) and node.operator == "NOT"
+                        or isinstance(node, BinaryOperation) and node.operator in {"AND", "OR", "XOR"}):
+                    self._pulse_expression_type(node, owner=node.describe())
                 if isinstance(node, Property):
                     subject = node.subject
                     # Graph bindings have their schema/property validation path.
@@ -1848,13 +1859,16 @@ class _Planner:
             return ValueType.BOOL
         if isinstance(expression, UnaryOperation):
             if expression.operator == "NOT":
+                boolean_argument_types("NOT", self._pulse_expression_type(expression.operand, owner=owner))
                 return ValueType.BOOL
             return self._pulse_expression_type(expression.operand, owner=owner)
         if isinstance(expression, BinaryOperation):
+            if expression.operator in ("AND", "OR", "XOR"):
+                boolean_argument_types(expression.operator,
+                                       self._pulse_expression_type(expression.left, owner=owner),
+                                       self._pulse_expression_type(expression.right, owner=owner))
+                return ValueType.BOOL
             if expression.operator in (
-                "AND",
-                "OR",
-                "XOR",
                 "=",
                 "<>",
                 "<",

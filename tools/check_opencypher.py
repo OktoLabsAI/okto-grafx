@@ -204,6 +204,8 @@ def main() -> int:
     parser.add_argument("--infer-fixture-schema", action="store_true",
                         help="Record typed single-label fixture schema adaptation; never rewrite tested queries")
     parser.add_argument("--feature-prefix", default="", help="Restrict execution, not inventory coverage")
+    parser.add_argument("--owner", choices=[f"FP-{number}" for number in range(1, 9)],
+                        help="Restrict execution to an owner in --verify-ledger, retaining the full inventory")
     parser.add_argument("--ledger-output", type=Path,
                         help="Create all-case ownership/expectation ledger; does not freeze exclusions")
     parser.add_argument("--verify-ledger", type=Path,
@@ -213,6 +215,8 @@ def main() -> int:
         parser.error("Choose either read-only diagnostics or stateful execution")
     if args.infer_fixture_schema and not args.execute_stateful:
         parser.error("--infer-fixture-schema requires --execute-stateful")
+    if args.owner and not args.verify_ledger:
+        parser.error("--owner requires --verify-ledger")
     report = inventory(args.checkout)
     # Also support direct script execution (tools/ is then sys.path[0]).
     if args.ledger_output or args.verify_ledger:
@@ -228,13 +232,19 @@ def main() -> int:
             saved = json.loads(args.ledger_output.read_text(encoding="utf-8"))
             if saved.get("status") == "frozen_checkpoint_a":
                 parser.error("Refusing to replace a frozen ledger with a new draft")
+    selected_ids = {case["id"] for case in report["cases"]
+                    if case["id"].startswith(args.feature_prefix)}
+    if args.owner:
+        selected_ids &= {case["id"] for case in ledger["cases"] if case["owner"] == args.owner}
+    report["execution_selection"] = {"feature_prefix": args.feature_prefix,
+                                     "owner": args.owner, "case_count": len(selected_ids)}
     if args.execute_reads:
         import okto_grafx
 
         with tempfile.TemporaryDirectory(prefix="grafx-tck-") as temporary:
             with okto_grafx.connect(Path(temporary) / "db") as database:
                 for case in report["cases"]:
-                    if case["id"].startswith(args.feature_prefix):
+                    if case["id"] in selected_ids:
                         with database.begin("read") as transaction:
                             case.update(run_read_case(case, transaction))
         report["execution_summary"] = dict(Counter(case["conformance"] for case in report["cases"]))
@@ -246,7 +256,7 @@ def main() -> int:
             from tck_native import NativeScenarioBackend
             from tck_stateful import run_stateful_case
         for case in report["cases"]:
-            if case["id"].startswith(args.feature_prefix):
+            if case["id"] in selected_ids:
                 backend = NativeScenarioBackend(infer_schema=args.infer_fixture_schema,
                                                 graph_fixtures=report["graph_fixtures"])
                 try:

@@ -236,6 +236,12 @@ custom provider registration and runtime configuration errors are unchanged.
 
 ## Types, ranges and persistence
 
+There is no new setting for range streaming: the native generated-list ceiling
+remains 100,000 elements. Materialized `range(...)` checks total size before
+allocation; direct `UNWIND range(...)` checks consumed elements per incoming row.
+The existing `max_intermediate_rows`, result/write limits and read cancellation
+still apply. See [range and LIMIT semantics](QUERY_LANGUAGE.md#values-and-python-mapping).
+
 Integer settings reject booleans. Time settings accept finite positive int/float
 seconds, not booleans, infinity or NaN. Optional integer limits accept `None` or a
 strictly positive integer: zero does **not** mean unlimited. Strings are
