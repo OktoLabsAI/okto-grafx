@@ -88,7 +88,6 @@ def test_optional_degrees_preserve_custom_full_read_hook(graph, monkeypatch):
 
 
 @pytest.mark.parametrize("query", [
-    "MATCH (n:A) OPTIONAL MATCH (n)-[r]->(target) OPTIONAL MATCH (target)<-[r2]-() RETURN n.id",
     "MATCH (n:A) OPTIONAL MATCH (n)-[r]->(target) RETURN *",
 ])
 def test_unsupported_shape_retains_parse_refusal(graph, monkeypatch, query):
@@ -98,6 +97,18 @@ def test_unsupported_shape_retains_parse_refusal(graph, monkeypatch, query):
     with pytest.raises((GrafxParseError, GrafxPlanError)) as oracle:
         graph.execute(query)
     assert candidate.value.to_dict() == oracle.value.to_dict()
+
+
+def test_composed_polymorphic_optional_keeps_endpoint_validation(graph, monkeypatch):
+    query = ("MATCH (n:A) OPTIONAL MATCH (n)-[r]->(target) "
+             "OPTIONAL MATCH (target)<-[r2]-() RETURN n.id")
+    candidate = graph.execute(query)
+    monkeypatch.setattr(qe, "_unused_optional_landings", lambda _: frozenset())
+    oracle = graph.execute(query)
+    # Three targets, two outgoing parallel edges and two returning edges each.
+    # Different MATCH clauses may reuse the same physical relationship.
+    assert candidate.rows == oracle.rows == (("a",),) * 12
+    assert candidate.columns == oracle.columns
 
 
 def test_unused_optional_vector_still_detects_corruption(graph, monkeypatch):

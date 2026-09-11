@@ -40,7 +40,7 @@ Python `execute()` call; CLI multi-statement arguments remain separate statement
 | `UNION`, `UNION ALL` | Up to 64 read-only RETURN branches; same ordered column names, heterogeneous values and qualified node/edge entities, no implicit numeric conversion; one duplicate policy per chain |
 | CALL subqueries | Independent or explicitly imported returning read subqueries; maximum nesting 16 |
 | Typed CALL/YIELD | Trusted per-handle tabular registry, explicit permissions/budgets, composed execution |
-| Path projection | Native `PathValue` for typed bounded ranges, zero length and multiple segments in either direction; composed MATCH/OPTIONAL MATCH, aliases, subqueries, `length`, `nodes`, `relationships`. Untyped/type-alternative capture remains pending |
+| Path projection | Native `PathValue` for typed, untyped and alternative-type bounded ranges, zero length and multiple segments in either direction; composed MATCH/OPTIONAL MATCH, aliases, subqueries, `length`, `nodes`, `relationships`; omitted upper bounds preserve explicit resource refusal |
 
 `MATCH` in a write transaction sees that owner's earlier node inserts, updates and deletes. A
 dirty node table plans a scan plus the private overlay instead of consulting an index that only
@@ -285,6 +285,98 @@ are read under the existing transaction; independent readers retain their
 snapshot. Existing value, memory, row and cancellation budgets apply. No new
 connection option or storage format is introduced.
 
+### Untyped and alternative-type single hops
+
+`MATCH (a)-[r]->(b)` reads all eligible relationship tables; `[r:A|B]` selects
+the declared alternatives. Repeating a type does not repeat its edges; distinct
+parallel edges remain distinct. All three directions, anonymous bindings, typed
+or polymorphic endpoints, filters, node property maps and bound targets work in
+composed MATCH/OPTIONAL, WITH/UNWIND, returning subqueries and UNION. A NULL bound
+endpoint is not a fresh variable. An undirected self-loop is one physical match.
+
+```cypher
+MATCH p=(a:Person {id:$id})-[r:KNOWS|MENTORS]->(b)
+RETURN p, type(r), labels(b), properties(r)
+```
+
+Named paths can concatenate these single-hop segments with other admitted
+segments; the same relationship cannot be reused within a MATCH clause.
+Separate MATCH clauses may reuse it. A written `*1..1` binds a relationship
+tuple, whereas an unwritten single hop binds one relationship. Bounded variable
+ranges also work across untyped/alternative types as described below. Inline
+relationship property maps remain pending; write property conditions in WHERE.
+Node tables remain typed.
+
+Missing properties on polymorphic bindings yield NULL; incompatible declared
+property families refuse before streaming. Missing alternatives contribute no
+edges, while a corrupt/missing endpoint declaration is not silently discarded.
+`TraverseAnyRelationship` draws upstream input once and shares snapshot, owner
+overlay, intermediate rows, expansion/path, memory and cancellation limits.
+Indexed anchors retain their access plan; unbound polymorphic roots can scan node
+tables. This does not claim general cross-table index selection. Native entity
+and path DTOs preserve qualified identity through cursor, sort and spill.
+No Pulse-specific names, new option, storage format or transaction are required.
+
+### Heterogeneous bounded relationship ranges
+
+`MATCH p=(a)-[r:A|B*0..5]->(b) RETURN p,r` can change relationship and node tables
+at every hop. Omitting types (`[r*0..5]`) selects all eligible relationship tables.
+Incoming/undirected ranges, anonymous nodes/edges, repeated nodes and cycles are
+supported, but each physical relationship can occur only once in a MATCH trail.
+Same table-local IDs in different tables are distinct. Parallel edges stay distinct;
+an undirected self-loop is one edge. Depth-first output has no shortest-path or
+implicit ordering guarantee: use ORDER BY when order matters.
+
+The final target label/property or previously bound target filters completed
+paths; it must not prune an intermediate node in a different table. Minimum zero
+includes a real anchor path even when its node table is unrelated to the selected
+edge types. A NULL anchor/destination is never rebound. Multiple captured segments
+concatenate without duplicating junction nodes; clause-wide edge uniqueness still
+applies. Explicit counts stay within 0..30. Written range variables are tuples of
+native relationships, including an empty tuple for zero hops; list typing survives
+WITH, subquery imports/exports and proved list-or-NULL UNION outputs.
+
+`TraverseRelationshipAlternatives` selects schema-reachable tables and uses the
+same depth-first iterator stack, snapshot/owner overlays and expansion/path quotas
+as typed ranges. The final label does not limit intermediate schema reachability.
+The engine retains one active sibling iterator per depth, not all complete paths
+in a breadth-wide queue. Node/path values also retain normal memory/value limits.
+Cursor close/cancellation closes active iterators. Late statement errors preserve
+rollback; earlier successful statements remain only under the usual proof.
+
+For `*`, `*n..` or `*..`, the 30-hop count is a resource ceiling, not a silent
+answer bound. An eligible unused edge at hop 31 raises `GrafxQueryBudgetExceeded`
+with `field=max_traversal_hops`, `limit=30`, `observed=31`. Schema selection includes
+types first reachable by that completeness probe. Owner deletions and old reader
+snapshots apply to it as to ordinary expansion. LIMIT/cursor close may stop before
+the probe; ORDER BY may require it. Explicit `*0..30` deliberately excludes hop 31.
+No new setting, storage format or application-specific behavior is introduced.
+
+### Absent tables in read patterns
+
+A missing node label or positive-length relationship type in a read pattern
+means no match, not a catalog error or implicit table creation. `MATCH
+(n:Missing) RETURN count(*)` returns `0`; `OPTIONAL MATCH (n:Missing) RETURN
+properties(n)` returns one NULL on an otherwise empty input pipeline. Optional
+failure null-extends only new bindings and preserves incoming values, including
+already-bound NULLs. Static name, entity-kind and supported-syntax checks still
+apply even when a pattern cannot produce rows. Writes continue to require schema.
+
+An absent relationship type is not necessarily an empty variable-length pattern:
+`MATCH p=(a:Person)-[:Missing*0..]->(b:Person) RETURN p` can match the zero-edge
+path at each eligible anchor. `a` and `b` must have the same qualified identity;
+an already-bound NULL destination never becomes a fresh node. Node label and
+property predicates still apply. A captured path has one node and no edges, or
+retains the preceding path when this is a zero-edge continuation. Positive
+minimum ranges have no matches. No relationship table or fake endpoint is created.
+
+EXPLAIN exposes `ZeroHopRelationship` for that zero-edge branch. It preserves
+indexed anchor access and uses the shared `max_traversal_paths` and cancellation
+budgets without relationship expansion. Empty positive patterns still consume
+upstream operations, so they cannot suppress earlier writes in the same statement.
+Statement errors retain rollback; plans are invalidated by subsequent schema
+creation. These semantics add no option and do not relax the typed storage model.
+
 `OPTIONAL MATCH (n:Person) RETURN n.id` produces a null-extended row when no
 candidate qualifies. Typed optional patterns can correlate with incoming values;
 all new bindings are NULL only if the complete optional clause fails. The existing
@@ -301,8 +393,8 @@ anchor may be interleaved with WITH projections/aggregations; carry the anchor
 forward. Aggregate one degree before the next expansion to avoid a cross-product.
 Fresh aliases, direction, optional WHERE and target-label checks apply. No matching
 edge yields `count(r)=0`, `count(*)=1`; an empty mandatory root yields no anchor.
-An undirected self-loop has two directional matches (`count(r)=2`,
-`count(DISTINCT r)=1`). Generic typed optional application is separate from that
+An undirected self-loop has one physical match (`count(r)=1`,
+`count(DISTINCT r)=1`); distinct parallel edges retain multiplicity. Generic typed optional application is separate from that
 specialized fast path. Untyped multi-hop, named-path and vector restrictions are
 not removed merely by supporting clause composition.
 
@@ -400,9 +492,8 @@ star expansion), UNWIND, DISTINCT, ordering, SKIP/LIMIT, typed OPTIONAL MATCH an
 returning subqueries. Incoming and undirected walks retain the physical relationship
 endpoints while ordering the path's nodes in walking order. An unmatched optional
 clause yields a NULL path. Schema-resolvable unlabelled endpoints and anonymous
-relationship variables are supported. Typed bounded ranges and multiple segments
-are also captured natively; fully untyped/ambiguous relationship alternatives and
-relationship inline maps remain pending.
+relationship variables are supported. Typed and heterogeneous bounded ranges and
+multiple segments are captured natively; relationship inline maps remain pending.
 UNION and cursors preserve the captured
 path, including pending identity and spill metadata. See [native paths](ENTITY_VALUES.md#paths)
 for the breaking result/JSON contract. This is not a claim of general path algebra.

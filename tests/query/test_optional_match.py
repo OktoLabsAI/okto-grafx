@@ -275,13 +275,6 @@ def test_analysis_and_planner_revalidate_composed_optional_trees(
 ) -> None:
     statement = _force_optional(text)
 
-    if "MATCH path" in text:
-        with pytest.raises(GrafxPlanError):
-            analyze(statement)
-        with pytest.raises(GrafxPlanError):
-            build_plan(statement, catalog=catalog, indexes=indexes,
-                       analysis=_forged_analysis(statement))
-        return
     actual = analyze(statement)
     if ":Person:Chunk" in text:
         with pytest.raises(GrafxPlanError):
@@ -333,4 +326,5 @@ def test_optional_flag_must_be_an_exact_boolean(
                 analysis=_forged_analysis(statement),
             )
 
-    assert raised.value.details["value"] == "optional"
+    assert raised.value.details["field"] == "ast"
+    assert raised.value.details["reason"] == "invalid_ast_structure"

@@ -114,13 +114,13 @@ def test_anchor_without_relationship_tables_and_empty_root(tmp_path):
         assert db.execute(query).rows == (("alone", 0),)
 
 
-def test_self_loop_matches_both_incident_directions(graph):
-    # Matches existing typed traversal and the legacy Pulse engine's semantics.
+def test_self_loop_is_one_physical_match_not_two_directions(graph):
+    # FP-3 trail identity counts a physical self-loop once, as in typed traversal.
     with graph.begin("write") as tx:
         tx.execute("MATCH (a:Person {id:'isolated'}) CREATE (a)-[:Knows {weight:5}]->(a)")
     result = graph.execute("MATCH (a:Person {id:'isolated'}) OPTIONAL MATCH (a)-[r]-() "
                            "RETURN count(r), count(DISTINCT r)")
-    assert result.rows == ((2, 1),)
+    assert result.rows == ((1, 1),)
 
 
 def test_optional_expansion_keeps_query_budgets(tmp_path):
@@ -132,6 +132,8 @@ def test_optional_expansion_keeps_query_budgets(tmp_path):
             tx.execute("CREATE REL TABLE R(FROM P TO P)")
         with db.begin("write") as tx:
             tx.execute("CREATE (:P {id:'a'})")
+            tx.execute("MATCH (a:P) CREATE (a)-[:R]->(a)")
+            # Two distinct physical edges, not a duplicate orientation of one loop.
             tx.execute("MATCH (a:P) CREATE (a)-[:R]->(a)")
         with pytest.raises(GrafxQueryBudgetExceeded):
             db.execute("MATCH (p:P) OPTIONAL MATCH (p)-[r]-() RETURN count(r)")

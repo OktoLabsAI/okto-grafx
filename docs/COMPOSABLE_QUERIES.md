@@ -87,9 +87,14 @@ fails. Inline property maps use ordinary equality and the same property typing a
 WHERE: missing keys yield NULL; incompatible declared families still refuse.
 
 These operators use the existing snapshot and transaction-private overlay; they
-do not create another participant/transaction or expose another writer's pending
-rows. Cursor/row budgets remain authoritative. Dynamic polymorphic writes,
-general path/relationship-alternative expansion remains pending
+also preserve [absent-table read semantics](QUERY_LANGUAGE.md#absent-tables-in-read-patterns)
+through aliases and returning subqueries. A missing table does not erase the
+static entity kind or turn an OPTIONAL NULL into permission to rebind a node.
+Absent positive-length patterns produce no rows while consuming prior stages;
+zero-length absent-type branches retain eligible anchors and preceding paths.
+They do not create another participant/transaction or expose another writer's pending
+rows. Cursor/row budgets remain authoritative. Dynamic polymorphic writes and
+remaining broader pattern-expression coverage remain pending
 under [FP-3](conformance/FP3_PROGRESS.md). Native typed/polymorphic node and edge
 results now use [qualified detached values](ENTITY_VALUES.md), also through
 lists/maps, cursors, sorting and DISTINCT. This is a breaking development contract,
@@ -196,7 +201,11 @@ WITH/UNWIND, DISTINCT/order/windows and typed OPTIONAL MATCH; optional failure
 extends the path as NULL. Within one MATCH, all relationship occurrences must be
 disjoint; separate MATCH clauses may reuse relationships. Typed zero-length and
 multiple captured segments concatenate without duplicating junction nodes.
-Untyped/type-alternative capture remains pending. Omitted upper bounds preserve
+Untyped/type-alternative bounded ranges also capture paths and compose with
+these clauses. Written relationship lists retain their type through aliases,
+imports/exports and proved list-or-NULL UNION results. See
+[heterogeneous ranges](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges).
+Omitted upper bounds preserve
 omission. Node-only capture (`MATCH p=(n)`) is supported without a relationship
 schema, including polymorphic/anonymous nodes, optional null extension, returning
 subqueries and UNION/aggregate composition. Omitted-upper traversals retain

@@ -13,6 +13,14 @@ does not certify unexplored tails. See [query semantics](QUERY_LANGUAGE.md).
 
 ## Entry points and supported imports
 
+Native read patterns referencing absent tables return no match (or OPTIONAL NULL
+extension); they do not create schema. `ZeroHopRelationship` in the detached
+EXPLAIN plan represents a zero-length branch for an absent relationship type,
+with source/target/relationship/path names and `hops="0"`. It is not a schema
+definition or transaction capability. Existing `execute`/cursor signatures apply;
+schema creation invalidates the cached read plan. See
+[absent-table semantics](QUERY_LANGUAGE.md#absent-tables-in-read-patterns).
+
 Native query functions `properties(value)`, `labels(node)` and `type(relationship)`
 return detached maps, singleton label tuples and physical table-name strings;
 NULL propagates. They consume query bindings, not external writable DTO handles.
@@ -39,8 +47,16 @@ these values. Typed bounded path captures compose with OPTIONAL MATCH, WITH,
 predicates, windows and returning subqueries; path-or-NULL UNION exports preserve
 path-function typing. Zero length and concatenated segments retain the same DTO;
 written range variables return relationship tuples even for `*1..1`.
-Untyped/type-alternative capture and coordinated Pulse migration remain
-FP-3 work in progress. `PathValue(nodes, relationships)` owns immutable component
+Untyped/type-alternative single-hop segments also return native paths. Their
+detached `TraverseAnyRelationship` plan exposes the candidate tables, direction,
+bound-target flag, path name/append flag and written-range list flag. Bounded
+heterogeneous ranges use `TraverseRelationshipAlternatives` with real candidate
+tables, min/max counts, target-table/bound-target information and the same path,
+relationship-list and omitted-upper flags. Explicit bounds render as `n..m`;
+omitted bounds render as `n..` with `max_traversal_hops=30`. See
+[range semantics](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges).
+Coordinated Pulse migration remains FP-3 work in progress.
+`PathValue(nodes, relationships)` owns immutable component
 tuples; `len(path)` and `path.to_dict()` expose length and tagged JSON. These result
 DTOs remain invalid as query parameters or persistent column values.
 

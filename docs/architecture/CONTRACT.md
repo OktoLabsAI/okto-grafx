@@ -1327,8 +1327,9 @@ remains disabled across WITH stages, which may filter or aggregate candidate row
 
 All matching edges retain multiplicity. Each anchor with no edge satisfying the target label
 and complete optional WHERE produces one row with null target/relationship: `count(r)=0`,
-`count(*)=1`. An empty mandatory root produces no such row. An undirected self-loop has two
-directional matches (`count(r)=2`, `count(DISTINCT r)=1`), as in typed traversal. Existing scalar,
+`count(*)=1`. An empty mandatory root produces no such row. An undirected self-loop has one
+physical match (`count(r)=1`, `count(DISTINCT r)=1`), as in typed traversal; distinct parallel
+edges retain multiplicity. Existing scalar,
 aggregate, ordering and window rules apply; unsupported expression/type combinations still fail.
 Label-free targets and untyped relationships read missing properties as null. Property families
 are checked across eligible tables before streaming; incompatible families are refused and
@@ -1359,31 +1360,34 @@ supplied analysis. The same bounded expression-depth and parameter-count limits 
 combined statement; alias expansion used only for type proof is memoized and never rewrites the
 executable branch AST.
 
-`MATCH (a:Decision)-[r]->(b) RETURN a.id` is admitted literally as the standalone mandatory
-untyped-hop form. Those names and that label are part of that form: a relationship that names no
-type names no table, so the answer is defined only where the tables it could live in are, and
-they are the relationship tables whose `from_table` is `Decision`. They are enumerated in
-table_id order, and multiplicity is preserved in both directions -- two parallel edges between
-the same pair are two rows, and a second table adds rows of its own -- because the pair a caller
-asked for is the edge and not the neighbour. A label with no relationship table leaving it
-answers no rows rather than failing: the shape was admitted, so it answers.
+Untyped single hops and explicit type alternatives are generic native read
+operations, not literal application templates. `MATCH (a)-[r]->(b)` and
+`MATCH p=(a)-[r:A|B]-(b)` support anonymous/typed/polymorphic endpoints,
+bound-target identity, filters, optional null extension and clause composition.
+Only the selected physical edges contribute; duplicate type names are deduplicated,
+parallel edges remain distinct and undirected self-loops match once. A written
+`*1..1` binds an edge tuple. Multiple single-hop segments can form one captured
+path while retaining clause-wide relationship uniqueness. Bounded variable ranges
+over untyped/alternative tables use `TraverseRelationshipAlternatives` and the
+same depth-first engine as typed ranges. Candidate schema reachability accounts
+for every intermediate hop (and the completeness probe for omitted bounds), not
+just the starting or final endpoint table. Minimum zero includes eligible anchors
+even without incident selected types. Final endpoint predicates cannot prune
+intermediate node tables. Explicit counts stay within 0..30; omitted bounds
+refuse an eligible unused 31st edge rather than silently truncating. Range lists
+remain lists through alias/subquery and proved list-or-NULL UNION composition.
 
-The physical shape is one `TraverseAnyRelationship` over the source scan. The child is drawn once
-and each row expands across the tables, so the statement keeps one execution context, transaction
-and snapshot, and the operator owns a single intermediate-row admission point for the whole
-fan-out. A candidate whose `to_table` the catalog does not hold fails before streaming, through
-the same door a typed hop uses; it is not filtered out, because filtering would answer with the
-sound tables and give no sign the answer was partial.
-
-Outside the correlated optional form described above, every other untyped spelling keeps its refusal: an incoming or
-undirected hop, an anonymous relationship, a written or implicit range, an inline map, a
-different source or target name, another label or none, a target carrying a label, a `WHERE`, a
-second pattern or `MATCH`, a named path, and any `RETURN` other than the single unaliased
-`a.id`. The form is a whole top-level query and never a `UNION` branch. Analysis and planner each
-retain their existing safety gates; the recognizer lives in the analysis layer, and the planner
-applies it directly to the statement before recomputing the statement's analysis. A supplied
-analysis therefore cannot widen the form, and the deciding fields are checked for their exact
-types before their values are read.
+The physical shape is one `TraverseAnyRelationship` over ordinary source access;
+the input is drawn once in one transaction/snapshot. Indexed bounded anchors keep
+their access path. Candidate endpoint schemas are validated before streaming.
+The executor checks both the source table and endpoint identity before admitting
+an edge: equal table-local IDs in different node tables cannot create false
+matches. Target identity/label filters cannot rebind a preexisting NULL. Optional
+failure extends new names only; final plan/value DTOs retain no transaction
+authority. Owner overlays, shared quotas, spill/cursor cancellation and
+whole-statement rollback remain authoritative. No new option or legacy
+application-specific recognizer is retained. See
+[query contract](../QUERY_LANGUAGE.md#untyped-and-alternative-type-single-hops).
 
 `MATCH (n)` -- a node that names no label -- matches every node table, and `AllNodesScan` reads
 them in table_id order under one name. It is one operator over the union rather than one scan per

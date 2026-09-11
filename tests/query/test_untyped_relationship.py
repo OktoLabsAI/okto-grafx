@@ -1,16 +1,4 @@
-"""One hop that names no type, and the single statement that is allowed to ask for it.
-
-A typed hop names its table. An untyped one names none, so the only honest answer is every
-relationship table that leaves the source's label, walked in a fixed order. That answer is
-expensive to be wrong about, so exactly one statement is admitted -- ``MATCH (a:Decision)-[r]->(b)
-RETURN a.id``, those names and that label -- and everything that merely RESEMBLES it keeps the
-refusal it already earned.
-
-Most of this file is about that boundary rather than about the traversal, because the traversal
-is the easy part. A gate written for "any label, any names" would admit a whole family nobody
-measured, and a gate that compares values without checking their types can be walked past by a
-``str`` subclass with an opinionated ``__eq__``.
-"""
+"""Generic one-hop traversal, historic access-path guarantees and forged AST refusal."""
 
 from __future__ import annotations
 
@@ -29,7 +17,6 @@ from okto_grafx.domain.query.analysis import (
     Aggregation,
     QueryAnalysis,
     analyze,
-    untyped_one_hop_source,
 )
 from okto_grafx.domain.query.ast import FunctionCall, Property, Query, Variable
 from okto_grafx.domain.query.parser import parse
@@ -338,18 +325,20 @@ def test_untyped_traversal_uses_the_same_cumulative_work_budgets(tmp_path: Path)
         pytest.param("MATCH p = (a:Decision)-[r]->(b) RETURN a.id", id="named-path"),
     ),
 )
-def test_a_statement_that_only_resembles_the_admitted_one_is_not_recognised(
+def test_general_one_hop_forms_are_not_limited_to_literal_names(
     text: str,
 ) -> None:
-    """The gate admits ONE statement; everything else keeps the refusal it already had."""
-    assert untyped_one_hop_source(parse(text)) is None
+    """FP-3 admits generic bounded forms while retaining typed-model refusals."""
+    if ":Decision:Bug" in text:
+        with pytest.raises(GrafxPlanError):
+            build_plan(parse(text), catalog=_catalog())
+    else:
+        assert build_plan(parse(text), catalog=_catalog()).columns
 
 
-def test_a_resembling_statement_still_earns_its_original_refusal() -> None:
-    """The message an untyped hop earned before this milestone is the message it still earns."""
-    with pytest.raises(GrafxPlanError) as failure:
-        build_plan(parse("MATCH (a:Bug)-[r]->(b) RETURN a.id"), catalog=_catalog())
-    assert "names exactly one type" in str(failure.value)
+def test_a_different_source_label_uses_its_own_incident_tables() -> None:
+    plan = build_plan(parse("MATCH (a:Bug)-[r]->(b) RETURN a.id"), catalog=_catalog())
+    assert any(isinstance(node, TraverseAnyRelationship) for node in plan.root.walk())
 
 
 def test_a_typed_hop_with_a_small_frontier_keeps_its_traversal() -> None:
@@ -505,11 +494,12 @@ FORGED = _forged()
 
 
 @pytest.mark.parametrize("name", sorted(FORGED))
-def test_a_tree_that_carries_the_shape_in_the_wrong_types_is_not_recognised(
+def test_a_tree_that_carries_the_shape_in_the_wrong_types_is_rejected(
     name: str,
 ) -> None:
     """A list is not a tuple and ``0`` is not ``False``, whatever ``len`` and truthiness say."""
-    assert untyped_one_hop_source(FORGED[name]) is None
+    with pytest.raises(GrafxPlanError):
+        analyze(FORGED[name])
 
 
 @pytest.mark.parametrize("name", sorted(FORGED))
@@ -567,11 +557,12 @@ def test_a_supplied_analysis_cannot_add_an_aggregation_the_statement_never_asked
         ),
     ),
 )
-def test_an_untyped_hop_is_a_whole_query_and_not_a_union_branch(text: str) -> None:
-    """Each branch is planned by a planner that sees only the branch, so the pair must refuse."""
+def test_untyped_union_still_requires_matching_column_names(text: str) -> None:
+    """Generic hops are legal branches, but a.id and n.id are different output names."""
     statement = parse(text)
-    with pytest.raises(GrafxPlanError):
+    with pytest.raises(GrafxPlanError) as raised:
         analyze(statement)
+    assert raised.value.details["reason"] == "different_columns_in_union"
     with pytest.raises(GrafxPlanError):
         build_plan(
             statement, catalog=_catalog(), analysis=QueryAnalysis(statement=statement)

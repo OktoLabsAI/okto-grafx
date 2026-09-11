@@ -82,6 +82,7 @@ __all__ = [
     "SkipRows",
     "SortRows",
     "TraverseAnyRelationship",
+    "TraverseRelationshipAlternatives",
     "TraverseRelationship",
     "UnionRows",
     "UnwindRows",
@@ -509,6 +510,47 @@ class TraverseRelationship(PlanNode):
 
 
 @dataclass(frozen=True, slots=True)
+class TraverseRelationshipAlternatives(PlanNode):
+    """A bounded heterogeneous trail over real eligible relationship tables."""
+
+    child: PlanNode
+    source: str
+    target: str
+    relationship: str | None
+    tables: tuple[TableDef, ...]
+    direction: Direction
+    min_hops: int
+    max_hops: int
+    target_table: TableDef | None = None
+    target_bound: bool = False
+    path_variable: str | None = None
+    path_append: bool = False
+    relationship_list: bool = True
+    upper_bound_omitted: bool = False
+
+    def children(self) -> tuple[PlanNode, ...]:
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        details: dict[str, object] = {
+            "source": self.source, "target": self.target,
+            "tables": ", ".join(table.name for table in self.tables),
+            "direction": self.direction.value,
+            "hops": f"{self.min_hops}..{self.max_hops}",
+            "target_bound": self.target_bound,
+            "relationship_list": self.relationship_list,
+        }
+        if self.path_variable is not None:
+            details["path"] = self.path_variable
+        if self.path_append:
+            details["path_append"] = True
+        if self.upper_bound_omitted:
+            details.update(hops=f"{self.min_hops}..", upper_bound_omitted=True,
+                           max_traversal_hops=self.max_hops)
+        return details
+
+
+@dataclass(frozen=True, slots=True)
 class TraverseAnyRelationship(PlanNode):
     """One incident hop across eligible tables, optionally null-extending each anchor.
 
@@ -537,6 +579,10 @@ class TraverseAnyRelationship(PlanNode):
     target_table: str | None = None
     relationship_polymorphic: bool = False
     predicate: Expression | None = None
+    target_bound: bool = False
+    path_variable: str | None = None
+    path_append: bool = False
+    relationship_list: bool = False
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -548,7 +594,10 @@ class TraverseAnyRelationship(PlanNode):
             "source": self.source,
             "target": self.target,
             "tables": ", ".join(table.name for table in self.tables),
+            "direction": self.direction.value,
         }
+        if self.path_variable is not None:
+            details["path"] = self.path_variable
         if self.optional:
             details["optional"] = "true"
             details["direction"] = self.direction.value

@@ -143,9 +143,18 @@ def test_nested_pending_binding_is_detached_before_a_write_is_released(
             "MATCH (p:Person {id: 1}) SET p.name = 'after' RETURN [p] AS nested"
         )
 
-        assert changed.rows == (((0,),),)
+        assert len(changed.rows) == len(changed.rows[0]) == len(changed.rows[0][0]) == 1
+        detached = changed.rows[0][0][0]
+        assert type(detached) is okto_grafx.NodeValue
+        assert dict(detached.properties) == {"id": 1, "name": "after", "age": 36}
+        assert detached.provenance.pending
+        assert detached.identity.record_id is None
+        assert detached.identity.provisional_id is not None
         _assert_public_rows_hold_no_pending_reference(changed)
 
+    assert dict(detached.properties) == {"id": 1, "name": "after", "age": 36}
+    with pytest.raises(TypeError):
+        detached.properties["name"] = "mutated"
     assert database.execute("MATCH (p:Person {id: 1}) RETURN p.name").rows == (
         ("after",),
     )

@@ -246,6 +246,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseAnyRelationship,
+    TraverseRelationshipAlternatives,
     TraverseRelationship,
     UnionRows,
     UnwindRows,
@@ -5782,6 +5783,16 @@ def _capture_node_path(engine: QueryEngine, node: CaptureNodePath, context: _Con
 
 def _zero_hop_relationship(engine: QueryEngine, node: ZeroHopRelationship, context: _Context) -> Iterator[_Row]:
     """No relationship exists, but a zero-length range can still match its anchor."""
+    if (any(type(name) is not str or not name for name in (node.source, node.target))
+            or any(name is not None and (type(name) is not str or not name)
+                   for name in (node.relationship, node.path_variable))
+            or type(node.target_bound) is not bool or type(node.path_append) is not bool
+            or (node.path_append and node.path_variable is None)
+            or (node.relationship is not None and node.relationship in (node.source, node.target))
+            or (node.path_variable is not None and node.path_variable in (node.source, node.target, node.relationship))):
+        raise GrafxPlanError("A zero-hop range requires canonical binding fields.", field="plan")
+    if node.target_table is not None and node.target_table.kind != "node":
+        raise GrafxPlanError("A zero-hop target must name a node table.", field="plan")
     incoming = engine._rows(node.child, context)
     try:
         for row in incoming:
@@ -5799,14 +5810,19 @@ def _zero_hop_relationship(engine: QueryEngine, node: ZeroHopRelationship, conte
             context.admit_traversal_path()
             bindings = {**row.bindings, node.target: anchor}
             if node.relationship is not None:
+                if node.relationship in row.bindings:
+                    raise GrafxPlanError("A zero-hop range cannot overwrite a relationship binding.", field="plan")
                 bindings[node.relationship] = ()
             if node.path_variable is not None:
                 prefix = row.bindings.get(node.path_variable)
                 if node.path_append:
-                    if type(prefix) is not _PathValue or _binding_identity(prefix.nodes[-1]) != _binding_identity(anchor):
+                    if (type(prefix) is not _PathValue or not prefix.nodes
+                            or _binding_identity(prefix.nodes[-1]) != _binding_identity(anchor)):
                         raise GrafxPlanError("A zero-hop continuation requires its original prefix.", field="path")
                     bindings[node.path_variable] = prefix
                 else:
+                    if node.path_variable in row.bindings:
+                        raise GrafxPlanError("A zero-hop capture cannot overwrite a path binding.", field="path")
                     bindings[node.path_variable] = _PathValue((anchor,), ())
             yield replace(row, bindings=bindings)
     finally:
@@ -7199,7 +7215,7 @@ def _batched_landing_steps(
 
 
 def _traverse(
-    engine: QueryEngine, node: TraverseRelationship, context: _Context
+    engine: QueryEngine, node: TraverseRelationship | TraverseRelationshipAlternatives, context: _Context
 ) -> Iterator[_Row]:
     """Expand each incoming row along the relationship table, one hop or a bounded range.
 
@@ -7231,23 +7247,18 @@ def _traverse(
     if (type(node.min_hops) is not int or type(node.max_hops) is not int
             or not 0 <= node.min_hops <= node.max_hops <= MAX_TRAVERSAL_HOPS
             or type(node.path_append) is not bool or type(node.relationship_list) is not bool
+            or type(node.target_bound) is not bool
             or type(node.upper_bound_omitted) is not bool
             or node.upper_bound_omitted and (
                 not node.relationship_list or node.max_hops != MAX_TRAVERSAL_HOPS)):
         raise GrafxPlanError("Traversal requires bounded exact hop counts and flags.", field="hops")
     catalog = context.schema()
-    relationship = node.table
+    relationships = (node.table,) if type(node) is TraverseRelationship else node.tables
     dirty_tables = _intent_table_ids(engine, context.txn)
     # The owner reads its own staged work. Everything this transaction has done to the three
     # tables a hop touches -- a committed edge whose properties it replaced, an edge it created,
     # a node it created, updated or ended -- folds into one view here, and a reader outside the
     # transaction never reaches this code at all.
-    relationship_changes: Mapping[object, tuple[Value, ...] | None] = {}
-    pending_edges: tuple[tuple[object, HeapVersion], ...] = ()
-    if relationship.table_id in dirty_tables:
-        relationship_changes, pending_edges = _owner_edges(context, relationship)
-    from_table = catalog.table(relationship.from_table)
-    to_table = catalog.table(relationship.to_table)
     landing_views: dict[int, _OwnerLandingView] = {}
 
     ended = _ended_by_this_transaction(context)
@@ -7259,7 +7270,7 @@ def _traverse(
         and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
         and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
     )
-    batch_landings = vector_free and _admits_batched_landings(engine, node, context)
+    batch_landings = type(node) is TraverseRelationship and vector_free and _admits_batched_landings(engine, node, context)
 
     def view_at(table: TableDef) -> _OwnerLandingView:
         """Reuse one endpoint landing view per table within this operation."""
@@ -7279,165 +7290,173 @@ def _traverse(
 
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
-    steps = _edge_steps(
-        engine,
-        context,
-        relationship,
-        from_table,
-        to_table,
-        outgoing,
-        incoming,
-        ended,
-        relationship_changes,
-        pending_edges,
-        bounded_frontier=(
-            _frontier_is_bounded(node.child, node.source)
-            or id(node) in context.short_circuit_traversals
-        ),
-    )
+    walkers = []
+    for relationship in relationships:
+        from_table = catalog.table(relationship.from_table)
+        to_table = catalog.table(relationship.to_table)
+        relationship_changes: Mapping[object, tuple[Value, ...] | None] = {}
+        pending_edges: tuple[tuple[object, HeapVersion], ...] = ()
+        if relationship.table_id in dirty_tables:
+            relationship_changes, pending_edges = _owner_edges(context, relationship)
+        steps = _edge_steps(
+            engine, context, relationship, from_table, to_table, outgoing, incoming,
+            ended, relationship_changes, pending_edges,
+            bounded_frontier=(_frontier_is_bounded(node.child, node.source)
+                              or id(node) in context.short_circuit_traversals),
+        )
+        walkers.append((relationship, from_table, to_table, steps))
 
-    for row in engine._rows(node.child, context):
-        start = row.bindings.get(node.source)
-        if start is None and node.source in row.bindings:
-            continue  # An OPTIONAL null anchor cannot produce a real hop.
-        if not isinstance(start, RowBinding):
-            raise GrafxPlanError(
-                f"The traversal from {node.source!r} found no bound row to start from.",
-                field="variable",
-                value=node.source,
-            )
-        bound_target = row.bindings.get(node.target) if node.target_bound else None
-        if node.target_bound and not isinstance(bound_target, RowBinding):
-            continue
-        prefix = row.bindings.get(path_variable) if node.path_append else None
-        if node.path_append:
-            if (type(prefix) is not _PathValue or not prefix.nodes
-                    or _binding_identity(prefix.nodes[-1]) != _binding_identity(start)):
-                raise GrafxPlanError("A continued path must start at its previous endpoint.", field="path_variable")
-        elif path_variable is not None and path_variable in row.bindings:
-            raise GrafxPlanError("A path cannot overwrite an existing binding.", field="path_variable")
+    incoming_rows = engine._rows(node.child, context)
+    try:
+        for row in incoming_rows:
+            start = row.bindings.get(node.source)
+            if start is None and node.source in row.bindings:
+                continue  # An OPTIONAL null anchor cannot produce a real hop.
+            if not isinstance(start, RowBinding):
+                raise GrafxPlanError(
+                    f"The traversal from {node.source!r} found no bound row to start from.",
+                    field="variable",
+                    value=node.source,
+                )
+            bound_target = row.bindings.get(node.target) if node.target_bound else None
+            if node.target_bound and not isinstance(bound_target, RowBinding):
+                continue
+            prefix = row.bindings.get(path_variable) if node.path_append else None
+            if node.path_append:
+                if (type(prefix) is not _PathValue or not prefix.nodes
+                        or _binding_identity(prefix.nodes[-1]) != _binding_identity(start)):
+                    raise GrafxPlanError("A continued path must start at its previous endpoint.", field="path_variable")
+            elif path_variable is not None and path_variable in row.bindings:
+                raise GrafxPlanError("A path cannot overwrite an existing binding.", field="path_variable")
 
-        def successors(current: RowBinding, path: tuple[RowBinding, ...]):
-            record_id, current_table = _overlay_identity(current), current.table
-            taken = {_binding_identity(edge) for edge in path}
-            if prefix is not None:
-                taken.update(_binding_identity(edge) for edge in prefix.relationships)
-            candidates = steps(record_id)
-            resolved = (
-                _batched_landing_steps(engine, context, iter(candidates), view_at)
-                if batch_landings else
-                ((*candidate, False, None) for candidate in candidates)
-            )
-            try:
-                for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
-                    if charge_expansions:
-                        context.admit_traversal_expansion()
-                    elif context.read_control is not None:
-                        context.read_control.step()
-                    endpoints = version.values[:2]
-                    if not (
-                        (outgoing and current_table.table_id == from_table.table_id
-                         and endpoints[0] == record_id and next_table.table_id == to_table.table_id
-                         and endpoints[1] == next_id)
-                        or (incoming and current_table.table_id == to_table.table_id
-                            and endpoints[1] == record_id and next_table.table_id == from_table.table_id
-                            and endpoints[0] == next_id)
-                    ):
+            def successors(current: RowBinding, path: tuple[RowBinding, ...]):
+                record_id, current_table = _overlay_identity(current), current.table
+                taken = {_binding_identity(edge) for edge in path}
+                if prefix is not None:
+                    taken.update(_binding_identity(edge) for edge in prefix.relationships)
+                for relationship, from_table, to_table, steps in walkers:
+                    if not ((outgoing and current_table.table_id == from_table.table_id)
+                            or (incoming and current_table.table_id == to_table.table_id)):
                         continue
-                    edge = RowBinding(variable=node.relationship or "", table=relationship,
-                                      ref=ref, version=version)
-                    if _binding_identity(edge) in taken:
-                        continue
-                    if prevalidated:
-                        landing = batch_landing
-                    elif (isinstance(bound_target, RowBinding)
-                          and _overlay_identity(bound_target) == next_id
-                          and bound_target.table.table_id == next_table.table_id):
-                        landing = (bound_target.ref, bound_target.version)
-                    else:
-                        landing = node_at(next_table, next_id)
-                    if landing is None:
-                        continue
+                    candidates = steps(record_id)
+                    resolved = (
+                        _batched_landing_steps(engine, context, iter(candidates), view_at)
+                        if batch_landings else
+                        ((*candidate, False, None) for candidate in candidates)
+                    )
+                    try:
+                        for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
+                            if charge_expansions:
+                                context.admit_traversal_expansion()
+                            elif context.read_control is not None:
+                                context.read_control.step()
+                            endpoints = version.values[:2]
+                            if not (
+                                (outgoing and current_table.table_id == from_table.table_id
+                                 and endpoints[0] == record_id and next_table.table_id == to_table.table_id
+                                 and endpoints[1] == next_id)
+                                or (incoming and current_table.table_id == to_table.table_id
+                                    and endpoints[1] == record_id and next_table.table_id == from_table.table_id
+                                    and endpoints[0] == next_id)
+                            ):
+                                continue
+                            edge = RowBinding(variable=node.relationship or "", table=relationship,
+                                              ref=ref, version=version,
+                                              polymorphic=type(node) is TraverseRelationshipAlternatives)
+                            if _binding_identity(edge) in taken:
+                                continue
+                            if prevalidated:
+                                landing = batch_landing
+                            elif (isinstance(bound_target, RowBinding)
+                                  and _overlay_identity(bound_target) == next_id
+                                  and bound_target.table.table_id == next_table.table_id):
+                                landing = (bound_target.ref, bound_target.version)
+                            else:
+                                landing = node_at(next_table, next_id)
+                            if landing is None:
+                                continue
+                            if charge_paths:
+                                context.admit_traversal_path()
+                            landing_ref, landing_version = landing
+                            target = RowBinding(variable=node.target, table=next_table,
+                                                ref=landing_ref, version=landing_version,
+                                                polymorphic=node.target_table is None)
+                            yield edge, target
+                    finally:
+                        _close_iterator(resolved, active_exception())
+                        _close_iterator(candidates, active_exception())
+
+            def walks():
+                # Depth-first streaming retains one sibling iterator per depth, never a
+                # breadth-wide collection of complete paths. Unordered result order is
+                # not a shortest-path guarantee; ORDER BY defines caller-visible order.
+                if node.min_hops == 0:
                     if charge_paths:
                         context.admit_traversal_path()
-                    landing_ref, landing_version = landing
-                    target = RowBinding(variable=node.target, table=next_table,
-                                        ref=landing_ref, version=landing_version,
-                                        polymorphic=node.target_table is None)
-                    yield edge, target
-            finally:
-                _close_iterator(resolved, active_exception())
-                _close_iterator(candidates, active_exception())
-
-        def walks():
-            # Depth-first streaming retains one sibling iterator per depth, never a
-            # breadth-wide collection of complete paths. Unordered result order is
-            # not a shortest-path guarantee; ORDER BY defines caller-visible order.
-            if node.min_hops == 0:
-                if charge_paths:
-                    context.admit_traversal_path()
-                yield (), (start,)
-            stack = []
-            if node.max_hops:
-                stack.append((iter(successors(start, ())), (), (start,)))
-            try:
-                while stack:
-                    iterator, path, nodes = stack[-1]
-                    try:
-                        edge, target = next(iterator)
-                    except StopIteration:
-                        stack.pop()
-                        _close_iterator(iterator)
-                        continue
-                    extended, visited = (*path, edge), (*nodes, target)
-                    if len(extended) >= node.min_hops:
-                        yield extended, visited
-                    if len(extended) < node.max_hops:
-                        stack.append((iter(successors(target, extended)), extended, visited))
-                    elif node.upper_bound_omitted:
-                        # Probe only on demand, after yielding the ceiling-length row.
-                        # LIMIT/cursor close may legitimately stop without requesting
-                        # complete enumeration. A valid further edge disproves it.
-                        probe = iter(successors(target, extended))
+                    yield (), (start,)
+                stack = []
+                if node.max_hops:
+                    stack.append((iter(successors(start, ())), (), (start,)))
+                try:
+                    while stack:
+                        iterator, path, nodes = stack[-1]
                         try:
-                            if next(probe, None) is not None:
-                                raise GrafxQueryBudgetExceeded(
-                                    "An omitted-upper traversal exceeds the hop resource ceiling.",
-                                    field="max_traversal_hops", limit=node.max_hops,
-                                    observed=len(extended) + 1,
-                                    operator="TraverseRelationship",
-                                )
-                        finally:
-                            _close_iterator(probe, active_exception())
-            finally:
-                for iterator, _, _ in reversed(stack):
-                    _close_iterator(iterator, active_exception())
+                            edge, target = next(iterator)
+                        except StopIteration:
+                            stack.pop()
+                            _close_iterator(iterator)
+                            continue
+                        extended, visited = (*path, edge), (*nodes, target)
+                        if len(extended) >= node.min_hops:
+                            yield extended, visited
+                        if len(extended) < node.max_hops:
+                            stack.append((iter(successors(target, extended)), extended, visited))
+                        elif node.upper_bound_omitted:
+                            # Probe only on demand, after yielding the ceiling-length row.
+                            # LIMIT/cursor close may legitimately stop without requesting
+                            # complete enumeration. A valid further edge disproves it.
+                            probe = iter(successors(target, extended))
+                            try:
+                                if next(probe, None) is not None:
+                                    raise GrafxQueryBudgetExceeded(
+                                        "An omitted-upper traversal exceeds the hop resource ceiling.",
+                                        field="max_traversal_hops", limit=node.max_hops,
+                                        observed=len(extended) + 1,
+                                        operator=type(node).__name__,
+                                    )
+                            finally:
+                                _close_iterator(probe, active_exception())
+                finally:
+                    for iterator, _, _ in reversed(stack):
+                        _close_iterator(iterator, active_exception())
 
-        iterator = walks()
-        try:
-            for path, visited in iterator:
-                target_binding = visited[-1]
-                if node.target_table is not None and node.target_table.table_id != target_binding.table.table_id:
-                    continue
-                if isinstance(bound_target, RowBinding) and _binding_identity(bound_target) != _binding_identity(target_binding):
-                    continue
-                bindings = dict(row.bindings)
-                bindings[node.target] = target_binding
-                if node.relationship is not None:
-                    bindings[node.relationship] = (
-                        path if node.relationship_list or node.min_hops != 1 or node.max_hops != 1 else path[0]
-                    )
-                if path_variable is not None:
-                    nodes = (*prefix.nodes, *visited[1:]) if prefix is not None else visited
-                    edges = (*prefix.relationships, *path) if prefix is not None else path
-                    if len(nodes) > MAX_LIST_ELEMENTS:
-                        raise GrafxQueryBudgetExceeded("A captured path exceeds the owned node limit.",
-                                                       field="path_nodes", limit=MAX_LIST_ELEMENTS)
-                    bindings[path_variable] = _PathValue(nodes=nodes, relationships=edges)
-                context.count("rows_scanned")
-                yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
-        finally:
-            _close_iterator(iterator, active_exception())
+            iterator = walks()
+            try:
+                for path, visited in iterator:
+                    target_binding = visited[-1]
+                    if node.target_table is not None and node.target_table.table_id != target_binding.table.table_id:
+                        continue
+                    if isinstance(bound_target, RowBinding) and _binding_identity(bound_target) != _binding_identity(target_binding):
+                        continue
+                    bindings = dict(row.bindings)
+                    bindings[node.target] = target_binding
+                    if node.relationship is not None:
+                        bindings[node.relationship] = (
+                            path if node.relationship_list or node.min_hops != 1 or node.max_hops != 1 else path[0]
+                        )
+                    if path_variable is not None:
+                        nodes = (*prefix.nodes, *visited[1:]) if prefix is not None else visited
+                        edges = (*prefix.relationships, *path) if prefix is not None else path
+                        if len(nodes) > MAX_LIST_ELEMENTS:
+                            raise GrafxQueryBudgetExceeded("A captured path exceeds the owned node limit.",
+                                                           field="path_nodes", limit=MAX_LIST_ELEMENTS)
+                        bindings[path_variable] = _PathValue(nodes=nodes, relationships=edges)
+                    context.count("rows_scanned")
+                    yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+            finally:
+                _close_iterator(iterator, active_exception())
+    finally:
+        _close_iterator(incoming_rows, active_exception())
 
 
 def _traverse_any(
@@ -7449,8 +7468,8 @@ def _traverse_any(
     child being redrawn per table: the rows a caller receives are the same either way, but the
     work and the budget are not, and the freeze asks for one admission point.
 
-    A single hop cannot revisit an edge, so the isomorphism bookkeeping a range needs is absent
-    here by construction rather than by omission.
+    A captured continuation excludes edges already in its prefix. The surrounding
+    MATCH plan also enforces disjoint relationships across separate pattern segments.
     """
     catalog = context.schema()
     charge_expansions = engine._max_traversal_expansions is not None
@@ -7505,56 +7524,92 @@ def _traverse_any(
             )
         )
 
-    for row in engine._rows(node.child, context):
-        start = row.bindings.get(node.source)
-        if not isinstance(start, RowBinding):
-            raise GrafxPlanError(
-                f"The traversal from {node.source!r} found no bound row to start from.",
-                field="variable",
-                value=node.source,
-            )
-        identity = _overlay_identity(start)
-        matched = False
-        for table, steps in walkers:
-            for ref, version, next_table, next_id in steps(identity):
-                if charge_expansions:
-                    context.admit_traversal_expansion()
-                if node.target_table is not None and next_table.name != node.target_table:
+    incoming_rows = engine._rows(node.child, context)
+    try:
+        for row in incoming_rows:
+            start = row.bindings.get(node.source)
+            if start is None and node.source in row.bindings:
+                if node.optional:
+                    bindings = {**row.bindings, node.relationship: None}
+                    if not node.target_bound:
+                        bindings[node.target] = None
+                    yield replace(row, bindings=bindings)
+                continue
+            if not isinstance(start, RowBinding) or start.table.kind != "node":
+                raise GrafxPlanError("An incident traversal requires a node anchor.", field="variable", value=node.source)
+            bound_target = row.bindings.get(node.target) if node.target_bound else None
+            prefix = row.bindings.get(node.path_variable) if node.path_append else None
+            if node.path_append:
+                if (type(prefix) is not _PathValue or not prefix.nodes
+                        or _binding_identity(prefix.nodes[-1]) != _binding_identity(start)):
+                    raise GrafxPlanError("A continued path must start at its previous endpoint.", field="path_variable")
+            elif node.path_variable is not None and node.path_variable in row.bindings:
+                raise GrafxPlanError("A path cannot overwrite an existing binding.", field="path_variable")
+            taken = {_binding_identity(edge) for edge in prefix.relationships} if prefix is not None else set()
+            identity = _overlay_identity(start)
+            matched = False
+            for table, steps in walkers:
+                outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
+                incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
+                # Reject wrong-table anchors before looking up equal table-local ids.
+                if not ((outgoing and start.table.name == table.from_table)
+                        or (incoming and start.table.name == table.to_table)):
                     continue
-                landing = node_at(next_table, next_id)
-                if landing is None:
-                    continue
-                if charge_paths:
-                    context.admit_traversal_path()
-                landing_ref, landing_version = landing
-                bindings = dict(row.bindings)
-                bindings[node.target] = RowBinding(
-                    variable=node.target,
-                    table=next_table,
-                    ref=landing_ref,
-                    version=landing_version,
-                    polymorphic=node.optional and node.target_table is None,
-                )
-                bindings[node.relationship] = RowBinding(
-                    variable=node.relationship,
-                    table=table,
-                    ref=ref,
-                    version=version,
-                    polymorphic=node.relationship_polymorphic,
-                )
-                context.count("rows_scanned")
-                candidate = _Row(
-                    bindings=bindings, computed=row.computed, columns=row.columns
-                )
-                if node.predicate is not None and not _predicate_admits(node.predicate, candidate, context):
-                    continue
-                matched = True
-                yield candidate
-        if node.optional and not matched:
-            bindings = dict(row.bindings)
-            bindings[node.target] = None
-            bindings[node.relationship] = None
-            yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+                candidates = steps(identity)
+                try:
+                    for ref, version, next_table, next_id in candidates:
+                        if charge_expansions:
+                            context.admit_traversal_expansion()
+                        elif context.read_control is not None:
+                            context.read_control.step()
+                        endpoints = version.values[:2]
+                        if not ((outgoing and start.table.name == table.from_table
+                                 and endpoints[0] == identity and next_table.name == table.to_table
+                                 and endpoints[1] == next_id)
+                                or (incoming and start.table.name == table.to_table
+                                    and endpoints[1] == identity and next_table.name == table.from_table
+                                    and endpoints[0] == next_id)):
+                            continue
+                        if node.target_table is not None and next_table.name != node.target_table:
+                            continue
+                        edge = RowBinding(variable=node.relationship, table=table, ref=ref, version=version,
+                                          polymorphic=node.relationship_polymorphic)
+                        if _binding_identity(edge) in taken:
+                            continue
+                        landing = node_at(next_table, next_id)
+                        if landing is None:
+                            continue
+                        landing_ref, landing_version = landing
+                        target = RowBinding(variable=node.target, table=next_table, ref=landing_ref,
+                                            version=landing_version, polymorphic=node.target_table is None)
+                        if node.target_bound and (not isinstance(bound_target, RowBinding)
+                                                  or _binding_identity(bound_target) != _binding_identity(target)):
+                            continue
+                        if charge_paths:
+                            context.admit_traversal_path()
+                        bindings = {**row.bindings, node.target: target,
+                                    node.relationship: (edge,) if node.relationship_list else edge}
+                        if node.path_variable is not None:
+                            bindings[node.path_variable] = (
+                                _PathValue((*prefix.nodes, target), (*prefix.relationships, edge))
+                                if prefix is not None else _PathValue((start, target), (edge,)))
+                        context.count("rows_scanned")
+                        candidate = replace(row, bindings=bindings)
+                        if node.predicate is not None and not _predicate_admits(node.predicate, candidate, context):
+                            continue
+                        matched = True
+                        yield candidate
+                finally:
+                    _close_iterator(candidates, active_exception())
+            if node.optional and not matched:
+                bindings = {**row.bindings, node.relationship: None}
+                if not node.target_bound:
+                    bindings[node.target] = None
+                if node.path_variable is not None:
+                    bindings[node.path_variable] = None
+                yield replace(row, bindings=bindings)
+    finally:
+        _close_iterator(incoming_rows, active_exception())
 
 
 def _relationship_scan(
@@ -14712,6 +14767,7 @@ _HANDLERS: dict[type, _Handler] = {
     OrderedNodeMerge: _ordered_node_merge,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
+    TraverseRelationshipAlternatives: _traverse,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
     RelationshipScan: _relationship_scan,  # type: ignore[dict-item]
     RelationshipIncidentSeek: _relationship_incident_seek,  # type: ignore[dict-item]

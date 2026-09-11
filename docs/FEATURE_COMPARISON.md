@@ -19,6 +19,21 @@ they do not retroactively change the NHC checkpoint's test evidence.
 
 ## Scope and reading rules
 
+Generic one-hop untyped and relationship-type alternatives now compose with
+MATCH/OPTIONAL, returning subqueries and native path capture. They replace the
+literal application-specific untyped-query recognizer. Direction, qualified
+endpoints, parallel-edge multiplicity and clause-wide trail rules are native;
+bounded variable ranges across multiple relationship tables now share the native
+depth-first trail engine, including zero hops and an omitted-upper completeness
+probe. See [query semantics](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges)
+and [working evidence](conformance/FP3_PROGRESS.md), not an overall parity claim.
+
+The current FP-3 increment also validates absent-table MATCH/OPTIONAL reads:
+empty results/null extension, static entity-kind checks and legitimate zero-hop
+paths without implicit schema creation. This addresses original graph-function
+cases, not schema-free storage parity. [Working evidence](conformance/FP3_PROGRESS.md)
+records the remaining failures and the exact regression selection.
+
 September 11 FP-2 development update: focused native tests now also cover
 hexadecimal/octal INT64 literals, source-faithful headings, general expression
 postfix access, adjacent comparison chains and nondeterministic `rand()`. The

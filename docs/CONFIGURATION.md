@@ -1,5 +1,23 @@
 # Configuration reference
 
+Heterogeneous relationship ranges add no knob. The fixed 30-hop resource ceiling,
+`max_traversal_expansions`, `max_traversal_paths`, intermediate-row, value,
+memory/spill and cancellation limits remain cumulative across all selected types.
+An omitted upper bound refuses an extendable trail rather than silently truncating;
+the completeness probe can consume expansion/path budget too. See
+[bounded range rules](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges).
+
+Generic untyped/alternative-type single hops add no configuration. They use the
+same intermediate-row, expansion/path, memory/spill and cancellation budgets as
+typed traversal, cumulatively across all candidate tables. Endpoint indexes
+remain subject to their existing freshness/owner-overlay checks. See
+[single-hop consumption](QUERY_LANGUAGE.md#untyped-and-alternative-type-single-hops).
+
+Absent-table MATCH/OPTIONAL reads add no option or schema-creation mode. Their
+zero-hop branch shares `max_traversal_paths` and query cancellation; no edge
+expansion is charged for a zero-edge path. Empty patterns retain upstream work
+and its quotas. See [read-pattern semantics](QUERY_LANGUAGE.md#absent-tables-in-read-patterns).
+
 `properties()`, `labels()` and `type()` add no options. `properties()` demands all
 user property values (including vectors) under existing query value, memory, row
 and cancellation limits. Resource refusal does not return a partial property map.

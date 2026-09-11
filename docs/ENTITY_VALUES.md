@@ -154,8 +154,13 @@ WHERE/WITH/UNWIND, row windows,
 DISTINCT/order, typed OPTIONAL MATCH and returning subqueries. An unmatched
 optional capture is NULL, not a fabricated empty path. Path aliases and path-or-NULL
 UNION subquery exports retain their type for `length`/`nodes`/`relationships`.
-Unlabelled endpoints must still be schema-resolvable (zero-hop anchors may span all
-node tables); untyped/ambiguous alternatives and inline relationship maps remain pending.
+Single-hop untyped/type-alternative segments support polymorphic endpoints and
+the same native capture/identity contract. Bounded variable ranges over multiple
+relationship tables now retain qualified identities and physical endpoint
+orientation at every hop; zero-hop anchors may span all node tables. Written
+range lists retain their type through imports/exports and list-or-NULL UNION.
+Inline relationship maps remain pending. See
+[range composition](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges).
 Zero length returns the anchor, not NULL: its path has one node and no relations.
 Concatenation does not duplicate junction nodes. Range variables hold relationship
 tuples even for a written `*1..1`; an unstarred hop returns one relationship.

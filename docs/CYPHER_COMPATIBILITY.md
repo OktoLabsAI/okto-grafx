@@ -6,8 +6,10 @@ FP-3 adds native `properties(node|relationship|map|NULL)`, `labels(node|NULL)` a
 `type(relationship|NULL)`, with typed planning/runtime refusals and own-write
 visibility. Lists of labels are singleton under Grafx's typed table model.
 Original and schema-adapted graph-function TCK outcomes remain separate in
-[FP-3 evidence](conformance/FP3_PROGRESS.md); these functions do not imply support
-for nonexistent table references or arbitrary multi-label storage.
+[FP-3 evidence](conformance/FP3_PROGRESS.md). Native MATCH/OPTIONAL now treat
+absent-table reads as no match, preserving zero-length paths and static type
+checks; they do not introduce implicit schema creation or arbitrary multi-label
+storage. See [read semantics](QUERY_LANGUAGE.md#absent-tables-in-read-patterns).
 
 FP-3 now returns qualified `NodeValue`/`RelationshipValue` objects from native
 execute/cursors, including nested values, entity UNION and aggregate/sort/DISTINCT
@@ -25,7 +27,11 @@ including path-or-NULL UNION exports. Reverse/undirected walks preserve physical
 endpoint identity. Explicit typed ranges now support zero length, cycles and
 multiple segments with relationship uniqueness, using depth-first streaming.
 Written range variables hold relationship tuples even for `*1..1`.
-Untyped/type-alternative capture remains pending. Omitted upper bounds preserve
+Untyped/type-alternative single-hop segments now support native capture and
+composition, without a literal Pulse query recognizer. Bounded variable ranges
+over multiple relationship tables now use the same native trail identity and
+snapshot contract, including zero length and explicit completeness refusal.
+Omitted upper bounds preserve
 omission. Node-only named capture (`MATCH p=(n)`) now produces a native zero-edge
 path with qualified node identity, including polymorphic/optional composition.
 Omitted-upper traversals preserve

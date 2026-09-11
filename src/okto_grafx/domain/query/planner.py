@@ -68,7 +68,6 @@ from okto_grafx.domain.query.analysis import (
     optional_match_refusal,
     correlated_optional_pipeline,
     is_aggregate,
-    untyped_one_hop_source,
     polymorphic_node_refusal,
 )
 from okto_grafx.domain.query.ast import (
@@ -151,6 +150,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseAnyRelationship,
+    TraverseRelationshipAlternatives,
     RelationshipScan,
     TraverseRelationship,
     UnionRows,
@@ -431,11 +431,12 @@ class _Planner:
     multi_hop_variables: set[str] = field(default_factory=set)
     polymorphic_variables: set[str] = field(default_factory=set)
     polymorphic_tables: dict[str, tuple[TableDef, ...]] = field(default_factory=dict)
+    # Kind survives even when an absent schema leaves no candidate TableDef.
+    empty_entity_kinds: dict[str, str] = field(default_factory=dict)
     typed_endpoint_form: bool = False
     path_projection: PatternPath | None = None
     capture_paths: set[str] = field(default_factory=set)
     bound_paths: set[str] = field(default_factory=set)
-    untyped_one_hop_label: str | None = None
     unwind_alias: str | None = None
     unwind_source: Expression | None = None
     unwind_sources: dict[str, Expression] = field(default_factory=dict)
@@ -466,6 +467,8 @@ class _Planner:
     anonymous: int = 0
     apply_slot: int = 0
     union_entity_outputs: dict[str, tuple[TableDef, ...]] = field(default_factory=dict)
+    union_entity_kinds: dict[str, str | None] = field(default_factory=dict)
+    union_list_outputs: dict[str, bool] = field(default_factory=dict)
     union_path_outputs: dict[str, bool] = field(default_factory=dict)
 
     # --- entry -------------------------------------------------------------------------------
@@ -496,15 +499,19 @@ class _Planner:
         columns = self.analysis.output_columns
         pipelines: list[PlanNode] = []
         entity_outputs: list[dict[str, tuple[TableDef, ...]]] = []
+        entity_kinds: list[dict[str, str | None]] = []
         path_outputs: list[dict[str, bool]] = []
+        list_outputs: list[dict[str, bool]] = []
         for branch in (statement.left, statement.right):
             sub = _Planner(scalar_types=self.scalar_types, catalog=self.catalog,
                            procedures=self.procedures,
                            indexes=self.indexes, analysis=analyze(branch, bindings=self.imported_bindings),
                            imported_bindings=self.imported_bindings, argument_slot=self.argument_slot,
                            binding_types=dict(self.binding_types),
+                           multi_hop_variables=set(self.multi_hop_variables),
                            polymorphic_variables=set(self.polymorphic_variables),
                            polymorphic_tables=dict(self.polymorphic_tables),
+                           empty_entity_kinds=dict(self.empty_entity_kinds),
                            tables=dict(self.tables), alias_definitions=dict(self.alias_definitions),
                            bound_paths=set(self.bound_paths),
                            apply_slot=self.apply_slot)
@@ -517,7 +524,9 @@ class _Planner:
                         # obeys the existing depth and shared-DAG budget.
                         sub._union_type_expression(item.expression)
             entity_outputs.append(sub._entity_output_tables())
+            entity_kinds.append(sub._entity_output_kinds())
             path_outputs.append(sub._path_output_columns())
+            list_outputs.append(sub._list_output_columns())
             root = planned.root
             if not isinstance(root, ProduceResults):
                 raise GrafxPlanError("A UNION branch must produce rows.", field="union", value="branch")
@@ -526,6 +535,12 @@ class _Planner:
             self.apply_slot = max(self.apply_slot, sub.apply_slot)
         combined = UnionRows(left=pipelines[0], right=pipelines[1], columns=columns)
         for name in columns:
+            if all(name in branch for branch in list_outputs):
+                self.union_list_outputs[name] = any(branch[name] for branch in list_outputs)
+            if all(name in branch for branch in entity_kinds):
+                kinds = {branch[name] for branch in entity_kinds} - {None}
+                if len(kinds) == 1:
+                    self.union_entity_kinds[name] = next(iter(kinds))
             if all(name in branch for branch in path_outputs):
                 self.union_path_outputs[name] = any(branch[name] for branch in path_outputs)
             if all(name in branch for branch in entity_outputs):
@@ -537,6 +552,25 @@ class _Planner:
                            columns=columns),
             columns=columns,
         )
+
+    def _list_output_columns(self) -> dict[str, bool]:
+        """Preserve proved list/null outputs without treating edge lists as entities."""
+        statement = self.analysis.statement
+        if isinstance(statement, UnionQuery):
+            return self.union_list_outputs
+        if not isinstance(statement, Query) or statement.return_clause is None:
+            return {}
+        result = {}
+        for item in statement.return_clause.items:
+            expression = item.expression
+            if isinstance(expression, Variable) and (expression.name in self.multi_hop_variables
+                    or self.binding_types.get(expression.name) is ValueType.LIST):
+                result[item.name] = True
+            elif isinstance(expression, ListExpression):
+                result[item.name] = True
+            elif isinstance(expression, Literal) and expression.value is None:
+                result[item.name] = False
+        return result
 
     def _path_output_columns(self) -> dict[str, bool]:
         statement = self.analysis.statement
@@ -552,6 +586,32 @@ class _Planner:
                 result[item.name] = False
         return result
 
+    def _entity_output_kinds(self) -> dict[str, str | None]:
+        """Carry static entity kinds independently from nonempty table candidates."""
+        statement = self.analysis.statement
+        if isinstance(statement, UnionQuery):
+            return self.union_entity_kinds
+        if not isinstance(statement, Query) or statement.return_clause is None:
+            return {}
+        result: dict[str, str | None] = {}
+        for item in statement.return_clause.items:
+            expression = item.expression
+            if isinstance(expression, Variable):
+                name = expression.name
+                if name in self.multi_hop_variables:
+                    continue
+                if name in self.tables:
+                    result[item.name] = "relationship" if self.tables[name].kind == "rel" else "node"
+                elif name in self.empty_entity_kinds:
+                    result[item.name] = self.empty_entity_kinds[name]
+                elif name in self.polymorphic_variables:
+                    kinds = {table.kind for table in self.polymorphic_tables.get(name, ())}
+                    if len(kinds) == 1:
+                        result[item.name] = "relationship" if kinds == {"rel"} else "node"
+            elif isinstance(expression, Literal) and expression.value is None:
+                result[item.name] = None
+        return result
+
     def _entity_output_tables(self) -> dict[str, tuple[TableDef, ...]]:
         """Retain entity-table alternatives through UNION and returning subqueries."""
         statement = self.analysis.statement
@@ -562,6 +622,8 @@ class _Planner:
         result = {}
         for item in statement.return_clause.items:
             expression = item.expression
+            if isinstance(expression, Variable) and expression.name in self.multi_hop_variables:
+                continue
             if isinstance(expression, Variable) and expression.name in self.tables:
                 result[item.name] = (self.tables[expression.name],)
             elif isinstance(expression, Variable) and expression.name in self.polymorphic_variables:
@@ -1175,11 +1237,7 @@ class _Planner:
             raise GrafxPlanError(message, field="clause", value=value)
         self.typed_endpoint_form = self._is_typed_endpoint_form(statement)
         self.path_projection = projected_path
-        untyped_source = untyped_one_hop_source(statement)
-        self.untyped_one_hop_label = (
-            None if untyped_source is None else untyped_source.labels[0]
-        )
-        if (untyped_source is not None or projected_path is not None
+        if (projected_path is not None
                 or statement.with_clauses or correlated_optional_pipeline(statement)):
             # Each literal recogniser judged the STATEMENT, while the pipeline below also reads
             # the analysis -- which a caller may have supplied. A supplied summary that claims
@@ -1235,10 +1293,12 @@ class _Planner:
                 imported = tuple(Binding(name=inner, entity="expression alias", labels=(), created=False)
                                  for inner in clause.imports)
                 from dataclasses import replace
-                imported = tuple(replace(binding, entity=("relationship" if self.tables[source].kind == "rel" else "node"),
+                imported = tuple(binding if source in self.multi_hop_variables else
+                                 replace(binding, entity=("relationship" if self.tables[source].kind == "rel" else "node"),
                                          labels=(self.tables[source].name,))
                                  if source in self.tables else
-                                 replace(binding, entity=("relationship" if self.polymorphic_tables.get(source)
+                                 replace(binding, entity=self.empty_entity_kinds.get(source,
+                                         "relationship" if self.polymorphic_tables.get(source)
                                          and self.polymorphic_tables[source][0].kind == "rel" else "node"))
                                  if source in self.polymorphic_variables else
                                  replace(binding, entity="path") if source in self.bound_paths else
@@ -1252,16 +1312,21 @@ class _Planner:
                     analysis=analyze(clause.query, bindings=imported), imported_bindings=imported,
                     argument_slot=slot, apply_slot=slot,
                     bound_paths={target for source, target in zip(outer, clause.imports) if source in self.bound_paths},
+                    multi_hop_variables={target for source, target in zip(outer, clause.imports)
+                                         if source in self.multi_hop_variables},
                     tables={target: self.tables[source] for source, target in zip(outer, clause.imports)
                             if source in self.tables},
                     polymorphic_variables={target for source, target in zip(outer, clause.imports)
                                            if source in self.polymorphic_variables},
+                    empty_entity_kinds={target: self.empty_entity_kinds[source]
+                                        for source, target in zip(outer, clause.imports)
+                                        if source in self.empty_entity_kinds},
                     polymorphic_tables={target: self.polymorphic_tables.get(source, self._node_tables())
                                         for source, target in zip(outer, clause.imports)
                                         if source in self.polymorphic_variables},
                     binding_types={target: self._pulse_expression_type(Variable(source), owner="subquery import")
                                    for source, target in zip(outer, clause.imports)
-                                   if not self._matched_row(source)},
+                                   if not self._matched_row(source) or source in self.multi_hop_variables},
                 )
                 planned = sub.run(clause.query)
                 assert isinstance(planned.root, ProduceResults)
@@ -1272,21 +1337,30 @@ class _Planner:
                 if isinstance(lowered, Query) and lowered.return_clause is not None:
                     for target, item in zip(outputs, lowered.return_clause.items, strict=True):
                         expression = item.expression
-                        if isinstance(expression, Variable) and expression.name in sub.tables:
+                        if isinstance(expression, Variable) and expression.name in sub.multi_hop_variables:
+                            self.binding_types[target] = ValueType.LIST
+                            self.multi_hop_variables.add(target)
+                        elif isinstance(expression, Variable) and expression.name in sub.tables:
                             self.tables[target] = sub.tables[expression.name]
                         elif isinstance(expression, Variable) and expression.name in sub.polymorphic_variables:
                             self.polymorphic_variables.add(target)
                             self.polymorphic_tables[target] = sub.polymorphic_tables.get(expression.name, self._node_tables())
+                            if expression.name in sub.empty_entity_kinds:
+                                self.empty_entity_kinds[target] = sub.empty_entity_kinds[expression.name]
                         elif isinstance(expression, Variable) and expression.name in sub.bound_paths:
                             self.bound_paths.add(target)
                         else:
                             self.binding_types[target] = sub._pulse_expression_type(expression, owner="subquery output")
                 else:
                     entity_tables = sub._entity_output_tables()
+                    list_columns = sub._list_output_columns()
+                    entity_kinds = sub._entity_output_kinds()
                     path_columns = sub._path_output_columns()
                     for source, target in zip(planned.columns, outputs, strict=True):
                         alternatives = entity_tables.get(source)
-                        if alternatives:
+                        if list_columns.get(source):
+                            self.binding_types[target] = ValueType.LIST
+                        elif alternatives:
                             if len(alternatives) == 1:
                                 self.tables[target] = alternatives[0]
                             else:
@@ -1294,6 +1368,10 @@ class _Planner:
                                 self.polymorphic_tables[target] = alternatives
                         elif path_columns.get(source):
                             self.bound_paths.add(target)
+                        elif entity_kinds.get(source) is not None:
+                            self.polymorphic_variables.add(target)
+                            self.polymorphic_tables[target] = ()
+                            self.empty_entity_kinds[target] = entity_kinds[source]
                         else:
                             self.binding_types[target] = None
                 pipeline = SubqueryRows(child=pipeline, inner=planned.root.child, slot=slot,
@@ -1318,6 +1396,10 @@ class _Planner:
                 continue
             if clause.optional and correlated and not any(
                 pattern.variable in self.capture_paths or self._has_absent_table(pattern)
+                or any(len(edge.types) > 1 for edge in pattern.relationships)
+                or any(node.variable is not None and (
+                    self._matched_row(node.variable) or node.variable in self.binding_types
+                    or node.variable in self.alias_definitions) for node in pattern.nodes[1:])
                 for pattern in clause.patterns
             ):
                 pipeline = self._correlated_optional(pipeline, clause)
@@ -1439,6 +1521,10 @@ class _Planner:
                     self.polymorphic_variables.add(item.alias)
                     if original in self.polymorphic_tables:
                         self.polymorphic_tables[item.alias] = self.polymorphic_tables[original]
+                    if original in self.empty_entity_kinds:
+                        self.empty_entity_kinds[item.alias] = self.empty_entity_kinds[original]
+                if original in self.multi_hop_variables:
+                    self.multi_hop_variables.add(item.alias)
         aggregations = tuple(
             Aggregation(position=position, call=call)
             for position, item in enumerate(clause.items)
@@ -1746,6 +1832,8 @@ class _Planner:
         if isinstance(expression, Literal):
             return value_type_of(expression.value)
         if isinstance(expression, Variable):
+            if expression.name in self.multi_hop_variables:
+                return ValueType.LIST
             if expression.name in self.bound_paths:
                 return None  # Native path, never a scalar column or writable handle.
             if expression.name in self.tables or expression.name in self.polymorphic_variables:
@@ -1881,7 +1969,8 @@ class _Planner:
                         kind = "relationship" if self.tables[argument.name].kind == "rel" else "node"
                     elif argument.name in self.polymorphic_variables:
                         kinds = {table.kind for table in self.polymorphic_tables.get(argument.name, ())}
-                        kind = "relationship" if kinds == {"rel"} else "node" if kinds == {"node"} else None
+                        kind = self.empty_entity_kinds.get(argument.name,
+                            "relationship" if kinds == {"rel"} else "node" if kinds == {"node"} else None)
                     elif binding is not None and binding.entity in {"node", "relationship", "path"}:
                         kind = binding.entity
                 if kind is None and value_type is None and not (
@@ -2284,18 +2373,22 @@ class _Planner:
         """Keep symbolic bindings for OPTIONAL/type checks; never fabricate tables."""
         for entity in (*pattern.nodes, *pattern.relationships):
             name = entity.variable
+            labels = entity.labels if isinstance(entity, NodePattern) else entity.types
+            if isinstance(entity, NodePattern) and len(labels) > 1:
+                self._node_table_of(entity)  # Retain typed-model admission even for an empty read.
+            expected = "node" if isinstance(entity, NodePattern) else "rel"
+            for label in labels:
+                if self.catalog.has_table(label) and self.catalog.table(label).kind != expected:
+                    raise GrafxPlanError("The pattern names the wrong table kind.", field="label", value=label)
             if name is None or self._matched_row(name):
                 continue
-            labels = entity.labels if isinstance(entity, NodePattern) else entity.types
             if len(labels) == 1 and self.catalog.has_table(labels[0]):
                 table = self.catalog.table(labels[0])
-                expected = "node" if isinstance(entity, NodePattern) else "rel"
-                if table.kind != expected:
-                    raise GrafxPlanError("The pattern names the wrong table kind.", field="label", value=labels[0])
                 self.tables[name] = table
             else:
                 self.polymorphic_variables.add(name)
                 self.polymorphic_tables[name] = ()
+                self.empty_entity_kinds[name] = "node" if expected == "node" else "relationship"
             if isinstance(entity, RelationshipPattern) and entity.hop_range_written:
                 self.multi_hop_variables.add(name)
         if pattern.variable in self.capture_paths:
@@ -2327,7 +2420,7 @@ class _Planner:
             pipeline,
             first,
             terms,
-            standalone=not pattern.relationships or zero_anchor,
+            standalone=not pattern.relationships or zero_anchor or (inferred is None and not first.labels),
             inferred_table=inferred,
         )
         for position, relationship in enumerate(pattern.relationships):
@@ -2499,6 +2592,9 @@ class _Planner:
         """
 
         self.polymorphic_variables.add(variable)
+        self.polymorphic_tables[variable] = self._node_tables()
+        if not self.polymorphic_tables[variable]:
+            self.empty_entity_kinds[variable] = "node"
         if pattern.properties is not None:
             terms = terms + list(self._property_terms(variable, pattern.properties))
             # Inline keys may have no explicit Property AST in the source query.
@@ -2808,50 +2904,94 @@ class _Planner:
             and value.subject.name == self.unwind_alias
         )
 
-    def _traverse_untyped(
-        self,
-        pipeline: PlanNode,
-        source: str,
-        relationship: RelationshipPattern,
-        target_pattern: NodePattern,
+    def _traverse_polymorphic(
+        self, pipeline: PlanNode, source: str, relationship: RelationshipPattern,
+        target_pattern: NodePattern, *, path_variable: str | None, path_append: bool,
     ) -> tuple[PlanNode, str]:
-        """Plan the one untyped hop this engine reads, across every table it could live in.
-
-        Reached only when the WHOLE statement is the admitted shape, which is decided once in
-        :func:`~okto_grafx.domain.query.analysis.untyped_one_hop_source` and not re-derived here.
-        Every other untyped relationship falls through to the refusal it has always earned.
-        """
-        label = self.untyped_one_hop_label
-        tables = tuple(
-            table
-            for table in sorted(self.catalog.tables(), key=lambda item: item.table_id)
-            if table.kind == "rel" and table.from_table == label
-        )
-        # A label with nothing leaving it is not a shape defect; it is a query whose answer is
-        # no rows, and the operator below produces exactly that from an empty table list.
-        # Refusing here would turn a fact about the schema into a fault in the query.
-        for table in tables:
-            # Every candidate's landing table is resolved BEFORE the operator is built, and by
-            # the same door the typed route uses. A catalog can name an endpoint it does not
-            # hold; admitting that plan would defer a schema defect until execution while the
-            # typed route refuses it during planning. Refusing here keeps both routes fail-fast
-            # at the same public boundary and with the same typed error.
-            self._table_named(table.to_table, "to")
-        named = target_pattern.variable
-        target = named if named is not None else self._anonymous()
-        # Deliberately NOT recorded in self.tables: the landing table differs per relationship
-        # table, so there is no single answer to "which table is b". Nothing in the admitted
-        # shape reads b, and a name bound to one table would be a claim this hop cannot make.
-        return (
-            TraverseAnyRelationship(
-                child=pipeline,
-                source=source,
-                target=target,
-                relationship=relationship.variable or "",
-                tables=tables,
-            ),
-            target,
-        )
+        """Plan bounded trails over the declared alternatives or eligible tables."""
+        if relationship.properties is not None:
+            raise GrafxPlanError("Inline relationship properties remain unsupported; use WHERE.", field="properties")
+        if relationship.types:
+            candidates = []
+            for name in dict.fromkeys(relationship.types):
+                if not self.catalog.has_table(name):
+                    continue
+                table = self._table_named(name, "type")
+                if table.kind != "rel":
+                    raise GrafxPlanError("A relationship type must name a relationship table.", field="type", value=name)
+                candidates.append(table)
+        else:
+            candidates = [table for table in self.catalog.tables() if table.kind == "rel"]
+        source_tables = (self.polymorphic_tables.get(source, self._node_tables())
+                         if source in self.polymorphic_variables else
+                         (self.tables[source],) if source in self.tables else self._node_tables())
+        source_names = {table.name for table in source_tables}
+        outgoing = relationship.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
+        incoming = relationship.direction in (Direction.INCOMING, Direction.UNDIRECTED)
+        selected_by_id = {}
+        landing_names = set(source_names) if relationship.min_hops == 0 else set()
+        for table in sorted(candidates, key=lambda candidate: candidate.table_id):
+            for name in (table.from_table, table.to_table):
+                if self._table_named(name, "endpoint").kind != "node":
+                    raise GrafxPlanError("A relationship endpoint must name a node table.", field="endpoint", value=name)
+        frontier = source_names
+        # The omitted-upper completeness probe may need a type first reachable
+        # at max+1; it must not mistake that schema boundary for a dead end.
+        for depth in range(1, relationship.max_hops + 1 + int(relationship.upper_bound_omitted)):
+            following = set()
+            for table in candidates:
+                if outgoing and table.from_table in frontier:
+                    selected_by_id[table.table_id] = table
+                    following.add(table.to_table)
+                if incoming and table.to_table in frontier:
+                    selected_by_id[table.table_id] = table
+                    following.add(table.from_table)
+            if relationship.min_hops <= depth <= relationship.max_hops:
+                landing_names.update(following)
+            frontier = following
+            if not frontier:
+                break
+        selected = tuple(selected_by_id[key] for key in sorted(selected_by_id))
+        target = target_pattern.variable or self._anonymous()
+        bound = self._matched_row(target) or target in self.binding_types or target in self.alias_definitions
+        target_table = self._node_table_of(target_pattern) if target_pattern.labels else self.tables.get(target)
+        if not bound:
+            if target_table is not None:
+                self.tables[target] = target_table
+            else:
+                self.polymorphic_variables.add(target)
+                self.polymorphic_tables[target] = tuple(table for table in self._node_tables() if table.name in landing_names)
+                if not self.polymorphic_tables[target]:
+                    self.empty_entity_kinds[target] = "node"
+        edge = relationship.variable or self._anonymous()
+        self.polymorphic_variables.add(edge)
+        self.polymorphic_tables[edge] = tuple(selected)
+        if len(relationship.types) == 1 and len(selected) == 1 and not relationship.hop_range_written:
+            # A polymorphic source does not erase an explicitly typed edge's
+            # authority/type proof for subsequent SET or DELETE.
+            self.tables[edge] = selected[0]
+        if not selected:
+            self.empty_entity_kinds[edge] = "relationship"
+        if relationship.hop_range_written:
+            self.multi_hop_variables.add(edge)
+        if (relationship.min_hops, relationship.max_hops) != (1, 1):
+            return TraverseRelationshipAlternatives(
+                child=pipeline, source=source, target=target, relationship=edge,
+                tables=selected, direction=relationship.direction,
+                min_hops=relationship.min_hops, max_hops=relationship.max_hops,
+                target_table=target_table, target_bound=bound,
+                path_variable=path_variable, path_append=path_append,
+                relationship_list=relationship.hop_range_written,
+                upper_bound_omitted=relationship.upper_bound_omitted,
+            ), target
+        return TraverseAnyRelationship(
+            child=pipeline, source=source, target=target, relationship=edge, tables=tuple(selected),
+            direction=relationship.direction, target_table=target_table.name if target_table is not None else None,
+            source_table=self.tables[source].name if source in self.tables else None,
+            relationship_polymorphic=True, target_bound=bound,
+            path_variable=path_variable, path_append=path_append,
+            relationship_list=relationship.hop_range_written,
+        ), target
 
     def _traverse(
         self,
@@ -2864,9 +3004,10 @@ class _Planner:
         path_append: bool = False,
     ) -> tuple[PlanNode, str]:
         """Plan one relationship hop, or a bounded range of them."""
-        if self.untyped_one_hop_label is not None and not relationship.types:
-            return self._traverse_untyped(
-                pipeline, source, relationship, target_pattern
+        if len(relationship.types) != 1 or source in self.polymorphic_variables:
+            return self._traverse_polymorphic(
+                pipeline, source, relationship, target_pattern,
+                path_variable=path_variable, path_append=path_append,
             )
         if len(relationship.types) != 1:
             raise GrafxPlanError(
@@ -2879,7 +3020,7 @@ class _Planner:
             if relationship.min_hops != 0:
                 raise GrafxPlanError("A positive absent-table traversal must have an empty read plan.", field="plan")
             target = target_pattern.variable or self._anonymous()
-            bound = self._matched_row(target) or target in self.binding_types
+            bound = self._matched_row(target) or target in self.binding_types or target in self.alias_definitions
             target_table = self._node_table_of(target_pattern) if target_pattern.labels else self.tables.get(target)
             if not bound:
                 if target_table is not None:

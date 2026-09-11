@@ -667,7 +667,7 @@ physical versus logical names. No production Pulse installation or Core-specific
 dependency was changed. Documentation validation, changed-file Ruff and whitespace
 checks pass; the complete functional-parity plan remains active.
 
-## Publication checkpoint: absent-table reads in progress
+## Publication checkpoint: absent-table reads in progress (historical)
 
 The development checkpoint also preserves the initial absent-table MATCH/OPTIONAL
 planner work and `ZeroHopRelationship` operator. An impossible positive-length
@@ -687,16 +687,230 @@ regression. Documentation, changed-file Ruff and whitespace checks also pass.
 This checkpoint is on Grafx `feature/v0.0.6`. Pulse Community and Core remain
 published on `feature/v0.3.3`; no production installation or release is included.
 
+## Absent-table reads and zero-hop binding validation (2026-09-11)
+
+Native positive-length MATCH over an absent named node/relationship table now
+produces no matches. OPTIONAL null-extends only newly introduced bindings;
+aggregates see zero mandatory input rows. No synthetic catalog object is created.
+The empty operator consumes its input, retaining preceding statement writes and
+their ordinary rollback boundary. Existing type/AST/name/typed-model admission
+is not waived merely because the read is empty.
+
+An absent relationship type with a zero-minimum range retains its legal zero-hop
+matches via `ZeroHopRelationship`. Anchors keep normal indexed/polymorphic access;
+target labels/properties and qualified bound-target identity remain required.
+Native paths contain the real anchor and no edges, or preserve the prior segment
+when appended. Paths consume the existing path quota with zero edge expansions.
+The returned public plan is detached and cannot modify a subsequent execution.
+
+Adversarial testing found and fixed three admission/binding problems in the
+initial checkpoint: a NULL alias destination could be overwritten by an anchor;
+empty table candidates lost node/relationship type information; and an absent
+table could bypass multi-label model refusal. Kind metadata now survives WITH,
+imports, returning subqueries and homogeneous entity/NULL UNION exports without
+inventing TableDefs. A label-free scan over an empty catalog also retains node
+typing. Cursor cancellation, independent-reader snapshots, schema-cache
+invalidation after both node and relationship DDL, and late failure after
+instrumented observed SET writes have native tests.
+
+The grouped regression additionally found six outdated assertions from earlier
+FP-3 changes: node-only named paths were expected to refuse, two AST cases
+expected the old diagnostic field, self-loop counting/budget assumed duplicated
+directions, and nested pending entities were expected to be integer IDs. Tests
+now assert accepted path analysis, exact structural refusal, one physical
+self-loop plus independent parallel-edge budget work, and immutable detached
+NodeValue identity/properties. These are contract updates, not xfail waivers.
+The query and architecture contracts now consistently state one self-loop match.
+
+Pinned TCK `expressions/graph` after this work: **14 original passed, 1
+schema-adapted passed, 8 failed, 38 selected not-run** (3,836 outside selection).
+Graph9 properties now has five original passes, one adapted pass and one not-run;
+its original absent-table NULL scenario passes without query/expectation changes.
+Graph3 NULL labels and Graph4 invalid node argument also pass. The remaining
+Graph6 untyped OPTIONAL on a catalog with no relationship tables belongs to the
+still-open untyped-pattern work; Graph5 label-expression parsing also remains
+open. Schema-free/multilabel writes remain visible in the original inventory.
+No ledger exclusions or upstream source files were changed.
+Receipt `.grafx-tmp/fp3-absent-tck-complete.json`, SHA-256
+`48fe66d4a680decaf9a4f40b4878547c1e936e0fb372b939e41a28cb7e2f5f04`.
+
+Final native grouped regression: **695 passed, 0 failures/errors/skips in
+176.182 s**, covering the new absent-table cases, native scalars/node paths/
+omitted ranges/entity UNION, polymorphic composition, optional pipelines and
+landing validation, schema/plan cache, planner shapes, composed write conflicts,
+owner writes and UNION variants. Receipt
+`.grafx-tmp/fp3-absent-regression-final.xml`, SHA-256
+`09937b388791986bbaaadbd8e4ecfd813dd93a25f1e6c96dd98148ecdb2fd526`.
+The earlier six-failure grouped run is superseded by this passing run, not
+counted as acceptance. This is a package-focused selection, not the full suite.
+Documentation validation (39 configuration fields, 11 preserved source plans),
+changed-file Ruff and whitespace validation also pass.
+
+Public query, API, configuration, composition, comparison, architecture and
+ROADMAP documentation were updated. No new configuration, persistent format,
+Pulse Core dependency, production install or publication is included. This is
+not FP-3 acceptance or completion of the full functional-parity plan.
+
+## Generic untyped/type-alternative single hops (2026-09-11)
+
+Native MATCH now accepts one-hop relationships with no explicit type or with
+type alternatives, in any direction and with anonymous, typed or polymorphic
+endpoints. Type names are deduplicated without collapsing physical parallel
+edges. The prior `untyped_one_hop_source` literal recognizer and its hard-coded
+Decision/source/target/return constants were removed, not retained as a legacy
+mode. Exact immutable AST admission still rejects forged containers, subclasses
+and non-boolean flags; supplied analyses cannot alter the statement's semantics.
+
+The planner uses `TraverseAnyRelationship` over one ordinary source access plan,
+with real candidate tables, endpoint schema validation and polymorphic property
+metadata. Bound targets compare qualified identity and cannot be rebound from
+NULL. OPTIONAL null-extends the entire failed clause, while nested/returning
+subqueries, aliases, UNION, filters, grouping and windows use the same query
+pipeline. `*1..1` binds a tuple, unlike an unwritten single hop. Inline
+relationship property maps and generic variable ranges over multiple tables
+remain pending; this increment does not claim those features.
+
+Named single-hop segments produce native paths and concatenate with other
+admitted segments. Prefix and clause-wide relationship uniqueness use physical
+identity, including equal local IDs in different node/relationship tables.
+Separate MATCH clauses may reuse an edge. Direction checks now verify the
+anchor table and both endpoint values before admitting a candidate: scanning
+several tables must not match another table's node just because its ID is equal.
+Each physical undirected self-loop is emitted once.
+
+The existing indexed-anchor/grouped-scan regime and transaction-private overlays
+are retained. Traversal draws upstream input once, shares expansion/path and
+intermediate-row quotas across candidate tables, and explicitly closes its
+incoming/candidate iterators. Unbound polymorphic roots may still scan all node
+tables; general endpoint/index access-path optimization remains a separate FP-3
+requirement, not an inferred performance guarantee.
+
+The first tests exposed the optimized correlated OPTIONAL route overwriting an
+already-bound NULL destination. That route now declines bound destinations so
+the generic binding-aware operator handles them. Earlier refusal-only tests
+were updated to test generic admission and actual results while preserving
+typed-model/unsupported-range/forged-AST refusals. The formerly refused chain of
+two OPTIONAL hops is checked against full landing materialization and an
+independent count: three targets times two parallel outgoing edges times two
+incoming matches equals twelve, since separate clauses may reuse relationships.
+
+Native tests exercise cross-table endpoint collisions, duplicate alternatives,
+parallel/self-loop counts, zero-row OPTIONAL, node/edge/path DTOs, predicates,
+bound/null targets, composed segments, imported and UNION paths, schema-cache
+invalidation, pending writes/independent readers, index retention and cursor
+cancellation. Instrumented forced disk spill preserves path identity and exact
+ordering; an observed SET followed by a dynamic argument failure rolls back the
+whole statement while retaining an earlier successful statement.
+
+Pinned graph-function TCK selection: **15 original passed, 1 adapted passed,
+7 failed, 38 selected not-run** (3,836 outside selection). The original Graph6
+NULL relationship-property case now passes against an empty catalog without
+rewriting its query or expectation. Receipt `.grafx-tmp/fp3-polyhop-tck.json`,
+SHA-256 `832d0352befe6d954802da5f6a3f93b367d2726a4b9513249dcec52c434c8075`.
+Remaining original failures and frozen model divergences are still visible;
+the result is not full TCK or profile acceptance.
+
+Query/API/configuration/entity/composition/comparison/architecture docs and
+ROADMAP describe the new native path and its boundaries. No new connection
+option, persistent format, Pulse dependency, installation or release is included.
+
+Final grouped regression: **409 passed, 0 failures/errors/skips in 141.966 s**.
+Selection includes generic-hop positive/negative/owner/spill tests, historical
+untyped access-path/forged-AST tests, correlated OPTIONAL and unused-landing
+validation, optional aggregation, absent-table cases, native entity functions,
+entity UNION/node paths/polymorphic composition, plan shapes, expression dispatch
+and prepared-plan cache. Receipt `.grafx-tmp/fp3-polyhop-regression-final.xml`,
+SHA-256 `ab557d6e7d50757b79c15f953f0f5bace461c3b9427a029809cecfdbc9dcb42f`.
+The earlier one-failure run is superseded; no expected-failure marker was added.
+Documentation validation (39 configuration fields, 11 preserved source plans),
+changed-file Ruff and whitespace validation pass. These are focused FP-3
+regressions, not full-package/profile/Pulse acceptance.
+
+## Heterogeneous bounded ranges (2026-09-11)
+
+`TraverseRelationshipAlternatives` now plans named/unnamed bounded trails across
+explicit relationship-type alternatives or all eligible tables. It shares the
+native typed depth-first engine instead of introducing a second traversal
+semantics. Real schema endpoints determine reachability at every depth; the final
+target label/property is only a completed-path filter, not an intermediate-node
+restriction. Anonymous/polymorphic starts, either direction, zero hops, repeated
+nodes, parallel edges and single physical self-loops retain qualified identity.
+Captured prefixes and clause-wide relationship exclusion prevent edge reuse.
+
+Static selection includes the extra schema depth needed for omitted-upper
+completeness: an edge type first reachable at hop 31 must not disappear from the
+probe at a 30-hop ceiling. A 32-node-table/31-relationship-table fixture verifies
+this case, with equal local record IDs across tables. Explicit bounds, streaming
+LIMIT, blocking ORDER BY, owner deletion/rollback and independent-reader probes
+are covered separately. No silent upper-bound truncation or new option is added.
+
+Both range operators explicitly close the input, candidate, probe and active DFS
+iterators. Typed batching/vector-free eligibility is not widened to the new plan
+class; unsupported projection proofs fall back to full value materialization.
+The existing shared intermediate/expansion/path/value/memory limits and statement
+rollback boundary remain unchanged.
+
+A recursive independent oracle enumerates small-graph edge subsets and compares
+full ordered node/edge signatures as bags for outgoing, incoming and undirected
+ranges, zero/positive minima, duplicate/missing alternatives, cycles and parallel
+edges. Native tests also cover bound and NULL targets, prefixes, list element
+metadata, owner overlays, cancellation, indexed anchors, detached plans,
+instrumented spill and observed-write late-failure rollback.
+
+The tests exposed two metadata defects, now corrected: an explicitly typed edge
+could lose its table proof merely because its source was polymorphic (blocking
+existing SET/DELETE), and range lists could be exported from a subquery as if
+they were single entities. Explicit single-edge table proofs are preserved;
+range list types now survive aliases, imported/returning subqueries and proved
+list-or-NULL UNION outputs. Invalid `type(list)` fails during planning, while
+valid list exports retain native relationship elements. A historical untyped
+`*1..2` refusal assertion is replaced by bounded-range admission, not an xfail.
+
+The pinned `expressions/path` selection has **4 original passes, 1 adapted pass,
+0 failures and 2 selected not-run** (3,890 cases outside selection). Receipt
+`.grafx-tmp/fp3-multirange-tck-paths.json`, SHA-256
+`1ec0c08a21ff766f088b468717211349fa90cb48f677b124c7d6958891332b5b`.
+The two not-run cases are **required**, not declared divergences:
+`expressions/path/Path2.feature#0001` and `#0002` use the same `REL` type for
+different endpoint-table pairs. The native fixture adapter still refuses this
+schema. Supporting multiple physical type alternatives is not the same as
+supporting one relationship type across several endpoint pairs; the remaining
+native schema/type-identity design is retained in FP-3, with no ledger exemption
+or rewritten expected result. These counts do not establish full path/profile
+acceptance.
+
+Public query, API/EXPLAIN, configuration, entity, composition, comparison and
+architecture contracts and ROADMAP were updated. No persistent format, Pulse
+installation, core-specific dependency or release was changed in this increment.
+
+| Receipt in `.grafx-tmp/` | Passed | Failures/errors/skips | Seconds | Scope |
+| --- | ---: | --- | ---: | --- |
+| `fp3-multirange-regression-final.xml` | 398 | 0/0/0 | 195.385 | Final heterogeneous oracle/limits/list/spill cases and preceding omitted ranges, single hops, native node/entity paths, scalar functions, optional pipelines, plan cache and untyped admission |
+| `fp3-multirange-typed-safety.xml` | 236 | 0/0/0 | 123.934 | Existing typed variable/composed/native paths, vector-free/batched landing proofs, owner writes, composed write conflicts and endpoint indexes |
+
+SHA-256 in table order:
+
+- `8a6c9fa3061e26596e6e56ac6f41ac250fd358e4545d17d1ab485d31d6b898d4`
+- `323421024075c0e89ef9d43e95f06b54f7b3041a363d69061ec8922328201efe`
+
+The earlier initialization indentation error, owner/list-metadata failures and
+outdated refusal assertion are superseded by the passing final runs, not counted
+as acceptance. Documentation validation (39 configuration fields, 11 preserved
+source plans), changed-file Ruff and whitespace checks pass. Full FP-3/profile,
+package-wide and coordinated Pulse acceptance remain outstanding.
+
 ## Remaining mandatory FP-3 work
 
-- Complete type alternatives and broader path expressions;
+- Complete remaining schema/pattern and broader path-expression cases;
   complete all hostile/public/budget and entity observation combinations.
-- Remaining entity-dependent scalar cases and absent-table OPTIONAL semantics
-  required by the FP-3 profile; the native function family alone is not full
-  upstream/profile qualification (including Graph9 NULL on absent tables).
+- Remaining entity-dependent scalar/label-expression cases and broader untyped
+  OPTIONAL semantics required by the FP-3 profile; the named absent-table and
+  native function cases alone are not full upstream/profile qualification.
 - Broader aggregate/spill and subsequent-clause combinations beyond the verified
   entity UNION cases; incompatible/missing-property and schema combinations.
-- Untyped/ambiguous relationship traversal and original fixture compatibility.
+- One relationship type across different endpoint-table pairs (including required
+  Path2 #0001/#0002), plus remaining original fixture compatibility. Do not turn
+  this required native schema/identity gap into a test-adapter label rewrite.
 - Cross-table index access when compatible keys can anchor new polymorphic
   bindings, without skipping possible results or silently truncating scans.
 - All required original/supplemental scenarios, package regression and affected
