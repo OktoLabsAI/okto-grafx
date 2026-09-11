@@ -132,8 +132,11 @@ round, with full Grafx regression and the affected real Pulse query contracts.
 
 The [functional parity plan](specs/FUNCTIONAL_PARITY_PLAN.md) addresses the remaining
 expression, subquery, pattern/path, entity-result, persisted-type and procedure
-capabilities together with stateful TCK execution. It is planned, not implemented;
-it does not change the results or exclusions recorded above. Package status belongs
+capabilities together with stateful TCK execution. Implementation is authorized;
+FP-1 checkpoint A is recorded and FP-2 is in progress, with hexadecimal/octal
+INT64 literals implemented. Full functional parity is not yet accepted. The
+[working case ledger and stateful-runner contract](conformance/README.md) do not
+change the historical results or exclusions recorded above. Package status belongs
 to the [roadmap](../ROADMAP.md#functional-parity-expansion-plan).
 
 The earlier 191-Community/23-Core consumer numbers above describe the initial

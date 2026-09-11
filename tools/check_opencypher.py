@@ -130,7 +130,9 @@ def compile_feature(source: str, uri: str) -> list[dict[str, object]]:
         for step in pickle["steps"]:
             argument = step.get("argument", {})
             doc = argument.get("docString")
-            if doc is None or "query" not in step["text"]:
+            if doc is None or step["text"] not in (
+                "having executed:", "executing query:", "executing control query:",
+            ):
                 continue
             query = doc["content"]
             try:
@@ -158,7 +160,7 @@ def inventory(checkout: Path) -> dict[str, object]:
     if revision != UPSTREAM_REVISION:
         raise ValueError(f"TCK revision mismatch: {revision}; need {UPSTREAM_REVISION}")
     dirty = subprocess.run(
-        ["git", "-C", str(checkout), "status", "--porcelain", "--", "tck/features"],
+        ["git", "-C", str(checkout), "status", "--porcelain", "--", "tck/features", "tck/graphs"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     if dirty:
@@ -174,9 +176,18 @@ def inventory(checkout: Path) -> dict[str, object]:
         source = path.read_text(encoding="utf-8")
         hashes[uri] = hashlib.sha256(source.encode("utf-8")).hexdigest()
         cases.extend(compile_feature(source, uri))
+    graph_fixtures = {}
+    for path in sorted((checkout / "tck" / "graphs").rglob("*.cypher")):
+        content = path.read_text(encoding="utf-8")
+        graph_fixtures[path.stem] = {
+            "uri": path.relative_to(checkout).as_posix(),
+            "sha256_lf": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "query": content,
+        }
     return {"schema_version": 1, "upstream_tag": UPSTREAM_TAG,
             "upstream_revision": revision, "feature_count": len(paths),
             "case_count": len(cases), "feature_sha256_lf": hashes,
+            "graph_fixtures": graph_fixtures,
             "warning": "Parse acceptance is not execution or semantic conformance.",
             "cases": cases}
 
@@ -188,9 +199,35 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--execute-reads", action="store_true",
                         help="Execute supported positive read scenarios against an empty public database")
+    parser.add_argument("--execute-stateful", action="store_true",
+                        help="Use isolated native transactions, graph observations and durable reopen")
+    parser.add_argument("--infer-fixture-schema", action="store_true",
+                        help="Record typed single-label fixture schema adaptation; never rewrite tested queries")
     parser.add_argument("--feature-prefix", default="", help="Restrict execution, not inventory coverage")
+    parser.add_argument("--ledger-output", type=Path,
+                        help="Create all-case ownership/expectation ledger; does not freeze exclusions")
+    parser.add_argument("--verify-ledger", type=Path,
+                        help="Refuse changed/missing source cases before any execution")
     args = parser.parse_args()
+    if args.execute_reads and args.execute_stateful:
+        parser.error("Choose either read-only diagnostics or stateful execution")
+    if args.infer_fixture_schema and not args.execute_stateful:
+        parser.error("--infer-fixture-schema requires --execute-stateful")
     report = inventory(args.checkout)
+    # Also support direct script execution (tools/ is then sys.path[0]).
+    if args.ledger_output or args.verify_ledger:
+        if __package__:
+            from tools.tck_ledger import build_ledger, profile_summary, verify_ledger
+        else:
+            from tck_ledger import build_ledger, profile_summary, verify_ledger
+
+        if args.verify_ledger:
+            ledger = json.loads(args.verify_ledger.read_text(encoding="utf-8"))
+            verify_ledger(ledger, report)
+        if args.ledger_output and args.ledger_output.exists():
+            saved = json.loads(args.ledger_output.read_text(encoding="utf-8"))
+            if saved.get("status") == "frozen_checkpoint_a":
+                parser.error("Refusing to replace a frozen ledger with a new draft")
     if args.execute_reads:
         import okto_grafx
 
@@ -201,8 +238,30 @@ def main() -> int:
                         with database.begin("read") as transaction:
                             case.update(run_read_case(case, transaction))
         report["execution_summary"] = dict(Counter(case["conformance"] for case in report["cases"]))
+    if args.execute_stateful:
+        if __package__:
+            from tools.tck_native import NativeScenarioBackend
+            from tools.tck_stateful import run_stateful_case
+        else:
+            from tck_native import NativeScenarioBackend
+            from tck_stateful import run_stateful_case
+        for case in report["cases"]:
+            if case["id"].startswith(args.feature_prefix):
+                backend = NativeScenarioBackend(infer_schema=args.infer_fixture_schema,
+                                                graph_fixtures=report["graph_fixtures"])
+                try:
+                    case.update(run_stateful_case(case, backend))
+                finally:
+                    backend.close()
+        report["execution_summary"] = dict(Counter(case["conformance"] for case in report["cases"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.verify_ledger:
+        report["profile_summary"] = profile_summary(report, ledger)
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if args.ledger_output:
+        args.ledger_output.parent.mkdir(parents=True, exist_ok=True)
+        args.ledger_output.write_text(json.dumps(build_ledger(report), indent=2, ensure_ascii=False)
+                                      + "\n", encoding="utf-8")
     print(json.dumps({key: report[key] for key in ("upstream_revision", "feature_count", "case_count")}))
     if "execution_summary" in report:
         print(json.dumps(report["execution_summary"]))

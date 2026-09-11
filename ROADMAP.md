@@ -14,7 +14,7 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## Functional parity expansion plan
 
-**Planned; implementation not started.** The user requested a concrete plan for
+**Authorized; checkpoint A recorded, FP-2 implementation in progress.** The user requested a concrete plan for
 the six remaining functional fronts plus the unresolved TCK inventory. The
 [functional parity specification](docs/specs/FUNCTIONAL_PARITY_PLAN.md) defines
 scope, dependencies, acceptance, Pulse migration and checkpoints. This section is
@@ -23,8 +23,8 @@ No release number, branch change or publication is implied by plan approval.
 
 | Order | ID | Planned delivery | Status |
 |---|---|---|---|
-| 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Planned |
-| 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | Planned |
+| 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Checkpoint A: 3,897 cases bound, 3,470 required / 427 explicit model divergences; compatible runner paths tested; later-package blockers retained |
+| 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | In progress |
 | 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | Planned |
 | 4 | FP-4 | Returning/unit read-write subqueries and variable-import rules | Planned |
 | 5 | FP-5 | Temporal functions/operations and exact native stored values | Planned |
@@ -39,6 +39,19 @@ Core boundaries remain mandatory. Checkpoints: matrix freeze after FP-1; grouped
 query/transaction validation after FP-4; format/upgrade validation after FP-6;
 final severe regression after FP-8. Focused tests run throughout. No moving
 percentage performance gate or rewriting TCK expectations to obtain a pass.
+
+FP-1 working evidence and reproduction: [conformance tooling](docs/conformance/README.md).
+The [checkpoint A decision](docs/conformance/CHECKPOINT_A.md) binds all 3,897 cases
+and 15 step families: 3,470 required, 427 reviewed source-based divergences within
+the plan's explicit model exclusions, never inferred from test failures. Native
+observation uses independent stored-row scans and durable reopen. All 22 supplemental
+feature/value/consumer contracts remain mandatory. This is not completed functional
+parity; FP-2–FP-8 and all required native failures remain pending.
+Latest focused fixture/oracle plus prior query/procedure regression: 179 passed,
+zero failures/errors/skips. Actual CALL reference diagnostic: 19 passed, 25 failed,
+8 not run; named-tree diagnostic: 10 failed after fixture load, 9 not run for
+incompatible endpoint-table families. Failures remain visible. Neo4j CE 5.26.0 image
+digests are pinned for later comparison, not claimed as executed comparative evidence.
 
 ## Authorized query-language compatibility round
 

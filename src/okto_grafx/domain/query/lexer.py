@@ -387,6 +387,8 @@ def _read_parameter(scanner: _Scanner) -> Token:
 
 def _read_number(scanner: _Scanner) -> Token:
     """Read an integer or a double, refusing one too long to convert or not finite."""
+    if scanner.peek() == "0" and scanner.peek(1) in ("x", "X", "o"):
+        return _read_based_integer(scanner)
     line, column, offset = scanner.line, scanner.column, scanner.index
     characters: list[str] = []
     is_double = False
@@ -451,9 +453,35 @@ def _double_token(literal: str, *, line: int, column: int, offset: int) -> Token
     )
 
 
-def _integer_token(literal: str, *, line: int, column: int, offset: int) -> Token:
+def _read_based_integer(scanner: _Scanner) -> Token:
+    """Read reference hexadecimal/octal spellings without rounding through DOUBLE.
+
+    The lexer admits magnitude 2**63 so a following parser sign can form INT64_MIN.
+    All other overflow and invalid digits are rejected before any statement effects.
+    """
+    line, column, offset = scanner.line, scanner.column, scanner.index
+    prefix = scanner.advance(2)
+    base = 16 if prefix[1] in ("x", "X") else 8
+    allowed = _HEX_DIGITS if base == 16 else frozenset("01234567")
+    characters: list[str] = []
+    while not scanner.done and (scanner.peek().isalnum() or scanner.peek() == "_"):
+        if scanner.index - offset >= MAX_NUMBER_CHARACTERS:
+            raise _refuse(f"A numeric literal may carry at most {MAX_NUMBER_CHARACTERS} characters",
+                          line=line, column=column, offset=offset, field="number",
+                          value=MAX_NUMBER_CHARACTERS)
+        characters.append(scanner.advance())
+    digits = "".join(characters)
+    valid = bool(digits) and digits[-1] != "_" and "__" not in digits
+    valid = valid and all(character in allowed or character == "_" for character in digits)
+    if not valid or not digits.replace("_", ""):
+        raise _refuse("Invalid based integer literal", line=line, column=column, offset=offset,
+                      field="number_literal", value=prefix + digits)
+    return _integer_token(prefix + digits, line=line, column=column, offset=offset, base=base)
+
+
+def _integer_token(literal: str, *, line: int, column: int, offset: int, base: int = 10) -> Token:
     """Return the token of an integer literal, refusing a magnitude no signed word can hold."""
-    number = int(literal)
+    number = int(literal, base)
     if number > INTEGER_MAGNITUDE_LIMIT:
         raise _refuse(
             f"The literal {literal} is outside the range a 64-bit integer can hold",

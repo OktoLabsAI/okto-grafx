@@ -4,11 +4,11 @@
 [Current compatibility](../CYPHER_COMPATIBILITY.md) ·
 [Product comparison](../FEATURE_COMPARISON.md)
 
-Prepared September 11, 2026. **Planning only; none of the work below is marked
-implemented by this document.** The user requested a plan covering six remaining
-functional fronts and the unresolved TCK inventory. This specifies that work; it
-does not start implementation, change a version/branch, authorize a release or
-modify the installed Pulse. ROADMAP.md remains the single delivery-status authority.
+Prepared September 11, 2026; subsequently authorized for implementation by the user.
+This document preserves the agreed scope, including all six functional fronts and
+the unresolved TCK inventory. It does not itself certify any package, change a
+version/branch, authorize a release or modify the installed Pulse. ROADMAP.md
+remains the single delivery-status authority.
 
 ## 1. Outcome and fixed boundaries
 

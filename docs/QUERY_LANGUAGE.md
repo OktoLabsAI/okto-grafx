@@ -63,6 +63,13 @@ transactions like any other.
 
 ## Values and Python mapping
 
+Integer query literals accept decimal, hexadecimal (`0x`/`0X`) and octal (`0o`)
+spellings, for example `RETURN 0x2A AS hex, 0o52 AS octal`. Based literals permit
+single underscores before digits (`0x_FF`, `0o7_7`), not trailing or repeated
+underscores. Values remain exact signed INT64, including `-0x8000000000000000`;
+malformed digits and overflow refuse before statement effects. This introduces
+no new configuration, storage type or Python parameter contract.
+
 | Column/value | Python boundary / restrictions |
 | --- | --- |
 | `INT64` | Signed 64-bit integer; bool is not an integer substitute |
