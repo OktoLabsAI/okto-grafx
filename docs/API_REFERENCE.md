@@ -32,6 +32,24 @@ and invalid-aggregation refusals have additive planning-phase evidence. See the
 [query contract](QUERY_LANGUAGE.md#values-and-python-mapping) for examples,
 per-carrier consumption limits and LIMIT/write behavior.
 
+RANGE operand failures now carry runtime `range_argument_type` /
+`range_argument_bounds` reasons; they occur only if the expression is evaluated.
+The numeric-token ceiling is now 2,048 characters to admit long finite DOUBLE
+spellings; INT64 and non-finite refusal remain unchanged. These are native query
+contracts, not new Python signatures, stored types or connection settings.
+
+Native queries also accept `WITH *` / `WITH *, expression AS alias`, expanded
+against the current named scope before ordinary planning. Python result names
+and value representations remain unchanged. IN operand refusals carry additive
+`membership_operand_type` / `query_phase` evidence, and invalid bound right-hand
+parameters refuse before opening a scan. See [scope and limits](COMPOSABLE_QUERIES.md#clause-order-and-scope).
+
+Standalone polymorphic reads now compose in native queries, including rematched
+aliases and explicitly imported/exported live query bindings. The public detached
+entity representation has **not** changed in this increment. There is no new
+`connect()` option or transaction mode; see [polymorphic composition](COMPOSABLE_QUERIES.md#polymorphic-node-read-composition)
+and [FP-3 working evidence](conformance/FP3_PROGRESS.md).
+
 0.0.6 NHC adds `TextMatchPositions` and `TemporalCompactionReport` at the root.
 `okto_grafx.temporal_diff` exports `diff_graph`, `TemporalDiff`,
 `TemporalSchemaChange`, `TemporalRowChange` and `TemporalPropertyChange`.

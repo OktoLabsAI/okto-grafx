@@ -380,29 +380,24 @@ def test_the_budget_counts_the_union_and_not_each_table(tmp_path: Path) -> None:
         refused.close()
 
 
-# --- the one shape it is read in -------------------------------------------------------------------
+# --- read composition does not grant dynamic writes -----------------------------------------------
 
 
 @pytest.mark.parametrize(
     "query",
     [
-        "MATCH () RETURN 1",
-        "MATCH (n), (m:Bug) RETURN n.id",
-        "MATCH (n) MATCH (m:Bug) RETURN n.id",
         "MATCH (n) CREATE (:Bug {id: 'x'})",
         "MATCH (n) SET n.title = 'x'",
         "MATCH (n) DELETE n",
-        "MATCH (n {id: 'd1'}) RETURN n.id",
-        "UNWIND $rows AS r MATCH (n) RETURN n.id",
     ],
 )
-def test_every_shape_but_the_one_is_refused_before_a_table_is_read(
+def test_dynamic_polymorphic_writes_remain_refused_before_a_table_is_read(
     database: object, query: str
 ) -> None:
     with pytest.raises(GrafxPlanError) as raised:
         database.execute(query, {"rows": [1]})
     assert raised.value.details["field"] == "pattern"
-    assert "exactly one shape" in str(raised.value)
+    assert "write needs one table" in str(raised.value)
 
 
 def test_a_node_at_the_end_of_a_hop_keeps_the_refusal_it_already_had(

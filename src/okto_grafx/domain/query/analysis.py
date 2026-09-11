@@ -67,6 +67,7 @@ from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
     MAX_CLAUSES,
     MAX_PARAMETERS,
+    MAX_PROJECTION_ITEMS,
     MAX_TRAVERSAL_HOPS,
 )
 from okto_grafx.domain.query.tokens import (
@@ -196,10 +197,9 @@ class QueryAnalysis:
 
 
 POLYMORPHIC_NODE_SHAPE: str = (
-    "one MATCH of one named node with no label, no relationship and no inline property map, "
-    "no UNWIND, no clause that writes, and a RETURN"
+    "composed read-only standalone node patterns, including inline maps, UNWIND and OPTIONAL MATCH"
 )
-"""The only shape a node written without a label is read in."""
+"""Current admission boundary for standalone label-free node reads."""
 
 
 def polymorphic_node(query: Query) -> NodePattern | None:
@@ -213,11 +213,27 @@ def polymorphic_node(query: Query) -> NodePattern | None:
     keeps the refusal it already had rather than being re-explained as a shape rule.
     """
     bound: set[str] = set()
-    for clause in query.match_clauses:
-        for pattern in clause.patterns:
+    for clause in query.ordered_clauses():
+        if isinstance(clause, WithClause):
+            bound = (bound if clause.include_existing else set()) | {item.name for item in clause.items}
+            continue
+        if isinstance(clause, UnwindClause):
+            bound.add(clause.alias)
+            continue
+        if isinstance(clause, ProcedureCall):
+            bound.update(item.name for item in clause.yields)
+            continue
+        if isinstance(clause, SubqueryClause):
+            branches = clause.query.branches() if isinstance(clause.query, UnionQuery) else (clause.query,)
+            if branches[0].return_clause is not None:
+                bound.update(branches[0].return_clause.column_names())
+            continue
+        patterns = ((clause.pattern,) if isinstance(clause, MergeClause) else
+                    clause.patterns if isinstance(clause, (MatchClause, CreateClause)) else ())
+        for pattern in patterns:
             first = pattern.nodes[0]
             if (
-                not pattern.relationships
+                isinstance(clause, MatchClause) and not pattern.relationships
                 and not first.labels
                 and (first.variable is None or first.variable not in bound)
             ):
@@ -232,7 +248,7 @@ def polymorphic_node(query: Query) -> NodePattern | None:
 
 
 def polymorphic_node_refusal(query: Query) -> tuple[str, str] | None:
-    """Return the refusal a label-free node earns outside its one shape, or None.
+    """Return a remaining polymorphic write restriction, or None.
 
     One function, asked by the analysis and asked again by the planner. Both need the answer --
     a tree that never passed the parser reaches the first, and a caller's own analysis walks
@@ -246,34 +262,14 @@ def polymorphic_node_refusal(query: Query) -> tuple[str, str] | None:
     if reason is None:
         return None
     return (
-        "A node that names no label matches every node table, and this subset reads one in "
-        f"exactly one shape: {POLYMORPHIC_NODE_SHAPE}. {reason}",
+        "A node that names no label matches every node table; supported reads use "
+        f"{POLYMORPHIC_NODE_SHAPE}. {reason}",
         driver.describe(),
     )
 
 
 def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
-    """Return what this statement does that the one shape does not allow, or None."""
-    if driver.variable is None:
-        return (
-            "This one carries no name, so nothing below it could read what it matched."
-        )
-    if driver.properties is not None:
-        return (
-            "This one carries an inline property map, and which column that matches depends "
-            "on the table."
-        )
-    if query.unwind_clause is not None:
-        return "This one follows an UNWIND."
-    if len(query.match_clauses) != 1:
-        return f"This query has {len(query.match_clauses)} MATCH clauses."
-    pattern = query.match_clauses[0].patterns
-    if len(pattern) != 1:
-        return f"This MATCH carries {len(pattern)} patterns."
-    if pattern[0].relationships:
-        return (
-            "This one is an end of a relationship, which names the table at each end."
-        )
+    """Keep dynamic write-target admission separate from expanded read composition."""
     if query.updating_clauses:
         return "This query writes, and a write needs one table to write into."
     if query.return_clause is None:
@@ -1339,8 +1335,13 @@ class _Analyzer:
         """
 
         incoming = tuple(self._bindings)
+        if type(clause.include_existing) is not bool:
+            raise self._refuse("WITH include_existing must be boolean.", field="include_existing")
         created = {item.alias for item in clause.items if item.alias is not None}
-        projected: list[Binding] = []
+        projected: list[Binding] = list(incoming) if clause.include_existing else []
+        if len(projected) + len(clause.items) > MAX_PROJECTION_ITEMS:
+            raise self._refuse(f"A WITH clause may project at most {MAX_PROJECTION_ITEMS} items after star expansion.",
+                               field="items", value=MAX_PROJECTION_ITEMS)
         for item in clause.items:
             binding = self._projected_binding(item, created)
             if any(carried.name == binding.name for carried in projected):

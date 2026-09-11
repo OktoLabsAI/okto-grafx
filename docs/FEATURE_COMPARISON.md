@@ -33,6 +33,19 @@ Empty map keys and bounded streaming direct `UNWIND range` are additionally
 covered by native tests and unchanged reference cases; they introduce neither
 a general unbounded sequence API nor a new cross-product parity claim.
 
+The complete original range and float-literal families also pass in the current
+FP-2 increment, including runtime RANGE argument errors and long finite DOUBLE
+spellings. The numeric-token bound remains explicit; NaN/infinity policy is
+unchanged. This is additional Grafx evidence, not a new competitor qualification.
+
+Current development additionally supports lexical `WITH *` expansion (including
+mixed explicit projections) and proves IN operand error phases; all 46 original
+membership cases pass. The first FP-3 increment also composes standalone
+polymorphic node reads, inline maps, rematches and optional/subquery pipelines.
+Public qualified entity UNION output and generalized named paths remain pending,
+so these additions do not establish general query-language parity. See
+[FP-3 evidence](conformance/FP3_PROGRESS.md) for exact remaining limits.
+
 | Product | Baseline and evidence |
 | --- | --- |
 | Okto Grafx | Published **0.0.5**, tag `v0.0.5`, merge `83cc313`. Local consumer contracts and implementation are the authority. [Publication receipt](reports/PYPI_0_0_5_PUBLICATION.md). |

@@ -1,5 +1,9 @@
 # FP-2 working evidence: numeric literals, headings and postfix access
 
+The first [FP-3 increment](FP3_PROGRESS.md) now closes the three conversion-query
+failures noted at the end of this historical record, with explicit fixture-schema
+adaptation. Its separate receipt does not overwrite the earlier diagnostics.
+
 This is a development checkpoint on `feature/v0.0.6`, not acceptance of FP-2 or
 functional parity. [Fixed scope](../specs/FUNCTIONAL_PARITY_PLAN.md) and
 [delivery status](../../ROADMAP.md#functional-parity-expansion-plan) remain authoritative.
@@ -222,3 +226,102 @@ change, not a legacy mode. Relevant existing Community tests include
 These Pulse suites have **not** been rerun for this checkpoint: affected-consumer
 regression remains required at checkpoint B and final FP-8. No Pulse production
 data, global installation or Core provider-specific code was changed.
+
+## RANGE runtime errors and long finite DOUBLE literals
+
+The next increment closes two native root causes without editing reference
+queries, expectations, the case ledger or exclusions:
+
+- RANGE's type inference no longer preempts evaluation with an early type refusal.
+  Materialized and direct-UNWIND evaluation share argument admission and explicit
+  `range_argument_type` / `range_argument_bounds`, with `query_phase="execution"`.
+  Empty inputs/unselected CASE branches do not evaluate them. Arity/syntax remain
+  compile-time checks. Native late-write tests verify complete statement rollback
+  plus preservation of a prior successful statement through durable reopen.
+- The previous 40-character numeric-token ceiling rejected valid finite DOUBLE
+  spellings. The fixed bound is now 2,048 characters, sufficient for full binary64
+  decimal expansions, including subnormals. Decimal INT64 magnitude is checked
+  lexically before converting at most 19 significant digits; a host integer-digit
+  limit cannot turn a large literal into an uncaught ValueError. No integer-to-
+  DOUBLE fallback, non-finite admission, new stored type or connection knob is added.
+
+Unchanged original TCK families (all 3,897 cases remain inventoried):
+
+| Receipt | Selected family | Result | Outside filter |
+|---|---|---|---|
+| `fp2-range-errors-upstream.json` | `expressions/list/List11.feature` | 67 passed, zero failed/not-run in selection | 3,830 |
+| `fp2-long-floats-upstream.json` | `expressions/literals/Literals5.feature` | 27 passed, zero failed/not-run in selection | 3,870 |
+
+SHA-256 respectively:
+`928c1cc1394efebece5cb605a7a10c4af3ce1f515f5c376369036ae458483648` and
+`1e6b549f564fd39dd79b632d5b4e97f1c46670924ede52a6ef75a1206c18ed42`.
+Reproduce with the existing stateful verified-ledger command and the corresponding
+`--feature-prefix` shown above. Both reports use pinned revision
+`677cbafabb8c3c5eed458fd3b1ec0daec8d67d23` without fixture/query substitutions.
+
+`fp2-range-float-regression.xml`: **468 passed**, zero failures/errors/skips,
+19.333 s, covering numeric literals, lexer/parser, RANGE, scalar/boolean rules,
+WITH, stateful runner and exact error mapping. Tests use independent expected
+binary64 decimal expansions, maximum/minimum normal/subnormal values, hostile
+integer lengths, pre-effect float overflow, late range failure and reopen.
+Mapper negative tests ensure incomplete/wrong function, reason or phase evidence
+does not become a reference match. Initial new-test failures were harness mistakes
+(missing backend admission/control and integer rather than DOUBLE test spelling),
+corrected without relaxing expected values or the engine's integer refusal.
+
+`fp2-range-float-boundaries.xml`: **161 passed**, zero failures/errors/skips,
+15.810 s. This adds parameter validation, expression dispatch, prepared-cache,
+deferred projection and public cursor coverage; it also reruns the feature tests
+with explicit exact-token-boundary and NULL/type/bounds-precedence cases. Lint,
+documentation/public-API/configuration validation and whitespace checks pass.
+
+This is not full FP-2 acceptance, a new full-repository/Pulse regression or a
+changed NaN policy. The previously recorded owner-wide diagnostic remains a
+historical baseline; required dependencies and other failures are still open.
+
+## Membership type phases and WITH star scope expansion
+
+IN now checks a provably invalid right operand during planning, including an
+empty input; invalid bound parameters refuse before index/scan/write work and
+unknown row values are checked when evaluated. All use explicit
+`membership_operand_type` / `query_phase` evidence. Nested three-valued equality,
+NULL, hash-memo versus scan results and dynamic boolean short-circuiting remain
+unchanged. Tests prove a late failure rolls back the complete statement and
+preserves a prior statement through reopen. One older seek regression expected a
+scan before rejecting a non-list parameter; it now asserts zero scans and the
+native binding-phase refusal, not a weaker result assertion.
+
+`fp2-membership-upstream.json`: all **46 List5 cases passed**, with 3,851 cases
+outside the selection, original queries/expectations unchanged. SHA-256:
+`d4154ce8a657fcd9cc1124b103b181e8c47a600d47e87a042e454fcdf8c2f118`.
+`fp2-membership-regression.xml`: **283 passed**, zero failures/errors/skips,
+77.193 s: native phase tests, IN memo/seek differential coverage, compiled and
+equality predicates, boolean semantics and error-mapper rejection of wrong evidence.
+
+Native `WITH *` / `WITH *, expression AS alias` use a parser marker, semantic
+incoming-scope validation and ordinary lexical scope lowering. The lowered plan
+contains explicit projections and uses existing execution/grouping/write
+operators; no separate runtime fast path, new authority or compatibility mode
+is introduced. Star carries named bindings, not schema columns, discarded names,
+list-local variables or unimported outer scope. Duplicate names and the existing
+256-item ceiling are checked after expansion. The AST's `column_names()` reports
+explicit items; unresolved star names require the incoming scope. The marker's
+Python type is checked even on caller-built ASTs.
+
+`fp2-with-star-regression.xml`: **288 passed**, zero failures/errors/skips,
+41.690 s: star-only/mixed projections, empty scopes, grouping/DISTINCT, windows,
+WHERE, repeated names, dropped variables, expression-local shadowing, typed entity
+writes/reopen/rollback, optional NULL bindings, explicit subquery imports, YIELD,
+UNION, cursor cleanup, prepared plans and public query boundaries. Lint, docs/API/
+configuration validation and whitespace checks pass.
+
+Re-running the original conversion family is diagnostic, **not acceptance**:
+`fp2-conversions-with-star.json` records 21 original passes, one fixture-adapted
+pass, three failures and 3,872 not-run (3,850 outside the 47-case selection and
+22 selected fixture blockers). SHA-256:
+`11e4f2bcabc618e30c979b22968e66a88af01cf78e541f0a8abe28a4fdc6466d`.
+The three failing queries (`TypeConversion2#0007`, `TypeConversion3#0005`,
+`TypeConversion4#0007`) now parse but hit the explicit polymorphic multi-MATCH
+shape refusal, an FP-3 requirement. They have not been rewritten as typed MATCHes,
+reclassified as passes or dropped from the ledger. No Pulse installation or
+production data was changed; grouped consumer regression remains due at B/FP-8.

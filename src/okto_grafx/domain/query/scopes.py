@@ -165,7 +165,8 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
         if isinstance(clause, ast.WithClause):
             projected: dict[str, str] = {}
             items = []
-            for item in clause.items:
+            carried = tuple(ast.ReturnItem(expression=ast.Variable(name)) for name in scope) if clause.include_existing else ()
+            for item in (*carried, *clause.items):
                 name = item.name
                 expression = _rewrite(item.expression, scope)
                 carries = isinstance(item.expression, ast.Variable) and (
@@ -176,7 +177,7 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
                 items.append(replace(item, expression=expression, alias=identity))
             scope = projected
             pipeline.append(replace(
-                clause, items=tuple(items), predicate=_rewrite(clause.predicate, scope),
+                clause, items=tuple(items), include_existing=False, predicate=_rewrite(clause.predicate, scope),
                 sort_items=_rewrite(clause.sort_items, scope),
                 skip=_rewrite(clause.skip, scope), limit=_rewrite(clause.limit, scope),
             ))

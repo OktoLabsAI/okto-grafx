@@ -143,3 +143,60 @@ def test_range_cap_failure_rolls_back_every_statement_write(tmp_path, monkeypatc
             tx.execute("UNWIND range(1,1000000) AS n WITH n LIMIT 0 CREATE (:N {id:n})")
     with connect(path) as db:
         assert db.execute("MATCH (n:N) RETURN n.id").rows == ((10,),)
+
+
+@pytest.mark.parametrize("expression,reason", [
+    ("range(true, 2)", "range_argument_type"),
+    ("range(1, 'x')", "range_argument_type"),
+    ("range(1, 2, 1.0)", "range_argument_type"),
+    ("range([], 2)", "range_argument_type"),
+    ("range(1, {}, 1)", "range_argument_type"),
+    ("range(1, 2, 0)", "range_argument_bounds"),
+])
+@pytest.mark.parametrize("streamed", [False, True])
+def test_invalid_range_is_an_evaluation_error_not_a_static_refusal(expression, reason, streamed):
+    tail = f"UNWIND {expression} AS n RETURN n" if streamed else f"RETURN {expression} AS n"
+    with connect(":memory:") as db:
+        # No evaluation occurs for an empty input; do not synthesize a runtime
+        # error during static inference or parameter/type preflight.
+        assert db.execute("UNWIND [] AS unused " + tail).rows == ()
+        with pytest.raises(GrafxPlanError) as caught:
+            db.execute(tail)
+        assert caught.value.details == {
+            "field": "function", "value": "RANGE", "reason": reason, "query_phase": "execution",
+        }
+
+
+def test_invalid_range_in_an_unselected_case_branch_is_not_evaluated():
+    with connect(":memory:") as db:
+        assert db.execute("RETURN CASE WHEN false THEN range(true, 2) ELSE [7] END").rows == (((7,),),)
+
+
+@pytest.mark.parametrize("args", [(None, 2, 0), (1, None, 0), (None, 1 << 63)])
+def test_range_null_propagation_precedes_bounds_but_not_type_validation(args):
+    assert range_values(*args) is None
+    assert scalar_value("RANGE", *args) is None
+    for evaluate in (range_values, lambda *values: scalar_value("RANGE", *values)):
+        with pytest.raises(GrafxPlanError) as caught:
+            evaluate(None, True)
+        assert caught.value.details["reason"] == "range_argument_type"
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("bad", [True, 0])
+def test_late_range_operand_failure_rolls_back_writes_and_preserves_prior_statement(tmp_path, streamed, bad):
+    path = tmp_path / "db"
+    projection = "UNWIND range(1, 2, step) AS x RETURN x" if streamed else "RETURN range(1, 2, step)"
+    with connect(path) as db:
+        with db.begin("write") as tx:
+            tx.execute("CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))")
+        with db.begin("write") as tx:
+            tx.execute("CREATE (:N {id:10})")
+            with pytest.raises(GrafxPlanError) as caught:
+                tx.execute("UNWIND [1, 2] AS id CREATE (:N {id:id}) "
+                           "WITH id, CASE WHEN id = 1 THEN 1 ELSE $bad END AS step " + projection, {"bad": bad})
+            assert caught.value.details["query_phase"] == "execution"
+            assert caught.value.details["reason"] == ("range_argument_type" if bad is True else "range_argument_bounds")
+            assert tx.execute("MATCH (n:N) RETURN n.id").rows == ((10,),)
+    with connect(path) as db:
+        assert db.execute("MATCH (n:N) RETURN n.id").rows == ((10,),)

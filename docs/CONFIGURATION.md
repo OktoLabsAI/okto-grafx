@@ -1,5 +1,14 @@
 # Configuration reference
 
+The fixed numeric-token ceiling is 2,048 characters (excluding a unary sign),
+allowing long finite DOUBLE spellings. It is not a `connect()` setting. INT64
+admission, non-finite refusal, query text/token limits and runtime value budgets
+remain independent; see [numeric rules](QUERY_LANGUAGE.md#values-and-python-mapping).
+
+`WITH *` introduces no setting: the existing fixed 256-item projection ceiling
+applies to carried variables plus explicit items after star expansion. IN operand
+validation likewise has no compatibility toggle or additional budget.
+
 Query-language semantics have no legacy compatibility switch. Host-owned tabular
 procedure settings (`required_permissions`, `max_rows`, `max_result_bytes`,
 `max_value_bytes`) belong to each immutable `ExtensionRegistry`, not persisted

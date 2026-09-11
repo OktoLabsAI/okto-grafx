@@ -2,6 +2,21 @@
 
 ## Reference and scope
 
+Current FP-2 development evidence additionally covers all 67 original List11
+range cases and all 27 Literals5 float cases: evaluation-phase argument errors,
+bounded streaming/materialization, long finite DOUBLE spellings and overflow
+refusal. See [working evidence](conformance/FP2_PROGRESS.md). This focused result
+does not replace the incomplete owner-wide/profile inventory or qualify all FP-2.
+
+The subsequent increment passes all 46 List5 membership cases and implements
+native `WITH *` scope expansion. Three conversion scenarios now advance past
+parsing but still fail the composed polymorphic-MATCH restriction assigned to
+FP-3. That intermediate receipt remains historical evidence. The first FP-3
+increment now passes those three queries with explicit fixture-schema adaptation;
+the conversion family has 21 original passes, four adapted passes and 22 selected
+fixture blockers. See [FP-3 progress](conformance/FP3_PROGRESS.md); broader entity,
+path and final profile qualification remain incomplete.
+
 The authorized language round uses the **openCypher TCK 2024.3**, commit
 `677cbafabb8c3c5eed458fd3b1ec0daec8d67d23`, as a fixed semantic reference.
 See the [upstream TCK](https://github.com/opencypher/openCypher/tree/2024.3/tck)

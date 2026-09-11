@@ -737,13 +737,9 @@ def test_a_vector_space_option_of_the_wrong_kind_is_refused(options: str) -> Non
 # --- catalog binding ------------------------------------------------------------------------
 
 
-def test_a_node_pattern_with_no_label_is_refused_outside_its_one_shape() -> None:
-    # A named label-free node on its own is the polymorphic scan; beside a second pattern it is
-    # not, and the refusal says which shape it is missing rather than naming the label rule.
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text("MATCH (n), (m:Person) RETURN n.id")
-    assert failure.value.details["field"] == "pattern"
-    assert "exactly one shape" in str(failure.value)
+def test_a_node_pattern_with_no_label_composes_with_a_typed_pattern() -> None:
+    plan = plan_text("MATCH (n), (m:Person) RETURN n.id")
+    assert any(node.label == "AllNodesScan" for node in plan.root.walk())
 
 
 def test_a_node_pattern_with_two_labels_is_refused() -> None:

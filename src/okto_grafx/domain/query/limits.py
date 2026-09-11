@@ -131,13 +131,14 @@ MAX_COLUMN_DEFINITIONS: int = 512
 MAX_NAME_CHARACTERS: int = 128
 """Characters one identifier may carry, matching the schema identifier rule of the domain model."""
 
-MAX_NUMBER_CHARACTERS: int = 40
+MAX_NUMBER_CHARACTERS: int = 2048
 """Characters one numeric literal may carry.
 
-The bound is about the conversion, not about taste. CPython refuses to build an integer from a
-very long digit string and raises ``ValueError`` while doing it, and a caller can ask for that in
-a few kilobytes of text; forty characters is more than any real literal and far below the point
-where the conversion becomes expensive at all.
+This admits long finite DOUBLE spellings, including the full decimal expansion of
+binary64 subnormals, while bounding token allocation and conversion work. Decimal
+integers are checked lexically against INT64 magnitude before conversion, so this
+limit does not depend on CPython's process-global integer conversion limit. Query
+text/token limits still apply independently; this is not a configurable budget.
 """
 
 MAX_STRING_CHARACTERS: int = 16384

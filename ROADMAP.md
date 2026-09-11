@@ -14,7 +14,7 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## Functional parity expansion plan
 
-**Authorized; checkpoint A recorded, FP-2 implementation in progress.** The user requested a concrete plan for
+**Authorized; checkpoint A recorded, FP-2 and its FP-3 dependencies in progress.** The user requested a concrete plan for
 the six remaining functional fronts plus the unresolved TCK inventory. The
 [functional parity specification](docs/specs/FUNCTIONAL_PARITY_PLAN.md) defines
 scope, dependencies, acceptance, Pulse migration and checkpoints. This section is
@@ -25,7 +25,7 @@ No release number, branch change or publication is implied by plan approval.
 |---|---|---|---|
 | 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Checkpoint A: 3,897 cases bound, 3,470 required / 427 explicit model divergences; compatible runner paths tested; later-package blockers retained |
 | 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | In progress: all five implementation fronts have focused tests; required negative contracts and cross-package case closure pending |
-| 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | Planned |
+| 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | In progress: composed standalone polymorphic reads implemented; qualified public entities, broader paths/type alternatives and remaining access-path work pending |
 | 4 | FP-4 | Returning/unit read-write subqueries and variable-import rules | Planned |
 | 5 | FP-5 | Temporal functions/operations and exact native stored values | Planned |
 | 6 | FP-6 | DECIMAL and typed LIST/MAP/ARRAY/STRUCT persistence and interoperability | Planned |
@@ -85,6 +85,30 @@ materializing the full list or raising its quota. The combined map/scope/range
 regression passed **587 tests**, including cursor cleanup and write rollback.
 This does not close the full FP-2 package: entity/value dependencies and remaining
 required cases stay tracked in the same working evidence.
+
+The next FP-2 increment implements evaluation-phase RANGE operand errors and
+admits long finite DOUBLE literals with a bounded 2,048-character numeric token.
+The unchanged original families now pass **67 range cases** and **27 float cases**.
+INT64 pre-conversion overflow admission, non-finite refusal, quotas and statement
+rollback remain enforced. Detailed focused regression evidence is tracked in
+[FP-2 progress](docs/conformance/FP2_PROGRESS.md); overall FP-2 remains in progress.
+
+IN now validates static/bound/dynamic right-hand types with explicit phase evidence;
+all **46 original List5 cases** pass and the membership/seek/predicate regression
+passes **283 tests**. `WITH *` and mixed star/explicit projections are implemented
+through native lexical scope expansion, preserving the existing projection cap,
+grouping and rollback. Conversion cases previously stopped by its grammar now
+reach the still-pending FP-3 polymorphic multi-MATCH boundary; they are **not**
+reported as passing. See the same progress record for feature/regression evidence.
+
+FP-3 now expands standalone label-free reads through multiple MATCH patterns,
+UNWIND, inline maps, OPTIONAL MATCH, WITH aliases and returning read subqueries.
+Rematching a bound entity preserves its identity instead of scanning again; an
+optional NULL cannot be rebound. The three conversion cases above now pass with
+explicit fixture-schema adaptation: the family reports 21 original passes,
+four adapted passes and 22 selected fixture blockers. See
+[FP-3 evidence and remaining work](docs/conformance/FP3_PROGRESS.md). This starts
+FP-3; it does not complete its public-entity/path/UNION or indexing requirements.
 
 ## Authorized query-language compatibility round
 

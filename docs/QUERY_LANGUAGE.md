@@ -28,8 +28,8 @@ Python `execute()` call; CLI multi-statement arguments remain separate statement
 | `DELETE` | nodes, and relationships a `MATCH` bound |
 | `DETACH DELETE` | ends every relationship incident on the node together with it |
 | `UNWIND $rows AS r` | repeated list expansion in ordered pipelines; NULL/empty carriers emit no rows |
-| `WITH` … `WHERE` | scalar/aggregate projection stages; each replaces scope with projected names; its WHERE runs after projection. Optional-hop aggregation has the closed forms below |
-| `MATCH (n)` | a node with no label reads every node table as one set; filters, `label(n)`, aggregates, `ORDER BY` and windows apply to the union, and an undeclared property reads as null |
+| `WITH` … `WHERE` | scalar/aggregate projection stages; `WITH *` carries the incoming named scope and can append explicit items; its WHERE runs after projection. Optional-hop aggregation has the closed forms below |
+| `MATCH (n)` | reads every node table as one set, including in composed read pipelines, inline maps and OPTIONAL MATCH; compatible-property checks, filters, aggregation and windows apply across the union; undeclared properties read as NULL |
 | Traversal | one hop, bounded ranges `[:REL*1..3]`, both directions, relationship isomorphism |
 | `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT` | |
 | Aggregates | Exactly `count`, `sum`, `avg`, `min`, `max`, `collect`; scalar/aggregate type restrictions apply |
@@ -63,12 +63,30 @@ transactions like any other.
 
 ## Values and Python mapping
 
+Standalone label-free node patterns compose with preceding UNWIND/WITH, multiple
+MATCH clauses/patterns and returning read subqueries. `MATCH ()` preserves node
+multiplicity without publishing a variable. `MATCH (n {id: $id})` compares that
+property across node tables; a table missing the key contributes NULL rather than
+an exception. Tables declaring incompatible types for a referenced property still
+refuse before rows. Reusing a bound node, including through a WITH alias or explicit
+subquery import, tests the existing binding instead of scanning again. A NULL
+introduced by OPTIONAL MATCH never becomes an unbound scan; a label on a rematch
+filters the bound node's table. See [composition and remaining bounds](COMPOSABLE_QUERIES.md#polymorphic-node-read-composition).
+
 Integer query literals accept decimal, hexadecimal (`0x`/`0X`) and octal (`0o`)
 spellings, for example `RETURN 0x2A AS hex, 0o52 AS octal`. Based literals permit
 single underscores before digits (`0x_FF`, `0o7_7`), not trailing or repeated
 underscores. Values remain exact signed INT64, including `-0x8000000000000000`;
 malformed digits and overflow refuse before statement effects. This introduces
 no new configuration, storage type or Python parameter contract.
+
+Numeric tokens have a fixed 2,048-character ceiling, excluding an external unary
+sign. This supports long finite DOUBLE decimal spellings, including exact binary64
+subnormal expansions. DOUBLE literals still need a decimal point or exponent;
+an oversized integer is not implicitly converted to DOUBLE. Decimal integers are
+checked against INT64 magnitude before host integer conversion, independently of
+Python's process-global digit limit. Overflow/non-finite DOUBLE literals refuse
+before statement effects. Query text and token budgets still apply.
 
 Unaliased expression headings preserve the original source spelling: `RETURN
 size(null)` produces the column `size(null)`, not `size(NULL)`. Spaces,
@@ -125,6 +143,14 @@ short-circuiting still skips an unneeded operand. Refusals carry
 `query_phase`. A late failure rolls back the statement, not earlier successful
 statements in the same transaction. This replaces the previous non-boolean-to-NULL
 behavior; consumers must write explicit predicates instead of implicit truthiness.
+
+`IN` accepts any query value on its left and only LIST or NULL on its right.
+Known invalid right-hand types fail at planning (also over an empty input).
+Invalid bound parameters fail before scanning/writing; unknown row values are
+checked when evaluated. These `GrafxPlanError` refusals expose
+`field="operator"`, `value="IN"`, `reason="membership_operand_type"` and the
+actual `query_phase`. NULL/nested equality and dynamic boolean short-circuiting
+are unchanged; a late failure rolls back the complete statement.
 
 Scalar literal expression identity distinguishes BOOL, INT64 and DOUBLE. A
 grouped projection of `true`, `1` and `1.0` preserves their respective result types;
@@ -286,6 +312,17 @@ pull an extra discarded read row, including at zero, and closes its input on
 exhaustion/failure/early close. Final RETURN LIMIT still preserves **all** writes
 before it, including LIMIT 0; a WITH LIMIT before a write controls input rows.
 If the consumed-range or write budget fails, the entire statement rolls back.
+
+`range` checks operand types and step bounds **when evaluated**, for both direct
+UNWIND and materialized results. Static inference reports LIST/NULL without
+evaluating the operands. Invalid literals therefore do not fail in an unselected
+CASE branch or over an empty input. Non-NULL operands must be INT64 (BOOL is not
+an integer); invalid types are rejected before NULL propagation. A zero step or
+out-of-INT64 operand is rejected after NULL propagation. Arity and literal syntax
+remain compile-time checks. Runtime refusals are `GrafxPlanError` with
+`field="function"`, `value="RANGE"`, `query_phase="execution"` and reason
+`range_argument_type` or `range_argument_bounds`. Late failures roll back all
+effects of that statement and retain only proven successful prior statements.
 
 Replacement output is bounded by the 1 MiB
 hard query-value character ceiling, with the configured public value limit still

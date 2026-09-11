@@ -67,3 +67,44 @@ def test_scope_mapping_requires_matching_native_evidence(details):
     from okto_grafx.errors import GrafxPlanError
 
     assert compile_error(GrafxPlanError("A semantic refusal", **details)).detail == "plan_error"
+
+
+@pytest.mark.parametrize("query,detail", [
+    ("RETURN range(1, 2, 0)", "NumberOutOfRange"),
+    ("RETURN range(true, 2)", "InvalidArgumentType"),
+    ("RETURN range(1, 2, {})", "InvalidArgumentType"),
+])
+def test_range_mapper_uses_actual_native_runtime_error(query, detail):
+    backend = NativeScenarioBackend()
+    try:
+        backend.admit({"steps": []})
+        observed = backend.execute(query, {}, control=False)
+        assert observed.error.type == "ArgumentError"
+        assert observed.error.phase == "runtime"
+        assert observed.error.detail == detail
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"query_phase": "planning"}, {"query_phase": None},
+    {"value": "OTHER"}, {"field": "operator"}, {"reason": "other"},
+])
+def test_range_mapping_requires_complete_matching_evidence(overrides):
+    from okto_grafx.errors import GrafxPlanError
+    from tools.tck_errors import native_error
+
+    details = {"field": "function", "value": "RANGE", "reason": "range_argument_type", "query_phase": "execution"}
+    assert native_error(GrafxPlanError("Range refusal", **(details | overrides))).phase == "unknown"
+
+
+@pytest.mark.parametrize("details", [
+    {"field": "operator", "value": "IN", "reason": "membership_operand_type"},
+    {"field": "function", "value": "IN", "reason": "membership_operand_type", "query_phase": "planning"},
+    {"field": "operator", "value": "OTHER", "reason": "membership_operand_type", "query_phase": "execution"},
+])
+def test_membership_mapping_requires_full_evidence(details):
+    from okto_grafx.errors import GrafxPlanError
+    from tools.tck_errors import native_error
+
+    assert native_error(GrafxPlanError("IN refusal", **details)).phase == "unknown"

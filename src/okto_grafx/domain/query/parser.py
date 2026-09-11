@@ -639,8 +639,10 @@ class _Parser:
         """Parse a projection with DISTINCT, ordering, row window and a scoped WHERE."""
         self._take_keyword("WITH")
         distinct = self._match_keyword("DISTINCT")
+        include_existing = self._match_symbol("*")
         items: list[ReturnItem] = []
-        while True:
+        has_items = not include_existing or self._match_symbol(",")
+        while has_items:
             if len(items) >= MAX_PROJECTION_ITEMS:
                 raise self._refuse(
                     f"A WITH clause may project at most {MAX_PROJECTION_ITEMS} items",
@@ -657,7 +659,7 @@ class _Parser:
         if self._match_keyword("WHERE"):
             predicate = self._expression()
         return WithClause(items=tuple(items), predicate=predicate, distinct=distinct,
-                          sort_items=sort_items, skip=skip, limit=limit)
+                          sort_items=sort_items, skip=skip, limit=limit, include_existing=include_existing)
 
     def _updating_clause(self) -> UpdatingClause:
         """Parse one clause that writes."""

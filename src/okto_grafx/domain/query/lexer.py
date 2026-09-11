@@ -481,7 +481,16 @@ def _read_based_integer(scanner: _Scanner) -> Token:
 
 def _integer_token(literal: str, *, line: int, column: int, offset: int, base: int = 10) -> Token:
     """Return the token of an integer literal, refusing a magnitude no signed word can hold."""
-    number = int(literal, base)
+    if base == 10:
+        # Convert at most 19 significant digits. A longer finite DOUBLE spelling
+        # is legal, but increasing its lexical budget must not permit expensive
+        # decimal integer conversion or leak CPython's host-configured ValueError.
+        significant = literal.lstrip("0") or "0"
+        bound = str(INTEGER_MAGNITUDE_LIMIT)
+        oversized = len(significant) > len(bound) or (len(significant) == len(bound) and significant > bound)
+        number = INTEGER_MAGNITUDE_LIMIT + 1 if oversized else int(significant)
+    else:
+        number = int(literal, base)
     if number > INTEGER_MAGNITUDE_LIMIT:
         raise _refuse(
             f"The literal {literal} is outside the range a 64-bit integer can hold",

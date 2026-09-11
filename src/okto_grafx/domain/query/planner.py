@@ -288,6 +288,13 @@ def boolean_argument_types(operator: str, *types: ValueType | None, phase: str =
                              reason="boolean_operand_type", query_phase=phase)
 
 
+def membership_argument_type(kind: ValueType | None, *, phase: str = "planning") -> None:
+    """IN accepts arbitrary left values, but only LIST/NULL on the right."""
+    if kind not in (None, ValueType.NULL, ValueType.LIST):
+        raise GrafxPlanError("IN looks inside a list; its right operand must be LIST or NULL.",
+                             field="operator", value="IN", reason="membership_operand_type", query_phase=phase)
+
+
 def subscript_argument_types(
     expression: Subscript, subject_type: ValueType | None, index_type: ValueType | None,
     *, phase: str = "planning",
@@ -1287,7 +1294,10 @@ class _Planner:
                 from dataclasses import replace
                 imported = tuple(replace(binding, entity=("relationship" if self.tables[source].kind == "rel" else "node"),
                                          labels=(self.tables[source].name,))
-                                 if source in self.tables else binding
+                                 if source in self.tables else
+                                 replace(binding, entity=("relationship" if self.polymorphic_tables.get(source)
+                                         and self.polymorphic_tables[source][0].kind == "rel" else "node"))
+                                 if source in self.polymorphic_variables else binding
                                  for source, binding in zip(outer, imported, strict=True))
                 sub = _Planner(
                     catalog=self.catalog, indexes=self.indexes, scalar_types=self.scalar_types,
@@ -1296,8 +1306,14 @@ class _Planner:
                     argument_slot=slot, apply_slot=slot,
                     tables={target: self.tables[source] for source, target in zip(outer, clause.imports)
                             if source in self.tables},
+                    polymorphic_variables={target for source, target in zip(outer, clause.imports)
+                                           if source in self.polymorphic_variables},
+                    polymorphic_tables={target: self.polymorphic_tables.get(source, self._node_tables())
+                                        for source, target in zip(outer, clause.imports)
+                                        if source in self.polymorphic_variables},
                     binding_types={target: self._pulse_expression_type(Variable(source), owner="subquery import")
-                                   for source, target in zip(outer, clause.imports) if source not in self.tables},
+                                   for source, target in zip(outer, clause.imports)
+                                   if not self._matched_row(source)},
                 )
                 planned = sub.run(clause.query)
                 assert isinstance(planned.root, ProduceResults)
@@ -1310,6 +1326,9 @@ class _Planner:
                         expression = item.expression
                         if isinstance(expression, Variable) and expression.name in sub.tables:
                             self.tables[target] = sub.tables[expression.name]
+                        elif isinstance(expression, Variable) and expression.name in sub.polymorphic_variables:
+                            self.polymorphic_variables.add(target)
+                            self.polymorphic_tables[target] = sub.polymorphic_tables.get(expression.name, self._node_tables())
                         else:
                             self.binding_types[target] = sub._pulse_expression_type(expression, owner="subquery output")
                 else:
@@ -1450,6 +1469,8 @@ class _Planner:
                     self.tables[item.alias] = self.tables[original]
                 if original in self.polymorphic_variables:
                     self.polymorphic_variables.add(item.alias)
+                    if original in self.polymorphic_tables:
+                        self.polymorphic_tables[item.alias] = self.polymorphic_tables[original]
         aggregations = tuple(
             Aggregation(position=position, call=call)
             for position, item in enumerate(clause.items)
@@ -1680,7 +1701,7 @@ class _Planner:
             for node in reversed(tuple(walk(expression))):
                 marker = id(node)
                 if (isinstance(node, UnaryOperation) and node.operator == "NOT"
-                        or isinstance(node, BinaryOperation) and node.operator in {"AND", "OR", "XOR"}):
+                        or isinstance(node, BinaryOperation) and node.operator in {"AND", "OR", "XOR", "IN"}):
                     self._pulse_expression_type(node, owner=node.describe())
                 if isinstance(node, Property):
                     subject = node.subject
@@ -1863,6 +1884,9 @@ class _Planner:
                 return ValueType.BOOL
             return self._pulse_expression_type(expression.operand, owner=owner)
         if isinstance(expression, BinaryOperation):
+            if expression.operator == "IN":
+                membership_argument_type(self._pulse_expression_type(expression.right, owner=owner))
+                return ValueType.BOOL
             if expression.operator in ("AND", "OR", "XOR"):
                 boolean_argument_types(expression.operator,
                                        self._pulse_expression_type(expression.left, owner=owner),
@@ -1875,7 +1899,6 @@ class _Planner:
                 "<=",
                 ">",
                 ">=",
-                "IN",
                 "STARTS WITH",
                 "ENDS WITH",
                 "CONTAINS",
@@ -2320,6 +2343,18 @@ class _Planner:
         refusal it already earns for naming no label is the one to keep.
         """
         variable = pattern.variable or self._anonymous()
+        if pattern.variable is not None and pattern.variable in self.polymorphic_variables:
+            # Re-matching an incoming entity is a test, not a new cross product.
+            # Preserve its table-qualified binding and null-extension semantics.
+            pipeline = FilterRows(child=pipeline, predicate=NullCheck(operand=Variable(variable), negated=True))
+            if pattern.labels:
+                table = self._node_table_of(pattern)
+                pipeline = FilterRows(child=pipeline, predicate=BinaryOperation(
+                    operator="=", left=FunctionCall(name=LABEL_FUNCTION, arguments=(Variable(variable),)),
+                    right=Literal(table.name)))
+            if pattern.properties is not None:
+                terms = terms + list(self._property_terms(variable, pattern.properties))
+            return pipeline, terms, variable
         if pattern.variable is not None and pattern.variable in self.tables:
             if pattern.labels:
                 self._require_same_table(pattern.variable, pattern.labels)
@@ -2420,17 +2455,12 @@ class _Planner:
         rather than a missing entry it can read as "unbound".
         """
 
-        if pattern.properties is not None:
-            # An inline map is a shorthand for equality against a column, and which column that
-            # is depends on the table. This subset reads the property rules through the
-            # predicate, where the polymorphic type check can see them.
-            raise GrafxPlanError(
-                "A node that names no label matches every node table, so an inline property "
-                f"map has no one column to match; got {pattern.describe()}.",
-                field="properties",
-                value=pattern.describe(),
-            )
         self.polymorphic_variables.add(variable)
+        if pattern.properties is not None:
+            terms = terms + list(self._property_terms(variable, pattern.properties))
+            # Inline keys may have no explicit Property AST in the source query.
+            for entry in pattern.properties.entries:
+                self._polymorphic_property_type(entry.key, pattern.describe(), variable)
         return (
             AllNodesScan(child=pipeline, variable=variable, tables=self._node_tables()),
             terms,

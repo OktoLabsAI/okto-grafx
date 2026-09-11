@@ -766,14 +766,15 @@ class WithClause:
     sort_items: tuple[SortItem, ...] = ()
     skip: Expression | None = None
     limit: Expression | None = None
+    include_existing: bool = False
 
     def column_names(self) -> tuple[str, ...]:
-        """Return the names this stage leaves in scope, in written order."""
+        """Return explicit item names; WITH * additionally carries its incoming scope."""
         return tuple(item.name for item in self.items)
 
     def describe(self) -> str:
         """Return the clause as it would be written back."""
-        body = ", ".join(item.describe() for item in self.items)
+        body = ", ".join((["*"] if self.include_existing else []) + [item.describe() for item in self.items])
         text = f"WITH {'DISTINCT ' if self.distinct else ''}{body}"
         if self.sort_items:
             text += " ORDER BY " + ", ".join(item.describe() for item in self.sort_items)

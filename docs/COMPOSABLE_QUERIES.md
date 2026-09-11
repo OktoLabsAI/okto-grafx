@@ -31,6 +31,60 @@ optional clause (including WHERE) succeeds or all its new bindings become NULL.
 Multiplicity is preserved; optional joins can multiply rows. A subsequent mandatory
 MATCH does not turn a NULL entity binding into a new unbound scan.
 
+`WITH *` carries every **currently bound named variable**, not every schema
+column or a name discarded by an earlier projection. `WITH *, expression AS alias`
+appends explicitly named values; the star must appear once, first. Duplicate
+output names, including an explicit alias that collides with a carried name,
+refuse. All explicit expressions read the incoming scope, not their neighbors.
+For example:
+
+```cypher
+WITH 2 AS x
+WITH *, x + 1 AS y
+RETURN x, y
+```
+
+Star expansion shares existing DISTINCT/grouping, ORDER BY/window/WHERE and write
+operators. With aggregates, carried variables are grouping keys. It preserves
+entity bindings and optional NULLs, and works inside returning read subqueries
+with **only their explicit imports**. An empty incoming scope contributes no
+names. The existing 256-item projection ceiling applies **after expansion**;
+exceeding it refuses before effects. It neither exposes internal scope identities
+nor broadens named-path, polymorphic MATCH or subquery-write admission. No new
+runtime configuration or persistent format is introduced.
+
+### Polymorphic node read composition
+
+Standalone node patterns without labels now compose in read pipelines:
+
+```cypher
+UNWIND [1, 2] AS wanted
+OPTIONAL MATCH (n {id: wanted})
+WITH wanted, n
+RETURN wanted, label(n) AS table_name, n.id AS id
+ORDER BY wanted, table_name
+```
+
+Each incoming row drives the union of node tables once. Multiple independent
+patterns form the requested cross product, bounded by the existing intermediate
+row and result/work limits. A typed first pattern retains its index access when
+available. A new label-free pattern currently uses the all-node scan; broad
+cross-table index selection is still FP-3 work, not an asserted optimization.
+
+Rematching an already-bound polymorphic node (including aliases, explicit imports
+and single-query subquery exports) preserves its table-qualified internal binding.
+It does not rescan or merge same-ID nodes from different tables. Optional NULL
+bindings remain NULL; a subsequent mandatory rematch filters them out. An optional
+multi-pattern clause null-extends all of its new names only if the complete clause
+fails. Inline property maps use ordinary equality and the same property typing as
+WHERE: missing keys yield NULL; incompatible declared families still refuse.
+
+These operators use the existing snapshot and transaction-private overlay; they
+do not create another participant/transaction or expose another writer's pending
+rows. Cursor/row budgets remain authoritative. Dynamic polymorphic writes,
+general path/relationship-alternative expansion and the new detached public entity
+identity contract remain pending under [FP-3](conformance/FP3_PROGRESS.md).
+
 ## Values and breaking semantics
 
 The FP-2 development checkpoint additionally preserves unaliased expression
@@ -58,6 +112,7 @@ short-circuit, statement rollback and resource bounds remain in effect.
 | Equality | Recursive three-valued list/map equality; NULL is not equal to NULL in predicates |
 | DISTINCT/grouping | NULLs group together; numerically equal integers/floats share a key; BOOL remains distinct; spill uses the same equality |
 | Boolean operands | AND/OR/XOR/NOT require BOOL or NULL; invalid known/bound types refuse before rows, evaluated dynamic invalid types refuse with statement rollback |
+| IN right operand | LIST/NULL only; static invalid types refuse at planning, invalid parameters before reads/writes, dynamic invalid values when evaluated; nested/NULL equality unchanged |
 | Empty map keys | Empty quoted keys and empty string indexing work; missing keys yield NULL; duplicate keys and empty schema/variable names still refuse |
 | Direct UNWIND range | Constant-size carrier; 100,000 consumed elements per input row, with existing row/cancellation budgets; LIMIT may consume a bounded prefix |
 | List ordering | Lexicographic; an earlier unequal element decides before later NULLs; an undecidable compared element yields NULL |
@@ -65,7 +120,15 @@ short-circuit, statement rollback and resource bounds remain in effect.
 | Operator precedence | IS NULL/IS NOT NULL bind above comparison and below arithmetic; exponentiation associates left-to-right, with signs binding above exponentiation |
 | SUM/AVG | NULL inputs are ignored; integer-only SUM retains exact integers instead of rounding through DOUBLE; empty/all-NULL SUM is 0 and AVG is NULL; nonnumeric non-NULL inputs refuse |
 
-Static name checks cover all branches. Provably invalid operand types and invalid
+RANGE operand-type/step errors occur at evaluation, not static inference: empty
+input and unselected CASE branches do not evaluate them. Both materialized and
+streamed forms share these rules and statement-wide rollback. Long finite DOUBLE
+spellings use the fixed 2,048-character numeric-token limit; integer magnitude,
+non-finite refusal and query budgets remain unchanged. See the
+[query contract](QUERY_LANGUAGE.md#values-and-python-mapping) for precise error details.
+
+Static name checks cover all branches. Except for functions with an explicit
+evaluation-phase contract such as RANGE, provably invalid operand types and invalid
 bound parameters are refused before row production where type information is
 available; heterogeneous row-dependent values are checked when evaluated. A query
 error discards its own logical writes even if the caller catches the exception

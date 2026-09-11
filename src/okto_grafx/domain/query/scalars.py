@@ -55,7 +55,10 @@ def scalar_type(name: str, *arguments: ValueType | None) -> ValueType | None:
     elif name in {"PI", "E", "RAND"}:
         allowed, result = (), ValueType.DOUBLE
     elif name == "RANGE":
-        allowed, result = (integer,) * len(arguments), ValueType.LIST
+        # RANGE validates operand values when evaluated, including statically
+        # known invalid literals. Inference must not move runtime errors ahead
+        # of CASE/empty-row evaluation or a statement's rollback boundary.
+        return ValueType.NULL if ValueType.NULL in arguments else ValueType.LIST
     elif name in {"HEAD", "LAST", "TAIL"}:
         allowed, result = ((ValueType.LIST,),), ValueType.LIST if name == "TAIL" else None
     elif name == "REVERSE":
@@ -134,23 +137,34 @@ def range_values(*arguments: object) -> range | None:
     never exposes a new stored/public value type or changes the scalar list cap.
     """
     scalar_arity("RANGE", len(arguments))
-    scalar_type("RANGE", *(_kind(value) for value in arguments))
+    if any(item is not None and type(item) is not int for item in arguments):
+        raise GrafxPlanError("range operands must be INT64 or NULL.", field="function", value="RANGE",
+                             reason="range_argument_type", query_phase="execution")
     if any(value is None for value in arguments):
         return None
-    if any(type(item) is not int for item in arguments):
-        raise _bad("RANGE")
     start, end = arguments[:2]
     step = arguments[2] if len(arguments) == 3 else 1
     if step == 0:
-        raise _bad("RANGE", "range step must not be zero.")
+        raise GrafxPlanError("range step must not be zero.", field="function", value="RANGE",
+                             reason="range_argument_bounds", query_phase="execution")
     if any(not -INT64_MAX - 1 <= item <= INT64_MAX for item in arguments):
-        raise _bad("RANGE", "range operands must fit INT64.")
+        raise GrafxPlanError("range operands must fit INT64.", field="function", value="RANGE",
+                             reason="range_argument_bounds", query_phase="execution")
     return range(start, end + (1 if step > 0 else -1), step)
 
 
 def scalar_value(name: str, *arguments: object) -> object:
     """Evaluate a closed function, with output admission before large allocations."""
     scalar_arity(name, len(arguments))
+    if name == "RANGE":
+        values = range_values(*arguments)
+        if values is None:
+            return None
+        distance, step = values.stop - values.start, values.step
+        count = max(0, (abs(distance) + abs(step) - 1) // abs(step)) if distance * step > 0 else 0
+        if count > MAX_GENERATED_LIST_ELEMENTS:
+            raise GrafxQueryBudgetExceeded("Generated list exceeds its element budget.", resource="generated_list")
+        return tuple(values)
     scalar_type(name, *(_kind(value) for value in arguments))
     if name in NONDETERMINISTIC_SCALARS:
         raise _bad(name, "Nondeterministic scalars require an execution source, not pure evaluation.")
@@ -177,14 +191,6 @@ def scalar_value(name: str, *arguments: object) -> object:
         return result
     if name in {"PI", "E"}:
         return math.pi if name == "PI" else math.e
-    if name == "RANGE":
-        values = range_values(*arguments)
-        assert values is not None  # NULL propagation already returned above.
-        distance, step = values.stop - values.start, values.step
-        count = max(0, (abs(distance) + abs(step) - 1) // abs(step)) if distance * step > 0 else 0
-        if count > MAX_GENERATED_LIST_ELEMENTS:
-            raise GrafxQueryBudgetExceeded("Generated list exceeds its element budget.", resource="generated_list")
-        return tuple(values)
     if name in {"HEAD", "LAST", "TAIL", "REVERSE"}:
         if not isinstance(value, (list, tuple)) and not (name == "REVERSE" and type(value) is str):
             raise _bad(name)

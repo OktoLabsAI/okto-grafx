@@ -249,6 +249,7 @@ from okto_grafx.domain.query.planner import (
     PlannedQuery,
     build_plan,
     boolean_argument_types,
+    membership_argument_type,
     case_comparison_type,
     case_result_type,
     coalesce_result_type,
@@ -15240,6 +15241,8 @@ def _membership(left: object, right: object) -> object:
             f"IN looks inside a list; got {type(right).__name__}.",
             field="operator",
             value="IN",
+            reason="membership_operand_type",
+            query_phase="execution",
         )
     unknown = False
     for element in right:
@@ -15648,13 +15651,7 @@ def _infer_bound_pulse_expression_type(
         ):
             return ValueType.BOOL
         if expression.operator == "IN":
-            if right not in (None, ValueType.NULL, ValueType.LIST):
-                message = f"IN looks inside a list; got {right.name}."
-                raise GrafxPlanError(
-                    message,
-                    field="operator",
-                    value=expression.operator,
-                )
+            membership_argument_type(right, phase="execution")
             return ValueType.BOOL
         if left is None or right is None:
             return static_type
@@ -15976,8 +15973,8 @@ def _bound_case_types(
     static_types = _bound_static_types(plan, parameters)
     for expression, _value_type in plan.pulse_expression_types:
         if (isinstance(expression, UnaryOperation) and expression.operator == "NOT"
-                or isinstance(expression, BinaryOperation) and expression.operator in {"AND", "OR", "XOR"}):
-            _bound_pulse_expression_type(expression, static_types, parameters, owner="boolean operator")
+                or isinstance(expression, BinaryOperation) and expression.operator in {"AND", "OR", "XOR", "IN"}):
+            _bound_pulse_expression_type(expression, static_types, parameters, owner="logical/membership operator")
         if isinstance(expression, (ListSlice, ListIteration)):
             _bound_pulse_expression_type(expression, static_types, parameters, owner="slice")
         if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:

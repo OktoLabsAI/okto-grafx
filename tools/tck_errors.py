@@ -55,7 +55,14 @@ def native_error(error) -> ObservedError:
     reason = error.details.get("reason")
     field = error.details.get("field")
     if isinstance(error, GrafxPlanError) and phase is not None:
+        if field == "function" and error.details.get("value") == "RANGE" and phase == "runtime":
+            if reason in {"range_argument_type", "range_argument_bounds"}:
+                return ObservedError("ArgumentError", phase,
+                                     "InvalidArgumentType" if reason == "range_argument_type" else "NumberOutOfRange")
         if field == "operator" and reason == "boolean_operand_type":
+            return ObservedError("SyntaxError" if phase == "compile time" else "TypeError",
+                                 phase, "InvalidArgumentType")
+        if field == "operator" and error.details.get("value") == "IN" and reason == "membership_operand_type":
             return ObservedError("SyntaxError" if phase == "compile time" else "TypeError",
                                  phase, "InvalidArgumentType")
         if field == "property" and reason == "property_subject_type":
