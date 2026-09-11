@@ -75,7 +75,7 @@ def test_two_native_databases_with_the_same_local_record_id_have_distinct_identi
                 tx.execute("CREATE NODE TABLE N(id INT64, PRIMARY KEY(id))")
                 tx.execute("CREATE (:N {id:1})")
             record = db.execute("MATCH (n:N) RETURN n").rows[0][0]
-            observed.append(EntityIdentity(db.identity.database_uuid, 1, "node", record_id=record))
+            observed.append(record.identity)
     assert observed[0].record_id == observed[1].record_id
     assert observed[0] != observed[1]
 
@@ -120,4 +120,4 @@ def test_native_record_identity_survives_updates_but_not_primary_key_recreation(
             tx.execute("CREATE (:N {id:1,value:3})")
         third = db.execute("MATCH (n:N) RETURN n").rows[0][0]
         assert len({first, second, third}) == 3
-        assert len({EntityIdentity(uuid, 1, "node", record_id=i) for i in (first, second, third)}) == 3
+        assert len({i.identity for i in (first, second, third)}) == 3

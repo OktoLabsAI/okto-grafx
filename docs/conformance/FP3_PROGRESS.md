@@ -104,13 +104,128 @@ and TCK error-mapping tests together. Documentation validation, changed-file
 Ruff checks and whitespace checks also pass. This is targeted regression, not a
 new full-repository or Pulse acceptance run.
 
+## Detached value model (internal; native result wiring pending)
+
+`domain/query/entity_values.py` now defines node, relationship and ordered-path
+observations on the qualified identity foundation. [Model and JSON contract](../ENTITY_VALUES.md).
+Properties are deep-owned, node/relationship equality and hashing ignore
+observation payload, endpoints reject foreign databases, and path validation
+checks cardinality, adjacency and a single read snapshot. Zero-hop, reverse and
+cyclic walks are represented without confusing repeated nodes with the executor's
+relationship-uniqueness rule. JSON preserves wide IDs, INT64 values and current
+domain scalar types through explicit tags; nested-map tags cannot collide with
+ordinary user keys.
+
+Tests include independent expected JSON, mutation of source containers/exported
+dictionaries, exact list/map/depth bounds, pending metadata, malformed paths,
+parameter rejection before write effects, and materialization of values read
+from a real database before/after a concurrent commit and after database close.
+The native fixture uses actual snapshot LSNs and commit reports, not fabricated
+version metadata. It explicitly constructs the internal DTOs: **native query
+output has not been switched**, and this evidence must not be used to claim it has.
+
+Final local receipt `fp3-entity-materialization-boundaries.xml`: **287 passed**,
+zero failures/errors/skips, 20.724 s. The selection combines the new value model,
+identity lifecycle, composed polymorphic reads, prior polymorphic tests and public
+collaborator-boundary regressions. A hostile mapping-proxy fixture lies about its
+length; materialization refuses after enumerating 257 entries rather than trusting
+that length or exhausting the source. Documentation, changed-file Ruff and diff
+whitespace checks pass. No full-repository or Pulse acceptance claim is made here.
+
+## Native node/relationship output (subsequent increment)
+
+The earlier internal-only status above is superseded for nodes and relationships:
+native execute/cursor output now uses the root-exported `NodeValue` and
+`RelationshipValue`, also nested in result lists/maps. `EntityIdentity`,
+`EntityProvenance` and the result-only `QueryValue` alias are public imports.
+[Contracts, constructors/fields, migration and JSON](../ENTITY_VALUES.md).
+Paths remain on their existing native representation pending the next integration.
+
+Assembly injects the database UUID and an independent handle namespace. Keyed
+digests qualify authentic transaction-local pending references without exposing
+tokens; subsequent statements retain the same provisional identity. Returned
+inserts are staged privately under the still-active statement rollback mark before
+conversion. Engine/public conversion failures roll back those effects; prior
+successful statements remain intact and survive reopen. No WAL/publication rule
+or cross-participant visibility contract changed.
+
+Native tests cover typed/polymorphic equivalence, nested aliases, optional NULL,
+equal primary keys in different tables, source/target identity for edges before
+and after commit, old cursors concurrent with committed updates, distinct pending
+identities from independent handles, and create/delete/recreate observations.
+Reduced overlays are shared by table and actual intent/held-row revision, avoiding
+an O(transaction writes) reduction for each returned entity.
+
+Spill regression exposed a real earlier defect: projected SortRows detached entity
+bindings to integers. Sorting now uses the operator row codec, retaining source
+version and pending provenance. Pending metadata resolves to an existing authentic
+transaction reference. A deliberately forged future version in spill fails closed.
+`RETURN DISTINCT n ORDER BY n.id` is admitted because the whole entity was retained;
+dropped-input-property refusals are preserved. Three old polymorphic result tests
+were updated from mutable maps to explicit identity and immutable-property checks.
+An intermediate cleanup edit caused seven NameError failures in aggregate spill;
+it was corrected before the final grouped regression, not waived.
+
+| Final local receipt | Scope | Result |
+|---|---|---|
+| `fp3-native-output-grouped.xml` | Cursor, sort/aggregate/DISTINCT spill, polymorphic/composed reads, planner, hostile public boundaries, detached/native identity and independent TCK oracles | 491 passed; zero failures/errors/skips; 35.942 s |
+| `fp3-native-output-transaction-boundaries.xml` | Final public annotations, native entities, forged future spill version, late public conversion rollback, cursors, pending row intents and TCK adapter | 74 passed; zero failures/errors/skips; 8.274 s |
+
+The frozen original `clauses/return/Return2.feature` was also run unchanged through
+the verified-ledger stateful backend: **3 original passes, 1 fixture-adapted pass,
+3 failures and 11 selected not-run cases**, plus 3,879 cases outside selection.
+Receipt `fp3-native-return2.json`, SHA-256
+`616350b79d544559fe9c3081e02abbdd8e8d69035989300b21cf171d757d60f1`.
+Failures #0012/#0013 still require generalized unlabeled relationship endpoints
+(the native planner specifically refuses `(n)` in this shape), while #0016 needs
+dynamic polymorphic DELETE and runtime deleted-entity access semantics. They stay
+assigned to FP-3; no case/query/expected answer or exclusion was changed.
+Native node/edge DTOs are translated into independent reference literals by the
+backend, not compared using identity equality. Tests deliberately use two equal
+entity identities with different properties to prove a wrong result still fails.
+
+### Pulse consumer mapping (not yet migrated or installed)
+
+Read-only inspection of the current Community worktree identifies
+`community/adapters/grafx_graph_transaction.py::_normalize_value` as the shared
+normalization seam. It currently handles scalar/container values but would leave
+the new DTOs unchanged. `grafx_cypher_executor.py::pulse_value`, `_envelope` and
+transactional read/batch consumers depend on it. These Community adapters must
+translate native observations into the agreed provider-neutral Pulse result/JSON
+contract, with paired tests. `project_path_sequences` currently expects `_NODES`
+and `_RELS`; its migration must be coordinated with native path output.
+Logical transfer and scalar-projection paths need regression but are not assumed
+to require an entity-output rewrite. No Grafx import/condition belongs in Core.
+No production installation, graph data or running Pulse process was changed.
+
+## Development checkpoint: native entity UNION (2026-09-11)
+
+This checkpoint includes native node/relationship UNION values, nested entity
+values, entity-preserving aggregate spill, and entity metadata exported by
+returning UNION subqueries. The focused receipt `fp3-entity-union-focused.xml`
+records 26 passed tests, including in-memory and spill variants.
+
+The fresh combined checkpoint receipt `fp3-commit-checkpoint.xml` records
+**165 passed, 2 failed, zero errors/skips (45.901 s)**. The failures are
+`test_combined_alias_depth_is_refused_by_a_typed_budget_before_the_stack` and
+`test_alias_expansion_accepts_the_ceiling_and_refuses_the_next_level`, both in
+`tests/query/test_union.py`: the expected alias expansion budget refusal is
+missing. They remain open regressions, not exclusions or waived requirements.
+Documentation checks, Ruff on changed Python files and `git diff --check` pass.
+
+This is a development snapshot, not a completed FP-3 delivery or a release-ready
+checkpoint. Existing descriptions of entity UNION as pending refer to acceptance;
+the implementation above is present but still requires the remaining validation
+and budget corrections. No full repository regression or paired Pulse acceptance
+was performed for this snapshot. Pulse adapter migration described above remains
+mandatory before installing these breaking entity-result changes into Pulse.
+
 ## Remaining mandatory FP-3 work
 
-- Public detached node/relationship/path values with database, table/schema,
-  kind and incarnation identity; provenance, immutable materialization,
-  equality/hash/JSON and stale/foreign mutation-handle refusal.
-- Entity UNION, nested/entity-valued results and subsequent clauses using that
-  public contract; broader incompatible/missing-property and schema combinations.
+- Finish native detached paths/functions on the shared identity/provenance model;
+  complete all hostile/public/budget and entity observation combinations.
+- Entity UNION, all aggregate/spill combinations and subsequent clauses using
+  entity bindings; broader incompatible/missing-property and schema combinations.
 - Relationship-type alternatives and general named variable-length trails,
   directions, zero length/cycles, uniqueness, bounds and cancellation.
 - Cross-table index access when compatible keys can anchor new polymorphic

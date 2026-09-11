@@ -27,6 +27,8 @@ from okto_grafx.api import ConnectOptions, connect
 from okto_grafx.catalogs import CatalogInfo, CatalogPathPolicy, CatalogSession
 from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult, TextMatchPositions
 from okto_grafx.domain.query.hybrid import HybridHit, HybridSearchOptions, HybridSearchResult
+from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
+from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, QueryValue
 from okto_grafx.domain.model import Timestamp, VectorValue
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.txn.commit_identity import CommitId
@@ -51,6 +53,11 @@ from okto_grafx.runtime.config import DatabaseConfig
 from okto_grafx.runtime.registry import PortRegistry
 
 __all__ = [
+    "EntityIdentity",
+    "EntityProvenance",
+    "NodeValue",
+    "RelationshipValue",
+    "QueryValue",
     "CancellationToken",
     "CatalogInfo",
     "CatalogPathPolicy",

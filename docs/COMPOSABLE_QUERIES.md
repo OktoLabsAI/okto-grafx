@@ -82,8 +82,11 @@ WHERE: missing keys yield NULL; incompatible declared families still refuse.
 These operators use the existing snapshot and transaction-private overlay; they
 do not create another participant/transaction or expose another writer's pending
 rows. Cursor/row budgets remain authoritative. Dynamic polymorphic writes,
-general path/relationship-alternative expansion and the new detached public entity
-identity contract remain pending under [FP-3](conformance/FP3_PROGRESS.md).
+general path/relationship-alternative expansion and entity UNION remain pending
+under [FP-3](conformance/FP3_PROGRESS.md). Native typed/polymorphic node and edge
+results now use [qualified detached values](ENTITY_VALUES.md), also through
+lists/maps, cursors, sorting and DISTINCT. This is a breaking development contract,
+not completed FP-3/Pulse acceptance.
 
 ## Values and breaking semantics
 

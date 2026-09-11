@@ -1159,6 +1159,15 @@ class TransactionContext:
         """Return whether this exact live pending identity was emitted by this context."""
         return self._pending_row_refs.get(reference.token) is reference
 
+    def _pending_reference_for_query(self, txn_id: int, table_id: int, token: int) -> PendingRowRef:
+        """Resolve spill metadata to an already-authenticated local reference, never mint one."""
+        self._require_active()
+        reference = self._pending_row_refs.get(token)
+        if reference is None or txn_id != self._txn_id or reference.table_id != table_id:
+            raise GrafxConfigurationError("A spilled pending entity is not owned by this transaction.",
+                                           field="query_spill.pending_reference")
+        return reference
+
     def _require_row_reference(self, table: object, reference: object) -> object:
         """Accept a physical ref or an authentic pending ref for this exact table."""
         accepted = _require_reference(reference)

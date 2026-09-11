@@ -255,28 +255,25 @@ def test_an_integer_and_a_double_column_promote_rather_than_disagree(
 # --- what the caller receives --------------------------------------------------------------------
 
 
-def test_a_node_matched_without_a_label_detaches_as_a_map(database: object) -> None:
+def test_a_node_matched_without_a_label_detaches_as_a_qualified_entity(database: object) -> None:
     """It carries the label and the properties, and nothing owner-private at all."""
     rows = database.execute("MATCH (n) WHERE label(n) = 'Bug' RETURN n").rows
 
-    assert rows == (
-        (
-            {
-                "label": "Bug",
-                "properties": {
+    assert len(rows) == 1
+    node = rows[0][0]
+    assert type(node) is okto_grafx.NodeValue
+    assert node.label == "Bug"
+    assert node.properties == {
                     "id": "b1",
                     "title": "bug",
                     "created_at": "2026-01-02",
                     "relevance_score": 0.8,
                     "graph_layer": "canonical",
-                },
-            },
-        ),
-    )
-    node = rows[0][0]
-    assert set(node) == {"label", "properties"}
-    for private in ("record_id", "ref", "version", "table_id", "id"):
-        assert private not in node
+    }
+    assert node.identity.database_uuid == database.identity.database_uuid
+    assert node.identity.committed
+    for private in ("ref", "version", "txn", "table"):
+        assert not hasattr(node, private)
 
 
 def test_a_node_this_transaction_staged_detaches_the_same_way(database: object) -> None:
@@ -287,28 +284,29 @@ def test_a_node_this_transaction_staged_detaches_the_same_way(database: object) 
         )
         staged = transaction.execute("MATCH (n) WHERE n.id = 'b2' RETURN n").rows
 
-    assert staged == (
-        (
-            {
-                "label": "Bug",
-                "properties": {
+    assert len(staged) == 1
+    node = staged[0][0]
+    assert type(node) is okto_grafx.NodeValue
+    assert node.label == "Bug"
+    assert node.properties == {
                     "id": "b2",
                     "title": "pending",
                     "created_at": "2026-01-04",
                     "relevance_score": 0.5,
                     "graph_layer": "working",
-                },
-            },
-        ),
-    )
-    # A row this statement staged has no identity yet, and none is invented for the caller.
-    assert "record_id" not in staged[0][0]
+    }
+    assert node.identity.record_id is None
+    assert node.identity.provisional_id is not None
+    assert node.provenance.pending
 
 
-def test_the_map_the_caller_receives_is_its_own(database: object) -> None:
+def test_the_entity_properties_are_immutable_and_json_is_owned(database: object) -> None:
     rows = database.execute("MATCH (n) WHERE label(n) = 'Bug' RETURN n").rows
-    rows[0][0]["properties"]["title"] = "mutated"
-    rows[0][0]["label"] = "NotATable"
+    with pytest.raises(TypeError):
+        rows[0][0].properties["title"] = "mutated"
+    copied = rows[0][0].to_dict()
+    copied["properties"]["title"] = "mutated"
+    copied["label"] = "NotATable"
 
     assert database.execute("MATCH (n) WHERE label(n) = 'Bug' RETURN n.title").rows == (
         ("bug",),

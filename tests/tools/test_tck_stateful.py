@@ -9,6 +9,26 @@ from tools.tck_stateful import GraphState, ObservedError, QueryObservation, run_
 from tools.tck_native import NativeScenarioBackend
 
 
+def test_native_entity_results_use_independent_reference_values_not_entity_equality():
+    from okto_grafx import EntityIdentity, EntityProvenance, NodeValue, RelationshipValue
+    from tools.tck_native import _reference_result_value
+    from tools.tck_values import reference_key, reference_value
+
+    identity = EntityIdentity(b"a" * 16, 1, "node", record_id=1)
+    provenance = EntityProvenance(10, 1, 5)
+    observed = NodeValue(identity, "N", {"id": 1, "missing": None}, provenance)
+    wrong = NodeValue(identity, "N", {"id": 2}, provenance)
+    assert observed == wrong  # Engine identity equality is NOT a property oracle.
+    expected = reference_key(reference_value("(:N {id:1})"))
+    assert reference_key(_reference_result_value(observed)) == expected
+    assert reference_key(_reference_result_value(wrong)) != expected
+    edge = RelationshipValue(EntityIdentity(b"a" * 16, 2, "relationship", record_id=1),
+                             "R", identity, identity, {"weight": 7}, provenance)
+    assert reference_key(_reference_result_value(edge)) == reference_key(reference_value("[:R {weight:7}]"))
+    assert reference_key(_reference_result_value([observed, {"node": observed}])) == reference_key(
+        reference_value("[(:N {id:1}), {node:(:N {id:1})}]"))
+
+
 def state(*ids):
     return GraphState(nodes=tuple(ids), labels=("N",) if ids else (),
                       properties=tuple((i, "id", ("int", i)) for i in ids))

@@ -142,6 +142,10 @@ def jsonable(value: object, *, depth: int = 0) -> object:
     """
     if depth > MAX_JSON_DEPTH:
         return "<nested deeper than this report renders>"
+    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue
+
+    if type(value) in (NodeValue, RelationshipValue):
+        return value.to_dict()
     if value is None or isinstance(value, (bool, str)):
         return value
     if isinstance(value, int):

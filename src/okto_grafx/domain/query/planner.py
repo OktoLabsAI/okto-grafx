@@ -462,6 +462,7 @@ class _Planner:
     prefer_full_relationship_scan: bool = False
     anonymous: int = 0
     apply_slot: int = 0
+    union_entity_outputs: dict[str, tuple[TableDef, ...]] = field(default_factory=dict)
 
     # --- entry -------------------------------------------------------------------------------
 
@@ -490,17 +491,19 @@ class _Planner:
         self.analysis = analyze(statement, bindings=self.imported_bindings)
         columns = self.analysis.output_columns
         pipelines: list[PlanNode] = []
+        entity_outputs: list[dict[str, tuple[TableDef, ...]]] = []
         for branch in (statement.left, statement.right):
             sub = _Planner(scalar_types=self.scalar_types, catalog=self.catalog,
                            procedures=self.procedures,
                            indexes=self.indexes, analysis=analyze(branch, bindings=self.imported_bindings),
                            imported_bindings=self.imported_bindings, argument_slot=self.argument_slot,
                            binding_types=dict(self.binding_types),
+                           polymorphic_variables=set(self.polymorphic_variables),
+                           polymorphic_tables=dict(self.polymorphic_tables),
                            tables=dict(self.tables), alias_definitions=dict(self.alias_definitions),
                            apply_slot=self.apply_slot)
             planned = sub.run(branch)
-            if isinstance(planned.analysis.statement, Query):
-                sub._validate_union_outputs(planned.analysis.statement)
+            entity_outputs.append(sub._entity_output_tables())
             root = planned.root
             if not isinstance(root, ProduceResults):
                 raise GrafxPlanError("A UNION branch must produce rows.", field="union", value="branch")
@@ -508,11 +511,34 @@ class _Planner:
             self._absorb(sub)
             self.apply_slot = max(self.apply_slot, sub.apply_slot)
         combined = UnionRows(left=pipelines[0], right=pipelines[1], columns=columns)
+        for name in columns:
+            if all(name in branch for branch in entity_outputs):
+                tables = tuple({table.table_id: table for branch in entity_outputs for table in branch[name]}.values())
+                if tables and len({table.kind for table in tables}) == 1:
+                    self.union_entity_outputs[name] = tables
         return self._planned(
             ProduceResults(child=combined if statement.all else DistinctRows(child=combined),
                            columns=columns),
             columns=columns,
         )
+
+    def _entity_output_tables(self) -> dict[str, tuple[TableDef, ...]]:
+        """Retain entity-table alternatives through UNION and returning subqueries."""
+        statement = self.analysis.statement
+        if isinstance(statement, UnionQuery):
+            return self.union_entity_outputs
+        if not isinstance(statement, Query) or statement.return_clause is None:
+            return {}
+        result = {}
+        for item in statement.return_clause.items:
+            expression = item.expression
+            if isinstance(expression, Variable) and expression.name in self.tables:
+                result[item.name] = (self.tables[expression.name],)
+            elif isinstance(expression, Variable) and expression.name in self.polymorphic_variables:
+                result[item.name] = self.polymorphic_tables.get(expression.name, self._node_tables())
+            elif isinstance(expression, Literal) and expression.value is None:
+                result[item.name] = ()
+        return result
 
     def _absorb(self, other: "_Planner") -> None:
         """Take over what a branch planner proved, so one bind covers the pair."""
@@ -525,124 +551,6 @@ class _Planner:
         self.label_calls.extend(other.label_calls)
         self.timestamp_calls.extend(other.timestamp_calls)
 
-    def _validate_union_outputs(self, statement: Query) -> None:
-        """Refuse private entity identities the current public scalar boundary cannot preserve."""
-        if statement.return_clause is None:
-            return
-        for item in statement.return_clause.items:
-            # Follow aliases only for the entity-containment proof, not numeric unification.
-            expression = self._union_type_expression(item.expression)
-            if self._union_output_contains_matched_row(expression):
-                raise GrafxPlanError(
-                    "UNION entity outputs require explicit scalar properties; the current "
-                    "public entity projection cannot preserve cross-table identity.",
-                    field="union", value="columns",
-                )
-
-    def _union_output_contains_matched_row(self, expression: Expression) -> bool:
-        """Return whether the published value can retain an owner-private row binding.
-
-        UNION eliminates duplicates before public values are detached.  Letting a binding hide
-        inside a list, map or aggregate would therefore compare its private table/record identity
-        and could publish two equal values afterwards.  Scalar consumers such as ``label(n)``,
-        ``n.id`` and ``size([n])`` are safe because their RESULT no longer contains the binding.
-        """
-        if isinstance(expression, Variable):
-            return self._matched_row(expression.name) or (
-                expression.name in self.multi_hop_variables
-            )
-        if isinstance(expression, (Literal, Parameter)):
-            return False
-        if isinstance(expression, Property):
-            selected = self._static_postfix_target(expression)
-            if selected is not expression:
-                return self._union_output_contains_matched_row(selected)
-            subject = expression.subject
-            if isinstance(subject, Variable) and self._matched_row(subject.name):
-                return False
-            if isinstance(subject, MapExpression):
-                entry = subject.entry(expression.key)
-                return (
-                    False
-                    if entry is None
-                    else self._union_output_contains_matched_row(entry)
-                )
-            return self._union_output_contains_matched_row(subject)
-        if isinstance(expression, Subscript):
-            selected = self._static_postfix_target(expression)
-            if selected is not expression:
-                return self._union_output_contains_matched_row(selected)
-            subject = expression.subject
-            if isinstance(subject, ListExpression):
-                index = expression.index
-                if (
-                    isinstance(index, Literal)
-                    and isinstance(index.value, int)
-                    and not isinstance(index.value, bool)
-                ):
-                    offset = index.value
-                    if -len(subject.elements) <= offset < len(subject.elements):
-                        return self._union_output_contains_matched_row(
-                            subject.elements[offset]
-                        )
-                return any(
-                    self._union_output_contains_matched_row(element)
-                    for element in subject.elements
-                )
-            return self._union_output_contains_matched_row(subject)
-        if isinstance(expression, ListIteration):
-            if expression.mode in ("all", "any", "none", "single"):
-                return False
-            return any(self._union_output_contains_matched_row(child) for child in expression.children())
-        if isinstance(expression, ListSlice):
-            return self._union_output_contains_matched_row(expression.subject)
-        if isinstance(expression, BinaryOperation) and expression.operator == "+":
-            return any(self._union_output_contains_matched_row(child) for child in expression.children())
-        if isinstance(expression, (NullCheck, UnaryOperation, BinaryOperation)):
-            return False
-        if isinstance(expression, FunctionCall):
-            name = expression.name.upper()
-            if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
-                return False  # The output is a detached value, never a RowBinding.
-            if name in {
-                STRING_SPLIT_FUNCTION,
-                "SPLIT",
-                LABEL_FUNCTION,
-                TIMESTAMP_FUNCTION,
-                SIZE_FUNCTION,
-                SIMILARITY_FUNCTION,
-                SIMILARITY_SCORE_FUNCTION,
-                "COUNT",
-                "SUM",
-                "AVG",
-            }:
-                return False
-            return any(
-                self._union_output_contains_matched_row(argument)
-                for argument in expression.arguments
-            ) or any(
-                self._union_output_contains_matched_row(argument.value)
-                for argument in expression.named_arguments
-            )
-        if isinstance(expression, ListExpression):
-            return any(
-                self._union_output_contains_matched_row(element)
-                for element in expression.elements
-            )
-        if isinstance(expression, MapExpression):
-            return any(
-                self._union_output_contains_matched_row(entry.value)
-                for entry in expression.entries
-            )
-        if isinstance(expression, CaseExpression):
-            return any(
-                self._union_output_contains_matched_row(alternative.result)
-                for alternative in expression.alternatives
-            ) or (
-                expression.fallback is not None
-                and self._union_output_contains_matched_row(expression.fallback)
-            )
-        return False
 
     def _union_type_expression(
         self,
@@ -1332,7 +1240,17 @@ class _Planner:
                         else:
                             self.binding_types[target] = sub._pulse_expression_type(expression, owner="subquery output")
                 else:
-                    self.binding_types.update(dict.fromkeys(outputs))
+                    entity_tables = sub._entity_output_tables()
+                    for source, target in zip(planned.columns, outputs, strict=True):
+                        alternatives = entity_tables.get(source)
+                        if alternatives:
+                            if len(alternatives) == 1:
+                                self.tables[target] = alternatives[0]
+                            else:
+                                self.polymorphic_variables.add(target)
+                                self.polymorphic_tables[target] = alternatives
+                        else:
+                            self.binding_types[target] = None
                 pipeline = SubqueryRows(child=pipeline, inner=planned.root.child, slot=slot,
                                         imports=tuple(zip(outer, clause.imports, strict=True)),
                                         outputs=outputs)

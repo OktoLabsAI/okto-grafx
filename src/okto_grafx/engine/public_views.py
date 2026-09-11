@@ -2186,6 +2186,7 @@ def _query_value_snapshot(
     depth: int,
     active: set[int],
     max_string_characters: int = MAX_STRING_CHARACTERS,
+    allow_entities: bool = False,
 ) -> Value:
     """Copy one query value into an exact, bounded and capability-free value graph."""
     if depth > MAX_VALUE_DEPTH:
@@ -2253,6 +2254,11 @@ def _query_value_snapshot(
             active=active,
             max_string_characters=max_string_characters,
         )
+    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue
+
+    if allow_entities and value_type in (NodeValue, RelationshipValue):
+        return _query_entity_snapshot(value, field=field, depth=depth, active=active,
+                                      max_string_characters=max_string_characters)
     if isinstance(value, Mapping):
         return _query_mapping_snapshot(
             value,
@@ -2260,6 +2266,7 @@ def _query_value_snapshot(
             depth=depth,
             active=active,
             max_string_characters=max_string_characters,
+            allow_entities=allow_entities,
         )
     if isinstance(value, Sequence):
         return _query_sequence_snapshot(
@@ -2268,6 +2275,7 @@ def _query_value_snapshot(
             depth=depth,
             active=active,
             max_string_characters=max_string_characters,
+            allow_entities=allow_entities,
         )
     observed = _builtin_type_name(value)
     raise GrafxConfigurationError(
@@ -2276,6 +2284,35 @@ def _query_value_snapshot(
         value=observed,
         reason="unsupported_value",
     )
+
+
+def _query_entity_snapshot(value: object, *, field: str, depth: int, active: set[int],
+                           max_string_characters: int) -> Value:
+    """Rebuild nominal entity results; the parameter/AST doors do not admit them."""
+    from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
+    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue
+
+    def identity(source: object) -> EntityIdentity:
+        if type(source) is not EntityIdentity:
+            raise GrafxConfigurationError("Entity results require qualified identity metadata.", field=field)
+        return EntityIdentity(*(_domain_field(source, EntityIdentity, name) for name in (
+            "database_uuid", "table_id", "kind", "record_id", "provisional_id")))
+
+    kind = type(value)
+    entity_id = identity(_domain_field(value, kind, "identity"))
+    source = _domain_field(value, kind, "provenance")
+    if type(source) is not EntityProvenance:
+        raise GrafxConfigurationError("Entity results require snapshot provenance.", field=field)
+    provenance = EntityProvenance(*(_domain_field(source, EntityProvenance, name) for name in (
+        "read_lsn", "schema_version", "version_lsn", "pending")))
+    label = _query_value_snapshot(_domain_field(value, kind, "label"), field=field + ".label",
+                                  depth=depth + 1, active=active, max_string_characters=max_string_characters)
+    properties = _query_value_snapshot(_domain_field(value, kind, "properties"), field=field + ".properties",
+                                       depth=depth + 1, active=active, max_string_characters=max_string_characters)
+    if kind is NodeValue:
+        return NodeValue(entity_id, label, properties, provenance)  # type: ignore[return-value, arg-type]
+    return RelationshipValue(entity_id, label, identity(_domain_field(value, kind, "source")),
+                              identity(_domain_field(value, kind, "target")), properties, provenance)  # type: ignore[return-value, arg-type]
 
 
 def _exact_float_sequence_snapshot(
@@ -2317,6 +2354,7 @@ def _query_mapping_snapshot(
     depth: int,
     active: set[int],
     max_string_characters: int,
+    allow_entities: bool = False,
 ) -> dict[Value, Value]:
     """Copy one bounded map, rejecting cycles and canonical-key collisions."""
     marker = id(value)
@@ -2345,6 +2383,7 @@ def _query_mapping_snapshot(
                 depth=depth + 1,
                 active=active,
                 max_string_characters=max_string_characters,
+                allow_entities=allow_entities,
             )
             try:
                 duplicate = key in detached
@@ -2374,6 +2413,7 @@ def _query_sequence_snapshot(
     depth: int,
     active: set[int],
     max_string_characters: int,
+    allow_entities: bool = False,
 ) -> tuple[Value, ...]:
     """Copy one bounded sequence without invoking list or tuple subclass overrides."""
     marker = id(value)
@@ -2408,6 +2448,7 @@ def _query_sequence_snapshot(
                     depth=depth + 1,
                     active=active,
                     max_string_characters=max_string_characters,
+                    allow_entities=allow_entities,
                 )
             )
         return tuple(detached)
@@ -3125,6 +3166,7 @@ def _query_result_snapshot(
                     depth=0,
                     active=active,
                     max_string_characters=max_string_characters,
+                    allow_entities=True,
                 )
                 for column_position, item in enumerate(row_items)
             )

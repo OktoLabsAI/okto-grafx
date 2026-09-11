@@ -581,6 +581,8 @@ def assemble_database(
             metrics=metrics,
             clock=clock,
             random_source=_new_query_random_source(),
+            database_uuid=identity.database_uuid,
+            entity_namespace=new_database_uuid(),
             indexes=indexes,
             vectors=vectors,
             page_stager=transactions._stage_page_image,

@@ -633,10 +633,10 @@ def test_coalesce_metadata_does_not_cross_branch_schema_contexts(
         handle.close()
 
 
-def test_a_column_with_no_type_at_all_is_refused_before_the_stream(
+def test_entity_branches_still_require_the_same_output_names(
     database: object,
 ) -> None:
-    """An entity has no ValueType, so no rule could ever show the two branches agree."""
+    """Admitting entity values does not waive column-name agreement."""
     with pytest.raises(GrafxPlanError) as failure:
         database.execute("MATCH (n:A) RETURN n UNION MATCH (m:B) RETURN m")
     assert failure.value.details["field"] == "union"
@@ -659,19 +659,28 @@ def test_a_column_with_no_type_at_all_is_refused_before_the_stream(
         "[] + $v",
     ),
 )
-def test_an_entity_cannot_hide_inside_a_union_value(
+def test_entity_identity_survives_nested_union_values(
     database: object, projection: str
 ) -> None:
-    """Private identity cannot drive DISTINCT and then disappear during detachment."""
+    """Dedupe and published entity values now retain the same qualified identity."""
     left = projection.replace("$v", "n")
     right = projection.replace("$v", "m")
 
-    with pytest.raises(GrafxPlanError) as failure:
-        database.execute(
-            f"MATCH (n:A) RETURN {left} AS value "
-            f"UNION MATCH (m:B) RETURN {right} AS value"
-        )
-    assert failure.value.details["field"] == "union"
+    found = database.execute(
+        f"MATCH (n:A) RETURN {left} AS value "
+        f"UNION MATCH (m:B) RETURN {right} AS value"
+    )
+    def entities(value):
+        if isinstance(value, okto_grafx.NodeValue):
+            return [value]
+        if isinstance(value, dict):
+            return [entity for item in value.values() for entity in entities(item)]
+        if isinstance(value, (tuple, list)):
+            return [entity for item in value for entity in entities(item)]
+        return []
+    observed = [entity for row in found.rows for entity in entities(row)]
+    assert sorted((entity.label, entity.properties["id"]) for entity in observed) == [("A", "x"), ("A", "y"), ("B", "x")]
+    assert len({entity.identity for entity in observed}) == 3
 
 
 @pytest.mark.parametrize(

@@ -16,12 +16,33 @@ if __package__:
     from tools.tck_fixtures import infer_fixture_schema
     from tools.tck_errors import compile_error, native_error
     from tools.tck_procedures import procedure_registry
+    from tools.tck_values import ReferenceNode, ReferenceRelationship
 else:
     from check_opencypher import canonical_value
     from tck_stateful import GraphState, QueryObservation
     from tck_fixtures import infer_fixture_schema
     from tck_errors import compile_error, native_error
     from tck_procedures import procedure_registry
+    from tck_values import ReferenceNode, ReferenceRelationship
+
+
+def _reference_result_value(value):
+    """Map native result DTOs into independent TCK notation, not engine equality.
+
+    Typed absent properties are stored as NULL and do not count as TCK properties,
+    consistently with the separate scan-based effects observer below.
+    """
+    if type(value) is okto_grafx.NodeValue:
+        return ReferenceNode(frozenset(value.labels), tuple(sorted(
+            (key, _reference_result_value(item)) for key, item in value.properties.items() if item is not None)))
+    if type(value) is okto_grafx.RelationshipValue:
+        return ReferenceRelationship(value.label, tuple(sorted(
+            (key, _reference_result_value(item)) for key, item in value.properties.items() if item is not None)))
+    if isinstance(value, (list, tuple)):
+        return tuple(_reference_result_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _reference_result_value(item) for key, item in value.items()}
+    return value
 
 
 def _attempts_write(statement) -> bool:
@@ -120,7 +141,7 @@ class NativeScenarioBackend:
         try:
             with self.database.begin("read" if control else "write") as transaction:
                 result = transaction.execute(query, parameters)
-                observed = QueryObservation(tuple(result.columns), tuple(result.rows),
+                observed = QueryObservation(tuple(result.columns), _reference_result_value(result.rows),
                                             attempted_write=attempted_write)
             return observed
         except GrafxError as exc:

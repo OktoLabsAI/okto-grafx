@@ -25,7 +25,7 @@ No release number, branch change or publication is implied by plan approval.
 |---|---|---|---|
 | 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Checkpoint A: 3,897 cases bound, 3,470 required / 427 explicit model divergences; compatible runner paths tested; later-package blockers retained |
 | 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | In progress: all five implementation fronts have focused tests; required negative contracts and cross-package case closure pending |
-| 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | In progress: composed standalone polymorphic reads implemented; qualified public entities, broader paths/type alternatives and remaining access-path work pending |
+| 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | In progress: composed polymorphic reads and [native detached node/edge output](docs/ENTITY_VALUES.md), including pending identity/cursors/sort/DISTINCT; path output, entity UNION, broader paths/type alternatives, access-path work and Pulse migration pending |
 | 4 | FP-4 | Returning/unit read-write subqueries and variable-import rules | Planned |
 | 5 | FP-5 | Temporal functions/operations and exact native stored values | Planned |
 | 6 | FP-6 | DECIMAL and typed LIST/MAP/ARRAY/STRUCT persistence and interoperability | Planned |

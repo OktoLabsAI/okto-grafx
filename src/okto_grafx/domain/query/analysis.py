@@ -1220,6 +1220,7 @@ class _Analyzer:
         """
         aliases = {item.alias for item in clause.items if item.alias is not None}
         projected = {item.expression for item in clause.items}
+        projected_variables = {item.expression.name for item in clause.items if isinstance(item.expression, Variable)}
         for key in clause.sort_items:
             if isinstance(key.expression, Variable) and key.expression.name in aliases:
                 # An alias names a column of this clause's own result, so it is resolved before
@@ -1228,6 +1229,11 @@ class _Analyzer:
                 continue
             self._check_expression(key.expression, where="an ORDER BY key")
             if key.expression in projected:
+                continue
+            if (isinstance(key.expression, Property) and isinstance(key.expression.subject, Variable)
+                    and key.expression.subject.name in projected_variables):
+                # Returning the whole entity retains its properties after dedupe;
+                # this does not admit a property of a discarded input variable.
                 continue
             if contains_aggregate(key.expression):
                 raise self._refuse(

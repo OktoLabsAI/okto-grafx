@@ -63,6 +63,13 @@ transactions like any other.
 
 ## Values and Python mapping
 
+In the 0.0.6 development line, returning a node (typed or polymorphic) yields
+`NodeValue`; returning an edge yields `RelationshipValue`, including in nested
+lists/maps. Their properties are immutable observations and their identities
+include database/table/kind/incarnation. `to_dict()` provides owned tagged JSON.
+This replaces prior integer/mutable-map entity output, not scalar `n.id` values.
+See [entity result contract and remaining path/UNION work](ENTITY_VALUES.md).
+
 Standalone label-free node patterns compose with preceding UNWIND/WITH, multiple
 MATCH clauses/patterns and returning read subqueries. `MATCH ()` preserves node
 multiplicity without publishing a variable. `MATCH (n {id: $id})` compares that

@@ -35,6 +35,7 @@ from okto_grafx.temporal_diff import TemporalDiff
 
 from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextSearchResult
 from okto_grafx.domain.query.hybrid import HybridSearchOptions, HybridSearchResult
+from okto_grafx.domain.query.entity_values import QueryValue
 from okto_grafx.engine.hybrid import search_hybrid as _search_hybrid
 from okto_grafx.engine.fulltext import create_text_index as _create_text_index, search_text as _search_text
 from okto_grafx.domain.query.text_procedure import text_call
@@ -1029,12 +1030,12 @@ class QueryCursor:
         # copied dictionary rather than exposing the engine's live counter map.
         return QueryResult(statistics=dict(observed)).statistics
 
-    def fetchone(self) -> tuple[Value, ...] | None:
+    def fetchone(self) -> tuple[QueryValue, ...] | None:
         """Return the next detached row, or ``None`` after exhaustion."""
         batch = self.fetchmany(1)
         return None if not batch else batch[0]
 
-    def fetchmany(self, size: int | None = None) -> tuple[tuple[Value, ...], ...]:
+    def fetchmany(self, size: int | None = None) -> tuple[tuple[QueryValue, ...], ...]:
         """Return at most ``size`` detached rows without materialising the remaining result."""
         wanted = self._batch_size if size is None else _query_cursor_batch_size(size)
         if self._closed:
@@ -1073,7 +1074,7 @@ class QueryCursor:
     def __iter__(self) -> QueryCursor:
         return self
 
-    def __next__(self) -> tuple[Value, ...]:
+    def __next__(self) -> tuple[QueryValue, ...]:
         if self._closed:
             raise StopIteration
         self._require_database_open()

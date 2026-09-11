@@ -42,6 +42,9 @@ Current development additionally supports lexical `WITH *` expansion (including
 mixed explicit projections) and proves IN operand error phases; all 46 original
 membership cases pass. The first FP-3 increment also composes standalone
 polymorphic node reads, inline maps, rematches and optional/subquery pipelines.
+Native typed/polymorphic node and relationship output now carries qualified
+identity, immutable properties, snapshot provenance and tagged JSON, including
+pending identities and cursor/sort/DISTINCT output. [Result contract](ENTITY_VALUES.md).
 Public qualified entity UNION output and generalized named paths remain pending,
 so these additions do not establish general query-language parity. See
 [FP-3 evidence](conformance/FP3_PROGRESS.md) for exact remaining limits.

@@ -64,7 +64,11 @@ from types import MappingProxyType
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from math import isnan
+from hashlib import blake2b
 from typing import cast
+
+from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
+from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, QueryValue
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -456,6 +460,8 @@ class RowBinding:
     version: HeapVersion
     polymorphic: bool = False
     """Whether the pattern that bound this row named no label."""
+    pending_observation: bool = False
+    """Private-overlay provenance retained when spill strips physical authority."""
 
     @property
     def record_id(self) -> int:
@@ -580,7 +586,7 @@ class QueryResult:
     """
 
     columns: tuple[str, ...] = ()
-    rows: tuple[tuple[Value, ...], ...] = ()
+    rows: tuple[tuple[QueryValue, ...], ...] = ()
     plan: PlanNode | None = None
     statistics: Mapping[str, int] = field(default_factory=dict)
 
@@ -744,7 +750,7 @@ class QueryResult:
         """Iterate the rows in the order the query produced them."""
         return iter(self.rows)
 
-    def dictionaries(self) -> tuple[dict[str, Value], ...]:
+    def dictionaries(self) -> tuple[dict[str, QueryValue], ...]:
         """Return the rows as mappings from column name to value."""
         return tuple(dict(zip(self.columns, row)) for row in self.rows)
 
@@ -948,7 +954,7 @@ class _QueryResultCursor:
                         limit=configured,
                         observed=observed,
                     )
-                produced.append(_projected(row, self.columns))
+                produced.append(_projected(row, self.columns, self._context))
                 self._seen = observed
         except GrafxError as failure:
             self._engine._count_error(failure)
@@ -1290,6 +1296,9 @@ class _Context:
     _ends_staged: frozenset[object] | None = None
     path_identities: dict[tuple[object, ...], int] = field(default_factory=dict)
     path_identities_issued: int = 0
+    entity_sequence: int = 0
+    entity_overlays: dict[int, dict[object, tuple[Value, ...] | None]] = field(default_factory=dict)
+    entity_overlay_revision: tuple[object, ...] | None = None
     # The identity door chooses its access path once per complete table identity.  ``None`` is
     # a deliberate, statement-stable canonical fallback; a store value is the exact ACTIVE
     # generation this statement selected and must never be replaced by a quiet fallback later.
@@ -3296,6 +3305,9 @@ class QueryEngine:
         "_compiled_predicates_lock",
         "_tuple_encoding_proofs",
         "_random_source",
+        "_entity_database_uuid",
+        "_entity_namespace",
+        "_entity_sequence",
     )
 
     def __init__(
@@ -3307,6 +3319,8 @@ class QueryEngine:
         metrics: MetricsSink,
         clock: Clock,
         random_source: Callable[[], float] | None = None,
+        database_uuid: bytes | None = None,
+        entity_namespace: bytes | None = None,
         indexes: object = None,
         vectors: object = None,
         page_stager: Callable[[object, str, int, bytes], None] | None = None,
@@ -3328,6 +3342,12 @@ class QueryEngine:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
         self._random_source = random_source
+        for name, identity in (("database_uuid", database_uuid), ("entity_namespace", entity_namespace)):
+            if identity is not None and (type(identity) is not bytes or len(identity) != 16):
+                raise GrafxConfigurationError("Entity identity composition needs 16 immutable bytes.", field=name)
+        self._entity_database_uuid = database_uuid
+        self._entity_namespace = entity_namespace
+        self._entity_sequence = 0
         self._extensions = None
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._heap = heap
@@ -4304,8 +4324,13 @@ class QueryEngine:
         finally:
             _close_iterator(stream, stream_failure)
         produced: tuple[tuple[Value, ...], ...] = ()
+        if root.columns and context.atomic_staging:
+            # Give returned inserts their authenticated transaction-local reference
+            # before detachment. This is private intent staging, not COMMIT: the
+            # enclosing statement mark remains active through conversion/checks.
+            context.publish_phase()
         if root.columns:
-            produced = tuple(_projected(row, root.columns) for row in rows)
+            produced = tuple(_projected(row, root.columns, context) for row in rows)
         result = _owned_query_result(
             columns=root.columns,
             rows=produced,
@@ -10357,6 +10382,8 @@ class _SpillRowCodec:
                 _spill_pack_internal(value.record_id),
                 self._detach(value.version.values),
                 value.polymorphic,
+                _spill_pack_internal(value.version.xmin),
+                value.pending_observation or value.ref in _entity_overlay(self._context, value.table),
             )
         if isinstance(value, PendingRowRef):
             return (
@@ -10449,15 +10476,19 @@ class _SpillRowCodec:
                 field="query_spill.row.binding",
                 value="pending_domain",
             )
+        resolver = getattr(self._context.txn, "_pending_reference_for_query", None)
+        if callable(resolver):
+            return resolver(txn_id, table_id, token)
         return PendingRowRef(txn_id=txn_id, table_id=table_id, token=token)
 
     def _restore_binding(self, value: tuple[Value, ...]) -> RowBinding:
         if (
-            len(value) != 7
+            len(value) != 9
             or not isinstance(value[1], str)
             or type(value[2]) is not int
             or not isinstance(value[3], tuple)
             or type(value[6]) is not bool
+            or type(value[8]) is not bool
         ):
             raise GrafxCorruptionDetected(
                 "A temporary row binding is malformed.",
@@ -10466,6 +10497,9 @@ class _SpillRowCodec:
             )
         table = self._context.schema().table_by_id(value[2])
         record_id = _spill_private_int(value[4], field="query_spill.row.binding")
+        version_lsn = _spill_private_int(value[7], field="query_spill.row.binding.version")
+        if not 0 <= version_lsn <= self._context.snapshot.read_lsn:
+            raise GrafxCorruptionDetected("A spilled entity version is outside its snapshot.", field="query_spill.row.binding.version")
         restored_values = self._restore(value[5])
         if not isinstance(restored_values, tuple) or len(restored_values) > table.arity:
             raise GrafxCorruptionDetected(
@@ -10489,7 +10523,7 @@ class _SpillRowCodec:
         else:
             version = HeapVersion(
                 record_id=record_id,
-                xmin=0,
+                xmin=version_lsn,
                 xmax=0,
                 values=cast(tuple[Value, ...], restored_values),
                 prev=None,
@@ -10527,6 +10561,7 @@ class _SpillRowCodec:
             ref=ref,
             version=version,
             polymorphic=value[6],
+            pending_observation=value[8],
         )
 
     def _named_values(
@@ -10997,7 +11032,7 @@ def _aggregate_input_payload(
         entries.append(
             (
                 "value",
-                _spill_detach_value(raw),
+                group_codec._detach(raw) if group_codec is not None else _spill_detach_value(raw),
                 _spill_signature(raw, nan_identities) if call.distinct else b"",
                 _spill_pack_internal(_sort_key(raw)),
             )
@@ -11032,6 +11067,7 @@ def _decode_aggregate_input(
 
 def _decode_aggregate_entry(
     entry: Value,
+    codec: _SpillRowCodec | None = None,
 ) -> tuple[str, Value | None, bytes | None, tuple[int, object] | None]:
     if not isinstance(entry, tuple) or not entry or not isinstance(entry[0], str):
         raise GrafxCorruptionDetected(
@@ -11059,7 +11095,7 @@ def _decode_aggregate_entry(
             field="query_spill.key",
             value="aggregate_sort_key",
         )
-    return kind, _spill_restore_value(entry[1]), entry[2], (unpacked[0], unpacked[1])
+    return kind, (codec._restore(entry[1]) if codec is not None else _spill_restore_value(entry[1])), entry[2], (unpacked[0], unpacked[1])
 
 
 def _aggregate_distinct_payload(
@@ -11067,13 +11103,14 @@ def _aggregate_distinct_payload(
     ordinal: int,
     value: Value,
     sort_key: tuple[int, object],
+    codec: _SpillRowCodec | None = None,
 ) -> bytes:
     return _spill_encode(
         (
             "aggregate-distinct-value",
             index,
             ordinal,
-            _spill_detach_value(value),
+            codec._detach(value) if codec is not None else _spill_detach_value(value),
             _spill_pack_internal(sort_key),
         ),
         key=False,
@@ -11082,6 +11119,7 @@ def _aggregate_distinct_payload(
 
 def _decode_aggregate_distinct_payload(
     payload: bytes,
+    codec: _SpillRowCodec | None = None,
 ) -> tuple[int, int, Value, tuple[int, object]]:
     value = _spill_decode(payload, key=False)
     if (
@@ -11112,7 +11150,7 @@ def _decode_aggregate_distinct_payload(
     return (
         value[1],
         value[2],
-        _spill_restore_value(value[3]),
+        codec._restore(value[3]) if codec is not None else _spill_restore_value(value[3]),
         (unpacked[0], unpacked[1]),
     )
 
@@ -11142,11 +11180,13 @@ class _SpilledAggregateState:
         keys: tuple[Value, ...],
         first_ordinal: int,
         workspace: QuerySpillWorkspace,
+        codec: _SpillRowCodec | None = None,
     ) -> None:
         self._node = node
         self.keys = keys
         self.first_ordinal = first_ordinal
         self._workspace = workspace
+        self._codec = codec
         self._accumulators = [_Accumulator(item) for item in node.aggregations]
         self._extra = [0 for _item in node.aggregations]
         self._base = (
@@ -11170,7 +11210,7 @@ class _SpilledAggregateState:
         for index, (aggregation, entry) in enumerate(
             zip(self._node.aggregations, entries)
         ):
-            kind, value, signature, sort_key = _decode_aggregate_entry(entry)
+            kind, value, signature, sort_key = _decode_aggregate_entry(entry, self._codec)
             if kind == "star":
                 self._accumulators[index]._count += 1
                 continue
@@ -11184,7 +11224,7 @@ class _SpilledAggregateState:
                     )
                 self._distinct.append(
                     _spill_encode(("distinct", index, signature, ordinal), key=True),
-                    _aggregate_distinct_payload(index, ordinal, value, sort_key),
+                    _aggregate_distinct_payload(index, ordinal, value, sort_key, self._codec),
                 )
                 continue
             self._fold(index, value, sort_key)
@@ -11231,7 +11271,7 @@ class _SpilledAggregateState:
             try:
                 for _key, payload in ordered:
                     index, _ordinal, value, sort_key = (
-                        _decode_aggregate_distinct_payload(payload)
+                        _decode_aggregate_distinct_payload(payload, self._codec)
                     )
                     if not 0 <= index < len(self._accumulators):
                         raise GrafxCorruptionDetected(
@@ -11264,7 +11304,7 @@ class _SpilledAggregateState:
             (
                 "aggregate-output",
                 _spill_detach_value(self.keys),
-                _spill_detach_value(results),
+                self._detach_value(results),
             ),
             key=False,
         )
@@ -11281,6 +11321,9 @@ class _SpilledAggregateState:
         self._workspace.release(self._base)
         self._closed = True
 
+    def _detach_value(self, value: object) -> Value:
+        return self._codec._detach(value) if self._codec is not None else _spill_detach_value(value)
+
     def _fold(self, index: int, value: Value, sort_key: tuple[int, object]) -> None:
         accumulator = self._accumulators[index]
         name = accumulator._function
@@ -11288,7 +11331,7 @@ class _SpilledAggregateState:
         new_charge = old_charge
         if name == "COLLECT":
             new_charge += _AGGREGATE_VALUE_OVERHEAD + len(
-                _spill_encode(_spill_detach_value(value), key=False)
+                _spill_encode(self._detach_value(value), key=False)
             )
         elif name in ("MIN", "MAX"):
             extreme_key = accumulator._extreme_key
@@ -11297,7 +11340,7 @@ class _SpilledAggregateState:
             )
             if replaces:
                 new_charge = _AGGREGATE_VALUE_OVERHEAD + len(
-                    _spill_encode(_spill_detach_value(value), key=False)
+                    _spill_encode(self._detach_value(value), key=False)
                 )
         difference = new_charge - old_charge
         if difference > 0:
@@ -11324,7 +11367,7 @@ def _decode_aggregate_output(payload: bytes, node: AggregateRows,
             value="aggregate_output",
         )
     keys = _spill_restore_value(value[1])
-    results = _spill_restore_value(value[2])
+    results = group_codec._restore(value[2]) if group_codec is not None else _spill_restore_value(value[2])
     if (
         not isinstance(keys, tuple)
         or len(keys) != len(node.grouping)
@@ -11355,7 +11398,7 @@ def _spilled_aggregate_rows(
     """Group through bounded external passes, retaining only one aggregate state in core."""
     workspace, _budget = engine._spill_workspace(node.label)
     nan_identities = _NaNIdentityRegistry(workspace)
-    group_codec = _SpillRowCodec(context, workspace) if node.preserve_group_bindings else None
+    group_codec = _SpillRowCodec(context, workspace)
     source = workspace.sorter(_compare_group_spill_keys)
     output = workspace.sorter(_compare_ordinal_spill_keys)
     current: _SpilledAggregateState | None = None
@@ -11399,7 +11442,7 @@ def _spilled_aggregate_rows(
                     output.append(
                         _spill_encode(current.first_ordinal, key=True), current.finish()
                     )
-                current = _SpilledAggregateState(node, keys, ordinal, workspace)
+                current = _SpilledAggregateState(node, keys, ordinal, workspace, group_codec)
                 current_signature = signature
             assert current is not None
             current.add(entries, ordinal)
@@ -11674,7 +11717,7 @@ def _sort_rows(
     yield from rows
 
 
-def _sort_row_payload(row: _Row) -> bytes:
+def _sort_row_payload(row: _Row, codec: _SpillRowCodec) -> bytes:
     """Encode one projected row after detaching every page-backed capability."""
     if row.columns is None:
         raise GrafxPlanError(
@@ -11683,12 +11726,12 @@ def _sort_row_payload(row: _Row) -> bytes:
             value="unprojected_row",
         )
     columns: tuple[Value, ...] = tuple(
-        (name, _spill_detach_value(value)) for name, value in row.columns.items()
+        (name, codec._detach(value)) for name, value in row.columns.items()
     )
     return _spill_encode(("sorted-row", columns), key=False)
 
 
-def _decode_sort_row(payload: bytes) -> _Row:
+def _decode_sort_row(payload: bytes, codec: _SpillRowCodec) -> _Row:
     """Rebuild a capability-free projected row from one complete spill payload."""
     value = _spill_decode(payload, key=False)
     if (
@@ -11716,7 +11759,7 @@ def _decode_sort_row(payload: bytes) -> _Row:
                 field="query_spill.record",
                 value=position,
             )
-        columns[pair[0]] = _spill_restore_value(pair[1])
+        columns[pair[0]] = codec._restore(pair[1])
     return _Row(bindings={}, columns=columns)
 
 
@@ -11726,6 +11769,7 @@ def _spilled_sort_rows(
     """Order projected rows through a bounded adapter-owned external merge."""
     workspace, _budget = engine._spill_workspace(node.label)
     sorter = workspace.sorter(_compare_sort_spill_keys)
+    row_codec = _SpillRowCodec(context, workspace)
     records: Iterator[tuple[bytes, bytes]] | None = None
     failure: BaseException | None = None
     try:
@@ -11749,11 +11793,11 @@ def _spilled_sort_rows(
             )
             sorter.append(
                 _spill_encode(("sort", components, ordinal), key=True),
-                _sort_row_payload(row),
+                _sort_row_payload(row, row_codec),
             )
         records = sorter.records()
         for _key, payload in records:
-            yield _decode_sort_row(payload)
+            yield _decode_sort_row(payload, row_codec)
     except BaseException as caught:
         failure = caught
         raise
@@ -11769,16 +11813,17 @@ def _spilled_sort_rows(
                     "A query spill iterator also failed to close with "
                     f"{type(close_failure).__name__}: {close_failure}"
                 )
-        try:
-            workspace.close()
-        except BaseException as close_failure:
-            if cleanup_failure is None:
-                cleanup_failure = close_failure
-            else:
-                cleanup_failure.add_note(
-                    "Query spill workspace cleanup also failed with "
-                    f"{type(close_failure).__name__}: {close_failure}"
-                )
+        for resource in (row_codec, workspace):
+            try:
+                resource.close()
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        "Query spill workspace cleanup also failed with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
         if failure is None and cleanup_failure is not None:
             raise cleanup_failure
 
@@ -16627,10 +16672,98 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
 # --- value helpers ------------------------------------------------------------------------------
 
 
-def _projected(row: _Row, columns: tuple[str, ...]) -> tuple[Value, ...]:
+def _projected(row: _Row, columns: tuple[str, ...], context: _Context) -> tuple[Value, ...]:
     """Return the projected values of one row, in column order."""
     values = row.columns if row.columns is not None else {}
-    return tuple(_as_value(values.get(name)) for name in columns)
+    return tuple(_entity_result_value(values.get(name), context) for name in columns)
+
+
+def _entity_overlay(context: _Context, table: TableDef) -> dict[object, tuple[Value, ...] | None]:
+    """Share one reduced overlay per table/revision, not an O(writes) scan per output."""
+    intents = getattr(context.txn, "row_intents", ())
+    revision = (id(intents), len(intents), getattr(intents, "rewrite_revision", None),
+                len(context.staged_rows), context.staged_rows.rewrite_revision)
+    if context.entity_overlay_revision != revision:
+        context.entity_overlays.clear()
+        context.entity_overlay_revision = revision
+    state = context.entity_overlays.get(table.table_id)
+    if state is None:
+        updated, inserted = _transaction_row_view(context, table)
+        state = dict(updated)
+        state.update(inserted)
+        context.entity_overlays[table.table_id] = state
+    return state
+
+
+def _qualified_entity_identity(context: _Context, binding: RowBinding) -> EntityIdentity:
+    """Qualify an entity without returning any PendingRowRef/transaction authority."""
+    database_uuid = context.engine._entity_database_uuid
+    if database_uuid is None:
+        raise GrafxConfigurationError("Entity results need the owning database UUID.", field="database_uuid")
+    kind = "relationship" if binding.table.kind == "rel" else "node"
+    reference = binding.ref
+    if not isinstance(reference, PendingRowRef) and binding.record_id > 0:
+        return EntityIdentity(database_uuid, binding.table.table_id, kind, record_id=binding.record_id)
+    namespace = context.engine._entity_namespace
+    if namespace is None:
+        raise GrafxConfigurationError("Pending entity results need a composition-owned namespace.", field="entity_namespace")
+    if isinstance(reference, PendingRowRef):
+        owns = getattr(context.txn, "owns_pending_row_ref", None)
+        if not callable(owns) or not owns(reference) or reference.table_id != binding.table.table_id:
+            raise GrafxConfigurationError("A provisional entity needs an authentic local reference.", field="entity_identity")
+        logical = ("pending", reference.txn_id, reference.table_id, reference.token)
+    else:
+        # An insertion cancelled in its own statement has no published reference.
+        # Its observation still gets an opaque, execution-unique identity.
+        if not context.entity_sequence:
+            with context.engine._endpoint_guard:
+                context.engine._entity_sequence += 1
+                context.entity_sequence = context.engine._entity_sequence
+        logical = ("held", context.entity_sequence, binding.table.table_id, context.token_for(binding))
+    nonce = blake2b(repr(logical).encode("ascii"), key=namespace, digest_size=16).digest()
+    return EntityIdentity(database_uuid, binding.table.table_id, kind, provisional_id=nonce)
+
+
+def _entity_result_value(value: object, context: _Context) -> Value:
+    """Materialize returned graph bindings, including nested entity-valued results."""
+    if isinstance(value, RowBinding):
+        binding = context.resolve_binding(value)
+        assert isinstance(binding, RowBinding)
+        identity = _qualified_entity_identity(context, binding)
+        state = _entity_overlay(context, binding.table)
+        values = state.get(binding.ref)
+        if values is None:
+            values = binding.version.values
+        pending = binding.pending_observation or not identity.committed or binding.ref in state or binding.version.xmin == NO_CSN
+        provenance = EntityProvenance(
+            context.snapshot.read_lsn, binding.table.schema_version,
+            binding.version.xmin if binding.version.xmin != NO_CSN else None, pending=pending,
+        )
+        first = ENDPOINT_COLUMN_COUNT if binding.table.kind == "rel" else 0
+        properties = {}
+        for position, column in enumerate(binding.table.columns):
+            if position < first:
+                continue
+            item = values[position] if position < len(values) else None
+            if _is_unmaterialized_column(item):
+                raise GrafxPlanError("Entity materialization requires its complete property projection.", field="projection")
+            properties[column.name] = item
+        if binding.table.kind == "node":
+            return NodeValue(identity, binding.table.name, properties, provenance)  # type: ignore[return-value]
+        endpoints = []
+        for table_name, endpoint in zip((binding.table.from_table, binding.table.to_table), values[:2], strict=True):
+            table = context.schema().table(table_name)
+            if isinstance(endpoint, PendingRowRef):
+                endpoint_binding = _pending_binding("endpoint", table, (), reference=endpoint)
+                endpoints.append(_qualified_entity_identity(context, endpoint_binding))
+            else:
+                endpoints.append(EntityIdentity(identity.database_uuid, table.table_id, "node", record_id=endpoint))
+        return RelationshipValue(identity, binding.table.name, *endpoints, properties, provenance)  # type: ignore[return-value]
+    if isinstance(value, (tuple, list)):
+        return tuple(_entity_result_value(item, context) for item in value)
+    if isinstance(value, dict):
+        return {key: _entity_result_value(item, context) for key, item in value.items()}
+    return _as_value(value)
 
 
 def _binding_identity(binding: RowBinding) -> tuple[object, ...]:

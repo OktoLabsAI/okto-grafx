@@ -4,6 +4,13 @@
 
 ## Entry points and supported imports
 
+The 0.0.6 development result contract now returns `NodeValue` and
+`RelationshipValue` from native `execute`/cursors, including nested results.
+Import them with `EntityIdentity` and `EntityProvenance` from `okto_grafx`.
+[Fields, ownership, equality, JSON and migration](ENTITY_VALUES.md) replace the
+former integer/label-map entity assumptions; scalar projections are unchanged.
+Paths, entity UNION and coordinated Pulse migration remain FP-3 work in progress.
+
 Unaliased `QueryResult.columns` preserve the expression's submitted source spelling;
 explicit aliases and logical variable names retain their existing meaning.
 `dictionaries()` uses these names as keys. Prefer `AS` for application-stable
@@ -258,7 +265,7 @@ Return an immutable-shape snapshot of counters observed so far.
 #### QueryCursor.fetchone
 
 ```python
-fetchone() -> tuple[Value, ...] | None
+fetchone() -> tuple[QueryValue, ...] | None
 ```
 
 Return the next detached row, or `None` after exhaustion.
@@ -266,7 +273,7 @@ Return the next detached row, or `None` after exhaustion.
 #### QueryCursor.fetchmany
 
 ```python
-fetchmany(size: int | None=None) -> tuple[tuple[Value, ...], ...]
+fetchmany(size: int | None=None) -> tuple[tuple[QueryValue, ...], ...]
 ```
 
 Return at most `size` detached rows without materialising the remaining result.
@@ -2714,7 +2721,7 @@ The rows one statement produced, with the plan that produced them.
 
 ```python
 columns: tuple[str, ...]
-rows: tuple[tuple[Value, ...], ...]
+rows: tuple[tuple[QueryValue, ...], ...]
 plan: PlanNode | None
 statistics: Mapping[str, int]
 ```
@@ -2722,7 +2729,7 @@ statistics: Mapping[str, int]
 #### QueryResult.dictionaries
 
 ```python
-dictionaries() -> tuple[dict[str, Value], ...]
+dictionaries() -> tuple[dict[str, QueryValue], ...]
 ```
 
 Return the rows as mappings from column name to value.

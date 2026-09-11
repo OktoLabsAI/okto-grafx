@@ -18,6 +18,7 @@ publication or that the latest source is installed in a particular application.
 | How do I install, create a graph and reopen it? | [Getting started](GETTING_STARTED.md) |
 | How do I integrate a synchronous library into services, workers or agents? | [Integration](INTEGRATION.md) |
 | Which public methods and return values exist? | [API reference](API_REFERENCE.md) |
+| How do native node/edge results expose identity, immutable properties and JSON? | [Detached entity results — FP-3 development](ENTITY_VALUES.md) |
 | How do I apply/check versioned application DDL safely? | [Schema migrations](SCHEMA_MIGRATIONS.md) |
 | How do I opt into commit provenance and page its history? | [Commit history](COMMIT_HISTORY.md) |
 | Which settings exist, what are their defaults and risks? | [Configuration](CONFIGURATION.md) |

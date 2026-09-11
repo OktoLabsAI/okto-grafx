@@ -2,6 +2,12 @@
 
 ## Reference and scope
 
+FP-3 now returns qualified `NodeValue`/`RelationshipValue` objects from native
+execute/cursors, including nested values and sort/DISTINCT spill. This changes
+the Python result representation, not the schema-free storage policy or the
+remaining entity UNION/path requirements. See [entity contracts](ENTITY_VALUES.md)
+and [working evidence](conformance/FP3_PROGRESS.md); this is not full conformance.
+
 Current FP-2 development evidence additionally covers all 67 original List11
 range cases and all 27 Literals5 float cases: evaluation-phase argument errors,
 bounded streaming/materialization, long finite DOUBLE spellings and overflow
