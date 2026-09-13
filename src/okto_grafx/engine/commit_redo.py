@@ -20,6 +20,7 @@ from okto_grafx.domain.errors import (
 from okto_grafx.domain.ids import Lsn, NO_LSN, NO_PAGE, PROVISIONAL_CSN
 from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.records import IndexOperation, change_of
+from okto_grafx.domain.model.node_labels import NODE_LABELS_CAPABILITY
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.recovery.decision import (
@@ -430,11 +431,50 @@ class CommitRedo:
             return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn, _catalogs=_catalogs)
         seen = False
         previous_horizon: int | None = None
+        previous_relationship_types: dict[str, tuple[tuple[object, ...], ...]] = {}
+        previous_property_models: dict[int, tuple[bool, bool, bool]] = {}
+        previous_node_labels: dict[int, frozenset[str]] = {}
+        previous_node_label_capability = False
         for terminal in replay.commit_records:
             images = grouped.get((terminal.epoch, terminal.txn_id))
             if images is None:
                 continue
             catalog = read_catalog_page_images(tuple(images), page_size=self._pool.page_size, sequence=terminal.lsn)
+            label_capability = catalog.requires_capability(NODE_LABELS_CAPABILITY)
+            if previous_node_label_capability and not label_capability:
+                raise GrafxRecoveryRefused("Catalog replay removes the native node-label capability.",
+                                          field="node_labels", lsn=terminal.lsn)
+            previous_node_label_capability = label_capability
+            models = {t.table_id: (t.flexible_properties, t.unlabeled, t.vector_identity_names) for t in catalog.tables()}
+            if any(key in previous_property_models and previous_property_models[key] != value
+                   for key, value in models.items()):
+                raise GrafxRecoveryRefused("Catalog replay redefines an established entity property/label model.",
+                                            field="flexible_properties", lsn=terminal.lsn)
+            previous_property_models.update(models)
+            node_labels = {t.table_id: frozenset(t.node_label_candidates) for t in catalog.tables() if t.kind == "node"}
+            if any(not labels <= node_labels.get(key, frozenset()) for key, labels in previous_node_labels.items()):
+                raise GrafxRecoveryRefused("Catalog replay removes established node-label candidates.",
+                                          field="node_labels", lsn=terminal.lsn)
+            previous_node_labels.update(node_labels)
+            relationship_types = {
+                group.name: tuple(
+                    (member.table_id, member.name, member.from_table, member.to_table)
+                    for key in group.table_ids for member in (catalog.table_by_id(key),)
+                )
+                for group in catalog.relationship_types()
+            }
+            flexible_names = {
+                group.name for group in catalog.relationship_types()
+                if all(catalog.table_by_id(key).flexible_properties for key in group.table_ids)
+            }
+            if any(relationship_types.get(name) != members and not (
+                name in flexible_names and relationship_types.get(name, ())[:len(members)] == members
+            ) for name, members in previous_relationship_types.items()):
+                raise GrafxRecoveryRefused(
+                    "Catalog replay removes or redefines established relationship type identity.",
+                    field="relationship_types", lsn=terminal.lsn,
+                )
+            previous_relationship_types = relationship_types
             if _catalogs is not None:
                 _catalogs.append((terminal.lsn, catalog))
             horizon = catalog.commit_catalog_activation

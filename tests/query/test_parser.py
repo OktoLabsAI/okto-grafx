@@ -27,7 +27,7 @@ from okto_grafx.domain.query.ast import (
     Variable,
 )
 from okto_grafx.domain.query.limits import (
-    MAX_CLAUSES,
+    MAX_PIPELINE_CLAUSES,
     MAX_EXPRESSION_DEPTH,
     MAX_LIST_ELEMENTS,
     MAX_MAP_ENTRIES,
@@ -240,6 +240,8 @@ def test_ascending_is_the_default_sort_direction() -> None:
         ("MATCH (a:Person)-->(b:Person) RETURN a.id", Direction.OUTGOING),
         ("MATCH (a:Person)<--(b:Person) RETURN a.id", Direction.INCOMING),
         ("MATCH (a:Person)--(b:Person) RETURN a.id", Direction.UNDIRECTED),
+        ("MATCH (a:Person)<-->(b:Person) RETURN a.id", Direction.UNDIRECTED),
+        ("MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id", Direction.UNDIRECTED),
     ],
 )
 def test_every_arrow_form_reads_its_direction(text: str, expected: Direction) -> None:
@@ -522,16 +524,16 @@ def test_a_hop_range_at_the_ceiling_is_accepted() -> None:
     assert isinstance(statement, Query)
 
 
-def test_a_backwards_hop_range_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person)-[:Knows*3..1]->(b:Person) RETURN a.id")
-    assert failure.value.details["field"] == "min_hops"
+def test_a_backwards_hop_range_preserves_empty_bounds() -> None:
+    statement = parse("MATCH (a:Person)-[:Knows*3..1]->(b:Person) RETURN a.id")
+    edge = statement.match_clauses[0].patterns[0].relationships[0]
+    assert (edge.min_hops, edge.max_hops, edge.hop_range_written) == (3,1,True)
 
 
-def test_an_arrow_pointing_both_ways_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id")
-    assert failure.value.details["field"] == "direction"
+def test_an_arrow_pointing_both_ways_has_canonical_undirected_semantics() -> None:
+    statement = parse("MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id")
+    assert statement.match_clauses[0].patterns[0].relationships[0].direction is Direction.UNDIRECTED
+    assert statement.describe() == "MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id"
 
 
 def test_a_star_on_something_that_is_not_an_aggregate_is_refused() -> None:
@@ -581,9 +583,14 @@ def test_a_vector_space_statement_without_options_is_refused() -> None:
         parse("CREATE VECTOR SPACE s")
 
 
-def test_set_must_assign_to_a_property() -> None:
+def test_set_accepts_whole_entity_target_but_not_a_literal_target() -> None:
+    statement = parse("MATCH (p:Person) SET p = {name:'Ada'}, p += {v:1}")
+    assignments = statement.updating_clauses[0].items
+    assert assignments[0].target.describe() == "p"
+    assert assignments[0].merge is False
+    assert assignments[1].merge is True
     with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (p:Person) SET p = 1")
+        parse("MATCH (p:Person) SET 1 = p")
     assert failure.value.details["field"] == "target"
 
 
@@ -628,7 +635,7 @@ def test_a_long_flat_chain_costs_no_parser_recursion(operator) -> None:
 
 
 def test_too_many_clauses_are_refused() -> None:
-    text = " ".join(["MATCH (p:Person)"] * (MAX_CLAUSES + 1)) + " RETURN p.id"
+    text = " ".join(["MATCH (p:Person)"] * (MAX_PIPELINE_CLAUSES + 1)) + " RETURN p.id"
     with pytest.raises(GrafxParseError) as failure:
         parse(text)
     assert failure.value.details["field"] == "clauses"

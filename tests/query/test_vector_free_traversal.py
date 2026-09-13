@@ -10,7 +10,6 @@ from okto_grafx.engine import query_engine as qe
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import IndexManager
 from okto_grafx.errors import GrafxCorruptionDetected, GrafxPlanError
-from okto_grafx.domain.model.errors import SchemaMismatchError
 
 
 @pytest.fixture
@@ -88,15 +87,26 @@ def test_partial_then_full_then_owner_update_cannot_reuse_partial_values(graph, 
 
 
 @pytest.mark.parametrize("optimized", [False, True])
-def test_pending_vector_parameter_tuple_is_not_a_quota_attribute_error(graph, monkeypatch, optimized):
+@pytest.mark.parametrize("carrier", [list, tuple])
+@pytest.mark.parametrize("commit", [False, True])
+def test_pending_vector_parameter_tuple_is_not_a_quota_attribute_error(graph, monkeypatch, optimized, carrier, commit):
     if not optimized:
         monkeypatch.setattr(qe, "_closed_vector_free_landings", lambda _root: frozenset())
-    with pytest.raises(SchemaMismatchError):
-        with graph.begin("write") as tx:
-            tx.execute("MATCH (b:B {id:'b1'}) SET b.v=$v", {"v": [7.0] * 384})
-            assert len(tx.execute(PREFIX + "RETURN b.id,b.title").rows) == 6
+    tx = graph.begin("write")
+    try:
+        tx.execute("MATCH (b:B {id:'b1'}) SET b.v=$v", {"v": carrier([7.0] * 384)})
+        assert len(tx.execute(PREFIX + "RETURN b.id,b.title").rows) == 6
+        assert tx.execute("MATCH (b:B {id:'b1'}) RETURN b.v").rows[0][0].values == (7.0,) * 384
+        if commit:
+            tx.commit()
+    finally:
+        if tx.active:
+            tx.rollback()
     rows = graph.execute("MATCH (b:B {id:'b1'}) RETURN b.v").rows
-    assert rows[0][0].values == (2.0,) * 384
+    assert rows[0][0].values == ((7.0 if commit else 2.0),) * 384
+    budget = graph._queries._owner_budget
+    assert budget._used_bytes == budget._used_entries == 0
+    assert not graph.verify("all").findings
 
 
 @pytest.mark.parametrize("prefix", [PREFIX, SCAN_PREFIX])

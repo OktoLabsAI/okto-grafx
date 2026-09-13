@@ -118,6 +118,12 @@ def test_entity_scalars_consume_list_selections_and_case_results(graph):
                          {"selected": True}).rows == ((row[1],),)
     with pytest.raises(GrafxPlanError) as raised:
         graph.execute("MATCH (n:P {id:1}) WITH [n,1] AS items RETURN labels(items[1])")
+    # LIST<ANY> remains dynamically typed for entity scalar admission even when
+    # a literal index names the invalid element (original Graph3 #0009).
+    assert raised.value.details["query_phase"] == "execution"
+    assert raised.value.details["reason"] == "entity_function_argument_type"
+    with pytest.raises(GrafxPlanError) as raised:
+        graph.execute("MATCH (n:P {id:1}) WITH [n,1] AS items RETURN labels(items[$slot])", {"slot": 1})
     assert raised.value.details["query_phase"] == "execution"
 
 

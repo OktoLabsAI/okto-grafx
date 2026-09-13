@@ -1,5 +1,10 @@
 # Evidence and report index
 
+- [Functional parity: final native regression, 22-contract reconciliation and explicit Neo4j deferral](FP_FINAL_NATIVE_QUALIFICATION.md)
+- [Final installed Pulse candidate: package, API, browser and MCP qualification](FP_FINAL_PULSE_QUALIFICATION.md)
+- [Final 0.0.6 native cost observations: exact fixtures, read/write boundaries and limitations](FP_NATIVE_COST_OBSERVATIONS.md)
+- [Bounded pinned Ladybug comparison and dialect differences](FP_BOUNDED_LADYBUG_COMPARISON.md)
+
 - [Pulse / Grafx 0.0.6 integration follow-up](PULSE_V006_INTEGRATION_REGRESSION.md)
 - [0.0.6 query-language round: fixed scope, full regression and consumer migration](V006_QUERY_LANGUAGE_ROUND.md)
 

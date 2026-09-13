@@ -11,7 +11,7 @@ else:
 
 _SIGNATURE = re.compile(r"there exists a procedure ([A-Za-z_][\w.]*)\((.*?)\) :: \((.*?)\)\s*:\Z")
 _FIELD = re.compile(r"([A-Za-z_]\w*)\s*::\s*(INTEGER|STRING|FLOAT|BOOLEAN|NUMBER)\?\Z")
-_TYPES = {"INTEGER": "INT64", "STRING": "STRING", "FLOAT": "DOUBLE", "BOOLEAN": "BOOL"}
+_TYPES = {"INTEGER": "INT64", "STRING": "STRING", "FLOAT": "DOUBLE", "BOOLEAN": "BOOL", "NUMBER": "NUMBER"}
 
 
 def _fields(text):
@@ -20,8 +20,6 @@ def _fields(text):
         match = _FIELD.fullmatch(part.strip())
         if not match:
             raise ValueError("Unadmitted reference procedure signature")
-        if match[2] not in _TYPES:
-            raise ValueError("Reference NUMBER procedure signature awaits FP-7")
         fields.append((match[1], _TYPES[match[2]]))
     return tuple(fields)
 
@@ -52,12 +50,13 @@ def procedure_registry(case):
         if not match:
             raise ValueError("Unadmitted reference procedure declaration")
         inputs, outputs = _fields(match[2]), _fields(match[3])
-        if not outputs:
-            raise ValueError("Unit reference procedures await FP-7")
         if match[1] in names:
             raise ValueError("Duplicate reference procedure declaration")
         names.add(match[1])
-        table = [[cell["value"] for cell in row["cells"]] for row in step["argument"]["dataTable"]["rows"]]
+        argument = step.get("argument", {})
+        if "dataTable" not in argument:
+            raise ValueError("Reference procedure requires an explicit fixture table")
+        table = [[cell["value"] for cell in row["cells"]] for row in argument["dataTable"]["rows"]]
         if not table or tuple(table[0]) != tuple(name for name, _ in inputs + outputs):
             raise ValueError("Reference procedure table header differs from its signature")
         rows = []
@@ -65,11 +64,19 @@ def procedure_registry(case):
             if len(row) != len(inputs) + len(outputs):
                 raise ValueError("Reference procedure fixture row has incorrect width")
             values = tuple(reference_value(cell) for cell in row)
-            expected = {"INT64": int, "STRING": str, "DOUBLE": float, "BOOL": bool}
-            if any(value is not None and type(value) is not expected[kind]
+            expected = {"INT64": (int,), "STRING": (str,), "DOUBLE": (float,), "BOOL": (bool,), "NUMBER": (int, float)}
+            if any(value is not None and type(value) not in expected[kind]
                    for value, (_, kind) in zip(values, inputs + outputs, strict=True)):
                 raise ValueError("Reference procedure fixture value differs from declared type")
             rows.append(values)
+        if not outputs and (inputs or rows):
+            raise ValueError("Unit reference fixture must be a no-argument empty table")
         procedures.append(TabularProcedure(match[1], tuple(kind for _, kind in inputs), outputs,
-                                             _implementation(rows, len(inputs))))
+                                             _implementation(rows, len(inputs)) if outputs else _unit_implementation,
+                                             argument_names=tuple(name for name, _kind in inputs)))
     return ExtensionRegistry(trusted=True, procedures=tuple(procedures)) if procedures else None
+
+
+def _unit_implementation():
+    """Implement the reference no-op unit procedure without inventing a result row."""
+    return None

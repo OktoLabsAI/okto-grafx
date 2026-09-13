@@ -333,7 +333,7 @@ def test_session_permission_and_registered_copy_lifetime(setup, tmp_path, monkey
         ).replayed
 
 
-def test_target_schema_mismatch_and_non_pk_source_are_explicit(setup, tmp_path):
+def test_target_schema_mismatch_and_non_pk_source_capture(setup, tmp_path):
     source, _, package = setup
     with connect(tmp_path / "incompatible") as target:
         prepare_copy_target(target)
@@ -346,8 +346,8 @@ def test_target_schema_mismatch_and_non_pk_source_are_explicit(setup, tmp_path):
     with source.begin() as tx:
         tx.execute("CREATE NODE TABLE Anonymous(value STRING)")
     with source.begin("read") as tx:
-        with pytest.raises(GrafxError):
-            capture_copy(tx, tables=("Anonymous",))
+        captured = capture_copy(tx, tables=("Anonymous",))
+        assert captured.tables[0].schema.primary_key is None
 
 
 def test_empty_relationship_properties(setup):

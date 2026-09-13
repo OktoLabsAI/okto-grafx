@@ -9,11 +9,11 @@ from okto_grafx.engine.txn_manager import TransactionManager
 
 
 def main():
-    source_path, target_path, cut = sys.argv[1:]
+    source_path, target_path, cut, *codec = sys.argv[1:]
     with connect(source_path, read_only=True) as source:
         with source.begin("read") as tx:
-            package = capture_copy(tx, tables=("N", "R"))
-    with connect(target_path) as target:
+            package = capture_copy(tx, tables=tuple(t.name for t in source.catalog.catalog.tables()))
+    with connect(target_path, codec=codec[0] if codec else "pure") as target:
         native_commit = Transaction.commit
         native_apply = TransactionManager._apply_images
         active_copy = None

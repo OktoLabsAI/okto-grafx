@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from okto_grafx.domain.errors import GrafxIndexError
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxIndexError
 from okto_grafx.domain.ids import RecordRef
 from okto_grafx.domain.index.catalog import (
     CatalogIndexDefinition,
@@ -275,24 +275,27 @@ def test_inexpressible_vector_name_does_not_hide_valid_v1_scalar_path(
         )
     )
     table_name = "T" * 120
-    table = catalog.add_table(
-        TableDef(
-            table_id=catalog.next_table_id(),
-            name=table_name,
-            kind="node",
-            columns=(
-                ColumnDef(name="id", type=ValueType.INT64, nullable=False),
-                ColumnDef(
-                    name="embedding",
-                    type=ValueType.VECTOR_F32,
-                    vector_space=space_name,
-                ),
-            ),
-            primary_key="id",
-        )
+    table = TableDef(
+        table_id=catalog.next_table_id(),
+        name=table_name,
+        kind="node",
+        columns=(
+            ColumnDef(name="id", type=ValueType.INT64, nullable=False),
+            ColumnDef(name="embedding", type=ValueType.VECTOR_F32, vector_space=space_name),
+        ),
+        primary_key="id",
     )
+    # New DDL must use the v2 bounded-name capability. This test instead models
+    # a previously stored v1 catalog, whose scalar facade must remain readable.
+    with pytest.raises(GrafxConfigurationError) as refused:
+        catalog.add_table(table)
+    assert refused.value.details["field"] == "format_version"
+    assert not catalog.has_table(table_name)
+    catalog._install_table(table)  # Same installation primitive as the legacy decoder.
     catalog_store.save()
     reopened = Catalog.deserialize(catalog.serialize())
+    assert reopened.format_version == 1
+    assert not reopened.table(table_name).vector_identity_names
 
     definitions = reopened.active_index_definitions_for(
         table.table_id, table_name=table.name

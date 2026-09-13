@@ -30,6 +30,8 @@ and re-opens the file by a freshly built path before it reports success.
 
 from __future__ import annotations
 
+from okto_grafx.domain.model.stored_types import stored_type_to_json
+
 import datetime
 import hashlib
 import json
@@ -698,7 +700,10 @@ def _schema_body(invocation: Invocation, database: Database) -> Report:
             "from_table": table.from_table, "to_table": table.to_table,
             "columns": [
                 {"name": column.name, "type": column.type.name,
-                 "nullable": column.nullable, "vector_space": column.vector_space}
+                 "nullable": column.nullable, "vector_space": column.vector_space,
+                 **({"decimal_precision": column.decimal_precision, "decimal_scale": column.decimal_scale}
+                    if column.type.name == "DECIMAL" else {}),
+                 **({"stored_type": stored_type_to_json(column.stored_type)} if column.stored_type is not None else {})}
                 for column in table.columns
             ],
         }

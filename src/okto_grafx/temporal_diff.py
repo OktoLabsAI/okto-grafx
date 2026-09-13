@@ -38,6 +38,8 @@ class TemporalRowChange:
     before: TemporalVersion | None
     after: TemporalVersion | None
     properties: tuple[TemporalPropertyChange, ...]
+    labels_added: tuple[str, ...] = ()
+    labels_removed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,11 +124,25 @@ def diff_graph(reader: Transaction, before: CommitId, after: CommitId, *, tables
             if present_old != present_new or encode_values((old_value,)) != encode_values((new_value,)):
                 charge()
                 properties.append(TemporalPropertyChange(name, present_old, present_new, old_value, new_value))
-        if old is None or new is None or properties:
+        def membership(version: TemporalVersion | None, schema: TableDef | None) -> frozenset[str]:
+            """Resolve a retained row's membership using its own historical schema."""
+            if version is None or schema.kind != "node":
+                return frozenset()
+            return frozenset(version.node_labels if version.node_labels is not None
+                             else () if schema.unlabeled else (schema.name,))
+
+        old_labels = membership(old, old_schema.get(key[0]))
+        new_labels = membership(new, new_schema.get(key[0]))
+        labels_added = tuple(sorted(new_labels - old_labels))
+        labels_removed = tuple(sorted(old_labels - new_labels))
+        for _name in (*labels_added, *labels_removed):
+            charge()
+        if old is None or new is None or properties or labels_added or labels_removed:
             charge()
             schema = new_schema.get(key[0], old_schema.get(key[0]))
             changes.append(TemporalRowChange(schema.name, schema.kind, key[1],
-                "added" if old is None else "removed" if new is None else "updated", old, new, tuple(properties)))
+                "added" if old is None else "removed" if new is None else "updated", old, new, tuple(properties),
+                labels_added, labels_removed))
     return TemporalDiff(before, after, tuple(schemas), tuple(changes),
                         left.events_scanned + right.events_scanned,
                         left.encoded_bytes_scanned + right.encoded_bytes_scanned)

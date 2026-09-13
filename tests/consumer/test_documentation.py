@@ -13,7 +13,7 @@ import threading
 import pytest
 
 from okto_grafx import connect
-from okto_grafx.errors import GrafxError, GrafxUnsupportedOperation
+from okto_grafx.errors import GrafxUnsupportedOperation
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -24,10 +24,25 @@ def blocks(name: str) -> list[str]:
     )
 
 
-@pytest.mark.parametrize("name", ["README.md", "docs/GETTING_STARTED.md"])
+@pytest.mark.parametrize("name", ["README.md", "docs/GETTING_STARTED.md", "docs/specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md", "docs/specs/DECIMAL_VALUES_V1.md"])
 def test_complete_documentation_examples(name: str) -> None:
     for snippet in blocks(name):
         exec(compile(snippet, name, "exec"), {})
+
+
+@pytest.mark.optional_dependency("pyarrow")
+def test_exact_decimal_columnar_documentation_example() -> None:
+    pytest.importorskip("pyarrow")
+    snippet, = [text for text in blocks("docs/EXTENSIONS_AND_ARROW.md")
+                if "kinds = (\"INT64\", ArrowDecimalType(12, 4))" in text]
+    exec(compile(snippet, "decimal128 consumption recipe", "exec"), {})
+
+
+@pytest.mark.optional_dependency("pyarrow")
+def test_exact_collection_columnar_documentation_example() -> None:
+    pytest.importorskip("pyarrow")
+    for snippet in blocks("docs/COLLECTION_COLUMNAR.md"):
+        exec(compile(snippet, "typed collection columnar recipe", "exec"), {})
 
 
 def test_reference_coverage_and_preservation() -> None:
@@ -75,11 +90,13 @@ def test_vector_recipe_and_filter() -> None:
     with connect(":memory:") as db:
         scope = {"db": db}
         snippets = blocks("docs/INDEXES_AND_VECTORS.md")
-        exec(compile(snippets[0], "vector recipe", "exec"), scope)
+        vector_recipe, = [snippet for snippet in snippets if "CREATE NODE TABLE Chunk(" in snippet]
+        filter_recipe, = [snippet for snippet in snippets if "candidate_filter = RecordIdFilter.of(" in snippet]
+        exec(compile(vector_recipe, "vector recipe", "exec"), scope)
         with db.begin("read") as reader:
             page = reader.scan_rows_v1("Chunk", limit=10)
             scope["record_ids"] = [r.record_id for r in page.rows]
-        exec(compile(snippets[1], "filter recipe", "exec"), scope)
+        exec(compile(filter_recipe, "filter recipe", "exec"), scope)
         result = scope["result"]
         assert result.achieved_k == 1 and result.requested_k == 10
 
@@ -92,8 +109,10 @@ def test_conflict_recipe_and_ddl_rollback() -> None:
             with db.begin("write") as txn:
                 txn.execute("CREATE NODE TABLE Abandoned(id INT64, PRIMARY KEY(id))")
                 raise RuntimeError("abandon")
-        with pytest.raises(GrafxError):
-            db.execute("MATCH (n:Abandoned) RETURN n.id")
+        assert not db.catalog.catalog.has_table("Abandoned")
+        # Native flexible MATCH on an absent label is now an empty relation;
+        # catalog absence, not a retired query error, proves DDL rollback.
+        assert db.execute("MATCH (n:Abandoned) RETURN n.id").rows == ()
         with db.begin("write") as txn:
             txn.execute("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))")
         report = scope["write_with_conflict_retry"](
@@ -112,6 +131,16 @@ def test_query_contract_examples() -> None:
             "MATCH (d:Decision) OPTIONAL MATCH (d)-[r]-() RETURN d.id, count(r)"
         ).rows == ((1, 0),)
         assert db.execute("RETURN 1 AS n UNION RETURN 1.0 AS n").rows == ((1.0,),)
+
+
+def test_typed_collection_declaration_recipe() -> None:
+    """Execute the documented native collection schema/assignment example."""
+    exec(compile(blocks("docs/specs/TYPED_COLLECTIONS_V1.md")[0], "typed collection recipe", "exec"), {})
+
+
+def test_collection_json_import_recipe(tmp_path: Path) -> None:
+    """Execute the exact nested JSON interchange recipe in an isolated directory."""
+    exec(compile(blocks("docs/COLLECTION_JSON.md")[0], "collection JSON recipe", "exec"), {"input_root": tmp_path})
 
 
 def test_async_recipe(tmp_path: Path) -> None:

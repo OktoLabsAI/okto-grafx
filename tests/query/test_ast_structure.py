@@ -1,12 +1,18 @@
 """Structural admission rejects hostile trees without narrowing valid composition."""
 
-from dataclasses import replace
+from dataclasses import is_dataclass, replace
 
 import pytest
 
 from okto_grafx.domain.errors import GrafxPlanError
 from okto_grafx.domain.query import ast, parse
-from okto_grafx.domain.query.structure import validate_structure
+from okto_grafx.domain.query.structure import _CANONICAL_IDS, validate_structure
+
+
+def test_declared_ast_exports_cover_every_canonical_dataclass():
+    expected = frozenset(id(value) for value in vars(ast).values()
+                         if isinstance(value, type) and value.__module__ == ast.__name__ and is_dataclass(value))
+    assert _CANONICAL_IDS == expected
 
 
 def test_structural_cycle_is_typed_before_any_recursive_expression_walk():

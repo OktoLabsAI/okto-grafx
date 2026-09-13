@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from okto_grafx.domain.errors import GrafxConfigurationError
 from okto_grafx.domain.model.schema import TableDef
+from okto_grafx.domain.model.table_selection import TableSelector
+from okto_grafx.domain.model.relationship_type import RelationshipTypeDef
 from okto_grafx.domain.txn.commit_identity import CommitId
 
 
@@ -32,7 +34,12 @@ class TemporalLimits:
 
 @dataclass(frozen=True, slots=True)
 class TemporalVersion:
-    """One row lineage interval [system_from, system_to); None is unbounded."""
+    """One row lineage interval [system_from, system_to); None is unbounded.
+
+    ``node_labels`` preserves explicit complete membership, including ``()``.
+    ``None`` denotes legacy implicit membership, resolved using this interval's
+    historical schema, or a relationship which has no node labels.
+    """
 
     table: str
     table_id: int
@@ -41,6 +48,8 @@ class TemporalVersion:
     schema_version: int
     system_from: CommitId
     system_to: CommitId | None = None
+    logical_type: str | None = None
+    node_labels: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +61,7 @@ class TemporalGraph:
     rows: tuple[TemporalVersion, ...]
     events_scanned: int
     encoded_bytes_scanned: int
+    relationship_types: tuple[RelationshipTypeDef, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +82,7 @@ class TemporalPin:
 
     name: str
     at: CommitId
-    tables: tuple[str, ...]
+    tables: tuple[TableSelector, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +100,7 @@ class TemporalPruneReport:
     """Atomic retention result; payload redaction does not reclaim physical file space."""
 
     before: CommitId
-    tables: tuple[str, ...]
+    tables: tuple[TableSelector, ...]
     commit: CommitId | None
     redacted_versions: int
     redacted_bytes: int

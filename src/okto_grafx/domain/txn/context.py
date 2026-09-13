@@ -25,11 +25,13 @@ from okto_grafx.domain.errors import (
     GrafxTransactionStateError,
 )
 from okto_grafx.domain.ids import NO_CSN, Csn, Epoch, PageIndex, RecordRef, TxnId
+from okto_grafx.domain.model.node_labels import encode_node_labels
 from okto_grafx.domain.model.schema import (
     ENDPOINT_COLUMN_COUNT,
     _forget_tuple_encoding_proof,
     _proved_tuple_payload,
     TupleEncodingProofs,
+    TableDef,
     encode_tuple,
 )
 from okto_grafx.domain.txn.partitions import page_partition
@@ -145,9 +147,12 @@ class RowIntent:
     operation: RowOperation = RowOperation.INSERT
     reference: object = None
     # Private, revocable acceleration only.  It is excluded from value equality so the domain
-    # outcome remains exactly table/values/identity/operation/reference; the commit boundary
+    # outcome remains exactly table/values/identity/operation/reference/node_labels; the commit boundary
     # accepts it only through schema.py's sealed exact-object protocol.
     _encoding_proof: object = dataclass_field(default=None, repr=False, compare=False)
+    # None means implicit membership for INSERT and inheritance for UPDATE;
+    # an explicit empty tuple removes membership, without deleting the node.
+    node_labels: tuple[str, ...] | None = None
 
 
 class TransactionMode(str, Enum):
@@ -267,6 +272,7 @@ class TransactionContext:
         "row_intents",
         "row_refs",
         "_text_analysis_memo",
+        "_temporal_context",
     )
 
     def __init__(
@@ -299,6 +305,7 @@ class TransactionContext:
         self._commit_csn: Csn = NO_CSN
         self.read_partitions: set[int] = set()
         self._text_analysis_memo = None
+        self._temporal_context = None
         self.write_partitions: set[int] = set()
         self.pending_records: list[WalRecordLike] = []
         self.page_images: dict[tuple[str, PageIndex], bytes] = {}
@@ -581,7 +588,8 @@ class TransactionContext:
         return tuple(sorted(unproved))
 
     def stage_row_insert(
-        self, table: object, values: Iterable[object], *, record_id: int | None = None
+        self, table: object, values: Iterable[object], *, record_id: int | None = None,
+        node_labels: tuple[str, ...] | None = None,
     ) -> PendingRowRef:
         """Stage a row to be written at the number that makes it visible, and name it privately.
 
@@ -600,7 +608,7 @@ class TransactionContext:
         durable is written, and refuses if the promise cannot be kept.
         """
         return self._stage_row_insert(
-            table, values, record_id=record_id, encoding_proof=None
+            table, values, record_id=record_id, encoding_proof=None, node_labels=node_labels
         )
 
     def _stage_row_insert_with_encoding_proof(
@@ -610,6 +618,7 @@ class TransactionContext:
         *,
         record_id: int | None = None,
         encoding_proof: object,
+        node_labels: tuple[str, ...] | None = None,
     ) -> PendingRowRef:
         """Stage through the ordinary door while carrying an optional exact encoding proof.
 
@@ -623,6 +632,7 @@ class TransactionContext:
             values,
             record_id=record_id,
             encoding_proof=encoding_proof,
+            node_labels=node_labels,
         )
 
     def _stage_row_insert(
@@ -632,6 +642,7 @@ class TransactionContext:
         *,
         record_id: int | None,
         encoding_proof: object,
+        node_labels: tuple[str, ...] | None,
     ) -> PendingRowRef:
         """Implement both insert staging doors without weakening their validation."""
         self._require_active()
@@ -648,8 +659,9 @@ class TransactionContext:
         accepted_table = _require_table(table)
         accepted_values = tuple(values)
         self._require_stageable_values(accepted_table, accepted_values)
+        accepted_values = _normalize_typed_assignments(accepted_table, accepted_values)
         payload_bytes = self._row_payload_bytes(
-            accepted_table, accepted_values, encoding_proof
+            accepted_table, accepted_values, encoding_proof, node_labels=node_labels
         )
         self._require_payload_capacity(payload_bytes)
         pending = self._allocate_pending_row_ref(accepted_table)
@@ -663,6 +675,7 @@ class TransactionContext:
                 record_id=record_id,
                 reference=pending,
                 _encoding_proof=accepted_proof,
+                node_labels=node_labels,
             )
         )
         self._staged_payload_bytes += payload_bytes
@@ -689,7 +702,8 @@ class TransactionContext:
         return reference
 
     def stage_row_update(
-        self, table: object, reference: object, values: Iterable[object]
+        self, table: object, reference: object, values: Iterable[object], *,
+        node_labels: tuple[str, ...] | None = None,
     ) -> None:
         """Stage a new version of an existing row, to be written at the commit number.
 
@@ -720,7 +734,8 @@ class TransactionContext:
                     )
                     break
         self._require_stageable_values(accepted_table, accepted_values, inserting=retained_pending_endpoints)
-        payload_bytes = self._row_payload_bytes(accepted_table, accepted_values)
+        accepted_values = _normalize_typed_assignments(accepted_table, accepted_values)
+        payload_bytes = self._row_payload_bytes(accepted_table, accepted_values, node_labels=node_labels)
         self._require_payload_capacity(payload_bytes)
         self.row_intents.append(
             RowIntent(
@@ -728,6 +743,7 @@ class TransactionContext:
                 values=accepted_values,
                 operation=RowOperation.UPDATE,
                 reference=accepted_reference,
+                node_labels=node_labels,
             )
         )
         self._staged_payload_bytes += payload_bytes
@@ -958,6 +974,7 @@ class TransactionContext:
         table: object,
         values: tuple[object, ...],
         encoding_proof: object = None,
+        *, node_labels: tuple[str, ...] | None = None,
     ) -> int:
         """Return the canonical encoded payload size of one inserted or updated row.
 
@@ -967,6 +984,7 @@ class TransactionContext:
         which matters, because a budget that charged an approximation would refuse or admit rows
         on a number the heap never writes.
         """
+        label_bytes = _node_label_payload_bytes(table, node_labels)
         if self._max_transaction_bytes is None:
             return 0
         sized = _sizing_values(values)
@@ -977,7 +995,7 @@ class TransactionContext:
         )
         if payload is None:
             payload = encode_tuple(table, sized)  # type: ignore[arg-type]
-        return len(payload)
+        return len(payload) + label_bytes
 
     def _retain_tuple_encoding_proof(
         self,
@@ -1046,7 +1064,7 @@ class TransactionContext:
         if intent.operation is RowOperation.DELETE:
             return 0
         return self._row_payload_bytes(
-            intent.table, intent.values, intent._encoding_proof
+            intent.table, intent.values, intent._encoding_proof, node_labels=intent.node_labels
         )
 
     def _record_payload_bytes(self, record: WalRecordLike) -> int:
@@ -1250,6 +1268,33 @@ def _require_optional_positive_limit(field: str, value: int | None) -> int | Non
             value=repr(value),
         )
     return int(value)
+
+
+def _normalize_typed_assignments(table: object, values: tuple[object, ...]) -> tuple[object, ...]:
+    """Keep staged values and encoded rows identical, retaining unchanged tuple proofs."""
+    if not isinstance(table, TableDef) or len(values) != table.arity:
+        return values  # Existing protocol/custom-table and arity validation remains authoritative.
+    changed = None
+    for position, column in table._typed_assignments:
+        value = values[position]
+        normalized = column.normalize_value(value)
+        if normalized is not value:
+            if changed is None:
+                changed = list(values)
+            changed[position] = normalized
+    return values if changed is None else tuple(changed)
+
+
+def _node_label_payload_bytes(table: object, labels: tuple[str, ...] | None) -> int:
+    """Validate retained label metadata independently of tuple encoding proofs."""
+    if labels is None:
+        return 0
+    if type(table) is not TableDef or table.kind != "node":
+        raise GrafxConfigurationError("Explicit label intents require a native node table.", field="node_labels")
+    encoded = encode_node_labels(labels)
+    if not table.admits_node_labels(labels):
+        raise GrafxConfigurationError("Label intents require admitted working-table candidates.", field="node_labels")
+    return len(encoded)
 
 
 def _require_table(table: object) -> object:

@@ -1,5 +1,13 @@
 # Bounded SQLite ingestion (0.0.6)
 
+Collection-root `StoredType` entries are accepted in `types` alongside scalar
+names. Their cells require SQL TEXT containing [exact collection JSON](COLLECTION_JSON.md),
+or SQL NULL subject to root nullability. No BLOB/INTEGER/REAL inference is allowed.
+Descriptors are privately cloned; malformed nested values fail while reading the
+bounded source, before Grafx staging. Native encoded collection bytes additionally
+charge the existing max_work allowance. No SQLite write or distributed transaction
+is introduced.
+
 [Documentation index](README.md) · [API reference](API_REFERENCE.md)
 
 This is a local ingestion adapter, **not SQL federation, CDC or a distributed
@@ -40,6 +48,30 @@ accepted. NULL is always `None`, never a magic string.
 | BYTES | BLOB, not base64 text |
 | UUID | canonical lowercase UUID text, converted to Grafx Uuid |
 | TIMESTAMP | INTEGER UTC microseconds, converted to Grafx Timestamp |
+| DECIMAL | TEXT containing the canonical `{"type":"decimal","coefficient":"1234500","precision":12,"scale":4}` object; exact 123.4500 |
+| DATE / LOCALTIME / TIME / LOCALDATETIME / DATETIME / DURATION | TEXT containing the corresponding explicit JSON temporal tag object |
+
+Temporal values use the [exact tagged field grammar](LOCAL_TEXT_IMPORT.md#native-temporal-fields-006-development),
+not SQLite date functions, host adapters or string inference. For example a DATE
+TEXT cell is `{"type":"date","epoch_day":"19782"}`; its declared type must be
+`DATE`. SQL NULL remains NULL; the text `null`, bare ISO date, BLOB, extra/missing
+fields, duplicate JSON keys, wrong tags and noncanonical coordinates refuse.
+Wide coordinates, nanosecond precision and recorded zone/offset identity survive
+without timezone lookup. Only DATETIME's `zone` coordinate may itself be NULL.
+No source schema inference, date affinity or automatic Grafx table creation is added.
+
+DECIMAL uses the [same exact tagged grammar as CSV/JSONL](LOCAL_TEXT_IMPORT.md#native-decimal-fields-006-development).
+Declare `types=("DECIMAL",)` for that column. Native coefficient, precision and
+scale are retained; SQLite INTEGER/REAL, numeric-affinity inference, untagged
+decimal text and host adapters are not implicit DECIMAL conversions. Use TEXT to
+avoid prior SQLite numeric-affinity rounding. SQL NULL stays None. Typed Grafx
+targets still require an exact assignment to their declared p/s; ANY retains the
+offered metadata. There is no source/target schema inference or new configuration.
+
+All temporal/decimal/collection decoding finishes while reading the bounded SQLite selection. A later
+invalid cell closes the source connection and fails before any of this import's
+Grafx staging; previously staged caller statements remain unchanged. Native target
+schema/range/transaction checks still run when the validated rows are staged.
 
 `SQLiteImportLimits` defaults: `max_rows=10000`, `max_bytes=16777216`,
 `max_field_bytes=65536`, `max_work=1000000`. All are positive integers <=2^31;

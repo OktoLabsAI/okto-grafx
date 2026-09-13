@@ -100,7 +100,12 @@ def prepare_retention(store: SystemHistoryStore, *, sequence: int, page_count: i
                 old = captured[prior[0]][1][prior[1]]
                 if old.operation in (1, 2):
                     size = len(encode_tuple(old.table, old.values))
-                    captured[prior[0]][1][prior[1]] = replace(old, operation=old.operation + 4, values=(), redacted_bytes=size)
+                    if old.node_labels is not None:
+                        from okto_grafx.domain.model.node_labels import encode_node_labels
+                        size += len(encode_node_labels(old.node_labels))
+                    captured[prior[0]][1][prior[1]] = replace(old, operation=old.operation + 4, values=(),
+                                                           redacted_bytes=size, node_labels=None,
+                                                           redacted_node_labels=old.node_labels is not None)
                     redacted_count += 1
                     redacted_bytes += size
             if change.operation == 3:

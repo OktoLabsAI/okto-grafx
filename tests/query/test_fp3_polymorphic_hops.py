@@ -96,8 +96,7 @@ def test_missing_properties_conflicting_families_and_entity_kinds(graph):
         graph.execute("MATCH ()-[r]->() RETURN labels(r)")
     with graph.begin("write") as tx:
         tx.execute("CREATE REL TABLE Conflict(FROM P TO Q, weight STRING)")
-    with pytest.raises(GrafxPlanError, match="tables do not agree"):
-        graph.execute("MATCH ()-[r]->() RETURN r.weight")
+    assert len(graph.execute("MATCH ()-[r]->() RETURN r.weight").rows) == 5
     assert len(graph.execute("MATCH ()-[r:A|B]->() RETURN r.weight").rows) == 3
 
 

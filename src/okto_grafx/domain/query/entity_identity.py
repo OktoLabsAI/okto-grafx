@@ -106,3 +106,9 @@ class EntityProvenance:
             "version_lsn": None if self.version_lsn is None else str(self.version_lsn),
             "pending": self.pending,
         }
+
+
+__all__ = [
+    'EntityIdentity',
+    'EntityProvenance',
+]

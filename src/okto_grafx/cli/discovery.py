@@ -52,6 +52,7 @@ def capabilities(invocation: Invocation) -> Report:
             "hybrid": "rrf",
             "max_k": 1000,
             "partial_results": False,
+            "vector_owner_selection": {"table": "optional_if_unique", "table_kind": ["node", "rel"]},
         },
         "transactions": {
             "scope": "single_store",
@@ -203,6 +204,11 @@ def search(invocation: Invocation, database: Database) -> Report:
         options["query" if kind == "vector" else "vector"] = vector
     if kind == "hybrid":
         options["table"] = _required(invocation, "table")
+    elif kind == "vector":
+        table_kind = invocation.text("table_kind")
+        if "table" in invocation.options or table_kind:
+            table = _required(invocation, "table")
+            options["table"] = (table_kind, table) if table_kind else table
     options["candidate_filter" if kind == "vector" else "filter"] = selected
     with database.begin("read") as reader:
         operation = {

@@ -1,5 +1,118 @@
 # Indexes and vector search
 
+Typed collection columns (0.0.6 development) are not legal primary keys or custom
+hash/ordered/fulltext keys. Index definition refuses before catalog effects;
+ARRAY/STRUCT declarations do not imply element indexes. Scalar columns in the same
+table retain their supported indexes, and native record-id/endpoint identity
+indexes remain available. Query list/map equality is independent of index support.
+[Typed collection contract](specs/TYPED_COLLECTIONS_V1.md).
+
+Native DECIMAL columns support PK and hash/sparse-hash/posting-hash equality seeks.
+Probes are converted to the declared precision/scale only when mathematically
+exact; incompatible/inexact probes cannot match. Cross-scale decimal values and
+exactly representable finite numeric probes use the index without a table scan.
+There is no new durable key format: canonical typed rows retain `columns`
+derivation. Ordered/full-text DECIMAL indexes remain unsupported and refuse before
+publication; query ORDER BY is not an ordered-index access path.
+[Contract](specs/DECIMAL_VALUES_V1.md#native-numeric-query-contract),
+[qualification](reports/FP6_DECIMAL_QUERY_QUALIFICATION.md).
+
+In 0.0.6 development, catalog-v2 textual `CREATE INDEX` can share a transaction
+with table DDL and earlier/later DML, including authorized procedure calls.
+The durable base is fenced, the private generation receives normal WAL row deltas,
+and catalog publication remains atomic. Python `db.create_index()` retains its
+dedicated transaction; legacy v1 activation still needs an explicit maintenance
+step before composition. [Protocol, layouts and boundaries](specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md#composable-custom-indexes).
+
+In the 0.0.6 independent-namespace development increment, `create_index` and
+textual `CREATE INDEX` retain their node-only contract and resolve node names
+independently of same-named relationships. Full-text indexes support both kinds:
+`db.create_text_index("edge_text", "R", ("body",), kind="rel")` qualifies the
+physical relationship table; `kind="node"` selects its node sibling. An omitted
+kind refuses an ambiguous name. Index replacement derives kind from the existing
+index's table ID and cannot switch to the sibling. Logical relationship groups
+must still be indexed by their physical member tables. Index names themselves
+remain globally unique under the existing registry rules.
+
+Hybrid search retains its node-target contract: `table="R"` selects the node
+table, while `HybridSearchOptions(graph_relations=("R",))` selects the physical
+relationship table. Both incident-index expansion and explicit scan expansion
+use that distinction; a same-named relationship does not shadow the vector or
+text target. Public vector search now accepts `table="Document"` or
+`table=("node", "Document")` / `table=("rel", "Related")` to select one physical
+owner of a shared space. Omitting the selector on a shared space refuses with
+`ambiguous_vector_owner`; hybrid automatically qualifies its node target.
+Hits retain table-local record IDs. This does not merge top-k across tables or
+change bounded candidate/fusion, snapshot or graph-evidence contracts.
+See [runtime ownership, SET admission and remaining boundaries](specs/VECTOR_PHYSICAL_OWNERS_V1.md).
+The subsequent [durable-name capability](specs/VECTOR_OWNER_NAMES_V1.md) preserves
+old unambiguous names and selects table-ID/column-position names for new collisions
+or overlong derived names. `TableDef.vector_identity_names` describes that durable
+choice; it is not an in-place toggle. Upgrade every participant before activation.
+
+Diagnostics and repair also accept `table=("node", "R")` / `("rel", "R")`:
+`db.vector_memory_usage("s", table=...)` and
+`db.maintenance.rebuild_vector_index("s", table=...)`. Detached vector index
+views expose `table_id`; use `db.vectors.index("s", table_id=...)` to select one.
+Ambiguity refuses before a rebuild claim. The existing live-handle post-rebuild
+coverage fence remains; see [selection, retry and sibling guarantees](specs/VECTOR_QUALIFIED_MAINTENANCE_V1.md).
+
+If an older store lacks a derived vector index, read-only opening preserves the
+files and refuses that owner's vector search. Writable opening can attach a stale
+placeholder; it does not rebuild or declare it healthy automatically. Use the
+explicit selected-owner rebuild above, then verify/reopen as documented in
+[missing-artifact recovery](specs/VECTOR_QUALIFIED_MAINTENANCE_V1.md#missing-derived-artifacts).
+No new connection setting enables this behavior.
+
+## Native temporal key support (0.0.6 development)
+
+The six [native temporal types](TEMPORAL_VALUES.md) use the canonical tagged value
+encoding for hash keys. They are not converted to strings or legacy TIMESTAMP.
+The following matrix applies equally to DATE, LOCALTIME, TIME, LOCALDATETIME,
+DATETIME and DURATION:
+
+| Use | Support and boundary |
+| --- | --- |
+| Typed primary-key column | Supported; exact native-value uniqueness and indexed equality |
+| Typed secondary column, `hash` | Supported; nullable and repeated values |
+| Typed secondary column, `sparse_hash` / `posting_hash` | Supported with their existing layout capabilities/limits |
+| Composite hash key | Supported; each ordered component retains its own type and value |
+| `layout="ordered"` | Refused at definition time; current ordered codec only accepts legacy TIMESTAMP then STRING |
+| Full-text index | Refused at definition time; requires declared STRING columns |
+| ANY/flexible property containing a temporal value | Query/storage supported; primary/secondary property indexes remain explicitly refused under the existing mixed-key contract |
+
+Recorded zone names, offsets and duration components participate in equality/key
+identity. Equal instants with different recorded representations can therefore be
+different keys; `duration('P1D')` and `duration('PT24H')` are different values/keys.
+No timezone-provider lookup occurs during key derivation. Use explicit normalization
+in application/query construction if your domain needs a different uniqueness rule.
+
+```python
+from okto_grafx import DateValue
+
+day = DateValue(2024, 2, 29)
+db.ensure_identity_indexes()  # explicit catalog-v2 prerequisite
+with db.begin() as tx:
+    tx.execute("CREATE NODE TABLE Event(day DATE, caption STRING, PRIMARY KEY(day))")
+db.create_index("by_caption_day", "Event", ("caption", "day"), bucket_count=32)
+rows = db.execute("MATCH(e:Event) WHERE e.day=$day RETURN e.caption", {"day": day})
+```
+
+The planner selects an IndexSeek for applicable equality predicates; hash support
+does **not** imply an ordered/range access path for temporal inequalities. Normal
+heap visibility and fresh index validation remain mandatory. Updates, rollback,
+delete/recreate, rehash/rebuild, reopen and recovery use the existing transaction/
+generation machinery. A reader already holding a snapshot retains its old answers
+after an independent writer commits. Competing primary-key writers cannot both
+publish the same native key. Normal OCC retries and finite page/key/batch limits
+still apply; this is not an unlimited-key-size or universal-serializability promise.
+
+Temporal ANY values remain queryable after an index-definition refusal. Their
+restriction is not bypassed based on the values currently stored: future mixed
+values need a separately specified equality/normalization contract. A separate
+typed key column is the supported indexed design today. See
+[heterogeneous properties](architecture/HETEROGENEOUS_PROPERTIES_V1.md).
+
 0.0.6 adds opt-in [`layout="posting_hash"`](POSTING_HASH.md) for repeated
 property keys. It shares keys within each page; unlike the decoded-page cache,
 this changes physical storage and requires catalog capability bit 14. It retains

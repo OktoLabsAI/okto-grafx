@@ -56,6 +56,7 @@ def create_text_index(
     *,
     options: TextIndexOptions | None,
     bucket_count: int,
+    kind: str | None = None,
     _replace_existing: bool = False,
 ) -> IndexView:
     """Publish a complete nonced generation through the existing detached build protocol."""
@@ -86,7 +87,7 @@ def create_text_index(
             from okto_grafx.engine.fulltext_durable import require_statistics_capacity
             require_statistics_capacity(selected.derivation(), database._pool.page_size)
         with database._transactions.page_access_section(fresh_read_view=True):
-            definition = database._catalog.catalog.table(table)
+            definition = database._catalog.catalog.table(table, kind=kind)
             positions = tuple(definition.column_index(column) for column in columns)
             if any(
                 definition.columns[p].type is not ValueType.STRING for p in positions
@@ -103,6 +104,7 @@ def create_text_index(
                 transaction._context,
                 name=name,
                 table_name=table,
+                table_kind=definition.kind,
                 positions=positions,
                 bucket_count=bucket_count,
                 expected_cardinality=None,

@@ -23,9 +23,12 @@ preserved. Expansion reuses operand trees and the ordinary bounded AND evaluator
 
 from __future__ import annotations
 
+from okto_grafx.domain.model.stored_types import StoredType, MAX_STRUCT_FIELDS
+from okto_grafx.domain.model.value import MAX_VALUE_DEPTH
+
 from dataclasses import dataclass, replace
 
-from okto_grafx.domain.errors import GrafxParseError
+from okto_grafx.domain.errors import GrafxParseError, GrafxConfigurationError
 from okto_grafx.domain.model.value import INT64_MAX, INT64_MIN
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
@@ -51,8 +54,12 @@ from okto_grafx.domain.query.ast import (
     NamedArgument,
     NodePattern,
     NullCheck,
+    LabelPredicate,
     Parameter,
     PatternPath,
+    PatternPredicate,
+    ExistsSubquery,
+    PatternComprehension,
     Property,
     Query,
     RelationshipPattern,
@@ -60,6 +67,7 @@ from okto_grafx.domain.query.ast import (
     ReturnItem,
     SetClause,
     SetItem,
+    LabelSetItem,
     SortItem,
     Statement,
     Subscript,
@@ -77,6 +85,7 @@ from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.scalars import NONDETERMINISTIC_SCALARS
 from okto_grafx.domain.query.limits import (
     MAX_CLAUSES,
+    MAX_PIPELINE_CLAUSES,
     MAX_COLUMN_DEFINITIONS,
     MAX_EXPRESSION_DEPTH,
     MAX_LIST_ELEMENTS,
@@ -87,7 +96,7 @@ from okto_grafx.domain.query.limits import (
     MAX_SORT_KEYS,
     MAX_TRAVERSAL_HOPS,
 )
-from okto_grafx.domain.query.tokens import AGGREGATE_FUNCTIONS, Token, TokenKind
+from okto_grafx.domain.query.tokens import AGGREGATE_FUNCTIONS, KEYWORDS, Token, TokenKind
 
 __all__ = [
     "COLUMN_TYPE_NAMES",
@@ -125,6 +134,9 @@ divergence rather than a silent one.
 
 COLUMN_TYPE_NAMES: frozenset[str] = frozenset(
     {
+        "DECIMAL",
+        "LIST", "MAP", "ARRAY", "STRUCT",
+        "ANY",
         "INT64",
         "STRING",
         "DOUBLE",
@@ -133,6 +145,7 @@ COLUMN_TYPE_NAMES: frozenset[str] = frozenset(
         "BLOB",
         "UUID",
         "TIMESTAMP",
+        "DATE", "LOCALTIME", "TIME", "LOCALDATETIME", "DATETIME", "DURATION",
         VECTOR_TYPE_NAME,
     }
 )
@@ -167,13 +180,14 @@ def parse(text: str) -> Statement:
 class _Parser:
     """A cursor over the tokens of one query, with a bounded recursion depth."""
 
-    __slots__ = ("_tokens", "_position", "_depth", "_source")
+    __slots__ = ("_tokens", "_position", "_depth", "_source", "_pattern_predicates_allowed")
 
     def __init__(self, tokens: tuple[Token, ...], source: str) -> None:
         self._tokens = tokens
         self._source = source
         self._position = 0
         self._depth = 0
+        self._pattern_predicates_allowed = False
 
     # --- cursor ------------------------------------------------------------------------------
 
@@ -307,7 +321,7 @@ class _Parser:
             return left
         return self._union(left)
 
-    def _union(self, left: Query) -> UnionQuery:
+    def _union(self, left: Query, *, existential: bool = False) -> UnionQuery:
         """Parse a bounded left-associated sequence with a per-operator duplicate policy."""
         combined: Query | UnionQuery = left
         branches = 1
@@ -315,7 +329,7 @@ class _Parser:
             if branches >= MAX_CLAUSES:
                 raise self._refuse("Too many UNION branches.", field="clauses", value=MAX_CLAUSES)
             keep_duplicates = self._match_keyword("ALL")
-            right = self._query()
+            right = self._query(existential=existential)
             combined = UnionQuery(left=combined, right=right, all=keep_duplicates)
             branches += 1
         assert isinstance(combined, UnionQuery)
@@ -442,18 +456,26 @@ class _Parser:
         self._take_keyword("CREATE")
         self._take_keyword("REL")
         self._take_keyword("TABLE")
+        group = self._match_keyword("GROUP")
         name = self._take_name("a table name")
         self._take_symbol("(")
         self._take_keyword("FROM")
         from_table = self._take_name("the table a relationship starts at")
         self._take_keyword("TO")
         to_table = self._take_name("the table a relationship ends at")
+        pairs = [(from_table, to_table)]
         columns: list[ColumnSpec] = []
         while self._match_symbol(","):
+            if group and not columns and self._match_keyword("FROM"):
+                source = self._take_name("the table a relationship starts at")
+                self._take_keyword("TO")
+                pairs.append((source, self._take_name("the table a relationship ends at")))
+                continue
             columns.append(self._column_spec(len(columns)))
         self._take_symbol(")")
         return CreateRelTableStatement(
-            name=name, from_table=from_table, to_table=to_table, columns=tuple(columns)
+            name=name, from_table=from_table, to_table=to_table, columns=tuple(columns),
+            endpoint_pairs=tuple(pairs) if group else (),
         )
 
     def _create_vector_space(self) -> CreateVectorSpaceStatement:
@@ -504,27 +526,114 @@ class _Parser:
                 field="type",
                 value=type_token.text,
             )
+        if type_name in ("LIST", "MAP", "ARRAY", "STRUCT"):
+            descriptor = self._stored_type_spec(0)
+            return ColumnSpec(name=name, type_name=type_name, stored_type=descriptor,
+                              nullable=False if not descriptor.nullable else None)
         self._advance()
+        if type_name == "DECIMAL":
+            self._take_symbol("(")
+            precision = self._decimal_type_parameter()
+            self._take_symbol(",")
+            scale = self._decimal_type_parameter()
+            self._take_symbol(")")
+            if not 1 <= precision <= 38 or not 0 <= scale <= precision:
+                raise self._refuse("DECIMAL requires 1 <= precision <= 38 and 0 <= scale <= precision",
+                                   field="decimal_type")
+            return ColumnSpec(name=name, type_name=type_name, decimal_precision=precision, decimal_scale=scale,
+                              nullable=self._column_nullability())
         if type_name != VECTOR_TYPE_NAME:
-            return ColumnSpec(name=name, type_name=type_name)
+            return ColumnSpec(name=name, type_name=type_name, nullable=self._column_nullability())
         self._take_symbol("(")
         space = self._space_name()
         self._take_symbol(")")
-        return ColumnSpec(name=name, type_name=type_name, vector_space=space)
+        return ColumnSpec(name=name, type_name=type_name, vector_space=space, nullable=self._column_nullability())
+
+    def _column_nullability(self) -> bool | None:
+        """Read explicit non-null admission, leaving absent declarations unchanged."""
+        if self._match_keyword("NOT"):
+            self._take_keyword("NULL")
+            return False
+        return None
+
+    def _stored_type_spec(self, depth: int) -> StoredType:
+        """Parse a bounded recursive native column type without changing expression tokens."""
+        if depth > MAX_VALUE_DEPTH:
+            raise self._refuse("Stored type depth exceeds its limit", field="stored_type")
+        token = self._current
+        if token.kind is not TokenKind.NAME:
+            raise self._unexpected("a stored type")
+        kind = {"BOOLEAN": "BOOL", "BLOB": "BYTES"}.get(token.upper, token.upper)
+        if token.upper not in COLUMN_TYPE_NAMES or kind == VECTOR_TYPE_NAME:
+            raise self._refuse("Unknown or unsupported nested stored type", field="stored_type", value=token.text)
+        self._advance()
+        element = length = precision = scale = None
+        fields = []
+        if kind == "DECIMAL":
+            self._take_symbol("(")
+            precision = self._decimal_type_parameter()
+            self._take_symbol(",")
+            scale = self._decimal_type_parameter()
+            self._take_symbol(")")
+        elif kind in ("LIST", "MAP", "ARRAY"):
+            self._take_symbol("<")
+            element = self._stored_type_spec(depth + 1)
+            if kind == "ARRAY":
+                self._take_symbol(",")
+                number = self._current
+                if number.kind is not TokenKind.INTEGER or type(number.value) is not int or not 0 <= number.value <= 0xFFFFFFFF:
+                    raise self._refuse("ARRAY length must be an integer from 0 to 2^32-1", field="stored_type")
+                length = number.value
+                self._advance()
+            self._take_symbol(">")
+        elif kind == "STRUCT" and self._match_symbol("<>"):
+            # The expression lexer intentionally preserves <> as one comparison token.
+            # Only this type-production interprets it as an empty field declaration.
+            pass
+        elif kind == "STRUCT":
+            self._take_symbol("<")
+            while not self._at_symbol(">"):
+                if len(fields) >= MAX_STRUCT_FIELDS:
+                    raise self._refuse("STRUCT field bound exceeded", field="stored_type")
+                name = self._take_name("a struct field")
+                self._take_symbol(":")
+                fields.append((name, self._stored_type_spec(depth + 1)))
+                if not self._match_symbol(","):
+                    break
+                if self._at_symbol(">"):
+                    raise self._unexpected("a struct field")
+            self._take_symbol(">")
+        nullable = self._column_nullability() is not False
+        try:
+            return StoredType(kind, nullable, element, length, tuple(fields), precision, scale)
+        except GrafxConfigurationError as failure:
+            raise self._refuse("Invalid stored type declaration", field="stored_type") from failure
+
+    def _decimal_type_parameter(self) -> int:
+        """Read a bounded integer declaration, not an expression or host coercion."""
+        token = self._current
+        if token.kind is not TokenKind.INTEGER or type(token.value) is not int or not 0 <= token.value <= 38:
+            raise self._refuse("DECIMAL type parameters must be integers from 0 to 38", field="decimal_type")
+        self._advance()
+        return token.value
 
     # --- queries -----------------------------------------------------------------------------
 
-    def _query(self) -> Query:
+    def _query(self, *, existential: bool = False) -> Query:
         """Parse clauses in written order, keeping WITH as the write/read boundary."""
+        if existential and (self._at_symbol("(") or self._at_symbol("=", 1)):
+            patterns = self._pattern_list(named=True)
+            predicate = self._predicate_expression() if self._match_keyword("WHERE") else None
+            return Query(match_clauses=(MatchClause(patterns=patterns, predicate=predicate),))
         pipeline: list[MatchClause | WithClause | UnwindClause | SubqueryClause | ProcedureCall | UpdatingClause] = []
         returned: ReturnClause | None = None
         writing = False
         while (self._current.kind is not TokenKind.END
                and not self._at_symbol(";") and not self._at_symbol("}")
                and not self._at_keyword("UNION")):
-            if len(pipeline) >= MAX_CLAUSES:
-                raise self._refuse(f"A query may chain at most {MAX_CLAUSES} clauses",
-                                   field="clauses", value=MAX_CLAUSES)
+            if len(pipeline) >= MAX_PIPELINE_CLAUSES:
+                raise self._refuse(f"A query may chain at most {MAX_PIPELINE_CLAUSES} clauses",
+                                   field="clauses", value=MAX_PIPELINE_CLAUSES)
             if returned is not None:
                 raise self._refuse("RETURN ends a query, so no clause may follow it",
                                    field="clause", value=self._current.text)
@@ -554,10 +663,16 @@ class _Parser:
             writing = True
         updates = tuple(clause for clause in pipeline
                         if isinstance(clause, (CreateClause, MergeClause, SetClause, DeleteClause)))
-        if returned is None and len(pipeline) == 1 and isinstance(pipeline[0], ProcedureCall):
+        if (returned is None and pipeline and isinstance(pipeline[-1], ProcedureCall)
+                and (len(pipeline) == 1 or not pipeline[-1].yields)):
+            if len(pipeline) == 1:
+                pipeline[0] = replace(pipeline[0], standalone=True)
             returned = ReturnClause(items=tuple(ReturnItem(expression=Variable(item.name))
-                                                for item in pipeline[0].yields))
-        if returned is None and not updates:
+                                                for item in pipeline[-1].yields))
+        nested_writes = any(isinstance(clause, SubqueryClause) and any(
+            branch.writes for branch in (clause.query.branches() if isinstance(clause.query, UnionQuery)
+                                        else (clause.query,))) for clause in pipeline)
+        if returned is None and not updates and not nested_writes and not existential:
             raise self._refuse("A query that only reads must end with RETURN",
                                field="clause", value="RETURN")
         unwinds = tuple(clause for clause in pipeline if isinstance(clause, UnwindClause))
@@ -574,6 +689,8 @@ class _Parser:
         # fields. All queries still execute through ordered_clauses().
         if query.ordered_clauses() != tuple(pipeline):
             query = replace(query, read_clause_order=read_order, clause_pipeline=tuple(pipeline))
+        if existential and not pipeline and returned is None:
+            raise self._refuse("An EXISTS body cannot be empty", field="subquery")
         return query
 
     def _call_subquery(self) -> SubqueryClause | ProcedureCall:
@@ -583,17 +700,23 @@ class _Parser:
             name = self._take_name("a registered procedure name")
             while self._match_symbol("."):
                 name += "." + self._take_name("a procedure name component")
-            self._take_symbol("(")
+            explicit_arguments = self._match_symbol("(")
             arguments = []
-            if not self._at_symbol(")"):
+            if explicit_arguments and not self._at_symbol(")"):
                 while True:
                     if len(arguments) >= 32:
                         raise self._refuse("Too many procedure arguments", field="arguments")
                     arguments.append(self._expression())
                     if not self._match_symbol(","):
                         break
-            self._take_symbol(")")
-            self._take_keyword("YIELD")
+            if explicit_arguments:
+                self._take_symbol(")")
+            if not self._match_keyword("YIELD"):
+                return ProcedureCall(name, tuple(arguments), (), None, implicit_arguments=not explicit_arguments)
+            if self._match_symbol("*"):
+                predicate = self._expression() if self._match_keyword("WHERE") else None
+                return ProcedureCall(name, tuple(arguments), (), predicate,
+                                     implicit_arguments=not explicit_arguments, yield_all=True)
             yielded = []
             while True:
                 if len(yielded) >= MAX_PROJECTION_ITEMS:
@@ -604,10 +727,15 @@ class _Parser:
                 if not self._match_symbol(","):
                     break
             predicate = self._expression() if self._match_keyword("WHERE") else None
-            return ProcedureCall(name, tuple(arguments), tuple(yielded), predicate)
+            return ProcedureCall(name, tuple(arguments), tuple(yielded), predicate,
+                                 implicit_arguments=not explicit_arguments)
         imports: list[str] = []
+        import_mode = "with"
         if self._match_symbol("("):
-            if not self._at_symbol(")"):
+            import_mode = "explicit"
+            if self._match_symbol("*"):
+                import_mode = "all"
+            elif not self._at_symbol(")"):
                 while True:
                     if len(imports) >= MAX_PROJECTION_ITEMS:
                         raise self._refuse("Too many imported variables", field="imports")
@@ -624,7 +752,7 @@ class _Parser:
         finally:
             self._ascend()
         self._take_symbol("}")
-        return SubqueryClause(query=query, imports=tuple(imports))
+        return SubqueryClause(query=query, imports=tuple(imports), import_mode=import_mode)
 
     def _unwind_clause(self) -> UnwindClause:
         """Parse ``UNWIND <expression> AS <alias>``."""
@@ -656,7 +784,7 @@ class _Parser:
         limit = self._expression() if self._match_keyword("LIMIT") else None
         predicate: Expression | None = None
         if self._match_keyword("WHERE"):
-            predicate = self._expression()
+            predicate = self._predicate_expression()
         return WithClause(items=tuple(items), predicate=predicate, distinct=distinct,
                           sort_items=sort_items, skip=skip, limit=limit, include_existing=include_existing)
 
@@ -664,12 +792,25 @@ class _Parser:
         """Parse one clause that writes."""
         if self._at_keyword("CREATE"):
             self._advance()
-            return CreateClause(patterns=self._pattern_list())
+            return CreateClause(patterns=self._pattern_list(named=True))
         if self._at_keyword("MERGE"):
             self._advance()
-            return MergeClause(pattern=self._pattern())
+            pattern = self._pattern(named=True)
+            on_create, on_match = [], []
+            while self._match_keyword("ON"):
+                if self._match_keyword("CREATE"):
+                    actions = on_create
+                else:
+                    self._take_keyword("MATCH")
+                    actions = on_match
+                actions.append(self._set_clause())
+                if len(on_create) + len(on_match) > MAX_CLAUSES:
+                    raise self._refuse("Too many MERGE actions.", field="clauses")
+            return MergeClause(pattern=pattern, on_create=tuple(on_create), on_match=tuple(on_match))
         if self._at_keyword("SET"):
             return self._set_clause()
+        if self._at_keyword("REMOVE"):
+            return self._remove_properties_clause()
         if self._at_keyword("DETACH") or self._at_keyword("DELETE"):
             return self._delete_clause()
         raise self._refuse(f"Unsupported query clause {self._current.text.upper()}",
@@ -689,38 +830,64 @@ class _Parser:
             # The predicate belongs to the clause, optional or not. For an OPTIONAL MATCH that
             # is the whole difference between "matched nothing" and "matched and then filtered
             # everything away": both are no rows, and both take the null extension.
-            predicate = self._expression()
+            predicate = self._predicate_expression()
         return MatchClause(patterns=patterns, predicate=predicate, optional=optional)
 
     def _set_clause(self) -> SetClause:
-        """Parse ``SET n.property = expression [, ...]``."""
+        """Parse property assignments and whole-entity map replacement/mutation."""
         self._take_keyword("SET")
-        items: list[SetItem] = []
+        items: list[SetItem | LabelSetItem] = []
         while True:
             # The target is read at property precedence, not at expression precedence: reading
             # it as a full expression would swallow the "=" as a comparison and the assignment
             # would arrive here as a boolean test that had already consumed its own value.
             target = self._postfix()
-            if not isinstance(target, Property):
+            if isinstance(target, LabelPredicate) and isinstance(target.subject, Variable):
+                items.append(LabelSetItem(target.subject, target.labels))
+                if self._match_symbol(","):
+                    continue
+                break
+            if not isinstance(target, (Property, Variable)):
                 raise self._refuse(
-                    "SET assigns to a property, as in SET n.age = 31",
+                    "SET targets a property or a bound node/relationship variable",
                     field="target",
                     value=target.describe(),
                 )
-            self._take_symbol("=")
-            items.append(SetItem(target=target, value=self._expression()))
+            merge = self._match_symbol("+=")
+            if not merge:
+                self._take_symbol("=")
+            if merge and not isinstance(target, Variable):
+                raise self._refuse("SET += targets a node or relationship property map.", field="target")
+            items.append(SetItem(target=target, value=self._expression(), merge=merge))
             if not self._match_symbol(","):
                 break
         return SetClause(items=tuple(items))
 
+    def _remove_properties_clause(self) -> SetClause:
+        """Lower property removal to the same atomic NULL assignment operation."""
+        self._take_keyword("REMOVE")
+        items: list[SetItem | LabelSetItem] = []
+        while True:
+            target = self._postfix()
+            if isinstance(target, LabelPredicate) and isinstance(target.subject, Variable):
+                items.append(LabelSetItem(target.subject, target.labels, remove=True))
+                if self._match_symbol(","):
+                    continue
+                break
+            if not isinstance(target, Property):
+                raise self._refuse("REMOVE needs a property target.", field="target", value=target.describe())
+            items.append(SetItem(target=target, value=Literal(value=None)))
+            if not self._match_symbol(","):
+                break
+        return SetClause(items=tuple(items), keyword="REMOVE")
+
     def _delete_clause(self) -> DeleteClause:
-        """Parse ``[DETACH] DELETE variable [, ...]``."""
+        """Parse ``[DETACH] DELETE expression [, ...]``."""
         detach = self._match_keyword("DETACH")
         self._take_keyword("DELETE")
-        targets: list[Variable] = []
+        targets: list[Expression] = []
         while True:
-            name = self._take_name("a variable to delete")
-            targets.append(Variable(name=name))
+            targets.append(self._expression())
             if not self._match_symbol(","):
                 break
         return DeleteClause(targets=tuple(targets), detach=detach)
@@ -729,8 +896,10 @@ class _Parser:
         """Parse ``RETURN [DISTINCT] items [ORDER BY keys] [SKIP n] [LIMIT n]``."""
         self._take_keyword("RETURN")
         distinct = self._match_keyword("DISTINCT")
+        include_existing = self._match_symbol("*")
         items: list[ReturnItem] = []
-        while True:
+        has_items = not include_existing or self._match_symbol(",")
+        while has_items:
             if len(items) >= MAX_PROJECTION_ITEMS:
                 raise self._refuse(
                     f"A RETURN clause may project at most {MAX_PROJECTION_ITEMS} items",
@@ -751,6 +920,7 @@ class _Parser:
             sort_items=sort_items,
             skip=skip,
             limit=limit,
+            include_existing=include_existing,
         )
 
     def _return_item(self) -> ReturnItem:
@@ -808,9 +978,7 @@ class _Parser:
     def _pattern(self, *, named: bool = False) -> PatternPath:
         """Parse one connected path of nodes and relationships.
 
-        ``named`` is true only where a MATCH is being read. A path name is a way of REFERRING
-        to what was matched, and nothing else in this subset reads one, so accepting it where
-        a pattern is written rather than matched would invent a meaning for it.
+        ``named`` admits a native path binding in MATCH, CREATE and MERGE.
         """
         variable: str | None = None
         if named and self._current.kind is TokenKind.NAME and self._at_symbol("=", 1):
@@ -842,7 +1010,7 @@ class _Parser:
         labels: list[str] = []
         while self._match_symbol(":"):
             labels.append(self._take_name("a node label"))
-        properties = self._map_literal() if self._at_symbol("{") else None
+        properties = self._pattern_properties()
         self._take_symbol(")")
         return NodePattern(
             variable=variable, labels=tuple(labels), properties=properties
@@ -867,11 +1035,8 @@ class _Parser:
         self._take_symbol("-")
         outgoing = self._match_symbol(">")
         if incoming and outgoing:
-            raise self._refuse(
-                "A relationship points one way; write it as -[]-> or <-[]- or -[]-",
-                field="direction",
-            )
-        if incoming:
+            direction = Direction.UNDIRECTED
+        elif incoming:
             direction = Direction.INCOMING
         elif outgoing:
             direction = Direction.OUTGOING
@@ -886,6 +1051,7 @@ class _Parser:
             properties=properties,
             hop_range_written=starred,
             upper_bound_omitted=upper_omitted,
+            both_directions_written=incoming and outgoing,
         )
 
     def _relationship_detail(
@@ -899,20 +1065,40 @@ class _Parser:
         if self._match_symbol(":"):
             types.append(self._take_name("a relationship type"))
             while self._match_symbol("|"):
+                self._match_symbol(":")
                 types.append(self._take_name("a relationship type"))
         starred = self._at_symbol("*")
+        if self._at_symbol(".."):
+            raise self._refuse("A relationship range requires an asterisk", field="hops",
+                               reason="invalid_relationship_pattern", query_phase="planning")
         min_hops, max_hops, upper_omitted = self._hop_range() if starred else (1, 1, False)
-        properties = self._map_literal() if self._at_symbol("{") else None
+        properties = self._pattern_properties()
         return variable, tuple(types), min_hops, max_hops, properties, starred, upper_omitted
+
+    def _pattern_properties(self) -> MapExpression | None:
+        """Pattern property keys are explicit; a bare parameter cannot supply them."""
+        if self._current.kind is TokenKind.PARAMETER:
+            raise self._refuse(
+                "Pattern properties require a literal map with explicit keys, not a bare parameter",
+                field="pattern_properties", value=self._current.value,
+                reason="invalid_parameter_use", query_phase="planning",
+            )
+        return self._map_literal() if self._at_symbol("{") else None
 
     def _hop_range(self) -> tuple[int, int, bool]:
         """Preserve omitted upper syntax separately from the execution safety ceiling."""
         self._take_symbol("*")
+        if self._at_symbol("-"):
+            raise self._refuse("Relationship bounds cannot be negative", field="hops",
+                               reason="invalid_relationship_pattern", query_phase="planning")
         upper_omitted = False
         lower: int | None = None
         if self._current.kind is TokenKind.INTEGER:
             lower = self._hop_count()
         if self._match_symbol(".."):
+            if self._at_symbol("-"):
+                raise self._refuse("Relationship bounds cannot be negative", field="hops",
+                                   reason="invalid_relationship_pattern", query_phase="planning")
             if self._current.kind is TokenKind.INTEGER:
                 upper = self._hop_count()
             else:
@@ -924,12 +1110,6 @@ class _Parser:
         else:
             lower, upper = 1, MAX_TRAVERSAL_HOPS
             upper_omitted = True
-        if lower > upper:
-            raise self._refuse(
-                f"A hop range starts at or below its upper bound; got {lower}..{upper}",
-                field="min_hops",
-                value=lower,
-            )
         return lower, upper, upper_omitted
 
     def _hop_count(self) -> int:
@@ -947,6 +1127,48 @@ class _Parser:
         return count
 
     # --- expressions -------------------------------------------------------------------------
+
+    def _predicate_expression(self) -> Expression:
+        """Admit graph predicates in WHERE, not as returned path-list values."""
+        previous = self._pattern_predicates_allowed
+        self._pattern_predicates_allowed = True
+        try:
+            return self._expression()
+        finally:
+            self._pattern_predicates_allowed = previous
+
+    def _starts_pattern_predicate(self) -> bool:
+        """Distinguish a relationship after a parenthesized node from arithmetic.
+
+        The lookahead never parses property expressions or allocates a second AST.
+        Existing token/depth/pattern ceilings still apply to the subsequent parse.
+        """
+        if not self._pattern_predicates_allowed or not self._at_symbol("("):
+            return False
+        first = self._peek()
+        if first.kind is TokenKind.NAME:
+            if self._peek(2).text not in (")", ":", "{"):
+                return False
+        elif first.kind is not TokenKind.SYMBOL or first.text not in (")", ":", "{"):
+            return False
+        depth = 0
+        for position in range(self._position, len(self._tokens)):
+            token = self._tokens[position]
+            if token.kind is not TokenKind.SYMBOL:
+                continue
+            if token.text == "(":
+                depth += 1
+            elif token.text == ")":
+                depth -= 1
+                if depth == 0:
+                    following = self._tokens[position + 1:position + 4]
+                    if len(following) != 3 or any(t.kind is not TokenKind.SYMBOL for t in following[:2]):
+                        return False
+                    return (following[0].text == "-" and (following[1].text == "["
+                            or following[1].text == "-" and following[2].text in ("(", ">"))
+                            or following[0].text == "<" and following[1].text == "-"
+                            and following[2].text in ("[", "-"))
+        return False
 
     def _expression(self) -> Expression:
         """Parse one expression at the lowest precedence."""
@@ -1094,10 +1316,24 @@ class _Parser:
             return None
         token = self._advance()
         magnitude = token.value
+        self._check_numeric_suffix(token)
         if not isinstance(magnitude, (int, float)) or isinstance(magnitude, bool):
             return None
         signed = -magnitude if operator == "-" else magnitude
         return Literal(value=self._require_storable_number(signed))
+
+    def _check_numeric_suffix(self, number: Token) -> None:
+        """Diagnose an adjacent non-keyword name as part of a malformed number.
+
+        Token offsets distinguish a corrupt literal from a separated unexpected
+        expression. Keyword/operator continuations retain their existing grammar.
+        """
+        following = self._current
+        if (number.end_offset == following.offset and following.kind is TokenKind.NAME
+                and not following.quoted and following.upper not in KEYWORDS):
+            raise self._refuse("A numeric literal cannot contain an identifier suffix.",
+                               field="number_literal", value=number.text + following.text,
+                               reason="invalid_numeric_literal", query_phase="planning")
 
     def _require_storable_number(self, number: int | float) -> int | float:
         """Return the number when the value system can store it, else refuse it."""
@@ -1113,6 +1349,12 @@ class _Parser:
         """Parse an atom followed by any number of property accesses or list extracts."""
         expression = self._atom()
         while True:
+            if self._at_symbol(":"):
+                labels = []
+                while self._match_symbol(":"):
+                    labels.append(self._take_name("a node label"))
+                expression = LabelPredicate(subject=expression, labels=tuple(labels))
+                continue
             if self._at_symbol(".") and self._peek().kind is TokenKind.NAME:
                 self._advance()
                 key = self._advance().text
@@ -1138,12 +1380,28 @@ class _Parser:
 
     def _atom(self) -> Expression:
         """Parse the smallest complete expression: a literal, a name, a call or a grouping."""
+        if self._at_keyword("EXISTS") and self._at_symbol("{", 1):
+            self._advance()
+            self._take_symbol("{")
+            self._descend()
+            try:
+                query = self._query(existential=True)
+                if self._at_keyword("UNION"):
+                    query = self._union(query, existential=True)
+            finally:
+                self._ascend()
+            self._take_symbol("}")
+            return ExistsSubquery(query=query)
+        if self._starts_pattern_predicate():
+            return PatternPredicate(self._pattern())
         token = self._current
         if token.kind is TokenKind.INTEGER:
             self._advance()
+            self._check_numeric_suffix(token)
             return Literal(value=self._require_storable_number(int(token.value or 0)))
         if token.kind is TokenKind.DOUBLE:
             self._advance()
+            self._check_numeric_suffix(token)
             return Literal(value=float(token.value or 0.0))
         if token.kind is TokenKind.STRING:
             self._advance()
@@ -1225,6 +1483,10 @@ class _Parser:
                 return Literal(value=None)
         if self._at_symbol("(", 1):
             return self._function_call()
+        if token.text.upper() in ("DATE", "LOCALTIME", "TIME", "LOCALDATETIME", "DATETIME", "DURATION") and (
+            self._at_symbol(".", 1) and self._at_symbol("(", 3)
+        ):
+            return self._function_call()
         self._advance()
         return Variable(name=token.text)
 
@@ -1232,6 +1494,8 @@ class _Parser:
         """Parse ``name(arguments)``, including ``count(*)`` and ``count(DISTINCT x)``."""
         token = self._advance()
         name = token.text
+        if name.upper() in ("DATE", "LOCALTIME", "TIME", "LOCALDATETIME", "DATETIME", "DURATION") and self._match_symbol("."):
+            name += "." + self._take_name("a temporal function name")
         self._take_symbol("(")
         if name.upper() in ("ALL", "ANY", "NONE", "SINGLE", "REDUCE"):
             self._descend()
@@ -1317,6 +1581,36 @@ class _Parser:
     def _list_literal(self) -> Expression:
         """Parse ``[element, ...]``."""
         self._take_symbol("[")
+        possible_name = self._current.kind is TokenKind.NAME and self._at_symbol("=", 1)
+        previous = self._pattern_predicates_allowed
+        position = self._position
+        self._pattern_predicates_allowed = True
+        try:
+            if possible_name:
+                self._position += 2
+            pattern_start = self._starts_pattern_predicate()
+        finally:
+            self._position = position
+            self._pattern_predicates_allowed = previous
+        if pattern_start:
+            self._descend()
+            try:
+                pattern = self._pattern(named=True)
+                if not pattern.relationships:
+                    raise self._refuse("A pattern comprehension requires a relationship pattern", field="pattern")
+                predicate = self._predicate_expression() if self._match_keyword("WHERE") else None
+                self._take_symbol("|")
+                # Its body is a value expression, not the surrounding WHERE's
+                # graph-predicate grammar (when this list is nested in WHERE).
+                self._pattern_predicates_allowed = False
+                try:
+                    projection = self._expression()
+                finally:
+                    self._pattern_predicates_allowed = previous
+                self._take_symbol("]")
+                return PatternComprehension(pattern, projection, predicate)
+            finally:
+                self._ascend()
         if self._current.kind is TokenKind.NAME and self._at_keyword("IN", 1):
             self._descend()
             variable = self._take_name("a list variable")

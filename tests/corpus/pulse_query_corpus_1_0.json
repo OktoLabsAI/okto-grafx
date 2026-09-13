@@ -258,8 +258,8 @@
       "YIELD"
     ],
     "probe_count": 87,
-    "engine_accepted": 78,
-    "engine_refused": 9,
+    "engine_accepted": 79,
+    "engine_refused": 8,
     "contract_refused": 14,
     "contract_error_codes": {
       "unsafe_cypher": 10,
@@ -1606,9 +1606,9 @@
         "contract_disposition": "refused",
         "contract_error_code": "unsafe_cypher",
         "contract_reason": "blacklisted keyword REMOVE",
-        "acceptance_phase": "parse_error",
-        "engine_verdict": "refused",
-        "error": "GrafxParseError: Unsupported query clause REMOVE (line 1, column 20). [code=parse_error retryable=False]"
+        "acceptance_phase": "planned",
+        "engine_verdict": "accepted",
+        "error": null
       },
       {
         "category": "forbidden_write",
@@ -1671,10 +1671,10 @@
     "class:fragment": 1,
     "class:read": 75,
     "class:write": 21,
-    "classification:already_supported": 83,
+    "classification:already_supported": 84,
     "classification:duplicate_text": 1,
     "classification:fragment": 1,
-    "classification:generic_gap": 12,
+    "classification:generic_gap": 11,
     "reachability:preventive": 2,
     "reachability:runtime_current": 66,
     "surface:internal_family": 68,
@@ -6712,9 +6712,9 @@
         "max_rows",
         "min_confidence"
       ],
-      "classification": "generic_gap",
-      "acceptance_phase": "plan_error",
-      "parse_error": "GrafxPlanError: A matched node names exactly one label, because a row lives in exactly one table; got (center). [code=plan_error retryable=False]",
+      "classification": "already_supported",
+      "acceptance_phase": "planned",
+      "parse_error": null,
       "expected": {
         "kind": "rows",
         "columns": [
@@ -6775,12 +6775,7 @@
         "order_by": null,
         "limit": "$max_rows",
         "notes": "nullable columns follow the stored node/edge properties",
-        "error": {
-          "phase": "plan_error",
-          "code": "plan_error",
-          "type": "GrafxPlanError",
-          "message": "A matched node names exactly one label, because a row lives in exactly one table; got (center). [code=plan_error retryable=False]"
-        }
+        "error": null
       }
     },
     {
@@ -7718,5 +7713,5 @@
       }
     }
   ],
-  "digest": "1adf6a7fab9452290aae97f317a2ae2ddf9cfec164195626f8e54abb430c4075"
+  "digest": "1320bab73ad62b1dd8711ca0e8afb35c99f8aec5e38a52435fa5da8a198eba81"
 }

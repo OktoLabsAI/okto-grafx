@@ -93,13 +93,13 @@ def test_polymorphic_target_and_relationship_properties(graph):
     assert result.rows == (("a", "t", 1), ("b", None, 0), ("isolated", None, 0))
 
 
-def test_incompatible_untyped_relationship_properties_refused_before_streaming(graph):
-    from okto_grafx.errors import GrafxPlanError
-
+def test_untyped_relationship_properties_keep_per_row_types(graph):
     with graph.begin("write") as tx:
         tx.execute("CREATE REL TABLE Conflict(FROM Person TO Topic, weight STRING)")
-    with pytest.raises(GrafxPlanError, match="tables do not agree"):
-        graph.execute("MATCH (p:Person) OPTIONAL MATCH (p)-[r]->() RETURN r.weight")
+        tx.execute("MATCH(p:Person {id:'b'}),(t:Topic) CREATE(p)-[:Conflict {weight:'text'}]->(t)")
+    result = graph.execute("MATCH (p:Person) OPTIONAL MATCH (p)-[r]->() "
+                           "RETURN r.weight AS weight ORDER BY weight").rows
+    assert result == (("text",),(1,),(2,),(None,),(None,))
 
 
 def test_anchor_without_relationship_tables_and_empty_root(tmp_path):

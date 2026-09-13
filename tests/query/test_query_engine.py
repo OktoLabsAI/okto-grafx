@@ -69,6 +69,7 @@ def names(result: QueryResult) -> list[object]:
 def test_a_binding_uses_the_tables_precomputed_column_position() -> None:
     class IndexedTable:
         name = "Person"
+        flexible_properties = False
         column_positions = {"name": 1}
 
         @property
@@ -130,6 +131,9 @@ def test_a_scan_rooted_at_single_row_does_not_copy_its_empty_bindings() -> None:
         txn = SimpleNamespace(row_intents=())
         staged_rows: tuple[()] = ()
         phase_rows: tuple[()] = ()
+
+        def node_table(self, requested: TableDef) -> TableDef:
+            return requested
 
         def count(self, name: str, amount: int = 1) -> None:
             return None
@@ -549,7 +553,8 @@ def test_case_binds_a_nested_parameter_expression_even_when_its_arm_is_not_selec
 
     with pytest.raises(GrafxPlanError) as invalid:
         run(stack, query, {"number": "bad"})
-    assert invalid.value.details == {"field": "operator", "value": "+"}
+    assert invalid.value.details == {"field": "operator", "value": "+",
+                                     "reason": "arithmetic_operand_type", "query_phase": "execution"}
 
 
 def test_case_binds_a_nested_parameter_expression_before_a_zero_row_stream(
@@ -563,7 +568,8 @@ def test_case_binds_a_nested_parameter_expression_before_a_zero_row_stream(
 
     with pytest.raises(GrafxPlanError) as invalid:
         run(stack, query, {"number": "bad"})
-    assert invalid.value.details == {"field": "operator", "value": "+"}
+    assert invalid.value.details == {"field": "operator", "value": "+",
+                                     "reason": "arithmetic_operand_type", "query_phase": "execution"}
 
 
 def test_case_may_wrap_aggregates_without_changing_group_evaluation(
@@ -1314,7 +1320,7 @@ def test_null_sorts_last_ascending_and_first_descending(stack: QueryStack) -> No
 
 
 def _add_double_ordering_rows(stack: QueryStack) -> None:
-    """Add finite and NaN doubles in an order that proves stable total ordering."""
+    """Add finite doubles; odd IDs produce expression-only NaNs in consumers."""
     stack.catalog_store.catalog.add_table(
         TableDef(
             table_id=4,
@@ -1328,9 +1334,9 @@ def _add_double_ordering_rows(stack: QueryStack) -> None:
         )
     )
     stack.catalog_store.save()
-    stack.insert("Measurement", 1, (1, float("nan")), csn=1)
+    stack.insert("Measurement", 1, (1, 0.0), csn=1)
     stack.insert("Measurement", 2, (2, 0.0), csn=1)
-    stack.insert("Measurement", 3, (3, float("nan")), csn=1)
+    stack.insert("Measurement", 3, (3, 0.0), csn=1)
     stack.insert("Measurement", 4, (4, -1.0), csn=1)
 
 
@@ -1341,11 +1347,15 @@ def test_nan_sorts_after_every_number_ascending_and_before_them_descending(
 
     ascending = run(
         stack,
-        "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value",
+        "MATCH (m:Measurement) WITH m.id AS id, "
+        "CASE WHEN m.id % 2 = 1 THEN 0.0 / 0.0 ELSE m.value END AS value "
+        "RETURN id, value ORDER BY value",
     )
     descending = run(
         stack,
-        "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value DESC",
+        "MATCH (m:Measurement) WITH m.id AS id, "
+        "CASE WHEN m.id % 2 = 1 THEN 0.0 / 0.0 ELSE m.value END AS value "
+        "RETURN id, value ORDER BY value DESC",
     )
 
     assert tuple(row[0] for row in ascending.rows) == (4, 2, 1, 3)
@@ -1548,7 +1558,9 @@ def test_min_and_max_use_the_same_total_nan_order_as_order_by(
 
     found = run(
         stack,
-        "MATCH (m:Measurement) RETURN min(m.value), max(m.value)",
+        "MATCH (m:Measurement) WITH "
+        "CASE WHEN m.id % 2 = 1 THEN 0.0 / 0.0 ELSE m.value END AS value "
+        "RETURN min(value), max(value)",
     )
 
     assert found.rows[0][0] == -1.0
@@ -1901,7 +1913,9 @@ def test_ordering_a_boolean_against_a_number_is_unknown(
 def test_arithmetic_over_a_boolean_is_refused(stack: QueryStack, expression: str) -> None:
     with pytest.raises(GrafxPlanError) as failure:
         run(stack, f"RETURN {expression} AS answer")
-    assert failure.value.details["field"] == "operator"
+    assert failure.value.details["field"] == "expression"
+    assert failure.value.details["reason"] == "arithmetic_operand_type"
+    assert failure.value.details["query_phase"] == "planning"
 
 
 def test_a_vector_subsystem_that_cannot_attach_is_told_apart_from_a_missing_one() -> None:
@@ -1957,7 +1971,10 @@ def test_a_column_attached_by_the_statement_is_searchable_at_once() -> None:
     built.apply_schema(ddl)
     ref = built.insert("Note", 1, (1, vector((1.0, 0.0, 0.0, 0.0))), 1)
     transaction = built.transaction()
-    built.vectors.stage_insert("minilm_v2", 1, ref, (1.0, 0.0, 0.0, 0.0), 1, transaction)
+    built.vectors.stage_insert(
+        "minilm_v2", 1, ref, (1.0, 0.0, 0.0, 0.0), 1, transaction,
+        table_id=built.catalog_store.catalog.table("Note", kind="node").table_id,
+    )
     built.indexes.commit(transaction, 1)
     found = built.engine.execute(
         "MATCH (n:Note) WHERE similarity(n.body, $q, space => 'minilm_v2') > 0.5 "

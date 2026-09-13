@@ -342,7 +342,7 @@ def _require_name_length(name: str, *, line: int, column: int, offset: int) -> N
 
 
 def _read_parameter(scanner: _Scanner) -> Token:
-    """Read a ``$name`` parameter reference."""
+    """Read a named, quoted or decimal-integer parameter reference without renaming it."""
     line, column, offset = scanner.line, scanner.column, scanner.index
     scanner.advance()
     if scanner.peek() == _BACK_QUOTE:
@@ -364,9 +364,9 @@ def _read_parameter(scanner: _Scanner) -> Token:
             continue
         break
     name = "".join(characters)
-    if not name or name[0] in _DIGITS:
+    if not name or (name[0] in _DIGITS and not name.isdecimal()):
         raise _refuse(
-            "A parameter is written as a dollar sign followed by a name, as in $limit",
+            "A parameter requires a name or decimal integer after the dollar sign, as in $limit or $1",
             line=line,
             column=column,
             offset=offset,
@@ -662,4 +662,5 @@ def _read_symbol(scanner: _Scanner) -> Token:
         offset=offset,
         field="character",
         value=character,
+        reason="unsupported_query_character", query_phase="planning",
     )

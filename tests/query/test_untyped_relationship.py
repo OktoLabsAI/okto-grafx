@@ -328,12 +328,8 @@ def test_untyped_traversal_uses_the_same_cumulative_work_budgets(tmp_path: Path)
 def test_general_one_hop_forms_are_not_limited_to_literal_names(
     text: str,
 ) -> None:
-    """FP-3 admits generic bounded forms while retaining typed-model refusals."""
-    if ":Decision:Bug" in text:
-        with pytest.raises(GrafxPlanError):
-            build_plan(parse(text), catalog=_catalog())
-    else:
-        assert build_plan(parse(text), catalog=_catalog()).columns
+    """Generic bounded forms include valid conjunctions with no candidate owner."""
+    assert build_plan(parse(text), catalog=_catalog()).columns
 
 
 def test_a_different_source_label_uses_its_own_incident_tables() -> None:

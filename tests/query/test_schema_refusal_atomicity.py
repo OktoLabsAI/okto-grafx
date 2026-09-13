@@ -33,44 +33,82 @@ import pytest
 
 import okto_grafx
 from okto_grafx.domain.errors import (
-    GrafxError,
+    GrafxConfigurationError,
     GrafxIndexError,
     GrafxTransactionStateError,
     GrafxWriteConflict,
 )
+from okto_grafx.engine.query_engine import QueryEngine
 
 
+@pytest.mark.parametrize("codec", ["pure", "numpy"])
 def test_a_refused_statement_poisons_nothing_and_the_transaction_still_commits(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch, codec,
 ) -> None:
-    """The headline repro: the case-folded collision, mid-transaction.
+    """A late failure after actual index attachment must unwind the statement.
 
-    Every assertion after the refusal held the opposite before the fix: the INSERT into the
-    phantom was accepted, the commit was durable, and the rows were unreachable with verify
-    clean -- silent data loss through the public door.
+    The original reproduction relied on a case-folded name collision. Physical
+    owner identities now allow those names in catalog v2, so inject a refusal
+    after real attachment and prove exact retry, prior writes and cold reopen.
     """
     root = tmp_path / "db"
-    with okto_grafx.connect(root, page_size=512) as db:
+    with okto_grafx.connect(root, page_size=512, codec=codec) as db:
+        db.ensure_identity_indexes()
         txn = db.begin("write")
         txn.execute("CREATE VECTOR SPACE s {dimension: 4, metric: 'cosine'}")
         txn.execute("CREATE NODE TABLE Person(id INT64, body VECTOR(s), PRIMARY KEY(id))")
-        with pytest.raises(GrafxIndexError):
-            txn.execute("CREATE NODE TABLE person(id INT64, body VECTOR(s), PRIMARY KEY(id))")
+        original = QueryEngine._attach_vector_columns
+        attached = []
 
-        # The refusal left the working copy at the previous statement's state: the phantom is
-        # not plannable, and the surviving schema still is.
-        with pytest.raises(GrafxError):
-            txn.execute("CREATE (:person {id: 1})")
+        def fail_after_attach(self, table, *args, **kwargs):
+            result = original(self, table, *args, **kwargs)
+            if table.name == "person":
+                attached.append(table.table_id)
+                raise GrafxIndexError("Injected failure after vector attachment.", field="late_ddl_probe")
+            return result
+
+        # Case-distinct physical owners are legal in catalog v2. Preserve the
+        # original late-refusal invariant with an actual post-attachment fault,
+        # not an expectation that the broader schema must still reject them.
+        with monkeypatch.context() as patch:
+            patch.setattr(QueryEngine, "_attach_vector_columns", fail_after_attach)
+            with pytest.raises(GrafxIndexError) as failure:
+                txn.execute("CREATE NODE TABLE person(id INT64, body VECTOR(s), PRIMARY KEY(id))")
+        assert failure.value.details["field"] == "late_ddl_probe"
+        assert len(attached) == 1
+
+        # An absent-label CREATE is now a legitimate schema-free operation, so
+        # it is no longer evidence of a leaked typed table. Exact typed DDL on
+        # retry proves the failed statement did not keep its table or indexes.
+        txn.execute("CREATE NODE TABLE person(id INT64, body VECTOR(s), PRIMARY KEY(id))")
+        txn.execute("CREATE (:person {id: 1, body: [0.0, 1.0, 0.0, 0.0]})")
         txn.execute("CREATE (:Person {id: 7, body: [1.0, 0.0, 0.0, 0.0]})")
         txn.commit()
 
         assert db.execute("MATCH (p:Person) RETURN p.id").rows == ((7,),)
-        assert sorted(t.name for t in db.catalog.catalog.tables()) == ["Person"]
+        assert db.execute("MATCH (p:person) RETURN p.id").rows == ((1,),)
+        assert sorted(t.name for t in db.catalog.catalog.tables()) == ["Person", "person"]
         assert db.verify("all").findings == ()
 
     with okto_grafx.connect(root, page_size=512) as reopened:
-        assert sorted(t.name for t in reopened.catalog.catalog.tables()) == ["Person"]
+        assert sorted(t.name for t in reopened.catalog.catalog.tables()) == ["Person", "person"]
+        assert reopened.execute("MATCH (p:person) RETURN p.id").rows == ((1,),)
+        assert reopened.execute("MATCH (p:Person) RETURN p.id").rows == ((7,),)
         assert reopened.verify("all").findings == ()
+
+
+def test_legacy_case_collision_refuses_before_adopting_a_phantom_table(tmp_path):
+    with okto_grafx.connect(tmp_path / "legacy", page_size=512) as db:
+        with db.begin("write") as txn:
+            txn.execute("CREATE VECTOR SPACE s {dimension: 4, metric: 'cosine'}")
+            txn.execute("CREATE NODE TABLE Person(id INT64, body VECTOR(s), PRIMARY KEY(id))")
+            with pytest.raises(GrafxConfigurationError) as failure:
+                txn.execute("CREATE NODE TABLE person(id INT64, body VECTOR(s), PRIMARY KEY(id))")
+            assert failure.value.details["field"] == "format_version"
+            txn.execute("CREATE (:Person {id: 7, body: [1.0, 0.0, 0.0, 0.0]})")
+        assert sorted(t.name for t in db.catalog.catalog.tables()) == ["Person"]
+        assert db.execute("MATCH (p:Person) RETURN p.id").rows == ((7,),)
+        assert not db.verify("all").findings
 
 
 def test_retry_settles_the_loser_so_the_successor_can_re_execute_its_ddl(

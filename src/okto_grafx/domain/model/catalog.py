@@ -60,12 +60,31 @@ from okto_grafx.domain.index.fulltext import (
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.index.keys import LARGE_HASH_CAPABILITY, LEGACY_MAX_BUCKET_COUNT
 from okto_grafx.domain.model.schema import (
+    HETEROGENEOUS_PROPERTIES_CAPABILITY,
+    FLEXIBLE_GRAPH_CAPABILITY,
+    SchemaType,
     SPACE_STATE_ACTIVE,
     ColumnDef,
     EmbeddingSpaceDef,
     TableDef,
+    is_identifier,
 )
-from okto_grafx.domain.model.value import ValueType
+from okto_grafx.domain.model.value import ValueType, TEMPORAL_VALUE_TYPES
+from okto_grafx.domain.model.node_labels import (
+    NODE_LABELS_CAPABILITY, NODE_LABELS_CAPABILITY_BIT, normalize_node_labels,
+    encode_node_labels, decode_node_labels,
+)
+from okto_grafx.domain.model.temporal_codec import TEMPORAL_VALUES_CAPABILITY, TEMPORAL_VALUES_CAPABILITY_BIT
+from okto_grafx.domain.model.decimal_codec import DECIMAL_VALUES_CAPABILITY, DECIMAL_VALUES_CAPABILITY_BIT
+from okto_grafx.domain.model.stored_types import (
+    TYPED_COLLECTIONS_CAPABILITY, TYPED_COLLECTIONS_CAPABILITY_BIT, TYPED_COLUMN_TAG,
+    encode_stored_type, decode_stored_type,
+    MAX_STORED_TYPE_BYTES,
+)
+from okto_grafx.domain.model.relationship_type import (
+    RELATIONSHIP_TYPES_CAPABILITY,
+    RelationshipTypeDef,
+)
 from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 
@@ -135,6 +154,14 @@ _SYSTEM_HISTORY_BIT = 1 << 15
 _FULLTEXT_POSITIONS_BIT = 1 << 16
 _SYSTEM_HISTORY_INDEX_BIT = 1 << 17
 _SYSTEM_HISTORY_COMPACTION_BIT = 1 << 18
+_RELATIONSHIP_TYPES_BIT = 1 << 19
+_HETEROGENEOUS_PROPERTIES_BIT = 1 << 20
+_FLEXIBLE_GRAPH_BIT = 1 << 21
+_SYSTEM_HISTORY_MODELS_BIT = 1 << 22
+GRAPH_NAMESPACES_CAPABILITY = "graph_namespaces_v1"
+GRAPH_NAMESPACES_CAPABILITY_BIT = 1 << 24
+VECTOR_OWNER_NAMES_CAPABILITY = "vector_owner_names_v1"
+VECTOR_OWNER_NAMES_CAPABILITY_BIT = 1 << 25
 SYSTEM_HISTORY_CAPABILITY = "system_history_v1"
 
 
@@ -158,6 +185,16 @@ _KNOWN_CAPABILITY_BITS = (
     | _FULLTEXT_POSITIONS_BIT
     | _SYSTEM_HISTORY_INDEX_BIT
     | _SYSTEM_HISTORY_COMPACTION_BIT
+    | _RELATIONSHIP_TYPES_BIT
+    | _HETEROGENEOUS_PROPERTIES_BIT
+    | _FLEXIBLE_GRAPH_BIT
+    | _SYSTEM_HISTORY_MODELS_BIT
+    | TEMPORAL_VALUES_CAPABILITY_BIT
+    | GRAPH_NAMESPACES_CAPABILITY_BIT
+    | VECTOR_OWNER_NAMES_CAPABILITY_BIT
+    | DECIMAL_VALUES_CAPABILITY_BIT
+    | TYPED_COLLECTIONS_CAPABILITY_BIT
+    | NODE_LABELS_CAPABILITY_BIT
 )
 _CAPABILITY_TO_BIT = MappingProxyType(
     {
@@ -182,6 +219,16 @@ _CAPABILITY_TO_BIT = MappingProxyType(
         "fulltext_positions_v1": _FULLTEXT_POSITIONS_BIT,
         "system_history_index_v1": _SYSTEM_HISTORY_INDEX_BIT,
         "system_history_compaction_v1": _SYSTEM_HISTORY_COMPACTION_BIT,
+        RELATIONSHIP_TYPES_CAPABILITY: _RELATIONSHIP_TYPES_BIT,
+        HETEROGENEOUS_PROPERTIES_CAPABILITY: _HETEROGENEOUS_PROPERTIES_BIT,
+        FLEXIBLE_GRAPH_CAPABILITY: _FLEXIBLE_GRAPH_BIT,
+        "system_history_models_v1": _SYSTEM_HISTORY_MODELS_BIT,
+        TEMPORAL_VALUES_CAPABILITY: TEMPORAL_VALUES_CAPABILITY_BIT,
+        GRAPH_NAMESPACES_CAPABILITY: GRAPH_NAMESPACES_CAPABILITY_BIT,
+        VECTOR_OWNER_NAMES_CAPABILITY: VECTOR_OWNER_NAMES_CAPABILITY_BIT,
+        DECIMAL_VALUES_CAPABILITY: DECIMAL_VALUES_CAPABILITY_BIT,
+        TYPED_COLLECTIONS_CAPABILITY: TYPED_COLLECTIONS_CAPABILITY_BIT,
+        NODE_LABELS_CAPABILITY: NODE_LABELS_CAPABILITY_BIT,
     }
 )
 _VISIBILITY_TO_TAG = MappingProxyType({IndexVisibility.EXACT: 1})
@@ -236,6 +283,8 @@ class Catalog:
     __slots__ = (
         "_tables",
         "_tables_by_id",
+        "_relationship_types",
+        "_relationship_type_by_table",
         "_spaces",
         "_spaces_by_id",
         "_format_version",
@@ -253,8 +302,10 @@ class Catalog:
 
     def __init__(self) -> None:
         """Build an empty catalog."""
-        self._tables: dict[str, TableDef] = {}
+        self._tables: dict[tuple[str, str], TableDef] = {}
         self._tables_by_id: dict[int, TableDef] = {}
+        self._relationship_types: dict[str, RelationshipTypeDef] = {}
+        self._relationship_type_by_table: dict[int, str] = {}
         self._spaces: dict[str, EmbeddingSpaceDef] = {}
         self._spaces_by_id: dict[int, EmbeddingSpaceDef] = {}
         self._format_version: int = CATALOG_LEGACY_FORMAT_VERSION
@@ -281,6 +332,83 @@ class Catalog:
         """Return every embedding space, ordered by space_id."""
         return tuple(self._spaces_by_id[key] for key in sorted(self._spaces_by_id))
 
+    def relationship_types(self) -> tuple[RelationshipTypeDef, ...]:
+        """Return explicit logical groups, ordered by name; physical tables stay separate."""
+        return tuple(self._relationship_types[key] for key in sorted(self._relationship_types))
+
+    def relationship_tables(self, name: str) -> tuple[TableDef, ...]:
+        """Resolve a logical group or an ordinary relationship table without id merging."""
+        group = self._relationship_types.get(name)
+        if group is not None:
+            return tuple(self._tables_by_id[key] for key in group.table_ids)
+        table = self._tables.get(("rel", name))
+        return ((table,) if table is not None and table.kind == "rel"
+                and table.table_id not in self._relationship_type_by_table else ())
+
+    def relationship_type_name(self, table_id: int) -> str:
+        """Resolve the logical type of one real relationship table, not an entity id."""
+        table = self.table_by_id(table_id)
+        if table.kind != "rel":
+            raise GrafxConfigurationError("A node table has no relationship type.", field="table_id")
+        return self._relationship_type_by_table.get(table_id, table.name)
+
+    def add_relationship_type(self, definition: RelationshipTypeDef) -> RelationshipTypeDef:
+        """Install native group authority after v2 activation and complete validation.
+
+        This is a catalog operation, not a live-store activation or DDL shortcut.
+        The caller must publish the resulting catalog through the normal schema
+        transaction and capability-admission protocol.
+        """
+        self._require_index_catalog()
+        if type(definition) is not RelationshipTypeDef:
+            raise GrafxConfigurationError("Expected a relationship type definition.", field="relationship_type")
+        if definition.name in self._relationship_types or ("rel", definition.name) in self._tables:
+            raise GrafxConfigurationError("Relationship type name already exists.", field="relationship_type")
+        first: TableDef | None = None
+        pairs: set[tuple[str | None, str | None]] = set()
+        for key in definition.table_ids:
+            table = self._tables_by_id.get(key)
+            if table is None or table.kind != "rel" or key in self._relationship_type_by_table:
+                raise GrafxConfigurationError("Invalid or already grouped relationship member.", field="relationship_members")
+            pair = (table.from_table, table.to_table)
+            if pair in pairs:
+                raise GrafxConfigurationError("Duplicate relationship endpoint pair.", field="relationship_endpoints")
+            for endpoint in pair:
+                target = self._tables.get(("node", str(endpoint)))
+                if target is None or target.kind != "node":
+                    raise GrafxConfigurationError("Relationship endpoint must be a node table.", field="relationship_endpoints")
+            pairs.add(pair)
+            if first is not None and (table.columns != first.columns or table.primary_key != first.primary_key
+                                      or table.flexible_properties != first.flexible_properties):
+                raise GrafxConfigurationError("Relationship members must share a property schema.", field="relationship_columns")
+            first = table
+        # No mutation, capability change or memo invalidation precedes validation.
+        self._relationship_types[definition.name] = definition
+        self._relationship_type_by_table.update(dict.fromkeys(definition.table_ids, definition.name))
+        self._required_capabilities = self._required_capabilities | {RELATIONSHIP_TYPES_CAPABILITY}
+        if ("node", definition.name) in self._tables:
+            self._required_capabilities |= {GRAPH_NAMESPACES_CAPABILITY}
+        self._invalidate_derived()
+        return definition
+
+    def extend_flexible_relationship_type(self, name: str, table_ids: tuple[int, ...]) -> RelationshipTypeDef:
+        """Append real endpoint pairs to a flexible type; typed groups stay immutable."""
+        if type(table_ids) is not tuple or not table_ids:
+            raise GrafxConfigurationError("Relationship extension requires a nonempty tuple of table IDs.", field="relationship_type")
+        prior = self._relationship_types.get(name)
+        if prior is None or not all(self.table_by_id(key).flexible_properties for key in prior.table_ids):
+            raise GrafxConfigurationError("Only an existing flexible relationship type can grow.", field="relationship_type")
+        proposed = RelationshipTypeDef(name, prior.table_ids + table_ids)
+        candidate = self.copy()
+        del candidate._relationship_types[name]
+        for key in prior.table_ids:
+            del candidate._relationship_type_by_table[key]
+        candidate.add_relationship_type(proposed)
+        self._relationship_types = candidate._relationship_types
+        self._relationship_type_by_table = candidate._relationship_type_by_table
+        self._invalidate_derived()
+        return proposed
+
     @property
     def format_version(self) -> int:
         """Return the exact format this value will preserve when serialized."""
@@ -296,6 +424,24 @@ class Catalog:
         """Test one required capability without allocating the public ordered snapshot."""
 
         return capability in self._required_capabilities
+
+    def _enable_temporal_values(self) -> Catalog:
+        """Set the temporal format fence on a detached catalog; no values are admitted here."""
+        self._require_index_catalog()
+        if TEMPORAL_VALUES_CAPABILITY not in self._required_capabilities:
+            self._required_capabilities = self._required_capabilities | {TEMPORAL_VALUES_CAPABILITY}
+            self._invalidate_derived()
+        return self
+
+    def _enable_native_value_capabilities(self, required: frozenset[str]) -> Catalog:
+        """Publish only validated native-value fences on this private v2 candidate."""
+        self._require_index_catalog()
+        if type(required) is not frozenset or not required <= {TEMPORAL_VALUES_CAPABILITY, DECIMAL_VALUES_CAPABILITY}:
+            raise GrafxConfigurationError("Unknown native-value capability set.", field="required_capabilities")
+        if not required <= self._required_capabilities:
+            self._required_capabilities = self._required_capabilities | required
+            self._invalidate_derived()
+        return self
 
     @property
     def commit_catalog_activation(self) -> int | None:
@@ -345,6 +491,9 @@ class Catalog:
         for key in table_ids:
             self._system_history.setdefault(key, (sequence, sequence))
         self._required_capabilities = frozenset((*self._required_capabilities, SYSTEM_HISTORY_CAPABILITY))
+        if any(self.table_by_id(key).flexible_properties or key in self._relationship_type_by_table
+               for key in self._system_history):
+            self._required_capabilities = self._required_capabilities | {"system_history_models_v1"}
         self._invalidate_derived()
         return self
 
@@ -542,24 +691,38 @@ class Catalog:
                 value=repr(name),
             ) from failure
 
-    def has_table(self, name: str) -> bool:
-        """Return True when a table with that name exists."""
-        return name in self._tables
+    def has_table(self, name: str, *, kind: str | None = None) -> bool:
+        """Test a physical name, optionally within one graph-kind namespace."""
+        self._validate_table_kind(kind)
+        return ((kind, name) in self._tables if kind is not None else
+                ("node", name) in self._tables or ("rel", name) in self._tables)
+
+    @staticmethod
+    def _validate_table_kind(kind: str | None) -> None:
+        if kind is not None and (type(kind) is not str or kind not in {"node", "rel"}):
+            raise GrafxConfigurationError("Table kind must be node or rel.", field="kind")
+
+    def _has_namespace_overlap(self) -> bool:
+        return any(kind == "node" and (("rel", name) in self._tables or name in self._relationship_types)
+                   for kind, name in self._tables)
 
     def has_space(self, name: str) -> bool:
         """Return True when an embedding space with that name exists."""
         return name in self._spaces
 
-    def table(self, name: str) -> TableDef:
-        """Return the table with that name."""
-        try:
-            return self._tables[name]
-        except KeyError as failure:
-            raise GrafxConfigurationError(
-                f"There is no table named {name!r} in this catalog.",
-                field="table",
-                value=name,
-            ) from failure
+    def table(self, name: str, *, kind: str | None = None) -> TableDef:
+        """Resolve a physical name; ambiguous unqualified names refuse."""
+        self._validate_table_kind(kind)
+        matches = tuple(self._tables[key] for key in (
+            ((kind, name),) if kind is not None else (("node", name), ("rel", name))
+        ) if key in self._tables)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise GrafxConfigurationError("Qualify an ambiguous physical table name with kind.",
+                                           field="table", value=name, reason="ambiguous_table_name")
+        raise GrafxConfigurationError(f"There is no table named {name!r} in this catalog.",
+                                       field="table", value=name)
 
     def table_by_id(self, table_id: int) -> TableDef:
         """Return the table with that numeric id, which is what a heap page records."""
@@ -685,6 +848,9 @@ class Catalog:
 
         self._require_index_catalog()
         proposed = (*self.index_definitions(), definition)
+        if isinstance(definition, CatalogIndexDefinition) and definition.name.lower().startswith("_grafx_vec_"):
+            raise GrafxConfigurationError("The _grafx_vec_ index prefix is reserved for physical vector owners.",
+                                          field="name", reason="reserved_index_prefix")
         validated = self._validated_index_authority(proposed, stored=False)
         if is_fulltext(definition.key_derivation):
             self._required_capabilities = frozenset((*self._required_capabilities, FULLTEXT_CAPABILITY))
@@ -802,10 +968,16 @@ class Catalog:
         self._install_indexes(validated)
         return definition
 
-    def add_nullable_column(self, name: str, column: ColumnDef) -> TableDef:
+    def add_nullable_column(self, name: str | tuple[str, str], column: ColumnDef) -> TableDef:
         """Append one nullable non-vector column, retaining exact prior decode layouts."""
         self._require_index_catalog()
-        table = self.table(name)
+        from okto_grafx.domain.model.table_selection import select_table
+        table = select_table(self, name)
+        if table.table_id in self._relationship_type_by_table:
+            raise GrafxConfigurationError(
+                "Grouped relationship schema changes must update every member atomically.",
+                field="relationship_columns",
+            )
         if (type(column) is not ColumnDef or not column.nullable or column.vector_space is not None
                 or column.type in (ValueType.VECTOR_F32, ValueType.VECTOR_F64)):
             raise GrafxConfigurationError("Only nullable non-vector columns can be appended.", field="column")
@@ -814,6 +986,33 @@ class Catalog:
         updated = replace(table, columns=(*table.columns, column), schema_version=table.schema_version + 1,
                           schema_layouts=(*table.schema_layouts, (table.schema_version, len(table.columns))))
         self._required_capabilities = self._required_capabilities | {"nullable_columns_v1"}
+        if column.type is SchemaType.ANY:
+            self._required_capabilities |= {HETEROGENEOUS_PROPERTIES_CAPABILITY}
+        if column.type in TEMPORAL_VALUE_TYPES:
+            self._required_capabilities |= {TEMPORAL_VALUES_CAPABILITY}
+        if column.type is ValueType.DECIMAL:
+            self._required_capabilities |= {DECIMAL_VALUES_CAPABILITY}
+        self._required_capabilities |= _collection_capabilities((column,))
+        self._install_table(updated)
+        return updated
+
+    def extend_node_labels(self, table_id: int, labels: tuple[str, ...]) -> TableDef:
+        """Admit possible labels append-only, without changing rows or table identity.
+
+        Even an empty explicit row label set needs this capability. This is a
+        working-catalog operation; callers must journal it in the outer statement.
+        """
+        self._require_index_catalog()
+        table = self.table_by_id(table_id)
+        if table.kind != "node":
+            raise GrafxConfigurationError("Only nodes carry label sets.", field="node_labels")
+        labels = normalize_node_labels(labels)
+        extras = normalize_node_labels((*table.extra_node_labels,
+                                       *(label for label in labels if table.unlabeled or label != table.name)))
+        updated = replace(table, extra_node_labels=extras)
+        if updated == table and NODE_LABELS_CAPABILITY in self._required_capabilities:
+            return table
+        self._required_capabilities |= {NODE_LABELS_CAPABILITY}
         self._install_table(updated)
         return updated
 
@@ -825,12 +1024,30 @@ class Catalog:
                 field="table",
                 value=type(table).__name__,
             )
-        if table.name in self._tables:
+        heterogeneous = any(c.type is SchemaType.ANY for c in table.columns)
+        temporal = any(c.type in TEMPORAL_VALUE_TYPES for c in table.columns)
+        decimal = any(c.type is ValueType.DECIMAL for c in table.columns)
+        collection_capabilities = _collection_capabilities(table.columns)
+        if table.extra_node_labels:
+            self._require_index_catalog()
+        if collection_capabilities:
+            self._require_index_catalog()
+        if decimal:
+            self._require_index_catalog()
+        if heterogeneous or temporal:
+            self._require_index_catalog()
+        if table.unlabeled and any(t.unlabeled for t in self.tables()):
+            raise GrafxConfigurationError("The catalog already has an unlabeled node store.", field="unlabeled")
+        if (table.kind, table.name) in self._tables or (table.kind == "rel" and table.name in self._relationship_types):
             raise GrafxConfigurationError(
                 f"This catalog already has a table named {table.name!r}.",
                 field="name",
                 value=table.name,
             )
+        namespace_overlap = (self.has_table(table.name) or
+                             table.kind == "node" and table.name in self._relationship_types)
+        if namespace_overlap:
+            self._require_index_catalog()
         if table.table_id in self._tables_by_id:
             raise GrafxConfigurationError(
                 f"This catalog already has a table with id {table.table_id}, named "
@@ -865,6 +1082,37 @@ class Catalog:
                     field="storage_dtype",
                     value=space.storage_dtype,
                 )
+        # Preserve established names. Only the newly admitted colliding table
+        # selects identity-derived vector names; no existing artifact is renamed.
+        vector_columns = tuple(position for position, column in enumerate(table.columns) if column.is_vector)
+        if vector_columns:
+            from okto_grafx.domain.index.definition import vector_index_name
+
+            occupied = {definition.registry_key for definition in self.active_index_definitions()}
+            collision = any(not is_identifier(vector_index_name(table, position)) or
+                            vector_index_name(table, position).lower() in occupied for position in vector_columns)
+            if collision and not table.vector_identity_names:
+                table = replace(table, vector_identity_names=True)
+            if table.vector_identity_names:
+                self._require_index_catalog()
+                if any(vector_index_name(table, position).lower() in occupied for position in vector_columns):
+                    raise GrafxConfigurationError("The physical vector identity is already owned by another index.",
+                                                  field="vector_identity_names")
+        if heterogeneous:
+            self._required_capabilities |= {HETEROGENEOUS_PROPERTIES_CAPABILITY}
+        if temporal:
+            self._required_capabilities |= {TEMPORAL_VALUES_CAPABILITY}
+        if decimal:
+            self._required_capabilities |= {DECIMAL_VALUES_CAPABILITY}
+        self._required_capabilities |= collection_capabilities
+        if table.flexible_properties:
+            self._required_capabilities |= {FLEXIBLE_GRAPH_CAPABILITY}
+        if namespace_overlap:
+            self._required_capabilities |= {GRAPH_NAMESPACES_CAPABILITY}
+        if table.vector_identity_names:
+            self._required_capabilities |= {VECTOR_OWNER_NAMES_CAPABILITY}
+        if table.extra_node_labels:
+            self._required_capabilities |= {NODE_LABELS_CAPABILITY}
         self._install_table(table)
         return table
 
@@ -941,6 +1189,47 @@ class Catalog:
             )
         indexes: tuple[CatalogIndexDefinition, ...] = ()
         capability_bits = 0
+        collection_capabilities = _collection_capabilities(c for t in self.tables() for c in t.columns)
+        if collection_capabilities and (self._format_version != CATALOG_FORMAT_VERSION or
+                                        not collection_capabilities <= self._required_capabilities):
+            raise GrafxConfigurationError("Typed collections require their catalog-v2 capabilities.", field="required_capabilities")
+        if any(c.type is ValueType.DECIMAL for t in self.tables() for c in t.columns) and (
+            self._format_version != CATALOG_FORMAT_VERSION or DECIMAL_VALUES_CAPABILITY not in self._required_capabilities
+        ):
+            raise GrafxConfigurationError("DECIMAL columns require their catalog-v2 capability.", field="required_capabilities")
+        if self._has_namespace_overlap() and (
+            self._format_version != CATALOG_FORMAT_VERSION or
+            GRAPH_NAMESPACES_CAPABILITY not in self._required_capabilities
+        ):
+            raise GrafxConfigurationError("Overlapping graph names require their catalog-v2 capability.",
+                                           field="required_capabilities")
+        if any(self.table_by_id(key).flexible_properties or key in self._relationship_type_by_table
+               for key in self._system_history) and "system_history_models_v1" not in self._required_capabilities:
+            raise GrafxConfigurationError("Flexible/grouped history requires its model metadata capability.", field="required_capabilities")
+        if any(t.vector_identity_names for t in self.tables()) and (
+            self._format_version != CATALOG_FORMAT_VERSION or
+            VECTOR_OWNER_NAMES_CAPABILITY not in self._required_capabilities
+        ):
+            raise GrafxConfigurationError("Identity vector names require their catalog-v2 capability.",
+                                          field="required_capabilities")
+        if any(t.flexible_properties for t in self.tables()) and FLEXIBLE_GRAPH_CAPABILITY not in self._required_capabilities:
+            raise GrafxConfigurationError("Flexible entities require their catalog capability.", field="required_capabilities")
+        if any(t.extra_node_labels for t in self.tables()) and (
+            self._format_version != CATALOG_FORMAT_VERSION or NODE_LABELS_CAPABILITY not in self._required_capabilities
+        ):
+            raise GrafxConfigurationError("Node labels require their catalog-v2 capability.", field="required_capabilities")
+        if any(c.type is SchemaType.ANY for t in self.tables() for c in t.columns) and (
+            self._format_version != CATALOG_FORMAT_VERSION
+            or HETEROGENEOUS_PROPERTIES_CAPABILITY not in self._required_capabilities
+        ):
+            raise GrafxConfigurationError("ANY properties require their catalog-v2 capability.",
+                                          field="required_capabilities")
+        if any(c.type in TEMPORAL_VALUE_TYPES for t in self.tables() for c in t.columns) and (
+            self._format_version != CATALOG_FORMAT_VERSION
+            or TEMPORAL_VALUES_CAPABILITY not in self._required_capabilities
+        ):
+            raise GrafxConfigurationError("Temporal columns require their catalog-v2 capability.",
+                                          field="required_capabilities")
         if self._format_version == CATALOG_FORMAT_VERSION:
             validated = self._validated_index_authority(
                 self.index_definitions(),
@@ -1021,10 +1310,23 @@ class Catalog:
                     parts.append(_U16.pack(version) + _U16.pack(count))
             elif table.schema_layouts:
                 raise GrafxConfigurationError("Prior layouts require nullable_columns_v1.", field="required_capabilities")
+            if FLEXIBLE_GRAPH_CAPABILITY in self._required_capabilities:
+                parts.append(_U8.pack(int(table.flexible_properties) | (int(table.unlabeled) << 1)))
+            if VECTOR_OWNER_NAMES_CAPABILITY in self._required_capabilities:
+                parts.append(_U8.pack(int(table.vector_identity_names)))
+            if NODE_LABELS_CAPABILITY in self._required_capabilities:
+                parts.append(encode_node_labels(table.extra_node_labels))
         for space in self.spaces():
             parts.append(_encode_space(space))
         for definition in indexes:
             parts.append(_encode_catalog_index(definition))
+        if bool(capability_bits & _RELATIONSHIP_TYPES_BIT) != bool(self._relationship_types):
+            raise GrafxConfigurationError("Relationship groups and capability differ.", field="relationship_types")
+        if self._relationship_types:
+            parts.append(_U32.pack(len(self._relationship_types)))
+            for group in self.relationship_types():
+                parts.extend((_encode_text(group.name), _U32.pack(len(group.table_ids))))
+                parts.extend(_U32.pack(key) for key in group.table_ids)
         body = b"".join(parts)
         encoded = body + _CHECKSUM.pack(crc32c(body))
         if type(self) is Catalog:
@@ -1050,6 +1352,8 @@ class Catalog:
         clone = Catalog()
         clone._tables = dict(self._tables)
         clone._tables_by_id = dict(self._tables_by_id)
+        clone._relationship_types = dict(self._relationship_types)
+        clone._relationship_type_by_table = dict(self._relationship_type_by_table)
         clone._spaces = dict(self._spaces)
         clone._spaces_by_id = dict(self._spaces_by_id)
         clone._format_version = self._format_version
@@ -1215,6 +1519,23 @@ class Catalog:
                     offset += layout_count * 4
                     table = replace(table, schema_layouts=layouts)
                 tables.append(table)
+                if FLEXIBLE_GRAPH_CAPABILITY in required_capabilities:
+                    _require(raw, offset, 1, "flexible graph flags")
+                    flags = raw[offset]
+                    offset += 1
+                    if flags & ~3:
+                        raise GrafxCorruptionDetected("Unknown flexible graph flags.", field="flexible_properties")
+                    tables[-1] = replace(table, flexible_properties=bool(flags & 1), unlabeled=bool(flags & 2))
+                if VECTOR_OWNER_NAMES_CAPABILITY in required_capabilities:
+                    _require(raw, offset, 1, "vector owner names flag")
+                    flag = raw[offset]
+                    offset += 1
+                    if flag not in (0, 1):
+                        raise GrafxCorruptionDetected("Unknown vector owner naming flag.", field="vector_identity_names")
+                    tables[-1] = replace(tables[-1], vector_identity_names=bool(flag))
+                if NODE_LABELS_CAPABILITY in required_capabilities:
+                    labels, offset = decode_node_labels(raw, offset)
+                    tables[-1] = replace(tables[-1], extra_node_labels=labels)
             for _ in range(space_count):
                 space, offset = _decode_space(raw, offset)
                 spaces.append(space)
@@ -1230,7 +1551,28 @@ class Catalog:
             ) from invalid
         if format_version == CATALOG_FORMAT_VERSION:
             _require_canonical_order(tables, spaces, indexes)
+        if any(c.type is SchemaType.ANY for t in tables for c in t.columns) and (
+            HETEROGENEOUS_PROPERTIES_CAPABILITY not in required_capabilities
+        ):
+            raise GrafxCorruptionDetected("ANY properties lack their required capability.",
+                                          field="required_capabilities")
+        if any(c.type in TEMPORAL_VALUE_TYPES for t in tables for c in t.columns) and (
+            TEMPORAL_VALUES_CAPABILITY not in required_capabilities
+        ):
+            raise GrafxCorruptionDetected("Temporal columns lack their required capability.",
+                                          field="required_capabilities")
+        if any(c.type is ValueType.DECIMAL for t in tables for c in t.columns) and (
+            DECIMAL_VALUES_CAPABILITY not in required_capabilities
+        ):
+            raise GrafxCorruptionDetected("Decimal columns lack their required capability.",
+                                          field="required_capabilities")
         catalog._install_loaded(tables, spaces)
+        collection_capabilities = _collection_capabilities(c for t in tables for c in t.columns)
+        if collection_capabilities and (format_version != CATALOG_FORMAT_VERSION or
+                                        not collection_capabilities <= required_capabilities):
+            raise GrafxCorruptionDetected("Typed collections lack their required capabilities.", field="required_capabilities")
+        if sum(t.unlabeled for t in tables) > 1:
+            raise GrafxCorruptionDetected("Duplicate unlabeled node stores.", field="unlabeled")
         if format_version == CATALOG_FORMAT_VERSION:
             if any(is_fulltext(d.key_derivation) for d in indexes) and FULLTEXT_CAPABILITY not in required_capabilities:
                 raise GrafxCorruptionDetected("Full-text indexes lack their required capability.", field="required_capabilities")
@@ -1269,6 +1611,33 @@ class Catalog:
             catalog._format_version = format_version
             catalog._required_capabilities = required_capabilities
             catalog._install_indexes(validated)
+        if RELATIONSHIP_TYPES_CAPABILITY in required_capabilities:
+            _require(raw, offset, _U32.size, "relationship type count")
+            group_count = _U32.unpack_from(raw, offset)[0]
+            offset += _U32.size
+            if not 0 < group_count <= table_count:
+                raise GrafxCorruptionDetected("Invalid relationship type count.", field="relationship_types")
+            previous = ""
+            try:
+                for _ in range(group_count):
+                    name, offset = _decode_text(raw, offset)
+                    _require(raw, offset, _U32.size, "relationship member count")
+                    member_count = _U32.unpack_from(raw, offset)[0]
+                    offset += _U32.size
+                    if not 0 < member_count <= table_count or name <= previous:
+                        raise GrafxCorruptionDetected("Invalid relationship group order/count.", field="relationship_types")
+                    _require(raw, offset, member_count * _U32.size, "relationship members")
+                    members = tuple(_U32.unpack_from(raw, offset + index * _U32.size)[0] for index in range(member_count))
+                    offset += member_count * _U32.size
+                    catalog.add_relationship_type(RelationshipTypeDef(name, members))
+                    previous = name
+            except GrafxConfigurationError as invalid:
+                raise GrafxCorruptionDetected(
+                    "Invalid persisted relationship group.", field=invalid.details.get("field", "relationship_types"),
+                ) from invalid
+        if catalog._has_namespace_overlap() and GRAPH_NAMESPACES_CAPABILITY not in required_capabilities:
+            raise GrafxCorruptionDetected("Overlapping graph names lack their required capability.",
+                                           field="required_capabilities", required=GRAPH_NAMESPACES_CAPABILITY)
         if offset != body_end:
             raise GrafxCorruptionDetected(
                 f"A serialised catalog decoded {offset} of {body_end} body bytes.",
@@ -1286,6 +1655,10 @@ class Catalog:
             )
         if any(key not in catalog._tables_by_id for key in catalog._system_history):
             raise GrafxCorruptionDetected("History references an unknown table.", field="system_history")
+        if any(catalog.table_by_id(key).flexible_properties or key in catalog._relationship_type_by_table
+               for key in catalog._system_history) and "system_history_models_v1" not in required_capabilities:
+            raise GrafxSchemaVersionMismatch("Flexible/grouped history lacks required model metadata capability; refusing to guess prior history.",
+                                             field="required_capabilities", required="system_history_models_v1")
         return catalog
 
     # --- protocol --------------------------------------------------------------------------
@@ -1295,6 +1668,7 @@ class Catalog:
             return NotImplemented
         return (
             self._tables == other._tables
+            and self._relationship_types == other._relationship_types
             and self._spaces == other._spaces
             and self._format_version == other._format_version
             and self._required_capabilities == other._required_capabilities
@@ -1370,7 +1744,7 @@ class Catalog:
             if relation.kind != "rel":
                 continue
             for endpoint_name in (relation.from_table, relation.to_table):
-                endpoint = self._tables.get(str(endpoint_name))
+                endpoint = self._tables.get(("node", str(endpoint_name)))
                 if endpoint is None or endpoint.kind != "node":
                     refuse(
                         f"Relationship {relation.name!r} points at missing or non-node "
@@ -1436,6 +1810,18 @@ class Catalog:
                     )
 
             is_identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
+            if not is_identity and any(
+                p < len(table.columns) and table.columns[p].stored_type is not None
+                for p in definition.positions
+            ):
+                refuse("Typed collection indexes require a separately specified key contract.",
+                       field="positions", index=definition.name)
+            if not is_identity and any(
+                p < len(table.columns) and table.columns[p].type is SchemaType.ANY
+                for p in definition.positions
+            ):
+                refuse("Indexes over ANY properties require a separately specified key contract.",
+                       field="positions", index=definition.name)
             text_offset = 2 if table.kind == "rel" else 0
             if is_fulltext(definition.key_derivation) and (
                 any(p < text_offset or p >= len(table.columns) or table.columns[p].type is not ValueType.STRING for p in definition.positions)
@@ -1484,7 +1870,7 @@ class Catalog:
 
         if require_endpoint_identity or require_active_identity:
             for endpoint_name in sorted(endpoints):
-                table = self._tables[endpoint_name]
+                table = self._tables[("node", endpoint_name)]
                 key = identity_index_name(table.table_id)
                 identity = by_key.get(key)
                 if identity is None:
@@ -1505,7 +1891,7 @@ class Catalog:
         return by_key
 
     def _install_table(self, table: TableDef) -> None:
-        self._tables[table.name] = table
+        self._tables[(table.kind, table.name)] = table
         self._tables_by_id[table.table_id] = table
         self._invalidate_derived()
 
@@ -1552,7 +1938,7 @@ class Catalog:
                 )
             self._install_space(space)
         for table in tables:
-            if table.name in self._tables:
+            if (table.kind, table.name) in self._tables:
                 raise GrafxCorruptionDetected(
                     f"The stored catalog declares the table {table.name!r} more than once.",
                     field="name",
@@ -1628,7 +2014,9 @@ def _encode_capabilities(capabilities: frozenset[str]) -> int:
     """Encode every required capability, refusing one this build cannot uphold."""
 
     for dependent, required in (
+        (FLEXIBLE_GRAPH_CAPABILITY, {HETEROGENEOUS_PROPERTIES_CAPABILITY}),
         ("system_history_index_v1", {SYSTEM_HISTORY_CAPABILITY}),
+        ("system_history_models_v1", {SYSTEM_HISTORY_CAPABILITY}),
         ("system_history_compaction_v1", {SYSTEM_HISTORY_CAPABILITY}),
         ("fulltext_positions_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
@@ -1666,7 +2054,9 @@ def _decode_capabilities(bits: int) -> frozenset[str]:
         capability for capability, bit in _CAPABILITY_TO_BIT.items() if bits & bit
     )
     for dependent, required in (
+        (FLEXIBLE_GRAPH_CAPABILITY, {HETEROGENEOUS_PROPERTIES_CAPABILITY}),
         ("system_history_index_v1", {SYSTEM_HISTORY_CAPABILITY}),
+        ("system_history_models_v1", {SYSTEM_HISTORY_CAPABILITY}),
         ("system_history_compaction_v1", {SYSTEM_HISTORY_CAPABILITY}),
         ("fulltext_positions_v1", {FULLTEXT_CAPABILITY}),
         ("fulltext_relationships_v1", {FULLTEXT_CAPABILITY}),
@@ -1940,6 +2330,22 @@ def _decode_optional_text(raw: bytes, offset: int) -> tuple[str | None, int]:
     return _decode_text(raw, offset)
 
 
+def _collection_capabilities(columns):
+    required = set()
+    for column in columns:
+        descriptor = column.stored_type
+        if descriptor is None:
+            continue
+        required.add(TYPED_COLLECTIONS_CAPABILITY)
+        if descriptor.contains("ANY"):
+            required.add(HETEROGENEOUS_PROPERTIES_CAPABILITY)
+        if descriptor.contains("DECIMAL"):
+            required.add(DECIMAL_VALUES_CAPABILITY)
+        if any(descriptor.contains(kind.name) for kind in TEMPORAL_VALUE_TYPES):
+            required.add(TEMPORAL_VALUES_CAPABILITY)
+    return frozenset(required)
+
+
 def _encode_table(table: TableDef) -> bytes:
     """Return the stored form of one table definition."""
     parts = [
@@ -1954,9 +2360,14 @@ def _encode_table(table: TableDef) -> bytes:
     ]
     for column in table.columns:
         parts.append(_encode_text(column.name))
-        parts.append(_U8.pack(int(column.type)))
+        parts.append(_U8.pack(TYPED_COLUMN_TAG if column.stored_type is not None else int(column.type)))
         parts.append(_U8.pack(1 if column.nullable else 0))
         parts.append(_encode_optional_text(column.vector_space))
+        if column.type is ValueType.DECIMAL:
+            parts.append(bytes((column.decimal_precision, column.decimal_scale)))
+        if column.stored_type is not None:
+            descriptor = encode_stored_type(column.stored_type)
+            parts.extend((_U32.pack(len(descriptor)), descriptor))
     return b"".join(parts)
 
 
@@ -1984,8 +2395,24 @@ def _decode_table(raw: bytes, offset: int) -> tuple[TableDef, int]:
         nullable = _U8.unpack_from(raw, offset + _U8.size)[0]
         offset += _U8.size * 2
         vector_space, offset = _decode_optional_text(raw, offset)
+        decimal_precision = decimal_scale = None
+        stored_type = None
+        if type_tag == TYPED_COLUMN_TAG:
+            _require(raw, offset, 4, "stored type length")
+            length = _U32.unpack_from(raw, offset)[0]
+            offset += 4
+            if not 6 <= length <= MAX_STORED_TYPE_BYTES:
+                raise GrafxCorruptionDetected("Stored type length exceeds its envelope.", field="stored_type")
+            _require(raw, offset, length, "stored type")
+            stored_type = decode_stored_type(raw[offset:offset + length])
+            offset += length
+        if type_tag == int(ValueType.DECIMAL):
+            _require(raw, offset, 2, "decimal type parameters")
+            decimal_precision, decimal_scale = raw[offset:offset + 2]
+            offset += 2
         try:
-            column_type = ValueType(type_tag)
+            column_type = (stored_type.value_type if stored_type is not None else
+                           SchemaType.ANY if type_tag == int(SchemaType.ANY) else ValueType(type_tag))
         except ValueError as failure:
             raise GrafxCorruptionDetected(
                 f"Column {column_name!r} of table {name!r} declares the unknown type tag "
@@ -2009,6 +2436,9 @@ def _decode_table(raw: bytes, offset: int) -> tuple[TableDef, int]:
                 type=column_type,
                 nullable=nullable == 1,
                 vector_space=vector_space,
+                decimal_precision=decimal_precision,
+                decimal_scale=decimal_scale,
+                stored_type=stored_type,
             )
         )
     table = TableDef(

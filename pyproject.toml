@@ -38,7 +38,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 # Accelerators are installed by default; engine mechanisms remain behind ports.
-dependencies = ["numpy>=1.24", "google-crc32c>=1.5"]
+dependencies = ["numpy>=1.24", "google-crc32c>=1.5", "tzdata>=2024.1"]
 
 [project.urls]
 Homepage = "https://github.com/OktoLabsAI/okto-grafx"

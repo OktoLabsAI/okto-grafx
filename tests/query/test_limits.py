@@ -14,6 +14,8 @@ from okto_grafx.domain.model.schema import MAX_IDENTIFIER_LENGTH
 from okto_grafx.domain.model.value import INT64_MAX
 from okto_grafx.domain.query import limits
 from okto_grafx.domain.query.lexer import INTEGER_MAGNITUDE_LIMIT
+from okto_grafx.domain.query.lexer import tokenize
+from okto_grafx.errors import GrafxParseError
 from okto_grafx.domain.query.plan import MAX_PLAN_DEPTH
 
 EXPECTED: dict[str, int] = {
@@ -21,9 +23,10 @@ EXPECTED: dict[str, int] = {
     "MAX_QUERY_CHARACTERS": 65536,
     "MAX_QUERY_VALUE_CHARACTERS": 1048576,
     "MAX_RENDERED_QUERY_CHARACTERS": 1048576,
-    "MAX_TOKENS": 8192,
+    "MAX_TOKENS": 32768,
     "MAX_EXPRESSION_DEPTH": 48,
     "MAX_CLAUSES": 64,
+    "MAX_PIPELINE_CLAUSES": 1024,
     "MAX_PATTERNS_PER_CLAUSE": 32,
     "MAX_PATTERN_ELEMENTS": 64,
     "MAX_TRAVERSAL_HOPS": 30,
@@ -34,7 +37,8 @@ EXPECTED: dict[str, int] = {
     "MAX_PARAMETERS": 256,
     "MAX_COLUMN_DEFINITIONS": 512,
     "MAX_NAME_CHARACTERS": 128,
-    "MAX_NUMBER_CHARACTERS": 40,
+    # FP-2 admits finite long DOUBLE spellings, including binary64 subnormals.
+    "MAX_NUMBER_CHARACTERS": 2048,
     "MAX_STRING_CHARACTERS": 16384,
 }
 
@@ -48,6 +52,14 @@ def test_the_declared_bounds_are_exactly_the_ones_pinned_here() -> None:
     # A new bound that nothing pins is a bound that can be widened silently, so the set itself
     # is the thing under test rather than the individual numbers.
     assert set(limits.__all__) == set(EXPECTED)
+
+
+def test_numeric_token_boundary_is_independent_of_the_exported_constant():
+    # These literal lengths do not move if the limit is accidentally widened.
+    tokenize("0." + "0" * 2045 + "1")
+    with pytest.raises(GrafxParseError) as failure:
+        tokenize("0." + "0" * 2046 + "1")
+    assert failure.value.details["field"] == "number"
 
 
 def test_the_rendered_query_bound_is_reexported_by_the_query_package() -> None:

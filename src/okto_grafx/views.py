@@ -26,6 +26,7 @@ from okto_grafx.domain.query.analysis import analyze
 from okto_grafx.domain.query.parser import parse
 from okto_grafx.domain.query.effects import is_deterministic
 from okto_grafx.domain.query.planner import build_plan
+from okto_grafx.domain.query.scopes import _owned_nodes
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxLedgerError,
@@ -101,7 +102,11 @@ class ViewParameter:
 
 @dataclass(frozen=True, slots=True)
 class ViewDefinition:
-    """Detached definition; dependencies pair table names with complete schema hashes."""
+    """Detached definition; sorted name/hash pairs retain every physical dependency.
+
+    Names can repeat across kinds. Each complete schema hash includes kind and
+    physical identity; callers must not collapse these pairs into a name-keyed dict.
+    """
 
     name: str
     query: str
@@ -151,22 +156,21 @@ def _parsed(query, parameters):
         raise GrafxUnsupportedOperation(
             "Views require read-only MATCH/RETURN queries.", operation="logical_view"
         )
-    # Explicit labels prevent silent expansion when unrelated tables are added.
-    for branch in branches:
-        for match in branch.match_clauses:
-            for path in match.patterns:
-                for node in path.nodes:
-                    if not isinstance(node, NodePattern) or not node.labels:
-                        raise GrafxUnsupportedOperation(
-                            "View nodes require explicit base labels.",
-                            operation="logical_view",
-                        )
-                for edge in path.relationships:
-                    if not isinstance(edge, RelationshipPattern) or not edge.types:
-                        raise GrafxUnsupportedOperation(
-                            "View edges require explicit base types.",
-                            operation="logical_view",
-                        )
+    # Include expression-local reads (EXISTS/pattern predicates/comprehensions),
+    # not only top-level MATCH and CALL. Never enter parameter/literal payloads.
+    for node in _owned_nodes(statement):
+        if isinstance(node, Query) and node.writes:
+            raise GrafxUnsupportedOperation("Views require read-only queries.", operation="logical_view")
+        if isinstance(node, (NodePattern, RelationshipPattern)):
+            names = node.labels if isinstance(node, NodePattern) else node.types
+            if not names:
+                raise GrafxUnsupportedOperation(
+                    "View patterns require explicit base labels and types.", operation="logical_view",
+                )
+            if any(name.startswith("_grafx_") for name in names):
+                raise GrafxUnsupportedOperation(
+                    "Views cannot depend on reserved metadata tables.", operation="logical_view",
+                )
     analysis = analyze(statement)
     if set(analysis.parameters) != {p.name for p in parameters}:
         raise _bad("parameters_schema")
@@ -178,21 +182,37 @@ def _binding(tx, query, parameters):
     catalog = tx._database._catalog.catalog
     plan = build_plan(statement, catalog=catalog)
     dependencies = {}
+
+    def record(table: TableDef) -> None:
+        """Record a bounded schema dependency and refuse reserved metadata owners."""
+        if table.name.startswith("_grafx_"):
+            raise GrafxUnsupportedOperation(
+                "Views cannot depend on reserved metadata tables.", operation="logical_view",
+            )
+        dependencies[table.table_id] = (table.name, _hash(_json(asdict(table))))
+        if len(dependencies) > 64:
+            raise _bad("dependencies")
+
     for node in plan.root.walk():
         for field in fields(node):
             value = getattr(node, field.name)
             candidates = value if isinstance(value, tuple) else (value,)
             for table in candidates:
                 if isinstance(table, TableDef):
-                    if table.name.startswith("_grafx_"):
-                        raise GrafxUnsupportedOperation(
-                            "Views cannot depend on reserved metadata tables.",
-                            operation="logical_view",
-                        )
-                    dependencies[table.name] = _hash(_json(asdict(table)))
-    if len(dependencies) > 64:
-        raise _bad("dependencies")
-    return plan.columns, tuple(sorted(dependencies.items()))
+                    record(table)
+    # Some expression subplans are compiled only at execution, so PlanNode.walk
+    # alone cannot prove their schema closure. Explicit syntax supplies kind;
+    # catalog resolution supplies physical identity and complete logical groups.
+    for node in _owned_nodes(statement):
+        if isinstance(node, NodePattern):
+            for name in node.labels:
+                if catalog.has_table(name, kind="node"):
+                    record(catalog.table(name, kind="node"))
+        elif isinstance(node, RelationshipPattern):
+            for name in node.types:
+                for table in catalog.relationship_tables(name):
+                    record(table)
+    return plan.columns, tuple(sorted(dependencies.values()))
 
 
 def _body(query, parameters, columns, dependencies):
@@ -260,9 +280,9 @@ def _decode(name, body, digest):
 
 def _schema(tx):
     catalog = tx._database._catalog.catalog
-    if not catalog.has_table(_TABLE):
+    if not catalog.has_table(_TABLE, kind="node"):
         raise _refuse("not_prepared")
-    table = catalog.table(_TABLE)
+    table = catalog.table(_TABLE, kind="node")
     if table.kind != "node" or table.columns != _COLUMNS or table.primary_key != "name":
         raise _refuse("unexpected_schema")
     rows = tx.execute(
@@ -311,7 +331,7 @@ class LogicalViews:
         db = self._database
         with db.begin("write") as tx:
             with db._transactions.page_access_section(transaction=tx._context):
-                exists = db._catalog.catalog.has_table(_TABLE)
+                exists = db._catalog.catalog.has_table(_TABLE, kind="node")
                 if exists:
                     _schema(tx)
             if exists:

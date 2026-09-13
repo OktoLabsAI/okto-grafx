@@ -547,14 +547,15 @@ def test_a_lifted_refusal_before_the_proof_is_refused(
         False,
         None,
         healthy.built_through_lsn,
+        healthy.table_id,
     )
     calls: list[int] = []
 
-    def sometimes_lifted(self: Any, space_name: str) -> VectorIndexView:
+    def sometimes_lifted(self: Any, space_name: str, *, table_id=None) -> VectorIndexView:
         calls.append(1)
         if len(calls) > 1:
             return lifted
-        return original(self, space_name)
+        return original(self, space_name, table_id=table_id)
 
     monkeypatch.setattr(type(seeded.vectors), "index", sometimes_lifted)
     with pytest.raises(GrafxIndexError) as refused:
@@ -587,14 +588,15 @@ def test_the_door_refuses_to_report_ready_without_the_position_it_completed(
         False,
         None,
         None,
+        healthy.table_id,
     )
     calls: list[int] = []
 
-    def sometimes_silent(self: Any, space_name: str) -> VectorIndexView:
+    def sometimes_silent(self: Any, space_name: str, *, table_id=None) -> VectorIndexView:
         calls.append(1)
         if len(calls) > 1:
             return silent
-        return original(self, space_name)
+        return original(self, space_name, table_id=table_id)
 
     monkeypatch.setattr(type(seeded.vectors), "index", sometimes_silent)
     with pytest.raises(GrafxIndexError) as refused:
@@ -623,14 +625,15 @@ def test_the_door_refuses_to_report_ready_when_the_view_still_says_stale(
         True,
         "injected stale verdict",
         healthy.built_through_lsn,
+        healthy.table_id,
     )
     calls: list[int] = []
 
-    def sometimes_lying(self: Any, space_name: str) -> VectorIndexView:
+    def sometimes_lying(self: Any, space_name: str, *, table_id=None) -> VectorIndexView:
         calls.append(1)
         if len(calls) > 1:
             return lying
-        return original(self, space_name)
+        return original(self, space_name, table_id=table_id)
 
     monkeypatch.setattr(type(seeded.vectors), "index", sometimes_lying)
     with pytest.raises(GrafxIndexError) as refused:

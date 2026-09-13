@@ -274,10 +274,17 @@ def test_a_dollar_sign_with_no_name_is_refused() -> None:
     assert failure.value.details["field"] == "parameter"
 
 
-def test_a_parameter_may_not_start_with_a_digit() -> None:
+def test_a_digit_leading_alphanumeric_parameter_is_refused() -> None:
     with pytest.raises(GrafxParseError) as failure:
-        tokenize("$1")
+        tokenize("$1name")
     assert failure.value.details["field"] == "parameter"
+
+
+@pytest.mark.parametrize("name", ["0", "1", "001", "12345678901234567890"])
+def test_decimal_parameter_names_preserve_exact_spelling(name):
+    token = tokenize("$" + name)[0]
+    assert token.kind is TokenKind.PARAMETER
+    assert token.value == name
 
 
 def test_a_character_with_no_meaning_is_refused_with_its_position() -> None:

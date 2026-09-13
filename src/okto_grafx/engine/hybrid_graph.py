@@ -29,7 +29,7 @@ def select_incident_indexes(database: Database, table: str, options: HybridSearc
     selected = []
     missing = False
     for name in options.graph_relations:
-        relation = catalog.table(name)
+        relation = catalog.table(name, kind="rel")
         if relation.kind != "rel" or relation.from_table != table or relation.to_table != table:
             raise GrafxConfigurationError(
                 "Hybrid relations must join the target table to itself.", field="graph_relations",

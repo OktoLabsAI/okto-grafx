@@ -63,3 +63,19 @@ def test_unordered_lists_still_preserve_duplicates_and_entity_kinds():
 def test_nested_reference_literals_are_bounded():
     with pytest.raises(ValueError, match="nesting"):
         reference_value("[" * 130 + "0" + "]" * 130)
+
+
+@pytest.mark.parametrize("literal,value", [
+    ("'Foo\nFoo'", "Foo\nFoo"),
+    ('"a\r\nb"', "a\r\nb"),
+    ("['a\nb', '漢\r文']", ["a\nb", "漢\r文"]),
+    ("{'a\nb':'x\ny'}", {"a\nb":"x\ny"}),
+    (r"'a\\nb'", r"a\nb"),
+])
+def test_gherkin_unescaped_newlines_preserve_literal_values(literal, value):
+    assert reference_value(literal) == value
+
+
+def test_escaped_and_physical_newlines_still_detect_duplicate_map_keys():
+    with pytest.raises(ValueError, match="Duplicate"):
+        reference_value("{'a\\nb':1, 'a\nb':2}")

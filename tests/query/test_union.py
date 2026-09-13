@@ -792,7 +792,6 @@ def test_a_quoted_name_spelled_like_the_keyword_stays_a_name(database: object) -
         "MATCH (n:A) RETURN n.id UNION",
         "UNION MATCH (n:A) RETURN n.id",
         "MATCH (n:A) RETURN n.id UNION CREATE (:B {id: 'z'})",
-        "MATCH (n:A) RETURN n.id UNION MATCH (m:B) SET m.n = 1 RETURN m.id AS `n.id`",
     ),
 )
 def test_incomplete_syntax_and_semantically_invalid_unions_are_distinct(
@@ -880,7 +879,7 @@ FORGED: dict[str, UnionQuery] = {
         ),
         right=_branch("Doc", "m"),
     ),
-    "a branch that writes": UnionQuery(
+    "a writing branch with mismatched columns": UnionQuery(
         left=_branch("Person", "n"),
         right=parse("CREATE (:Doc {id: 'x'}) RETURN 1"),  # type: ignore[arg-type]
     ),

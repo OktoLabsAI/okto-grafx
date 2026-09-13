@@ -1,5 +1,59 @@
 # Logical read views
 
+## Independent namespaces (0.0.6 development)
+
+Views over a same-named node and relationship retain **both physical schema
+dependencies**. `ViewDefinition.dependencies` remains a sorted tuple of
+`(name, schema_hash)` pairs, but names may repeat across kinds: do not convert it
+to a name-keyed dictionary. Each schema hash includes the complete table definition,
+including kind and physical ID. The 64-dependency limit counts physical tables,
+not distinct spellings. Unique-name definitions retain their prior encoding.
+
+A change to either schema refuses with `stale_dependency`; ordinary data writes
+do not invalidate the definition. An older development definition that lost one
+homonymous dependency also refuses, even if its saved checksum is valid. Use
+`create(..., replace=True)` explicitly to validate and adopt a complete definition.
+No automatic rewrite occurs on reads, and no new metadata format or connection
+setting is introduced. The existing namespace capability fences unsupported old
+store participants. The registry itself always resolves the node
+`_grafx_views_v1`; a same-named relationship does not supply ownership authority.
+
+## Usage
+
+### Graph reads inside expressions (0.0.6 development)
+
+`EXISTS { ... }`, pattern predicates and pattern comprehensions participate in
+the same schema-dependency validation as outer MATCH clauses. This includes nested
+EXISTS, its optional RETURN and supported UNION bodies. For example:
+
+```python
+db.views.create(
+    "connected",
+    query="RETURN EXISTS { MATCH(n:Note)-[:Related]->(m:Note) } AS present",
+)
+assert db.views.execute("connected").columns == ("present",)
+```
+
+Every pattern inside a view still requires explicit node labels and relationship
+types, even inside expressions or returning read CALL subqueries. This is the
+view's stable-dependency contract, not a restriction on ordinary native queries.
+Anonymous endpoints can be written `(:Note)`; a correlated node can repeat its
+known label `(n:Note)`. Unlabelled patterns, untyped relationships, hidden writes,
+nondeterministic expressions and reserved `_grafx_` metadata reads refuse before
+the definition is stored. Literal/parameter text is never treated as query syntax.
+
+Dependencies include complete physical schemas for expression-only reads and all
+members of a named logical relationship group. Adding an unrelated table does
+not invalidate a view; adding an explicitly referenced previously absent table,
+changing either physical schema or growing a referenced relationship group does.
+The latter is conservative even when node labels exclude the group's new endpoint
+pair. A stored incomplete development definition refuses `stale_dependency` until
+explicit replacement. No checksum bypass, read-side rewrite or new format/config
+setting is introduced. The existing 64-physical-dependency limit applies across
+all scopes, with deduplication by table ID.
+
+### Basic example
+
 Grafx 0.0.6 adds persistent named read queries through `Database.views`. These are
 logical views, not materialized results. Import parameter declarations from
 `okto_grafx.views`; native types are `okto_grafx.domain.model.value.ValueType`.
@@ -36,8 +90,9 @@ with connect("graph") as db:
   OCC retry. `drop(name)` returns whether a definition was deleted; absent adds no commit.
 - Query text is <=64 KiB UTF-8. All node labels and relationship types must be
   explicit base tables. MATCH/RETURN, projections, aggregations and the existing
-  two-branch UNION subset are supported to the extent the native query planner supports them.
-- CALL, DDL, updates, reserved `_grafx_` metadata tables and nested view expansion
+  native UNION forms are supported to the extent the native query planner supports them.
+- Returning read CALL subqueries are supported with explicit dependencies; procedure
+  CALL, DDL, updates, reserved `_grafx_` metadata tables and nested view expansion
   are refused. Views cannot call themselves or each other. No new Cypher `SHOW VIEW`
   or view-as-table syntax is introduced; `get`/`list` provide typed introspection.
 - Declare exactly the query's parameters, at most 32, as an immutable tuple of

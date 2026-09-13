@@ -14,11 +14,22 @@ from types import MappingProxyType
 from typing import TypeAlias, Union
 
 from okto_grafx.domain.errors import GrafxConfigurationError
+from okto_grafx.domain.model.temporal_values import (
+    DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue,
+)
+from okto_grafx.domain.model.temporal_codec import encode_temporal_value, decode_temporal_value
+from okto_grafx.domain.model.decimal_codec import encode_decimal_value, decode_decimal_value
+from okto_grafx.domain.model.decimal_values import DecimalValue
+from okto_grafx.domain.model.decimal_interchange import decimal_json_value
+from okto_grafx.domain.model.temporal_interchange import temporal_json_value
 from okto_grafx.domain.model.value import (
     INT64_MAX, INT64_MIN, MAX_VALUE_DEPTH, MAX_VECTOR_DIMENSION, Timestamp, Uuid, VectorValue, encode_value,
 )
 from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
+from okto_grafx.domain.model.node_labels import validate_node_labels
 from okto_grafx.domain.query.limits import MAX_LIST_ELEMENTS, MAX_MAP_ENTRIES, MAX_QUERY_VALUE_CHARACTERS
+
+_TEMPORAL_TYPES = (DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue)
 
 
 def _refuse(field: str, reason: str) -> GrafxConfigurationError:
@@ -50,10 +61,16 @@ def _owned(value: object, depth: int, active: set[int]) -> object:
         return _text(value, "properties")
     if kind in (bytes, bytearray):
         return bytes(value)
+    if kind in _TEMPORAL_TYPES:
+        # Validate and detach every nested component even for a forged frozen DTO;
+        # never retain its children or reinterpret a recorded zone using new rules.
+        return decode_temporal_value(encode_temporal_value(value))[0]
     if kind is Timestamp:
         if type(value.micros) is not int:
             raise _refuse("properties", "timestamp")
         return Timestamp(value.micros)
+    if kind is DecimalValue:
+        return decode_decimal_value(encode_decimal_value(value))[0]
     if kind is Uuid:
         if type(value.raw) not in (bytes, bytearray):
             raise _refuse("properties", "uuid")
@@ -131,6 +148,10 @@ def _json_value(value: object) -> object:
     if kind is VectorValue:
         return {"type": "vector", "dtype": value.dtype, "space_ref": str(value.space_ref),
                 "components": list(value.values)}
+    if kind in _TEMPORAL_TYPES:
+        return temporal_json_value(value)
+    if kind is DecimalValue:
+        return decimal_json_value(value)
     if kind is tuple:
         return {"type": "list", "items": [_json_value(item) for item in value]}
     if kind is MappingProxyType:
@@ -143,23 +164,30 @@ class NodeValue:
     """One owned node observation; equality/hash use only qualified identity."""
 
     identity: EntityIdentity
-    label: str = field(compare=False)
+    label: str | None = field(compare=False)
     properties: Mapping[str, object] = field(compare=False, hash=False)
     provenance: EntityProvenance = field(compare=False)
+    node_labels: tuple[str, ...] | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         _metadata(self.identity, self.provenance, "node")
-        _text(self.label, "label", nonempty=True)
+        if self.label is not None:
+            _text(self.label, "label", nonempty=True)
+        if self.node_labels is not None:
+            validate_node_labels(self.node_labels)
+            if self.label != (self.node_labels[0] if self.node_labels else None):
+                raise _refuse("label", "not_first_canonical_label")
         object.__setattr__(self, "properties", _properties(self.properties))
 
     @property
     def labels(self) -> tuple[str, ...]:
-        """Typed tables supply one label; this does not introduce multi-label storage."""
-        return (self.label,)
+        """Return the actual label set, including an empty set for unlabeled nodes."""
+        return self.node_labels if self.node_labels is not None else (() if self.label is None else (self.label,))
 
     def to_dict(self) -> dict[str, object]:
         """Detach JSON-safe data; neither the DTO nor its serialization is authority."""
         return {"format": "grafx.node.v1", "identity": self.identity.to_dict(), "label": self.label,
+                "labels": list(self.labels),
                 "properties": {key: _json_value(item) for key, item in self.properties.items()},
                 "provenance": self.provenance.to_dict()}
 
@@ -188,6 +216,7 @@ class RelationshipValue:
         object.__setattr__(self, "properties", _properties(self.properties))
 
     def to_dict(self) -> dict[str, object]:
+        """Export a detached relationship with qualified identities and JSON-safe properties."""
         return {"format": "grafx.relationship.v1", "identity": self.identity.to_dict(), "label": self.label,
                 "source": self.source.to_dict(), "target": self.target.to_dict(),
                 "properties": {key: _json_value(item) for key, item in self.properties.items()},
@@ -230,12 +259,22 @@ class PathValue:
         return len(self.relationships)
 
     def to_dict(self) -> dict[str, object]:
+        """Export ordered detached path nodes and relationships as versioned dictionaries."""
         return {"format": "grafx.path.v1", "nodes": [node.to_dict() for node in self.nodes],
                 "relationships": [rel.to_dict() for rel in self.relationships]}
 
 
 QueryValue: TypeAlias = Union[
-    None, bool, int, float, str, bytes, Timestamp, Uuid, VectorValue,
+    None, bool, int, float, str, bytes, Timestamp, Uuid, VectorValue, DecimalValue,
+    DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue,
     NodeValue, RelationshipValue, PathValue, tuple["QueryValue", ...], dict["QueryValue", "QueryValue"],
 ]
 """Result-only values; the stored/parameter Value grammar does not admit entities."""
+
+
+__all__ = [
+    'NodeValue',
+    'RelationshipValue',
+    'PathValue',
+    'QueryValue',
+]

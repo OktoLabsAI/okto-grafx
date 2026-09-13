@@ -1,5 +1,273 @@
 # Feature comparison: Okto Grafx, Ladybug and Neo4j
 
+## Latest development evidence
+
+The complete [native V3 query execution](reports/FP_V3_INTEGRATED_QUERY_QUALIFICATION.md)
+passes **all 3,896 required cases**, with one explicit upstream divergence for
+retained lists of maps and zero unexecuted cases. Native multiple labels now
+include CREATE/MERGE, SET/REMOVE, exact membership, stable identities, history,
+copy and transfer/resume. The [installed label-format matrix](reports/FP_NODE_LABEL_WHEEL_QUALIFICATION.md)
+passes 36 native scenarios and 36 transfer worker checks.
+
+This is development evidence, not a released version, full TCK conformance or
+proof of matching every Ladybug/Neo4j feature. The [final repository regression](reports/FP_FINAL_NATIVE_QUALIFICATION.md)
+passes 25,077 tests with 19 attributed skips; all 20 mapped native supplemental
+contracts pass. [Final installed Pulse qualification](reports/FP_FINAL_PULSE_QUALIFICATION.md)
+also passes its exercised API/UI/MCP flows. Neo4j execution was explicitly deferred
+by the user and is not a current delivery gate or an observed pass. The
+chronological increments below preserve their original scope; later qualifications
+supersede their former implementation-pending statements.
+
+The subsequent [bounded Ladybug 0.20.3 execution](reports/FP_BOUNDED_LADYBUG_COMPARISON.md)
+records 16 actual scenarios: seven matching observations and nine explicit dialect,
+result or admission differences, with zero unavailable cases. Grafx's existing
+final installed candidate matches all 16 independent expected results. Neo4j execution
+is deferred; this is not a full-product
+parity or performance claim. [Installed Pulse operational evidence](reports/FP_PULSE_OPERATIONAL_QUALIFICATION.md)
+also covers source lifecycle, Settings/schema, API/MCP/search UI and native recovery.
+
+## Development increments and their original scope
+
+Grafx development now includes native `EXISTS { ... }` read subqueries with
+implicit correlations, non-exporting scopes, optional RETURN, aggregation, UNION
+and nesting. All 10 pinned original existential cases pass. This narrows the
+subquery gap; it is not general Cypher/Neo4j parity. [Grafx contract and qualification](specs/EXISTS_SUBQUERIES_V1.md),
+[Neo4j semantic reference](https://neo4j.com/docs/cypher-manual/current/subqueries/existential/).
+
+Grafx logical views now capture schema dependencies inside EXISTS, pattern
+predicates/comprehensions and nested reads, retaining both physical kinds when
+names overlap. Their explicit-label/type policy applies in those scopes too;
+ordinary native expressions are unchanged. This is consumer-integrity coverage,
+not an additional Cypher-parity claim. [Qualification](reports/VIEW_EXPRESSION_DEPENDENCY_QUALIFICATION.md).
+
+Large consecutive CREATE queries now run as an iterative native program, retaining
+dependencies and a single atomic statement. Both original large-CREATE scenarios
+pass; the CREATE family has 76 passes and only two retained multiple-label
+divergences. This is bounded source admission, not unlimited queries or full
+mutation parity. [Contract](specs/WRITE_PATTERN_CONTRACTS_V1.md#large-create-pipelines).
+
+CREATE and supported MERGE patterns now expose native named paths. Explicit
+binding/null-pattern errors and mutation-to-MERGE read phases are qualified in
+the current development line. Bound-edge undirected MERGE and native
+`startNode()`/`endNode()` are now implemented. Unbound/fixed multi-hop MERGE now
+matches the entire path or creates every unbound entity. Label actions were added
+by the later [native-label increment](specs/NODE_LABELS_V1.md).
+[General MERGE contract and evidence](specs/GENERAL_MERGE_V1.md).
+
+Native expression/path DELETE now passes all 41 original DELETE cases, including
+list/map selectors, null paths, repeated identities and error contracts. It uses
+bounded input preparation and outer-statement rollback; this closes the earlier
+expression-DELETE gap, not full mutation parity.
+[Contract and evidence](specs/DELETE_EXPRESSIONS_V1.md).
+
+Native conditional MERGE property actions now support `ON CREATE SET` and
+`ON MATCH SET`, including every matching bound-edge instance and outer-statement
+rollback. Whole-map replacement/overlay from maps/native entity properties is
+also implemented ([contract](specs/SET_PROPERTY_MAPS_V1.md)). Label actions are
+covered by the later native-label increment; general fixed-length MERGE is implemented,
+not a claim of all vendor-specific MERGE/Cypher behavior.
+[Evidence](specs/GENERAL_MERGE_V1.md).
+
+Independent node labels and relationship types with the same spelling now work
+in native queries and catalog v2, together with `r:TYPE` predicates. All 528
+required FP-3 query cases pass without fixture adaptation. Qualified copy/logical
+transfer/resume, history and full-text index ownership now preserve overlapping
+names. Hybrid search and 24 installed catalog/WAL admission cases also pass.
+Subsequent vector ownership, durable naming and explicit missing-index repair are
+qualified separately; projection capture, logical-view schema dependencies and
+metadata ledgers now distinguish both physical kinds as well. See the
+[consumer evidence](reports/NAMESPACE_PROJECTION_VIEW_MIGRATION_QUALIFICATION.md).
+Remaining consumer, Pulse and full-package qualification stays open; this is not a claim
+of full Cypher or product parity. [Contract and evidence](specs/GRAPH_NAMESPACES_V1.md).
+
+The latest property-access increment adds native `keys(node|relationship)`, dynamic
+entity string-key reads and property `REMOVE` using the existing atomic SET path.
+SET/REMOVE label changes and the remaining frozen-profile failures
+are not covered by that claim. [Usage and limits](QUERY_LANGUAGE.md#dynamic-entity-properties-and-property-removal).
+
+The current development increment adds returning and unit writing subqueries,
+explicit/all-name persistent imports and branch-local leading-WITH imports, with
+one outer statement rollback boundary. This closes the earlier blanket
+writing-subquery exclusion. Updating/unit UNION branches now share ordered private
+effects and statement rollback. This is not complete CALL parity or installed-Pulse
+qualification. A subsequent [writing callback increment](specs/WRITING_PROCEDURES_V1.md)
+adds explicit same-transaction, result-free DML on declared models, revocable
+authority and shared budgets. Subsequent native signature/nesting increments are
+described below; bounded schema authority is now added, not complete procedure parity.
+The subsequent [native procedure value contract](specs/PROCEDURE_NATIVE_VALUES_V1.md)
+adds temporal/DECIMAL, LIST/MAP/ANY and vector signatures with owned copies, recursive
+budgets and native persistence/recovery. [Entity procedure signatures](specs/PROCEDURE_ENTITY_SIGNATURES_V1.md)
+now restore native identity from invocation-scoped observations, including paths
+and typed entity lists. Broader procedure capabilities and parameterized stored
+collections/DECIMAL still remain distinct gaps. The later native DECIMAL storage
+increment adds typed columns, native parameters/results and durable admission,
+followed by native arithmetic/casts/aggregates, exact numeric grouping/order and
+typed equality-index seeks and [qualified history/copy/logical transfer](reports/FP6_DECIMAL_CONSUMER_QUALIFICATION.md).
+Tagged CLI/local imports and DECIMAL/NUMBER procedures are also implemented;
+[exact decimal128 Arrow/Pandas/Polars/Parquet](EXTENSIONS_AND_ARROW.md#exact-native-decimals-006-development)
+now preserve p/s with explicit descriptors, mandatory metadata and atomic native
+imports. Decimal ordered indexes remain unsupported. The combined native type
+package now has [installed-reader qualification](reports/FP6_TYPE_WHEEL_QUALIFICATION.md);
+[scope and evidence](specs/DECIMAL_VALUES_V1.md#native-storage-contract-development).
+The development [typed-collection increment](specs/TYPED_COLLECTIONS_V1.md) adds
+native LIST/MAP element declarations, fixed ARRAY lengths and named STRUCT fields,
+with nested nullability, public schema descriptors and catalog capability fencing.
+Native history/copy/transfer and CLI preserve this metadata, with
+[local grouped qualification](reports/FP6_TYPED_COLLECTION_NATIVE_QUALIFICATION.md).
+The subsequent [exact JSON/CSV/JSONL/SQLite collection transport](COLLECTION_JSON.md)
+preserves full descriptors, native leaf precision and heterogeneous map identity,
+with bounded input and atomic imports. [Qualification](reports/FP6_TYPED_COLLECTION_TEXT_QUALIFICATION.md).
+The following [columnar collection integration](COLLECTION_COLUMNAR.md) supports
+Arrow/Pandas/Polars/Parquet with exact descriptors, typed nested values and
+whole-call rollback. The [type support matrix](TYPE_SUPPORT.md) distinguishes
+supported consumers and explicit refusals; the installed native-reader checkpoint
+is qualified separately. This is not a claim of full nested-type interoperability
+or Cypher parity. [Active V3](conformance/PROFILE_V3.md) requires multiple labels
+and records Set1 #0010 as a deliberate divergence because native lists of maps
+remain supported. The later native-label implementation and its current complete
+query-profile result are recorded at the top of this comparison.
+The latest [native query authority](specs/PROCEDURE_QUERY_AUTHORITY_V1.md) supplies
+permissioned same-transaction readers and returning writer queries, bounded native
+results, shared snapshot/clocks/cancellation and rollback. [Recursive registered
+procedures and effect declarations](specs/PROCEDURE_NESTING_EFFECTS_V1.md) now add
+inherited call depth, shared root budgets and explicit default-volatile callback
+determinism. [Native schema authority](specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md) adds
+permissioned CREATE DDL, flexible schema and catalog-v2 index/DML composition; this is not
+full Neo4j procedure compatibility or an installed-Pulse qualification.
+[Updating UNION](COMPOSABLE_QUERIES.md#updating-union-branches),
+[Import scopes](COMPOSABLE_QUERIES.md#subquery-import-scopes),
+[native contract](COMPOSABLE_QUERIES.md#native-writing-and-unit-subqueries)
+and [supplemental profile](specs/WRITE_SUBQUERIES_V1.md).
+
+The development line now also stores heterogeneous node/edge properties through
+native `ANY` columns, retaining concrete scalar/list/map types across updates and
+logical transfer. Native unlabeled node creation and dynamic property maps now
+extend that foundation, along with automatic flexible relationship types and
+transactional endpoint-pair growth. Multiple labels were subsequently implemented;
+unrestricted mixed-type property indexes are not claimed.
+[ANY contract](architecture/HETEROGENEOUS_PROPERTIES_V1.md)
+and [unlabeled node contract](architecture/FLEXIBLE_GRAPH_V1.md).
+
+Re-matching a bound relationship now preserves its full identity through
+MATCH/OPTIONAL and named path segments. The original path-count and duplicate
+relationship-variable reference cases pass; the wider required MATCH/MATCH-WHERE
+selection, after native map, spelling, interval, expression-binding and node-MERGE
+support, has 363 required passes, no execution failures and one fixture blocker,
+so this is not complete
+path/language parity. See [current native evidence](conformance/FP3_PROGRESS.md).
+
+Relationship property maps now compose with typed/untyped MATCH, OPTIONAL,
+paths, predicates and comprehensions. A range map constrains every edge, with
+vacuous truth at zero hops; no new schema-free storage or index promise is
+implied. See [syntax and costs](QUERY_LANGUAGE.md#inline-relationship-property-maps).
+
+Inverted explicit hop intervals now represent empty matches instead of parse
+errors, while zero-hop paths remain distinct. Bounds outside `0..30` still
+refuse; no omitted-upper truncation policy was added. These changes close three
+positive interval cases and two malformed-range error cases, not all path parity.
+
+Read arrows accept the bidirectional spelling `<-->` with existing undirected
+semantics, and type alternatives accept `:R|:S` as well as `:R|S`. This improves
+source-query compatibility without changing stored relationship direction or
+making ambiguous CREATE/MERGE writes legal. See [canonical interpretation](QUERY_LANGUAGE.md#read-arrows-and-type-alternatives).
+
+WITH can retain same-kind coalesce/CASE entity results and ordered relationship
+lists as native graph bindings for later MATCH. This closes four recorded cases
+without treating scalar/map expressions as graph authority. General expression
+provenance and the remaining fixture cases are not declared complete. See
+[binding semantics](COMPOSABLE_QUERIES.md#clause-order-and-scope).
+
+Standalone node MERGE now preserves all matches per input instead of selecting
+one row. Unlabeled searches preserve qualified identities across tables, but a
+no-match creation still requires a typed label and otherwise refuses atomically.
+This closes Match8 #0002 with its original query/expectation; it does not claim
+full MERGE compatibility. Runtime-bound writes are described below. See
+[matching and creation](QUERY_LANGUAGE.md#node-merge-matching-and-creation).
+
+Polymorphic property reads now preserve different per-row scalar families across
+node/relationship tables, including comparison/NULL and lazy scalar semantics.
+This removes a query-level refusal, not the typed-storage boundary. All 26
+required MATCH/WHERE cases pass (two original, 24 with declared schema adaptation).
+See [property semantics](QUERY_LANGUAGE.md#heterogeneous-properties-across-tables)
+and the [FP-3 progress record](conformance/FP3_PROGRESS.md).
+
+Native node-label predicates (`n:Label`, conjunctive labels, NULL and composed
+node expressions) are implemented in the 0.0.6 development line. Grafx supports
+unlabeled nodes or one table label per node; this is not parity with multi-label
+storage or label mutation. See [exact contract](QUERY_LANGUAGE.md#node-label-predicates).
+
+Native existential WHERE pattern predicates now cover scoped bound-node/edge
+references, directions and bounded ranges, NULL semantics and shared read/write
+snapshot visibility. All 39 pinned Pattern1 cases pass (19 original, 20 explicitly
+typed-fixture-adapted). Native pattern comprehensions now execute as scoped list
+projections; the five required Pattern2 cases pass with explicit fixture-schema
+adaptation, not as original upstream passes. This is not full Cypher
+parity; [comprehensions](QUERY_LANGUAGE.md#pattern-comprehensions),
+[predicate semantics](QUERY_LANGUAGE.md#existential-pattern-predicates) and
+[scoped regression evidence](conformance/FP3_PROGRESS.md) identify the boundaries.
+
+FP-3 development update: Grafx now has native logical relationship groups over
+declared endpoint-table pairs, atomic group DDL, logical edge/path type results
+and statically or runtime-resolved member writes. The formerly blocked Path2 endpoint-pair
+cases pass with explicitly recorded typed-schema adaptation. This narrows the
+typed-relationship expressiveness gap without changing the single-label node
+model or establishing full Cypher parity. Bound SET/DELETE uses each actual row's
+schema; relationship creation resolves an exact candidate member and retains
+endpoint identity/OCC proofs. Group-wide
+schema evolution and broader projection integration remain
+pending. Bounded existing-target copy now preserves typed groups over keyed nodes,
+with logical-name/endpoint-pair resolution and atomic receipts.
+Fresh-store logical transfer now preserves typed/flexible groups and maps
+through versioned artifacts and qualified endpoint remapping. Opt-in retained
+history also preserves model flags/logical types through scan/index reads and
+backup, with a separate capability fencing older writers.
+[Native contract](QUERY_LANGUAGE.md#relationship-types-spanning-endpoint-tables)
+and [working evidence](conformance/FP3_PROGRESS.md). No new competitor execution
+or benchmark is claimed by this update.
+
+Native `RETURN *` expands visible variables through existing projection, UNION
+and returning read-subquery operators, preserving detached entity/path identity.
+That scalar increment does not establish complete Cypher conformance; subsequent
+native writing-call support is tracked in the current contract above.
+[Projection contract](QUERY_LANGUAGE.md#returning-the-visible-scope).
+
+Row windows accept row-independent scalar expressions, not just literal counts or
+parameters, with per-invocation evaluation and explicit type/negative errors.
+The 31 original RETURN window cases and all 9 WITH window cases pass. Plain WITH
+ordering now reads source-only bindings temporarily without leaking them into
+downstream scope; the wider ordering family remains incomplete. General expressions retain canonical execution instead of duplicated
+top-K evaluation. [Window contract](QUERY_LANGUAGE.md#row-independent-skip-and-limit-expressions).
+
+Native exact percentileDisc/percentileCont support DISTINCT/grouped samples and
+bounded external sorting. The 35 original aggregation-expression cases pass;
+this does not imply every aggregate or temporal function is implemented.
+[Percentile contract](QUERY_LANGUAGE.md#percentile-aggregates).
+
+RETURN aliases work inside sort expressions/property access, including shadowing.
+Native grouping ambiguity and nested-aggregate errors have explicit evidence;
+WithOrderBy4 passes all 20 original cases. Return6 now passes all 21: direct
+volatile aggregate arguments refuse, while WITH materialization retains random
+aggregation. [Contract and migration](QUERY_LANGUAGE.md#stable-aggregate-arguments-and-volatile-row-values).
+
+WITH DISTINCT/grouped modifiers reuse exactly projected subexpressions and
+aggregate results. Plain attached WHERE may read unexported source bindings only
+until that stage ends; all 19 original WITH-WHERE scenarios pass. This does not
+establish full aggregate-ordering or temporal parity.
+
+Live property/label access after owner deletion now refuses with native runtime
+evidence and whole-instruction rollback; all 18 original Return2 cases pass in
+the focused run. Counts, immutable relationship type and detached observations
+are preserved. [Deletion contract](QUERY_LANGUAGE.md#content-access-after-deletion).
+This is a semantic correction, not a new competitor benchmark or parity claim.
+
+Native implicit single-label creation, label-free nodes and heterogeneous persisted properties are implemented
+parts of the broader model expansion. Automatic relationship creation now closes
+the original Match4 #0004 without fixture adaptation. Existing-target copy now
+preserves flexible/no-PK entity multiplicity and topology through native target
+bindings and atomic receipts; installed-Pulse qualification remains pending.
+See the [copy identity contract](CATALOG_COPY.md#flexible-and-no-pk-entity-identity)
+and [expanded scope](specs/FUNCTIONAL_PARITY_PLAN.md#authorized-model-expansion-label-free-nodes-and-heterogeneous-properties).
+
 [Project README](../README.md) · [Documentation](README.md) · [Roadmap](../ROADMAP.md)
 
 Reviewed September 10, 2026. This is a capability and integration comparison,
@@ -85,11 +353,11 @@ relationship schema; aliases, optional nulls, UNION and aggregates preserve thei
 qualified identities. This development increment is not a published release or
 new competitor execution result.
 
-Native `properties()`, `labels()` and `type()` now expose property maps, the
-single declared node label and the physical relationship type, including NULL,
-polymorphic/UNION/path composition and owner writes. Graph-function typing keeps
-runtime checks lazy. This narrows the function gap but does not provide arbitrary
-multiple labels, absent-table pattern semantics or full graph-function parity.
+Native `properties()`, `labels()` and `type()` expose property maps, the current
+node-label set and relationship type, including NULL, polymorphic/UNION/path
+composition and owner writes. Graph-function typing keeps runtime checks lazy.
+The subsequent complete V3 execution covers the original graph-function cases;
+vendor-specific extensions and final integrated consumer qualification remain distinct.
 
 | Product | Baseline and evidence |
 | --- | --- |
@@ -165,9 +433,9 @@ not the same deployment model or isolation contract as Grafx.
 
 | Capability | Grafx 0.0.6 development | Ladybug | Neo4j |
 | --- | --- | --- | --- |
-| Property graph/schema | Typed node/relationship tables, declared endpoints and primary keys. [Query reference](QUERY_LANGUAGE.md). | Structured property graph with typed tables. [Overview](https://docs.ladybugdb.com/). | Labels/types and property graphs with configurable constraints. [Constraints](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
-| Query language | Typed tables and a bounded language, not full Cypher. The validated 0.0.6 development round adds ordered clauses, correlated typed `OPTIONAL MATCH`, up to 64 `UNION`/`UNION ALL` branches, returning read subqueries, native scalar/list families and trusted typed `CALL/YIELD`. The complete local Grafx regression passed; this does not establish full TCK conformance. No arbitrary graph-writing callbacks. [Exact surface](QUERY_LANGUAGE.md), [fixed compatibility contract](CYPHER_COMPATIBILITY.md). | Cypher surface includes subqueries and macros beyond Grafx's closed subset. [Macros](https://docs.ladybugdb.com/cypher/macro/). | Broad Cypher language and procedure ecosystem; queries still need dialect/version validation. [Cypher manual](https://neo4j.com/docs/cypher-manual/current/). |
-| Stored value breadth | INT64, DOUBLE, STRING, BOOL, BLOB, UUID, TIMESTAMP and declared vectors. Query lists/maps do not imply general nested-column support. [Types](QUERY_LANGUAGE.md#values-and-python-mapping). | Additional integer widths, DECIMAL, DATE/INTERVAL and nested LIST/ARRAY/STRUCT/MAP/UNION families. [Types](https://docs.ladybugdb.com/cypher/data-types/). | A different property/constraint model; do not port typed table DDL unchanged. [Schema](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
+| Property graph/schema | Explicit typed tables/constraints and flexible schema-free nodes/relationships with native heterogeneous properties. Nodes may have zero, one or multiple versioned labels on one stable identity; labels do not remove physical typed constraints. [Query reference](QUERY_LANGUAGE.md), [native labels](specs/NODE_LABELS_V1.md). | Structured property graph with typed tables. [Overview](https://docs.ladybugdb.com/). | Labels/types and property graphs with configurable constraints. [Constraints](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
+| Query language | Typed and flexible graph models with a bounded language, not full Cypher. Current 0.0.6 development includes ordered clauses, correlated `OPTIONAL MATCH`, up to 64 read/write or unit `UNION`/`UNION ALL` branches, returning/unit writing subqueries, explicit/wildcard/leading-WITH imports, native scalar/list/temporal families and trusted typed `CALL/YIELD`. Callbacks can receive explicit transaction-scoped native read/write/schema authority, not unrestricted database handles. Native branch effects share statement rollback; the complete native regression and separate installed-Pulse checks are qualified, not full TCK conformance. [Exact surface](QUERY_LANGUAGE.md), [fixed compatibility contract](CYPHER_COMPATIBILITY.md). | Cypher dialect; the pinned 0.20.3 run refused several scoped CALL forms accepted by Grafx. Do not assume either dialect is a superset from a feature checkbox. [Actual bounded observations](reports/FP_BOUNDED_LADYBUG_COMPARISON.md). | Broad Cypher language and procedure ecosystem; queries still need dialect/version validation. [Cypher manual](https://neo4j.com/docs/cypher-manual/current/). |
+| Stored value breadth | INT64, DOUBLE, STRING, BOOL, BLOB, UUID, TIMESTAMP, vectors, native temporal families and DECIMAL(p,s). ANY retains nested values. Temporal constructors/clocks, arithmetic and row persistence are implemented. Native DECIMAL has explicit casts, basic arithmetic, SUM/AVG/MIN/MAX, exact comparisons/grouping/order, typed equality-index seeks, history/copy/logical transfer, CLI/local imports, native procedures and exact decimal128 Arrow/Pandas/Polars/Parquet. Typed LIST/MAP/ARRAY/STRUCT descriptors, DDL/catalog, native consumers, exact JSON/CSV/JSONL/SQLite and Arrow/Pandas/Polars/Parquet are implemented with local qualification; [combined installed-reader qualification](reports/FP6_TYPE_WHEEL_QUALIFICATION.md) is recorded separately from final profile/Pulse acceptance. [Types](QUERY_LANGUAGE.md#values-and-python-mapping), [temporal](TEMPORAL_VALUES.md), [decimal scope](specs/DECIMAL_VALUES_V1.md). | Additional integer widths, DECIMAL, DATE/INTERVAL and nested LIST/ARRAY/STRUCT/MAP/UNION families. [Types](https://docs.ladybugdb.com/cypher/data-types/). | A different property/constraint model; do not port typed table DDL unchanged. [Schema](https://neo4j.com/docs/cypher-manual/current/schema/constraints/). |
 | Scalar/structural indexes | PK, endpoint and identity indexes; custom equality/hash and ordered indexes; optional repeated-key `posting_hash`, explicit sizing and maintenance. [Indexes](INDEXES_AND_VECTORS.md), [posting hash](POSTING_HASH.md). | PK hash/ART indexes and automatic column zone maps; not an identical secondary-index API. [Indexes](https://docs.ladybugdb.com/cypher/indexes/). | Range, text, point and token-lookup indexes, with planner integration. [Index families](https://neo4j.com/docs/cypher-manual/current/indexes/search-performance-indexes/). |
 | Bulk and streamed consumption | Atomic `executemany`, bounded physical scans, cursor ownership and typed batch import/export. [Integration](INTEGRATION.md). | `COPY FROM` and Python data-frame interoperability. [Python](https://docs.ladybugdb.com/client-apis/python/). | Driver transactions/results and server import tooling; boundaries differ from an embedded transaction. [Python driver](https://neo4j.com/docs/python-manual/current/). |
 | Multiple stores/federation | Attached `CatalogSession`, explicit alias/permission/workspace resolution and single-store transactions; no cross-store joins, edges or distributed COMMIT. [Catalogs](CATALOGS_AND_WORKSPACES.md). | `ATTACH`/`DETACH`; external systems through extensions. No cross-store atomicity equivalence is asserted. [Attach](https://docs.ladybugdb.com/cypher/attach/). | Additional databases/composite databases are EE features, not direct attachment of Grafx/Ladybug files. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
@@ -230,7 +498,7 @@ customer outcomes or new engine guarantees.
 | Posting-hash indexes | Share repeated property keys per physical page and bound repeated-key decoding. | Opt-in index layout; preserves WAL/OCC/verification. Not a universal throughput or write-amplification improvement. [Posting hash](POSTING_HASH.md). |
 | CLI inventories and text/vector/hybrid search | Inspect local schemas, indexes, catalogs and bounded search results from scripts. | Machine-readable local CLI; JS/TS subprocess recipe is not a native network driver. [CLI](CLI.md). |
 | Local SQLite ingestion and offline HTML snapshots | Bring data from a closed local SQLite source into Grafx and inspect/export a graph picture. | Bounded whole-call atomic staging; script-free static HTML, not an interactive graph console. [SQLite](LOCAL_SQLITE_IMPORT.md), [HTML](HTML_SNAPSHOTS.md). |
-| Scalar functions, UNION ALL and topological ordering | Normalize values, preserve duplicate rows across branches and examine directed dependency order. | The validated development language round broadens native functions/list expressions and supports up to 64 read branches with identical ordered column names. Topological results explicitly report blocked nodes when cycles prevent a full order. [Queries](QUERY_LANGUAGE.md), [algorithms](GRAPH_PROJECTIONS.md). |
+| Scalar functions, UNION ALL and topological ordering | Normalize values, preserve duplicate rows across branches and examine directed dependency order. | Native functions/list expressions and up to 64 read/write returning branches with identical ordered column names, or all-unit writing branches. Branches share ordered private effects and rollback. Topological results explicitly report blocked nodes when cycles prevent a full order. [Queries](QUERY_LANGUAGE.md), [algorithms](GRAPH_PROJECTIONS.md). |
 
 ### Competitor interpretation of these additions
 

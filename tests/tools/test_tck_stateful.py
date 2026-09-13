@@ -9,6 +9,28 @@ from tools.tck_stateful import GraphState, ObservedError, QueryObservation, run_
 from tools.tck_native import NativeScenarioBackend
 
 
+def test_native_snapshot_observes_membership_not_physical_table_names(monkeypatch):
+    backend = NativeScenarioBackend()
+    try:
+        backend.admit({"steps": []})
+        assert backend.setup("CREATE (:A:B {id:1}), (:B:A {id:2}), (n:C) REMOVE n:C", {}).error is None
+        before = backend.snapshot()
+        assert len(before.nodes) == 3
+        assert before.labels == ("A", "B")
+        assert backend.setup("MATCH (n:B) REMOVE n:A", {}).error is None
+        expected = backend.snapshot()
+        assert len(expected.nodes) == 3 and expected.labels == ("B",)
+        backend.reopen()
+
+        def no_queries(*args, **kwargs):
+            raise AssertionError("The state oracle must use physical scans, not execute queries")
+
+        monkeypatch.setattr(type(backend.database), "execute", no_queries)
+        assert backend.snapshot() == expected
+    finally:
+        backend.close()
+
+
 def test_native_entity_results_use_independent_reference_values_not_entity_equality():
     from okto_grafx import EntityIdentity, EntityProvenance, NodeValue, RelationshipValue
     from tools.tck_native import _reference_result_value

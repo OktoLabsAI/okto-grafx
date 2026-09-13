@@ -2,6 +2,33 @@
 
 Implementation contract for approved continuation item 3 (GX-CAP-2).
 
+This original v1 contract is extended by the [current typed-group contract](../CATALOG_COPY.md#typed-logical-relationship-groups):
+selected physical members carry logical names, grouped package hashes use domain
+v2, and target member names/IDs may differ when logical name, endpoint pair and
+property schema agree. The native receipt protocol remains v1. The consumption
+guide also specifies the subsequently implemented explicit skip policy.
+The later [flexible/no-PK extension](../CATALOG_COPY.md#flexible-and-no-pk-entity-identity)
+supersedes this original slice's PK-only limitation: it uses native node bindings
+and target endpoint remapping with no equality-based deduplication of no-PK nodes.
+The [independent graph namespaces extension](GRAPH_NAMESPACES_V1.md) further
+permits qualified `(kind, name)` selectors, node-only endpoint closure and both
+kinds sharing a spelling. Overlapping selected schemas use digest domain
+`grafx-copy-package-v3`; the atomic receipt publication protocol remains unchanged.
+
+The [native DECIMAL extension](../CATALOG_COPY.md#native-decimal-declarations)
+includes precision and scale in decimal column shape/digest inputs. Other column
+shapes and the existing v1/v2/v3 domain selection stay unchanged. Stored decimal
+frames must match their declarations exactly; copy does not rescale them. The
+target schema check includes both parameters even when the package has no rows.
+
+The subsequent [native label extension](../CATALOG_COPY.md#native-node-label-membership)
+uses package domain v4 when needed, with bounded GXL1-prefixed node row frames and
+candidate-schema digest binding. Target physical schemas still preexist; native
+label candidate admission joins data and receipt in their single transaction.
+`skip` resolves physical PK ownership and preserves existing properties/labels.
+This supersedes the original v1's bare-tuple/implicit-label-only execution, not its
+receipt schema, provenance proof, bounds or durability/concurrency guarantees.
+
 ## Scope and authority
 
 Capture an explicit set of complete tables in one source read snapshot, within

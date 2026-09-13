@@ -17,7 +17,8 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxPlanError
+from okto_grafx.domain.errors import GrafxPlanError, GrafxTransactionStateError
+from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.query.analysis import Binding, QueryAnalysis, analyze
 from okto_grafx.domain.query.ast import (
     Direction,
@@ -233,51 +234,58 @@ def test_the_owner_sees_the_edge_it_staged_and_a_rollback_removes_it(
     assert database.execute(I01).rows == (("canonical", "rule-1"),)
 
 
-# --- the shapes that keep the refusal they had ------------------------------------------------
+# --- expanded FP-3 forms preserve exact rows and typed boundaries -------------------------------
 
 
 @pytest.mark.parametrize(
-    "query",
+    "query,expected",
     [
-        "MATCH (a)<-[r:R]-(b) RETURN r.layer",
-        "MATCH (a)-[r:R]-(b) RETURN r.layer",
-        "MATCH (a)-[r:R]->() RETURN r.layer",
-        "MATCH (a)-[r]->(b) RETURN a.id",
-        "MATCH (a {id: 'a1'})-[r:R]->(b) RETURN r.layer",
-        "MATCH (a)-[r:R]->(b {id: 'b1'}) RETURN r.layer",
-        "MATCH (a)-[r:R*1..2]->(b) RETURN a.id",
-        "MATCH (a)-[r:R]->(b) SET a.kind_of = 'z'",
-        "MATCH (a)-[r:R]->(b) DELETE r",
-        "MATCH (a)-[r:R]->(b) WITH r RETURN r.layer",
-        "MATCH (a)-[r:R]->(b), (c:A) RETURN r.layer",
-        "MATCH (a)-[r:R]->(b) MATCH (c:A) RETURN r.layer",
-        "MATCH (a)-[:R]->(b) RETURN a.id",
-        "MATCH (a)-[r:R]->(b:B) RETURN r.layer",
-        "MATCH (a)-[r:R]->(b)-[q:R]->(c) RETURN r.layer",
-        "MATCH (a)-[r:R*1..1]->(b) RETURN r.layer",
-        "MATCH ()-[r:R]->(b) RETURN r.layer",
-        "MATCH (a)-[r:R {layer: 'canonical'}]->(b) RETURN r.layer",
-        "MATCH (a)-[r:R|Q]->(b) RETURN r.layer",
+        ("MATCH (a)<-[r:R]-(b) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R]-(b) RETURN r.layer", (("canonical",), ("canonical",))),
+        ("MATCH (a)-[r:R]->() RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r]->(b) RETURN a.id", (("a1",),)),
+        ("MATCH (a {id: 'a1'})-[r:R]->(b) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R]->(b {id: 'b1'}) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R*1..2]->(b) RETURN a.id", (("a1",),)),
+        ("MATCH (a)-[r:R]->(b) WITH r RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R]->(b), (c:A) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R]->(b) MATCH (c:A) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[:R]->(b) RETURN a.id", (("a1",),)),
+        ("MATCH (a)-[r:R]->(b:B) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R]->(b)-[q:R]->(c) RETURN r.layer", ()),
+        ("MATCH ()-[r:R]->(b) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R {layer: 'canonical'}]->(b) RETURN r.layer", (("canonical",),)),
+        ("MATCH (a)-[r:R|Q]->(b) RETURN r.layer", (("canonical",),)),
     ],
 )
-def test_every_shape_outside_the_frozen_one_keeps_its_refusal(
-    database: object, query: str
+def test_expanded_endpoint_read_forms_keep_exact_cardinality(
+    database: object, query: str, expected: tuple
 ) -> None:
-    """The message is the one these shapes already had: this batch adds no new vocabulary."""
+    assert database.execute(query).rows == expected
+
+
+def test_relationship_list_is_not_a_scalar_edge_even_at_one_hop(database):
     with pytest.raises(GrafxPlanError) as raised:
-        database.execute(query, {"rows": [1]})
+        database.execute("MATCH (a)-[r:R*1..1]->(b) RETURN r.layer")
+    assert raised.value.details["field"] == "property"
+    assert database.execute("MATCH (a)-[r:R*1..1]->(b) RETURN [x IN r | x.layer]").rows == ((("canonical",),),)
 
-    assert raised.value.details["field"] == "labels"
-    assert "exactly one label" in str(raised.value)
+
+@pytest.mark.parametrize("operation", ["SET a.kind_of = 'z'", "DELETE r"])
+def test_endpoint_writes_require_write_mode_and_have_the_expected_effect(database, operation):
+    query = "MATCH (a)-[r:R]->(b) " + operation
+    with pytest.raises(GrafxTransactionStateError):
+        database.execute(query)
+    with database.begin("write") as tx:
+        tx.execute(query)
+    if operation.startswith("SET"):
+        assert database.execute("MATCH(a:A) RETURN a.kind_of").rows == (("z",),)
+    else:
+        assert database.execute("MATCH()-[r:R]->() RETURN count(r)").rows == ((0,),)
 
 
-def test_a_written_hop_range_is_outside_the_form_even_when_it_means_one_hop() -> None:
-    """`*1..1` matches exactly one hop, and is still a range that the frozen text does not have.
-
-    The counts cannot tell the two apart -- both are min 1, max 1 -- so the pattern carries
-    whether a star was typed. Without that, a subset frozen without variable-length traversal
-    would admit `*1..1` for being semantically equal to a form it never froze.
-    """
+def test_a_written_one_hop_range_retains_relationship_list_syntax() -> None:
+    """Equal hop counts do not erase the distinction between an edge and an edge list."""
 
     plain = parse("MATCH (a)-[r:R]->(b) RETURN r.layer")
     starred = parse("MATCH (a)-[r:R*1..1]->(b) RETURN r.layer")
@@ -294,16 +302,12 @@ def test_a_written_hop_range_is_outside_the_form_even_when_it_means_one_hop() ->
     assert starred_hop.describe() == "-[r:R*1..1]->"
 
 
-def test_unwind_before_the_form_is_refused_for_the_clause_it_is(
+def test_unwind_before_the_form_preserves_input_multiplicity(
     database: object,
 ) -> None:
-    """Clause composition does not silently widen the current unlabelled endpoint contract."""
-    with pytest.raises(GrafxPlanError) as raised:
-        database.execute(
-            "UNWIND $rows AS x MATCH (a)-[r:R]->(b) RETURN r.layer", {"rows": [1]}
-        )
-
-    assert raised.value.details["field"] == "labels"
+    query = "UNWIND $rows AS x MATCH (a)-[r:R]->(b) RETURN r.layer"
+    assert database.execute(query, {"rows": [1, 2]}).rows == (("canonical",), ("canonical",))
+    assert database.execute(query, {"rows": []}).rows == ()
 
 
 def test_a_labelled_source_keeps_the_small_frontier_traversal(database: object) -> None:
@@ -335,6 +339,14 @@ def _supplied_analysis(statement: Query) -> QueryAnalysis:
         ),
         output_columns=("r.layer",),
     )
+
+
+def _planning_catalog(database):
+    """Copy detached definitions into a domain catalog; never unwrap live authority."""
+    catalog = Catalog()
+    for table in sorted(database.catalog.catalog.tables(), key=lambda table: table.kind != "node"):
+        catalog.add_table(table)
+    return catalog
 
 
 def _returns_layer() -> ReturnClause:
@@ -383,30 +395,24 @@ def _returns_layer() -> ReturnClause:
         ),
     ],
 )
-def test_a_caller_supplying_its_own_analysis_cannot_widen_the_form(
-    catalog: object, indexes: tuple, name: str, statement: Query
+def test_caller_supplied_analysis_retains_native_scope_and_endpoint_planning(
+    database: object, name: str, statement: Query
 ) -> None:
-    """The form is decided from the STATEMENT, so an analysis handed in cannot vouch for it."""
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(
-            statement,
-            catalog=catalog,
-            indexes=indexes,
-            analysis=_supplied_analysis(statement),
-        )
+    if name == "no RETURN at all":
+        with pytest.raises(GrafxPlanError) as raised:
+            build_plan(statement, catalog=_planning_catalog(database), analysis=_supplied_analysis(statement))
+        assert raised.value.details["field"] == "clause"
+        return
+    planned = build_plan(statement, catalog=_planning_catalog(database), analysis=_supplied_analysis(statement))
+    hop = next(node for node in planned.root.walk() if node.label in {"TraverseRelationship", "TraverseAnyRelationship"})
+    tables = (hop.table,) if hop.label == "TraverseRelationship" else hop.tables
+    assert {table.name for table in tables} == {"R"}
+    assert hop.direction is (Direction.INCOMING if "incoming" in name else Direction.OUTGOING)
+    assert ("SetProperties" in _operators(planned.root)) == ("write" in name)
 
-    assert raised.value.details["field"] == ("clause" if name == "no RETURN at all" else "labels"), name
 
-
-def test_the_analysis_admits_what_the_planner_refuses(catalog: object) -> None:
-    """The planner is the door, and this is what proves it is load-bearing.
-
-    A write over a label-free path is a perfectly meaningful statement to the analysis: the
-    variables are bound, the target is a bound variable, nothing is aggregated where it may not
-    be. So analyze() ACCEPTS it, and if the planner did not carry the shape rule the form would
-    widen silently. Asserting the acceptance is the falsifiable half of the claim; asserting
-    only the refusal below would leave it an assumption.
-    """
+def test_analysis_and_planner_agree_on_inferred_endpoint_write(database: object) -> None:
+    """A bound node keeps its inferred typed endpoint through a later SET."""
     statement = Query(
         match_clauses=(MatchClause(patterns=(_frozen_pattern(),)),),
         updating_clauses=(
@@ -425,29 +431,25 @@ def test_the_analysis_admits_what_the_planner_refuses(catalog: object) -> None:
     analysed = analyze(statement)
     assert [binding.name for binding in analysed.bindings] == ["a", "b", "r"]
 
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(statement, catalog=catalog, analysis=analysed)
-    assert raised.value.details["field"] == "labels"
+    plan = build_plan(statement, catalog=_planning_catalog(database), analysis=analysed)
+    hop = next(node for node in plan.root.walk() if node.label in {"TraverseRelationship", "TraverseAnyRelationship"})
+    tables = (hop.table,) if hop.label == "TraverseRelationship" else hop.tables
+    assert {(table.from_table, table.to_table) for table in tables} == {("A", "B")}
+    assert "SetProperties" in _operators(plan.root)
 
 
-def test_a_type_that_names_a_node_table_is_refused_as_a_type(database: object) -> None:
-    """The hop's own refusal, not the source's: the mistake is the type, and it says so."""
-    with pytest.raises(GrafxPlanError) as raised:
-        database.execute("MATCH (a)-[r:B]->(b) RETURN r.layer")
-
-    assert raised.value.details == {"field": "type", "value": "B"}
-    assert "cannot match a relationship" in str(raised.value)
-    # A labelled source has always answered this way; the new form now answers the same.
-    with pytest.raises(GrafxPlanError) as labelled:
-        database.execute("MATCH (a:A)-[r:B]->(b) RETURN r.layer")
-    assert labelled.value.details == raised.value.details
+def test_node_name_alone_does_not_declare_a_relationship_type(database: object) -> None:
+    """Separate namespaces make these absent-type reads, not kind errors."""
+    before = database.catalog.catalog.tables()
+    assert database.execute("MATCH (a)-[r:B]->(b) RETURN r.layer").rows == ()
+    assert database.execute("MATCH (a:A)-[r:B]->(b) RETURN r.layer").rows == ()
+    assert database.catalog.catalog.tables() == before
 
 
-def test_a_type_no_table_declares_is_refused_by_name(database: object) -> None:
-    with pytest.raises(GrafxPlanError) as raised:
-        database.execute("MATCH (a)-[r:NoSuchType]->(b) RETURN r.layer")
-
-    assert raised.value.details == {"field": "type", "value": "NoSuchType"}
+def test_a_type_no_table_declares_is_an_empty_read_without_schema_mutation(database: object) -> None:
+    before = database.catalog.catalog.tables()
+    assert database.execute("MATCH (a)-[r:NoSuchType]->(b) RETURN r.layer").rows == ()
+    assert database.catalog.catalog.tables() == before
 
 
 def test_the_frozen_form_itself_plans_from_a_tree_nobody_parsed(

@@ -1,21 +1,83 @@
-# Detached entity result model — FP-3 work in progress
+# Detached entity result model — 0.0.6 development contract
+
+Native [procedure entity signatures](specs/PROCEDURE_ENTITY_SIGNATURES_V1.md) now
+export these observations to trusted callbacks and restore only references issued
+by that invocation. This is not promotion of arbitrary DTOs or a public attachment
+API; copied, foreign and previous-call objects remain unauthorized.
+
+`startNode(r)` / `endNode(r)` produce native node values inside a query and
+detached `NodeValue` results at the public boundary. Endpoint direction is physical,
+not reversed by an undirected walk. Aliases and sorted WITH stages retain native
+write authority through transaction-qualified reacquisition, not DTO promotion.
+[Contract](specs/WRITE_PATTERN_CONTRACTS_V1.md#undirected-merge-and-native-endpoint-functions).
+
+Native `keys(entity)` and `entity[string_key]` now read actual property names and
+owner-current values, including collected entities and path components. This does
+not admit detached DTOs as parameters or writable handles. NULL/missing keys,
+typed constraints and property REMOVE are documented in
+[the query contract](QUERY_LANGUAGE.md#dynamic-entity-properties-and-property-removal).
+
+Within one native query, entity collections now retain node/relationship authority
+through UNWIND, including collect, explicit lists, compatible CASE/coalesce,
+slices and identity-preserving/filtering comprehensions. Physical authority lost
+to spill is reacquired against the transaction snapshot, not reconstructed from
+detached properties. Rematch/SET/DELETE use the actual entity identity, including
+polymorphic collections. This does not make detached result DTOs writable or
+permit external maps to impersonate entities.
+[Examples and transaction/spill contract](QUERY_LANGUAGE.md#native-entity-collections-and-unwind).
+
+An empty collection proves no element kind, but remains compatible with a
+zero-edge relationship-range pattern and neutral alongside proven node/edge
+lists in CASE/coalesce or concatenation. This proof survives aliases/subquery
+imports without assigning a fictitious entity kind to UNWIND elements. All-NULL
+collections likewise do not invent a kind; their NULL elements propagate through
+entity/path scalar functions instead of being treated as relationships.
+Literal list selections with a provably invalid scalar type fail
+during planning; dynamic selections retain execution-time validation.
+
+Native unlabeled nodes expose `NodeValue.label: str | None` as `None` and
+`NodeValue.labels == ()`. `to_dict()` uses JSON `label: null`; its qualified
+identity is unchanged. Properties expose the user map, never the physical bag
+column or generated table name as a label. In the native-label development
+checkpoint, typed or flexible nodes can also carry a complete versioned label set.
+`NodeValue.labels` is authoritative; `label` is its first canonical (lexically
+sorted) name, or `None` for the empty set. It is not physical table identity.
+`to_dict()` adds the JSON `labels` array to `grafx.node.v1`, preserving the singular
+convenience field. Consumers must use `labels` for membership and
+`identity.table_id` for physical identity. The optional constructor field
+`node_labels` accepts only a canonical tuple and must agree with `label`; omission
+retains singleton/empty construction. This DTO does not activate a storage format.
+The [native-label contract](specs/NODE_LABELS_V1.md) includes CREATE/MERGE,
+SET/REMOVE, retained history, copy and transfer/resume. Its
+[installed format matrix](reports/FP_NODE_LABEL_WHEEL_QUALIFICATION.md) qualifies
+old-reader refusal and durable admission for the recorded candidate.
+See [native creation and durable semantics](architecture/FLEXIBLE_GRAPH_V1.md).
 
 [API reference](API_REFERENCE.md) · [FP-3 evidence](conformance/FP3_PROGRESS.md) ·
 [Roadmap](../ROADMAP.md#functional-parity-expansion-plan)
 
 This page documents the **0.0.6 development API**, not a published release or
-completed FP-3 acceptance. Native `execute` and cursors now return `NodeValue`
+full Cypher conformance. Native `execute` and cursors return `NodeValue`
 for typed and polymorphic nodes and `RelationshipValue` for relationships, also
 inside lists/maps. Both types, `EntityIdentity` and `EntityProvenance`, are exported
 from `okto_grafx`. UNION/UNION ALL now preserve these entities, including nested
 values and aggregate spill. `PathValue` is also exported and returned by the
-currently admitted typed bounded capture, including UNION and cursors. Full named
-path traversal/composition and coordinated Pulse migration are still pending.
+native bounded capture, including UNION and cursors. Named paths support typed,
+untyped and alternative-type ranges, zero hops and composed clauses under shared
+resource limits. [Current profile evidence](reports/FP_V3_INTEGRATED_QUERY_QUALIFICATION.md)
+and [paired Pulse operational qualification](reports/FP_PULSE_OPERATIONAL_QUALIFICATION.md)
+remain distinct from a full-product parity or release claim.
 
 This is an intentional breaking result change, with no legacy-result mode. Replace
 assumptions that an entity is a table-local integer or a mutable `label/properties`
 map with the explicit attributes below. Scalar projections such as `RETURN n.id`
 are unchanged. The installed production Pulse has not been upgraded by this work.
+
+Inside native queries, `n:Person` tests the node's owner-visible label set and `r:KNOWS`
+tests the relationship's logical type. Both return BOOL/NULL, including native
+entities carried through list/path expressions and aliases.
+It neither modifies labels nor grants write authority to detached results.
+See [node-label predicates](QUERY_LANGUAGE.md#node-label-predicates).
 
 ```python
 from okto_grafx import NodeValue, RelationshipValue
@@ -33,7 +95,7 @@ Root imports and fields:
 |---|---|
 | `EntityIdentity` | `database_uuid: bytes`, `table_id: int`, `kind: str`, `record_id: int \| None`, `provisional_id: bytes \| None`; `committed: bool` property |
 | `EntityProvenance` | `read_lsn: int`, `schema_version: int`, `version_lsn: int \| None`, `pending: bool` |
-| `NodeValue` | `identity: EntityIdentity`, `label: str`, `properties: Mapping[str, object]`, `provenance: EntityProvenance`; `labels: tuple[str, ...]` property |
+| `NodeValue` | `identity: EntityIdentity`, `label: str | None` (None for unlabeled), `properties: Mapping[str, object]`, `provenance: EntityProvenance`; `labels: tuple[str, ...]` property |
 | `RelationshipValue` | Same observation fields, plus `source: EntityIdentity` and `target: EntityIdentity` |
 | `PathValue` | `nodes: tuple[NodeValue, ...]`, `relationships: tuple[RelationshipValue, ...]`; `len(path)` returns the relationship count |
 
@@ -73,7 +135,18 @@ as write authority; the current parameter boundary already refuses these DTOs.
 
 ## Owned properties and endpoints
 
-Nodes carry a typed-table `label`, singleton `labels` tuple, identity, properties
+Native relationship groups (`CREATE REL TABLE GROUP`) may give several physical
+endpoint-table pairs the same logical type. `RelationshipValue.label` and
+`type(r)` carry that logical name. The identity retains the member's physical
+`table_id` and record incarnation; equal local record IDs in two members remain
+different entities through paths, DISTINCT and UNION. Endpoints retain their
+qualified node-table identities. Physical member names are introspection/scan
+addresses, not alternative type labels. See the
+[group contract](QUERY_LANGUAGE.md#relationship-types-spanning-endpoint-tables)
+for current admission and consumer limits.
+
+
+Nodes carry a first-canonical-name `label`, complete `labels` tuple, identity, properties
 and provenance. Relationships additionally carry qualified `source` and `target`
 node identities. Endpoints must belong to the relationship's logical database.
 A non-pending relationship cannot claim a provisional endpoint.
@@ -159,13 +232,26 @@ the same native capture/identity contract. Bounded variable ranges over multiple
 relationship tables now retain qualified identities and physical endpoint
 orientation at every hop; zero-hop anchors may span all node tables. Written
 range lists retain their type through imports/exports and list-or-NULL UNION.
-Inline relationship maps remain pending. See
+Inline relationship maps constrain each annotated edge/range before emission,
+without replacing entity identity or changing the captured property values. See
 [range composition](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges).
 Zero length returns the anchor, not NULL: its path has one node and no relations.
 Concatenation does not duplicate junction nodes. Range variables hold relationship
 tuples even for a written `*1..1`; an unstarred hop returns one relationship.
 Relationships cannot be reused across segments/patterns within one MATCH clause;
 separate MATCH clauses may reuse them. This is distinct from node repetition.
+Entities selected by a proved WITH coalesce/CASE keep their original qualified
+identities and snapshot bindings. A list assembled from relationship entities
+can constrain a subsequent ranged MATCH by ordered identity; no list or detached
+value is thereby converted into independent write authority.
+Bidirectional read spelling (`<-->`) uses undirected traversal and preserves each
+edge's physical source/target; it neither creates reverse identities nor duplicates
+a self-loop. Directed neighboring segments still constrain their own orientation.
+Such reuse preserves the incoming edge identity and its existing binding, even
+when later candidates share endpoints/properties or table-local record numbers.
+No detached result becomes a writable handle as a consequence. Bound-edge reads
+currently filter native scan/traversal candidates; they do not promise direct
+endpoint lookup or sublinear enumeration for all patterns.
 UNION/ALL and result cursors preserve path identity and snapshot. Temporary path
 spill uses the bounded row codec and refuses malformed cardinality, nonentity
 components, invalid endpoint connections and future source versions. Private
@@ -190,12 +276,49 @@ encoding; nested maps are tagged so user properties cannot impersonate a type ta
 | TIMESTAMP | `{"type":"timestamp","micros":"-5"}` |
 | UUID | `{"type":"uuid","hex":"...32 hexadecimal digits..."}` |
 | VECTOR | `{"type":"vector","dtype":"float64","space_ref":"1","components":[1.0,2.0]}` |
+| DATE | `{"type":"date","epoch_day":"0"}`; proleptic Gregorian days from 1970-01-01 |
+| LOCALTIME | `{"type":"localtime","nanoseconds":"1"}`; nanos since local midnight |
+| TIME | `{"type":"time","nanoseconds":"1","offset_seconds":3600}` |
+| LOCALDATETIME | `{"type":"localdatetime","epoch_day":"0","nanoseconds":"1"}` |
+| DATETIME | `{"type":"datetime","epoch_seconds":"0","nanosecond":1,"offset_seconds":3600,"zone":"Europe/Paris"}`; zone may be null |
+| DURATION | `{"type":"duration","months":"1","days":"2","seconds":"3","nanoseconds":4}` |
+| DECIMAL | `{"type":"decimal","coefficient":"1230","precision":10,"scale":3}`; exact value 1.230, no DOUBLE conversion |
 | LIST | `{"type":"list","items":[...encoded values...]}` |
 | MAP | `{"type":"map","entries":{"key":...encoded value...}}` |
 
-There is no durable format change or entity-deserialization/write-handle API in
-this increment. JSON values are observations, not executable references. Temporal
-and nested stored-type expansion in FP-5/6 must extend this grammar explicitly.
+Temporal native values, including nested entity properties and path components,
+are validated and copied with their exact codec. JSON retains native type,
+nanoseconds, recorded offset/zone and independent duration components. Wide integer
+coordinates use decimal strings; subsecond remainders and bounded offsets use
+JSON integers. Serialization never consults current timezone rules. These tags
+extend the development v1 observation grammar, not a graph write-handle API or
+general-purpose temporal import/export claim. [Native temporal value contract](TEMPORAL_VALUES.md).
+Native decimal properties now use the explicit tag above, including nested values.
+Scalar CLI JSON uses the same validated tag, and typed local CSV/JSONL/SQLite
+imports accept it under an explicit DECIMAL declaration. These preserve p/s;
+ordinary JSON maps and CLI parameters are not automatically interpreted as native
+values. See [tagged decimal fields](LOCAL_TEXT_IMPORT.md#native-decimal-fields-006-development).
+Their owned observations retain declared precision/scale; integer coefficients use
+strings to avoid JSON consumer precision loss. This observation export does not
+qualify CLI/import/history/transfer support. [Decimal scope](specs/DECIMAL_VALUES_V1.md).
+
+## Deleted bindings versus detached observations
+
+A live query binding cannot read properties or labels after its owner instruction
+deletes the entity. This includes aliases, list/aggregate traversal and spill
+restoration. Such access raises the structured runtime
+`plan_error` / `deleted_entity_access` and rolls back the whole instruction.
+Previously computed scalars, identity, counts and immutable relationship type
+remain valid. A returned detached DTO is an observation, not a live handle; it
+retains its documented values even if the entity was deleted. This does not
+change independent readers' snapshots. See the
+[query examples and exact error fields](QUERY_LANGUAGE.md#content-access-after-deletion).
+
+Normal content reads without a deletion in the instruction do not scan transaction
+delete intents. A spilled binding has no physical write authority; its qualified
+record identity is checked against lazily decoded deleted headers, at most once
+per deleted reference. This lookup does not scan the stored graph or restore
+write authority from temporary bytes. Existing statement/memory limits apply.
 
 ## Native execution and remaining integration
 
@@ -235,8 +358,11 @@ WITH n, count(*) AS copies
 RETURN n, copies ORDER BY n.id
 ```
 
-General named-path execution and broader aggregate/spill combinations still need
-complete integration and frozen-case validation. Broader alias/scope
-composition, projection budgets, public adversarial tests and the full query/txn
-checkpoint remain open. Pulse result/JSON consumers must be mapped and tested
-before the public breaking change is accepted as a coordinated delivery.
+Named paths, aggregate/spill and alias/scope composition participate in the
+[complete required-profile execution](reports/FP_V3_INTEGRATED_QUERY_QUALIFICATION.md)
+and the [supplemental native contracts](conformance/EXTENSION_COVERAGE.md).
+Community maps native node/relationship/path observations and temporal values
+into plain result envelopes without provider-specific Core code. The
+[installed/API/browser/MCP evidence](reports/FP_PULSE_OPERATIONAL_QUALIFICATION.md)
+records exercised migration flows. The roadmap tracks final whole-delivery
+acceptance separately; no production upgrade is implied by this API contract.

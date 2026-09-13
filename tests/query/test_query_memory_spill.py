@@ -96,14 +96,18 @@ def test_spilled_sort_keeps_the_canonical_stable_nan_order() -> None:
         )
     )
     stack.catalog_store.save()
-    for record_id, value in ((1, float("nan")), (2, 0.0), (3, float("nan")), (4, -1.0)):
+    for record_id, value in ((1, 0.0), (2, 0.0), (3, 0.0), (4, -1.0)):
         stack.insert("Measurement", record_id, (record_id, value))
 
     ascending = _run(
-        stack, "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value"
+        stack, "MATCH (m:Measurement) WITH m.id AS id, "
+        "CASE WHEN m.id % 2 = 1 THEN 0.0 / 0.0 ELSE m.value END AS value "
+        "RETURN id, value ORDER BY value"
     )
     descending = _run(
-        stack, "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value DESC"
+        stack, "MATCH (m:Measurement) WITH m.id AS id, "
+        "CASE WHEN m.id % 2 = 1 THEN 0.0 / 0.0 ELSE m.value END AS value "
+        "RETURN id, value ORDER BY value DESC"
     )
 
     assert tuple(row[0] for row in ascending.rows) == (4, 2, 1, 3)
@@ -159,16 +163,16 @@ def test_spilled_grouping_preserves_repeated_and_distinct_nan_identities() -> No
             )
         )
         stack.catalog_store.save()
-        stack.insert("Measurement", 1, (1, float("nan")))
-        stack.insert("Measurement", 2, (2, float("nan")))
-        stack.insert("Measurement", 3, (3, float("nan")))
+        stack.insert("Measurement", 1, (1, 0.0))
+        stack.insert("Measurement", 2, (2, 0.0))
+        stack.insert("Measurement", 3, (3, 0.0))
         groups = _run(
             stack,
-            "MATCH (m:Measurement) RETURN m.value AS value, count(*) AS rows",
+            "MATCH (m:Measurement) RETURN m.value / 0.0 AS value, count(*) AS rows",
         )
         distinct = _run(
             stack,
-            "MATCH (m:Measurement) RETURN count(DISTINCT m.value) AS values",
+            "MATCH (m:Measurement) RETURN count(DISTINCT m.value / 0.0) AS values",
         )
         shared = float("nan")
         parameter_group = stack.engine.execute(
@@ -183,7 +187,7 @@ def test_spilled_grouping_preserves_repeated_and_distinct_nan_identities() -> No
         )
         row_distinct = _run(
             stack,
-            "MATCH (m:Measurement) RETURN DISTINCT m.value AS value",
+            "MATCH (m:Measurement) RETURN DISTINCT m.value / 0.0 AS value",
         )
         parameter_row_distinct = stack.engine.execute(
             "MATCH (m:Measurement) RETURN DISTINCT $value AS value",

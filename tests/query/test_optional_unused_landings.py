@@ -6,7 +6,7 @@ import pytest
 import okto_grafx
 from okto_grafx.engine import query_engine as qe
 from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.errors import GrafxCorruptionDetected, GrafxParseError, GrafxPlanError, GrafxQueryBudgetExceeded
+from okto_grafx.errors import GrafxCorruptionDetected, GrafxQueryBudgetExceeded
 
 from . import test_vector_free_traversal as vector_fixture
 
@@ -90,13 +90,13 @@ def test_optional_degrees_preserve_custom_full_read_hook(graph, monkeypatch):
 @pytest.mark.parametrize("query", [
     "MATCH (n:A) OPTIONAL MATCH (n)-[r]->(target) RETURN *",
 ])
-def test_unsupported_shape_retains_parse_refusal(graph, monkeypatch, query):
-    with pytest.raises((GrafxParseError, GrafxPlanError)) as candidate:
-        graph.execute(query)
+def test_return_star_keeps_all_optional_bindings_consumed(graph, monkeypatch, query):
+    candidate = graph.execute(query)
     monkeypatch.setattr(qe, "_unused_optional_landings", lambda _: frozenset())
-    with pytest.raises((GrafxParseError, GrafxPlanError)) as oracle:
-        graph.execute(query)
-    assert candidate.value.to_dict() == oracle.value.to_dict()
+    oracle = graph.execute(query)
+    assert candidate.columns == oracle.columns == ("n", "r", "target")
+    assert candidate.rows == oracle.rows
+    assert len(candidate.rows) == 6
 
 
 def test_composed_polymorphic_optional_keeps_endpoint_validation(graph, monkeypatch):

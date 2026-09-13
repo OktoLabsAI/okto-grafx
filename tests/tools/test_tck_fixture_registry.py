@@ -44,7 +44,7 @@ def test_native_table_procedure_keeps_input_filtering_and_duplicates():
 
 
 @pytest.mark.parametrize("before,after", [
-    ("INTEGER?", "NUMBER?"),
+    ("INTEGER?", "DECIMAL?"),
     ("| in | out |", "| wrong | out |"),
     ("| 1 | 'a' |", "| true | 'a' |"),
 ])
@@ -59,9 +59,35 @@ def test_invalid_procedure_fixtures_are_not_silently_coerced(before, after):
         backend.close()
 
 
-def test_unit_procedure_is_pending_not_replaced_by_fabricated_return_column():
-    with pytest.raises(ValueError, match="Unit reference procedures await FP-7"):
+def test_unit_procedure_requires_its_fixture_table():
+    with pytest.raises(ValueError, match="explicit fixture table"):
         procedure_registry({"steps": [{"text": "there exists a procedure test.proc() :: ():"}]})
+
+
+def test_native_unit_fixture_does_not_fabricate_a_column_or_result_row():
+    source = '''Feature: unit procedure
+  Scenario: no output
+    Given an empty graph
+    And there exists a procedure test.unit() :: ():
+      |
+    When executing query:
+      """
+      CALL test.unit()
+      """
+    Then the result should be empty
+    And no side effects
+'''
+    case = compile_feature(source, "clauses/call/Unit.feature")[0]
+    registry = procedure_registry(case)
+    assert registry.procedures[0].columns == ()
+    assert tuple(registry.procedures[0].invoke(())) == ()
+    backend = NativeScenarioBackend()
+    try:
+        outcome = run_stateful_case(case, backend)
+        assert outcome["conformance"] == "passed", outcome
+        assert not backend.snapshot().nodes
+    finally:
+        backend.close()
 
 
 def test_procedure_registry_refuses_forged_compiled_row_width():

@@ -1,8 +1,8 @@
 """Source-bound architectural review, independent of execution failures.
 
-These candidates implement only boundaries explicitly excluded by the approved
-functional-parity plan. They are reviewed before freezing, never inferred from a
-test failure or from an unsupported native function.
+These rules reconstruct the historical V1 boundaries, including exclusions since
+withdrawn by V2/V3. They are not the active profile policy. Successors record explicit
+decisions without inferring scope from a failed test or an unsupported function.
 """
 
 from dataclasses import fields, is_dataclass

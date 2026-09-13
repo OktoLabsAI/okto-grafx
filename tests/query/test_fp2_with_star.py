@@ -61,8 +61,10 @@ def test_star_expansion_is_bounded_and_wrong_ast_flag_is_refused():
             db.execute(f"WITH {source} WITH *, 1 AS extra RETURN extra")
     query = parse("WITH * RETURN 1")
     wrong = replace(query.with_clauses[0], include_existing=1)
-    with pytest.raises(GrafxPlanError, match="include_existing must be boolean"):
+    with pytest.raises(GrafxPlanError) as failure:
         analyze(replace(query, with_clauses=(wrong,)))
+    assert failure.value.details["field"] == "ast"
+    assert failure.value.details["reason"] == "invalid_ast_structure"
 
 
 def test_lowering_expands_only_current_names_and_does_not_expose_internal_names():

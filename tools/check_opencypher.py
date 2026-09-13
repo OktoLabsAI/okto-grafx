@@ -210,6 +210,10 @@ def main() -> int:
                         help="Create all-case ownership/expectation ledger; does not freeze exclusions")
     parser.add_argument("--verify-ledger", type=Path,
                         help="Refuse changed/missing source cases before any execution")
+    parser.add_argument("--predecessor-ledger", type=Path,
+                        help="Frozen immediate predecessor (V1 for V2; V2 for V3)")
+    parser.add_argument("--ancestor-ledger", type=Path,
+                        help="Frozen V1 source required alongside V2 when verifying V3")
     args = parser.parse_args()
     if args.execute_reads and args.execute_stateful:
         parser.error("Choose either read-only diagnostics or stateful execution")
@@ -217,6 +221,15 @@ def main() -> int:
         parser.error("--infer-fixture-schema requires --execute-stateful")
     if args.owner and not args.verify_ledger:
         parser.error("--owner requires --verify-ledger")
+    if args.predecessor_ledger and not args.verify_ledger:
+        parser.error("--predecessor-ledger requires --verify-ledger")
+    if args.ancestor_ledger and not args.predecessor_ledger:
+        parser.error("--ancestor-ledger requires --predecessor-ledger")
+    for target in (args.output, args.ledger_output):
+        if target is not None and target.exists():
+            saved = json.loads(target.read_text(encoding="utf-8"))
+            if saved.get("status", "").startswith("frozen_"):
+                parser.error("Refusing to overwrite a frozen ledger with a report or draft")
     report = inventory(args.checkout)
     # Also support direct script execution (tools/ is then sys.path[0]).
     if args.ledger_output or args.verify_ledger:
@@ -227,11 +240,11 @@ def main() -> int:
 
         if args.verify_ledger:
             ledger = json.loads(args.verify_ledger.read_text(encoding="utf-8"))
-            verify_ledger(ledger, report)
-        if args.ledger_output and args.ledger_output.exists():
-            saved = json.loads(args.ledger_output.read_text(encoding="utf-8"))
-            if saved.get("status") == "frozen_checkpoint_a":
-                parser.error("Refusing to replace a frozen ledger with a new draft")
+            predecessor = (json.loads(args.predecessor_ledger.read_text(encoding="utf-8"))
+                           if args.predecessor_ledger else None)
+            ancestor = (json.loads(args.ancestor_ledger.read_text(encoding="utf-8"))
+                        if args.ancestor_ledger else None)
+            verify_ledger(ledger, report, predecessor=predecessor, ancestor=ancestor)
     selected_ids = {case["id"] for case in report["cases"]
                     if case["id"].startswith(args.feature_prefix)}
     if args.owner:
@@ -266,7 +279,7 @@ def main() -> int:
         report["execution_summary"] = dict(Counter(case["conformance"] for case in report["cases"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.verify_ledger:
-        report["profile_summary"] = profile_summary(report, ledger)
+        report["profile_summary"] = profile_summary(report, ledger, predecessor=predecessor, ancestor=ancestor)
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     if args.ledger_output:
         args.ledger_output.parent.mkdir(parents=True, exist_ok=True)

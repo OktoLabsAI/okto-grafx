@@ -276,15 +276,14 @@ def test_analysis_and_planner_revalidate_composed_optional_trees(
     statement = _force_optional(text)
 
     actual = analyze(statement)
+    planned = build_plan(statement, catalog=catalog, indexes=indexes,
+                         analysis=_forged_analysis(statement))
+    assert planned.writes == actual.statement.writes
+    assert planned.columns == actual.output_columns
     if ":Person:Chunk" in text:
-        with pytest.raises(GrafxPlanError):
-            build_plan(statement, catalog=catalog, indexes=indexes,
-                       analysis=_forged_analysis(statement))
-    else:
-        planned = build_plan(statement, catalog=catalog, indexes=indexes,
-                             analysis=_forged_analysis(statement))
-        assert planned.writes == actual.statement.writes
-        assert planned.columns == actual.output_columns
+        # This valid conjunction has no candidate owner in the typed fixture.
+        scans = [node for node in planned.root.walk() if node.label == "AllNodesScan"]
+        assert len(scans) == 1 and scans[0].tables == ()
 
 
 @pytest.mark.parametrize("door", ["analysis", "planner"])

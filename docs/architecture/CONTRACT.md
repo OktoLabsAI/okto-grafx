@@ -1,5 +1,22 @@
 # Okto Grafx — Frozen Architecture Contract (v1)
 
+Authorized development extension `FP-MULTILABEL-20260912`:
+[node-label storage v1](../specs/NODE_LABELS_V1.md) adds required catalog-v2 bit 28
+and heap flag bit 2 for a canonical GXL1 prefix before the unchanged property
+tuple. It preserves the 40-byte header, stable identity, MVCC/OCC and WAL rules.
+Native CREATE/MERGE, SET/REMOVE and detached membership are implemented, together
+with retained history, copy and transfer/resume. The
+[installed label-format qualification](../reports/FP_NODE_LABEL_WHEEL_QUALIFICATION.md)
+and [complete V3 query execution](../reports/FP_V3_INTEGRATED_QUERY_QUALIFICATION.md)
+record their tested scope without weakening the storage invariants below.
+
+Development FP-6 extension: [typed collection columns](../specs/TYPED_COLLECTIONS_V1.md)
+use catalog-v2 capability bit 27, schema marker 252 and bounded GXT1 descriptors.
+No new row LIST/MAP tag or WAL/isolation policy is introduced. Admission is atomic;
+stored validation rejects malformed nested values, including projected-away fields.
+The [combined installed-reader qualification](../reports/FP6_TYPE_WHEEL_QUALIFICATION.md)
+covers the recorded type-format candidate; final integrated delivery remains separate.
+
 **This document is normative and FROZEN.** Every builder agent implements against it; every critic
 agent reviews against it. If a builder believes the contract is wrong, it must STOP and report the
 conflict rather than silently deviating — a unilateral interface change breaks every other component.
@@ -798,14 +815,36 @@ Reason codes: `1 truncated_tail · 2 checksum_failure · 3 stale_epoch · 4 devi
 
 ### 7.1 Values
 
+The 0.0.6 temporal domain uses narrowly admitted pure algorithms:
+`fractions.Fraction` in temporal arithmetic/components/text, and exact aliased
+regular-expression functions in temporal text/interchange. The gate binds each
+consumer, origin, symbol and alias; neither library is generally allowed as a
+module namespace. Patterns are fixed ASCII grammar over bounded input; rational
+results are independent of ambient decimal context. No mechanism access or
+weakening of finite storage, WAL or transaction authority is introduced. See
+[exact imports and adversarial qualification](../reports/FP_STATIC_CONTRACT_QUALIFICATION.md).
+
 ```python
 class ValueType(IntEnum):
     NULL=0; BOOL=1; INT64=2; DOUBLE=3; STRING=4; BYTES=5; LIST=6; MAP=7
     VECTOR_F32=8; VECTOR_F64=9; TIMESTAMP=10; UUID=11
+    DATE=12; LOCALTIME=13; TIME=14; LOCALDATETIME=15; DATETIME=16; DURATION=17
 ```
 Encoding: `tag u8` then type-specific body; STRING/BYTES/LIST/MAP prefix `u32 length`.
 `VECTOR_F32` body = `u32 dimension | u32 space_ref | f32[dimension]`; `VECTOR_F64` likewise with f64.
 `space_ref` is the catalog-assigned numeric id of the embedding space (0 = unassigned is invalid).
+
+Temporal tags retain native nanos, offset/zone identity and separate duration
+months/days/seconds; [wire frames and admission](../specs/TEMPORAL_VALUES_V1.md#v1-binary-frames-and-pending-durable-admission).
+Typed temporal columns and first temporal writes inside ANY require catalog-v2
+`temporal_values_v1` (bit 23), published in the same transaction. Existing value
+tags and TIMESTAMP's UTC-microsecond representation are unchanged.
+
+Native query constructors, scoped wall clocks, property fields, duration
+arithmetic and separate predicate/total-order semantics use these same native
+values. Transaction/statement instants do not replace liveness/OCC/WAL clocks;
+query defaults are UTC with explicit per-call zones. [Query temporal contract](../TEMPORAL_VALUES.md)
+includes overloads, supported fields, NULL/error behavior and remaining routes.
 
 ### 7.2 Schema / catalog
 
@@ -838,15 +877,69 @@ class EmbeddingSpaceDef:
 `Catalog` exposes `tables()`, `table(name)`, `spaces()`, `space(name)`, `next_table_id()`,
 `next_space_id()` and is itself persisted through `catalog.dat` as normal WAL-covered pages.
 
+The FP-3 development line also has a logical relationship group catalog
+extension, required capability bit 19 (`relationship_types_v1`). It preserves
+fixed physical endpoint tables and qualified identity. Native codec/replay,
+atomic group DDL, query/value consumption, detached inspection and migration
+preview are implemented. Polymorphic writes and qualified copy/transfer,
+projection/history and installed-reader admission have subsequent native coverage.
+Group-wide nullable-column evolution remains unsupported; per-physical-table rules
+are explicit. Exact bytes, admission, invariants and qualified increments:
+[RELATIONSHIP_TYPES_V1](RELATIONSHIP_TYPES_V1.md).
+
+Heterogeneous properties use catalog-v2 capability bit 20
+(`heterogeneous_properties_v1`) and the schema-only column tag 255 (`SchemaType.ANY`).
+They do not extend the concrete value tag taxonomy. Unknown readers and catalogs
+missing the required capability refuse before authority is applied; COMMIT,
+snapshot/OCC and finite-storage rules remain intact. Definition, projection checks,
+native writes, transfer, current index restrictions and remaining flexible-model work:
+[HETEROGENEOUS_PROPERTIES_V1](HETEROGENEOUS_PROPERTIES_V1.md).
+
+Capability bit 21 (`flexible_graph_v1`) depends on heterogeneous properties and
+adds one per-table flags byte after its definition/prior-layout metadata. The
+flags distinguish flexible property maps and actually unlabeled nodes, independently
+of the physical table name. Schema/data creation remains one native statement;
+unknown readers and inconsistent model transitions refuse before replay applies
+pages. [FLEXIBLE_GRAPH_V1](FLEXIBLE_GRAPH_V1.md) defines the bytes, query/DTO semantics,
+current transfer support and outstanding integration.
+
+Catalog-v2 bit 24 (`graph_namespaces_v1`) admits independent, case-sensitive
+node/relationship names, including a node label equal to a logical relationship
+group. The body already records table kinds/IDs; no new body field is added.
+Missing capability with overlapping definitions is corruption, while unknown
+readers reject the required bit. Name-only physical lookup refuses ambiguity;
+kind/ID-qualified resolution preserves endpoint and entity authority. The
+[namespace contract](../specs/GRAPH_NAMESPACES_V1.md) records current native
+evidence and unfinished transport/index/consumer qualification.
+
+Catalog-v2 bit 25 (`vector_owner_names_v1`) appends an exact 0/1 naming-policy
+byte per table after prior table extensions. New vector owners whose legacy names
+collide or exceed the identifier budget use `_grafx_vec_t{table_id}_p{position}`;
+existing owners retain their names. The policy is immutable for an established
+table, is preserved in catalog/replay/history, and cannot be guessed from files.
+Historical identity-named schemas use the canonical `GXHM02` trailer with bit 2.
+Unknown readers refuse before use. See [durable vector owner contract](../specs/VECTOR_OWNER_NAMES_V1.md)
+for admission, exact provenance, installed-wheel evidence and remaining scope.
+
+Catalog-v2 bit 22 (`system_history_models_v1`) depends on system-history bit 15
+and is required when a flexible/grouped table is tracked. It fences old writers
+before they could omit the new historical schema trailer. Model flags and logical
+type names are WAL-covered event metadata; replay/public reads validate them
+without reconstructing lost evidence. See
+[temporal format and admission](../SYSTEM_TIME_HISTORY.md#durable-model-admission-and-compatibility).
+
 Internal CAP-1B catalog-v2 extension: required capability bit 4 (`commit_catalog_v1`)
 adds a checksummed u64 activation COMMIT LSN at byte offset 44, immediately after
 the ordinary v2 extension, before schema bodies. It is absent when the capability
 is absent; legacy bytes are unchanged. The horizon is 1..PROVISIONAL_CSN-1 and
 unknown required capabilities refuse before body interpretation. The private
-activation transaction remains v1 WAL and does not create journal files. Automatic
-journal publication/replay and public APIs are not yet enabled; subsequent writes
-on experimentally activated stores explicitly refuse. Exact format, remaining
-integration requirements and evidence: [COMMIT_CATALOG_V1](COMMIT_CATALOG_V1.md).
+activation transaction publishes the fence before later journal effects. Native
+journal publication/replay and public activation, metadata, snapshot lookup/paging,
+verification and transfer hooks are implemented. The tracked interval begins after
+activation; earlier logical history is not fabricated. The original experimental
+writer guard is superseded by the integrated contract. Exact format, ordering and
+qualification: [COMMIT_CATALOG_V1](COMMIT_CATALOG_V1.md) and
+[public commit history](../COMMIT_HISTORY.md).
 
 ---
 
@@ -1199,6 +1292,15 @@ that was removed, not that oracle's work. No WAL, format, HNSW beam, recall rule
 premise changes.
 
 ### 8.9 `engine/query_engine.py` (C10)
+
+Read-side relationship maps are normalized by native MATCH planning into
+property equality predicates. A range map uses `all` over its relationship
+tuple; an empty range satisfies it vacuously. These predicates participate in
+the complete MATCH condition before OPTIONAL null extension, using existing
+entity bindings, snapshot/owner-overlay visibility and statement rollback.
+This introduces neither property writes nor a new transaction or authority
+boundary. Traversal candidates and generated list iteration remain subject to
+the existing query budgets; map syntax does not promise early edge pruning.
 ```python
 class QueryEngine:
     def __init__(..., *, max_statement_writes: int | None = None,
@@ -1219,16 +1321,19 @@ Cypher subset (openCypher, Kùzu dialect): `CREATE NODE TABLE` / `CREATE REL TAB
 `CREATE VECTOR SPACE`, `CREATE`, `MATCH` (+ variable-length `-[:R*1..3]->`, and `-[:R*]->`
 for the default bound), the narrow root `OPTIONAL MATCH (v:Label)`, `WHERE`, `RETURN`
 (`DISTINCT`, aliases), one leading `UNWIND`, scalar or aggregating `WITH` stages, `ORDER BY`, `SKIP`, `LIMIT`, `SET`, `DELETE`, `MERGE`, parameters `$name`,
-aggregates `count/sum/avg/min/max/collect`, the scalar functions `coalesce(value, ...)`,
+aggregates `count/sum/avg/min/max/collect/percentileDisc/percentileCont`, the scalar functions `coalesce(value, ...)`,
 `string_split(text, separator)` and `size(value)`, and the similarity extension. `coalesce`
-evaluates every argument from left to right and returns the first non-null one, or null when all
-arguments are null. It is case-insensitive, positional-only and requires at least one argument.
-Its supported non-null families are string, boolean and numeric; arguments must stay in one
-family, except that integers and doubles may mix and promote the selected result to double. Lists,
-maps, graph bindings and other families are refused. Families are resolved from declared column
-types, literal types and bound parameter types before rows are produced, so a nullable double
-argument still promotes an integer result and a known mismatch is refused even for an empty
-result. `string_split` takes exactly two positional strings and `size` takes exactly one
+evaluates arguments from left to right only until the first non-null value, or returns null
+when all arguments are null. It is case-insensitive, positional-only and requires at least one
+argument. Scalar/list/map/entity/path query values may be heterogeneous; the selected value
+retains its type without numeric or string coercion. The planner infers a common expression
+type only when provable; dynamic values are checked by their consuming operators at use.
+Stored-column admission is separate and remains strict.
+See the [conversion/arithmetic error contract](../QUERY_LANGUAGE.md#conversion-and-arithmetic-error-contracts)
+for supported conversion families, known list-local type inference and structured
+planning/runtime refusals; no host-object conversion or type coercion of stored
+values is implied. `string_split` takes exactly two
+positional strings and `size` takes exactly one
 positional string or list; both propagate null.
 `timestamp` takes exactly one positional argument and answers an instant in whole
 microseconds. Null answers null and a timestamp passes through unchanged; an ISO-8601 string is
@@ -1332,8 +1437,10 @@ physical match (`count(r)=1`, `count(DISTINCT r)=1`), as in typed traversal; dis
 edges retain multiplicity. Existing scalar,
 aggregate, ordering and window rules apply; unsupported expression/type combinations still fail.
 Label-free targets and untyped relationships read missing properties as null. Property families
-are checked across eligible tables before streaming; incompatible families are refused and
-integer/double families promote under the existing polymorphic rules.
+are checked across eligible tables for common-type proofs; differing families
+remain dynamically typed expression values with per-row operator checks, and
+integer/double families retain their existing common-type rule. Missing properties
+remain null; no stored ANY/union type or storage-admission relaxation is introduced.
 `TraverseAnyRelationship` expands only incident tables in catalog table-id order, using the
 existing indexed/batched traversal access paths, owner overlay and one statement snapshot.
 Existing traversal, result and intermediate budgets remain enforced. No storage format, WAL,
@@ -1420,6 +1527,14 @@ answers unambiguously only where the direction fixes which end is which. `*1..1`
 the other ranges even though it matches a single hop: what the form excludes is a written range,
 and the pattern records that a `*` was typed rather than inferring it from the hop counts.
 
+**Historical 0.0.4 path projection contract (superseded):** the following paragraphs
+through the legacy `name =` restriction describe the older closed projection,
+not current 0.0.6 admission. Current detached `PathValue`/entity identity,
+composition, inline maps, direction and range contracts are documented in
+[entity values](../ENTITY_VALUES.md) and [query language](../QUERY_LANGUAGE.md).
+The legacy fixture specification remains indexed for provenance, not as a runtime
+compatibility mode.
+
 A path may also be NAMED, in `MATCH path = (a:A)-[r:T]->(b:B) [WHERE ...] RETURN ...`. Ordinarily
 the name is decorative: it is written and checked but not read, and the plan is the plan of the
 same query without the name. A closed typed one-hop form reads it:
@@ -1458,22 +1573,18 @@ written range or inline map, both ends named with exactly one label, and a `RETU
 reads the path. A path name that collides with a node or relationship name is also refused.
 `name =` is read only inside a `MATCH`, so a written pattern cannot carry one.
 
-`MATCH (a:A)-[r:T*]->(b:B)` writes no upper bound, and does not mean an unbounded walk. The
-public endpoint rewrites `*` to twenty hops from its own `MAX_TRAVERSAL_DEPTH` before a query
-reaches any engine, so the omission already had one meaning; the engine reads it the same way.
-`*` and `*..` become `1..20`, `*n..` keeps the lower bound it wrote and takes twenty as its
-upper, and the accepted form is written back as the explicit range it became -- Pulse Core
-materialises `*..20`, which is the same traversal as `1..20`. A range that WRITES its upper
-bound is untouched and still reaches thirty, `MAX_TRAVERSAL_HOPS`, which is a different number
-from the default and answers a different question: what a query may ask for, rather than what it
-gets when it asks for nothing. `*25..` is refused, because twenty-five to twenty is an empty
-range, and so are a zero lower bound, an upper past thirty and a lower above its upper.
-
-A hop range that arrives in a tree the parser did not write is checked before anything walks it,
-at the analysis and again at the planner: the counts must be whole numbers, the range must run
-from one to thirty with the lower no greater than the upper, and a relationship that records no
-written range must span exactly one hop. A forged upper bound is not a wrong answer; it is
-unbounded work, which is what the bound exists to prevent.
+**Current native range contract:** omitted upper syntax (`*`, `*..`, `*n..`)
+retains `upper_bound_omitted` and uses the 30-hop resource ceiling, not an implicit
+20-hop result truncation. An extendable trail at the ceiling refuses explicitly;
+zero length is supported. There is no client-specific rewrite in native Grafx.
+Both bounds of a written interval must independently be integer values in
+`0..30`; lower greater than upper is an empty interval, not a parser failure.
+Planning emits a consuming false filter: no traversal, no fabricated zero-hop
+path, normal OPTIONAL null extension and preservation of upstream statement work.
+The AST keeps the original bounds. Analysis and planning validate caller-built
+and expression-local patterns before any empty-plan shortcut. No-range syntax
+still requires exactly one hop, and malformed runtime traversal plans remain
+refused. Negative/over-ceiling bounds cannot hide behind an empty interval.
 
 ```
 MATCH (n:Chunk)-[:BELONGS_TO]->(d:Doc)
@@ -1613,8 +1724,9 @@ db.close()
 ```
 `Database` is a context manager. `close()` releases the lease and the reader registration; closing
 with an open transaction aborts it and never corrupts. Every public method has an en-US docstring.
-`Timestamp` and `VectorValue` are the supported parameter/result value types for temporal and
-vector columns; integrations must not import their definitions through `okto_grafx.domain`.
+`Timestamp`, `DateValue`, `LocalTimeValue`, `TimeValue`, `LocalDateTimeValue`,
+`DateTimeValue`, `DurationValue` and `VectorValue` are public parameter/result
+wrappers exported from `okto_grafx`; [native temporal contract](../TEMPORAL_VALUES.md).
 
 `Database.query(text, parameters=None) -> Query` snapshots the public inputs immediately.
 `Query.cursor(*, batch_size=256) -> QueryCursor` opens an independent read transaction and owns its

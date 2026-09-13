@@ -284,7 +284,6 @@ def test_relationship_scan_charges_filtered_candidates_but_no_paths(tmp_path: Pa
     ("spelling", "field"),
     [
         ("*31..", "hops"),
-        ("*3..2", "min_hops"),
         ("*1..31", "hops"),
         ("*31", "hops"),
     ],
@@ -292,7 +291,7 @@ def test_relationship_scan_charges_filtered_candidates_but_no_paths(tmp_path: Pa
 def test_the_shapes_that_were_refused_are_still_refused(
     spelling: str, field: str
 ) -> None:
-    """Reversed explicit ranges and lower bounds beyond resources are refused."""
+    """Bounds beyond execution resources remain refused, even for empty intervals."""
     with pytest.raises(GrafxParseError) as raised:
         parse(f"MATCH (a:A)-[r:R{spelling}]->(b:A) RETURN a.id")
 
@@ -364,6 +363,15 @@ def _supplied_analysis(statement: Query) -> QueryAnalysis:
     )
 
 
+def test_caller_supplied_empty_range_is_admitted_without_a_traversal(catalog, indexes):
+    statement = _forged(min_hops=5, max_hops=2)
+    analyze(statement)
+    planned = build_plan(statement, catalog=catalog, indexes=indexes,
+                         analysis=_supplied_analysis(statement))
+    assert not any("Traverse" in type(node).__name__ for node in planned.root.walk())
+    assert any(type(node).__name__ == "FilterRows" for node in planned.root.walk())
+
+
 @pytest.mark.parametrize(
     ("name", "fields"),
     [
@@ -372,7 +380,7 @@ def _supplied_analysis(statement: Query) -> QueryAnalysis:
         ("an upper bound that is a float", {"min_hops": 1, "max_hops": 2.5}),
         ("an upper bound past the ceiling", {"min_hops": 1, "max_hops": 10_000}),
         ("a negative lower bound", {"min_hops": -1, "max_hops": 3}),
-        ("a lower bound above the upper", {"min_hops": 5, "max_hops": 2}),
+        ("a lower bound above the ceiling even with an empty interval", {"min_hops": 31, "max_hops": 2}),
         ("an object that refuses to be read", {"min_hops": 1, "max_hops": _Hostile()}),
         (
             "a written flag that is not a bool",

@@ -71,7 +71,8 @@ def test_json_has_exact_typed_values_and_no_private_capabilities():
         "ts": {"type": "timestamp", "micros": "-5"}, "uuid": {"type": "uuid", "hex": "61" * 16},
         "vector": {"type": "vector", "dtype": "float64", "space_ref": "1", "components": [1.0, 2.0]},
     }
-    assert set(exported) == {"format", "identity", "label", "properties", "provenance"}
+    assert set(exported) == {"format", "identity", "label", "labels", "properties", "provenance"}
+    assert exported["labels"] == ["N"]
 
 
 @pytest.mark.parametrize("value", [object(), lambda: None, float("nan"), float("inf"), 1 << 63,

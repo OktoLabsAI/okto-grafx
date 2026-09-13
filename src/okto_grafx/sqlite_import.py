@@ -8,6 +8,7 @@ import os
 import sqlite3
 
 from okto_grafx.domain.model.value import encode_value
+from okto_grafx.domain.model.stored_types import StoredType
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.engine.database import Transaction, ExecuteManyReport
 from okto_grafx.errors import (
@@ -52,16 +53,21 @@ def read_sqlite_rows(
     allowed_root: str | os.PathLike[str],
     query: str,
     columns: tuple[str, ...],
-    types: tuple[str, ...],
+    types: tuple[str | StoredType, ...],
     parameters: tuple = (),
     limits: SQLiteImportLimits = SQLiteImportLimits(),
     cancellation: CancellationToken | None = None,
 ) -> tuple[dict[str, object], ...]:
-    """Read one bounded SELECT; SQL NULL stays None; no source connection survives return."""
+    """Read one bounded SELECT; SQL NULL stays None; source closes before return.
+
+    Explicit temporal/DECIMAL types decode canonical tagged JSON from TEXT,
+    preserving coordinates and p/s without inference, float casts or zone lookup.
+    StoredType collections require TEXT containing exact collection JSON or SQL NULL.
+    """
     if type(limits) is not SQLiteImportLimits:
         raise GrafxConfigurationError("Expected SQLiteImportLimits.", field="limits")
     conversion = TextImportLimits(max_field_bytes=limits.max_field_bytes)
-    _declarations(columns, types, conversion)
+    types = _declarations(columns, types, conversion)
     if type(query) is not str or not query or len(query) > 65536:
         raise GrafxConfigurationError("Declare bounded SQL query.", field="query")
     if (
@@ -167,10 +173,15 @@ def read_sqlite_rows(
                             "SQLite BYTES requires BLOB.", field="types"
                         )
                 else:
+                    if type(kind) is StoredType and value is not None and type(value) is not str:
+                        raise GrafxUnsupportedOperation("SQLite collections require JSON TEXT.", field="types", row=number, column=name)
                     if kind == "BOOL" and type(value) is int and value in (0, 1):
                         value = bool(value)
                     value = _value(value, kind, False, number, name, conversion)
-                size += len(encode_value(value)) + len(name.encode("utf-8")) + 64
+                encoded_size = len(encode_value(value))
+                if type(kind) is StoredType:
+                    work.step(encoded_size)
+                size += encoded_size + len(name.encode("utf-8")) + 64
                 if size > limits.max_bytes:
                     raise GrafxQueryBudgetExceeded(
                         "SQLite byte bound exceeded.", resource="sqlite_bytes"
@@ -199,7 +210,7 @@ def import_sqlite(
     allowed_root: str | os.PathLike[str],
     query: str,
     columns: tuple[str, ...],
-    types: tuple[str, ...],
+    types: tuple[str | StoredType, ...],
     parameters: tuple = (),
     limits: SQLiteImportLimits = SQLiteImportLimits(),
     cancellation: CancellationToken | None = None,

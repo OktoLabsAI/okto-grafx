@@ -1,4 +1,4 @@
-"""Optional bounded scalar/vector Arrow interop with explicit ownership and atomic import."""
+"""Bounded scalar/vector/temporal/decimal/collection interop with atomic import."""
 
 from __future__ import annotations
 
@@ -8,13 +8,41 @@ from typing import TYPE_CHECKING
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxUnsupportedOperation, GrafxQueryBudgetExceeded
 from okto_grafx.domain.model.value import Timestamp, Uuid, VectorValue, MAX_VECTOR_DIMENSION, encode_value
+from okto_grafx.domain.model.decimal_values import DecimalValue
+from okto_grafx.domain.model.stored_types import StoredType, validate_typed_value
+from okto_grafx._arrow_values import (
+    _decimal_to_arrow, _decimal_from_arrow, _own_collections, _collection_metadata,
+    _collection_type, _CollectionBudget, _collection_to_arrow, _collection_from_arrow,
+    _collection_schema_charge,
+)
+from okto_grafx.domain.model.temporal_interchange import (
+    TEMPORAL_CLASSES_BY_NAME, temporal_components, temporal_from_components,
+)
 from okto_grafx.engine.database import QueryCursor, Transaction, ExecuteManyReport
 from okto_grafx.engine.query_engine import QueryResult
 
 if TYPE_CHECKING:
-    from pyarrow import RecordBatch
+    from pyarrow import DataType, RecordBatch, StructType
 
-__all__ = ["ArrowVectorType", "to_arrow_batches", "import_arrow_batches"]
+__all__ = ["ArrowDecimalType", "ArrowVectorType", "to_arrow_batches", "import_arrow_batches"]
+
+
+@dataclass(frozen=True, slots=True)
+class ArrowDecimalType:
+    """Exact DECIMAL(p,s) interchange declaration, represented by Arrow decimal128.
+
+    Precision is 1..38; scale is 0..precision. Native export values must carry
+    exactly these coordinates, including trailing-zero scale. No implicit cast.
+    """
+
+    precision: int
+    scale: int
+
+    def __post_init__(self) -> None:
+        if type(self.precision) is not int or not 1 <= self.precision <= 38:
+            raise GrafxConfigurationError("Decimal precision must be 1..38.", field="precision")
+        if type(self.scale) is not int or not 0 <= self.scale <= self.precision:
+            raise GrafxConfigurationError("Decimal scale must be 0..precision.", field="scale")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,15 +63,51 @@ class ArrowVectorType:
 
 
 def _metadata(kind):
+    if type(kind) is StoredType:
+        return _collection_metadata(kind)
+    if type(kind) is ArrowDecimalType:
+        kind.__post_init__()  # Revalidate even a forged frozen descriptor.
+        return {b"grafx.type": b"DECIMAL", b"grafx.decimal": b"decimal128-v1"}
     if type(kind) is ArrowVectorType:
         return {b"grafx.type": b"VECTOR_F32" if kind.dtype == "float32" else b"VECTOR_F64",
                 b"grafx.space_ref": str(kind.space_ref).encode("ascii"),
                 b"grafx.dimension": str(kind.dimension).encode("ascii"),
                 b"grafx.dtype": kind.dtype.encode("ascii")}
+    if kind in TEMPORAL_CLASSES_BY_NAME:
+        return {b"grafx.type": kind.encode("ascii"), b"grafx.temporal": b"components-v1"}
     return {b"grafx.type": kind.encode("ascii")}
 
 
+def _structured(kind):
+    return type(kind) in (ArrowVectorType, ArrowDecimalType, StoredType) or kind in TEMPORAL_CLASSES_BY_NAME
+
+
+def _scalar_arrow_types(pa):
+    """Use exact coordinates, not narrow Arrow/host datetime calendar ranges."""
+    i64, i32 = pa.int64(), pa.int32()
+
+    def record(*fields: tuple[str, DataType]) -> StructType:
+        # Portable physical nullability: Polars/Parquet may make children nullable.
+        # Native import rejects null coordinates inside a valid parent, except zone.
+        """Build an Arrow struct with the declared ordered native temporal fields."""
+        return pa.struct([pa.field(name, dtype) for name, dtype in fields])
+
+    return {"BOOL": pa.bool_(), "INT64": i64, "DOUBLE": pa.float64(), "STRING": pa.string(),
+            "BYTES": pa.binary(), "TIMESTAMP": pa.timestamp("us", tz="UTC"), "UUID": pa.binary(16),
+            "DATE": record(("epoch_day", i64)),
+            "LOCALTIME": record(("nanoseconds", i64)),
+            "TIME": record(("nanoseconds", i64), ("offset_seconds", i32)),
+            "LOCALDATETIME": record(("epoch_day", i64), ("nanoseconds", i64)),
+            "DATETIME": record(("epoch_seconds", i64), ("nanosecond", i32), ("offset_seconds", i32), ("zone", pa.string())),
+            "DURATION": record(("months", i64), ("days", i64), ("seconds", i64), ("nanoseconds", i32))}
+
+
 def _arrow_type(kind, pa, scalars):
+    if type(kind) is StoredType:
+        return _collection_type(kind, pa, scalars)
+    if type(kind) is ArrowDecimalType:
+        kind.__post_init__()
+        return pa.decimal128(kind.precision, kind.scale)
     if type(kind) is ArrowVectorType:
         return pa.list_(pa.float32() if kind.dtype == "float32" else pa.float64(), kind.dimension)
     return scalars[kind]
@@ -51,15 +115,21 @@ def _arrow_type(kind, pa, scalars):
 
 def import_arrow_batches(
     transaction: Transaction, statement: str, batches: Iterable[RecordBatch], *,
-    types: tuple[str | ArrowVectorType, ...], max_batch_rows: int = 65536,
+    types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int = 65536,
     max_batch_bytes: int = 16 * 1024 * 1024, max_rows: int = 1_000_000,
     max_batches: int = 4096,
 ) -> ExecuteManyReport:
-    """Atomically stage typed scalar/vector batches as named parameters, without committing.
+    """Atomically stage typed scalar/vector/temporal/decimal/collection batches.
 
     One executemany savepoint covers the whole call. Any later malformed batch or
     bound refusal discards this call, preserving prior transaction staging. The
     caller owns source iteration, transaction lifetime, commit and retries.
+    Native temporal types use components-v1 structs with mandatory metadata;
+    required coordinates cannot be NULL inside a non-NULL temporal value.
+    ArrowDecimalType requires decimal128 with exact p/s and decimal128-v1 metadata;
+    native assignment to a different destination declaration remains exact only.
+    Collection-root StoredType requires nested-v1 physical types and the complete
+    descriptor metadata. Nested ANY uses canonical native-value-v1 binary leaves.
     """
     if type(transaction) is not Transaction:
         raise GrafxConfigurationError("Arrow import needs a native transaction.", field="transaction")
@@ -68,17 +138,19 @@ def import_arrow_batches(
             ("max_batches", max_batches, 2**31)):
         if type(value) is not int or not 1 <= value <= maximum:
             raise GrafxConfigurationError("Invalid Arrow import bound.", field=name)
-    allowed = {"BOOL", "INT64", "DOUBLE", "STRING", "BYTES", "TIMESTAMP", "UUID"}
+    types = _own_collections(types)
+    schema_charge = _collection_schema_charge(types)
+    if schema_charge > max_batch_bytes:
+        raise GrafxQueryBudgetExceeded("Arrow collection schema budget exceeded.", resource="arrow_import")
+    allowed = {"BOOL", "INT64", "DOUBLE", "STRING", "BYTES", "TIMESTAMP", "UUID", *TEMPORAL_CLASSES_BY_NAME}
     if (type(types) is not tuple or not 1 <= len(types) <= 256
-            or any(type(kind) is not ArrowVectorType and (type(kind) is not str or kind not in allowed) for kind in types)):
+            or any(type(kind) not in (ArrowVectorType, ArrowDecimalType, StoredType) and (type(kind) is not str or kind not in allowed) for kind in types)):
         raise GrafxConfigurationError("Arrow import requires 1..256 explicit native types.", field="types")
     try:
         import pyarrow as pa
     except ImportError as failure:
         raise GrafxUnsupportedOperation("Install okto-grafx[arrow] for Arrow import.", field="arrow") from failure
-    expected = {"BOOL": pa.bool_(), "INT64": pa.int64(), "DOUBLE": pa.float64(),
-                "STRING": pa.string(), "BYTES": pa.binary(), "TIMESTAMP": pa.timestamp("us", tz="UTC"),
-                "UUID": pa.binary(16)}
+    expected = _scalar_arrow_types(pa)
 
     def parameters() -> Iterator[dict[str, object]]:
         """Validate/copy at most one bounded input batch inside the native savepoint."""
@@ -98,21 +170,30 @@ def import_arrow_batches(
                 metadata = field.metadata or {}
                 required = _metadata(kind)
                 bad_metadata = (any(metadata.get(k) != v for k, v in required.items())
-                                if type(kind) is ArrowVectorType else
+                                if _structured(kind) else
                                 b"grafx.type" in metadata and metadata[b"grafx.type"] != required[b"grafx.type"])
                 if field.type != _arrow_type(kind, pa, expected) or bad_metadata:
                     raise GrafxUnsupportedOperation("Arrow schema differs from explicit native types.", field="types", column=field.name, batch=batch_index)
-            multiplier = 16 if any(type(kind) is ArrowVectorType for kind in types) else 4
-            charge = 256 + 256 * len(types) + 80 * batch.num_rows * len(types) + multiplier * batch.nbytes
+            multiplier = 16 if any(_structured(kind) for kind in types) else 4
+            charge = 256 + schema_charge + 256 * len(types) + 80 * batch.num_rows * len(types) + multiplier * batch.nbytes
+            charge += 1024 * batch.num_rows * sum(type(kind) is ArrowDecimalType for kind in types)
             rows += batch.num_rows
             if batch.num_rows > max_batch_rows or charge > max_batch_bytes or rows > max_rows:
                 raise GrafxQueryBudgetExceeded("Arrow import rows/logical memory exceeded.", resource="arrow_import", batch=batch_index)
+            nested_budget = _CollectionBudget(max_batch_bytes - charge)
             for row in range(batch.num_rows):
                 values = {}
                 for column, (name, kind) in enumerate(zip(names, types)):
                     scalar = batch.column(column)[row]
+                    if type(kind) is StoredType:
+                        value = _collection_from_arrow(kind, scalar, pa, nested_budget)
+                        validate_typed_value(kind, value)
+                        values[name] = value
+                        continue
                     value = (None if not scalar.is_valid else
+                             _decimal_from_arrow(scalar.as_py(), kind) if type(kind) is ArrowDecimalType else
                              VectorValue(tuple(scalar.as_py()), kind.space_ref, kind.dtype) if type(kind) is ArrowVectorType else
+                             temporal_from_components(kind, scalar.as_py()) if kind in TEMPORAL_CLASSES_BY_NAME else
                              Timestamp(scalar.cast(pa.int64()).as_py()) if kind == "TIMESTAMP" else
                              Uuid(scalar.as_py()) if kind == "UUID" else scalar.as_py())
                     encode_value(value)
@@ -123,28 +204,38 @@ def import_arrow_batches(
 
 
 def to_arrow_batches(
-    source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...], batch_rows: int = 256,
+    source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], batch_rows: int = 256,
     max_batch_bytes: int = 16 * 1024 * 1024,
 ) -> Iterator[RecordBatch]:
-    """Yield copied typed batches; caller owns cursor lifetime and already-emitted batches."""
+    """Yield copied typed batches; caller owns cursor lifetime and emitted batches.
+
+    Temporal types use exact components-v1 structs, not host datetime objects or
+    narrow Arrow timestamps. Explicit types/metadata preserve recorded zones.
+    ArrowDecimalType exports exact native DecimalValue coordinates to decimal128,
+    without host-context arithmetic, inference or precision/scale coercion.
+    Collection StoredType declarations are detached at iterator admission. ARRAY
+    length and nested nullability remain exact even with portable nullable lists.
+    """
     if type(source) not in (QueryResult, QueryCursor):
         raise GrafxConfigurationError("Arrow source must be a native result or cursor.", field="source")
+    types = _own_collections(types)
     allowed = {"BOOL": bool, "INT64": int, "DOUBLE": float, "STRING": str, "BYTES": bytes,
-               "TIMESTAMP": Timestamp, "UUID": Uuid}
+               "TIMESTAMP": Timestamp, "UUID": Uuid, **TEMPORAL_CLASSES_BY_NAME}
     if (type(types) is not tuple or len(types) != len(source.columns)
-            or any(type(kind) is not ArrowVectorType and (type(kind) is not str or kind not in allowed) for kind in types)):
+            or any(type(kind) not in (ArrowVectorType, ArrowDecimalType, StoredType) and (type(kind) is not str or kind not in allowed) for kind in types)):
         raise GrafxConfigurationError("Arrow export needs one supported native type per column.", field="types")
     if type(batch_rows) is not int or not 1 <= batch_rows <= 65536:
         raise GrafxConfigurationError("batch_rows must be 1..65536.", field="batch_rows")
     if type(max_batch_bytes) is not int or not 1 <= max_batch_bytes <= 2**31:
         raise GrafxConfigurationError("Invalid Arrow batch budget.", field="max_batch_bytes")
+    schema_charge = _collection_schema_charge(types)
+    if schema_charge > max_batch_bytes:
+        raise GrafxQueryBudgetExceeded("Arrow collection schema budget exceeded.", resource="arrow_batch")
     try:
         import pyarrow as pa
     except ImportError as failure:
         raise GrafxUnsupportedOperation("Install okto-grafx[arrow] for Arrow export.", field="arrow") from failure
-    arrow_types = {"BOOL": pa.bool_(), "INT64": pa.int64(), "DOUBLE": pa.float64(),
-                   "STRING": pa.string(), "BYTES": pa.binary(), "TIMESTAMP": pa.timestamp("us", tz="UTC"),
-                   "UUID": pa.binary(16)}
+    arrow_types = _scalar_arrow_types(pa)
     schema = pa.schema([pa.field(name, _arrow_type(kind, pa, arrow_types), nullable=True,
                                 metadata=_metadata(kind))
                         for name, kind in zip(source.columns, types)])
@@ -159,19 +250,32 @@ def to_arrow_batches(
             return
         if not types:
             raise GrafxUnsupportedOperation("Arrow export requires columns for non-empty rows.", field="types")
-        cost = 256 + len(types) * 256
+        cost = 256 + schema_charge + len(types) * 256
         columns = [[] for _ in types]
         for row in rows:
             if type(row) is not tuple or len(row) != len(types):
                 raise GrafxConfigurationError("Malformed Arrow source row.", field="rows")
             for column, (value, kind) in enumerate(zip(row, types)):
+                if type(kind) is StoredType:
+                    nested_budget = _CollectionBudget(max_batch_bytes - cost)
+                    nested_budget.native(value)
+                    validate_typed_value(kind, value)
+                    cost += nested_budget.used
+                    columns[column].append(_collection_to_arrow(kind, value))
+                    continue
                 vector = type(kind) is ArrowVectorType
-                if value is not None and type(value) is not (VectorValue if vector else allowed[kind]):
+                decimal = type(kind) is ArrowDecimalType
+                if value is not None and type(value) is not (VectorValue if vector else DecimalValue if decimal else allowed[kind]):
                     raise GrafxUnsupportedOperation("Arrow value differs from the explicit scalar schema.", field="types", column=source.columns[column])
                 if vector and value is not None and (value.space_ref != kind.space_ref or value.dtype != kind.dtype
                                                       or len(value.values) != kind.dimension):
                     raise GrafxUnsupportedOperation("Vector differs from its explicit Arrow descriptor.", field="types", column=source.columns[column])
+                if decimal and value is not None and (value.precision != kind.precision or value.scale != kind.scale):
+                    raise GrafxUnsupportedOperation("Decimal differs from its explicit Arrow descriptor.", field="types", column=source.columns[column])
                 cost += 64 + (128 + 32 * kind.dimension if vector else
+                              1024 if decimal else
+                              1024 + (4 * len(value.zone) if kind == "DATETIME" and value is not None and value.zone else 0)
+                              if kind in TEMPORAL_CLASSES_BY_NAME else
                               4 * len(value) if type(value) is str else len(value) if type(value) is bytes else 16)
                 if cost > max_batch_bytes:
                     raise GrafxQueryBudgetExceeded("Arrow logical batch budget exceeded.", resource="arrow_batch")
@@ -181,6 +285,8 @@ def to_arrow_batches(
                     except Exception as failure:
                         raise GrafxUnsupportedOperation("Arrow source violates the native scalar contract.", field="types") from failure
                 columns[column].append(value.values if type(value) is VectorValue else
+                                       _decimal_to_arrow(value) if value is not None and decimal else
+                                       temporal_components(value) if value is not None and kind in TEMPORAL_CLASSES_BY_NAME else
                                        value.micros if type(value) is Timestamp else value.raw if type(value) is Uuid else value)
         try:
             arrays = [pa.array(values, type=_arrow_type(kind, pa, arrow_types), safe=True, from_pandas=False)

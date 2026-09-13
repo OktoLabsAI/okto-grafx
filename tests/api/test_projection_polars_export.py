@@ -56,6 +56,7 @@ def test_polars_scalar_vector_null_nan_and_atomic_import():
     )
     frame = to_polars(source, types=kinds, batch_rows=1)
     assert type(frame.frame) is pl.DataFrame
+    assert math.isnan(frame.frame[0, "f"]) and frame.frame[1, "f"] is None
     with connect(":memory:") as db:
         with db.begin() as tx:
             tx.execute("CREATE VECTOR SPACE emb {dimension:2,metric:'cosine'}")
@@ -63,11 +64,19 @@ def test_polars_scalar_vector_null_nan_and_atomic_import():
                 "CREATE NODE TABLE N(id INT64,v VECTOR(emb),f DOUBLE,s STRING,u UUID,PRIMARY KEY(id))"
             )
         with db.begin() as tx:
+            with pytest.raises(GrafxError):
+                import_polars(tx, "CREATE (:N {id:$id,v:$v,f:$f,s:$s,u:$u})",
+                              frame, types=kinds, max_batch_rows=1)
+            assert tx.execute("MATCH (n:N) RETURN count(n)").rows == ((0,),)
+        finite_source = QueryResult(source.columns,
+            ((1, source.rows[0][1], 1.5, "hi", source.rows[0][4]), source.rows[1]))
+        finite_frame = to_polars(finite_source, types=kinds, batch_rows=1)
+        with db.begin() as tx:
             assert (
                 import_polars(
                     tx,
                     "CREATE (:N {id:$id,v:$v,f:$f,s:$s,u:$u})",
-                    frame,
+                    finite_frame,
                     types=kinds,
                     max_batch_rows=1,
                 ).statements
@@ -76,7 +85,7 @@ def test_polars_scalar_vector_null_nan_and_atomic_import():
         actual = db.execute(
             "MATCH (n:N) RETURN n.id,n.v,n.f,n.s,n.u ORDER BY n.id"
         ).rows
-        assert actual[0][1] == source.rows[0][1] and math.isnan(actual[0][2])
+        assert actual[0] == finite_source.rows[0]
         assert actual[1] == source.rows[1]
         with db.begin() as tx:
             tx.execute("CREATE (:N {id:99})")

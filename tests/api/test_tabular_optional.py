@@ -1,4 +1,4 @@
-"""Optional interop imports must not contaminate a dependency-free consumer."""
+"""Optional interop imports must not contaminate a pure-backend consumer."""
 
 from pathlib import Path
 import subprocess
@@ -6,9 +6,17 @@ import sys
 
 
 def test_bare_source_typed_optional_refusals():
+    import tzdata
     source = str(Path(__file__).resolve().parents[2] / "src")
     code = """
 import sys
+import importlib.util
+# Load only the declared required timezone package, not its site-packages root.
+# -I -S must still keep every optional interop/acceleration package unavailable.
+spec = importlib.util.spec_from_file_location('tzdata', TZDATA_INIT)
+tzdata = importlib.util.module_from_spec(spec)
+sys.modules['tzdata'] = tzdata
+spec.loader.exec_module(tzdata)
 sys.path.insert(0, SOURCE)
 from okto_grafx import QueryResult, connect
 from okto_grafx.projections import project_graph
@@ -42,6 +50,6 @@ with connect(':memory:', codec='pure', vector_math='pure', checksum='pure') as d
         else:
             raise AssertionError('selected absent dependency was not refused')
 assert not any(n in sys.modules for n in ('numpy', 'pandas', 'pyarrow', 'polars', 'networkx'))
-""".replace("SOURCE", repr(source))
+""".replace("SOURCE", repr(source)).replace("TZDATA_INIT", repr(tzdata.__file__))
     completed = subprocess.run([sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, timeout=30)
     assert completed.returncode == 0, completed.stdout + completed.stderr

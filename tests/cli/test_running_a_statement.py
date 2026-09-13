@@ -27,10 +27,8 @@ from tests.cli.conftest import TABLE_STATEMENT, CliRunner
 INSERT_STATEMENT: str = "CREATE (:Person {id: 1, name: 'Ada'})"
 """A row write. It landed mid-build, so nothing here asserts that it refuses."""
 
-UNKNOWN_LABEL_STATEMENT: str = "MATCH (p:NoSuchTable) RETURN p.name"
-"""A statement the planner refuses whatever else this build can do, used to pin how a refusal
-is rendered. Choosing a refusal that cannot become supported is the difference between a test
-about rendering and a test that quietly starts measuring nothing (A48)."""
+UNBOUND_VARIABLE_STATEMENT: str = "RETURN NoSuchVariable"
+"""A true scope error; an unknown label now legitimately yields an empty match."""
 
 
 def test_a_read_query_prints_its_columns_and_its_row_count(
@@ -80,12 +78,12 @@ def test_a_schema_statement_without_the_write_flag_is_refused(
 def test_a_typed_refusal_is_printed_as_a_refusal_with_its_code(
     database_path: str, cli: CliRunner
 ) -> None:
-    run = cli("query", database_path, UNKNOWN_LABEL_STATEMENT)
+    run = cli("query", database_path, UNBOUND_VARIABLE_STATEMENT)
     assert run.code == REFUSED
     assert "refused" in run.err
     assert "plan_error" in run.err
     assert "will not succeed if tried again" in run.err
-    assert "NoSuchTable" in run.err
+    assert "NoSuchVariable" in run.err
     assert "Traceback" not in run.text
     assert run.out == ""
 
@@ -93,7 +91,7 @@ def test_a_typed_refusal_is_printed_as_a_refusal_with_its_code(
 def test_a_typed_refusal_carries_its_taxonomy_into_the_document(
     database_path: str, cli: CliRunner
 ) -> None:
-    document = cli("query", database_path, UNKNOWN_LABEL_STATEMENT, "--json").document
+    document = cli("query", database_path, UNBOUND_VARIABLE_STATEMENT, "--json").document
     error = document["error"]
     assert error["code"] == "plan_error"
     assert error["type"] == "GrafxPlanError"
@@ -217,7 +215,7 @@ def test_rows_staged_in_a_transaction_that_refuses_are_discarded(
     # reported and deliberately does NOT assert, because asserting a defect freezes it.
     path = str(tmp_path / "rollback")
     assert cli("query", path, TABLE_STATEMENT, "--write", "--create").code == OK
-    refused = cli("query", path, INSERT_STATEMENT, UNKNOWN_LABEL_STATEMENT, "--write")
+    refused = cli("query", path, INSERT_STATEMENT, UNBOUND_VARIABLE_STATEMENT, "--write")
     assert refused.code == REFUSED
     assert "plan_error" in refused.err
     after = cli("query", path, "MATCH (p:Person) RETURN p.id", "--json")
@@ -293,7 +291,7 @@ def test_a_refusal_the_write_flag_would_not_fix_carries_no_hint(
 ) -> None:
     # A hint that fires on every refusal is noise, and a hint that names a remedy which would
     # not have helped is worse than none. This one is keyed on the class and the command line.
-    plan = cli("query", database_path, UNKNOWN_LABEL_STATEMENT)
+    plan = cli("query", database_path, UNBOUND_VARIABLE_STATEMENT)
     assert plan.code == REFUSED
     assert "hint" not in plan.err
     written = cli("query", database_path, INSERT_STATEMENT, "--write")

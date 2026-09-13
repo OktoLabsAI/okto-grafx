@@ -280,14 +280,12 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
             or not reader.active or reader.mode != "read"):
         raise GrafxTransactionStateError("Projection requires an active read transaction from this handle.")
     catalog = database.catalog.catalog
-    definitions = tuple(catalog.table(n) for n in node_tables + relationship_tables)
+    definitions = (tuple(catalog.table(n, kind="node") for n in node_tables)
+                   + tuple(catalog.table(n, kind="rel") for n in relationship_tables))
     for table in definitions:
         work.step()
-        if table.name in node_tables:
-            if table.kind != "node":
-                raise GrafxConfigurationError("Expected a node table.", table=table.name)
-        elif (table.kind != "rel" or table.from_table not in node_tables
-              or table.to_table not in node_tables):
+        if table.kind == "rel" and (table.from_table not in node_tables
+                                    or table.to_table not in node_tables):
             raise GrafxConfigurationError("Relationship endpoints must both be selected node tables.", table=table.name)
         if table.kind == "rel" and weight_columns is not None:
             column = table.columns[table.column_index(weight_columns[table.name])]
@@ -312,7 +310,7 @@ def project_graph(database: Database, reader: Transaction | None = None, *,
                          max(1e-12, control._deadline - database._clock.monotonic()))
             selected_columns = (() if table.kind == "node" else ("_from", "_to") if weight_columns is None
                                 else ("_from", "_to", weight_columns[table.name]))
-            page = reader.scan_rows_v1(table.name, limit=limits.batch_rows, cursor=cursor,
+            page = reader.scan_rows_v1(table.name, kind=table.kind, limit=limits.batch_rows, cursor=cursor,
                                       columns=selected_columns,
                                       max_batch_bytes=limits.max_batch_bytes, cancellation=cancellation,
                                       timeout_seconds=remaining)

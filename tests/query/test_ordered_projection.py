@@ -60,7 +60,8 @@ def test_requested_large_values_are_materialized(db):
 def test_omitted_malformed_vector_refuses_like_full_decoder(db, monkeypatch):
     original = HeapStore._validated_payload
     def malformed(heap, table, header, content):
-        return original(heap, table, header, content)[:-1]
+        payload, labels = original(heap, table, header, content)
+        return payload[:-1], labels
     monkeypatch.setattr(HeapStore, "_validated_payload", malformed)
     with pytest.raises(GrafxCorruptionDetected) as projected:
         db.execute(PAGE, {"minimum": 0.5})

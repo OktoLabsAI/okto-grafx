@@ -7,7 +7,7 @@ import hashlib
 import okto_grafx
 from okto_grafx.errors import GrafxError, GrafxParseError, GrafxPlanError
 from okto_grafx.domain.query.analysis import analyze
-from okto_grafx.domain.query.ast import ProcedureCall, Query, SubqueryClause, UnionQuery
+from okto_grafx.domain.query.ast import CreateRelTableStatement, ProcedureCall, Query, SubqueryClause, UnionQuery
 from okto_grafx.domain.query.parser import parse
 
 if __package__:
@@ -32,6 +32,13 @@ def _reference_result_value(value):
     Typed absent properties are stored as NULL and do not count as TCK properties,
     consistently with the separate scan-based effects observer below.
     """
+    # Temporal1/2/... express native temporal expected values as quoted ISO text.
+    # Render only exact native temporal DTOs; do not evaluate expected expressions
+    # or coerce arbitrary host objects. Engine/API tests separately prove native
+    # result types and durable tags, which TCK's quoted notation cannot distinguish.
+    if type(value) in (okto_grafx.DateValue, okto_grafx.LocalTimeValue, okto_grafx.TimeValue,
+                       okto_grafx.LocalDateTimeValue, okto_grafx.DateTimeValue, okto_grafx.DurationValue):
+        return value.isoformat()
     if type(value) is okto_grafx.NodeValue:
         return ReferenceNode(frozenset(value.labels), tuple(sorted(
             (key, _reference_result_value(item)) for key, item in value.properties.items() if item is not None)))
@@ -114,12 +121,25 @@ class NativeScenarioBackend:
         if self.infer_schema:
             if self.schema:
                 raise ValueError("Choose explicit or inferred fixture schema, not both")
-            self.schema = infer_fixture_schema({"steps": inference_steps})
-            self.adaptations = tuple(f"Inferred fixture schema: {ddl}" for ddl in self.schema)
+            has_fixture = any(step["text"] == "having executed:" for step in inference_steps)
+            try:
+                self.schema = infer_fixture_schema({"steps": inference_steps}, allow_initial_create=True)
+            except ValueError:
+                if has_fixture:
+                    raise
+                # Failure to infer an action's schema is not a new runner exclusion.
+                # Run the original action without invented schema and observe its error.
+                self.schema = ()
+            source = "fixture" if has_fixture else "initial CREATE"
+            self.adaptations = tuple(f"Inferred {source} schema: {ddl}" for ddl in self.schema)
         self.temporary = TemporaryDirectory(prefix="grafx-tck-stateful-")
         self.path = Path(self.temporary.name) / "graph"
         self.database = okto_grafx.connect(self.path, extensions=self.extensions)
         if self.schema:
+            if any(isinstance(statement := parse(ddl), CreateRelTableStatement)
+                   and statement.endpoint_pairs for ddl in self.schema):
+                self.database.maintenance.ensure_identity_indexes()
+                self.adaptations += ("Explicit native catalog-v2 activation for relationship groups",)
             with self.database.begin("write") as transaction:
                 for ddl in self.schema:
                     transaction.execute(ddl)
@@ -140,7 +160,12 @@ class NativeScenarioBackend:
             return QueryObservation(error=compile_error(exc))
         attempted_write = _attempts_write(statement)
         try:
-            analyze(statement)
+            from okto_grafx.domain.query.procedure_resolution import resolve_procedure_calls
+            procedures = {} if self.extensions is None else {
+                item.name: item for item in self.extensions.procedures
+                if item.required_permissions <= self.extensions.procedure_permissions
+            }
+            analyze(resolve_procedure_calls(statement, procedures))
         except (GrafxParseError, GrafxPlanError) as exc:
             return QueryObservation(error=compile_error(exc), attempted_write=attempted_write)
         try:
@@ -166,10 +191,16 @@ class NativeScenarioBackend:
                         identity = (table.kind, table.table_id, row.record_id)
                         if table.kind == "node":
                             nodes.append(identity)
-                            labels.add(table.name)
+                            actual_labels = row.node_labels
+                            if actual_labels is None:
+                                actual_labels = () if table.unlabeled else (table.name,)
+                            labels.update(actual_labels)
                         else:
                             relationships.append((identity, table.from_table, row.values[0],
                                                   table.to_table, row.values[1]))
+                        if table.flexible_properties:
+                            properties.extend((identity, key, canonical_value(value)) for key, value in row.values[-1].items())
+                            continue
                         for column, value in zip(table.columns, row.values, strict=True):
                             if value is not None and not (table.kind == "rel" and column.name in {"_from", "_to"}):
                                 properties.append((identity, column.name, canonical_value(value)))

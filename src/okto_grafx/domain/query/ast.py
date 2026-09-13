@@ -17,6 +17,8 @@ out of stack. :func:`walk` still carries its own bound, because a tree can also 
 
 from __future__ import annotations
 
+from okto_grafx.domain.model.stored_types import StoredType
+
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,6 +40,7 @@ __all__ = [
     "DeleteClause",
     "Direction",
     "Expression",
+    "ExistsSubquery",
     "FunctionCall",
     "ListExpression",
     "ListSlice",
@@ -50,8 +53,11 @@ __all__ = [
     "NamedArgument",
     "NodePattern",
     "NullCheck",
+    "LabelPredicate",
     "Parameter",
     "PatternPath",
+    "PatternPredicate",
+    "PatternComprehension",
     "Property",
     "Query",
     "ProcedureCall",
@@ -62,6 +68,7 @@ __all__ = [
     "ReturnItem",
     "SetClause",
     "SetItem",
+    "LabelSetItem",
     "SortItem",
     "Statement",
     "Subscript",
@@ -189,6 +196,23 @@ class BinaryOperation(Expression):
     def describe(self) -> str:
         """Return the parenthesised operation, so precedence is never ambiguous in a plan."""
         return f"({self.left.describe()} {self.operator} {self.right.describe()})"
+
+
+@dataclass(frozen=True, slots=True)
+class LabelPredicate(Expression):
+    """A node-label conjunction over one expression; NULL propagates."""
+
+    subject: Expression
+    labels: tuple[str, ...]
+
+    def children(self) -> tuple[Expression, ...]:
+        """Expose the label predicate's subject to expression traversal."""
+        return (self.subject,)
+
+    def describe(self) -> str:
+        """Render the subject and safely quoted label tests."""
+        labels = "".join(":`" + label.replace("`", "``") + "`" for label in self.labels)
+        return f"({self.subject.describe()}){labels}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,6 +513,9 @@ class RelationshipPattern:
     upper_bound_omitted: bool = False
     """The upper count is an execution ceiling, not a syntactic result bound."""
 
+    both_directions_written: bool = False
+    """Preserve double arrowheads: read-undirected, but not a valid writing direction."""
+
     @property
     def variable_length(self) -> bool:
         """Return True when this relationship may match more than one hop."""
@@ -505,6 +532,8 @@ class RelationshipPattern:
         if self.properties is not None:
             inner += f" {self.properties.describe()}"
         body = f"[{inner}]"
+        if self.both_directions_written:
+            return f"<-{body}->"
         if self.direction is Direction.OUTGOING:
             return f"-{body}->"
         if self.direction is Direction.INCOMING:
@@ -534,6 +563,75 @@ class PatternPath:
             parts.append(self.nodes[position + 1].describe())
         body = "".join(parts)
         return body if self.variable is None else f"{self.variable} = {body}"
+
+
+@dataclass(frozen=True, slots=True)
+class ExistsSubquery(Expression):
+    """A read-only query expression with lexical, non-exporting correlations."""
+
+    query: Query | UnionQuery
+    imports: tuple[tuple[str, str], ...] = ()
+
+    def children(self) -> tuple[Expression, ...]:
+        """Only outer dependencies belong to the enclosing expression scope."""
+        return tuple(Variable(source) for _target, source in self.imports)
+
+    def describe(self) -> str:
+        """Render the existential body inside an EXISTS subquery."""
+        return f"EXISTS {{ {self.query.describe()} }}"
+
+
+@dataclass(frozen=True, slots=True)
+class PatternPredicate(Expression):
+    """An existential pattern whose named entities are references, never declarations."""
+
+    pattern: PatternPath
+
+    def children(self) -> tuple[Expression, ...]:
+        """Expose pattern bindings and property maps for expression analysis."""
+        expressions: list[Expression] = []
+        for element in (*self.pattern.nodes, *self.pattern.relationships):
+            if element.variable is not None:
+                expressions.append(Variable(element.variable))
+            if element.properties is not None:
+                expressions.append(element.properties)
+        return tuple(expressions)
+
+    def describe(self) -> str:
+        """Render the graph pattern used as a predicate."""
+        return self.pattern.describe()
+
+
+@dataclass(frozen=True, slots=True)
+class PatternComprehension(Expression):
+    """A local pattern scope projected into a list; correlations resolve at planning."""
+
+    pattern: PatternPath
+    projection: Expression
+    predicate: Expression | None = None
+
+    def local_names(self) -> tuple[str, ...]:
+        """Names declared or potentially correlated by this pattern, not body free names."""
+        names = [element.variable for element in (*self.pattern.nodes, *self.pattern.relationships)
+                 if element.variable is not None]
+        if self.pattern.variable is not None:
+            names.append(self.pattern.variable)
+        return tuple(dict.fromkeys(names))
+
+    def children(self) -> tuple[Expression, ...]:
+        """Expose anchors, property maps, predicate and projection for scoped analysis."""
+        properties = tuple(element.properties for element in (*self.pattern.nodes, *self.pattern.relationships)
+                           if element.properties is not None)
+        condition = () if self.predicate is None else (self.predicate,)
+        # Dependency/projection proofs must see the graph entities used as anchors,
+        # even when the projection mentions only the captured path or a constant.
+        anchors = tuple(Variable(name) for name in self.local_names())
+        return (*anchors, *properties, *condition, self.projection)
+
+    def describe(self) -> str:
+        """Render the pattern comprehension with its optional filter and projection."""
+        condition = "" if self.predicate is None else f" WHERE {self.predicate.describe()}"
+        return f"[{self.pattern.describe()}{condition} | {self.projection.describe()}]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -643,40 +741,61 @@ class MergeClause(UpdatingClause):
     """A MERGE clause: match the pattern, or create it when nothing matches."""
 
     pattern: PatternPath
+    on_create: tuple[SetClause, ...] = ()
+    on_match: tuple[SetClause, ...] = ()
 
     def describe(self) -> str:
         """Return the clause as it would be written back."""
-        return f"MERGE {self.pattern.describe()}"
+        return (f"MERGE {self.pattern.describe()}"
+                + "".join(f" ON CREATE {clause.describe()}" for clause in self.on_create)
+                + "".join(f" ON MATCH {clause.describe()}" for clause in self.on_match))
 
 
 @dataclass(frozen=True, slots=True)
 class SetItem:
     """One assignment of a SET clause."""
 
-    target: Property
+    target: Property | Variable
     value: Expression
+    merge: bool = False
 
     def describe(self) -> str:
         """Return the assignment as it was written."""
-        return f"{self.target.describe()} = {self.value.describe()}"
+        return f"{self.target.describe()} {'+=' if self.merge else '='} {self.value.describe()}"
+
+
+@dataclass(frozen=True, slots=True)
+class LabelSetItem:
+    """One node-label addition/removal, ordered with property assignments."""
+
+    target: Variable
+    labels: tuple[str, ...]
+    remove: bool = False
+
+    def describe(self) -> str:
+        """Render logical names without treating them as table identifiers."""
+        return LabelPredicate(self.target, self.labels).describe()
 
 
 @dataclass(frozen=True, slots=True)
 class SetClause(UpdatingClause):
     """A SET clause and its assignments, applied in written order."""
 
-    items: tuple[SetItem, ...]
+    items: tuple[SetItem | LabelSetItem, ...]
+    keyword: str = "SET"
 
     def describe(self) -> str:
         """Return the clause as it would be written back."""
-        return "SET " + ", ".join(item.describe() for item in self.items)
+        return self.keyword + " " + ", ".join(
+            item.target.describe() if self.keyword == "REMOVE" and isinstance(item, SetItem)
+            else item.describe() for item in self.items)
 
 
 @dataclass(frozen=True, slots=True)
 class DeleteClause(UpdatingClause):
     """A DELETE clause, optionally detaching the relationships of the rows it removes."""
 
-    targets: tuple[Variable, ...]
+    targets: tuple[Expression, ...]
     detach: bool = False
 
     def describe(self) -> str:
@@ -730,6 +849,7 @@ class ReturnClause:
     sort_items: tuple[SortItem, ...] = ()
     skip: Expression | None = None
     limit: Expression | None = None
+    include_existing: bool = False
 
     def column_names(self) -> tuple[str, ...]:
         """Return the names of the columns this clause produces, in order."""
@@ -740,7 +860,8 @@ class ReturnClause:
         parts = ["RETURN"]
         if self.distinct:
             parts.append("DISTINCT")
-        parts.append(", ".join(item.describe() for item in self.items))
+        body = (["*"] if self.include_existing else []) + [item.describe() for item in self.items]
+        parts.append(", ".join(body))
         if self.sort_items:
             parts.append(
                 "ORDER BY " + ", ".join(item.describe() for item in self.sort_items)
@@ -792,32 +913,46 @@ class WithClause:
 
 @dataclass(frozen=True, slots=True)
 class ProcedureCall:
-    """An explicitly registered tabular CALL and named YIELD projection."""
+    """A registered CALL with explicit or standalone implicit invocation syntax."""
 
     name: str
     arguments: tuple[Expression, ...]
     yields: tuple[ReturnItem, ...]
     predicate: Expression | None = None
+    implicit_arguments: bool = False
+    yield_all: bool = False
+    standalone: bool = False
+    writes: bool = False
+    result_types: tuple[tuple[str, str], ...] = ()
+    deterministic: bool = False
 
     def describe(self) -> str:
         """Render a procedure call without conflating it with a subquery."""
-        body = f"CALL {self.name}({', '.join(arg.describe() for arg in self.arguments)})"
-        body += " YIELD " + ", ".join(item.describe() for item in self.yields)
+        body = f"CALL {self.name}"
+        if not self.implicit_arguments:
+            body += f"({', '.join(arg.describe() for arg in self.arguments)})"
+        if self.yield_all:
+            body += " YIELD *"
+        elif self.yields:
+            body += " YIELD " + ", ".join(item.describe() for item in self.yields)
         return body if self.predicate is None else body + f" WHERE {self.predicate.describe()}"
 
 
 @dataclass(frozen=True, slots=True)
 class SubqueryClause:
-    """A returning subquery with explicitly imported variables (language extension)."""
+    """A returning or unit subquery with explicitly imported variables."""
 
     query: Query | UnionQuery
     imports: tuple[str, ...] = ()
     outer_names: tuple[str, ...] = ()
     output_aliases: tuple[str, ...] = ()
+    import_mode: str = "explicit"
 
     def describe(self) -> str:
         """Render a CALL subquery, distinct from procedure CALL/YIELD."""
-        return f"CALL ({', '.join(self.imports)}) {{ {self.query.describe()} }}"
+        scope = "" if self.import_mode in ("with", "with_resolved") else (
+            " (*)" if self.import_mode == "all" else f" ({', '.join(self.imports)})")
+        return f"CALL{scope} {{ {self.query.describe()} }}"
 
 
 class Statement:
@@ -848,6 +983,9 @@ class Query(Statement):
     # retain their MATCH-then-WITH meaning without a new positional argument.
     read_clause_order: tuple[str, ...] = ()
     clause_pipeline: tuple[MatchClause | WithClause | UnwindClause | SubqueryClause | ProcedureCall | UpdatingClause, ...] = ()
+    # Resolved lexical admission, never an independent source of graph authority.
+    scope_imports: tuple[str, ...] | None = None
+    global_imports: tuple[str, ...] = ()
 
     def ordered_clauses(self) -> tuple[MatchClause | WithClause | UnwindClause | SubqueryClause | ProcedureCall | UpdatingClause, ...]:
         """Return the complete clause pipeline, preserving each projection/write boundary."""
@@ -866,8 +1004,8 @@ class Query(Statement):
 
     @property
     def writes(self) -> bool:
-        """Return True when this query changes anything."""
-        return bool(self.updating_clauses)
+        """Include nested effects; a CALL is not a read-only escape hatch."""
+        return _query_writes(self)
 
     def describe(self) -> str:
         """Return the query as it would be written back."""
@@ -884,6 +1022,11 @@ class UnionQuery(Statement):
     left: Query | UnionQuery
     right: Query | UnionQuery
     all: bool = False
+
+    @property
+    def writes(self) -> bool:
+        """Include every branch and nested CALL before effects are admitted."""
+        return _query_writes(self)
 
     def branches(self) -> tuple[Query, ...]:
         """Return leaves in execution order after analysis validates the tree."""
@@ -903,6 +1046,25 @@ class UnionQuery(Statement):
         return f"{self.left.describe()} {operator} {self.right.describe()}"
 
 
+def _query_writes(statement: Query | UnionQuery) -> bool:
+    pending = [statement]
+    seen: set[int] = set()
+    while pending:
+        query = pending.pop()
+        if id(query) in seen:
+            continue  # Structural validation separately refuses cyclic ASTs.
+        seen.add(id(query))
+        if isinstance(query, UnionQuery):
+            pending.extend((query.left, query.right))
+        elif isinstance(query, Query):
+            if query.updating_clauses or any(isinstance(clause, ProcedureCall) and clause.writes
+                                             for clause in query.ordered_clauses()):
+                return True
+            pending.extend(clause.query for clause in query.ordered_clauses()
+                           if isinstance(clause, SubqueryClause))
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class ColumnSpec:
     """One column of a table as the DDL declared it.
@@ -917,12 +1079,21 @@ class ColumnSpec:
     name: str
     type_name: str
     vector_space: str | None = None
+    decimal_precision: int | None = None
+    decimal_scale: int | None = None
+    stored_type: StoredType | None = None
+    nullable: bool | None = None
 
     def describe(self) -> str:
         """Return the column as it was written."""
+        if self.stored_type is not None:
+            return f"{self.name} {self.stored_type.describe()}"
+        suffix = " NOT NULL" if self.nullable is False else ""
+        if self.type_name == "DECIMAL":
+            return f"{self.name} DECIMAL({self.decimal_precision},{self.decimal_scale})" + suffix
         if self.vector_space is not None:
-            return f"{self.name} {self.type_name}({self.vector_space})"
-        return f"{self.name} {self.type_name}"
+            return f"{self.name} {self.type_name}({self.vector_space})" + suffix
+        return f"{self.name} {self.type_name}" + suffix
 
 
 @dataclass(frozen=True, slots=True)
@@ -980,12 +1151,15 @@ class CreateRelTableStatement(Statement):
     from_table: str
     to_table: str
     columns: tuple[ColumnSpec, ...] = ()
+    endpoint_pairs: tuple[tuple[str, str], ...] = ()
 
     def describe(self) -> str:
         """Return the statement as it would be written back."""
-        parts = [f"FROM {self.from_table} TO {self.to_table}"]
+        parts = [f"FROM {source} TO {target}" for source, target in
+                 (self.endpoint_pairs or ((self.from_table, self.to_table),))]
         parts.extend(column.describe() for column in self.columns)
-        return f"CREATE REL TABLE {self.name}({', '.join(parts)})"
+        group = "GROUP " if self.endpoint_pairs else ""
+        return f"CREATE REL TABLE {group}{self.name}({', '.join(parts)})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1048,7 +1222,12 @@ def free_variables(expression: Expression) -> tuple[str, ...]:
         if isinstance(node, Variable) and node.name not in bound and node.name not in seen:
             seen.add(node.name)
             found.append(node.name)
-        if isinstance(node, ListIteration):
+        if isinstance(node, PatternComprehension):
+            # Whether a named pattern endpoint is local or correlated requires
+            # the incoming query scope. Body-only names remain genuinely free.
+            local = bound | frozenset(node.local_names())
+            pending.extend((child, local, depth + 1) for child in reversed(node.children()))
+        elif isinstance(node, ListIteration):
             local = bound | {node.variable}
             if node.accumulator is not None:
                 local = local | {node.accumulator}

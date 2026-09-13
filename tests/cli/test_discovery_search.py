@@ -68,6 +68,12 @@ def test_inventory(cli, searchable):
     assert limited["truncated"] is True and limited["indexes"] == []
 
 
+def test_vector_unique_table_selector_and_kind(cli, searchable):
+    for options in (("--table", "Doc"), ("--table", "Doc", "--table-kind", "node")):
+        result = cli("search", "vector", searchable, *args("vector"), *options, "--json")
+        assert result.code == 0 and result.document["search"]["hits"], result.text
+
+
 def test_capabilities_and_no_creation(cli, tmp_path):
     result = cli("capabilities", "--json")
     assert result.code == 0

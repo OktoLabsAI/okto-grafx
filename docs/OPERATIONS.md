@@ -232,6 +232,14 @@ horizon, but deliberately excludes overflow-page bytes and keeps
 `vacuum_safety_established=False`: observing potential bloat neither mutates the database nor
 certifies that physical reclamation is safe.
 
+For `bloat` and `vacuum`, `table` accepts `None` (all tables), a unique string
+name, or `("node", name)` / `("rel", name)`. A bare ambiguous name refuses before
+mutation or capability activation. Each table report retains `table_id`; its
+`table` field is a qualified pair only when the current catalog contains both
+kinds with that name, otherwise the original string. Code serializing reports
+must handle both selector shapes. Qualification does not change the global
+reclamation horizon, quiescence requirement or snapshot-floor consequences.
+
 `db.maintenance.vacuum(table=None, *, confirm_quiescent=False, max_versions=None)` is the
 separate mutating operation. Vacuum v1 is manual and foreground. It refuses catalog v1,
 read-only handles, an open local transaction and every call that does not pass the exact

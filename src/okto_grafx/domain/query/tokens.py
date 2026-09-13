@@ -80,6 +80,7 @@ class Token:
 
 SYMBOLS: tuple[str, ...] = (
     "=>",
+    "+=",
     "<>",
     "!=",
     "<=",
@@ -179,9 +180,9 @@ rather than with a puzzling failure about an unexpected word.
 """
 
 AGGREGATE_FUNCTIONS: frozenset[str] = frozenset(
-    {"COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT"}
+    {"COUNT", "SUM", "AVG", "MIN", "MAX", "COLLECT", "PERCENTILEDISC", "PERCENTILECONT"}
 )
-"""The six aggregates CONTRACT.md section 8.9 freezes, compared case-insensitively."""
+"""Native aggregate functions, compared case-insensitively."""
 
 COALESCE_FUNCTION: str = "COALESCE"
 """The null-selection function required by the Pulse query contract 1.0."""

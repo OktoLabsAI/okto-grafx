@@ -15,6 +15,9 @@ TARGET = ROOT / "docs/API_REFERENCE.md"
 MARKER = "<!-- GENERATED PUBLIC REFERENCE: do not edit below -->"
 FACADES = {"Database", "Transaction", "Maintenance", "Query", "QueryCursor"}
 DTO_SOURCES = {
+    "domain/model/stored_types.py": {"StoredType"},
+    "domain/model/decimal_values.py": {"DecimalValue"},
+    "domain/model/relationship_type.py": {"RelationshipTypeDef"},
     "domain/temporal.py": {"TemporalCompactionReport", "TemporalGraph", "TemporalLimits", "TemporalPin", "TemporalPruneReport", "TemporalVersion", "TemporalVersions"},
     "views.py": {"ViewParameter", "ViewDefinition"},
     "catalog_copy.py": {"CopyLimits", "CopyTable", "CopyPackage", "CopyReceipt"},
@@ -27,8 +30,9 @@ DTO_SOURCES = {
     "polars.py": {"PolarsFrame"},
     "text_import.py": {"TextImportLimits"},
     "parquet.py": {"ParquetExportReport"},
-    "arrow.py": {"ArrowVectorType"},
+    "arrow.py": {"ArrowVectorType", "ArrowDecimalType"},
     "domain/query/extensions.py": {"ScalarFunction", "TabularProcedure", "ExtensionRegistry"},
+    "domain/query/procedure_writer.py": {"ProcedureResult"},
     "engine/vector_memory.py": {"VectorMemoryUsage", "VectorTotalMemoryUsage"},
     "engine/key_page_memo.py": {"KeyPageCacheUsage"},
     "migrations.py": {"SchemaMigration", "MigrationReport"},
@@ -71,6 +75,7 @@ DTO_SOURCES = {
 
 
 FUNCTION_SOURCES = {
+    "collection_json.py": {"collection_json_value", "collection_from_json_value"},
     "temporal_diff.py": {"diff_graph"},
     "catalog_copy.py": {"capture_copy", "prepare_copy_target", "copy_graph"},
     "workspace.py": {"resolve_workspace"},
@@ -139,6 +144,9 @@ def render() -> str:
             result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
     for cls in source_tree("views.py").body:
         if isinstance(cls, ast.ClassDef) and cls.name == "LogicalViews":
+            result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
+    for cls in source_tree("domain/query/procedure_writer.py").body:
+        if isinstance(cls, ast.ClassDef) and cls.name in ("ProcedureWriter", "ProcedureReader"):
             result.append(f"\n### {cls.name}\n\n{description(cls)}\n" + methods(cls))
     result.append("\n## Public factory and transfer functions\n\n")
     for relative, names in FUNCTION_SOURCES.items():

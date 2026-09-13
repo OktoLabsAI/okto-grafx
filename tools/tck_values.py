@@ -38,6 +38,15 @@ _TOKEN = re.compile(
 )
 
 
+def _string_literal(token: str) -> str:
+    """Decode quoted oracle text after Gherkin has unescaped physical newlines.
+
+    Only already-tokenized literal content is normalized, never query text or
+    expected values. Preserve CR/LF individually instead of joining source lines.
+    """
+    return ast.literal_eval(token.replace("\r", "\\r").replace("\n", "\\n"))
+
+
 class _Reader:
     def __init__(self, text: str):
         self.tokens = []
@@ -69,7 +78,7 @@ class _Reader:
         if kind == "quoted":
             return value[1:-1].replace("``", "`")
         if kind == "string":
-            return ast.literal_eval(value)
+            return _string_literal(value)
         if kind == "name":
             return value
         raise ValueError("Expected reference key or label")
@@ -144,7 +153,7 @@ class _Reader:
             return result
         kind, token = self.take()
         if kind == "string":
-            return ast.literal_eval(token)
+            return _string_literal(token)
         if kind == "number":
             return float(token) if any(c in token for c in ".eE") else int(token)
         if token == "-" and self.peek() == "Inf":

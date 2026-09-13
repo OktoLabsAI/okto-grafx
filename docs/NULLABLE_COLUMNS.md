@@ -1,5 +1,11 @@
 # Append nullable columns without a row rewrite
 
+Development collection additions accept `ColumnDef.stored_type`: a collection-root
+`StoredType` with matching LIST/MAP family and nullable root. Nested children may
+be non-nullable; preexisting rows receive NULL for the entire new column. Descriptors
+and their capabilities are published atomically through the existing operation.
+Non-nullable root additions remain refused. [Usage and metadata](specs/TYPED_COLLECTIONS_V1.md).
+
 Grafx 0.0.6 development adds the typed `Database.add_nullable_column(table, column)`
 operation. It runs a dedicated native transaction and returns the new immutable
 `TableDef`. Existing rows acquire NULL in the added column when read; new/updated
@@ -20,6 +26,13 @@ with connect("graph") as db:
 
 ## Supported scope
 
+- `table` accepts a unique name or `("node", name)` / `("rel", name)`.
+  When both kinds use the same name, qualify the intended table, for example
+  `db.add_nullable_column(("rel", "R"), ColumnDef("note", ValueType.STRING))`.
+  A bare ambiguous name refuses before schema/capability publication. The returned
+  `TableDef` retains the selected physical identity; the other kind is unchanged.
+  Grouped relationship schema additions remain unsupported; a qualified selector
+  does not bypass that guard or the `_grafx_` reserved-table guard.
 - Append exactly one nullable, non-vector column to a node or relationship table.
   Existing columns, table identity, PK and relationship endpoints are unchanged.
 - No table scan or heap row rewrite during the operation. Existing exact/FTS/vector
@@ -35,6 +48,13 @@ with connect("graph") as db:
   online non-null backfills or integration into the string-only migration ledger.
 
 ## Transactions, readers and recovery
+
+Development DECIMAL additions use
+`ColumnDef("amount", ValueType.DECIMAL, decimal_precision=10, decimal_scale=3)`.
+The public capture and returned catalog preserve both parameters; old rows still
+read NULL. The same schema COMMIT publishes `decimal_values_v1`. Exact typed
+equality indexes have separate qualification; ordered indexes and full interchange
+remain outside the current supported matrix. [Full scope](specs/DECIMAL_VALUES_V1.md).
 
 Catalog and required capability publish atomically under normal WAL/OCC. A failed
 pre-COMMIT attempt discards its staged catalog. An ambiguous post-COMMIT result is

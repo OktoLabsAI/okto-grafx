@@ -23,6 +23,10 @@ exists to forbid.
 from __future__ import annotations
 
 from okto_grafx.domain.query.entity_scalars import ENTITY_SCALARS
+from okto_grafx.domain.query.percentiles import PERCENTILE_FUNCTIONS
+from okto_grafx.domain.query.effects import is_deterministic
+from okto_grafx.domain.query.projection_scope import projected_reference, returned_reference
+from okto_grafx.domain.query.binding_inference import EMPTY_LIST, NODE_LIST, RELATIONSHIP_LIST, entity_sources
 
 from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_arity
 
@@ -41,6 +45,7 @@ from okto_grafx.domain.query.ast import (
     DeleteClause,
     Direction,
     Expression,
+    ExistsSubquery,
     FunctionCall,
     Literal,
     MapExpression,
@@ -48,7 +53,12 @@ from okto_grafx.domain.query.ast import (
     MergeClause,
     NodePattern,
     Parameter,
+    SortItem,
+    UnaryOperation,
     PatternPath,
+    PatternPredicate,
+    PatternComprehension,
+    LabelPredicate,
     Property,
     Query,
     RelationshipPattern,
@@ -58,6 +68,7 @@ from okto_grafx.domain.query.ast import (
     ProcedureCall,
     ReturnItem,
     SetClause,
+    LabelSetItem,
     Statement,
     UnwindClause,
     Variable,
@@ -69,6 +80,7 @@ from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.structure import validate_structure
 from okto_grafx.domain.query.limits import (
     MAX_CLAUSES,
+    MAX_PIPELINE_CLAUSES,
     MAX_PARAMETERS,
     MAX_PROJECTION_ITEMS,
     MAX_TRAVERSAL_HOPS,
@@ -91,6 +103,7 @@ __all__ = [
     "NAMED_PATH_SHAPE",
     "POLYMORPHIC_NODE_SHAPE",
     "ENTITY_RELATIONSHIP",
+    "ENTITY_RELATIONSHIP_LIST",
     "ENTITY_PROJECTED",
     "ENTITY_UNWOUND",
     "Aggregation",
@@ -111,6 +124,7 @@ ENTITY_NODE: str = "node"
 ENTITY_PATH: str = "path"
 """A named walk binding, materialized as an owned native path at output."""
 ENTITY_RELATIONSHIP: str = "relationship"
+ENTITY_RELATIONSHIP_LIST: str = RELATIONSHIP_LIST
 ENTITY_UNWOUND: str = "unwound value"
 """What UNWIND binds: one element of a list, which is a value and not a matched row."""
 ENTITY_PROJECTED: str = "expression alias"
@@ -275,9 +289,9 @@ def polymorphic_node_refusal(query: Query) -> tuple[str, str] | None:
 
 def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
     """Keep dynamic write-target admission separate from expanded read composition."""
-    if query.updating_clauses:
-        return "This query writes, and a write needs one table to write into."
-    if query.return_clause is None:
+    # Read polymorphism does not choose a creation target. CREATE still requires
+    # labels/types, and writes to bound entities validate the actual row's schema.
+    if query.return_clause is None and not query.updating_clauses:
         return "This query has no RETURN, so it would read every table for nothing."
     return None
 
@@ -308,6 +322,9 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
                 "An omitted upper bound requires a written range and the execution ceiling.",
                 "upper_bound_omitted",
             )
+        if (type(relationship.both_directions_written) is not bool
+                or relationship.both_directions_written and relationship.direction is not Direction.UNDIRECTED):
+            return ("Double-arrow syntax requires a boolean and undirected semantics.", "both_directions_written")
         if type(relationship.hop_range_written) is not bool:
             return (
                 "A relationship records whether a hop range was written as a boolean.",
@@ -324,14 +341,12 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
                 "max_hops",
             )
         if (
-            not 0
-            <= relationship.min_hops
-            <= relationship.max_hops
-            <= MAX_TRAVERSAL_HOPS
+            not 0 <= relationship.min_hops <= MAX_TRAVERSAL_HOPS
+            or not 0 <= relationship.max_hops <= MAX_TRAVERSAL_HOPS
         ):
             return (
                 "A hop range runs from zero hops to at most "
-                f"{MAX_TRAVERSAL_HOPS}, and starts at or below where it ends.",
+                f"{MAX_TRAVERSAL_HOPS}; inverted bounds describe an empty interval.",
                 "hops",
             )
         if relationship.upper_bound_omitted and (
@@ -371,6 +386,7 @@ def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
     pending: list[object] = [statement]
     seen: set[int] = set()
     columns: tuple[str, ...] | None = None
+    unit: bool | None = None
     leaves = 0
     while pending:
         branch = pending.pop()
@@ -391,10 +407,18 @@ def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
         leaves += 1
         if leaves > MAX_CLAUSES:
             return ("Too many UNION branches.", "branch")
-        if branch.writes:
-            return ("UNION write branches are not yet supported.", "branch")
-        if branch.return_clause is None:
-            return ("Each UNION branch must end with RETURN.", "branch")
+        branch_unit = branch.return_clause is None
+        if unit is None:
+            unit = branch_unit
+        elif unit != branch_unit:
+            return ("UNION branches cannot mix returning and unit queries.", "columns")
+        if branch_unit:
+            if not branch.writes:
+                return ("A unit UNION branch must write.", "branch")
+            continue
+        if branch.return_clause.include_existing:
+            # Visible columns are known only after lexical binding analysis.
+            continue
         names = branch.return_clause.column_names()
         if columns is None:
             columns = names
@@ -429,9 +453,9 @@ def analyze_union(statement: UnionQuery, bindings: tuple[Binding, ...] = (), dep
 
     Each branch is analysed on its own, because each is a whole query: its own bindings, its own
     grouping, its own similarity. What the UNION contributes is what survives it -- the column
-    names of the left branch and the parameters of both -- and nothing else does. No variable
-    crosses the boundary, so the combined analysis binds none: a name that meant a matched row
-    inside a branch has no meaning above the union, and carrying it up would say otherwise.
+    names of the left branch and the parameters of both. Branch-local variables never cross
+    the boundary. Exported columns retain native entity kind only when every non-null branch
+    proves that same kind; a shared spelling alone grants no entity authority.
     """
     refusal = union_refusal(statement)
     if refusal is not None:
@@ -445,13 +469,46 @@ def analyze_union(statement: UnionQuery, bindings: tuple[Binding, ...] = (), dep
         raise GrafxPlanError(message, field="union", value=value)
     branches = statement.branches()
     analyses = tuple(_Analyzer(branch, bindings, depth).run() for branch in branches)
+    if any(item.output_columns != analyses[0].output_columns for item in analyses[1:]):
+        raise GrafxPlanError("UNION branches must return the same column names in the same order.",
+                             field="union", value="columns", reason="different_columns_in_union",
+                             query_phase="planning")
+    expanded = {id(branch): item.statement for branch, item in zip(branches, analyses, strict=True)}
+    def expand_tree(tree: Query | UnionQuery) -> Query | UnionQuery:
+        """Rebuild the UNION tree with each branch's expanded analysis statement."""
+        if isinstance(tree, Query):
+            return expanded[id(tree)]
+        return replace(tree, left=expand_tree(tree.left), right=expand_tree(tree.right))
+    statement = expand_tree(statement)
     parameters = tuple(dict.fromkeys(name for item in analyses for name in item.parameters))
     if len(parameters) > MAX_PARAMETERS:
         raise GrafxPlanError("Too many parameters across UNION branches.", field="parameters")
+    # Entity authority survives only when every branch proves the same kind
+    # (NULL alternatives are neutral). Scalars/maps cannot acquire it by name.
+    outputs = []
+    for position, name in enumerate(analyses[0].output_columns):
+        proven = []
+        for item in analyses:
+            expression = item.statement.return_clause.items[position].expression
+            if isinstance(expression, Variable):
+                binding = item.binding(expression.name)
+            elif isinstance(expression, Literal) and expression.value is None:
+                binding = Binding(name=name, entity=ENTITY_NULL, labels=(), created=False)
+            else:
+                binding = None
+            proven.append(binding)
+        kinds = {binding.entity for binding in proven if binding is not None and binding.entity != ENTITY_NULL}
+        if all(binding is not None for binding in proven) and len(kinds) == 1:
+            kind = next(iter(kinds))
+            if kind in (ENTITY_NODE, ENTITY_RELATIONSHIP, ENTITY_PATH, NODE_LIST, RELATIONSHIP_LIST):
+                labels = {binding.labels for binding in proven if binding.entity != ENTITY_NULL}
+                outputs.append(Binding(name=name, entity=kind, labels=next(iter(labels)) if len(labels) == 1 else (),
+                                       created=False))
     return QueryAnalysis(
         statement=statement,
         parameters=parameters,
         output_columns=analyses[0].output_columns,
+        bindings=tuple(outputs),
     )
 
 
@@ -636,6 +693,8 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
     pipeline = query.clause_pipeline
     if type(pipeline) is not tuple:
         return "A query pipeline is an immutable tuple of clauses.", "pipeline"
+    if len(query.ordered_clauses()) + (query.return_clause is not None) > MAX_PIPELINE_CLAUSES:
+        return "A query exceeds its written pipeline clause limit.", "clauses"
     if pipeline:
         accepted = (MatchClause, WithClause, UnwindClause, SubqueryClause, ProcedureCall,
                     CreateClause, MergeClause, SetClause, DeleteClause)
@@ -739,28 +798,41 @@ def _is_written_path_name(value: object) -> bool:
 
 def named_path_refusal(query: Query) -> tuple[str, str] | None:
     """Admit composed read captures; retain explicit bounds for unimplemented paths."""
+    refusal = _named_path_refusal_detail(query)
+    return None if refusal is None else refusal[:2]
+
+
+def _named_path_refusal_detail(query: Query) -> tuple[str, str, str | None] | None:
+    """Retain raise-site evidence without changing the public two-field summary."""
     for clause in query.updating_clauses:
         patterns = clause.patterns if isinstance(clause, CreateClause) else (
             (clause.pattern,) if isinstance(clause, MergeClause) else ())
         for pattern in patterns:
             if pattern.variable is not None:
-                return "Capturing a path in a writing pattern is not yet implemented.", "path"
+                if not _is_written_path_name(pattern.variable):
+                    return "A path needs a parser-compatible name.", "path", None
+                if len(pattern.nodes) != len(pattern.relationships) + 1:
+                    return "Named capture requires alternating nodes and relationship segments.", pattern.variable, None
     for clause in query.match_clauses:
-        for pattern in clause.patterns:
+        for pattern_position, pattern in enumerate(clause.patterns):
             if pattern.variable is None:
                 continue
             if not _is_written_path_name(pattern.variable):
-                return "A path needs a parser-compatible name.", "path"
+                return "A path needs a parser-compatible name.", "path", None
             if len(pattern.nodes) != len(pattern.relationships) + 1:
-                return "Named capture requires alternating nodes and relationship segments.", pattern.variable
-            for node in pattern.nodes:
+                return "Named capture requires alternating nodes and relationship segments.", pattern.variable, None
+            # Capture follows its own entities and earlier comma-separated
+            # patterns. Later entity use of an existing path is a type conflict,
+            # not a second path declaration. Preserve this source-order distinction.
+            preceding_patterns = clause.patterns[:pattern_position + 1]
+            for node in (node for candidate in preceding_patterns for node in candidate.nodes):
                 if (node.variable is not None and type(node.variable) is not str) or node.variable == pattern.variable:
-                    return "A path name must differ from its node variables.", pattern.variable
-            for edge in pattern.relationships:
+                    return ("A path name must differ from its node variables.", pattern.variable,
+                            "variable_already_bound" if node.variable == pattern.variable else None)
+            for edge in (edge for candidate in preceding_patterns for edge in candidate.relationships):
                 if (edge.variable is not None and type(edge.variable) is not str) or edge.variable == pattern.variable:
-                    return "A path name must differ from its relationship variable.", pattern.variable
-                if edge.properties is not None:
-                    return "Inline relationship property capture remains pending.", pattern.variable
+                    return ("A path name must differ from its relationship variable.", pattern.variable,
+                            "variable_already_bound" if edge.variable == pattern.variable else None)
     return None
 
 
@@ -839,6 +911,14 @@ class _Analyzer:
 
     def __init__(self, query: Query, bindings: tuple[Binding, ...] = (), depth: int = 0) -> None:
         self._query = query
+        available = {binding.name for binding in bindings}
+        if query.scope_imports is not None:
+            if len(set(query.scope_imports)) != len(query.scope_imports) or not set(query.scope_imports) <= available:
+                raise GrafxPlanError("Query imports require their enclosing lexical bindings.", field="imports")
+            bindings = tuple(binding for binding in bindings if binding.name in query.scope_imports)
+        if (len(set(query.global_imports)) != len(query.global_imports)
+                or not set(query.global_imports) <= {binding.name for binding in bindings}):
+            raise GrafxPlanError("Global imports require their enclosing lexical bindings.", field="imports")
         self._bindings: list[Binding] = list(bindings)
         self._depth = depth
         # The names a WITH stopped carrying, kept only so that reading one below it
@@ -854,9 +934,12 @@ class _Analyzer:
         if refusal is not None:
             message, value = refusal
             raise self._refuse(message, field="hops", value=value)
-        refusal = named_path_refusal(self._query)
+        refusal = _named_path_refusal_detail(self._query)
         if refusal is not None:
-            message, value = refusal
+            message, value, reason = refusal
+            if reason is not None:
+                raise self._refuse(message, field="pattern", value=value,
+                                   reason=reason, query_phase="planning")
             raise self._refuse(message, field="pattern", value=value)
         refusal = polymorphic_node_refusal(self._query)
         if refusal is not None:
@@ -881,9 +964,15 @@ class _Analyzer:
                     self._check_expression(argument, where="a procedure argument")
                     self._refuse_aggregate(argument, "CALL")
                 for item in clause.yields:
-                    if not isinstance(item.expression, Variable) or self._binding(item.name) is not None:
+                    if not isinstance(item.expression, Variable):
                         raise self._refuse("YIELD must bind a new name to a declared output column.", field="yield")
-                    self._bind(item.name, ENTITY_PROJECTED, (), created=False)
+                    if self._binding(item.name) is not None:
+                        raise self._refuse("YIELD cannot replace an existing binding.", field="yield",
+                                           value=item.name, reason="variable_already_bound", query_phase="planning")
+                    kind = {"NODE": ENTITY_NODE, "RELATIONSHIP": ENTITY_RELATIONSHIP, "PATH": ENTITY_PATH,
+                            "LIST<NODE>": NODE_LIST, "LIST<RELATIONSHIP>": RELATIONSHIP_LIST}.get(
+                                dict(clause.result_types).get(item.expression.name), ENTITY_PROJECTED)
+                    self._bind(item.name, kind, (), created=False)
                 if clause.predicate is not None:
                     self._check_expression(clause.predicate, where="YIELD WHERE")
                     self._refuse_aggregate(clause.predicate, "YIELD WHERE")
@@ -924,21 +1013,53 @@ class _Analyzer:
     def _match_clause(self, clause: MatchClause) -> None:
         """Bind the variables of a MATCH clause and check its predicate."""
         for pattern in clause.patterns:
+            self._require_read_pattern(pattern)
+        for pattern in clause.patterns:
             self._name_path(pattern)
         for pattern in clause.patterns:
             self._bind_pattern(pattern, created=False)
         if clause.predicate is not None:
             self._check_expression(clause.predicate, where="a WHERE predicate")
-            if contains_aggregate(clause.predicate):
+            self._refuse_aggregate(clause.predicate, "WHERE", field="predicate")
+
+    def _require_read_pattern(self, pattern: PatternPath) -> None:
+        """Validate ranges and relationship uniqueness, including expression-local patterns."""
+        refusal = hop_range_refusal(Query(match_clauses=(MatchClause(patterns=(pattern,)),)))
+        if refusal is not None:
+            raise self._refuse(refusal[0], field="hops", value=refusal[1])
+        seen: set[str] = set()
+        for relationship in pattern.relationships:
+            name = relationship.variable
+            if name is not None and name in seen:
                 raise self._refuse(
-                    "An aggregate cannot appear in WHERE, because there is no group to "
-                    "aggregate over until the rows are projected.",
-                    field="predicate",
-                    value=clause.predicate.describe(),
+                    "A relationship variable cannot occur twice in one connected read pattern.",
+                    field="variable", value=name,
+                    reason="relationship_uniqueness_violation", query_phase="planning",
                 )
+            if name is not None:
+                seen.add(name)
 
     def _subquery_clause(self, clause: SubqueryClause) -> None:
         """Check imported scope independently and publish only explicit RETURN columns."""
+        original = clause
+        if clause.import_mode not in ("explicit", "all", "with", "with_resolved"):
+            raise self._refuse("Unknown subquery import mode.", field="imports")
+        if clause.import_mode == "all":
+            if clause.imports or clause.outer_names:
+                raise self._refuse("Wildcard imports cannot include explicit mappings.", field="imports")
+            clause = replace(clause, imports=tuple(binding.name for binding in self._bindings), import_mode="explicit")
+        if clause.import_mode == "with":
+            from okto_grafx.domain.query.subquery_scope import resolve_with_imports
+            query, names = resolve_with_imports(clause.query, tuple(binding.name for binding in self._bindings))
+            clause = replace(clause, query=query, imports=names, import_mode="with_resolved")
+        elif clause.import_mode == "explicit":
+            from okto_grafx.domain.query.subquery_scope import scope_branches
+            clause = replace(clause, query=scope_branches(clause.query, clause.imports, persistent=True))
+        if len(clause.imports) > MAX_PROJECTION_ITEMS:
+            raise self._refuse("Too many imported variables.", field="imports", value=MAX_PROJECTION_ITEMS)
+        if clause is not original:
+            self._query = replace(self._query, clause_pipeline=tuple(
+                clause if candidate is original else candidate for candidate in self._query.ordered_clauses()))
         if (type(clause.imports) is not tuple or len(set(clause.imports)) != len(clause.imports)
                 or any(type(name) is not str for name in clause.imports)):
             raise self._refuse("Subquery imports must be unique variable names.", field="imports")
@@ -952,9 +1073,11 @@ class _Analyzer:
             assert binding is not None
             imported.append(replace(binding, name=target))
         inner = analyze(clause.query, bindings=tuple(imported), depth=self._depth + 1)
-        branches = clause.query.branches() if isinstance(clause.query, UnionQuery) else (clause.query,)
-        if any(branch.writes or branch.return_clause is None for branch in branches):
-            raise self._refuse("A returning subquery must be read-only.", field="subquery")
+        if inner.statement is not clause.query:
+            updated = replace(clause, query=inner.statement)
+            self._query = replace(self._query, clause_pipeline=tuple(
+                updated if candidate is clause else candidate for candidate in self._query.ordered_clauses()))
+            clause = updated
         exported = clause.output_aliases or inner.output_columns
         if len(exported) != len(inner.output_columns):
             raise self._refuse("Subquery output mapping has wrong arity.", field="subquery")
@@ -962,6 +1085,8 @@ class _Analyzer:
             if self._binding(name) is not None:
                 raise self._refuse("A subquery cannot overwrite an outer variable.", field="variable", value=name)
             carried = None
+            if isinstance(clause.query, UnionQuery):
+                carried = inner.binding(inner.output_columns[position])
             if isinstance(clause.query, Query) and clause.query.return_clause is not None:
                 expression = clause.query.return_clause.items[position].expression
                 if isinstance(expression, Variable):
@@ -983,21 +1108,51 @@ class _Analyzer:
         if isinstance(clause, CreateClause):
             for pattern in clause.patterns:
                 self._require_writable_pattern(pattern, "CREATE")
+                self._name_path(pattern)
                 self._bind_pattern(pattern, created=True)
             return
         if isinstance(clause, MergeClause):
+            if len(clause.on_create) + len(clause.on_match) > MAX_CLAUSES:
+                raise self._refuse("Too many MERGE actions.", field="clauses")
             self._require_writable_pattern(clause.pattern, "MERGE")
+            self._name_path(clause.pattern)
             self._bind_pattern(clause.pattern, created=True)
+            for action in (*clause.on_create, *clause.on_match):
+                self._updating_clause(action)
             return
         if isinstance(clause, SetClause):
+            if clause.keyword not in ("SET", "REMOVE"):
+                raise self._refuse("Invalid mutation keyword.", field="clause")
             for item in clause.items:
-                self._require_bound_subject(item.target, "SET")
+                if isinstance(item, LabelSetItem):
+                    if item.remove != (clause.keyword == "REMOVE"):
+                        raise self._refuse("Label mutation disagrees with its clause.", field="clause")
+                    self._require_bound(item.target.name, "REMOVE" if item.remove else "SET")
+                    binding = self._binding(item.target.name)
+                    if binding is not None and binding.entity == ENTITY_RELATIONSHIP:
+                        raise self._refuse("Labels can only be changed on nodes.", field="target",
+                                           reason="label_assignment_type", query_phase="planning")
+                    if not item.labels or any(not name for name in item.labels):
+                        raise self._refuse("A label assignment needs nonempty names.", field="label")
+                    continue
+                if clause.keyword == "REMOVE" and (item.merge or item.value != Literal(None)):
+                    raise self._refuse("Property REMOVE cannot assign a value.", field="clause")
+                if isinstance(item.target, Variable):
+                    self._require_bound_entity(item.target.name, "SET")
+                else:
+                    if item.merge:
+                        raise self._refuse("SET += requires a whole entity target.", field="target")
+                    self._require_bound_subject(item.target, "SET")
                 self._check_expression(item.value, where="a SET value")
                 self._refuse_aggregate(item.value, "SET")
             return
         if isinstance(clause, DeleteClause):
             for target in clause.targets:
-                self._require_bound_entity(target.name, "DELETE")
+                self._check_expression(target, where="a DELETE target")
+                self._refuse_aggregate(target, "DELETE")
+                if isinstance(target, LabelPredicate):
+                    raise self._refuse("DELETE cannot remove a label or relationship type.",
+                                       field="target", reason="invalid_delete", query_phase="planning")
             return
         raise self._refuse(
             f"A clause of type {type(clause).__name__} cannot be planned.",
@@ -1010,7 +1165,21 @@ class _Analyzer:
         clause = self._query.return_clause
         if clause is None:
             return (), ()
+        if type(clause.include_existing) is not bool:
+            raise self._refuse("RETURN wildcard flag must be a boolean.", field="include_existing")
+        if clause.include_existing:
+            names = sorted(binding.name for binding in self._bindings)
+            if not names:
+                raise self._refuse("RETURN * requires variables in scope.", field="return_star",
+                                   reason="no_variables_in_scope", query_phase="planning")
+            items = tuple(ReturnItem(expression=Variable(name)) for name in names) + clause.items
+            if len(items) > MAX_PROJECTION_ITEMS:
+                raise self._refuse("Expanded RETURN exceeds the projection limit.", field="items",
+                                   value=MAX_PROJECTION_ITEMS)
+            clause = replace(clause, items=items, include_existing=False)
+            self._query = replace(self._query, return_clause=clause)
         self._require_unique_output_columns(clause)
+        self._check_grouping_expressions(clause.items, clause.sort_items)
         grouping: list[int] = []
         aggregations: list[Aggregation] = []
         for position, item in enumerate(clause.items):
@@ -1021,7 +1190,25 @@ class _Analyzer:
                 continue
             for call in found:
                 aggregations.append(Aggregation(position=position, call=call))
-        self._check_sort_keys(clause, bool(aggregations))
+        incoming = self._bindings
+        alias_bindings = []
+        for item in clause.items:
+            if item.alias is None:
+                continue
+            if isinstance(item.expression, Variable):
+                carried = self._binding(item.expression.name)
+                assert carried is not None
+                alias_bindings.append(replace(carried, name=item.alias))
+            else:
+                proof = entity_sources(item.expression, lambda name: self._binding(name).entity if self._binding(name) else None)
+                alias_bindings.append(Binding(name=item.alias, entity=proof[0] if proof else ENTITY_PROJECTED,
+                                              labels=(), created=False))
+        alias_names = {binding.name for binding in alias_bindings}
+        self._bindings = alias_bindings + [binding for binding in incoming if binding.name not in alias_names]
+        try:
+            self._check_sort_keys(clause, bool(aggregations))
+        finally:
+            self._bindings = incoming
         self._check_row_window(clause.skip, "SKIP")
         self._check_row_window(clause.limit, "LIMIT")
         if self._scores and self._similarity is None:
@@ -1045,6 +1232,7 @@ class _Analyzer:
                     "must identify exactly one item.",
                     field="alias" if explicit_collision else "column",
                     value=name,
+                    reason="column_name_conflict", query_phase="planning",
                 )
             seen[name] = item.alias is not None
 
@@ -1058,8 +1246,26 @@ class _Analyzer:
         """
         aliases = {item.alias for item in clause.items if item.alias is not None}
         projected = {item.expression for item in clause.items}
-        projected_variables = {item.expression.name for item in clause.items if isinstance(item.expression, Variable)}
+        projected_variables = {item.expression.name for item in clause.items if isinstance(item.expression, Variable)} | aliases
         for key in clause.sort_items:
+            if aggregated or clause.distinct:
+                # These rows no longer grant access to discarded input bindings.
+                # Reuse complete projected expressions inside compound keys first,
+                # then validate the remainder against the actual output scope.
+                normalized = returned_reference(key.expression, clause.items)
+                incoming = self._bindings
+                self._bindings = [
+                    replace(carried, name=item.name) if (carried := self._binding(item.alias or
+                        (item.expression.name if isinstance(item.expression, Variable) else item.name))) is not None
+                    else Binding(name=item.name, entity=ENTITY_PROJECTED, labels=(), created=False)
+                    for item in clause.items
+                ]
+                try:
+                    self._check_expression(normalized, where="an ORDER BY key")
+                    self._refuse_aggregate(normalized, "the ORDER BY of a grouped or DISTINCT RETURN")
+                finally:
+                    self._bindings = incoming
+                continue
             if isinstance(key.expression, Variable) and key.expression.name in aliases:
                 # An alias names a column of this clause's own result, so it is resolved before
                 # the key is treated as an expression over bound variables -- otherwise every
@@ -1070,8 +1276,7 @@ class _Analyzer:
                 continue
             if (isinstance(key.expression, Property) and isinstance(key.expression.subject, Variable)
                     and key.expression.subject.name in projected_variables):
-                # Returning the whole entity retains its properties after dedupe;
-                # this does not admit a property of a discarded input variable.
+                # A plain RETURN retains the incoming entity for sorting.
                 continue
             if contains_aggregate(key.expression):
                 raise self._refuse(
@@ -1081,41 +1286,27 @@ class _Analyzer:
                     value=key.expression.describe(),
                     reason="invalid_aggregation_context", query_phase="planning",
                 )
-            if set(free_variables(key.expression)) <= projected_variables:
-                # A scalar expression over carried values can still be evaluated
-                # after deduplication; discarded bindings remain inaccessible.
-                continue
-            if aggregated or clause.distinct:
-                raise self._refuse(
-                    f"ORDER BY {key.expression.describe()} reads something this clause does not "
-                    "return, and after DISTINCT or an aggregate there is no row left to read "
-                    "it from.",
-                    field="sort_item",
-                    value=key.expression.describe(),
-                )
 
     def _check_row_window(self, expression: Expression | None, keyword: str) -> None:
-        """Refuse a SKIP or LIMIT that is not a whole number of rows."""
+        """Admit row-independent windows; literal failures are compile-time evidence."""
         if expression is None:
             return
-        if isinstance(expression, Parameter):
-            self._note_parameter(expression.name)
-            return
-        if isinstance(expression, Literal) and isinstance(expression.value, int):
-            if isinstance(expression.value, bool) or expression.value < 0:
-                raise self._refuse(
-                    f"{keyword} takes a count of rows that is zero or more; got "
-                    f"{expression.describe()}.",
-                    field=keyword.lower(),
-                    value=expression.describe(),
-                )
-            return
-        raise self._refuse(
-            f"{keyword} takes a whole number of rows or a parameter; got "
-            f"{expression.describe()}.",
-            field=keyword.lower(),
-            value=expression.describe(),
-        )
+        if set(free_variables(expression)) - set(self._query.global_imports) or contains_aggregate(expression):
+            raise self._refuse(f"{keyword} cannot depend on input rows.",
+                               field=keyword.lower(), reason="non_constant_window", query_phase="planning")
+        literal = expression
+        sign = 1
+        while isinstance(literal, UnaryOperation) and literal.operator in ("+", "-"):
+            sign *= -1 if literal.operator == "-" else 1
+            literal = literal.operand
+        if isinstance(literal, Literal):
+            value = literal.value
+            reason = ("window_argument_type" if type(value) is not int
+                      else "negative_window" if sign * value < 0 else None)
+            if reason is not None:
+                raise self._refuse(f"{keyword} takes a nonnegative whole number of rows.",
+                                   field=keyword.lower(), reason=reason, query_phase="planning")
+        self._check_expression(expression, where=f"{keyword} window")
 
     # --- patterns ----------------------------------------------------------------------------
 
@@ -1125,7 +1316,8 @@ class _Analyzer:
         if name is None:
             return
         if self._binding(name) is not None:
-            raise self._refuse("A captured path needs a new variable in this scope.", field="variable", value=name)
+            raise self._refuse("A captured path needs a new variable in this scope.", field="variable", value=name,
+                               reason="variable_already_bound", query_phase="planning")
         self._bind(name, ENTITY_PATH, (), created=False)
 
     def _bind_pattern(self, pattern: PatternPath, *, created: bool) -> None:
@@ -1136,7 +1328,7 @@ class _Analyzer:
         for relationship in pattern.relationships:
             self._bind(
                 relationship.variable,
-                ENTITY_RELATIONSHIP,
+                ENTITY_RELATIONSHIP_LIST if relationship.hop_range_written else ENTITY_RELATIONSHIP,
                 relationship.types,
                 created=created,
             )
@@ -1160,7 +1352,10 @@ class _Analyzer:
         self._check_expression(clause.expression, where="an UNWIND list")
         # There is no group before the source, so an aggregate here has nothing to summarise.
         self._refuse_aggregate(clause.expression, "UNWIND")
-        self._bind(clause.alias, ENTITY_UNWOUND, (), created=False)
+        proof = entity_sources(clause.expression, lambda name: self._binding(name).entity if self._binding(name) else None)
+        kind = ({NODE_LIST: ENTITY_NODE, RELATIONSHIP_LIST: ENTITY_RELATIONSHIP}.get(proof[0], ENTITY_UNWOUND)
+                if proof is not None else ENTITY_UNWOUND)
+        self._bind(clause.alias, kind, (), created=False)
 
     def _with_clause(self, clause: WithClause) -> None:
         """Replace the scope with what this stage projects, then check the WHERE it carries.
@@ -1171,19 +1366,24 @@ class _Analyzer:
         those names arrive together; and a variable this stage did not carry is unreadable
         below it, because it is no longer in the scope the clauses under it are checked in.
 
-        The predicate is checked AFTER the substitution, because it belongs to this stage: it
-        reads the aliases just created and it runs once the projection has produced them.
+        Attached modifiers see output aliases and, for plain projection, incoming
+        bindings. DISTINCT/grouping modifiers reuse projected expressions instead
+        of reopening discarded rows. Only the projected scope survives the stage.
         """
 
         incoming = tuple(self._bindings)
         if type(clause.include_existing) is not bool:
             raise self._refuse("WITH include_existing must be boolean.", field="include_existing")
+        grouping_items = tuple(ReturnItem(expression=Variable(binding.name)) for binding in incoming) if clause.include_existing else ()
+        self._check_grouping_expressions(grouping_items + clause.items, clause.sort_items)
         created = {item.alias for item in clause.items if item.alias is not None}
         projected: list[Binding] = list(incoming) if clause.include_existing else []
         if len(projected) + len(clause.items) > MAX_PROJECTION_ITEMS:
             raise self._refuse(f"A WITH clause may project at most {MAX_PROJECTION_ITEMS} items after star expansion.",
                                field="items", value=MAX_PROJECTION_ITEMS)
         for item in clause.items:
+            if item.name in self._query.global_imports and item.expression != Variable(item.name):
+                raise self._refuse("An explicit subquery import cannot be redeclared.", field="imports", value=item.name)
             binding = self._projected_binding(item, created)
             if any(carried.name == binding.name for carried in projected):
                 raise self._refuse(
@@ -1191,26 +1391,101 @@ class _Analyzer:
                     "name once.",
                     field="item",
                     value=binding.name,
+                    reason="column_name_conflict", query_phase="planning",
                 )
             projected.append(binding)
+        names = {binding.name for binding in projected}
+        projected.extend(binding for binding in incoming
+                         if binding.name in self._query.global_imports and binding.name not in names)
         self._bindings = projected
         names = {binding.name for binding in projected}
         self._discarded.update(
             binding.name for binding in incoming if binding.name not in names
         )
         self._discarded.difference_update(names)
+        normalized = replace(clause,
+                             sort_items=tuple(replace(key, expression=projected_reference(key.expression, clause.items))
+                                              for key in clause.sort_items),
+                             predicate=projected_reference(clause.predicate, clause.items))
+        self._query = replace(self._query, clause_pipeline=tuple(
+            normalized if candidate is clause else candidate for candidate in self._query.ordered_clauses()))
+        clause = normalized
+        grouped = any(contains_aggregate(item.expression) for item in clause.items)
         for key in clause.sort_items:
             # No aggregate is valid in this normalized, non-grouped sort context.
             # Prove that before resolving arguments against the projected scope;
             # otherwise a dropped argument masks the real invalid aggregation.
+            if grouped:
+                # Aggregation has discarded the input scope. Resolve surviving
+                # names before deciding whether a new aggregate is legal here.
+                for name in free_variables(key.expression):
+                    self._require_bound(name, "the ORDER BY of a grouped WITH")
             self._refuse_aggregate(key.expression, "the ORDER BY of a WITH")
-        for key in clause.sort_items:
-            self._check_expression(key.expression, where="the ORDER BY of a WITH")
+        # Plain projection modifiers can read their input as well as their output;
+        # output aliases shadow input names. DISTINCT/grouping have discarded
+        # that input identity and cannot reopen it for ordering.
+        if not clause.distinct and not grouped:
+            self._bindings = projected + [binding for binding in incoming if binding.name not in names]
+        try:
+            for key in clause.sort_items:
+                self._check_expression(key.expression, where="the ORDER BY of a WITH")
+            if clause.predicate is not None:
+                self._check_expression(clause.predicate, where="the WHERE of a WITH")
+                self._refuse_aggregate(clause.predicate, "the WHERE of a WITH")
+        finally:
+            self._bindings = projected
         self._check_row_window(clause.skip, "SKIP")
         self._check_row_window(clause.limit, "LIMIT")
-        if clause.predicate is not None:
-            self._check_expression(clause.predicate, where="the WHERE of a WITH")
-            self._refuse_aggregate(clause.predicate, "the WHERE of a WITH")
+
+    def _check_grouping_expressions(self, items: tuple[ReturnItem, ...], sort_items: tuple[SortItem, ...]) -> None:
+        """Reject implicit grouping leaves that were not independently projected.
+
+        Returning a composite key does not also group by each of its components.
+        Aggregate arguments themselves belong to the incoming rows, not this check.
+        """
+        grouping = tuple(item.expression for item in items if not contains_aggregate(item.expression))
+        variables = {expression.name for expression in grouping if isinstance(expression, Variable)} | set(self._query.global_imports)
+        properties = tuple(expression for expression in grouping if isinstance(expression, Property))
+
+        def check(expression: Expression, aliases: set[str]) -> None:
+            """Validate free references outside aggregates against grouped, aliased and local names."""
+            pending = [(expression, frozenset())]
+            while pending:
+                node, local = pending.pop()
+                if is_aggregate(node):
+                    continue
+                if isinstance(node, Variable):
+                    if node.name in variables | aliases | local:
+                        continue
+                    raise self._refuse("An aggregate expression uses an ungrouped value.",
+                                       field="aggregation", reason="ambiguous_aggregation_expression", query_phase="planning")
+                if isinstance(node, Property) and node in properties:
+                    continue
+                if isinstance(node, ListIteration):
+                    bound = local | {node.variable}
+                    if node.accumulator is not None:
+                        bound |= {node.accumulator}
+                    pending.append((node.source, local))
+                    if node.initial is not None:
+                        pending.append((node.initial, local))
+                    if node.predicate is not None:
+                        pending.append((node.predicate, bound))
+                    pending.append((node.body, bound))
+                else:
+                    pending.extend((child, local) for child in node.children())
+
+        for item in items:
+            if contains_aggregate(item.expression):
+                check(item.expression, set())
+        # Composite grouping keys need this check before modifier substitution
+        # can hide an illegal implicit grouping leaf. Other missing sort variables
+        # are diagnosed by the normal post-group scope resolver.
+        if any(not isinstance(expression, (Variable, Property, Literal, Parameter)) and free_variables(expression)
+               for expression in grouping):
+            aliases = {item.alias for item in items if item.alias is not None}
+            for key in sort_items:
+                if contains_aggregate(key.expression):
+                    check(key.expression, aliases)
 
     def _projected_binding(self, item: ReturnItem, created: set[str]) -> Binding:
         """Check one WITH item against the incoming scope and return what it leaves bound."""
@@ -1231,8 +1506,12 @@ class _Analyzer:
                 f"{expression.describe()} needs AS.",
                 field="item",
                 value=expression.describe(),
+                reason="no_expression_alias", query_phase="planning",
             )
         self._check_expression(expression, where="a WITH item")
+        proof = entity_sources(expression, lambda name: self._binding(name).entity if self._binding(name) else None)
+        if proof is not None:
+            return Binding(name=item.alias, entity=proof[0], labels=(), created=False)
         # Aggregate calls are validated by _check_expression, exactly as in RETURN.
         # The planner inserts the same budgeted grouping operator before WITH.
         return Binding(
@@ -1270,12 +1549,23 @@ class _Analyzer:
         if existing.entity != entity:
             if existing.entity == ENTITY_NULL and entity == ENTITY_NODE and not created:
                 return
+            if existing.entity == EMPTY_LIST and entity == ENTITY_RELATIONSHIP_LIST and not created:
+                return  # Only the range pattern supplies relationship-list context.
             raise self._refuse(
                 f"The variable {name!r} is bound to a {existing.entity} and used again as a "
                 f"{entity}.",
                 field="variable",
                 value=name,
+                reason="variable_type_conflict", query_phase="planning",
             )
+        if entity == ENTITY_NODE and not created:
+            if labels and not existing.labels:
+                self._bindings[self._bindings.index(existing)] = replace(existing, labels=labels)
+            return  # A later label set is a membership test, not a type conflict.
+        if entity in (ENTITY_RELATIONSHIP, ENTITY_RELATIONSHIP_LIST) and not created:
+            # Read patterns constrain an existing edge; a different type may
+            # yield no rows but must neither rebind it nor rewrite its proof.
+            return
         if labels and existing.labels and labels != existing.labels:
             raise self._refuse(
                 f"The variable {name!r} is bound with labels {list(existing.labels)} and used "
@@ -1290,23 +1580,41 @@ class _Analyzer:
 
     def _require_writable_pattern(self, pattern: PatternPath, keyword: str) -> None:
         """Refuse a pattern that says what to look for but not what to write."""
+        declared_nodes: set[str] = set()
         for node in pattern.nodes:
-            if node.variable is not None and self._binding(node.variable) is not None:
+            if pattern.variable is not None and node.variable == pattern.variable:
+                raise self._refuse("A path and a node cannot declare the same variable.",
+                                   field="variable", value=node.variable,
+                                   reason="variable_already_bound", query_phase="planning")
+            if node.variable is not None and (
+                self._binding(node.variable) is not None or node.variable in declared_nodes
+            ):
+                if not pattern.relationships or node.labels or node.properties is not None:
+                    raise self._refuse(f"{keyword} cannot redeclare a bound node; reference its bare name as an endpoint.",
+                                       field="variable", value=node.variable,
+                                       reason="variable_already_bound", query_phase="planning")
                 continue
-            if len(node.labels) != 1:
-                raise self._refuse(
-                    f"{keyword} needs exactly one label on every new node, because a row is "
-                    f"stored in exactly one table; got {node.describe()}.",
-                    field="labels",
-                    value=node.describe(),
-                )
+            if node.variable is not None:
+                declared_nodes.add(node.variable)
+        declared_relationships: set[str] = set()
         for relationship in pattern.relationships:
+            if relationship.variable is not None and (
+                    self._binding(relationship.variable) is not None
+                    or relationship.variable in declared_relationships
+                    or relationship.variable in declared_nodes
+                    or relationship.variable == pattern.variable):
+                raise self._refuse(f"{keyword} cannot redeclare a bound relationship or path.",
+                                   field="variable", value=relationship.variable,
+                                   reason="variable_already_bound", query_phase="planning")
+            if relationship.variable is not None:
+                declared_relationships.add(relationship.variable)
             if len(relationship.types) != 1:
                 raise self._refuse(
                     f"{keyword} needs exactly one relationship type on every new relationship; "
                     f"got {relationship.describe()}.",
                     field="types",
                     value=relationship.describe(),
+                    reason="no_single_relationship_type", query_phase="planning",
                 )
             if relationship.variable_length or relationship.hop_range_written:
                 raise self._refuse(
@@ -1314,23 +1622,140 @@ class _Analyzer:
                     f"meaning here; got {relationship.describe()}.",
                     field="hops",
                     value=relationship.describe(),
+                    reason="creating_variable_length", query_phase="planning",
                 )
-            if relationship.direction is Direction.UNDIRECTED:
+            if relationship.direction is Direction.UNDIRECTED and (keyword != "MERGE" or relationship.both_directions_written):
                 raise self._refuse(
                     f"{keyword} needs a direction on every new relationship; got "
                     f"{relationship.describe()}.",
                     field="direction",
                     value=relationship.describe(),
+                    reason="requires_directed_relationship", query_phase="planning",
                 )
 
     # --- expressions -------------------------------------------------------------------------
+
+    def _semantic_expression_nodes(self, expression: Expression) -> Iterator[tuple[Expression, dict[str, str]]]:
+        """Walk this scope; comprehension bodies receive their own semantic pass."""
+        from okto_grafx.domain.query.existential import element_kind
+        pending = [(expression, {})]
+        while pending:
+            node, local = pending.pop()
+            yield node, local
+            if isinstance(node, PatternComprehension):
+                continue
+            if isinstance(node, ListIteration):
+                def resolve(name: str) -> str | None:
+                    """Resolve list-local names before consulting the enclosing query bindings."""
+                    binding = self._binding(name)
+                    return local.get(name, binding.entity if binding else None)
+                inner = {**local, node.variable: element_kind(node.source, resolve) or ENTITY_PROJECTED}
+                if node.accumulator is not None:
+                    inner[node.accumulator] = ENTITY_PROJECTED
+                children = [(node.source, local)]
+                if node.initial is not None:
+                    children.append((node.initial, local))
+                if node.predicate is not None:
+                    children.append((node.predicate, inner))
+                children.append((node.body, inner))
+                pending.extend(reversed(children))
+            else:
+                pending.extend((child, local) for child in reversed(node.children()))
+
+    def _check_pattern_comprehension(self, expression: PatternComprehension, list_locals: frozenset[str]) -> None:
+        """Bind local pattern entities without leaking them into the enclosing query."""
+        pattern = expression.pattern
+        self._require_read_pattern(pattern)
+        if not pattern.relationships or len(pattern.nodes) != len(pattern.relationships) + 1:
+            raise self._refuse("A pattern comprehension needs a connected relationship pattern.",
+                               field="pattern", reason="pattern_comprehension_shape", query_phase="planning")
+        saved = self._bindings
+        self._bindings = [binding for binding in saved if binding.name not in list_locals]
+        self._bindings.extend(Binding(name=name, entity=ENTITY_PROJECTED, labels=(), created=False)
+                              for name in sorted(list_locals))
+        try:
+            self._name_path(pattern)
+            for node in pattern.nodes:
+                binding = self._binding(node.variable) if node.variable is not None else None
+                if node.variable in list_locals and binding is not None and binding.entity == ENTITY_PROJECTED:
+                    # The catalog-aware pass must validate the collection's
+                    # element type; runtime still requires a genuine node binding.
+                    self._bindings = [binding for binding in self._bindings if binding.name != node.variable]
+                self._bind(node.variable, ENTITY_NODE, node.labels, created=False)
+            for edge in pattern.relationships:
+                self._bind(edge.variable, ENTITY_RELATIONSHIP_LIST if edge.hop_range_written else ENTITY_RELATIONSHIP,
+                           edge.types, created=False)
+            for element in (*pattern.nodes, *pattern.relationships):
+                self._check_properties(element.properties)
+            if expression.predicate is not None:
+                self._check_expression(expression.predicate, where="a WHERE predicate")
+                self._refuse_aggregate(expression.predicate, "a pattern comprehension")
+            self._check_expression(expression.projection, where="a pattern comprehension projection")
+            self._refuse_aggregate(expression.projection, "a pattern comprehension")
+        finally:
+            self._bindings = saved
+
+    def _check_exists(self, expression: ExistsSubquery, list_locals: dict[str, str]) -> None:
+        """Validate the entire read body even when the outer stream is empty."""
+        from okto_grafx.domain.query.existential import read_query
+        visible = {binding.name: binding for binding in self._bindings if binding.name not in list_locals}
+        visible.update({name: Binding(name=name, entity=entity, labels=(), created=False)
+                        for name, entity in list_locals.items()})
+        mappings = expression.imports or tuple((name, name) for name in visible)
+        if len({target for target, _source in mappings}) != len(mappings):
+            raise self._refuse("EXISTS imports must have unique targets.", field="imports")
+        imported = []
+        for target, source in mappings:
+            if source not in visible:
+                self._require_bound(source, "an EXISTS import")
+            imported.append(replace(visible[source], name=target))
+        inner = analyze(read_query(expression.query, tuple(binding.name for binding in imported)),
+                        bindings=tuple(imported), depth=self._depth + 1)
+        for name in inner.parameters:
+            self._note_parameter(name)
 
     def _check_expression(self, expression: Expression, *, where: str) -> None:
         """Check one expression: its variables are bound and its aggregates are not nested."""
         for name in free_variables(expression):
             self._require_bound(name, where)
-        for node in walk(expression):
-            if isinstance(node, ListIteration):
+        if where in ("a WHERE predicate", "the WHERE of a WITH") and isinstance(expression, Variable):
+            binding = self._binding(expression.name)
+            if binding is not None and binding.entity in (ENTITY_NODE, ENTITY_RELATIONSHIP, ENTITY_PATH):
+                raise self._refuse("A graph entity is not a boolean predicate.", field="predicate",
+                                   reason="predicate_argument_type", query_phase="planning")
+        for node, local_names in self._semantic_expression_nodes(expression):
+            if isinstance(node, LabelPredicate):
+                if not node.labels or any(not label for label in node.labels):
+                    raise self._refuse("A label predicate requires nonempty labels.", field="label")
+            elif isinstance(node, ExistsSubquery):
+                self._check_exists(node, local_names)
+            elif isinstance(node, PatternComprehension):
+                self._check_pattern_comprehension(node, frozenset(local_names))
+            elif isinstance(node, PatternPredicate):
+                if where != "a WHERE predicate" and where != "the WHERE of a WITH":
+                    raise self._refuse("A pattern predicate belongs to WHERE, not a value projection.",
+                                       field="pattern", reason="pattern_predicate_context", query_phase="planning")
+                pattern = node.pattern
+                self._require_read_pattern(pattern)
+                if (pattern.variable is not None or not pattern.relationships
+                        or len(pattern.nodes) != len(pattern.relationships) + 1):
+                    raise self._refuse("A pattern predicate needs an unnamed connected relationship pattern.",
+                                       field="pattern", reason="pattern_predicate_shape", query_phase="planning")
+                for element, entity in (
+                    *((item, ENTITY_NODE) for item in pattern.nodes),
+                    *((item, ENTITY_RELATIONSHIP_LIST if item.hop_range_written else ENTITY_RELATIONSHIP)
+                      for item in pattern.relationships),
+                ):
+                    if element.variable is not None:
+                        binding = self._binding(element.variable)
+                        if binding is not None and binding.entity not in (entity, ENTITY_NULL):
+                            raise self._refuse("A pattern reference has the wrong entity kind.",
+                                               field="variable", value=element.variable,
+                                               reason="pattern_reference_type", query_phase="planning")
+                if any(contains_aggregate(item.properties) for item in (*pattern.nodes, *pattern.relationships)
+                       if item.properties is not None):
+                    raise self._refuse("Pattern properties cannot contain aggregates.", field="pattern")
+            elif isinstance(node, ListIteration):
                 if node.mode not in ("map", "all", "any", "none", "single", "reduce"):
                     raise self._refuse("Unknown list iteration mode.", field="iteration")
                 if (node.mode == "reduce") != (node.accumulator is not None and node.initial is not None):
@@ -1341,7 +1766,8 @@ class _Analyzer:
                     raise self._refuse("Invalid list iteration bindings.", field="iteration")
                 for body in (node.predicate, node.body):
                     if body is not None and contains_aggregate(body):
-                        raise self._refuse("List-local expressions cannot contain row aggregates.", field="iteration")
+                        raise self._refuse("List-local expressions cannot contain row aggregates.", field="iteration",
+                                           reason="invalid_aggregation_context", query_phase="planning")
             elif isinstance(node, Parameter):
                 self._note_parameter(node.name)
             elif isinstance(node, FunctionCall):
@@ -1371,15 +1797,18 @@ class _Analyzer:
                 raise self._refuse("udf needs a literal registered name.", field="function", value=call.name)
             return
         if is_aggregate(call):
+            if call.named_arguments:
+                raise self._refuse("Aggregates accept positional arguments only.", field="function", value=call.name)
             if call.star and name != "COUNT":
                 raise self._refuse(
                     f"Only count is written as count(*); got {call.describe()}.",
                     field="function",
                     value=call.name,
                 )
-            if not call.star and len(call.arguments) != 1:
+            arity = 2 if name in PERCENTILE_FUNCTIONS else 1
+            if not call.star and len(call.arguments) != arity:
                 raise self._refuse(
-                    f"The aggregate {call.name} takes exactly one argument; got "
+                    f"The aggregate {call.name} takes exactly {arity} argument(s); got "
                     f"{len(call.arguments)}.",
                     field="function",
                     value=call.name,
@@ -1391,7 +1820,11 @@ class _Analyzer:
                         f"{call.describe()}.",
                         field="function",
                         value=call.name,
+                        reason="nested_aggregation", query_phase="planning",
                     )
+                if not is_deterministic(argument):
+                    raise self._refuse("An aggregate argument must be deterministic; project volatile values with WITH first.",
+                                       field="aggregation", reason="non_deterministic_aggregate_argument", query_phase="planning")
             return
         if name == SIMILARITY_SCORE_FUNCTION:
             if call.arguments or call.named_arguments:
@@ -1550,13 +1983,13 @@ class _Analyzer:
             )
         self._similarity = use
 
-    def _refuse_aggregate(self, expression: Expression, keyword: str) -> None:
+    def _refuse_aggregate(self, expression: Expression, keyword: str, *, field: str = "expression") -> None:
         """Refuse an aggregate in a place that has no group to aggregate over."""
         if contains_aggregate(expression):
             raise self._refuse(
                 f"An aggregate cannot appear in {keyword}, because it summarises a group of "
                 "result rows and nothing here has produced one.",
-                field="expression",
+                field=field,
                 value=expression.describe(),
                 reason="invalid_aggregation_context", query_phase="planning",
             )

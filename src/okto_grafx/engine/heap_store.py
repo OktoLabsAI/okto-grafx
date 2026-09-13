@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
+from okto_grafx.domain.model.catalog import Catalog
+
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -51,6 +53,7 @@ from okto_grafx.domain.model.record import (
     NO_PREVIOUS_VERSION,
     RECORD_FLAG_DELETED,
     RECORD_FLAG_HAS_OVERFLOW,
+    RECORD_FLAG_NODE_LABELS,
     RECORD_HEADER_SIZE,
     HeapVersion,
     RecordHeader,
@@ -70,6 +73,7 @@ from okto_grafx.domain.model.schema import (
     encode_tuple,
 )
 from okto_grafx.domain.model.catalog import HEAP_RECLAIM_V1_CAPABILITY
+from okto_grafx.domain.model.node_labels import NODE_LABELS_CAPABILITY, encode_node_labels, decode_node_labels
 from okto_grafx.domain.model.value import Value
 from okto_grafx.domain.page import (
     FILE_HEADER_SIZE,
@@ -644,6 +648,7 @@ class HeapStore:
         "_tuple_encoding_proofs",
         "_overflow_reuse_cursor",
         "_free_index_cursor",
+        "_node_label_write_catalog",
     )
 
     def __init__(
@@ -660,6 +665,7 @@ class HeapStore:
                 value=pool.budget_bytes,
             )
         self._pool: BufferPool = pool
+        self._node_label_write_catalog: Catalog | None = None
         self._catalog: CatalogStore = catalog
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._file: str = file
@@ -977,7 +983,7 @@ class HeapStore:
                     table=table.name,
                     field=end,
                 )
-            endpoint_table = self._catalog.catalog.table(name)
+            endpoint_table = self._catalog.catalog.table(name, kind="node")
             _require_record_id(identity)
             if self.lookup(endpoint_table, identity, snapshot) is None:
                 raise GrafxConfigurationError(
@@ -1585,6 +1591,7 @@ class HeapStore:
         xmin: Csn,
         *,
         _encoding_proof: object = None,
+        node_labels: tuple[str, ...] | None = None,
     ) -> RecordRef:
         """Store the first version of a record and return where it was placed.
 
@@ -1598,7 +1605,7 @@ class HeapStore:
         """
         _require_commit_number("xmin", xmin)
         _require_record_id(record_id)
-        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
+        payload = self._labeled_payload(table, _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs), node_labels)
         extent_epoch = self._derived_read_epoch()
         extent, _ = self._observe_record_id_extent(table, record_id)
         extent_proof = self._new_extent_proof(extent, derived_epoch=extent_epoch)
@@ -1609,6 +1616,7 @@ class HeapStore:
             prev_version=NO_PREVIOUS_VERSION,
             payload_len=len(payload),
             schema_version=table.schema_version,
+            flags=RECORD_FLAG_NODE_LABELS if node_labels is not None else 0,
         )
         return self._store_version(table, header, payload, extent_proof=extent_proof)
 
@@ -1621,6 +1629,7 @@ class HeapStore:
         *,
         extent_proof: object | None = None,
         _encoding_proof: object = None,
+        node_labels: tuple[str, ...] | None = None,
     ) -> RecordRef:
         """Store a row whose identity is already below this table's durable floor.
 
@@ -1679,7 +1688,7 @@ class HeapStore:
                 record_id=record_id,
                 durable_floor=durable_floor,
             )
-        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
+        payload = self._labeled_payload(table, _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs), node_labels)
         header = RecordHeader(
             record_id=record_id,
             xmin=xmin,
@@ -1687,6 +1696,7 @@ class HeapStore:
             prev_version=NO_PREVIOUS_VERSION,
             payload_len=len(payload),
             schema_version=table.schema_version,
+            flags=RECORD_FLAG_NODE_LABELS if node_labels is not None else 0,
         )
         return self._store_version(table, header, payload, extent_proof=proof)
 
@@ -1699,6 +1709,7 @@ class HeapStore:
         *,
         next_record_id: RecordId,
         _encoding_proof: object = None,
+        node_labels: tuple[str, ...] | None = None,
     ) -> RecordRef:
         """Create a table's first extent with one batch-wide identity floor.
 
@@ -1738,7 +1749,7 @@ class HeapStore:
                 record_id=record_id,
                 next_record_id=floor,
             )
-        payload = _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs)
+        payload = self._labeled_payload(table, _write_payload(table, values, _encoding_proof, self._tuple_encoding_proofs), node_labels)
         extent = self._create_extent(table, next_record_id=floor)
         extent_proof = self._new_extent_proof(extent)
         header = RecordHeader(
@@ -1748,6 +1759,7 @@ class HeapStore:
             prev_version=NO_PREVIOUS_VERSION,
             payload_len=len(payload),
             schema_version=table.schema_version,
+            flags=RECORD_FLAG_NODE_LABELS if node_labels is not None else 0,
         )
         return self._store_version(table, header, payload, extent_proof=extent_proof)
 
@@ -1799,6 +1811,7 @@ class HeapStore:
         xmin: Csn,
         *,
         _encoding_proof: object = None,
+        node_labels: tuple[str, ...] | None = None,
     ) -> RecordRef:
         """Write a new version of a record, chained to the old one, and end the old one.
 
@@ -1857,6 +1870,8 @@ class HeapStore:
         # must not reach a page, and it must not hold a pin while it finds that out.
         accepted_values = values if type(values) is tuple else tuple(values)
         payload = _write_payload(table, accepted_values, _encoding_proof, self._tuple_encoding_proofs)
+        if node_labels is not None:
+            payload = self._labeled_payload(table, payload, node_labels)
         with self._pool.pinned(self._file, ref.page) as old_page:
             self._require_table_page(old_page, table)
             if ref.slot < FIRST_RECORD_SLOT:
@@ -1890,6 +1905,11 @@ class HeapStore:
                     xmax=previous.xmax,
                     field="already_ended",
                 )
+            if previous.flags & RECORD_FLAG_NODE_LABELS:
+                _, previous_labels = self._validated_payload(table, previous, content)
+                if node_labels is None:
+                    node_labels = previous_labels
+                    payload = self._labeled_payload(table, payload, node_labels)
             header = RecordHeader(
                 record_id=previous.record_id,
                 xmin=xmin,
@@ -1897,6 +1917,7 @@ class HeapStore:
                 prev_version=ref.encode(),
                 payload_len=len(payload),
                 schema_version=table.schema_version,
+                flags=RECORD_FLAG_NODE_LABELS if node_labels is not None else 0,
             )
             new_ref = self._store_version(table, header, payload)
             ended = previous.ended_at(xmin, deleted=False)
@@ -2146,7 +2167,7 @@ class HeapStore:
             return snapshot.visible(xmin, xmax)
 
         for ref, header, content in self._walk(table, accept=visible):
-            payload = self._validated_payload(table, header, content)
+            payload, _ = self._validated_payload(table, header, content)
             endpoints = decode_relationship_endpoints(table, payload)
             # HeapVersion construction evaluates the tuple before the previous-version
             # reference.  Preserve both that validation and its order without retaining either
@@ -3501,7 +3522,7 @@ class HeapStore:
         materialized_positions: frozenset[int] | None = None,
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
-        payload = self._validated_payload(table, header, content)
+        payload, node_labels = self._validated_payload(table, header, content)
         version = HeapVersion(
             record_id=header.record_id,
             xmin=header.xmin,
@@ -3519,6 +3540,7 @@ class HeapStore:
             schema_version=header.schema_version,
             deleted=bool(header.flags & RECORD_FLAG_DELETED),
             table_id=table.table_id,
+            node_labels=node_labels,
         )
         # _validated_payload has authenticated this exact header length against the inline or
         # overflow payload.  Carry the already-paid fact for optional decoded-result accounting;
@@ -3529,7 +3551,7 @@ class HeapStore:
 
     def _validated_payload(
         self, table: TableDef, header: RecordHeader, content: bytes
-    ) -> bytes:
+    ) -> tuple[bytes, tuple[str, ...] | None]:
         """Return one payload after the checks shared by full and projected decoders."""
         prior_count = None
         if header.schema_version != table.schema_version:
@@ -3555,11 +3577,61 @@ class HeapStore:
                 declared=header.payload_len,
                 observed=len(payload),
             )
+        node_labels = None
+        if header.flags & RECORD_FLAG_NODE_LABELS:
+            authority = self._node_label_authority(table, stored=True)
+            node_labels, offset = decode_node_labels(payload)
+            if not authority.admits_node_labels(node_labels):
+                raise GrafxCorruptionDetected("Node labels are absent from the catalog candidate set.", field="node_labels")
+            payload = payload[offset:]
         if header.schema_version != table.schema_version:
             prior = replace(table, columns=table.columns[:prior_count], schema_version=header.schema_version, schema_layouts=())
             values = decode_tuple(prior, payload)
-            return encode_tuple(table, (*values, *((None,) * (len(table.columns) - prior_count))))
-        return payload
+            return encode_tuple(table, (*values, *((None,) * (len(table.columns) - prior_count)))), node_labels
+        return payload, node_labels
+
+    def _labeled_payload(self, table: TableDef, payload: bytes, labels: tuple[str, ...] | None) -> bytes:
+        """Admit metadata before any extent/page mutation; tuple proofs exclude it."""
+        if labels is None:
+            return payload
+        authority = self._node_label_authority(table, stored=False)
+        prefix = encode_node_labels(labels)
+        if not authority.admits_node_labels(labels):
+            raise GrafxConfigurationError("Node labels require admitted table candidates.", field="node_labels")
+        return prefix + payload
+
+    def _node_label_authority(self, table: TableDef, *, stored: bool) -> TableDef:
+        """Resolve label authority from the native catalog, never caller metadata."""
+        error = GrafxCorruptionDetected if stored else GrafxConfigurationError
+        catalog = (None if stored else self._node_label_write_catalog) or self._catalog.catalog
+        if table.kind != "node" or not catalog.requires_capability(NODE_LABELS_CAPABILITY):
+            raise error("Node-label payload lacks native node/catalog authority.", field="node_labels")
+        try:
+            authority = catalog.table_by_id(table.table_id)
+        except (GrafxConfigurationError, GrafxCorruptionDetected) as failure:
+            raise error("Node labels name an unknown native table.", field="node_labels") from failure
+        if authority.kind != "node" or authority.name != table.name:
+            raise error("Node labels require the same native table identity.", field="node_labels")
+        return authority
+
+    @contextmanager
+    def _node_label_write_scope(self, catalog: Catalog) -> Iterator[None]:
+        """Use manager-validated staged schema for this participant's writes only.
+
+        The transaction manager holds the existing participant/commit sections
+        and owns staging provenance and both OCC checks. There is one native row
+        materialization per participant; independent handles own distinct heaps.
+        This ephemeral view does not adopt/publish a catalog or affect readers.
+        """
+        if type(catalog) is not Catalog or not catalog.requires_capability(NODE_LABELS_CAPABILITY):
+            raise GrafxConfigurationError("Label writing requires its effective native catalog.", field="node_labels")
+        if self._node_label_write_catalog is not None:
+            raise GrafxTransactionStateError("A participant already holds a label write scope.", field="node_labels")
+        self._node_label_write_catalog = catalog
+        try:
+            yield
+        finally:
+            self._node_label_write_catalog = None
 
     def _payload_of(self, header: RecordHeader, content: bytes) -> bytes:
         """Return the payload of a version, following its overflow chain when it has one."""

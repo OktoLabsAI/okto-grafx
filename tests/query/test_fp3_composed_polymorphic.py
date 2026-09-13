@@ -5,7 +5,7 @@ import pytest
 from okto_grafx import connect
 from okto_grafx.domain.query.analysis import analyze, polymorphic_node
 from okto_grafx.domain.query.parser import parse
-from okto_grafx.errors import GrafxPlanError, GrafxQueryBudgetExceeded
+from okto_grafx.errors import GrafxQueryBudgetExceeded
 
 
 @pytest.fixture
@@ -58,19 +58,17 @@ def test_composition_does_not_remove_an_available_typed_anchor_seek(db):
     assert any(node.label == "IndexSeek" for node in plan.walk())
 
 
-def test_scope_discard_does_not_bypass_remaining_polymorphic_write_refusal():
+def test_scope_discard_rebinds_a_real_node_before_polymorphic_write():
     query = parse("MATCH (n:A) WITH n.id AS id MATCH (n) SET n.id=2")
     assert polymorphic_node(query) is not None
-    with pytest.raises(GrafxPlanError, match="write needs one table"):
-        analyze(query)
+    assert next(binding for binding in analyze(query).bindings if binding.name == "n").entity == "node"
 
 
-def test_incompatible_property_types_still_refuse_before_rows(db):
+def test_different_property_types_do_not_refuse_empty_or_filtered_reads(db):
     with db.begin("write") as tx:
         tx.execute("CREATE NODE TABLE C(id INT64, name INT64, PRIMARY KEY(id))")
-    for query in ("UNWIND [] AS i MATCH (n) RETURN n.name", "MATCH (n {name:'one'}) RETURN n.id"):
-        with pytest.raises(GrafxPlanError, match="tables do not agree"):
-            db.execute(query)
+    assert db.execute("UNWIND [] AS i MATCH (n) RETURN n.name").rows == ()
+    assert db.execute("MATCH (n {name:'one'}) RETURN n.id").rows == ((1,),)
 
 
 def test_composed_reads_see_private_overlay_without_exposing_it_to_other_readers(db):

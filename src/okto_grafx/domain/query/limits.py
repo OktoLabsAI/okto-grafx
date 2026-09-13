@@ -23,6 +23,7 @@ from __future__ import annotations
 __all__ = [
     "DEFAULT_MAX_QUERY_VALUE_CHARACTERS",
     "MAX_CLAUSES",
+    "MAX_PIPELINE_CLAUSES",
     "MAX_COLUMN_DEFINITIONS",
     "MAX_EXPRESSION_DEPTH",
     "MAX_LIST_ELEMENTS",
@@ -71,7 +72,7 @@ columns unbounded.  This bound applies only to derived display names; identifier
 string values retain their substantially smaller limits.
 """
 
-MAX_TOKENS: int = 8192
+MAX_TOKENS: int = 32768
 """Tokens one query may produce, so a pathological but short text cannot expand without bound."""
 
 MAX_EXPRESSION_DEPTH: int = 48
@@ -82,7 +83,14 @@ so this leaves two orders of magnitude of headroom. Real Cypher rarely passes fi
 """
 
 MAX_CLAUSES: int = 64
-"""Clauses one query may chain, counting every MATCH, CREATE, MERGE, SET, DELETE and RETURN."""
+"""Maximum UNION branches or conditional SET actions within one MERGE."""
+
+MAX_PIPELINE_CLAUSES: int = 1024
+"""Written clauses in a query pipeline; source size and physical plan depth also bound it.
+
+Consecutive CREATE patterns run as a flat native sequence. Other operator trees
+still obey their independent depth guard, and expression recursion is unchanged.
+"""
 
 MAX_PATTERNS_PER_CLAUSE: int = 32
 """Comma-separated patterns one MATCH, CREATE or MERGE clause may carry."""

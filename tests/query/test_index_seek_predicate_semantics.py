@@ -34,10 +34,10 @@ def _operators(handle, statement: str) -> tuple[object, ...]:
 
 
 def test_seek_keeps_the_original_conjunction_over_a_matching_hit(database) -> None:
-    """A STRING is unknown inside AND, but is a refused standalone WHERE predicate."""
+    """A false residual still filters the index hit; seeking does not drop the filter."""
 
-    keyed = "MATCH (p:WithPk) WHERE p.k = 1 AND p.name RETURN p.k"
-    scanned = "MATCH (p:WithoutIndex) WHERE p.k = 1 AND p.name RETURN p.k"
+    keyed = "MATCH (p:WithPk) WHERE p.k = 1 AND p.name = 'missing' RETURN p.k"
+    scanned = "MATCH (p:WithoutIndex) WHERE p.k = 1 AND p.name = 'missing' RETURN p.k"
 
     assert database.execute(scanned).rows == ()
     assert database.execute(keyed).rows == ()
@@ -46,14 +46,26 @@ def test_seek_keeps_the_original_conjunction_over_a_matching_hit(database) -> No
     assert any(isinstance(node, IndexSeek) for node in plan)
     filters = [node for node in plan if isinstance(node, FilterRows)]
     assert len(filters) == 1
-    assert filters[0].predicate.describe() == "((p.k = 1) AND p.name)"
+    assert filters[0].predicate.describe() == "((p.k = 1) AND (p.name = 'missing'))"
 
 
 def test_seek_miss_keeps_the_equality_short_circuit(database) -> None:
-    statement = "MATCH (p:WithPk) WHERE p.k = 9 AND p.name RETURN p.k"
+    # Evaluating the residual on row k=1 would divide by zero. Neither the seek
+    # nor the canonical scan may evaluate it after a false leading equality.
+    statement = "MATCH (p:WithPk) WHERE p.k = 9 AND (1 / (p.k - 1)) = 0 RETURN p.k"
 
     assert database.execute(statement).rows == ()
+    assert database.execute(statement.replace("WithPk", "WithoutIndex")).rows == ()
     assert any(isinstance(node, IndexSeek) for node in _operators(database, statement))
+
+
+@pytest.mark.parametrize("table", ["WithPk", "WithoutIndex"])
+@pytest.mark.parametrize("key", [1,9])
+def test_known_string_boolean_operand_refuses_even_for_a_seek_miss(database, table, key):
+    with pytest.raises(GrafxPlanError) as failure:
+        database.execute(f"MATCH (p:{table}) WHERE p.k = {key} AND p.name RETURN p.k")
+    assert failure.value.details["reason"] == "boolean_operand_type"
+    assert failure.value.details["query_phase"] == "planning"
 
 
 def test_a_term_before_the_indexed_equality_keeps_the_canonical_scan(database) -> None:

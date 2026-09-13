@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass, replace
 from typing import TypeVar, cast
+from collections.abc import Callable
 
 from okto_grafx.domain.query import ast
 
@@ -11,17 +12,37 @@ T = TypeVar("T")
 __all__ = ["lower_scopes"]
 
 
-def _rewrite(value: T, names: dict[str, str]) -> T:
+def _rewrite(value: T, names: dict[str, str], fresh: Callable[[str], str]) -> T:
     """Rewrite only language-owned nodes; never descend into parameter/literal values."""
     if type(value) is ast.Variable:
         return cast(T, replace(value, name=names.get(value.name, value.name)))
     if type(value) in (ast.Literal, ast.Parameter):
         return value
+    if type(value) is ast.ExistsSubquery:
+        from okto_grafx.domain.query.existential import referenced_names
+        local = {**names, **{target: names.get(source, source) for target, source in value.imports}}
+        referenced = referenced_names(value.query, local)
+        return cast(T, replace(value, imports=tuple((target, source) for target, source in local.items()
+                                                    if target in referenced)))
+    if type(value) is ast.ListIteration:
+        local = {**names, value.variable: value.variable}
+        if value.accumulator is not None:
+            local[value.accumulator] = value.accumulator
+        return cast(T, replace(value, source=_rewrite(value.source, names, fresh),
+            initial=_rewrite(value.initial, names, fresh),
+            predicate=_rewrite(value.predicate, local, fresh), body=_rewrite(value.body, local, fresh)))
+    if type(value) is ast.PatternComprehension:
+        local = dict(names)
+        for name in value.local_names():
+            if name not in local:
+                local[name] = fresh(name)
+        return cast(T, replace(value, pattern=_rewrite(value.pattern, local, fresh),
+            predicate=_rewrite(value.predicate, local, fresh), projection=_rewrite(value.projection, local, fresh)))
     if type(value) is tuple:
-        return cast(T, tuple(_rewrite(item, names) for item in value))
+        return cast(T, tuple(_rewrite(item, names, fresh) for item in value))
     if type(value).__module__ != ast.__name__ or not is_dataclass(value):
         return value
-    changes = {field.name: _rewrite(getattr(value, field.name), names) for field in fields(value)}
+    changes = {field.name: _rewrite(getattr(value, field.name), names, fresh) for field in fields(value)}
     if type(value) in (ast.NodePattern, ast.RelationshipPattern, ast.PatternPath):
         variable = value.variable
         changes["variable"] = names.get(variable, variable)
@@ -73,6 +94,10 @@ def _lower_list_locals(query: ast.Query) -> ast.Query:
 
     def visit_uncached(value: T, names: dict[str, str]) -> T:
         """Lower one owned AST node, introducing lexical binders only in their bodies."""
+        if type(value) is ast.ExistsSubquery:
+            # Inner query binders are lowered by their own planner. Capture only
+            # the enclosing list-local aliases at this lexical boundary.
+            return cast(T, replace(value, imports=tuple({**dict(value.imports), **names}.items())))
         if type(value) is ast.Variable:
             return cast(T, replace(value, name=names.get(value.name, value.name)))
         if type(value) in (ast.Literal, ast.Parameter):
@@ -92,6 +117,10 @@ def _lower_list_locals(query: ast.Query) -> ast.Query:
         if type(value).__module__ != ast.__name__ or not is_dataclass(value):
             return value
         changes = {f.name: visit(getattr(value, f.name), names) for f in fields(value)}
+        if type(value) in (ast.NodePattern, ast.RelationshipPattern, ast.PatternPath):
+            # Entity references inside a list-local graph expression use the
+            # same lowered identity as Variable expressions in its body.
+            changes["variable"] = names.get(value.variable, value.variable)
         if type(value) is ast.ReturnItem:
             changes["alias"] = value.name
         return cast(T, replace(value, **changes))
@@ -108,8 +137,6 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
     and later scopes, rather than assuming an internal-looking prefix cannot be written.
     """
     query = _lower_list_locals(query)
-    if not query.with_clauses:
-        return query
     scope: dict[str, str] = {name: name for name in initial}
     used: set[str] = set(initial)
     reserved = set(initial)
@@ -127,6 +154,13 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
             pending.extend(getattr(value, field.name) for field in fields(value))
     ordinal = 0
 
+    # Ordinary queries keep their existing identity/alias shape. Comprehensions
+    # require scope-aware rewriting even when there is no WITH clause.
+    if not query.with_clauses and not any(
+        isinstance(value, (ast.PatternComprehension, ast.ExistsSubquery)) for value in _owned_nodes(query)
+    ):
+        return query
+
     def fresh(name: str) -> str:
         """Reuse a first spelling or allocate a collision-free shadow identity."""
         nonlocal ordinal
@@ -143,21 +177,20 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
     pipeline = []
     for clause in query.ordered_clauses():
         if isinstance(clause, ast.ProcedureCall):
-            arguments = _rewrite(clause.arguments, scope)
+            arguments = _rewrite(clause.arguments, scope, fresh)
             yielded = []
             for item in clause.yields:
                 identity = fresh(item.name)
                 scope[item.name] = identity
                 yielded.append(replace(item, alias=identity))
             pipeline.append(replace(clause, arguments=arguments, yields=tuple(yielded),
-                                    predicate=_rewrite(clause.predicate, scope)))
+                                    predicate=_rewrite(clause.predicate, scope, fresh)))
             continue
         if isinstance(clause, ast.SubqueryClause):
             outer_names = tuple(scope[name] for name in clause.imports)
             branches = clause.query.branches() if isinstance(clause.query, ast.UnionQuery) else (clause.query,)
             returned = branches[0].return_clause
-            assert returned is not None
-            columns = returned.column_names()
+            columns = () if returned is None else returned.column_names()
             outputs = tuple(fresh(name) for name in columns)
             scope.update(zip(columns, outputs, strict=True))
             pipeline.append(replace(clause, outer_names=outer_names, output_aliases=outputs))
@@ -168,22 +201,23 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
             carried = tuple(ast.ReturnItem(expression=ast.Variable(name)) for name in scope) if clause.include_existing else ()
             for item in (*carried, *clause.items):
                 name = item.name
-                expression = _rewrite(item.expression, scope)
+                expression = _rewrite(item.expression, scope, fresh)
                 carries = isinstance(item.expression, ast.Variable) and (
                     item.alias is None or item.alias == item.expression.name
                 )
                 identity = scope[name] if carries else fresh(name)
                 projected[name] = identity
                 items.append(replace(item, expression=expression, alias=identity))
-            scope = projected
+            ordering_scope = {**scope, **projected}
+            scope = {**{name: scope[name] for name in query.global_imports}, **projected}
             pipeline.append(replace(
-                clause, items=tuple(items), include_existing=False, predicate=_rewrite(clause.predicate, scope),
-                sort_items=_rewrite(clause.sort_items, scope),
-                skip=_rewrite(clause.skip, scope), limit=_rewrite(clause.limit, scope),
+                clause, items=tuple(items), include_existing=False, predicate=_rewrite(clause.predicate, ordering_scope, fresh),
+                sort_items=_rewrite(clause.sort_items, ordering_scope, fresh),
+                skip=_rewrite(clause.skip, scope, fresh), limit=_rewrite(clause.limit, scope, fresh),
             ))
             continue
         if isinstance(clause, ast.UnwindClause):
-            expression = _rewrite(clause.expression, scope)
+            expression = _rewrite(clause.expression, scope, fresh)
             identity = fresh(clause.alias)
             scope[clause.alias] = identity
             pipeline.append(replace(clause, expression=expression, alias=identity))
@@ -195,17 +229,17 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
             for bound in (*pattern.nodes, *pattern.relationships, pattern):
                 if bound.variable is not None and bound.variable not in scope:
                     scope[bound.variable] = fresh(bound.variable)
-        pipeline.append(_rewrite(clause, scope))
+        pipeline.append(_rewrite(clause, scope, fresh))
     returned = query.return_clause
     if returned is not None:
         output_scope = {**scope, **{item.alias: item.alias for item in returned.items
                                   if item.alias is not None}}
         returned = replace(
             returned,
-            items=tuple(replace(item, expression=_rewrite(item.expression, scope), alias=item.name)
+            items=tuple(replace(item, expression=_rewrite(item.expression, scope, fresh), alias=item.name)
                         for item in returned.items),
-            sort_items=_rewrite(returned.sort_items, output_scope),
-            skip=_rewrite(returned.skip, scope), limit=_rewrite(returned.limit, scope),
+            sort_items=_rewrite(returned.sort_items, output_scope, fresh),
+            skip=_rewrite(returned.skip, scope, fresh), limit=_rewrite(returned.limit, scope, fresh),
         )
     return replace(
         query, clause_pipeline=tuple(pipeline),
@@ -215,3 +249,19 @@ def lower_scopes(query: ast.Query, initial: tuple[str, ...] = ()) -> ast.Query:
         updating_clauses=tuple(c for c in pipeline if isinstance(c, ast.UpdatingClause)),
         return_clause=returned,
     )
+
+
+def _owned_nodes(query: ast.Query):
+    """Inspect language-owned structure only, without entering literal payloads."""
+    pending = [query]
+    seen = set()
+    while pending:
+        value = pending.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        yield value
+        if type(value) is tuple:
+            pending.extend(value)
+        elif type(value).__module__ == ast.__name__ and is_dataclass(value) and type(value) not in (ast.Literal, ast.Parameter):
+            pending.extend(getattr(value, item.name) for item in fields(value))

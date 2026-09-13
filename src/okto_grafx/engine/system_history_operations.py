@@ -1,6 +1,7 @@
 """Explicit operator controls for native system history, never autonomous retention."""
 
 from __future__ import annotations
+from okto_grafx.domain.model.table_selection import TableSelector, validate_table_selections, public_table_selector
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -15,14 +16,12 @@ from okto_grafx.domain.txn.commit_identity import CommitId
 
 
 def control(database: Database, *, operation: str, before: CommitId | None = None,
-            tables: tuple[str, ...] = (), name: str | None = None,
+            tables: tuple[TableSelector, ...] = (), name: str | None = None,
             max_bytes: int = 16 * 1024 * 1024) -> TemporalPruneReport | None:
     """Validate inputs before admission and delegate publication to the native coordinator."""
     if operation != "unpin system history":
         before = database._history_identity(before)
-        if (type(tables) is not tuple or not tables or any(type(table) is not str or not table for table in tables)
-                or len(set(tables)) != len(tables)):
-            raise GrafxConfigurationError("Specify distinct history tables.", field="tables")
+        validate_table_selections(tables)
     if operation != "prune system history":
         try:
             valid_name = type(name) is str and bool(name) and len(name.encode("utf-8")) <= 128
@@ -88,6 +87,6 @@ def pins(database: Database) -> tuple[TemporalPin, ...]:
                 """Capture detached pin values inside the journal's qualified observation."""
                 catalog = database._catalog.catalog
                 return tuple(TemporalPin(name, CommitId(database.identity.database_uuid, sequence),
-                             tuple(catalog.table_by_id(key).name for key in tables))
+                             tuple(public_table_selector(catalog, catalog.table_by_id(key)) for key in tables))
                              for name, sequence, tables in catalog.system_history_pins())
             return database._observe_history(tx._context, collect, ())

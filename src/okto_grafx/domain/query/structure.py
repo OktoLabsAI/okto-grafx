@@ -5,6 +5,8 @@ This pass rejects impostor classes, mutable inventories and cycles, without
 calling user-defined equality, iteration or AST methods. Shared DAGs are allowed.
 """
 
+from __future__ import annotations
+
 from dataclasses import fields, is_dataclass
 from functools import lru_cache
 from types import UnionType
@@ -15,7 +17,7 @@ from okto_grafx.domain.query import ast
 
 
 _CANONICAL_IDS = frozenset(
-    id(value) for value in vars(ast).values()
+    id(value) for name in ast.__all__ for value in (getattr(ast, name),)
     if isinstance(value, type) and value.__module__ == ast.__name__
     and is_dataclass(value)
 )
@@ -71,6 +73,12 @@ def validate_structure(statement: object) -> None:
         active.add(marker)
         pending.append((value, expected, True))
         if kind is tuple:
+            if get_origin(expected) in (UnionType, Union):
+                candidates = tuple(option for option in get_args(expected) if get_origin(option) is tuple)
+                if len(candidates) != 1:
+                    raise GrafxPlanError("Query tuple requires an unambiguous tuple annotation.",
+                                         field="ast", reason="invalid_ast_structure")
+                expected = candidates[0]
             options = get_args(expected)
             if len(options) == 2 and options[1] is Ellipsis:
                 pending.extend((item, options[0], False) for item in reversed(value))
@@ -89,3 +97,8 @@ def validate_structure(statement: object) -> None:
             except AttributeError as error:
                 raise GrafxPlanError("Query syntax is missing a required AST field.",
                                      field="ast", reason="invalid_ast_structure") from error
+
+
+__all__ = [
+    'validate_structure',
+]

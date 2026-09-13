@@ -100,18 +100,40 @@ def test_impossible_pattern_consumes_prior_statement_writes(graph):
 @pytest.mark.parametrize("query", [
     "MATCH (n:Missing) RETURN not_defined",
     "MATCH (n:Missing) RETURN labels(1)",
-    "MATCH (n:Missing), (a:E) RETURN a",
-    "MATCH (:E)-[:Missing]->(:P) RETURN 1",
-    "MATCH (:Missing)-[:P]->(:P) RETURN 1",
-    "MATCH (n:Missing:Other) RETURN n",
-    "CREATE (:Missing {id:1})",
     "WITH 1 AS n MATCH (n:Missing) RETURN n",
     "WITH 1 AS n OPTIONAL MATCH (n:Missing) RETURN n",
     "MATCH (a:P) WITH a,1 AS b MATCH (a)-[:Missing*0..]->(b) RETURN b",
 ])
-def test_absent_reads_do_not_waive_compile_errors_or_enable_schema_free_writes(graph, query):
+def test_absent_reads_do_not_waive_compile_errors(graph, query):
     with pytest.raises(GrafxPlanError):
         graph.execute(query)
+
+
+def test_multiple_missing_labels_are_a_valid_empty_conjunction_not_a_compile_error(graph):
+    before = graph.catalog.catalog.tables()
+    assert graph.execute("MATCH (n:Missing:Other) RETURN n").rows == ()
+    assert graph.execute("OPTIONAL MATCH (n:Missing:Other) RETURN n").rows == ((None,),)
+    assert graph.catalog.catalog.tables() == before
+
+
+@pytest.mark.parametrize("query", [
+    "MATCH (n:Missing), (a:E) RETURN a",
+    "MATCH (:E)-[:Missing]->(:P) RETURN 1",
+    "MATCH (:Missing)-[:P]->(:P) RETURN 1",
+])
+def test_other_kind_name_does_not_populate_an_absent_namespace(graph, query):
+    assert graph.execute(query).rows == ()
+
+
+def test_implicit_label_creation_is_still_refused_by_the_read_transaction(graph):
+    from okto_grafx.errors import GrafxTransactionStateError
+
+    # The model is now valid, but the read door must reject the write plan before
+    # its lazy schema creation, rather than rejecting the label during planning.
+    with pytest.raises(GrafxTransactionStateError) as failure:
+        graph.execute("CREATE (:Missing {id:1})")
+    assert failure.value.code == "transaction_state"
+    assert not graph.catalog.catalog.has_table("Missing")
 
 
 def test_optional_missing_entities_cross_alias_and_subquery(graph):

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
+from okto_grafx.domain.errors import GrafxPlanError
 from okto_grafx.domain.query.analysis import (
     Binding,
     QueryAnalysis,
@@ -175,14 +175,26 @@ def test_a_path_name_may_not_be_a_name_something_else_answers_to(query):
 
 
 @pytest.mark.parametrize("query", [
-    "MATCH path = (a:A)-[r]->(b:B) RETURN a.id",
     "MATCH path = (a:A)<-[r:R]-(b:B) RETURN a.id",
-    "MATCH path = (a:A)-[r:R {layer:'canonical'}]->(b:B) RETURN a.id",
     "MATCH path = (a:A)-[r:R]->(b:B)-[q:R]->(c:B) RETURN a.id",
 ])
-def test_unimplemented_capture_and_wrong_endpoint_schema_remain_refused(database, query):
+def test_wrong_endpoint_schema_remains_refused(database, query):
     with pytest.raises(GrafxPlanError):
         database.explain(query)
+
+
+def test_named_path_inline_map_filters_instead_of_refusing(database):
+    query = "MATCH path = (a:A)-[r:R {layer:$layer}]->(b:B) RETURN a.id,path"
+    rows = database.execute(query, {"layer":"canonical"}).rows
+    assert len(rows) == 1 and rows[0][0] == "a1"
+    assert rows[0][1].relationships[0].properties["layer"] == "canonical"
+    assert database.execute(query, {"layer":"missing"}).rows == ()
+
+
+def test_decorative_path_name_allows_native_relationship_type_inference(database):
+    query = "MATCH path = (a:A)-[r]->(b:B) RETURN a.id"
+    assert database.execute(query).rows == (("a1",),)
+    assert database.explain(query) is not None
 
 
 @pytest.mark.parametrize("operation,probe,expected", [
@@ -198,12 +210,10 @@ def test_named_read_before_write_uses_original_transaction(database, operation, 
     assert database.execute(probe).rows == expected
 
 
-def test_a_name_on_a_written_pattern_never_reaches_the_analysis() -> None:
-    """The parser reads `name =` only inside MATCH, so a write cannot carry one at all."""
-    with pytest.raises(GrafxParseError):
-        parse("CREATE p = (a:A)-[:R]->(b:B)")
-    with pytest.raises(GrafxParseError):
-        parse("MERGE p = (a:A)-[:R]->(b:B)")
+def test_written_pattern_path_names_reach_the_analysis() -> None:
+    """CREATE and MERGE now preserve named captures; shape support is checked later."""
+    assert parse("CREATE p = (a:A)-[:R]->(b:B)").updating_clauses[0].patterns[0].variable == "p"
+    assert parse("MERGE p = (a:A)").updating_clauses[0].pattern.variable == "p"
 
 
 # --- a tree nobody parsed ------------------------------------------------------------------------

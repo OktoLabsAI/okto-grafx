@@ -227,38 +227,49 @@ def test_a_variable_a_stage_dropped_is_refused_for_being_dropped() -> None:
 
 
 @pytest.mark.parametrize(
-    ("query", "field", "value"),
+    ("query", "field", "value", "reason"),
     [
-        ("MATCH (n:Decision) WITH n, n.id RETURN n.id", "item", "n.id"),
-        ("WITH 1 AS a, 2 AS a RETURN a", "item", "a"),
-        ("MATCH (n:Decision) WITH n, n.id AS n RETURN n", "item", "n"),
-        ("WITH 1 AS a, a + 1 AS b RETURN b", "variable", "a"),
+        ("MATCH (n:Decision) WITH n, n.id RETURN n.id", "item", "n.id", "no_expression_alias"),
+        ("WITH 1 AS a, 2 AS a RETURN a", "item", "a", "column_name_conflict"),
+        ("MATCH (n:Decision) WITH n, n.id AS n RETURN n", "item", "n", "column_name_conflict"),
+        ("WITH 1 AS a, a + 1 AS b RETURN b", "variable", "a", "undefined_variable"),
         (
             "MATCH (n:Decision) WITH n WHERE count(n) > 1 RETURN n.id",
             "expression",
             "(count(n) > 1)",
+            "invalid_aggregation_context",
         ),
     ],
 )
 def test_a_stage_refuses_the_projections_that_have_no_single_meaning(
-    query: str, field: str, value: str
+    query: str, field: str, value: str, reason: str
 ) -> None:
     with pytest.raises(GrafxPlanError) as raised:
         analyze(parse(query))
-    expected = {"field": field, "value": value}
-    if field in {"variable", "expression"}:
-        expected.update(reason="undefined_variable" if field == "variable" else "invalid_aggregation_context",
-                        query_phase="planning")
+    expected = {"field": field, "value": value, "reason": reason, "query_phase": "planning"}
     assert raised.value.details == expected
 
 
-@pytest.mark.parametrize("keyword", ["SET ref.x = 1", "DELETE ref"])
-def test_a_projected_value_is_never_a_write_target(keyword: str) -> None:
+def test_a_projected_scalar_is_not_a_property_set_target() -> None:
     with pytest.raises(GrafxPlanError) as raised:
-        analyze(parse(f"MATCH (n:Decision) WITH n.id AS ref {keyword}"))
+        analyze(parse("MATCH (n:Decision) WITH n.id AS ref SET ref.x = 1"))
 
     assert raised.value.details == {"field": "variable", "value": "ref"}
     assert "expression alias" in str(raised.value)
+
+
+def test_a_projected_scalar_is_not_a_delete_target() -> None:
+    # DELETE admits native entity-valued expressions; an alias's scalar type is
+    # established by catalog-aware planning, not by its syntactic alias category.
+    with okto_grafx.connect(":memory:") as db:
+        with db.begin("write") as tx:
+            tx.execute("CREATE NODE TABLE Decision(id INT64, PRIMARY KEY(id))")
+            tx.execute("CREATE(:Decision {id:1})")
+            with pytest.raises(GrafxPlanError) as failure:
+                tx.execute("MATCH(n:Decision) WITH n.id AS ref DELETE ref")
+            assert failure.value.details["reason"] == "delete_argument_type"
+            assert failure.value.details["query_phase"] == "planning"
+            assert tx.execute("MATCH(n:Decision) RETURN n.id").rows == ((1,),)
 
 
 def test_a_later_stage_reads_what_an_earlier_stage_created() -> None:

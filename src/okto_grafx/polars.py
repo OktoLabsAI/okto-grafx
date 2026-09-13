@@ -5,8 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
+from okto_grafx.domain.model.temporal_interchange import TEMPORAL_CLASSES_BY_NAME
+from okto_grafx.domain.model.stored_types import StoredType, validate_typed_value
+from okto_grafx.domain.model.value import MAX_VALUE_DEPTH
+from okto_grafx._arrow_values import (
+    _own_collections, _polars_collection_layout, _collection_from_arrow,
+    _collection_to_arrow, _CollectionBudget,
+    _collection_schema_charge,
+)
 
-from okto_grafx.arrow import ArrowVectorType, to_arrow_batches, import_arrow_batches
+from okto_grafx.arrow import ArrowVectorType, ArrowDecimalType, to_arrow_batches, import_arrow_batches
 from okto_grafx.tabular import _arrow, _schema, _match_schema, _limit, _charge
 from okto_grafx.engine.database import Transaction, QueryCursor, ExecuteManyReport
 from okto_grafx.engine.query_engine import QueryResult
@@ -42,10 +50,51 @@ def _polars():
     return pl
 
 
+def _temporal_layout(actual, expected, pa):
+    """Polars loses child nullability and widens UTF-8 offsets, not coordinates.
+
+    Names, order and integer widths must remain exact. Native import validates
+    each non-null struct after the safe cast, including required child values.
+    """
+    return (pa.types.is_struct(actual) and len(actual) == len(expected)
+            and all(a.name == e.name and (
+                a.type == e.type or e.name == "zone" and pa.types.is_large_string(a.type)
+                and pa.types.is_string(e.type)) for a, e in zip(actual, expected)))
+
+
+def _collection_series_arrow(series, pa, pl, budget, depth=0):
+    """Avoid the Arrow C Data schema recursion ceiling without converting host dates.
+
+    Export shallow leaves and reconstruct LIST/STRUCT buffers, preserving masks.
+    Charge occurrences before Polars filtering or Python offset construction.
+    """
+    if depth > 3 * MAX_VALUE_DEPTH + 4:
+        raise GrafxUnsupportedOperation("Polars collection schema exceeds native layout depth.", field="types")
+    budget.add(128 + 128 * len(series) + 16 * series.estimated_size())
+    dtype = series.dtype
+    if isinstance(dtype, pl.List):
+        lengths = series.list.len()
+        offsets = [0]
+        for length in lengths.to_list():
+            offsets.append(offsets[-1] + (length or 0))
+        # Polars explode inserts placeholders for empty/NULL lists; remove those
+        # parents first. Real NULL elements within a nonempty list remain.
+        flattened = series.filter(lengths > 0).explode()
+        children = _collection_series_arrow(flattened, pa, pl, budget, depth + 1)
+        return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), children,
+                                        mask=series.is_null().to_arrow())
+    if isinstance(dtype, pl.Struct) and dtype.fields:
+        children = [_collection_series_arrow(series.struct.field(field.name), pa, pl, budget, depth + 1)
+                    for field in dtype.fields]
+        return pa.StructArray.from_arrays(children, names=[field.name for field in dtype.fields],
+                                          mask=series.is_null().to_arrow())
+    return series.to_arrow()
+
+
 def to_polars(
     source: QueryResult | QueryCursor,
     *,
-    types: tuple[str | ArrowVectorType, ...],
+    types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...],
     batch_rows: int = 256,
     max_batch_bytes: int = 16 * 1024 * 1024,
     max_rows: int = 100_000,
@@ -59,6 +108,7 @@ def to_polars(
     _limit("max_rows", max_rows)
     _limit("max_bytes", max_bytes)
     pa, pl = _arrow(), _polars()
+    types = _own_collections(types)
     schema = _schema(source.columns, types, pa)
     batches, count, charge = [], 0, 4096
     if charge > max_bytes:
@@ -91,7 +141,7 @@ def import_polars(
     statement: str,
     frame: PolarsFrame,
     *,
-    types: tuple[str | ArrowVectorType, ...],
+    types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...],
     max_batch_rows: int = 256,
     max_batch_bytes: int = 16 * 1024 * 1024,
     max_rows: int = 1_000_000,
@@ -114,6 +164,7 @@ def import_polars(
         ("max_batches", max_batches),
     ):
         _limit(name, value)
+    types = _own_collections(types)
     schema = _schema(tuple(frame.frame.columns), types, pa)
     _match_schema(frame.arrow_schema, schema, types)
     if frame.frame.height > max_rows:
@@ -125,9 +176,18 @@ def import_polars(
         """Normalize only documented Arrow offset-width differences, inside the savepoint."""
         try:
             for offset in range(0, max(1, frame.frame.height), max_batch_rows):
-                raw = frame.frame.slice(offset, max_batch_rows).to_arrow()
-                for actual, expected in zip(raw.schema, schema):
+                segment = frame.frame.slice(offset, max_batch_rows)
+                conversion_budget = _CollectionBudget(max_batch_bytes - _collection_schema_charge(types))
+                raw = pa.Table.from_arrays([
+                    _collection_series_arrow(segment[name], pa, pl, conversion_budget)
+                    if type(kind) is StoredType else segment[name].to_arrow()
+                    for name, kind in zip(segment.columns, types)], names=segment.columns)
+                for actual, expected, kind in zip(raw.schema, schema, types):
                     allowed = actual.type == expected.type
+                    if type(kind) is StoredType:
+                        allowed = _polars_collection_layout(actual.type, expected.type, pa)
+                    elif kind in TEMPORAL_CLASSES_BY_NAME:
+                        allowed |= _temporal_layout(actual.type, expected.type, pa)
                     allowed |= pa.types.is_large_string(
                         actual.type
                     ) and pa.types.is_string(expected.type)
@@ -144,11 +204,27 @@ def import_polars(
                             field="types",
                             column=actual.name,
                         )
-                if _charge(raw) > max_batch_bytes:
+                charge = _charge(raw) + _collection_schema_charge(types)
+                if charge > max_batch_bytes:
                     raise GrafxQueryBudgetExceeded(
                         "Polars batch bound exceeded.", resource="polars_import"
                     )
-                yield from raw.cast(schema, safe=True).to_batches(
+                # Arrow cannot cast Polars list-of-entries back to MAP. Rebuild
+                # declared collections through bounded exact native values, not
+                # dtype inference or lossy map-to-dict convenience conversions.
+                arrays = []
+                budget = _CollectionBudget(max_batch_bytes - charge)
+                for column, field, kind in zip(raw.columns, schema, types):
+                    if type(kind) is StoredType:
+                        values = []
+                        for scalar in column:
+                            value = _collection_from_arrow(kind, scalar, pa, budget)
+                            validate_typed_value(kind, value)
+                            values.append(_collection_to_arrow(kind, value))
+                        arrays.append(pa.chunked_array([pa.array(values, type=field.type, safe=True)], type=field.type))
+                    else:
+                        arrays.append(column.cast(field.type, safe=True))
+                yield from pa.Table.from_arrays(arrays, schema=schema).to_batches(
                     max_chunksize=max_batch_rows
                 )
         except (pa.ArrowException, pl.exceptions.PolarsError) as failure:

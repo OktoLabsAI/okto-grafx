@@ -127,15 +127,27 @@ def test_unwind_missing_keys_are_null_and_case_distinct_keys_coexist(database: o
     ).rows == (("d1", 1, 2),)
 
 
-def test_unwind_alias_is_a_value_and_never_a_set_or_delete_target() -> None:
-    statements = (
-        "UNWIND [{x: 1}] AS r MATCH (n:T) SET r.x = 2",
-        "UNWIND [1] AS r DELETE r",
-    )
-    for text in statements:
-        with pytest.raises(GrafxPlanError) as raised:
+@pytest.mark.parametrize("text,details", [
+    ("UNWIND [{x: 1}] AS r MATCH (n:Decision) SET r.x = 2", {"field": "variable", "value": "r"}),
+    ("UNWIND [1] AS r DELETE r", {"field": "target", "reason": "delete_argument_type", "query_phase": "planning"}),
+])
+def test_unwind_scalar_or_map_does_not_gain_entity_write_authority(database, text, details):
+    # SET still refuses a proven map carrier during analysis. DELETE now admits
+    # expressions here and rejects this scalar target during typed planning.
+    if details["field"] == "variable":
+        with pytest.raises(GrafxPlanError) as analysis_failure:
             analyze(parse(text))
-        assert raised.value.details == {"field": "variable", "value": "r"}
+        assert analysis_failure.value.details == details
+    else:
+        analyze(parse(text))
+    with database.begin("write") as tx:
+        tx.execute("MATCH(n:Decision {id:'d1'}) SET n.relevance_score=0.5")
+        with pytest.raises(GrafxPlanError) as raised:
+            tx.execute("MATCH(n:Decision {id:'d2'}) SET n.relevance_score=0.9 WITH n " + text)
+        assert raised.value.details == details
+    assert database.execute("MATCH(n:Decision) RETURN n.id,n.relevance_score ORDER BY n.id").rows == (
+        ("d1", 0.5), ("d2", 0.0), ("d3", 0.0),
+    )
 
 
 @pytest.mark.parametrize(

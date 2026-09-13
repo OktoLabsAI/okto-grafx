@@ -87,12 +87,14 @@ from okto_grafx.domain.query.control import _ReadControl
 from okto_grafx.domain.index.definition import (
     IndexDefinition,
     index_definition_matches_table,
+    vector_index_name,
 )
 from okto_grafx.domain.index.entry import IndexEntry
 from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.records import IndexChange, IndexOperation
 from okto_grafx.domain.index.visibility import (
     IndexVisibility,
+    ReconcileReport,
     SnapshotLike,
     entry_visible,
 )
@@ -1735,12 +1737,12 @@ class VectorEngine:
         self._neighbours = neighbours
         self._ef_construction = ef_construction
         self._ef_search = search_width
-        self._by_space: dict[str, VectorHnswIndex] = {}
-        self._map_claims: dict[str, dict[VectorHnswIndex, set[object]]] = {}
-        self._map_epochs: dict[str, int] = {}
+        self._by_space: dict[tuple[str, int], VectorHnswIndex] = {}
+        self._map_claims: dict[tuple[str, int], dict[VectorHnswIndex, set[object]]] = {}
+        self._map_epochs: dict[tuple[str, int], int] = {}
         self._next_map_epoch = 0
-        self._durable_by_space: dict[str, VectorHnswIndex] = {}
-        self._maintained_at: dict[str, float] = {}
+        self._durable_by_space: dict[tuple[str, int], VectorHnswIndex] = {}
+        self._maintained_at: dict[tuple[str, int], float] = {}
         self._guard = guard
         if type(catalog_changes_are_wal_logged) is not bool:
             raise GrafxConfigurationError(
@@ -1889,41 +1891,42 @@ class VectorEngine:
             catalog,
             speculative=True,
         )
+        key = (space_name, table.table_id)
         owner = object()
-        previous_maintained = self._maintained_at.get(space_name)
-        had_previous_maintained = space_name in self._maintained_at
-        previous_epoch = self._map_epochs.get(space_name)
+        previous_maintained = self._maintained_at.get(key)
+        had_previous_maintained = key in self._maintained_at
+        previous_epoch = self._map_epochs.get(key)
         installed_epoch: int | None = None
         try:
-            claims = self._map_claims.setdefault(space_name, {})
+            claims = self._map_claims.setdefault(key, {})
             claims.setdefault(index, set()).add(owner)
-            self._by_space[space_name] = index
-            installed_epoch = self._advance_map_epoch(space_name)
-            self._maintained_at[space_name] = self._clock.monotonic()
+            self._by_space[key] = index
+            installed_epoch = self._advance_map_epoch(key)
+            self._maintained_at[key] = self._clock.monotonic()
             self._publish_space_metrics()
         except BaseException as failure:
             # QueryEngine cannot journal an attach whose call never returned. Compensate every
             # exact process-local effect here, while the caller still owns the schema artifact
             # section, and preserve a re-entrant replacement if a host callback installed one.
-            self._release_map_claim(space_name, index, owner)
+            self._release_map_claim(key, index, owner)
             if (
                 installed_epoch is not None
-                and self._by_space.get(space_name) is index
-                and self._map_epochs.get(space_name) == installed_epoch
+                and self._by_space.get(key) is index
+                and self._map_epochs.get(key) == installed_epoch
             ):
                 if previous is None:
-                    self._by_space.pop(space_name, None)
+                    self._by_space.pop(key, None)
                 else:
-                    self._by_space[space_name] = previous
+                    self._by_space[key] = previous
                 if previous_epoch is None:
-                    self._map_epochs.pop(space_name, None)
+                    self._map_epochs.pop(key, None)
                 else:
-                    self._map_epochs[space_name] = previous_epoch
+                    self._map_epochs[key] = previous_epoch
                 if had_previous_maintained:
                     assert previous_maintained is not None
-                    self._maintained_at[space_name] = previous_maintained
+                    self._maintained_at[key] = previous_maintained
                 else:
-                    self._maintained_at.pop(space_name, None)
+                    self._maintained_at.pop(key, None)
             settle = getattr(self._require_registry(), "settle_speculative", None)
             if artifact is not None and callable(settle):
                 try:
@@ -1957,7 +1960,7 @@ class VectorEngine:
         registry = self._require_registry()
         index = VectorHnswIndex(
             VectorIndexDefinition(
-                name=f"vector_{table.name}_{space.name}",
+                name=vector_index_name(table, position),
                 table_id=table.table_id,
                 table_name=table.name,
                 positions=(position,),
@@ -2040,20 +2043,21 @@ class VectorEngine:
                         persist_stale=persist_stale,
                         proved_present=proved_present,
                     )
-        previous = self._by_space.get(space.name)
+        key = (space.name, table.table_id)
+        previous = self._by_space.get(key)
         if speculative:
             # The journal owner does not exist until _attach_speculative regains control. Do not
             # expose the map or invoke a fallible clock/metrics callback before that method can
             # compensate a call that never returns to QueryEngine.
             return index, artifact, previous
-        self._by_space[space.name] = index
-        self._advance_map_epoch(space.name)
-        self._durable_by_space[space.name] = index
-        self._maintained_at[space.name] = self._clock.monotonic()
+        self._by_space[key] = index
+        self._advance_map_epoch(key)
+        self._durable_by_space[key] = index
+        self._maintained_at[key] = self._clock.monotonic()
         self._publish_space_metrics()
         return index, artifact, previous
 
-    def _advance_map_epoch(self, space_name: str) -> int:
+    def _advance_map_epoch(self, space_name: tuple[str, int]) -> int:
         """Publish a non-repeating identity for one process-local map replacement."""
         self._next_map_epoch += 1
         epoch = self._next_map_epoch
@@ -2061,7 +2065,7 @@ class VectorEngine:
         return epoch
 
     def _release_map_claim(
-        self, space_name: str, index: VectorHnswIndex, owner: object
+        self, space_name: tuple[str, int], index: VectorHnswIndex, owner: object
     ) -> bool:
         """Release one exact map owner and prune even a partially-created empty claim path."""
         by_index = self._map_claims.get(space_name)
@@ -2087,19 +2091,20 @@ class VectorEngine:
         """Release one exact speculative map claim without removing an adopter's mapping."""
         if not isinstance(expected, VectorHnswIndex):
             return False
-        if not self._release_map_claim(space_name, expected, owner):
+        key = (space_name, expected.definition.table_id)
+        if not self._release_map_claim(key, expected, owner):
             return False
 
-        current = self._by_space.get(space_name)
+        current = self._by_space.get(key)
         if committed:
             if current is expected:
-                self._durable_by_space[space_name] = expected
+                self._durable_by_space[key] = expected
             return True
         if current is not expected:
             return True
-        if self._durable_by_space.get(space_name) is expected:
+        if self._durable_by_space.get(key) is expected:
             return True
-        remaining = self._map_claims.get(space_name, {}).get(expected)
+        remaining = self._map_claims.get(key, {}).get(expected)
         if remaining:
             return True
         if self._matches_committed_mapping(expected, space_name):
@@ -2107,7 +2112,7 @@ class VectorEngine:
             # this process still holds the speculative object that originally installed the
             # shared canonical file.  The freshly refreshed catalog, rather than local object
             # ownership, is the authority that turns that identical mapping durable.
-            self._durable_by_space[space_name] = expected
+            self._durable_by_space[key] = expected
             return True
 
         replacement = previous if isinstance(previous, VectorHnswIndex) else None
@@ -2122,13 +2127,13 @@ class VectorEngine:
             except GrafxError:
                 replacement = None
         if replacement is None:
-            self._by_space.pop(space_name, None)
-            self._map_epochs.pop(space_name, None)
-            self._maintained_at.pop(space_name, None)
+            self._by_space.pop(key, None)
+            self._map_epochs.pop(key, None)
+            self._maintained_at.pop(key, None)
         else:
-            self._by_space[space_name] = replacement
-            self._advance_map_epoch(space_name)
-            self._maintained_at[space_name] = self._clock.monotonic()
+            self._by_space[key] = replacement
+            self._advance_map_epoch(key)
+            self._maintained_at[key] = self._clock.monotonic()
         self._publish_space_metrics()
         return True
 
@@ -2181,15 +2186,20 @@ class VectorEngine:
         transaction, whose spaces are not in this one's base picture either. Registry entries
         are the index manager's and are unwound there by name. Never raises.
         """
-        current = self._by_space.get(space_name)
+        matches = tuple(key for key, index in self._by_space.items()
+                        if key[0] == space_name and (expected is None or index is expected))
+        if len(matches) != 1:
+            return False
+        key = matches[0]
+        current = self._by_space.get(key)
         if current is None or (expected is not None and current is not expected):
             return False
-        held = self._by_space.pop(space_name, None) is current
-        if held and self._durable_by_space.get(space_name) is current:
-            self._durable_by_space.pop(space_name, None)
+        held = self._by_space.pop(key, None) is current
+        if held and self._durable_by_space.get(key) is current:
+            self._durable_by_space.pop(key, None)
         if held:
-            self._map_epochs.pop(space_name, None)
-        self._maintained_at.pop(space_name, None)
+            self._map_epochs.pop(key, None)
+        self._maintained_at.pop(key, None)
         return held
 
     def discard_unknown(self, catalog: object) -> tuple[str, ...]:
@@ -2203,7 +2213,9 @@ class VectorEngine:
         unwind.
         """
         try:
-            alive = {space.name for space in catalog.spaces()}
+            alive = {(str(column.vector_space), table.table_id)
+                     for table in catalog.tables() for column in table.columns
+                     if column.is_vector and column.vector_space is not None}
         except Exception:  # noqa: BLE001 - an unwind must not gain a second failure
             return ()
         dropped = tuple(name for name in self._by_space if name not in alive)
@@ -2212,7 +2224,7 @@ class VectorEngine:
             self._map_epochs.pop(name, None)
             self._durable_by_space.pop(name, None)
             self._maintained_at.pop(name, None)
-        return dropped
+        return tuple(sorted({key[0] for key in dropped}))
 
     def _require_registry(self) -> IndexManager:
         """Return the index registry, refusing an engine that was built without one.
@@ -2231,20 +2243,31 @@ class VectorEngine:
             )
         return self._indexes
 
-    def index(self, space_name: str) -> VectorHnswIndex:
-        """Return the index of one embedding space, refusing a space with no index yet."""
-        existing = self._by_space.get(space_name)
+    def index(self, space_name: str, *, table_id: int | None = None) -> VectorHnswIndex:
+        """Resolve one physical owner; a shared space never selects the first table."""
+        if table_id is not None and (type(table_id) is not int or table_id < 1):
+            raise GrafxIndexError("Vector table identity must be a positive integer.",
+                                  field="table_id", value=table_id)
+        if table_id is None:
+            matches = tuple(index for (name, _table), index in self._by_space.items()
+                            if name == space_name)
+            if len(matches) > 1:
+                raise GrafxIndexError(
+                    "The embedding space has multiple physical owners; select a table.",
+                    field="space", value=space_name, reason="ambiguous_vector_owner",
+                )
+            existing = matches[0] if matches else None
+        else:
+            existing = self._by_space.get((space_name, table_id))
         if existing is None:
             raise GrafxIndexError(
-                f"Embedding space {space_name!r} has no index; a table declaring a column in it "
-                f"must be attached before it can be searched.",
-                field="space",
-                value=space_name,
+                f"Embedding space {space_name!r} has no index for the selected owner.",
+                field="space", value=space_name, table_id=table_id,
             )
         return existing
 
     def indexes(self) -> Iterable[VectorHnswIndex]:
-        """Return every index this engine holds, in space name order."""
+        """Return every physical index in stable (space name, table ID) order."""
         return tuple(self._by_space[name] for name in sorted(self._by_space))
 
     def _resolver_for(self, space: EmbeddingSpaceDef) -> VectorResolver:
@@ -2291,6 +2314,8 @@ class VectorEngine:
         values: Sequence[float],
         csn: Csn,
         txn: StagingTransaction,
+        *,
+        table_id: int | None = None,
     ) -> WalRecord:
         """Stage the index entry one vector write owes, validating the vector first.
 
@@ -2301,7 +2326,7 @@ class VectorEngine:
         space = self._catalog.catalog.space(space_name)
         require_active(space)
         stored = validate_components(space, values)
-        index = self.index(space_name)
+        index = self.index(space_name, table_id=table_id)
         del record_id
         return index.stage_insert(txn, index.key_for(stored), ref, csn)
 
@@ -2313,6 +2338,8 @@ class VectorEngine:
         values: Sequence[float],
         csn: Csn,
         txn: StagingTransaction,
+        *,
+        table_id: int | None = None,
     ) -> WalRecord:
         """Stage the tombstone of one vector version.
 
@@ -2321,15 +2348,17 @@ class VectorEngine:
         migration it was told to drive.
         """
         space = self._catalog.catalog.space(space_name)
-        index = self.index(space_name)
+        index = self.index(space_name, table_id=table_id)
         del record_id
         return index.stage_delete(
             txn, index.key_for(validate_components(space, values)), ref, csn
         )
 
-    def commit(self, space_name: str, txn: StagingTransaction, csn: Csn) -> int:
-        """Apply everything a transaction staged into one space's index."""
-        index = self.index(space_name)
+    def commit(
+        self, space_name: str, txn: StagingTransaction, csn: Csn, *, table_id: int | None = None
+    ) -> int:
+        """Apply what a transaction staged into one physical owner's index."""
+        index = self.index(space_name, table_id=table_id)
         try:
             applied = index.commit(txn, csn)
         finally:
@@ -2337,24 +2366,26 @@ class VectorEngine:
             # resident certificate still belongs to this pool and must remain paired with the
             # local heap frames; the graph itself is retired and rebuilt on the next search.
             self._require_registry()._bind_local_heap_view(index)
-        self._maintained_at[space_name] = self._clock.monotonic()
+        self._maintained_at[(space_name, index.definition.table_id)] = self._clock.monotonic()
         self._publish_space_metrics()
         return applied
 
-    def rollback(self, space_name: str, txn: StagingTransaction) -> int:
-        """Drop everything a transaction staged into one space's index."""
-        return self.index(space_name).rollback(txn)
+    def rollback(self, space_name: str, txn: StagingTransaction, *, table_id: int | None = None) -> int:
+        """Drop only the selected owner's staged changes, never its sibling's."""
+        return self.index(space_name, table_id=table_id).rollback(txn)
 
     def reconcile(
-        self, space_name: str, horizon: Lsn, txn: StagingTransaction | None = None
-    ) -> object:
-        """Measure or perform the horizon-bounded reconciliation of one space's index (BR-3).
+        self, space_name: str, horizon: Lsn, txn: StagingTransaction | None = None,
+        *, table_id: int | None = None,
+    ) -> ReconcileReport:
+        """Measure or stage horizon-bounded reconciliation of one physical owner (BR-3).
 
         With no transaction the pass MEASURES and removes nothing, because a cleanup the log
         never saw is what BR-3 forbids. With one, every removal is staged as a log record and
-        applied when that transaction commits.
+        applied when that transaction commits. Native checkpoint/replay publishes the
+        logged reconciliation horizon; this component does not bypass that protocol.
         """
-        index = self.index(space_name)
+        index = self.index(space_name, table_id=table_id)
         report = index.reconcile(horizon, txn)
         self._emit(
             "vector.index_reconciled",
@@ -2397,7 +2428,8 @@ class VectorEngine:
             or candidate_count < 0
         ):
             return None
-        index = self._by_space.get(space) or self._durable_by_space.get(space)
+        key = (space, table_id)
+        index = self._by_space.get(key) or self._durable_by_space.get(key)
         if (
             index is None
             or index.definition.table_id != table_id
@@ -2536,7 +2568,9 @@ class VectorEngine:
         """
         definition = self._catalog.catalog.space(space)
         _require_snapshot(snapshot)
-        index = self.index(space)
+        index = self._by_space.get((space, table_id))
+        if index is None:
+            return None
         self._require_committed_search_index(index, definition)
         if index.definition.table_id != table_id or index.definition.positions != (
             position,
@@ -2579,7 +2613,9 @@ class VectorEngine:
         ):
             return None
         definition = self._catalog.catalog.space(space)
-        index = self.index(space)
+        index = self._by_space.get((space, table_id))
+        if index is None:
+            return None
         self._require_committed_search_index(index, definition)
         if index.definition.table_id != table_id or index.definition.positions != (position,):
             return None
@@ -2701,7 +2737,7 @@ class VectorEngine:
         definition = self._catalog.catalog.space(proof.space.name)
         _require_positive_k(k)
         components = validate_query_components(definition, query)
-        index = self.index(definition.name)
+        index = self.index(definition.name, table_id=proof.table_id)
         self._require_committed_search_index(index, definition)
         if (
             definition != proof.space
@@ -2797,6 +2833,7 @@ class VectorEngine:
         candidate_filter: CandidateFilter | None = None,
         _control: _ReadControl | None = None,
         _memory: Callable[[int], None] | None = None,
+        table_id: int | None = None,
     ) -> VectorSearchResult:
         """Return the nearest neighbours of a query inside one embedding space.
 
@@ -2816,7 +2853,7 @@ class VectorEngine:
         _require_positive_k(k)
         _require_snapshot(snapshot)
         components = validate_query_components(definition, query)
-        index = self.index(space)
+        index = self.index(space, table_id=table_id)
         self._require_committed_search_index(index, definition)
         # ``live_count`` is itself generation-fenced. It either rebases a handle that observed a
         # foreign rebuild or refuses while the durable index is unavailable, before regime
@@ -2858,13 +2895,25 @@ class VectorEngine:
             filter_cardinality=plan.filter_cardinality,
         )
 
+    def search_for_table(
+        self, *, table_id: int, space: str, query: Sequence[float], k: int,
+        snapshot: SnapshotLike, candidate_filter: CandidateFilter | None = None,
+        _control: _ReadControl | None = None, _memory: Callable[[int], None] | None = None,
+    ) -> VectorSearchResult:
+        """Native query seam carrying proven physical ownership, not a name guess."""
+        return self.search(table_id=table_id, space=space, query=query, k=k,
+                           snapshot=snapshot, candidate_filter=candidate_filter,
+                           _control=_control, _memory=_memory)
+
     def search_controlled(self, *, space: str, query: Sequence[float], k: int,
                           snapshot: SnapshotLike, candidate_filter: CandidateFilter | None = None,
                           control: _ReadControl | None,
-                          memory: Callable[[int], None] | None = None) -> VectorSearchResult:
+                          memory: Callable[[int], None] | None = None,
+                          table_id: int | None = None) -> VectorSearchResult:
         """Explicit collaborator capability; ordinary search keeps its existing contract."""
         return self.search(space=space, query=query, k=k, snapshot=snapshot,
-                           candidate_filter=candidate_filter, _control=control, _memory=memory)
+                           candidate_filter=candidate_filter, _control=control, _memory=memory,
+                           table_id=table_id)
 
     def _require_committed_search_index(
         self, index: VectorHnswIndex, space: EmbeddingSpaceDef
@@ -3205,48 +3254,38 @@ class VectorEngine:
         self._publish(lambda: self._metrics.observe(_SELECTIVITY, plan.selectivity))
 
     def _publish_space_metrics(self) -> None:
-        """Publish the size, the coverage and the age of every index this engine holds.
-
-        Coverage is a space as a fraction of every vector the engine holds, so the coverage of the
-        spaces sums to one while any vector exists at all. That is what makes the residual
-        coverage of a retired space fall visibly as the caller migrates out of it (AC-3, AC-4).
-        """
+        """Aggregate metrics over physical owners without overwriting sibling values."""
         if not self._metrics.enabled:
             return
-        live = {name: index.live_count() for name, index in self._by_space.items()}
+        grouped: dict[str, list[tuple[tuple[str, int], VectorHnswIndex]]] = {}
+        for key, index in self._by_space.items():
+            grouped.setdefault(key[0], []).append((key, index))
+        live = {name: sum(index.live_count() for _key, index in owners)
+                for name, owners in grouped.items()}
         total = sum(live.values())
         now = self._clock.monotonic()
-        for name, index in self._by_space.items():
+        for name, owners in grouped.items():
             labels = {"space": name}
-            self._publish(
-                lambda index=index, labels=labels: self._metrics.set_gauge(
-                    _INDEX_ENTRIES,
-                    float(index._entry_counts_from_headers()[0]),
-                    labels,
-                )
-            )
-            share = (live[name] / total) if total else 0.0
-            self._publish(
-                lambda share=share, labels=labels: self._metrics.set_gauge(
-                    _COVERAGE, share, labels
-                )
-            )
-            since = self._maintained_at.get(name)
-            if since is not None:
-                age = now - since
-                self._publish(
-                    lambda age=age, labels=labels: self._metrics.set_gauge(
-                        _INDEX_AGE, age if age > 0.0 else 0.0, labels
-                    )
-                )
+            entries = sum(index._entry_counts_from_headers()[0] for _key, index in owners)
+            self._publish(lambda entries=entries, labels=labels:
+                          self._metrics.set_gauge(_INDEX_ENTRIES, float(entries), labels))
+            share = live[name] / total if total else 0.0
+            self._publish(lambda share=share, labels=labels:
+                          self._metrics.set_gauge(_COVERAGE, share, labels))
+            maintained = [self._maintained_at[key] for key, _index in owners
+                          if key in self._maintained_at]
+            if maintained:
+                age = max(0.0, now - min(maintained))
+                self._publish(lambda age=age, labels=labels:
+                              self._metrics.set_gauge(_INDEX_AGE, age, labels))
 
     def coverage(self) -> dict[str, float]:
-        """Return the coverage of every space this engine holds, which sums to one or to zero."""
-        live = {name: index.live_count() for name, index in self._by_space.items()}
+        """Return aggregate space coverage across all physical owners."""
+        live: dict[str, int] = {}
+        for (name, _table), index in self._by_space.items():
+            live[name] = live.get(name, 0) + index.live_count()
         total = sum(live.values())
-        if not total:
-            return {name: 0.0 for name in live}
-        return {name: count / total for name, count in live.items()}
+        return {name: count / total if total else 0.0 for name, count in live.items()}
 
     def _emit(self, event: str, **payload: object) -> None:
         """Notify the host of a lifecycle change, with this engine's invariants already held.

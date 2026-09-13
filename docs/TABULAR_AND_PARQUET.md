@@ -18,8 +18,38 @@ vector remapping. Scalar field metadata, when present, must agree; vector space,
 dimension and precision metadata are mandatory. Query columns become named
 statement parameters during import. Destination schema must already exist.
 
-Scalar DOUBLE NaN is preserved as NaN, not NULL; vectors still reject non-finite or
-NULL components through native admission. A vector itself may be NULL. Input
+**0.0.6 native temporal extension:** `DATE`, `LOCALTIME`, `TIME`, `LOCALDATETIME`,
+`DATETIME`, `DURATION` use the exact [components-v1 Arrow structs](EXTENSIONS_AND_ARROW.md#exact-native-temporal-values-006-development).
+Both `grafx.type` and `grafx.temporal` metadata are mandatory. This is not Pandas
+datetime64 or Polars Datetime inference: wide coordinates, nanos and per-row recorded
+zone/offset identity remain explicit. Pandas uses ArrowDtype structs; Polars uses
+struct columns plus its metadata wrapper; Parquet stores those structs/metadata
+without stringification. A NULL parent is preserved; non-NULL temporal values cannot
+contain NULL coordinates except optional DATETIME `zone`.
+
+**0.0.6 native DECIMAL extension:** declare `ArrowDecimalType(p,s)` from
+`okto_grafx.arrow`. The [exact decimal128 contract](EXTENSIONS_AND_ARROW.md#exact-native-decimals-006-development)
+preserves native coefficient/p/s with mandatory `grafx.type=DECIMAL` and
+`grafx.decimal=decimal128-v1` field metadata. Pandas uses an exact decimal128
+ArrowDtype; Polars uses its exact Decimal precision/scale plus `PolarsFrame`
+metadata; Parquet retains decimal128 and those tags. There is no host object-dtype,
+float, decimal256 or automatic precision/scale inference. Export values must match
+the declaration; target-column assignment on import remains exact only. Empty
+frames/files and whole-value NULL retain type, and malformed late values or
+inexact destination assignment roll back the entire import call.
+
+**0.0.6 typed collection extension:** collection-root `StoredType` entries use
+[exact nested columnar transport](COLLECTION_COLUMNAR.md). LIST/MAP/ARRAY/STRUCT,
+nested decimals/temporals/ANY and NULL/empty distinctions retain their full schema.
+Pandas attrs, PolarsFrame and Parquet must retain the descriptor metadata. ARRAY
+uses a descriptor-bound variable list; MAP-to-entry-list Polars changes are
+validated and reconstructed explicitly. No generic dtype inference is added.
+
+Scalar DOUBLE NaN is preserved as NaN, not NULL, in transient exports and decoded
+batches. Importing it as a stored graph property rejects the entire import call,
+including earlier batches, while preserving prior transaction work. It is never
+silently coerced to NULL. Vectors still reject non-finite or NULL components
+through native admission. A vector itself may be NULL. Input
 DataFrames/files must not be mutated concurrently. Returned frames/batches own
 their Arrow buffers independently of database pages. Caller owns source cursors
 and must close them even after export refusal; the helpers never close a cursor.
@@ -43,8 +73,9 @@ max_batch_bytes=16777216, max_rows=1000000, max_batches=4096)` requires an exact
 DataFrame with exact `pandas.ArrowDtype` columns. Ordinary NumPy/object-backed
 DataFrames refuse rather than guessing. Convert explicitly in application code
 only when that conversion preserves the desired NULL/NaN/type semantics. Index
-values are ignored. Metadata attrs are checked when present; vectors require them.
-Operations that discard Pandas attrs cannot silently reidentify vector spaces.
+values are ignored. Metadata attrs are checked when present; vectors, decimals, collections and temporal
+columns require them. Operations that discard Pandas attrs cannot silently
+reidentify vector spaces, decimal declarations or temporal representations.
 
 ```python
 from okto_grafx import QueryResult
@@ -139,8 +170,11 @@ batch row limits which stop at 65,536. Defaults:
 | Parquet reader/import | max_row_group_bytes | 64 MiB declared uncompressed row-group size |
 | Parquet | allowed_root | Required; no ambient default |
 
-Batch tariff is 256 + 256C + 80RC + 16 × Arrow nbytes; Pandas export accumulates
-this charge plus 4,096 fixed bytes. Export conversion also uses the existing Arrow
+Batch tariff is 256 + 256C + 80RC + 16 × Arrow nbytes, plus 1,024RD for D decimal
+columns, plus collection descriptor metadata (16 per hexadecimal metadata byte);
+Pandas/Polars export accumulates this charge plus 4,096 fixed bytes. Collection
+conversion has additional [occurrence/leaf/ANY expansion charges](COLLECTION_COLUMNAR.md#bounds-and-failures).
+Export conversion also uses the existing Arrow
 per-batch bound. Parquet row-group count is capped by max_batches in addition to
 the number of emitted batches. Row-group sizes and total rows are checked from
 metadata before decoding; Arrow thrift string/container metadata caps are fixed at
@@ -172,9 +206,13 @@ it concurrently with import or infer new vector identity from its contents.
 `import_polars(transaction, statement, frame, types=..., max_batch_rows=256,
 max_batch_bytes=16777216, max_rows=1000000, max_batches=4096)` requires that wrapper,
 validates metadata/types, and stages the entire call with the native Arrow import
-savepoint. It does not commit or retry. Exact float/integer/timestamp/vector dtypes
+savepoint. It does not commit or retry. Exact float/integer/timestamp/vector/decimal dtypes
 are required; safe conversion of Polars large string/binary offsets to native Arrow
 offsets is explicit. UUID binary width is checked by the safe fixed-width cast.
+For explicit temporal structs, Polars' child nullability and large-string zone
+offsets may be normalized; coordinate field names/order and integer widths must
+remain exact. Native decoding then rejects invalid/null required coordinates and
+noncanonical values within the whole-call savepoint. No zone resolution occurs.
 No LazyFrame, inferred nested/vector semantics, arbitrary numeric coercion or zero-copy
 promise. NULL and scalar NaN remain distinct. Limits are logical charges, not RSS.
 Missing dependency, invalid options/types, native errors and budget refusal follow

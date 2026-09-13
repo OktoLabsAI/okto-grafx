@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxParseError, GrafxQueryError, GrafxWriteConflict
+from okto_grafx.domain.errors import GrafxQueryError, GrafxWriteConflict
 
 SCHEMA: tuple[str, ...] = (
     "CREATE NODE TABLE P(id INT64, a INT64, b INT64, c INT64, PRIMARY KEY(id))",
@@ -186,14 +186,14 @@ def test_a_second_row_under_a_key_this_transaction_still_holds_is_refused(path: 
         handle.close()
 
 
-# --- B6: zero-length paths are refused, not answered as one hop ---------------------------------
+# --- B6: zero-length paths are distinct from one-hop paths --------------------------------------
 
 
-def test_a_zero_hop_pattern_is_refused_at_the_door(fan: str) -> None:
+def test_a_zero_hop_pattern_includes_the_anchor_and_one_hop_landings(fan: str) -> None:
     handle = okto_grafx.connect(fan)
     try:
-        with pytest.raises(GrafxParseError):
-            handle.execute("MATCH (x:P {id: 1})-[:R*0..1]->(y:P) RETURN y.id")
+        rows = handle.execute("MATCH (x:P {id: 1})-[:R*0..1]->(y:P) RETURN y.id").rows
+        assert sorted(rows) == [(1,), (2,), (3,)]
     finally:
         handle.close()
 

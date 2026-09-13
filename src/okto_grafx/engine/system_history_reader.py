@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 from okto_grafx.domain.model.schema import TableDef
+from okto_grafx.domain.model.catalog import Catalog
+from okto_grafx.domain.model.table_selection import TableSelector, validate_table_selections, select_tables
 from okto_grafx.domain.txn.context import TransactionContext
 if TYPE_CHECKING:
     from okto_grafx.engine.database import Database
@@ -30,8 +32,7 @@ def _corrupt(field):
 def _inputs(database, at, tables, limits, record_id):
     if type(limits) is not TemporalLimits:
         raise GrafxConfigurationError("Expected TemporalLimits.", field="limits")
-    if type(tables) is not tuple or not tables or any(type(name) is not str or not name for name in tables) or len(set(tables)) != len(tables):
-        raise GrafxConfigurationError("Specify distinct temporal table names.", field="tables")
+    validate_table_selections(tables)
     if record_id is not None and (type(record_id) is not int or not 0 < record_id < 2**64):
         raise GrafxConfigurationError("Expected a positive record identity.", field="record_id")
     if type(at) is CommitId:
@@ -42,7 +43,7 @@ def _inputs(database, at, tables, limits, record_id):
 
 
 def read_system_history(database: Database, context: TransactionContext, *,
-                        at: CommitId | Timestamp, tables: tuple[str, ...],
+                        at: CommitId | Timestamp, tables: tuple[TableSelector, ...],
                         limits: TemporalLimits, record_id: int | None = None) -> TemporalGraph | TemporalVersions:
     """Read a complete qualified historical picture inside an existing public operation."""
     at = _inputs(database, at, tables, limits, record_id)
@@ -73,7 +74,8 @@ def read_system_history(database: Database, context: TransactionContext, *,
         if metadata_bytes >= limits.max_bytes:
             raise GrafxQueryBudgetExceeded("Temporal metadata exhausted the read budget.", resource="history_scan")
         captured_limits = replace(limits, max_bytes=limits.max_bytes - metadata_bytes)
-        selected = tuple(catalog.table(name) for name in tables)
+        selected = select_tables(catalog, tables)
+        selected_nodes = {table.name for table in selected if table.kind == "node"}
         policy = {key: (start, horizon) for key, start, horizon in catalog.system_history_tables()}
         for table in selected:
             start, horizon = policy.get(table.table_id, (0, 0))
@@ -82,7 +84,7 @@ def read_system_history(database: Database, context: TransactionContext, *,
                                               activation=start)
             if target.sequence < horizon:
                 raise GrafxHistoryExpired("Requested commit precedes retained history.", table=table.name, retained_from=horizon)
-            if record_id is None and table.kind == "rel" and any(name not in tables for name in (table.from_table, table.to_table)):
+            if record_id is None and table.kind == "rel" and any(name not in selected_nodes for name in (table.from_table, table.to_table)):
                 raise GrafxConfigurationError("Historical graphs require selected endpoint tables.", field="tables")
 
         store = SystemHistoryStore(read, database_uuid=database.identity.database_uuid, page_size=database._pool.page_size)
@@ -104,11 +106,12 @@ def read_system_history(database: Database, context: TransactionContext, *,
             from okto_grafx.engine.system_history_index_reader import read_indexed_history
             graph, versions = read_indexed_history(store, root=root, boundary=boundary, target=target,
                 table_ids=tuple(table.table_id for table in selected), limits=captured_limits, record_id=record_id,
-                horizons={key: value[1] for key, value in policy.items()})
+                horizons={key: value[1] for key, value in policy.items()}, catalog=catalog)
         else:
             graph, versions = fold_history(store, expected_sequence=boundary, page_count=length // database._pool.page_size,
                                        target=target, table_ids=tuple(table.table_id for table in selected),
                                        limits=captured_limits, record_id=record_id,
+                                       catalog=catalog,
                                        retention_horizons={key: value[1] for key, value in policy.items()})
         if record_id is None:
             return replace(graph, encoded_bytes_scanned=graph.encoded_bytes_scanned + metadata_bytes)
@@ -121,7 +124,7 @@ def read_system_history(database: Database, context: TransactionContext, *,
 
 def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_count: int,
                  target: CommitId, table_ids: tuple[int, ...], limits: TemporalLimits, record_id: int | None = None,
-                 retention_horizons: dict[int, int] | None = None) -> tuple[TemporalGraph, tuple[TemporalVersion, ...]]:
+                 retention_horizons: dict[int, int] | None = None, catalog: Catalog | None = None) -> tuple[TemporalGraph, tuple[TemporalVersion, ...]]:
     """Validate settled intervals/endpoint lineage, capture the requested picture, then finish chain verification.
 
     Work is linear in encoded retained events plus affected incident relationships,
@@ -130,6 +133,7 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
     """
     live = {}
     schemas = {}
+    logical_types = {}
     names = {}
     identities = set()
     primary = {}
@@ -138,6 +142,7 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
     horizons = {} if retention_horizons is None else retention_horizons
     output_versions = []
     snapshot_rows = snapshot_schemas = None
+    snapshot_types = None
     events = consumed = 0
     from okto_grafx.engine.system_history_index_store import head_root
     from okto_grafx.engine.system_history_store import _HEAD
@@ -152,11 +157,15 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
 
     def endpoints(table: TableDef, values: tuple[object, ...]) -> tuple[tuple[int, object], tuple[int, object]]:
         """Resolve endpoint table IDs through the historical schema, never a recreated PK."""
-        if table.from_table not in names or table.to_table not in names:
+        if ("node", table.from_table) not in names or ("node", table.to_table) not in names:
             raise _corrupt("endpoint_schema")
-        return ((names[table.from_table], values[0]), (names[table.to_table], values[1]))
+        return ((names["node", table.from_table], values[0]), (names["node", table.to_table], values[1]))
 
     for identity, changes, size in store._iter_batches(expected_sequence=expected_sequence, page_count=page_count):
+        if catalog is not None:
+            from okto_grafx.engine.system_history_store import validate_history_model
+            for change in changes:
+                validate_history_model(change, catalog)
         consumed += size
         events += len(changes)
         if events > limits.max_events or consumed > limits.max_bytes:
@@ -166,23 +175,31 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
                 indexed_expected[change.table.table_id, change.record_id, identity.sequence] = change.encode()
         if identity.sequence > target.sequence and snapshot_rows is None:
             snapshot_rows, snapshot_schemas = dict(live), dict(schemas)
+            snapshot_types = dict(logical_types)
         affected_edges = set()
         for change in changes:
             if change.operation != 4:
                 continue
             previous = schemas.get(change.table.table_id)
             table = change.table
-            if table.name in names and names[table.name] != table.table_id:
+            if (table.kind, table.name) in names and names[table.kind, table.name] != table.table_id:
                 raise _corrupt("schema_identity")
             if previous is not None:
+                labels_only = (table.extra_node_labels != previous.extra_node_labels
+                               and replace(table, extra_node_labels=previous.extra_node_labels) == previous)
                 if (table.name != previous.name or table.kind != previous.kind or table.primary_key != previous.primary_key
                         or table.from_table != previous.from_table or table.to_table != previous.to_table
-                        or table.schema_version != previous.schema_version + 1
+                        or table.flexible_properties != previous.flexible_properties or table.unlabeled != previous.unlabeled
+                        or table.vector_identity_names != previous.vector_identity_names
+                        or not set(previous.extra_node_labels) <= set(table.extra_node_labels)
+                        or change.logical_type != logical_types[table.table_id]
+                        or not labels_only and table.schema_version != previous.schema_version + 1
                         or table.columns[:len(previous.columns)] != previous.columns
                         or any(not column.nullable for column in table.columns[len(previous.columns):])):
                     raise _corrupt("schema_evolution")
             schemas[table.table_id] = table
-            names[table.name] = table.table_id
+            logical_types[table.table_id] = change.logical_type
+            names[table.kind, table.name] = table.table_id
         # A COMMIT is a settled set, not an order of individually visible row
         # mutations: release all ended PKs before admitting any new values.
         for change in changes:
@@ -198,7 +215,7 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
                 continue
             key = (change.table.table_id, change.record_id)
             table = schemas.get(key[0])
-            if table != change.table:
+            if table != change.table or change.logical_type != logical_types.get(key[0]):
                 raise _corrupt("event_schema")
             old = live.get(key)
             if change.operation in (1, 5):
@@ -229,7 +246,8 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
                         raise _corrupt("primary_key_overlap")
                     primary[pk] = key
                 row = TemporalVersion(table.name, table.table_id, change.record_id, change.values,
-                                      table.schema_version, identity)
+                                      table.schema_version, identity, logical_type=change.logical_type,
+                                      node_labels=change.node_labels)
                 live[key] = row
                 if redacted:
                     redacted_live.add(key)
@@ -265,6 +283,7 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
             raise _corrupt("index_history_missing")
     if snapshot_rows is None:
         snapshot_rows, snapshot_schemas = live, schemas
+        snapshot_types = logical_types
     selected_schemas = tuple(snapshot_schemas[key] for key in table_ids if key in snapshot_schemas)
     if len(selected_schemas) != len(table_ids):
         raise _corrupt("missing_historical_schema")
@@ -282,4 +301,6 @@ def fold_history(store: SystemHistoryStore, *, expected_sequence: int, page_coun
         current = snapshot_rows.get((table_ids[0], record_id))
         if current is not None:
             output_versions.append(current)
-    return TemporalGraph(target, selected_schemas, tuple(selected), events, consumed), tuple(output_versions)
+    from okto_grafx.engine.system_history_store import historical_relationship_types
+    groups = historical_relationship_types({key: snapshot_types[key] for key in table_ids})
+    return TemporalGraph(target, selected_schemas, tuple(selected), events, consumed, groups), tuple(output_versions)

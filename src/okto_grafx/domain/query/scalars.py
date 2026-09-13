@@ -7,7 +7,12 @@ from collections.abc import Mapping
 
 from okto_grafx.domain.errors import GrafxPlanError, GrafxQueryBudgetExceeded
 from okto_grafx.domain.model.value import INT64_MAX, ValueType
+from okto_grafx.domain.model.decimal_values import DecimalValue, decimal_absolute, decimal_from_number, decimal_from_text
+from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.query.limits import MAX_QUERY_VALUE_CHARACTERS
+from okto_grafx.domain.query.temporal_functions import (
+    TEMPORAL_ARITIES, TEMPORAL_CLASSES, temporal_function, temporal_result_type,
+)
 
 MAX_GENERATED_LIST_ELEMENTS = 100_000
 _STRING_UNARY = {"LOWER": str.lower, "UPPER": str.upper, "TRIM": str.strip,
@@ -23,14 +28,24 @@ _ARITIES = {**{name: (1, 1) for name in (*_STRING_UNARY, *_MATH_UNARY, *_CONVERS
                                       "HEAD", "LAST", "TAIL", "REVERSE", "KEYS")},
             "RANGE": (2, 3), "SUBSTRING": (2, 3), "LEFT": (2, 2), "RIGHT": (2, 2),
             "REPLACE": (3, 3), "ROUND": (1, 1), "ATAN2": (2, 2), "PI": (0, 0), "E": (0, 0),
-            "RAND": (0, 0)}
+            "RAND": (0, 0), "DECIMAL": (3, 4)}
+_ARITIES.update(TEMPORAL_ARITIES)
 NATIVE_SCALARS = frozenset(_ARITIES)
-NONDETERMINISTIC_SCALARS = frozenset({"RAND"})
+NONDETERMINISTIC_SCALARS = frozenset({"RAND", *TEMPORAL_ARITIES})
 __all__ = ["NATIVE_SCALARS", "NONDETERMINISTIC_SCALARS", "MAX_GENERATED_LIST_ELEMENTS", "scalar_arity", "scalar_type", "scalar_value"]
 
 
 def _bad(name: str, message: str = "Incompatible native function argument.") -> GrafxPlanError:
     return GrafxPlanError(message, field="function", value=name)
+
+
+def _conversion_argument_error(name: str) -> GrafxPlanError:
+    """Preserve the evaluated conversion's type failure, distinct from bad text."""
+    return GrafxPlanError(
+        "This value type is not accepted by the conversion function.",
+        field="function", value=name, reason="conversion_argument_type",
+        query_phase="execution",
+    )
 
 
 def scalar_arity(name: str, count: int) -> None:
@@ -43,14 +58,21 @@ def scalar_arity(name: str, count: int) -> None:
 def scalar_type(name: str, *arguments: ValueType | None) -> ValueType | None:
     """Infer types without forcing heterogeneous list elements into one scalar family."""
     scalar_arity(name, len(arguments))
+    if name in TEMPORAL_ARITIES:
+        return ValueType.NULL if ValueType.NULL in arguments else temporal_result_type(name)
     number = (ValueType.INT64, ValueType.DOUBLE)
     string = (ValueType.STRING,)
     integer = (ValueType.INT64,)
     any_value = tuple(ValueType)
     if name in _STRING_UNARY:
         allowed, result = (string,), ValueType.STRING
+    elif name == "DECIMAL":
+        allowed = ((ValueType.STRING, ValueType.INT64, ValueType.DOUBLE, ValueType.DECIMAL), integer, integer)
+        if len(arguments) == 4:
+            allowed += (string,)
+        result = ValueType.DECIMAL
     elif name in _MATH_UNARY or name in {"ROUND", "ATAN2"}:
-        allowed = (number,) * len(arguments)
+        allowed = ((number + (ValueType.DECIMAL,)) if name in ("ABS", "SIGN") else number,) * len(arguments)
         result = arguments[0] if name == "ABS" else ValueType.INT64 if name == "SIGN" else ValueType.DOUBLE
     elif name in {"PI", "E", "RAND"}:
         allowed, result = (), ValueType.DOUBLE
@@ -82,6 +104,7 @@ def scalar_type(name: str, *arguments: ValueType | None) -> ValueType | None:
 def _kind(value: object) -> ValueType | None:
     """Classify language values, never invoking arbitrary host conversion callbacks."""
     return {bool: ValueType.BOOL, int: ValueType.INT64, float: ValueType.DOUBLE,
+            DecimalValue: ValueType.DECIMAL,
             str: ValueType.STRING, list: ValueType.LIST, tuple: ValueType.LIST,
             dict: ValueType.MAP, type(None): ValueType.NULL}.get(type(value))
 
@@ -165,12 +188,28 @@ def scalar_value(name: str, *arguments: object) -> object:
         if count > MAX_GENERATED_LIST_ELEMENTS:
             raise GrafxQueryBudgetExceeded("Generated list exceeds its element budget.", resource="generated_list")
         return tuple(values)
+    if name in TEMPORAL_ARITIES:
+        return temporal_function(name, arguments)
     scalar_type(name, *(_kind(value) for value in arguments))
     if name in NONDETERMINISTIC_SCALARS:
         raise _bad(name, "Nondeterministic scalars require an execution source, not pure evaluation.")
     if any(value is None for value in arguments):
         return None
     value = arguments[0] if arguments else None
+    if name == "DECIMAL":
+        precision, scale = arguments[1:3]
+        rounding = arguments[3] if len(arguments) == 4 else "EXACT"
+        try:
+            if type(value) is DecimalValue:
+                return value.rescale(precision, scale, rounding=rounding)
+            if type(value) is str:
+                return decimal_from_text(value, precision, scale, rounding=rounding)
+            return decimal_from_number(value, precision, scale, rounding=rounding)
+        except SchemaMismatchError as failure:
+            raise GrafxPlanError("Explicit decimal conversion cannot satisfy its contract.", field="function",
+                                 value=name, reason=failure.details.get("reason"), query_phase="execution") from failure
+    if type(value) is DecimalValue and name in ("ABS", "SIGN"):
+        return decimal_absolute(value) if name == "ABS" else (value.coefficient > 0) - (value.coefficient < 0)
     if name in _STRING_UNARY:
         if type(value) is not str:
             raise _bad(name)
@@ -178,6 +217,8 @@ def scalar_value(name: str, *arguments: object) -> object:
     if name in _MATH_UNARY or name in {"ROUND", "ATAN2"}:
         if any(type(item) not in (int, float) for item in arguments):
             raise _bad(name)
+        if name != "SIGN" and any(type(item) is float and math.isnan(item) for item in arguments):
+            return float("nan")
         try:
             result = (math.floor(value + 0.5) if name == "ROUND" else
                       math.atan2(*arguments) if name == "ATAN2" else _MATH_UNARY[name](value))
@@ -221,8 +262,20 @@ def scalar_value(name: str, *arguments: object) -> object:
         if length > MAX_QUERY_VALUE_CHARACTERS:
             raise GrafxQueryBudgetExceeded("Replacement exceeds its string budget.", resource="query_value")
         return text.replace(search, replacement)
+    if name == "TOSTRING" and type(value) in TEMPORAL_CLASSES:
+        return value.isoformat()
+    if type(value) is DecimalValue:
+        if name == "TOSTRING":
+            return value.to_string()
+        if name == "TOINTEGER":
+            integer = abs(value.coefficient) // (10 ** value.scale)
+            integer = -integer if value.coefficient < 0 else integer
+            return integer if -INT64_MAX - 1 <= integer <= INT64_MAX else None
+        if name == "TOFLOAT":
+            return value.coefficient / (10 ** value.scale)  # Explicit lossy conversion only.
+        raise _conversion_argument_error(name)
     if type(value) not in (str, bool, int, float):
-        raise _bad(name, "Conversion requires a scalar string, boolean or number.")
+        raise _conversion_argument_error(name)
     if name == "TOSTRING":
         return ("true" if value else "false") if type(value) is bool else str(value)
     if name == "TOBOOLEAN":
@@ -230,9 +283,9 @@ def scalar_value(name: str, *arguments: object) -> object:
             return value
         if type(value) is str:
             return {"true": True, "false": False}.get(value.strip().lower())
-        raise _bad(name)
+        raise _conversion_argument_error(name)
     if type(value) is bool and name == "TOFLOAT":
-        raise _bad(name)
+        raise _conversion_argument_error(name)
     try:
         if name == "TOINTEGER" and type(value) is str:
             return _decimal_int64(value)

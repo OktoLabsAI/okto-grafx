@@ -1,5 +1,13 @@
 # Snapshot graph projections
 
+In 0.0.6 development, `node_tables` resolves the node namespace and
+`relationship_tables` resolves physical relationship tables, including when both
+lists contain the same name. Paged scans preserve that kind. For example,
+`node_tables=("R", "M"), relationship_tables=("R",)` captures node R and edges R
+separately; both edge endpoints must still be selected. `weight_columns={"R":"w"}`
+reads the relationship's column, never a node property with that spelling.
+Detached node/edge DTOs, table-local IDs, snapshot ownership and budgets are unchanged.
+
 ## Topological ordering (0.0.6)
 
 `projection.topological_order(cancellation=None)` returns a frozen

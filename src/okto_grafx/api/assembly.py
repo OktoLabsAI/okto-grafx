@@ -64,7 +64,7 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.definition import IndexDefinition, vector_index_name
 from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION
@@ -530,6 +530,11 @@ def assemble_database(
             # from WAL.
             pool.checkpoint()
 
+        from okto_grafx.adapters.temporal_clock import SystemTemporalClock
+        from okto_grafx.adapters.temporal_zoneinfo import ZoneInfoTemporalResolver
+        from okto_grafx.domain.temporal_runtime import TemporalTransactionContext
+        temporal_clock = SystemTemporalClock()
+        temporal_resolver = ZoneInfoTemporalResolver()
         transactions = TransactionManager(
             wal,
             pool,
@@ -539,6 +544,8 @@ def assemble_database(
             clock,
             metrics,
             indexes,
+            temporal_context_factory=lambda: TemporalTransactionContext.begin(
+                temporal_clock, resolver=temporal_resolver),
             partitions_per_table=config.partitions_per_table,
             identity_lease_size=config.identity_lease_size,
             commit_lock_timeout=config.commit_lock_timeout_seconds,
@@ -575,6 +582,8 @@ def assemble_database(
             with transactions.schema_artifact_section():
                 sync_indexes(existing_only=False)
         queries = QueryEngine(
+            temporal_resolver=temporal_resolver,
+            execution_identity=threading.get_ident,
             catalog=catalog,
             heap=heap,
             pool=pool,
@@ -880,11 +889,11 @@ def _attach_declared_vector_indexes(
     }
     attached: list[str] = []
     for table in catalog.catalog.tables():
-        for column in table.columns:
+        for position, column in enumerate(table.columns):
             space = column.vector_space
             if space is None:
                 continue
-            name = f"vector_{table.name}_{space}"
+            name = vector_index_name(table, position)
             if name.lower() not in active_names:
                 continue
             file = index_file(name)

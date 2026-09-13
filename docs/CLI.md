@@ -1,5 +1,16 @@
 # CLI and agent consumption
 
+Development `schema --json` includes `stored_type` for typed collection columns:
+the full LIST/MAP/ARRAY/STRUCT descriptor, nested nullability and decimal p/s.
+Other columns omit this key. Query JSON preserves native list/map contents and
+tagged decimal/temporal leaves, without stringifying collections. No new CLI flag
+is needed. [Descriptor JSON, usage and limits](specs/TYPED_COLLECTIONS_V1.md).
+
+Query JSON remains a bounded observation, not a universal lossless import format.
+For exact collection data movement, including full INT64 values and non-string
+ANY map keys, use [collection JSON helpers](COLLECTION_JSON.md) or native logical
+transfer. No existing CLI flag silently changes its output protocol.
+
 [Documentation index](README.md) · [Operations](OPERATIONS.md) · [Python API](API_REFERENCE.md)
 
 Installing the distribution adds `oktografx`. It is a local command-line interface,
@@ -82,6 +93,7 @@ nor is it a complete manifest of every Python API.
 ```sh
 oktografx search text ./graph --index docs_text --query 'durable graph' --k 20 --json
 oktografx search vector ./graph --space semantic --vector '[1,0]' --k 20 --json
+oktografx search vector ./graph --space semantic --table R --table-kind rel --vector '[1,0]' --json
 oktografx search hybrid ./graph --table Doc --index docs_text --query graph --space semantic --vector '[1,0]' --json
 ```
 
@@ -91,6 +103,26 @@ sources in a search use one owned read transaction, closed before returning.
 IDs (not application primary keys); `[]` selects nothing; omission is unfiltered.
 Vectors must be nonempty finite numeric JSON arrays; the engine checks dimension,
 space and numeric storage rules. No embedding provider runs implicitly.
+
+In 0.0.6 development, vector search accepts optional `--table NAME` and
+`--table-kind node|rel`. The latter requires `--table` and disambiguates same-named
+node/relationship tables. Omit both only when the space has one physical owner;
+a bare table name also must be unique. Ambiguous, unknown and invalid owners
+refuse instead of selecting the first index. An invalid kind is a CLI usage
+error (exit 2); runtime ownership refusals retain the native error envelope.
+These are per-search selectors, not connection settings or schema mutations.
+
+Selection goes directly to `Database.search_vectors(table=...)` under the command's
+one read transaction. Filters/hits use **table-local** record IDs, not cross-table
+identity; retain the selected owner when consuming results. JSON `search` retains
+the existing vector DTO without a new ranking/merging layer. `indexes --json`
+exposes each vector index's physical `table_id`, and `capabilities --json` advertises
+`search.vector_owner_selection` as build support, not store activation.
+
+Text search remains selected by globally unique index name. Hybrid `--table` is
+still a **node** target, including when a relationship has that spelling; its text
+index must belong to that node table. `--table-kind` is not accepted for text or
+hybrid commands and does not imply relationship-target hybrid fusion.
 
 `--timeout-seconds` is a positive finite cooperative search timeout, default 30;
 it does not bound connection open/close or preempt an arbitrary blocked OS call.
@@ -149,6 +181,27 @@ In PowerShell and POSIX shells, single quotes around query text containing `$id`
 prevent shell expansion. Repeat `--parameter NAME=VALUE`; values parse as JSON
 when possible, otherwise as text. `--limit` limits **printed rows**, not execution
 work/memory; zero prints all. Use query `LIMIT` or Python budgets for those limits.
+
+In 0.0.6 development, temporal scalar results in `--json` use the same
+[explicit temporal tags as entity properties](ENTITY_VALUES.md#json-grammar),
+including temporals nested in lists/maps. For example `date('2024-02-29')` returns
+`{"type":"date","epoch_day":"19782"}`, not a Python description string.
+Wide coordinates use decimal strings; nanos, recorded offset and zone are retained.
+This changes temporal result rendering, not `--parameter` parsing: tagged result
+objects are not automatically decoded as temporal parameters. Use query constructors
+or the native Python API. Ordinary CLI maps still render as JSON objects, so CLI
+JSON is an observation/report format, not a collision-free generic value importer.
+
+DECIMAL scalar/nested results also share the entity-property tag:
+`{"type":"decimal","coefficient":"1234500","precision":12,"scale":4}` means
+exact 123.4500. Coefficients are strings so JavaScript cannot round a 38-digit value;
+precision and scale are bounded integers. `schema --json` includes
+`decimal_precision`/`decimal_scale` only on DECIMAL columns. Other column entries
+retain their previous shape. Expression-only decimal queries do not activate the
+storage capability. Use, for example, `RETURN decimal('123.4500',12,4)`; tagged
+objects passed through `--parameter` remain ordinary maps, not implicit native
+decimals. Explicit typed [CSV/JSONL/SQLite imports](LOCAL_TEXT_IMPORT.md#native-decimal-fields-006-development)
+decode the tags under their own declared type contract.
 
 Commands refuse a missing database path by default. `--create` explicitly permits
 creation. Writable open may recover; a command without `--read-only` is therefore

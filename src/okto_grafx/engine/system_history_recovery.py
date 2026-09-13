@@ -18,6 +18,7 @@ from okto_grafx.engine.system_history_store import (
     HistoryPageImage, SystemHistoryStore, _BLOCK, _BLOCK_MAGIC, _FILE, _HEAD, _HEAD_MAGIC,
     _MAX_BATCH, _decode_changes, _image,
     _COMPACT_HEAD_MAGIC,
+    validate_history_model,
 )
 from okto_grafx.engine.system_history_index_store import (
     PreparedHistoryIndex, head_root, trailer, _EXT, _EXT_MAGIC, _INDEX_BLOCK_MAGIC,
@@ -156,6 +157,7 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
                          target=CommitId(database_uuid, terminal.lsn),
                          table_ids=tuple(key for key, _, _ in schema.system_history_tables()),
                          retention_horizons={key: floor for key, _, floor in schema.system_history_tables()},
+                         catalog=schema,
                          limits=TemporalLimits(max_events=10_000_000, max_bytes=2**31, max_rows=1_000_000))
             rewritten_commits = set()
             for identity, _, _ in after._iter_batches(expected_sequence=terminal.lsn, page_count=len(incoming)):
@@ -188,6 +190,8 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
                 raise _refuse("system_history_activation")
             payload = b"".join(Page.from_bytes(image.raw).read_slot(0)[_BLOCK.size:] for image in chunks)
             changes = _decode_changes(payload)
+            for change in changes:
+                validate_history_model(change, catalog)
             expected = store.activation_images(changes, terminal.lsn)
             if {image.page_index: image.raw for image in expected} != {image.page_index: image.raw for image in images}:
                 raise _refuse("system_history_activation_images")
@@ -253,8 +257,10 @@ def validate_system_history(pool: BufferPool, replay: CommittedReplay,
                         prefix._iter_batches(expected_sequence=previous, page_count=chunks[0].page_index))
                 index_plan = PreparedHistoryIndex(predecessor_read, old_index, baseline)
             transition = SystemHistoryStore(predecessor_read, database_uuid=database_uuid, page_size=pool.page_size)
-            transition.validate_append_images(images, previous_sequence=previous, page_count=chunks[0].page_index,
-                                              commit=CommitId(database_uuid, terminal.lsn), index=index_plan)
+            changes = transition.validate_append_images(images, previous_sequence=previous, page_count=chunks[0].page_index,
+                                                        commit=CommitId(database_uuid, terminal.lsn), index=index_plan)
+            for change in changes:
+                validate_history_model(change, catalog)
         previous_root = roots[0].raw
         final_extent = _HEAD.unpack_from(Page.from_bytes(previous_root).read_slot(0))[5]
         for image in images:

@@ -6,17 +6,18 @@ from dataclasses import replace
 
 from okto_grafx.domain.errors import GrafxQueryBudgetExceeded
 from okto_grafx.domain.index.keys import index_key
+from okto_grafx.domain.model.catalog import Catalog
 from okto_grafx.domain.temporal import TemporalGraph, TemporalLimits, TemporalVersion
 from okto_grafx.domain.txn.commit_identity import CommitId
 from okto_grafx.engine.system_history_index import HistoryAccessTree
-from okto_grafx.engine.system_history_store import HistoryChange, SystemHistoryStore, _decode_change, _corrupt
+from okto_grafx.engine.system_history_store import HistoryChange, SystemHistoryStore, _decode_change, _corrupt, historical_relationship_types
 
 __all__ = ["read_indexed_history"]
 
 
 def read_indexed_history(store: SystemHistoryStore, *, root: tuple[int, bytes], boundary: int,
                          target: CommitId, table_ids: tuple[int, ...], limits: TemporalLimits,
-                         horizons: dict[int, int], record_id: int | None) -> tuple[TemporalGraph, tuple[TemporalVersion, ...]]:
+                         horizons: dict[int, int], record_id: int | None, catalog: Catalog | None = None) -> tuple[TemporalGraph, tuple[TemporalVersion, ...]]:
     """Read a complete lineage range without decoding unrelated historical batches.
 
     The caller owns the native journal observation and capability/horizon checks.
@@ -44,12 +45,16 @@ def read_indexed_history(store: SystemHistoryStore, *, root: tuple[int, bytes], 
             raise GrafxQueryBudgetExceeded("Temporal index event budget exhausted.", resource="history_scan")
         key, ref = entry
         change = _decode_change(tree.value(ref))
+        if catalog is not None:
+            from okto_grafx.engine.system_history_store import validate_history_model
+            validate_history_model(change, catalog)
         if (change.table.table_id, change.record_id) != key[:2]:
             raise _corrupt("index_event_identity")
         return change
 
     if record_id is None:
         schemas = []
+        logical_types = {}
         rows = []
         identities = set()
         primary = set()
@@ -61,6 +66,7 @@ def read_indexed_history(store: SystemHistoryStore, *, root: tuple[int, bytes], 
             if schema_change.operation != 4:
                 raise _corrupt("index_schema")
             schema = schema_change.table
+            logical_types[table_id] = schema_change.logical_type
             schemas.append(schema)
             candidate = tree.ceiling((table_id, 1, 0))
             while candidate is not None and candidate[0][0] == table_id:
@@ -72,11 +78,17 @@ def read_indexed_history(store: SystemHistoryStore, *, root: tuple[int, bytes], 
                         raise _corrupt("index_retained_event")
                     if change.operation != 3:
                         if (change.table.schema_version > schema.schema_version
+                                or change.table.flexible_properties != schema.flexible_properties
+                                or change.table.unlabeled != schema.unlabeled
+                                or not set(change.table.extra_node_labels) <= set(schema.extra_node_labels)
+                                or change.node_labels is not None and not schema.admits_node_labels(change.node_labels)
+                                or change.logical_type != schema_change.logical_type
                                 or change.table.columns != schema.columns[:len(change.table.columns)]):
                             raise _corrupt("event_schema")
                         values = (*change.values, *((None,) * (len(schema.columns) - len(change.values))))
                         row = TemporalVersion(schema.name, table_id, rid, values,
-                            schema.schema_version, CommitId(target.database_uuid, entry[0][2]))
+                            schema.schema_version, CommitId(target.database_uuid, entry[0][2]), logical_type=change.logical_type,
+                            node_labels=change.node_labels)
                         identities.add((table_id, rid))
                         if schema.primary_key is not None:
                             pk = (table_id, index_key(values, (schema.column_index(schema.primary_key),)))
@@ -93,7 +105,7 @@ def read_indexed_history(store: SystemHistoryStore, *, root: tuple[int, bytes], 
                 if events > limits.max_events:
                     raise GrafxQueryBudgetExceeded("Temporal index candidate budget exhausted.", resource="history_scan")
                 candidate = None if rid == 2**64 - 1 else tree.ceiling((table_id, rid + 1, 0))
-        names = {schema.name: schema.table_id for schema in schemas}
+        names = {schema.name: schema.table_id for schema in schemas if schema.kind == "node"}
         schema_by_id = {schema.table_id: schema for schema in schemas}
         for row in rows:
             schema = schema_by_id[row.table_id]
@@ -102,7 +114,7 @@ def read_indexed_history(store: SystemHistoryStore, *, root: tuple[int, bytes], 
                         names.get(schema.to_table), row.values[1]) not in identities:
                     raise _corrupt("historical_endpoint")
         return TemporalGraph(target, tuple(schemas), tuple(sorted(rows, key=lambda row: (row.table_id, row.record_id))),
-                             events, consumed), ()
+                             events, consumed, historical_relationship_types(logical_types)), ()
     output = []
     current = None
     seen = False
@@ -127,7 +139,8 @@ def read_indexed_history(store: SystemHistoryStore, *, root: tuple[int, bytes], 
                 output.append(replace(current, system_to=identity))
         redacted = change.operation in (5, 6)
         current = None if change.operation == 3 else TemporalVersion(change.table.name, table_id,
-            record_id, change.values, change.table.schema_version, identity)
+            record_id, change.values, change.table.schema_version, identity, logical_type=change.logical_type,
+            node_labels=change.node_labels)
         if len(output) + (current is not None) > limits.max_rows:
             raise GrafxQueryBudgetExceeded("Temporal index row budget exhausted.", resource="history_rows")
     if redacted:

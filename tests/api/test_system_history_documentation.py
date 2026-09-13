@@ -10,6 +10,10 @@ def test_temporal_consumer_workflow(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     namespace = {"__name__": "__temporal_example__"}
     examples = re.findall(r"```python\n(.*?)```", source, re.DOTALL)
-    assert len(examples) == 3
+    assert len(examples) == 5
     for example in examples:
         exec(compile(example, guide.name, "exec"), namespace)
+    assert namespace["graph"].schemas[0].unlabeled
+    assert namespace["graph"].relationship_types[0].name == "R"
+    graph = namespace["graph"]
+    assert all(namespace["historical_labels"](row, graph) == () for row in graph.rows)

@@ -46,6 +46,12 @@ from typing import TypeAlias, cast
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxVectorValidationError
 from okto_grafx.domain.model.errors import SchemaMismatchError
+from okto_grafx.domain.model.decimal_values import DecimalValue
+from okto_grafx.domain.model.decimal_codec import DECIMAL_VALUE_TAG, encode_decimal_value, decode_decimal_value
+from okto_grafx.domain.model.temporal_codec import encode_temporal_value, decode_temporal_value
+from okto_grafx.domain.model.temporal_values import (
+    DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue,
+)
 
 __all__ = [
     "MAX_VALUE_DEPTH",
@@ -110,7 +116,7 @@ _UUID_SIZE = 16
 
 
 class ValueType(IntEnum):
-    """The twelve types a stored value can have, as written in the tag byte."""
+    """The stored value types, with stable durable one-byte tags."""
 
     NULL = 0
     BOOL = 1
@@ -124,10 +130,20 @@ class ValueType(IntEnum):
     VECTOR_F64 = 9
     TIMESTAMP = 10
     UUID = 11
+    DATE = 12
+    LOCALTIME = 13
+    TIME = 14
+    LOCALDATETIME = 15
+    DATETIME = 16
+    DURATION = 17
+    DECIMAL = DECIMAL_VALUE_TAG
 
 
 _KIND_OF_TAG: tuple[ValueType, ...] = tuple(ValueType)
 """Closed, positional decoder table for the durable one-byte type tags."""
+
+TEMPORAL_VALUE_TYPES = frozenset((ValueType.DATE, ValueType.LOCALTIME, ValueType.TIME,
+                                ValueType.LOCALDATETIME, ValueType.DATETIME, ValueType.DURATION))
 
 
 VECTOR_VALUE_TYPES: tuple[ValueType, ...] = (ValueType.VECTOR_F32, ValueType.VECTOR_F64)
@@ -317,6 +333,7 @@ class VectorValue:
 
 Value: TypeAlias = (
     "None | bool | int | float | str | bytes | Timestamp | Uuid | VectorValue"
+    " | DateValue | LocalTimeValue | TimeValue | LocalDateTimeValue | DateTimeValue | DurationValue | DecimalValue"
     " | tuple[Value, ...] | dict[Value, Value]"
 )
 """Every Python shape the value system can store. Lists decode to tuples and maps to dicts."""
@@ -355,6 +372,13 @@ _EXACT_VALUE_TYPES: Mapping[type, ValueType] = MappingProxyType(
         tuple: ValueType.LIST,
         list: ValueType.LIST,
         dict: ValueType.MAP,
+        DateValue: ValueType.DATE,
+        LocalTimeValue: ValueType.LOCALTIME,
+        TimeValue: ValueType.TIME,
+        LocalDateTimeValue: ValueType.LOCALDATETIME,
+        DateTimeValue: ValueType.DATETIME,
+        DurationValue: ValueType.DURATION,
+        DecimalValue: ValueType.DECIMAL,
     }
 )
 """The value type of each exact built-in or domain class, read before the isinstance walk.
@@ -473,6 +497,12 @@ def _append_encoded_value(
         return
     if kind is ValueType.UUID:
         encoded.extend(value.raw)  # type: ignore[union-attr]
+        return
+    if kind in TEMPORAL_VALUE_TYPES:
+        encoded.extend(encode_temporal_value(value)[1:])
+        return
+    if kind is ValueType.DECIMAL:
+        encoded.extend(encode_decimal_value(value)[1:])
         return
     if kind is ValueType.LIST:
         elements = tuple(value)  # type: ignore[arg-type]
@@ -718,6 +748,12 @@ def _decode_value_mode(
             offset=offset - 1,
         ) from failure
     kind = _KIND_OF_TAG[tag]
+    if kind is ValueType.DECIMAL:
+        value, following = decode_decimal_value(buf, offset - 1)
+        return (value if materialize else _ValidatedValue("DecimalValue")), following
+    if kind in TEMPORAL_VALUE_TYPES:
+        value, following = decode_temporal_value(buf, offset - 1)
+        return (value if materialize else _ValidatedValue(type(value).__name__)), following
     if kind is ValueType.NULL:
         return (None if materialize else _VALIDATED_NULL), offset
     if kind is ValueType.BOOL:

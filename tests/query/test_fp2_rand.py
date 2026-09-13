@@ -87,7 +87,7 @@ def test_order_limit_aggregation_and_union_placement(draws):
     with connect(":memory:") as db:
         assert db.execute("UNWIND [1,2,3] AS n RETURN rand() AS r ORDER BY r LIMIT 1").rows == ((0.1,),)
         assert observed == [0.8, 0.1, 0.4]
-        assert db.execute("UNWIND [1,2] AS n RETURN sum(rand()) AS total").rows == ((1.0,),)
+        assert db.execute("UNWIND [1,2] AS n WITH rand() AS r RETURN sum(r) AS total").rows == ((1.0,),)
         assert db.execute("RETURN rand() AS r UNION ALL RETURN rand() AS r").rows == ((0.2,), (0.6,))
 
 
@@ -104,7 +104,7 @@ def test_separate_aggregate_calls_and_nested_groups_do_not_merge_draws(draws):
     values, observed = draws
     values.extend([0.125, 0.25, 0.5, 0.75, 0.125, 0.75])
     with connect(":memory:") as db:
-        assert db.execute("UNWIND [1,2] AS n RETURN sum(rand()) AS a, sum(rand()) AS b").rows == ((0.625, 1.0),)
+        assert db.execute("UNWIND [1,2] AS n WITH rand() AS a, rand() AS b RETURN sum(a) AS a, sum(b) AS b").rows == ((0.625, 1.0),)
         assert db.execute("UNWIND [1] AS n RETURN coalesce(rand(),1) AS a, coalesce(rand(),1) AS b, count(*)").rows == ((0.125, 0.75, 1),)
     assert len(observed) == 6
 

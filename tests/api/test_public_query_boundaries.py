@@ -951,11 +951,15 @@ def test_exact_plan_nodes_are_rebuilt_with_exact_scalar_tuple_and_schema_leaves(
     column = ColumnDef(name=HostileText("id"), type=ValueType.INT64, nullable=False)
     table = TableDef(
         table_id=1,
-        name=HostileText("Person"),
+        name="Person",
         kind=HostileText("node"),
         columns=HostileTuple((column,)),
         primary_key=HostileText("id"),
     )
+    # Current TableDef admission rejects non-exact label names. Inject the
+    # hostile returned leaf *after* construction to exercise the public-plan
+    # copying boundary independently of constructor admission.
+    object.__setattr__(table, "name", HostileText("Person"))
     raw = ProduceResults(
         child=NodeScan(
             child=SingleRow(),

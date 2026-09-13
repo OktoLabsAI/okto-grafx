@@ -15,6 +15,16 @@ sys.path.insert(0, str(ROOT / "tools"))
 from generate_api_reference import MARKER, render  # noqa: E402
 
 CONSUMER_DOCS = (
+    "docs/reports/FP_FINAL_NATIVE_QUALIFICATION.md",
+    "docs/reports/FP_FINAL_PULSE_QUALIFICATION.md",
+    "docs/reports/FP_NATIVE_COST_OBSERVATIONS.md",
+    "docs/conformance/EXTENSION_COVERAGE.md",
+    "docs/conformance/README.md",
+    "docs/specs/FUNCTIONAL_PARITY_PLAN.md",
+    "docs/reports/FP_INTEGRATED_REGRESSION_CORRECTIONS.md",
+    "docs/TYPE_SUPPORT.md",
+    "docs/ENTITY_VALUES.md",
+    "docs/TEMPORAL_VALUES.md",
     "docs/CYPHER_COMPATIBILITY.md",
     "docs/COMPOSABLE_QUERIES.md",
     "docs/FEATURE_COMPARISON.md",

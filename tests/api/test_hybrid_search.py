@@ -341,8 +341,11 @@ def test_partial_does_not_swallow_source_failure_or_accept_ambiguous_binding(
             tx.execute(
                 "CREATE NODE TABLE Other(id INT64, v VECTOR(semantic), PRIMARY KEY(id))"
             )
-        with pytest.raises(GrafxConfigurationError):
-            search(db, options=HybridSearchOptions(allow_partial=True))
+        # A second physical owner no longer makes the explicit Doc target
+        # ambiguous. Its independent vector index must not replace Doc's.
+        result = search(db, options=HybridSearchOptions(allow_partial=True))
+        assert result.regime == "complete"
+        assert {hit.record_id for hit in result.hits} == {1, 2, 3}
 
 
 def test_reader_ownership_and_empty_graph_direction(tmp_path):

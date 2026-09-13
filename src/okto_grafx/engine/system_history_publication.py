@@ -1,6 +1,7 @@
 """Native coordinator-owned temporal preparation; no independent write door."""
 
 from __future__ import annotations
+from okto_grafx.domain.model.table_selection import TableSelector, validate_table_selections, select_tables
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -20,6 +21,13 @@ from okto_grafx.engine.system_history_store import (
 )
 from okto_grafx.engine.system_history_retention import PreparedHistoryRetention
 from okto_grafx.engine.system_history_index_store import PreparedHistoryIndex, head_root
+
+
+def _logical_type(catalog, table):
+    if table.kind != "rel":
+        return None
+    name = catalog.relationship_type_name(table.table_id)
+    return None if name == table.name else name
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,13 +80,12 @@ class HistoryPublication:
         if self.attempt is not None and self.attempt.txn_id == txn_id:
             self.attempt = None
 
-    def stage_activation(self, txn: TransactionContext, names: tuple[str, ...]) -> bool:
+    def stage_activation(self, txn: TransactionContext, names: tuple[TableSelector, ...]) -> bool:
         """Capture a bounded baseline under a dedicated, fully partition-fenced DDL transaction."""
         manager = self.manager
         operation = "enable system history"
         manager._require_fresh_index_catalog_transaction(txn, operation=operation, purpose=operation)
-        if type(names) is not tuple or not names or any(type(name) is not str for name in names) or len(set(names)) != len(names):
-            raise GrafxConfigurationError("Specify distinct table names.", field="tables")
+        validate_table_selections(names)
         with manager._participant_section():
             manager._require_current_active(txn)
             manager._require_recovery_complete()
@@ -87,22 +94,23 @@ class HistoryPublication:
                 if source.commit_catalog_activation is None:
                     raise GrafxConfigurationError("Enable commit history first.", field="commit_catalog_activation")
                 existing = {key for key, _, _ in source.system_history_tables()}
-                tables = tuple(source.table(name) for name in names)
+                tables = select_tables(source, names)
                 tables = tuple(table for table in tables if table.table_id not in existing)
                 if not tables:
                     return False
                 enabled = existing | {table.table_id for table in tables}
                 for table in tables:
-                    if table.kind == "rel" and any(source.table(name).table_id not in enabled
+                    if table.kind == "rel" and any(source.table(name, kind="node").table_id not in enabled
                                                    for name in (table.from_table, table.to_table)):
                         raise GrafxConfigurationError("Enable history for both endpoint tables first or together.", field="tables")
                 changes = []
                 for table in tables:
                     for partition in range(manager.partitions_per_table):
                         txn.note_read(partition_key(table.table_id, partition))
-                    changes.append(HistoryChange(table, 0, 4, ()))
+                    changes.append(HistoryChange(table, 0, 4, (), logical_type=_logical_type(source, table)))
                     for _, version in manager._heap.scan(table, txn.snapshot):
-                        changes.append(HistoryChange(table, version.record_id, 1, tuple(version.values)))
+                        changes.append(HistoryChange(table, version.record_id, 1, tuple(version.values),
+                                                     logical_type=_logical_type(source, table), node_labels=version.node_labels))
                         if len(changes) > 4096:
                             raise GrafxTransactionBudgetExceeded("History baseline exceeds 4096 changes.", field="history_changes")
                 baseline = tuple(changes)
@@ -181,6 +189,7 @@ class HistoryPublication:
             return frozenset()
         active = {key for key, _, _ in source.system_history_tables()}
         changes = list(activation.baseline if activation is not None else ())
+        effective = source
         if activation is None:
             catalog_images = tuple((index, raw) for (file, index), raw in txn.page_images.items()
                                    if file == manager._file_ids.catalog_file)
@@ -194,15 +203,19 @@ class HistoryPublication:
                     normalized.append((index, page.to_bytes()))
                 after = read_catalog_page_images(tuple(normalized), page_size=manager._pool.page_size,
                                                   sequence=current)
+                effective = after
                 for key in sorted(active):
                     table = after.table_by_id(key)
                     if table != source.table_by_id(key):
-                        changes.append(HistoryChange(table, 0, 4, ()))
+                        changes.append(HistoryChange(table, 0, 4, (), logical_type=_logical_type(after, table)))
         for row in rows:
             if row.table.table_id in active:
                 operation = 3 if row.born is None else 1 if row.ended is None else 2
-                changes.append(HistoryChange(row.table, row.record_id, operation,
-                                             tuple(row.born_values) if row.born is not None else ()))
+                table = effective.table_by_id(row.table.table_id)
+                changes.append(HistoryChange(table, row.record_id, operation,
+                                             tuple(row.born_values) if row.born is not None else (),
+                                             logical_type=_logical_type(effective, table),
+                                             node_labels=row.born_node_labels if row.born is not None else None))
         changes = tuple(changes)
         pool = manager._pool
 
@@ -295,7 +308,7 @@ class HistoryPublication:
                     target=CommitId(manager._database_uuid, sequence),
                     table_ids=tuple(key for key, _, _ in source.system_history_tables()),
                     retention_horizons={key: floor for key, _, floor in source.system_history_tables()},
-                    limits=TemporalLimits(max_bytes=max_bytes))
+                    limits=TemporalLimits(max_bytes=max_bytes), catalog=source)
                 baseline = tuple((identity.sequence, changes) for identity, changes, _ in
                     store._iter_batches(expected_sequence=sequence, page_count=count))
                 candidate = source.copy()
@@ -335,7 +348,7 @@ class HistoryPublication:
                     target=CommitId(manager._database_uuid, sequence),
                     table_ids=tuple(key for key, _, _ in source.system_history_tables()),
                     retention_horizons={key: floor for key, _, floor in source.system_history_tables()},
-                    limits=TemporalLimits(max_bytes=max_bytes))
+                    limits=TemporalLimits(max_bytes=max_bytes), catalog=source)
                 plan = prepare_retention(store, sequence=sequence, page_count=count, tables=(), before=0)
                 plan = replace(plan, compact=True, batches=tuple((identity, tuple(
                     replace(change, redacted_bytes=0) if change.operation in (5, 6) else change for change in changes))
@@ -350,7 +363,7 @@ class HistoryPublication:
                 self.controls[txn.txn_id] = _Control(candidate.serialize(), frozenset(txn.read_partitions), plan)
                 return plan
 
-    def stage_control(self, txn: TransactionContext, *, operation: str, names: tuple[str, ...] = (),
+    def stage_control(self, txn: TransactionContext, *, operation: str, names: tuple[TableSelector, ...] = (),
                       before: CommitId | None = None, pin_name: str | None = None,
                       max_bytes: int = 16 * 1024 * 1024) -> PreparedHistoryRetention | None:
         """Stage durable pin/retention metadata and a bounded, native-owned redaction plan."""
@@ -366,9 +379,8 @@ class HistoryPublication:
                 if not source.system_history_tables():
                     raise GrafxConfigurationError("Enable system history first.", field="system_history")
                 candidate = source.copy()
-                if type(names) is not tuple or any(type(name) is not str for name in names) or len(set(names)) != len(names):
-                    raise GrafxConfigurationError("Specify distinct history tables.", field="tables")
-                selected = tuple(sorted(source.table(name).table_id for name in names))
+                validate_table_selections(names, allow_empty=True)
+                selected = tuple(sorted(table.table_id for table in select_tables(source, names)))
                 retention = None
                 if operation == "unpin system history":
                     changed = candidate.remove_system_history_pin(pin_name)
@@ -407,7 +419,7 @@ class HistoryPublication:
                                 target=CommitId(manager._database_uuid, txn.snapshot.read_lsn),
                                 table_ids=tuple(key for key, _, _ in source.system_history_tables()),
                                 retention_horizons={key: floor for key, _, floor in source.system_history_tables()},
-                                limits=TemporalLimits(max_bytes=max_bytes))
+                                limits=TemporalLimits(max_bytes=max_bytes), catalog=source)
                             retention = prepare_retention(store, sequence=txn.snapshot.read_lsn,
                                 page_count=pool.storage.page_count("system-history.dat"), tables=selected, before=before.sequence)
                     else:

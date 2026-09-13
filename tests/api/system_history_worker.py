@@ -8,8 +8,8 @@ from okto_grafx.engine.txn_manager import TransactionManager
 
 
 def main():
-    path, operation, cut = sys.argv[1:]
-    with connect(path, page_size=512) as db:
+    path, operation, cut, *codec = sys.argv[1:]
+    with connect(path, page_size=512, codec=codec[0] if codec else "pure") as db:
         original_commit = Transaction.commit
         original_apply = TransactionManager._apply_images
         active = None
@@ -41,7 +41,13 @@ def main():
 
         Transaction.commit = commit
         TransactionManager._apply_images = apply
-        if operation == "activate":
+        if operation == "node_labels":
+            with db.begin("write") as tx:
+                tx.execute("MATCH(n:N {id:1}) REMOVE n:N SET n:Audit, n.value=$value", {"value":"changed" * 200})
+        elif operation == "implicit_labels":
+            with db.begin("write") as tx:
+                tx.execute("CREATE(a:A {v:'text'})-[:R]->(b:B {v:2})")
+        elif operation == "activate":
             db.enable_system_history(("N",))
         elif operation == "index":
             db.enable_system_history_index()
@@ -54,6 +60,9 @@ def main():
             from okto_grafx import CommitId
             boundary = CommitId(db.identity.database_uuid, db._transactions.published_state().last_committed_lsn)
             db.prune_system_history(boundary, tables=("N",))
+        elif operation == "flex_update":
+            with db.begin() as tx:
+                tx.execute("MATCH()-[r:R]->() SET r.v=$value", {"value":"changed"*200})
         else:
             with db.begin() as tx:
                 tx.execute("MATCH (n:N {id:1}) SET n.value = $value", {"value": "changed" * 200})

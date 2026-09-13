@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from copy import deepcopy
 
 ERROR_STEP = re.compile(
     r"a (\w+) should be raised at (compile time|runtime|any time): (\w+|\*)\Z"
@@ -154,10 +155,16 @@ def build_ledger(report: dict) -> dict:
     }
 
 
-def verify_ledger(ledger: dict, report: dict) -> None:
+def verify_ledger(ledger: dict, report: dict, *, predecessor: dict | None = None,
+                  ancestor: dict | None = None) -> None:
     """Refuse missing/added cases or changed source expectations before execution."""
     if ledger["schema_version"] != 1 or ledger["upstream_revision"] != report["upstream_revision"]:
         raise ValueError("Ledger schema/revision mismatch")
+    frozen_status = {"grafx-local-first-fp-v2": "frozen_model_expansion",
+                     "grafx-local-first-fp-v3": "frozen_multilabel_nested_storage"}
+    if (ledger.get("profile_id") in frozen_status
+            and ledger.get("status") != frozen_status[ledger["profile_id"]]):
+        raise ValueError("Frozen successor status changed")
     graph_hashes = {name: fixture["sha256_lf"] for name, fixture in report.get("graph_fixtures", {}).items()}
     if ledger.get("graph_fixture_sha256_lf", {}) != graph_hashes:
         raise ValueError("Ledger named graph fixture coverage/source mismatch")
@@ -185,6 +192,124 @@ def verify_ledger(ledger: dict, report: dict) -> None:
         if ([e["profile"] for e in ledger["cases"]] != [e["profile"] for e in checked["cases"]]
                 or ledger["profile_counts"] != checked["profile_counts"]):
             raise ValueError("Frozen profile decisions/counts changed")
+    if ledger.get("status") == "frozen_model_expansion":
+        if predecessor is None:
+            raise ValueError("Expanded profile verification requires its frozen predecessor")
+        expected = expand_flexible_ledger(report, predecessor, decision=ledger["review_decision"])
+        if ledger != expected:
+            raise ValueError("Expanded profile differs from its source-bound authorized succession")
+    if ledger.get("status") == "frozen_multilabel_nested_storage":
+        if predecessor is None or ancestor is None:
+            raise ValueError("V3 verification requires its frozen V2 predecessor and V1 ancestor")
+        expected = expand_multilabel_ledger(
+            report, predecessor, ancestor=ancestor, decision=ledger["review_decision"],
+            nested_storage_decision=ledger["nested_storage_decision"],
+        )
+        if ledger != expected:
+            raise ValueError("V3 differs from its source-bound authorized succession")
+
+
+def expand_flexible_ledger(report: dict, predecessor: dict, *, decision: str) -> dict:
+    """Withdraw only authorized unlabeled/NaN exclusions; never infer a passing case.
+
+    This is a monotone V1-to-V2 scope expansion, not a generic exclusion editor.
+    All source contracts, ownership and historical observations are preserved.
+    """
+    if (not decision.strip() or predecessor.get("status") != "frozen_checkpoint_a"
+            or predecessor.get("profile_id") != "grafx-local-first-fp-v1"):
+        raise ValueError("Model expansion requires a frozen V1 predecessor and explicit decision")
+    verify_ledger(predecessor, report)
+    ledger = deepcopy(predecessor)
+    changes = []
+    for entry in ledger["cases"]:
+        prior = entry["profile"]
+        if prior["inclusion"] != "architectural_divergence":
+            continue
+        retained = [item for item in prior["evidence"]
+                    if item["rule"] != "MODEL_UNLABELED_CREATE"
+                    and not (item["rule"] == "FINITE_ARITHMETIC" and item["counterexample"] == "NaN")]
+        if retained == prior["evidence"]:
+            continue
+        entry["profile"] = ({"inclusion": "architectural_divergence", "decision": decision,
+                             "evidence": retained} if retained else
+                            {"inclusion": "required", "decision": decision})
+        if not retained:
+            entry["root_cause"] = "authorized_model_expansion_execution_pending"
+        changes.append({"id": entry["id"], "case_sha256": entry["case_sha256"],
+                        "previous_profile": prior, "current_profile": deepcopy(entry["profile"])})
+    ledger.update(
+        profile_id="grafx-local-first-fp-v2", status="frozen_model_expansion",
+        review_decision=decision,
+        predecessor={"profile_id": predecessor["profile_id"], "canonical_sha256": hashlib.sha256(
+            json.dumps(predecessor, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()},
+        scope_changes=changes,
+        profile_counts=dict(Counter(e["profile"]["inclusion"] for e in ledger["cases"])),
+        policy="Authorized unlabeled storage and expression NaN expand required scope. "
+               "No new exclusions, rewritten expectations or inferred passes; V1 remains historical evidence.",
+    )
+    return ledger
+
+
+NESTED_STORAGE_CASE = "clauses/set/Set1.feature#0010"
+NESTED_STORAGE_CASE_SHA256 = "101a110fe6773e7cc0e3d04f65833ad656e14105c34ed0cd677212689b4564fd"
+
+
+def expand_multilabel_ledger(report: dict, predecessor: dict, *, ancestor: dict,
+                            decision: str, nested_storage_decision: str) -> dict:
+    """Apply the two explicit V3 decisions, not an arbitrary exclusion allowlist.
+
+    Label exclusions become requirements. Only the exact pinned Set1 #0010 oracle
+    becomes a divergence; its runtime error expectation and observations survive.
+    """
+    if (not decision.strip() or not nested_storage_decision.strip()
+            or predecessor.get("profile_id") != "grafx-local-first-fp-v2"
+            or predecessor.get("status") != "frozen_model_expansion"):
+        raise ValueError("V3 requires frozen V2, V1 ancestor and both explicit decisions")
+    verify_ledger(predecessor, report, predecessor=ancestor)
+    nested = next((case for case in report["cases"] if case["id"] == NESTED_STORAGE_CASE), None)
+    if nested is None or case_checksum(nested) != NESTED_STORAGE_CASE_SHA256:
+        raise ValueError("Nested-storage decision requires the exact pinned Set1 #0010 source")
+    ledger = deepcopy(predecessor)
+    changes = []
+    for entry in ledger["cases"]:
+        prior = entry["profile"]
+        if entry["id"] == NESTED_STORAGE_CASE:
+            if prior["inclusion"] != "required":
+                raise ValueError("Nested-storage predecessor must keep Set1 #0010 required")
+            entry["profile"] = {
+                "inclusion": "architectural_divergence", "decision": nested_storage_decision,
+                "evidence": [{"rule": "NATIVE_NESTED_PROPERTY_STORAGE", "step": 1,
+                              "counterexample": "CREATE (a)\nSET a.maplist = [{num: 1}]",
+                              "expected_error": "TypeError/runtime/InvalidPropertyType"}],
+            }
+            entry["root_cause"] = "declared_native_nested_storage_divergence"
+        elif prior["inclusion"] == "architectural_divergence":
+            retained = [item for item in prior["evidence"] if item["rule"] != "MODEL_MULTILABEL"]
+            if retained == prior["evidence"]:
+                continue
+            entry["profile"] = ({"inclusion": "architectural_divergence", "decision": decision,
+                                 "evidence": retained} if retained else
+                                {"inclusion": "required", "decision": decision})
+            if not retained:
+                entry["root_cause"] = "authorized_multilabel_execution_pending"
+        else:
+            continue
+        changes.append({"id": entry["id"], "case_sha256": entry["case_sha256"],
+                        "previous_profile": prior, "current_profile": deepcopy(entry["profile"])})
+    ledger.update(
+        profile_id="grafx-local-first-fp-v3", status="frozen_multilabel_nested_storage",
+        review_decision=decision, nested_storage_decision=nested_storage_decision,
+        predecessor={"profile_id": predecessor["profile_id"], "canonical_sha256": hashlib.sha256(
+            json.dumps(predecessor, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()},
+        scope_changes=changes,
+        profile_counts=dict(Counter(e["profile"]["inclusion"] for e in ledger["cases"])),
+        policy="Multiple labels are required native functionality. Only pinned Set1 #0010 is a "
+               "new explicit divergence: Grafx retains nested property storage. Original expectations "
+               "and observations are preserved; neither reclassification implies a pass. V1/V2 remain historical.",
+    )
+    return ledger
 
 
 def freeze_ledger(report: dict, reviewed: dict, *, decision: str) -> dict:
@@ -227,9 +352,10 @@ def freeze_ledger(report: dict, reviewed: dict, *, decision: str) -> dict:
     return ledger
 
 
-def profile_summary(report: dict, ledger: dict) -> dict:
+def profile_summary(report: dict, ledger: dict, *, predecessor: dict | None = None,
+                    ancestor: dict | None = None) -> dict:
     """Keep observed upstream outcomes distinct from adapted profile acceptance."""
-    verify_ledger(ledger, report)
+    verify_ledger(ledger, report, predecessor=predecessor, ancestor=ancestor)
     scope = {entry["id"]: entry["profile"]["inclusion"] for entry in ledger["cases"]}
     upstream, required, divergent = Counter(), Counter(), Counter()
     for case in report["cases"]:

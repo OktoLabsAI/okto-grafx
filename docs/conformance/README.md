@@ -6,6 +6,40 @@
 
 ## Status: checkpoint A recorded; functional parity remains in progress
 
+**Active requirements are [profile V3](PROFILE_V3.md): 3,896 required cases and
+one explicit Set1 #0010 native nested-storage divergence.** Multiple labels are now
+required, including the 22 former exclusions. V1/V2 accounts below are historical;
+source expectations and observations remain unchanged. V3 verification uses its
+V2 predecessor and V1 ancestor. Scope expansion does not assert new passes.
+
+Latest [complete native query-profile run](../reports/FP_V3_INTEGRATED_QUERY_QUALIFICATION.md):
+**3,896 passes, one failure, zero unexecuted cases**. All required V3 cases pass.
+Set1 #0010 remains the sole upstream divergence; the runner honestly exits 1.
+The corrected Graph3 phase now passes in a new complete execution, not a renamed
+historical receipt. The [final full repository/supplemental qualification](../reports/FP_FINAL_NATIVE_QUALIFICATION.md)
+and [final paired Pulse qualification](../reports/FP_FINAL_PULSE_QUALIFICATION.md)
+now pass their scopes. Neo4j execution was explicitly deferred by the user and
+does not block this delivery; no Neo4j observed result is claimed.
+
+## Historical owner and implementation checkpoints
+
+The earlier counts and former pending statements below apply to their recorded
+candidates, not the current complete V3/native/Pulse results above. Original
+observations, including failures and divergences, remain unchanged.
+
+The [native namespace increment](../specs/GRAPH_NAMESPACES_V1.md) passes all 528
+required FP-3 cases, with 17 retained multiple-label divergence failures and
+3,352 outside selection. This is an owner-scoped query receipt, not full-profile
+or package acceptance; transport/index/consumer qualification remains open.
+
+The native temporal-family selection now passes **1,004/1,004 original cases**,
+with 2,893 outside selection. It includes native query execution, not merely
+component-function matching. [Matrix and exact receipts](../specs/TEMPORAL_VALUES_V1.md#current-evidence).
+Full FP-5 consumption/format qualification and complete profile acceptance remain
+open; do not infer the FP-2 owner result from this separate family selection.
+The independently executed [FP-2 owner selection](FP2_PROGRESS.md#latest-owner-wide-checkpoint-temporal-dependencies-closed)
+also passes all 1,976 required cases, with 1,921 outside selection.
+
 [FP_CASE_LEDGER_V1.json](FP_CASE_LEDGER_V1.json) records all **3,897** expanded
 cases from **220** unchanged feature files at upstream revision
 `677cbafabb8c3c5eed458fd3b1ec0daec8d67d23`. Each entry records the case checksum,
@@ -20,10 +54,28 @@ The [checkpoint A decision](CHECKPOINT_A.md) freezes **3,470 required cases** an
 boundaries. Divergences remain inventoried and never count as passes. The
 [22 supplemental contracts](EXTENSION_SCENARIOS_V1.json) retain the functional
 requirements beyond schema-free upstream fixtures; they are not execution evidence.
+The [execution coverage map](EXTENSION_COVERAGE.md) links all 22 to native suites
+and outstanding external qualification. Its seven-test literal-query receipt does
+not stand in for the compound contracts or final integration regression.
 A family owner is not a diagnosed root cause. No percentage/conformance claim follows
 from these counts. The frozen ledger's baseline is inventory-only (`not_run`);
 historical 1,004/1,077/1,816 observations remain in the linked compatibility report,
 not substituted for fresh execution evidence.
+
+The subsequent [authorized model expansion](../specs/FUNCTIONAL_PARITY_PLAN.md#authorized-model-expansion-label-free-nodes-and-heterogeneous-properties)
+adds native label-free nodes and heterogeneous persisted properties. V1 remains
+historical frozen evidence; the first [source-reviewed successor](PROFILE_V2.md)
+reclassifies affected divergences. Match4 #0004 remains required and now passes
+without fixture adaptation through native flexible nodes/relationships. This is
+not completion of the broader model acceptance matrix; see the
+[implementation receipts](FP3_PROGRESS.md#automatic-flexible-relationships-and-original-match4-closure).
+
+Native implicit single-label creation now removes the need for schema inference
+in the latest MATCH/MATCH-WHERE selection: 410 original passes and five
+multiple-label fixture failures, including 364/364 selected V1-required passes.
+The other 3,482 cases are outside that run. Historical V1 divergences include 46
+of those native passes; V2 changes their required status without rewriting that
+historical run. See [current model contract](../architecture/FLEXIBLE_GRAPH_V1.md).
 
 | Primary package | Cases |
 |---|---:|
@@ -89,21 +141,46 @@ Broader phase/detail mapping remains work assigned to the affected packages. Une
 exceptions fail the scenario; they are not retrospectively changed to `not_run`.
 
 An explicit typed-schema fixture can be supplied to the development backend. With
-`--infer-fixture-schema`, CREATE-only, single-label/fixed-endpoint fixtures can have
-their scalar column types inferred from inputs, never expected results. Fixture
+`--infer-fixture-schema`, typed CREATE fixtures and MATCH/DELETE/CREATE setup
+pipelines can have scalar column types inferred from inputs, never expected results. Fixture
 queries are unchanged and no primary keys/values are invented. Label-only node
 tables receive an unset nullable layout column (no added graph property), recorded
-in the adaptation. Untyped/multilabel graphs, incompatible endpoint families,
-ambiguous stored types and nonliteral fixture computation remain explicit blockers.
+in the adaptation. Fixed relationship endpoint pairs can use native logical
+relationship-group DDL, explicitly recorded with catalog-v2 activation.
+MATCH type proofs use previously declared node/edge schema, fixed-hop endpoint
+constraints and alias domains. Direct edge endpoint-pair correlation is retained
+for reversal rather than replaced by a Cartesian product of labels. Property
+reads and statically typed STRING/numeric addition may infer stored column types;
+no predicates, random functions or setup expressions are executed to guess them.
+Other nonliteral computations, optional/ranged setup binding proofs, unresolved
+types and label-free/multilabel fixtures still refuse that optional inference
+route. Native execution without the flag now admits unlabeled and implicit
+single-label flexible models directly; multiple labels remain unsupported.
 The
 query under test remains unchanged; such a successful scenario reports
 `adapted_passed`, never upstream `passed`. Named graph scripts are loaded unchanged
-from the checksummed inventory. `binary-tree-1` is admitted with inferred schema;
-`binary-tree-2` currently refuses its relationship type spanning X/X and X/Y endpoints.
+from the checksummed inventory. Relationship types spanning several endpoint pairs
+are not rejected merely for that multiplicity; the inputs must determine all pairs
+and compatible stored columns. This is not blanket admission of every named fixture.
+
+On an otherwise empty graph, one CREATE-only action with explicit typed patterns
+and literal scalar properties may supply initial schema even if it has RETURN.
+Only input pattern declarations are used: the action is not executed early,
+RETURN/expected values are not schema clues, and original effects/results remain
+the oracle. Receipts label this **initial CREATE schema adaptation**. Existing
+fixtures and other/multiple action pipelines retain their admission. Unavailable
+action inference runs the original action without invented schema, not as a new
+runner exclusion. See [coverage and evidence](FP3_PROGRESS.md#node-label-predicates-and-expression-owner-checkpoint).
 
 Table-defined procedure fixtures register trusted scalar-signature callbacks with
-exact input filtering and duplicate output preservation. Unit procedures and NUMBER
-union signatures remain FP-7 blockers, not fabricated output columns or coercions.
+exact input filtering and duplicate output preservation. No-argument unit fixtures
+with an explicit empty table now use native zero-column callbacks returning None,
+without fabricated columns or rows. Native standalone implicit invocation and
+output expansion now pass; native NUMBER signatures and integer-to-FLOAT widening
+subsequently close **52/52 original procedure cases**. Broader writing/value
+contracts remain FP-7 work. [Numeric qualification](../specs/PROCEDURE_NUMERIC_SIGNATURES_V1.md),
+[prior invocation evidence](../reports/FP7_INVOCATION_QUALIFICATION.md),
+[complete baseline and unit follow-up](../reports/FP_FULL_PROFILE_20260912.md).
 Named/procedure fixtures are prevalidated before database creation. General fixture
 admission, temporal value integration, complete negative taxonomy coverage,
 execution of the supplemental extension scenarios remain pending. The architectural
@@ -179,7 +256,7 @@ described in the compatibility document. From the repository root:
 python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp1-inventory.json --ledger-output .grafx-tmp/fp1-draft-ledger.json
 python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp1-check.json --verify-ledger docs/conformance/FP_CASE_LEDGER_V1.json
 python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp1-stateful.json --verify-ledger docs/conformance/FP_CASE_LEDGER_V1.json --execute-stateful --infer-fixture-schema --feature-prefix clauses/call/
-python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp2-owner-current.json --verify-ledger docs/conformance/FP_CASE_LEDGER_V1.json --execute-stateful --infer-fixture-schema --owner FP-2
+python -m tools.check_opencypher --checkout .grafx-tmp/opencypher-2024.3 --output .grafx-tmp/fp2-owner-v3.json --verify-ledger docs/conformance/FP_CASE_LEDGER_V3.json --predecessor-ledger docs/conformance/FP_CASE_LEDGER_V2.json --ancestor-ledger docs/conformance/FP_CASE_LEDGER_V1.json --execute-stateful --owner FP-2
 python -m pytest tests/tools/test_tck_ledger.py tests/tools/test_tck_stateful.py tests/query/test_compatibility_profile.py
 ```
 

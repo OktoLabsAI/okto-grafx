@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import okto_grafx.engine.query_engine as query_module
+import okto_grafx.domain.query.planner as planner_module
 from okto_grafx.domain.model.schema import ColumnDef, TableDef
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.query.plan import IndexSeek, NodeScan
@@ -15,31 +16,34 @@ def test_repeated_exact_text_reuses_parse_analysis_and_plan(
     stack = build_query_stack()
     counts = {"parse": 0, "analyze": 0, "plan": 0}
     original_parse = query_module.parse_text
-    original_analyze = query_module.analyze
+    original_analyze = planner_module.analyze
     original_plan = query_module.build_plan
 
     def counted_parse(text):
         counts["parse"] += 1
         return original_parse(text)
 
-    def counted_analyze(statement):
+    def counted_analyze(statement, **kwargs):
         counts["analyze"] += 1
-        return original_analyze(statement)
+        return original_analyze(statement, **kwargs)
 
     def counted_plan(*args, **kwargs):
         counts["plan"] += 1
         return original_plan(*args, **kwargs)
 
     monkeypatch.setattr(query_module, "parse_text", counted_parse)
-    monkeypatch.setattr(query_module, "analyze", counted_analyze)
+    monkeypatch.setattr(planner_module, "analyze", counted_analyze)
     monkeypatch.setattr(query_module, "build_plan", counted_plan)
     transaction = stack.transaction()
     text = "RETURN 1 AS value"
 
     first = stack.engine.execute(text, transaction)
+    # Native planning validates its input, ordered pipeline and lowered scopes.
+    # The former engine-level probe counted only the external preliminary pass.
+    assert counts == {"parse": 1, "analyze": 3, "plan": 1}
     second = stack.engine.execute(text, transaction)
 
-    assert counts == {"parse": 1, "analyze": 1, "plan": 1}
+    assert counts == {"parse": 1, "analyze": 3, "plan": 1}  # No work on cache hit.
     assert first.plan is second.plan
     assert first.rows == second.rows == ((1,),)
 
@@ -49,30 +53,31 @@ def test_equivalent_committed_catalog_objects_reuse_the_prepared_plan(
 ) -> None:
     stack = build_query_stack()
     counts = {"analyze": 0, "plan": 0}
-    original_analyze = query_module.analyze
+    original_analyze = planner_module.analyze
     original_plan = query_module.build_plan
 
-    def counted_analyze(statement):
+    def counted_analyze(statement, **kwargs):
         counts["analyze"] += 1
-        return original_analyze(statement)
+        return original_analyze(statement, **kwargs)
 
     def counted_plan(*args, **kwargs):
         counts["plan"] += 1
         return original_plan(*args, **kwargs)
 
-    monkeypatch.setattr(query_module, "analyze", counted_analyze)
+    monkeypatch.setattr(planner_module, "analyze", counted_analyze)
     monkeypatch.setattr(query_module, "build_plan", counted_plan)
     text = "MATCH (n:Person) WHERE n.id = 7 RETURN n.id"
 
     first_catalog = stack.catalog_store.catalog
     first = stack.engine.execute(text, stack.transaction())
+    assert counts == {"analyze": 3, "plan": 1}
     stack.catalog_store.adopt(stack.catalog_store.read_from_pages())
     second_catalog = stack.catalog_store.catalog
     second = stack.engine.execute(text, stack.transaction())
 
     assert second_catalog is not first_catalog
     assert stack.catalog_store.persisted_image() == first_catalog.serialize()
-    assert counts == {"analyze": 1, "plan": 1}
+    assert counts == {"analyze": 3, "plan": 1}
     assert second.plan is first.plan
 
 

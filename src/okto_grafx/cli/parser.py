@@ -308,6 +308,9 @@ COMMANDS: tuple[CommandSpec, ...] = (
             *((Option("--space", "Embedding space name."), Option("--vector", "JSON numeric vector."))
               if kind != "text" else ()),
             *((Option("--table", "Node table for hybrid fusion."),) if kind == "hybrid" else ()),
+            *((Option("--table", "Physical vector owner; required when the space is shared."),
+               Option("--table-kind", "Qualify a same-named node or relationship owner (requires --table).",
+                      choices=("node", "rel"))) if kind == "vector" else ()),
         )) for kind in ("text", "vector", "hybrid")),
     _database_command(
         "schema",

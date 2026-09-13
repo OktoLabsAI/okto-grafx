@@ -55,7 +55,9 @@ def test_arrow_vector_recipe():
             tx.execute("CREATE NODE TABLE Copies(id INT64,v VECTOR(emb),PRIMARY KEY(id))")
             tx.execute("CREATE (:Documents {id:1,v:[1.0,0.0]})")
         scope = {"db": db}
-        exec(compile(snippets("EXTENSIONS_AND_ARROW.md")[3], "Arrow vector documentation", "exec"), scope)
+        recipes = [code for code in snippets("EXTENSIONS_AND_ARROW.md") if "ArrowVectorType" in code]
+        assert len(recipes) == 1, "Execute the unique printed vector recipe, not a shifted snippet index"
+        exec(compile(recipes[0], "Arrow vector documentation", "exec"), scope)
         assert scope["report"].statements == 1
         assert db.execute("MATCH (n:Copies) RETURN n.v").rows == db.execute("MATCH (n:Documents) RETURN n.v").rows
 

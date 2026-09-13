@@ -1,10 +1,11 @@
 # Okto Grafx roadmap
 
-**Single active product backlog — reconciled September 10, 2026.**
+**Single active product backlog — reconciled September 13, 2026.**
 Published/main baseline: `0.0.5`, tag `v0.0.5`, main merge
 `83cc3137bb7e95ad2a1ed9271b1a1134063097a8`. The `feature/v0.0.6` MP-1–MP-8
 checkpoint and the latest authorized native-history/catalog/search follow-up are
-implemented and locally validated, not released. Latest recorded Pulse measurement is a different build,
+implemented and locally validated, not released. Latest isolated native/Pulse
+observations use 0.0.6; the latest production spec-consolidation sample uses
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
 
 This roadmap includes **new capabilities, corrective work, known limitations,
@@ -12,7 +13,885 @@ operational hardening and developer experience**. It replaces the execution
 authority of the former evolution/agent/performance/round plans. It does not
 reopen completed work, authorize production data changes or imply release approval.
 
+## Current functional-parity acceptance
+
+The [final complete native regression](docs/reports/FP_FINAL_NATIVE_QUALIFICATION.md)
+passes **25,077 tests**, zero failures/errors, with the same 19 attributed skips.
+All 1,307 inputs were unchanged during the run. All **3,896 required V3 cases**
+pass; Set1 #0010 remains the sole authorized upstream divergence for native lists
+of maps. All **20 native supplemental maps** pass on that qualified run.
+
+The [final privately installed Pulse candidate](docs/reports/FP_FINAL_PULSE_QUALIFICATION.md)
+passes 158 installed tests and actual API/UI/MCP checks, including 500 + 11 unique
+KG nodes, exact types, search/key decisions, Settings/schema and recovered data.
+The preceding live fault-to-next-ordinary-writer sequence proves automatic native
+recovery without restarting Pulse during that sequence. Core remains agnostic;
+no global installation or production-data mutation was used for this acceptance.
+
+FP-1–FP-7 are implemented and natively qualified within their published contracts.
+FP-8 is **complete for this delivery**. On September 13 the user explicitly
+deferred the proposed Neo4j execution (`FP-NEO4J-DEFERRED-20260913`); it is a future
+comparative task, not a current acceptance gate. Keep its pins/tooling and
+unexecuted status, without starting Docker or claiming Neo4j equivalence.
+The 16-case Ladybug run is complete (seven matches, nine documented differences).
+No native capability, required test, invariant or documentation requirement was
+waived. [Scope decision](docs/specs/FUNCTIONAL_PARITY_PLAN.md#delivery-decision-defer-neo4j-execution).
+
+Current measured costs and the confirmed scalar-driving-key optimization limit
+are [documented](docs/reports/FP_NATIVE_COST_OBSERVATIONS.md); the latter is a future
+performance item, not reopened scope. Current docs are checked separately after
+the full regression's input freeze; runtime/tests remain the qualified payload.
+Documentation links/configuration/API checks, 30 executable documentation tests,
+11 offline comparative-observer tests and tool lint now pass. The latter are not
+Neo4j engine results. All 251 Grafx package files still match the privately
+installed qualified wheel; there is no remaining native/doc implementation gate.
+
+## Historical functional-parity checkpoint trail
+
+The chronological paragraphs below retain each original candidate's observations.
+Their former "pending", "failed" and "latest" descriptions are superseded for
+current status by the acceptance section above and package table below. Historical
+failed receipts remain failed; they are not additional open copies of the work.
+
+Current authorized scope: [profile V3](docs/conformance/PROFILE_V3.md) contains
+**3,896 required cases and one explicit nested-storage divergence**, retaining all
+3,897 original cases and V1/V2 history. Multiple labels per node are now required
+native work; the former exclusion is removed. Set1 #0010 keeps its original
+negative oracle but is explicitly divergent because Grafx retains lists of maps.
+The native Set1 rerun has 10 passes and that one expected upstream divergence;
+this is not full-profile acceptance or completion of multiple labels.
+
+Latest native-label checkpoint: query mutations/CREATE/MERGE, retained history,
+existing-target copy and fresh-store transfer/resume format 4 are implemented.
+The [installed candidate qualification](docs/reports/FP_NODE_LABEL_WHEEL_QUALIFICATION.md)
+passes **36 native scenarios and 36 transfer worker checks** with exact old-reader
+refusal and no file changes. All 251 candidate package files match installed wheel
+and source. The transfer consumer regression has **236 passes**, including all 58
+new label-transfer cases. The subsequent [complete V3 query execution](docs/reports/FP_V3_INTEGRATED_QUERY_QUALIFICATION.md)
+passes **all 3,896 required cases**, with only the authorized Set1 #0010 upstream
+divergence and zero not run. Final current-source full repository regression,
+supplemental/competitor evidence and paired Pulse qualification remain open;
+no release or global install occurred. The chronological checkpoints below retain
+their original scope and receipts, not additional unimplemented copies of this work.
+
+Latest Pulse consumer checkpoint: [exact value/label-transfer qualification](docs/reports/FP_PULSE_CURRENT_VALUES_QUALIFICATION.md)
+passes **255 grouped source tests and 65 installed-package tests** (overlapping).
+Community now preserves exact JSON observations for DECIMAL/nonfinite expression
+results and scalar frontiers, and refuses label loss in Pulse's single-type
+logical artifact before export. Core is unchanged; no Settings knob or global
+installation is introduced. Current real HTTP/browser/MCP, full Grafx regression
+and comparative acceptance remain required.
+
+The same candidate subsequently passes 11 exact HTTP checks and real-browser
+pagination (500 → 510), Key Decisions results and node detail. Broader installed
+source/search/Settings/recovery/MCP acceptance is still required; this does not
+replace the full repository run or competitor comparison.
+The next checkpoint also passes six authenticated real MCP calls, preserving
+exact DECIMAL/NaN output and typed read-only refusal in the neutral v2 envelope.
+The subsequent [operational checkpoint](docs/reports/FP_PULSE_OPERATIONAL_QUALIFICATION.md)
+passes **121 affected source and 158 installed tests**, with source lifecycle,
+Settings/schema, nine actual MCP calls and positive semantic search in the real UI.
+An actual post-barrier writer crash is recovered by the next ordinary Pulse writer,
+without restarting Pulse; a read alone retained the last published snapshot.
+Community now maps schema unavailability and missing spec delivery context to
+their typed public errors. No native/Core code or new configuration changed in
+that checkpoint. Full Grafx regression, supplemental reconciliation and pinned
+competitor execution remain required before the full parity DoD can close.
+
+Final regression checkpoint: **25,053 passed / 24 failed / 19 attributed skips**
+on the complete repository selection. Corrective work addresses documentation
+recipe selection, current public/dependency/corpus inventories, immutable CRC
+fixture inputs, hostile-plan fixture construction and source annotation/docstring/
+ASCII requirements. The original failed receipt is retained; this is not a green
+regression claim. The [bounded Ladybug comparison](docs/reports/FP_BOUNDED_LADYBUG_COMPARISON.md)
+now executes all 16 pinned scenarios (seven matches, nine documented differences);
+Neo4j execution remains pending. No required profile case or invariant was waived.
+The [corrective checkpoint](docs/reports/FP_INTEGRATED_REGRESSION_CORRECTIONS.md)
+records 3,566 directed passes with three further source-surface failures, followed
+by **3,270 passes with zero failures/errors/skips** after the complete helper audit.
+Every original failing ID is covered by the corrective receipts; a fresh complete
+regression and final candidate packaging remain required, not inferred as green.
+
+Earlier native-label foundation: [node-label storage v1](docs/specs/NODE_LABELS_V1.md)
+adds per-version GXL1 membership, catalog capability bit 28, immutable cached
+candidate summaries, native-authority admission and replay transition checks.
+Stable record/table identity, prior snapshots and existing tuple/overflow formats
+are preserved. The final grouped storage/transaction/query/contract selection
+passed **3,168 tests**, with no failures/errors/skips in 108.879 s; the specification
+records its exact receipt and scope. The native Set1 rerun keeps the same ten
+passes and one explicit divergence. This foundation
+does not yet enable multiple-label Cypher, retained-history/transfer consumption
+or installed-Pulse use; the remaining authorized integration is still required.
+
+Next native-label increment: [transactional publication](docs/specs/NODE_LABELS_V1.md#transactional-publication-checkpoint)
+now carries explicit membership through staging, reduction, quota checks, proved
+schema admission and all canonical heap write paths in the existing COMMIT.
+No-op candidate admission avoids repeat schema writes; public table snapshots
+preserve candidate metadata. The final grouped selection passed **719 tests**,
+zero failures/errors/skips, 210.218 s, including older snapshots on an independent
+current-reader handle and pre-WAL failure/rollback under buffer pressure. A pure
+engine import violation was corrected without relaxing its architectural policy;
+the specification records the original and corrective evidence.
+At that checkpoint, history refused unsupported label effects rather than
+discarding them; the native-history increment below replaces those temporary guards.
+
+The following [query-label mutation checkpoint](docs/specs/NODE_LABELS_V1.md#query-label-mutation-checkpoint)
+adds ordered SET/REMOVE labels, staged-owner predicates/labels(), candidate-table
+MATCH with exact membership checks, indexed-hit filtering, native edge/optional
+landings, metadata-preserving spill and detached entity labels. First-canonical
+DTO `label` is only a convenience: consumers use `labels` for membership, not
+physical owner identity. New schema candidates honor procedure schema permission;
+unchanged label sets stage no row. The following
+[CREATE/MERGE and scan increment](docs/specs/NODE_LABELS_V1.md#query-create-merge-and-scan-checkpoint)
+adds multi-label patterns, cross-owner MERGE, nested composition and native-label
+TCK state observation. FP-4 now has **289 required passes** and the single authorized
+Set1 #0010 divergence. Fresh-store logical transfer was still pending at that
+checkpoint and is qualified above; complete profile/package regressions and paired
+Pulse acceptance remain outstanding.
+The subsequent complete V3 query run has **3,895 passes / two failures / zero
+unexecuted cases**: the authorized Set1 divergence and Graph3 #0009 error phase.
+The latter is corrected with 61 original graph-expression cases passing; this
+does not relabel the full run as green. After the 172-pass codec checkpoint, the
+[native retained-history integration](docs/specs/NODE_LABELS_V1.md#native-retained-history-integration)
+now preserves membership in activation, COMMIT, scan/index reads, version/diff
+DTOs, retention/compaction, verification and physical backup/restore. Its affected
+regression has **238 passes**, including real-process cuts with pure/NumPy;
+subsequent focused checks cover label-only verification disagreement and pre-WAL
+rollback. The public history contract documents label deltas and bounded costs.
+The subsequent [existing-target copy integration](docs/specs/NODE_LABELS_V1.md#existing-target-copy-integration)
+adds bounded GXL1 copy frames/v4 digest binding and native label/endpoint/receipt
+publication. Physical-PK skip preserves target labels even after base-label
+removal, independent of other owners sharing a logical label. Existing copy
+regression: **77 passes**; final copy/history-codec/contract collection: **421
+passes**, including all 25 label-copy cases and six real pure/NumPy process cuts.
+Two new fixture-provenance failures were corrected without weakening the API;
+their failed receipt remains recorded. The subsequent format-4 transfer and
+installed-reader qualification is recorded above. Final full regression/profile
+and paired Pulse qualification remain open. No overlapping counts or focused
+receipts substitute for final acceptance.
+The 5,917-test grouped query/transaction/API run recorded six obsolete-test or
+fault-hook mismatches. All are addressed by the final **392-pass** combined
+corrective collection; the original grouped run remains failed, with final
+current-source package regression still required. Exact receipts and limits are
+in the linked node-label contract.
+This is still an in-progress native-label delivery, not a release or upgrade.
+The corrected query/transaction/procedure group has **1,110 passes**, zero
+failures/errors/skips; [the contract](docs/specs/NODE_LABELS_V1.md#query-label-mutation-checkpoint)
+records original/corrective evidence and the final read-boundary follow-up.
+
+Latest type-package checkpoint: the [consolidated support/refusal matrix](docs/TYPE_SUPPORT.md)
+and [60-case installed-wheel qualification](docs/reports/FP6_TYPE_WHEEL_QUALIFICATION.md)
+close the FP-5/FP-6 combined old/new-reader checkpoint for the recorded candidate.
+Independent DECIMAL/typed-collection bits and the full temporal/decimal/nested
+bundle are qualified with pure and accelerated writes, pure recovery/readback,
+old live handles, interrupted durable COMMIT and all-file non-mutation proofs.
+At that checkpoint, all 250 candidate package files matched its installed wheel
+and checkout; it does not qualify the subsequent label-format changes. The
+[combined upgrade procedure](docs/V006_COMPATIBILITY.md#combined-native-type-upgrade-procedure)
+requires draining/upgrading participants, verified backup and no in-place downgrade.
+No global Pulse installation/release occurred. Multiple-label native implementation,
+final full regression/profile/supplemental/competitor and paired Pulse acceptance
+remain; historical pending statements below describe their original checkpoints.
+
+The same checkpoint's logical-artifact follow-up adds **30 installed scenarios**
+for separate DECIMAL/collection descriptors and the combined type bundle, normal
+and resumable imports, exact old refusal and no partial destination/workspace.
+It exposed a resumable malformed-artifact exception leak; the current API now
+normalizes it to `GrafxRecoveryRefused(artifact_invalid)` like normal import.
+The corrected installed candidate differs from the native-matrix package only
+in `transfer.py`; all other 249 package files are identical. Archived raw errors
+are explicitly recorded, not patched or represented as clean typed refusals.
+The final affected conformance/type-transfer regression passes **558 tests**,
+zero failures/errors/skips, including real process-cut recovery and malformed
+manifest refusal before destination/workspace effects; [exact receipt](docs/reports/FP6_TYPE_WHEEL_QUALIFICATION.md#logical-artifacts-and-the-resumable-error-correction).
+
+Latest FP-6 increment: [native decimal storage](docs/specs/DECIMAL_VALUES_V1.md#native-storage-contract-development)
+adds public DecimalValue parameters/results, DECIMAL(p,s) schema, exact staged
+assignment, a 19-byte frame and atomic decimal_values_v1 capability admission.
+Focused durability/storage qualification passes **441 tests**, including pure/NumPy,
+real process cuts, recovery and concurrent snapshots. [Evidence and remaining work](docs/reports/FP6_DECIMAL_NATIVE_QUALIFICATION.md).
+The next increment adds exact native arithmetic/casts/aggregates, numeric
+comparison/grouping/order, spill parity and typed-decimal equality indexes, with
+**818 passing affected regression tests**. [Numeric qualification](docs/reports/FP6_DECIMAL_QUERY_QUALIFICATION.md).
+The subsequent [history/copy/logical-transfer increment](docs/reports/FP6_DECIMAL_CONSUMER_QUALIFICATION.md)
+preserves decimal precision/scale across retained versions, backup/restore,
+parameter-bound copy receipts, native logical artifacts and crash resume. Schema
+mismatches and malformed frames refuse before import destination/workspace effects.
+Final grouped affected regression: **529 passed**; public/API/architecture and
+executable documentation contracts: **2,427 passed**, zero failures/errors/skips.
+The latest [interface increment](docs/reports/FP6_DECIMAL_INTERFACE_QUALIFICATION.md)
+adds canonical CLI JSON/schema, typed CSV/JSONL/SQLite imports and owned
+DECIMAL/NUMBER procedures, with exact values, existing bounds and native rollback.
+Grouped interface regression: **1,240 passed**. Two architecture failures had one
+cause (an unrestricted regex import); direct bounded ASCII parsing fixed it, with
+**342 passing** import-boundary/decimal-transport corrective tests.
+The [columnar increment](docs/reports/FP6_DECIMAL_COLUMNAR_QUALIFICATION.md) now adds
+ArrowDecimalType(p,s) and exact decimal128 Arrow/Pandas/Polars/Parquet, mandatory
+metadata, bounded workspace and whole-call import rollback. **347 grouped tests
+pass**, including earlier scalar/vector/temporal consumers, independent snapshot
+reads and proven-durable apply-failure recovery on both codecs.
+Final public/API/architecture/executable-documentation contracts: **2,474 passed**,
+zero failures/errors/skips. This closes the preceding pure-core import violation.
+Typed collections and installed-reader coverage,
+unsupported index families and checkpoint C remain open; no installation or release.
+
+The [typed-collection integration](docs/specs/TYPED_COLLECTIONS_V1.md) connects
+public StoredType/ColumnDef, recursive DDL, catalog-v2 capability bit 27 and strict
+native tuple validation. Assignment precedes intent/quota proofs. CLI schema,
+history, nullable append, copy and logical transfer preserve full descriptors.
+Empty STRUCT parsing is corrected without changing expression comparisons;
+frozen public observations remain separate from engine authority. [Native qualification](docs/reports/FP6_TYPED_COLLECTION_NATIVE_QUALIFICATION.md)
+passes **3,048 grouped tests** and **2,447 public/annotation/import/documentation
+tests**, zero failures/errors/skips. Intermediate fixture errors and an outdated
+decimal-dispatch inventory test were corrected, not hidden. Parameterized external interchange, installed-reader
+checkpoint C and full FP-8/Pulse remain open; no installation or release.
+Earlier foundation receipts (86 model, 428 corrective and eight module-surface
+passes, plus the initial annotation failures) remain historical evidence in the spec.
+
+The next [collection JSON/text increment](docs/COLLECTION_JSON.md) adds exact,
+owned JSON helpers and StoredType-aware CSV/JSONL/SQLite imports. Explicit ANY tags
+preserve map/scalar identity; INT64 strings preserve full precision. Transport
+schema validation is separate from exact target assignment. Descriptors are owned,
+existing budgets and whole-call rollback remain, and cumulative binary charging
+precedes Base64 allocation. [Qualification](docs/reports/FP6_TYPED_COLLECTION_TEXT_QUALIFICATION.md):
+**506 grouped tests** and **2,474 public/annotation/import/documentation/executemany
+tests** pass with zero failures/errors/skips. No new native format or connection
+knob. At this checkpoint, parameterized columnar transport, checkpoint C and
+FP-8/Pulse remained open; the following increment advances the columnar portion.
+
+The [typed collection columnar increment](docs/COLLECTION_COLUMNAR.md) now supports
+Arrow/Pandas/Polars/Parquet with complete owned descriptors, exact nested native
+values and atomic import staging. Metadata is canonical UTF-8-safe ASCII, MAP
+conversions reject duplicate keys, ARRAY length remains exact, and empty STRUCT
+is distinct from NULL. Bounded recursive Polars conversion preserves native depth
+without passing deep schemas through the Arrow C Data recursion ceiling. No new
+native row/WAL/catalog format or connection option is introduced. Its support
+matrix and installed-reader checkpoint C are now covered by the later increment
+above; final FP-8/Pulse acceptance remains open.
+
+[Columnar qualification](docs/reports/FP6_TYPED_COLLECTION_COLUMNAR_QUALIFICATION.md):
+660 grouped regression tests, 2,483 contract/documentation tests and 161 final
+feature tests pass (overlapping selections, not summed). The report retains the
+intermediate depth/declaration failures and documents their corrections.
+
+Preceding FP-7 schema increment: [permissioned native schema authority](docs/specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md)
+adds schema_write/max_schema_statements, explicit CREATE DDL and implicit flexible
+schema under the caller's artifact journal. Catalog-v2 textual custom indexes now
+compose with earlier/later DML using a fenced durable base plus normal WAL deltas.
+[Qualification](docs/reports/FP7_SCHEMA_QUALIFICATION.md) records successes and
+intermediate failures. Compiled outer scans do not dynamically replan after DDL;
+v1 activation and changed-existing-schema index builds retain explicit prerequisites.
+FP-6, pending FP-4 decisions and full FP-8/Pulse qualification remain open.
+Schema checkpoint: all 62 new cases pass in the final 107-case selection; 348
+consumer/configuration/extension cases and original 52/52 procedure TCK pass.
+The expanded 7,122-case run had 7,120 passes and two fixture failures, both
+corrected and revalidated without production-source changes. The receipt preserves
+the failed run; no second complete clean-exit execution is claimed.
+
+Prior FP-7 nesting/effect increment: [recursive CALL and explicit determinism](docs/specs/PROCEDURE_NESTING_EFFECTS_V1.md)
+adds self/mutual native procedure recursion, inherited bounded depth, root mutation/
+traversal budgets and per-name counters shared throughout the chain. Native read
+authority cannot escalate to a writer. Callback determinism is now explicit and
+defaults to False; registry metadata controls optimizer effect admission.
+[Qualification](docs/reports/FP7_NESTING_QUALIFICATION.md). Schema authority is added
+above; FP-6, pending FP-4 decisions and FP-8 remain open.
+Acceptance: 610 combined regressions, 1,466 feature/static-contract tests and 138
+final affected tests pass in overlapping runs; all 36 new cases and the original
+52/52 procedure TCK cases are covered.
+
+Prior FP-7 query increment: [permissioned native query/result authority](docs/specs/PROCEDURE_QUERY_AUTHORITY_V1.md)
+adds opt-in ProcedureReader and ProcedureWriter.query(), bounded materialized
+results and invocation-witnessed entities, including returning native writes.
+Child queries preserve the caller's snapshot, clocks, cancellation and rollback.
+Query count/row/byte limits span input-row invocations; no independent transaction
+or commit is exposed. [Qualification](docs/reports/FP7_QUERY_QUALIFICATION.md).
+Acceptance: 562 combined regressions, 1,462 feature/static-contract tests and 125
+final query/writer/cancellation tests pass in overlapping selections; 33 new
+feature cases and the original 52/52 procedure TCK cases are covered.
+Nesting/effect and native schema declarations are added above with explicit limits.
+FP-6/FP-8 and pending FP-4 decisions are not closed by this increment.
+
+Prior FP-7 entity increment: [NODE, RELATIONSHIP, PATH and typed entity lists](docs/specs/PROCEDURE_ENTITY_SIGNATURES_V1.md)
+preserves native committed/provisional identity through callback observations,
+UNWIND, query writes and results. Only current-invocation witnesses are accepted;
+foreign/copied/expired observations grant no native authority. Existing budgets,
+statement rollback and durability are unchanged. [Qualification](docs/reports/FP7_ENTITY_QUALIFICATION.md).
+Native query/result, nesting and bounded schema authority are added above; this
+does not close FP-7 or the full functional-parity plan.
+Acceptance: 27 entity feature tests, 452 combined affected regressions and 1,455
+feature/static-contract tests pass in overlapping selections; original FP-7 TCK
+remains 52/52. Child-DELETE alias invalidation was corrected and regression-tested.
+
+Prior FP-7 value increment: [temporal, LIST/MAP/ANY and vector signatures](docs/specs/PROCEDURE_NATIVE_VALUES_V1.md)
+adds native value arguments/results with recursive ownership, bounded encoding,
+typed persistence and whole-statement rollback. The existing temporal capability
+still publishes only with durable data. No new storage format or scalar-UDF
+contract is introduced. [Qualification](docs/reports/FP7_NATIVE_VALUES_QUALIFICATION.md).
+Validation: 416 expanded regressions, 3,516 public-contract/feature tests and 241
+final affected tests pass (overlapping runs); original procedure owner remains 52/52.
+The subsequent entity increment is recorded above; broader procedure capabilities remain FP-7 work; parameterized
+collection/DECIMAL storage remains FP-6.
+
+Prior FP-7 writing increment: [native transaction-scoped mutation authority](docs/specs/WRITING_PROCEDURES_V1.md)
+adds explicit write registration/permissions, revocable same-thread authority,
+shared operation/output/native mutation budgets and whole-statement rollback.
+The initial door accepts result-free DML on declared models; it does not expose
+commit, DDL, nested procedure calls or arbitrary query-result authority.
+[Qualification and remaining scope](docs/reports/FP7_WRITING_QUALIFICATION.md).
+Acceptance: 357 expanded query/transaction tests, 3,543 combined feature/cache/
+public-contract tests and 139 final authority/extension tests pass (overlapping
+selections); the separate original procedure family remains 52/52 passing.
+FP-7 stays partial until broader signatures and capability contracts are qualified.
+
+Prior FP-7 numeric increment: [NUMBER signatures and DOUBLE widening](docs/specs/PROCEDURE_NUMERIC_SIGNATURES_V1.md)
+close **all 52 original procedure cases**, with no failed/unexecuted selected cases.
+317 affected regression tests pass; exact integer preservation, finite/range
+validation, conversion precision, budgets and statement rollback are documented.
+The final numeric/public-contract selection passes 3,510 tests; generated API and
+documentation checks also pass. Counts overlap rather than form one combined run.
+The subsequent bounded writing increment above does not close broader signatures.
+
+Prior FP-7 invocation increment: [standalone CALL and signature resolution](docs/specs/PROCEDURE_INVOCATION_V1.md)
+advances the original procedure family to **46 passed / two failed / four not run**.
+The remaining six cases require numeric signature/coercion support. Combined
+1,230-test, parameter/API/search 394-test and final 101-test hardening selections
+pass; [scope, receipts and remaining work](docs/reports/FP7_INVOCATION_QUALIFICATION.md).
+Writing callback authority is still pending; no new model exclusions were added.
+
+Full frozen-profile checkpoint: **3,816 passed / 73 failed / eight not run**;
+the required subset has 51 failures and the same eight not-run cases. The subsequent
+[unit-procedure increment](docs/specs/UNIT_PROCEDURES_V1.md) passes 513 affected tests
+and advances the separate FP-7 selection to 27 passed / 21 failed / four not run.
+[Baseline, remaining causes and exact receipts](docs/reports/FP_FULL_PROFILE_20260912.md).
+No profile exclusion changed; FP-6/7 and final acceptance remain open.
+The wider documentation/API surface follow-up also passes **3,445 tests** after
+completing 128 missing docstrings in 29 prior-increment modules; executable ASTs
+are unchanged. Its initial failures and final receipt are retained in that report.
+
+FP-6 preparation: [exact decimal contract](docs/specs/DECIMAL_VALUES_V1.md) fixes
+precision/scale, exact fitting, explicit rounding and finite numeric keys. Internal
+integer-only arithmetic, explicit conversion and exact aggregate finalization pass
+118 functional tests; earlier grouped contract checks are recorded in the spec.
+The newer native storage increment above supersedes the earlier absence of a
+format/parameter type. Native numeric query integration is now exercised above;
+typed collections, full consumer coverage and checkpoint C remain open. No new connection configuration.
+
+Grouped query/transaction checkpoint: [corrective follow-up](docs/reports/FP_QUERY_TRANSACTION_CHECKPOINT.md)
+records 6,171 passes and five old-contract fixture failures in the full selected
+run, followed by **427 passing corrective tests** covering all five causes.
+Actual post-attachment DDL failure, UNWIND target authority, qualified vector owner
+selection and vector-list commit/rollback remain tested. The original failed run
+is not relabeled green; frozen-profile and final checkpoint acceptance remain open.
+
+Latest paired consumer check: [installed Pulse HTTP/UI](docs/reports/PULSE_HTTP_UI_PARITY_QUALIFICATION.md)
+qualifies 500 → 510 node pagination and eight HTTP operations on a synthetic board.
+It corrects false-empty logical relationship reads in Community with **153 passing
+source tests** and **41 installed-package tests** (overlapping coverage); Core remains agnostic. Broader logical query syntax, full Pulse/MCP
+regression and full-profile acceptance remain open. No global install or release.
+
+Preceding FP-4 consumer follow-up: [general MERGE in Pulse](docs/reports/GENERAL_MERGE_PULSE_QUALIFICATION.md)
+passes 39 adapter/result tests against three privately installed, byte-verified
+wheels, plus **137 affected source tests**. No Core implementation change or new UI
+write permission. This closes that Python consumer check, not HTTP/browser/full
+profile acceptance. Global installations and production data remain untouched.
+
+Preceding FP-4 increment: [whole-pattern MERGE](docs/specs/GENERAL_MERGE_V1.md)
+adds unbound endpoints and fixed multi-hop patterns with complete-match-or-create
+semantics. Partial matches never reuse unbound nodes implicitly. **307 affected
+regression tests pass**, followed by **2,390 contract/fault tests** including all
+29 new native cases and four real process cuts (overlapping coverage). Shared-node
+actions now see earlier owner updates; read snapshots and conflicting-writer OCC
+are tested. Original MERGE stays at 70 passes/five label-related failures. Label
+scope/oracle decisions and the broader parity/Pulse acceptance remain open.
+No new format or configuration, installation, commit, push or release.
+
+Preceding CLI consumer increment: [vector owner selection](docs/reports/CLI_VECTOR_OWNER_QUALIFICATION.md)
+adds `--table` / `--table-kind node|rel` to vector search and advertises them through
+help/build capabilities. It delegates to the existing snapshot-bound Python API;
+ambiguous owners refuse, text index identity and hybrid node ownership remain
+unchanged. **324 command/process/output tests pass**. No new format or connection
+configuration; no release/Pulse claim.
+
+Preceding query-consumer correction: [view expression dependencies](docs/reports/VIEW_EXPRESSION_DEPENDENCY_QUALIFICATION.md)
+captures physical schema dependencies inside EXISTS and pattern expressions,
+including nested scopes and logical group members. It closes reproduced empty-
+inventory/reserved-read bypasses without disabling native expressions. **176
+affected tests pass**, including namespace-consumer process cuts; a subsequent
+**2,341-case contract/boundary selection passes**, including all 19 current view
+expression tests (overlapping coverage). No new format
+or configuration; this source increment is not installed-Pulse/full-parity acceptance.
+
+Preceding namespace acceptance: [installed logical transfer](docs/reports/LOGICAL_TRANSFER_WHEEL_QUALIFICATION.md)
+passes 42 worker checks: 10 seeds, 16 imports and 16 exact ordinary/resumable format
+refusals. **67 affected tests pass**. Actual archived 0.0.5/0.0.6 packages and a
+current candidate are identified by hashes. Old format-1 import is qualified at
+their default batch size; their reproduced tiny-batch identity-floor defect is
+explicitly not a passing claim. Current one-row imports pass. This closes the
+selected old-importer qualification, not full parity, Pulse or release acceptance.
+
+Preceding namespace increment: [projection, view and migration consumers](docs/reports/NAMESPACE_PROJECTION_VIEW_MIGRATION_QUALIFICATION.md)
+resolve known kind through projection scans and metadata ownership. Logical views
+retain both physical dependencies with a shared spelling and refuse stale/incomplete
+inventories. **87 affected tests and eight real process cuts pass**, followed by
+**2,356 interop/public-contract/boundary checks** (overlapping coverage); no new format,
+configuration, installed-Pulse or full-profile claim.
+
+Preceding namespace increment: [component and legacy vector repair](docs/reports/VECTOR_OWNER_REPAIR_QUALIFICATION.md)
+qualifies five lower-level mutation/maintenance operations by physical table ID
+and verifies explicit reconstruction of missing historical vector indexes.
+**609 affected tests pass**, including owner isolation, pure/NumPy execution and
+process interruption. A separate old-installed-writer/current-source matrix passes
+**12/12 scenarios**, including eight process cuts. Read-only opening does not silently recreate missing files;
+writable opening does not declare a stale placeholder healthy. No new format or
+configuration, no installed-Pulse or full-parity claim.
+
+Preceding quality increment: [declaration and boundary qualification](docs/reports/FP_STATIC_CONTRACT_QUALIFICATION.md)
+corrects the 75 public-surface failures: **2,357 final static/boundary/runtime-contract checks pass**, with
+**1,976 behavioral tests** and a subsequent **695-case algorithm/boundary suite**
+passing. Exact temporal algorithm imports are narrowly admitted; module-wide
+mechanism access remains forbidden. Counts overlap; no full-profile/package claim.
+
+Preceding namespace increment: [qualified vector maintenance](docs/specs/VECTOR_QUALIFIED_MAINTENANCE_V1.md)
+adds public memory/rebuild selection and detached physical IDs. **95 affected tests
+pass**, including both codecs/kinds, sibling preservation, stale failure/retry and
+cold reopen. Its expanded foundation audit exposed the 75 static-contract
+failures corrected above; the failed receipt remains historical evidence.
+
+Preceding namespace repair: [physical vector ownership](docs/specs/VECTOR_PHYSICAL_OWNERS_V1.md)
+qualifies local attachment/epochs and native/public/hybrid searches by table,
+installs relationship vector indexes through journaled DDL, and fixes typed
+vector SET conversion in property/overlay/replacement forms. **219 affected tests
+pass**, including eight real process cuts and pinned-reader/foreign-writer checks.
+The subsequent [durable naming repair](docs/specs/VECTOR_OWNER_NAMES_V1.md)
+preserves existing names and selects table-ID/column-position names for new
+colliding or oversized names, with catalog capability 25. It passes 185 affected
+tests, a subsequent 20-case API suite (overlapping coverage), and 24 installed-wheel
+admission cases, including intact legacy artifact adoption. The latest component
+and missing-artifact qualification above completes those separate vector obligations;
+no installed-Pulse, complete parity or release claim.
+
+Preceding FP-4 increment: [native EXISTS subqueries](docs/specs/EXISTS_SUBQUERIES_V1.md)
+implement correlated boolean read bodies, implicit imports, optional RETURN,
+aggregation/UNION and nested scopes. All 10 original existential-subquery cases
+pass natively. The final combined regression passes 978 tests, including four
+pure/NumPy subprocess recovery cuts and public-plan/cancellation boundaries;
+documentation/API/configuration checks pass. Exact receipts are in that contract. This is
+not completion of FP-4, the full parity plan or installed-Pulse qualification.
+
 ## Functional parity expansion plan
+
+September 12 namespace-consumer follow-up: qualified bloat/vacuum and nullable
+column addition preserve node/relationship identity, including same-name tables.
+Affected regression: 104 passed; subprocess schema-recovery matrix: eight passed.
+Pulse Community logical transfer now qualifies catalog/scans and validates the
+complete `(kind, name)` inventory; Core is unchanged. See [contracts, receipts
+and remaining acceptance](docs/specs/GRAPH_NAMESPACES_V1.md). The later vector
+runtime and durable naming repairs above resolve shared-space local ownership
+and intact legacy adoption; qualified maintenance and missing-artifact repair
+are now covered by the later increments above. Remaining consumer and complete
+package acceptance retain their own requirements.
+No production installation is implied.
+
+Current FP-4 increment: SQ-13 adds native returning/unit updating UNION, ordered
+private branch effects, stable inserted-entity identity before DISTINCT/spill,
+shared rollback and read/cursor refusal. [Usage](docs/COMPOSABLE_QUERIES.md#updating-union-branches)
+and [implementation/receipts](docs/specs/WRITE_SUBQUERIES_V1.md#sq-13-implementation-and-qualification).
+The focused selection passes 338 tests; eight additional interruption/API-control
+tests pass. Final grouped qualification passes **6,528 distinct tests**: 5,542
+across all 178 query/tools files and 986 across all 49 transaction files, with zero
+failures/errors/skips and no duplicate cases between those three receipts.
+Hashes and exact selections are recorded in the supplemental profile. Focused
+counts overlap this total. This is not full-repository/frozen-profile acceptance,
+installed-Pulse validation or completion of the overall parity plan.
+
+Preceding SQ-12 increment: import scopes support persistent explicit and
+wildcard imports plus branch-local leading-WITH imports. Native authority is
+preserved across UNION and real sorting spill without promoting detached values.
+[Scope contract](docs/COMPOSABLE_QUERIES.md#subquery-import-scopes) and
+[corrective trace/evidence](docs/specs/WRITE_SUBQUERIES_V1.md#sq-12-persistent-explicit-imports-and-branch-local-importing-with).
+The final focused selection passes 190 tests, including bounded sorting, recovery and public
+plan isolation; it does not qualify updating UNION or installed Pulse.
+After the final correction, the complete grouped query/tools regression passes
+**5,468 distinct tests across 177 files**, zero failures/errors/skips. Both final
+receipts and SHA-256 hashes are recorded in the supplemental profile; the failed
+intermediate regression is superseded. Focused counts overlap this total.
+
+Preceding FP-4 increment: native explicit-import returning and unit writing calls
+are implemented, including invocation-local write/read phases, owner-current
+entity values, nested write refusal in read APIs and exact pending-identity
+witnesses. All invocations retain the outer statement's rollback boundary.
+[Usage](docs/COMPOSABLE_QUERIES.md#native-writing-and-unit-subqueries) and
+[scope/corrective trace/receipts](docs/specs/WRITE_SUBQUERIES_V1.md).
+Final grouped regression passes **5,372 distinct tests** across all 176 query/tools
+test files, zero failures/errors/skips. The focused 37-test receipt contains 35
+feature tests (included in that regression) and two additional real subprocess
+COMMIT/recovery cuts. Counts are not added as if disjoint. That checkpoint left
+updating UNION open; SQ-13 above adds it. Complete checkpoint B/Pulse qualification
+and the overall parity plan remain open.
+
+Current temporal checkpoint: **1,004/1,004 original temporal-family cases pass**
+through native query execution, with unchanged V2/V1 sources and expectations;
+2,893 cases are outside this selection. Public constructors, scoped clocks,
+fields, duration arithmetic, comparison/ordering, truncation/differences,
+toString and native parameter/typed/ANY storage are implemented.
+[Usage and boundaries](docs/TEMPORAL_VALUES.md),
+[matrix and exact receipts](docs/specs/TEMPORAL_VALUES_V1.md#current-evidence).
+This does not close FP-5: the follow-ups below qualify index/history/copy/transport
+and the current temporal old-wheel fence, but package acceptance, the combined
+FP-5/FP-6 cross-version checkpoint and Pulse qualification remain required.
+Broader FP-2 qualification is tracked
+separately, never inferred by adding focused counts.
+
+Temporal lifecycle follow-up: logical transfer now activates catalog v2 for typed
+temporal schemas (the missing prerequisite previously blocked export validation).
+Focused integration covers exact temporal values in typed/ANY/flexible node/edge
+properties through transfer, existing-target copy/receipt replay, indexed equality,
+as-of/diff history and physical backup/reopen. See
+[the consumption contract](docs/TEMPORAL_VALUES.md#transfer-copy-and-history).
+This is additional FP-5 coverage, not full format/transport/Pulse acceptance.
+Its qualification passes **259 tests**, zero failures/errors/skips: 27 focused
+temporal lifecycle/adversarial cases, 119 transfer/copy regressions and 113
+history/backup regressions. These are scoped native integration suites, not a
+whole-repository or installed-Pulse regression.
+
+Next temporal consumption increment: scalar/nested CLI JSON now uses explicit
+temporal tags; Arrow/Pandas/Polars/Parquet use exact coordinate structs with
+mandatory `components-v1` metadata, bounded conversion and whole-call atomic
+imports. [Types, schema and bounds](docs/EXTENSIONS_AND_ARROW.md#exact-native-temporal-values-006-development).
+No host datetime narrowing, timezone lookup or NaN storage admission is introduced.
+Final qualification passes **718 distinct tests**, zero failures/errors/skips:
+115 interchange/component tests and 603 CLI/entity/expression tests in disjoint
+selections. New tests include malformed late batches, metadata loss, independent
+cursor/writer snapshots and pure/NumPy round-trips. Full FP-5 remains open.
+
+Local temporal ingestion now accepts all six native families in CSV, JSONL and
+SQLite, using explicit canonical JSON tags under a declared type. This preserves
+full native values without string/date inference or zone lookup. Existing source
+limits, NULL rules, source-connection release and whole-call staging are unchanged.
+[Usage and field grammar](docs/LOCAL_TEXT_IMPORT.md#native-temporal-fields-006-development),
+[SQLite contract](docs/LOCAL_SQLITE_IMPORT.md). This is FP-5 consumption progress,
+not completion of the remaining index/lifecycle/cross-version/Pulse qualification.
+Qualification: **228 tests passed**, zero failures/errors/skips, across 160 local
+import/component regressions and 68 shared temporal transport/entity/lifecycle
+regressions. The focused 101-test receipt overlaps these and is not added again.
+
+Temporal index qualification now covers all six typed primary keys, exact secondary
+and composite keys across hash/sparse/posting layouts, updates/rollback/delete,
+snapshot isolation, duplicate-writer rejection, rehash/rebuild and durable recovery.
+[Support/refusal matrix](docs/INDEXES_AND_VECTORS.md#native-temporal-key-support-006-development).
+The existing ANY-index, ordered-type and FTS-type exclusions are tested before
+catalog publication; no new exclusion or relaxed mixed-key policy is introduced.
+This checkpoint adds 76 focused index tests; final disjoint regressions pass
+**798 tests**, zero failures/errors/skips (157 API/query/transaction and 641 index
+tests). Existing native key encoding needed no production change. Package-level
+acceptance, cross-version and Pulse qualification are still not inferred from it.
+
+The native temporal old-wheel boundary is now qualified in **24 installed-wheel
+scenarios**: two archived binaries × materialized/pending-WAL/already-open handle
+states × read/write attempts × pure/accelerated writers. Every old refusal leaves
+all files unchanged; the candidate recovers all six exact values and reopens twice.
+The accompanying focused regression passes **138 tests**, zero failures/errors/
+skips, including unlabeled/ANY properties and expression-NaN storage rejection.
+The original required Match4 #0004 also passes again without fixture adaptations.
+[Wheel identities, reproduction and receipt hashes](docs/specs/TEMPORAL_VALUES_V1.md#installed-wheel-temporal-fence-qualification).
+These counts are separate evidence, not a whole-repository/Pulse regression or
+completion of the combined FP-5/FP-6 checkpoint.
+
+The subsequent complete native **FP-2 owner selection passes 1,976/1,976 required
+cases**, zero failures and 1,921 outside selection. Its previous 65 temporal
+dependencies are closed, including whole-entity observations with temporal
+properties. [Owner receipt](docs/conformance/FP2_PROGRESS.md#latest-owner-wide-checkpoint-temporal-dependencies-closed).
+Complete multi-package/Pulse acceptance is still open.
+
+Final grouped regression for this increment: **6,812 passed**, zero failures,
+errors or skips, covering all query/tools tests plus temporal storage, provider
+and selected native API suites. The final-code FP-2 rerun again passes all 1,976
+required cases. [Scope, corrective trace and per-group hashes](docs/specs/TEMPORAL_VALUES_V1.md#grouped-regression-trace).
+
+The following foundation checkpoints are chronological evidence. Their earlier
+query/storage “pending” statements are superseded by the current checkpoint above.
+
+The remaining malformed-literal contracts now pass the full 131-case original
+literal family, with 384 regression tests passing. This closes the three literal
+taxonomy blockers in the FP-2 baseline without fixture/ledger changes.
+
+FP-5 implementation has started with six internal calendar/local/zoned/duration
+containers, including year zero and expanded fixed-offset/named-zone years, and a
+bounded package-backed timezone provider. Recorded transition instants remain
+exact; only annual future rules use Gregorian-cycle equivalence. Provider tests
+cover all 598 names in the tested timezone package, and the selected grouped
+regression passes 1,314 tests. Query/storage integration remains open. The
+[temporal integration matrix](docs/specs/TEMPORAL_VALUES_V1.md) inventories all
+1,004 original temporal-family cases and preserves full query/storage/lifecycle
+requirements. This foundation is not yet a public constructor, parameter or
+stored-value capability; FP-5 remains open.
+
+The internal temporal text layer now constructs all six value families, including
+calendar/week/ordinal/quarter forms, named offsets and signed/fractional durations.
+All 53 Temporal2 input/result pairs pass as component tests, not as executed TCK
+queries; the grouped regression passes 1,441 tests. Exact round-trip/negative coverage and remaining integrations are recorded
+in the same [temporal contract](docs/specs/TEMPORAL_VALUES_V1.md#internal-text-construction).
+
+Internal temporal map/selection builders and exact epoch helpers now retain
+calendar/clock provenance, ISO week years and zone-assignment versus
+instant-conversion semantics. Unchanged zoned selections preserve recorded
+offsets without reinterpreting them with newer rules. The grouped regression
+passes 1,552 tests. [Component contracts and remaining integration](docs/specs/TEMPORAL_VALUES_V1.md#internal-map-construction-and-selection)
+remain explicit: public query overloads, clock context and durable admission are
+not enabled or qualified by these component tests.
+
+The internal temporal clock protocol now provides exact transaction/statement
+captures and fresh realtime reads, independent of liveness/lease clocks. Context
+defaults and per-call timezone overrides remain isolated, and named conversion
+must preserve the captured instant. The grouped regression passes 1,594 tests.
+[Capture contract and required lifecycle wiring](docs/specs/TEMPORAL_VALUES_V1.md#internal-temporal-clock-scopes)
+remain distinct: the transaction manager/executor and public clock overloads are
+not yet connected to this context.
+
+Internal temporal arithmetic now covers the 27 original Temporal8 input/result
+pairs as component tests, including duration scaling and each instant family.
+Additional proofs cover month-end clamping, date whole-second days, negative
+precision, DST day-versus-24-hour behavior, repeated/skipped local times and
+overflow refusal. The grouped regression passes 1,657 tests. The
+[arithmetic contract](docs/specs/TEMPORAL_VALUES_V1.md#internal-temporal-arithmetic)
+documents the semantics and remaining operator/query/storage integration;
+component evidence does not qualify Temporal8's native write/read scenarios.
+
+Internal temporal accessors and separate predicate/order contracts now cover all
+seven Temporal5 result vectors and 18 Temporal7 pairs at component level. Negative
+duration components, recorded offsets, pre-epoch precision, int64 field overflow,
+NULL/incomparable predicates and duration order ties are tested. The selected
+grouped regression passes 1,713 tests. [Field and comparison contracts](docs/specs/TEMPORAL_VALUES_V1.md#internal-accessors-and-comparison)
+remain separate from native property/operator, spill/index and storage wiring;
+neither TCK family is marked qualified from internal component evidence.
+
+Internal truncation now covers all five instant targets, calendar/ISO week
+boundaries, bounded smaller-field overrides and same-local timezone replacement.
+All 322 Temporal9 argument/result pairs match in a component diagnostic; the
+grouped selected regression passes 1,892 tests, including independent calendar
+checks and DST/negative/precision bounds. The [truncation contract](docs/specs/TEMPORAL_VALUES_V1.md#internal-truncation)
+records signed expanded-year semantics and explicit named-time context. Native
+query/default-clock and persisted-value qualification remain open.
+
+Internal `between`/`inMonths`/`inDays`/`inSeconds` now implement mixed-family
+component inheritance, complete calendar units and exact elapsed residues.
+The selected regression passes 1,971 tests; all 131 Temporal10 examples match in
+a component diagnostic (clock examples use explicit captured test values, not
+native query clock execution). [Difference contracts](docs/specs/TEMPORAL_VALUES_V1.md#internal-differences-between-instants)
+record named-rule requirements, full-range and dateless semantics. Query type,
+operator/function, parameter/spill/index and durable admission remain open;
+these receipts do not close FP-5 or change native conformance counts.
+
+The six [native temporal values](docs/TEMPORAL_VALUES.md) now have public Python
+wrappers, query parameter/result support, typed DDL and general/ANY/nested tuple
+persistence. Existing tags 0–11 are unchanged; tags 12–17 retain nanos, offsets,
+zone identity and calendar duration components. Catalog-v2 bit 23 is published by
+typed DDL or automatically in the same transaction as the first temporal ANY
+write, preserving already-staged schema and original-snapshot OCC. After activation,
+ordinary row commits avoid a new schema admission lock. Rollback, pre-WAL retry,
+independent reader snapshots and durable-fault row recovery are tested.
+This closes native row admission, not the full FP-5 package: complete
+index/history/copy/transfer/JSON/tabular qualification and
+Pulse consumption remain open. The [chronological receipts and remaining matrix](docs/specs/TEMPORAL_VALUES_V1.md#current-evidence)
+preserve earlier preparatory evidence without changing native TCK qualification.
+Native storage checkpoint: **4,121 passed**, zero failures/errors/skips, 296.426 s;
+all storage-core, transaction and recovery tests plus selected API/query regressions.
+The run includes a corrected close/commit ownership regression and real temporal
+row recovery. [Detailed receipt](docs/specs/TEMPORAL_VALUES_V1.md#current-evidence).
+
+Native entity collections now retain identity and source-table authority across
+UNWIND, rematch and writes, including bounded spill and repeated identities.
+Implicit relationship DDL adopts newly created endpoint indexes without switching
+previously selected authorities. All seven original List12 and 14 Unwind1 cases
+pass, closing the four collection/MERGE blockers in the FP-2 baseline inventory.
+[Usage/API contract](docs/QUERY_LANGUAGE.md#native-entity-collections-and-unwind)
+and [FP-3 evidence](docs/conformance/FP3_PROGRESS.md). Full package/profile and Pulse
+qualification remain outstanding; there is no installation or release in this increment.
+
+Five required negative-contract blockers are closed: duplicate RETURN/WITH
+headings, missing computed WITH alias, a row aggregate in a list-local expression,
+and size(path). Native errors preserve cause and planning phase; the conformance
+mapper consumes that evidence, not expected scenario output. Existing admission,
+transaction rollback and persistence boundaries are unchanged.
+[Public error contract](docs/QUERY_LANGUAGE.md#return-aliases-and-grouping-expressions)
+and [qualification/remaining failures](docs/conformance/FP2_PROGRESS.md).
+
+Grouped/DISTINCT RETURN now supports compound sort keys over complete projected
+expressions and aggregate results without reopening discarded inputs. Alias type
+proof is separate from execution; local shadowing and single producer evaluation
+are preserved. Original ReturnOrderBy6 and ReturnOrderBy2 selections pass all five
+and 14 cases, respectively. [Language/API contract](docs/QUERY_LANGUAGE.md#return-aliases-and-grouping-expressions)
+and [test receipts](docs/conformance/FP2_PROGRESS.md). Full FP-2/profile closure
+remains pending; no case reclassification or fixture adaptation was used.
+
+Projected nested maps now work across aliases, parameters, CASE, NULL and returning
+read-subquery imports/exports without requiring a graph table or reevaluating the
+source expression. Literal selected paths retain type inference; unknown fields
+are checked at use. The original With2 family passes both cases without fixture
+adaptation. [Consumption contract](docs/QUERY_LANGUAGE.md#values-and-python-mapping)
+and [increment evidence](docs/conformance/FP2_PROGRESS.md). Remaining FP-2 work is
+still tracked separately; this does not declare full parity.
+
+Scalar conversion failures now expose native evaluated-type/phase evidence, while
+unconvertible text remains NULL and arbitrary host coercion remains forbidden.
+The focused 47-case original conversion family passes. Homogeneous literal-list
+element types now reach local expressions without mixing lexical scopes; known
+invalid arithmetic refuses at planning and dynamic type failures retain execution
+evidence. All 604 original quantifier scenarios pass, and the final query/tools
+regression passes 5,013 tests without failures/errors/skips. Data-only rollback
+retains bounded owner landing caches only under the existing identity/content
+proofs; schema rollback still retires them.
+[Error/API contract](docs/QUERY_LANGUAGE.md#conversion-and-arithmetic-error-contracts)
+and [qualification and remaining work](docs/conformance/FP2_PROGRESS.md).
+This is a development increment, not closure of FP-2 or the full parity profile.
+
+RETURN alias properties/compound sort expressions, grouping ambiguity and grouped
+WITH name-resolution precedence are implemented and tested. The focused original
+WithOrderBy4 family passes all 20 cases. Nested aggregates have a proven error
+category; Return6 now passes all 21 original cases. Direct volatile aggregate
+arguments refuse at planning; WITH materialization retains random aggregation.
+[Contract](docs/QUERY_LANGUAGE.md#stable-aggregate-arguments-and-volatile-row-values)
+and [evidence](docs/conformance/FP2_PROGRESS.md). Overall FP-2 is not closed.
+
+Native `percentileDisc` / `percentileCont` now close the 13 percentile cases,
+including numeric range errors and composed grouping. All 35 original cases in
+the aggregation-expression family pass. Both ordinary and memory-bounded execution,
+DISTINCT, numeric extremes, NULLs, NaN expressions and late rollback are tested;
+truncated external runs refuse. [Usage and costs](docs/QUERY_LANGUAGE.md#percentile-aggregates).
+This does not close FP-2 or the full profile; no fixture adaptations or exclusions
+were introduced.
+
+Row-independent `SKIP`/`LIMIT` expressions are implemented with single evaluation
+per logical invocation and phase-proven type/negative/dependency errors. The
+focused RETURN window family passes all 31 original cases; the WITH window family
+now passes all 9 original cases after correcting plain WITH ordering scope.
+[Usage and optimization cost](docs/QUERY_LANGUAGE.md#row-independent-skip-and-limit-expressions)
+and [regression evidence](docs/conformance/FP2_PROGRESS.md). This does not close FP-2.
+
+Plain WITH ORDER BY can now use unexported input bindings while output aliases
+shadow the input names. Private sort inputs are dropped before later clauses.
+The wider WITH-ordering inventory now reports 227 original passes / 65 failures;
+all remaining failures in this selection stop at missing functions.
+[Scope contract](docs/QUERY_LANGUAGE.md#with-ordering-scope).
+
+WITH modifiers now reuse exactly projected expressions after DISTINCT/grouping;
+plain attached WHERE can temporarily read unexported source bindings. Those private
+inputs survive bounded sorting and are removed before downstream export. All 19
+original WITH-WHERE cases pass. Alias/local shadowing, spill and rollback have
+focused tests; full functional parity and installed-Pulse qualification remain open.
+
+**Historical V2 scope: [V2](docs/conformance/PROFILE_V2.md)** retains all 3,897 source
+cases and makes 3,875 mandatory, with 22 existing multiple-label divergences.
+It withdraws 405 obsolete exclusions without modifying V1, expectations or
+observed outcomes. Native `RETURN *` now projects visible lexical variables through
+UNION/read subqueries and cursors; [usage and limits](docs/QUERY_LANGUAGE.md#returning-the-visible-scope).
+The independent TCK literal reader now admits Gherkin-unescaped newlines, allowing
+the three previously unexecuted string cases to run. FP-2/profile closure remains
+incomplete; [diagnostics and focused evidence](docs/conformance/FP2_PROGRESS.md).
+
+Native content access after owner deletion now fails with a proven runtime cause
+and whole-instruction rollback, including aliases and spill-restored bindings.
+Counts, immutable relationship type and detached observations remain supported;
+[contract](docs/QUERY_LANGUAGE.md#content-access-after-deletion). Return2's 18
+original cases pass in the focused run; this is not full-profile acceptance.
+
+**Authorized model expansion:** the user chose native label-free nodes and
+persisted heterogeneous properties instead of excluding Match4 #0004. This
+FP-3/FP-6 work is in progress, not complete. The first foundation implements
+native node/edge `ANY` columns, concrete tagged persistence, dynamic reads/updates,
+catalog-v2 capability fencing and logical transfer. Native implicit single-label and label-free CREATE/MERGE,
+dynamic property-key growth/removal and empty-label DTOs now extend that foundation:
+[flexible node contract](docs/architecture/FLEXIBLE_GRAPH_V1.md).
+Automatic flexible relationship types now create/extend actual endpoint pairs
+transactionally, including same-statement reads. The original Match4 #0004 passes
+without fixture adaptation. Fresh-store logical transfer now preserves typed and
+flexible groups/maps through [artifact format 2](docs/LOGICAL_TRANSFER.md#artifact-v2-flexible-models-and-relationship-groups),
+including endpoint remapping and resumable private publication. Existing-target
+flexible/no-PK copy now preserves distinct equal-valued nodes through native target
+bindings and remapped endpoints, with atomic receipts; Pulse qualification remains
+pending. [Identity contract](docs/CATALOG_COPY.md#flexible-and-no-pk-entity-identity).
+Typed-group existing-target
+copy now resolves logical type and endpoint pairs independently of physical names/IDs,
+with atomic receipts; [contract](docs/CATALOG_COPY.md#typed-logical-relationship-groups).
+Opt-in system history now preserves
+model flags/logical types through scan/index, retention/compaction and backup, with
+catalog bit 22 fencing old writers; this is not completion of
+the entire flexible-model package.
+See the [heterogeneous-property contract](docs/architecture/HETEROGENEOUS_PROPERTIES_V1.md)
+for current index/embedding restrictions and outstanding qualification. Preserve typed-table constraints,
+actual empty labels, original value types, atomic schema/data writes and existing
+durability/concurrency/nonfinite-storage safeguards. Audit related V1 divergences
+into a versioned successor profile; do not rewrite old expectations or receipts.
+See the [complete acceptance scope](docs/specs/FUNCTIONAL_PARITY_PLAN.md#authorized-model-expansion-label-free-nodes-and-heterogeneous-properties).
+
+The three recorded MATCH/WHERE blockers are corrected: heterogeneous per-row
+property reads and exact native error-phase/category evidence. All 26 required
+cases pass (two original, 24 schema-adapted), without new exclusions. Broader
+MATCH and remaining FP packages still need qualification. The combined MATCH /
+MATCH-WHERE owner diagnostic now records 363 required passes (246 original,
+117 schema-adapted), zero execution failures and one fixture-admission blocker out of 364
+required cases. Native scope categories respect declaration order; re-matched
+relationships preserve incoming identity, including optional/path reads, and
+duplicate names in connected read patterns refuse statically. Bound-edge direct
+access and broader bound-list patterns remain pending. No failing case was
+excluded. See [FP-3 progress](docs/conformance/FP3_PROGRESS.md).
+
+Inline relationship maps now use native equality predicates, including every
+edge of a bounded range, before OPTIONAL null extension. Named paths and
+predicate/comprehension composition are supported; existing query budgets and
+whole-statement rollback are retained. Property-based traversal pruning remains
+access-path work, not a claim of this syntax completion.
+
+Read patterns also accept `<-->` / `<-[r]->` as undirected segments and the
+optional colon in `:R|:S`. Stored edge orientation, cycle/self-loop multiplicity,
+directed neighboring segments and single-direction write admission are retained.
+Bare pattern-map parameters carry an explicit native parsing error category;
+parameters inside literal maps remain supported. No frozen case was rewritten.
+
+Empty explicit relationship intervals (`*2..1`, `*1..0`, `*..0`) now return no
+paths without traversal, preserving upstream effects and OPTIONAL/aggregate
+semantics. Both bounds remain independently limited to `0..30`, including local
+pattern expressions and caller-built ASTs. Malformed negative/missing-star syntax
+has an explicit native error category. Match5 #0025–#0029 now pass through
+input-derived setup schema and native runtime-bound writes. Match4 #0004 now
+passes without adaptation using the authorized flexible model; broader model
+integration remains pending.
+
+Standalone node MERGE now emits all existing matches per input, including
+unlabeled searches across node tables. Only an empty match set creates a node,
+with native unlabeled creation for an untyped pattern and typed creation for an
+explicit label. Empty maps match all candidates, and matching does not demand
+unspecified creation columns. Read transactions refuse write plans before
+execution even when the pipeline is empty or mutation-free. Remaining MERGE
+pattern shapes and indexed MERGE access are not declared complete.
+See [semantics](docs/QUERY_LANGUAGE.md#node-merge-matching-and-creation) and
+[acceptance evidence](docs/conformance/FP3_PROGRESS.md#standalone-node-merge-multiplicity-and-typed-creation).
+
+Bound polymorphic SET/DELETE now validate each actual row schema. Relationship
+CREATE/MERGE resolves the declared member for the actual bound endpoint pair,
+then runs the unchanged catalog/identity/visibility/OCC proofs. Late missing-pair
+or type failures roll back the whole statement. Typed setup fixtures may infer
+property/addition types and correlated endpoint pairs without rewriting input
+queries or consulting expected results. See [runtime write contracts](docs/QUERY_LANGUAGE.md#writes-through-polymorphic-bindings).
+
+WITH now retains structurally proved entity/list kinds through coalesce and
+CASE, and literal ordered relationship lists can constrain ranged MATCHes.
+Written ranges have a distinct relationship-list binding kind; explicit subquery
+imports retain it. NULL alias provenance is preserved across renamed projections.
+The four recorded expression-binding failures pass; broader provenance/access
+paths and supplemental FP-3 obligations still require completion.
+
+Node-label predicates now execute natively. The latest expression-owner
+diagnostic passes all **69 required FP-3 expression cases** (38 original,
+31 explicitly schema-adapted); broader clause/pattern, type and integration
+packages remain incomplete. The frozen ledger is unchanged. See
+[label and runner evidence](docs/conformance/FP3_PROGRESS.md#node-label-predicates-and-expression-owner-checkpoint).
+
+Pattern comprehensions now have native correlated list execution, hygienic local
+scopes, typed path/entity results, statement rollback and materialization limits.
+All five required Pattern2 cases pass with recorded fixture-schema adaptation;
+this does not close broader FP-3 or the full profile. See [FP-3 execution evidence
+and known limits](docs/conformance/FP3_PROGRESS.md#pattern-comprehension-native-execution).
 
 **Authorized; checkpoint A recorded, FP-2 and its FP-3 dependencies in progress.** The user requested a concrete plan for
 the six remaining functional fronts plus the unresolved TCK inventory. The
@@ -23,18 +902,102 @@ No release number, branch change or publication is implied by plan approval.
 
 | Order | ID | Planned delivery | Status |
 |---|---|---|---|
-| 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Checkpoint A: 3,897 cases bound, 3,470 required / 427 explicit model divergences; compatible runner paths tested; later-package blockers retained |
-| 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | In progress: all five implementation fronts have focused tests; required negative contracts and cross-package case closure pending |
-| 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | In progress: composed polymorphic reads and [native detached node/edge/path output](docs/ENTITY_VALUES.md), including entity UNION, nested aggregate spill, exported subquery bindings, pending identity/cursors/sort/DISTINCT, composed directional/optional captures, explicit typed variable ranges/zero length/concatenated segments with depth-first streaming, clause-wide relationship uniqueness and explicit resource refusal for omitted upper bounds, node-only capture with polymorphic/optional composition and same-statement SET component refresh, native properties()/labels()/type() with lazy dynamic checks, absent-table read/null extension and identity-preserving zero-hop ranges, generic one-hop untyped/type-alternative capture and bound-target validation without application-specific query recognition, heterogeneous bounded ranges sharing typed DFS/quotas and schema-aware omitted-upper probes; remaining pattern/expression cases, access-path work, remaining TCK discrepancies and Pulse migration pending |
-| 4 | FP-4 | Returning/unit read-write subqueries and variable-import rules | Planned |
-| 5 | FP-5 | Temporal functions/operations and exact native stored values | Planned |
-| 6 | FP-6 | DECIMAL and typed LIST/MAP/ARRAY/STRUCT persistence and interoperability | Planned |
-| 7 | FP-7 | Authorized transaction-scoped writing procedures | Planned |
-| 8 | FP-8 | Final conformance accounting, paired Pulse validation and public contracts | Planned |
+| 1 | FP-1 | Frozen capability/case matrix; stateful fixture/write/error/effect TCK runner | Implemented and qualified. Frozen V3 preserves all 3,897 upstream IDs: 3,896 required passes and one authorized lists-of-maps divergence. Stateful runner and native accounting are in the complete 25,077-pass regression; no oracle rewrite. |
+| 2 | FP-2 | Numeric/postfix syntax, chained comparisons, rand and faithful result-column names | Implemented and qualified in the complete required V3 profile and repository regression: numeric/postfix syntax, chained comparisons, volatile rand, original headings and expression-only NaN. [Query contract](docs/QUERY_LANGUAGE.md). |
+| 3 | FP-3 | Qualified entity UNION output, polymorphic patterns and named variable-length paths | Implemented and qualified: detached entity identity, bounded polymorphic/named paths, flexible/ANY models, unlabeled/multiple labels and supported history/copy/transfer consumers. Original V3 cases and supplemental maps 1–5 pass; installed format/consumer evidence is in the final audit. [Entity contract](docs/ENTITY_VALUES.md). |
+| 4 | FP-4 | Returning/unit read-write subqueries and variable-import rules | Implemented and qualified: returning/unit writing CALL and UNION, native private phases, explicit/star/leading-WITH imports, independent readers/writers and shared statement rollback. V3, supplemental maps 6–11 and affected installed Pulse checks pass. [Write contract](docs/specs/WRITE_SUBQUERIES_V1.md). |
+| 5 | FP-5 | Temporal functions/operations and exact native stored values | Implemented and qualified: all six native temporal families, query operations and exact supported persistence/consumers. All 1,004 original temporal cases pass; combined 60-case installed type checkpoint and supplemental maps 12–13 pass. [Temporal contract](docs/TEMPORAL_VALUES.md). |
+| 6 | FP-6 | DECIMAL and typed LIST/MAP/ARRAY/STRUCT persistence and interoperability | Implemented and qualified: exact DECIMAL and typed LIST/MAP/ARRAY/STRUCT with supported indexes, history/copy, text and columnar consumers; installed checkpoint C and supplemental maps 14–17 pass. Unsupported combinations remain explicit in the [type matrix](docs/TYPE_SUPPORT.md). |
+| 7 | FP-7 | Authorized transaction-scoped writing procedures | Implemented and qualified: native read/write/unit calls, value/entity signatures, bounded recursion/effects and permissioned query/schema authority. All 52 original procedure cases and supplemental maps 18–20 pass. [Schema contract](docs/specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md). |
+| 8 | FP-8 | Final conformance accounting, paired Pulse validation and public contracts | Delivered: complete native regression/profile/supplemental maps, final paired Pulse API/UI/MCP and documentation checks pass; all 16 Ladybug observations recorded. Neo4j execution explicitly deferred by the user, not counted as passed (`FP-NEO4J-DEFERRED-20260913`). [Final qualification](docs/reports/FP_FINAL_NATIVE_QUALIFICATION.md). |
+
+Latest FP-3/4 follow-up: native entity `keys()` and dynamic string-key property
+reads, plus property `REMOVE` using the atomic SET path. The
+[property-access evidence](docs/conformance/PROPERTY_ACCESS_PROGRESS.md) preserves
+the owner-wide baselines and current regression receipts. The subsequent
+[independent namespace increment](docs/specs/GRAPH_NAMESPACES_V1.md) implements
+kind-qualified catalog/native queries and relationship-type predicates, bringing
+the FP-3 original required cases to 528/528. The subsequent consumer increment
+implements kind-qualified copy/transfer/resume/history and full-text ownership;
+transfer format 3 and copy digest domain v3 preserve overlapping names. Qualified
+hybrid search and 24 installed catalog/WAL admission scenarios pass. Vector
+maintenance/missing-artifact repair is covered by the subsequent increments above;
+remaining consumers/artifact importers and Pulse qualification remain open. This
+is not package acceptance.
+The [conditional MERGE increment](docs/specs/MERGE_ACTIONS_V1.md) implements
+`ON CREATE SET` / `ON MATCH SET` property actions and enumerates every matching
+bound-endpoint relationship. Original MERGE family: 51 passes, 23 required failures
+and one retained divergence failure; all 75 selected cases executed. This is not
+completion of FP-4. The subsequent [whole-map SET increment](docs/specs/SET_PROPERTY_MAPS_V1.md)
+adds replacement/overlay from maps and native entity properties, including MERGE
+actions. Original SET: 37 passes/16 required failures; original MERGE: 55 passes,
+19 required failures/one retained divergence. The nested-property negative case
+is recorded explicitly without changing the frozen profile. Label changes, broader MERGE pattern forms,
+existential forms and remaining error/effect cases stay
+required; these are not covered merely by the completed writing-CALL/UNION work.
+Map-update source qualification: 996 affected tests passed, including independent
+reader/writer behavior, index/history checks and subprocess COMMIT/recovery cuts.
+This does not replace the remaining full-profile and installed Pulse qualification.
+The subsequent full FP-4 owner refresh executes all 290 selected cases: 201 pass,
+84 required failures and five retained divergences. All 147 previously passing
+post-SQ-13 owner cases remain passing; the owner is not complete.
+The subsequent [DELETE increment](docs/specs/DELETE_EXPRESSIONS_V1.md) implements
+expression/path targets, freezes predicates/targets before deletion and passes
+all 41 original DELETE cases. It closes that family without reclassifying cases;
+label mutations, broader MERGE and existential forms remain required.
+Its 359-test affected regression and separate public-plan ownership test pass,
+including four subprocess crash/recovery cases. Predicate-free direct node scans
+remain streaming; other delete inputs obey the existing memory bound. The earlier
+memory/spill regression is fixed without relaxing its test or configuring a larger budget.
+The subsequent [written-pattern increment](docs/specs/WRITE_PATTERN_CONTRACTS_V1.md)
+adds native named CREATE/MERGE paths, explicit binding/type/direction/null errors
+and a private phase boundary before MERGE reads preceding mutations. Grouped
+regression: 1,023 passes. CREATE: 74 passes/two required failures/two retained
+divergences; MERGE: 67 passes/seven required failures/one retained divergence.
+These family receipts do not replace the remaining owner/full-package acceptance.
+The final 168-case namespace/import/diagnostic/fault collection also passes,
+including four new pure/NumPy crash cases proving that mutation-to-MERGE private
+phases and captured-path writes share one durable COMMIT outcome.
+
+The follow-up implements bound-edge undirected MERGE and native
+`startNode()`/`endNode()`; its MERGE family now passes 70/75 (four required
+label-action failures and one retained divergence). It also corrects native
+write-binding loss after externally sorted WITH projections. Existing snapshot
+identity validation, OCC, transaction rollback and memory limits remain mandatory.
+This is the next increment of the same [contract](docs/specs/WRITE_PATTERN_CONTRACTS_V1.md),
+not completion of the owner/full-package gate or a new roadmap scope.
+Final affected regression: **1,016 passes, zero failures/errors/skips**, including
+pure/NumPy directed/undirected MERGE and endpoint-write crash recovery. The initial
+two sequential-action regressions were corrected and the entire collection rerun;
+the contract preserves both failed and passing receipts. Documentation and public
+API/configuration checks pass. Match4 #0004 is separately reconfirmed natively.
+The subsequent large-CREATE increment implements flat ordered native instruction
+programs and separates 1,024 pipeline clauses from the existing 64 UNION/action
+limits. Lexer admission is 32,768 tokens under the unchanged 65,536-character
+source ceiling. Both original large-CREATE scenarios now pass; all 76 required
+CREATE cases pass, with only two retained multiple-label divergences. Expression/
+physical-plan depth and transaction/write quotas remain enforced. No independent
+commits, source rewriting, storage format or new connection setting is introduced.
+Large-CREATE qualification: **947 grouped regression passes** and **14 focused
+passes**, including four pure/NumPy subprocess recovery cuts. All documentation,
+API/configuration and changed-source Ruff checks pass. The new complete FP-4 owner
+receipt records **245 passes / 40 required failures / five retained divergence
+failures**, with no loss among its previous 201 passes. Pending required cases:
+29 label mutations, ten existential subqueries and one nested-storage negative
+oracle conflicting with the authorized broader model. Several required label
+actions also imply multiple labels; the model/profile conflict is recorded, not
+silently waived. [Receipts and remaining scope](docs/specs/WRITE_PATTERN_CONTRACTS_V1.md#large-create-qualification-receipts).
+
+The later [EXISTS increment](docs/specs/EXISTS_SUBQUERIES_V1.md) closes those ten
+existential cases. Its full owner run has **255 passes / 30 required failures /
+five retained divergence failures**, with no loss of any previous 245 pass.
+Label mutations and the nested-storage oracle conflict remain pending; this
+does not claim completion of general MERGE, FP-4, Pulse qualification or full parity.
 
 These packages detail CMP-Q/T and the existing extension/type contracts; they do
 not reopen completed bounded rounds or silently add HA, server security, drivers
-or schema-free storage. Multi-reader/multi-writer, WAL/durability and agnostic Pulse
+or other unapproved model changes. The later explicit flexible-model authorization
+is recorded below. Multi-reader/multi-writer, WAL/durability and agnostic Pulse
 Core boundaries remain mandatory. Checkpoints: matrix freeze after FP-1; grouped
 query/transaction validation after FP-4; format/upgrade validation after FP-6;
 final severe regression after FP-8. Focused tests run throughout. No moving
@@ -75,8 +1038,10 @@ planning, parameters before effects, dynamic types at evaluation) and prevents
 BOOL/INT64/DOUBLE literal memo collisions in grouped projections. The focused
 query/planner/compiled-predicate regression passed **667 tests**; the original
 boolean family records **141 passes**, with remaining cases/dependencies retained.
-The owner-wide diagnostic, durable zero-effect-write checks and the unresolved
-eight-case NaN policy inconsistency are recorded in the FP-2 working evidence.
+The owner-wide diagnostic and durable zero-effect-write checks are recorded in
+the FP-2 working evidence. The explicit NaN decision is now implemented: expression
+NaN is supported, nonfinite storage is rejected, and all eight original NaN
+comparison cases pass without changing the frozen required-case inventory.
 
 Further FP-2 closure: empty map keys, explicit scope/aggregation error evidence
 and bounded streaming `UNWIND range` are implemented. All **149 required boolean
@@ -802,6 +1767,7 @@ native API, HTTP/MCP and UI boundaries.
 | 5 / PERF-SCALE | Partial: ordered cursor OIX work, index growth and vector access paths landed | Measure increasing N, fan-out, skew and churn on selected real query shapes. Canonical fallback may still be O(N); preserve it where completeness/validation requires it. |
 | 6 / PERF-MEM | Partial: bounded caches, spill, vector-free landings and retained metrics/history improvements landed | Measure peak memory with realistic handle count and indexed writes; logical counters are not RSS. Do not discard validation to reduce allocations. |
 | Future / AUTH-BUNDLE | Deferred, explicitly not needed to unblock current work | Possible cache/bundle of authority requires a separate security/invalidations design. The selected protocol remains complete pre-validation → operation with the real 30 s budget → post-validation/close, every phase fail-closed. Do not expand the authority surface merely to pass a gate. |
+| Future / PERF-DRIVING-KEYS | Confirmed optimizer limitation, deferred from functional parity: scalar UNWIND variables and arithmetic driving keys retain node scans; direct properties of map-batch elements already use indexed seeks | The final 0.0.6 synthetic sample records two NodeScan operators for scalar endpoint binding versus two IndexSeek operators for the supported map-element batch. Widen eligibility only after proving binding order, NULL/type/error and snapshot/rollback equivalence; never seek from an unproduced matched variable. This is a future bounded optimization, not a new parity gate or a claimed speedup. |
 
 Completed Wave 0–3, OIX-0–3, source-reference seeks, query-expression reuse,
 vector-free relationship landings, grouped endpoint/count checks, bucket batching,

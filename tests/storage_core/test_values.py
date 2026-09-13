@@ -102,7 +102,7 @@ def test_every_value_round_trips(label: str, value: object) -> None:
 
 
 def test_the_tag_of_every_type_is_the_one_the_contract_froze() -> None:
-    assert [int(member) for member in ValueType] == list(range(12))
+    assert [int(member) for member in ValueType] == list(range(19))
     assert ValueType.NULL == 0
     assert ValueType.BOOL == 1
     assert ValueType.INT64 == 2

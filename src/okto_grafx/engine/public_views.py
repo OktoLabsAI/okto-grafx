@@ -56,7 +56,9 @@ from okto_grafx.domain.ledger.entry import (
 )
 from okto_grafx.domain.ledger.payload import LedgerPayload, decode_payload
 from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
-from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
+from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef, SchemaType
+from okto_grafx.domain.model.stored_types import StoredType
+from okto_grafx.domain.model.relationship_type import RelationshipTypeDef
 from okto_grafx.domain.model.value import (
     INT64_MAX,
     INT64_MIN,
@@ -73,11 +75,22 @@ from okto_grafx.domain.page.layout import MAX_U32, MAX_U64
 from okto_grafx.domain.page.checksum import crc32c_implementation
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import Aggregation
+from okto_grafx.domain.model.table_selection import TableSelector
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
     CaseAlternative,
     CaseExpression,
     Expression,
+    ExistsSubquery,
+    Query,
+    UnionQuery,
+    MatchClause,
+    WithClause,
+    ReturnClause,
+    UnwindClause,
+    SubqueryClause,
+    ProcedureCall,
+    UpdatingClause,
     FunctionCall,
     ListExpression,
     Literal,
@@ -86,6 +99,12 @@ from okto_grafx.domain.query.ast import (
     NamedArgument,
     NullCheck,
     Parameter,
+    PatternPredicate,
+    PatternComprehension,
+    LabelPredicate,
+    PatternPath,
+    NodePattern,
+    RelationshipPattern,
     Property,
     ReturnItem,
     SortItem,
@@ -112,6 +131,7 @@ from okto_grafx.domain.query.plan import (
     ArgumentRows,
     ApplyRows,
     SubqueryRows,
+    RestoreImports,
     ProcedureRows,
     MAX_PLAN_DEPTH,
     AggregateRows,
@@ -120,6 +140,8 @@ from okto_grafx.domain.query.plan import (
     CreatedNode,
     CreatedRelationship,
     CreateRelationships,
+    CreateSequence,
+    CreatedPattern,
     CreateRelTable,
     CreateVectorSpace,
     DeleteEntities,
@@ -137,6 +159,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    LabelAssignment,
     RelationshipIncidentSeek,
     RelationshipScan,
     SetProperties,
@@ -335,7 +358,7 @@ class TableBloatReport:
     never presented as bloat.
     """
 
-    table: str
+    table: TableSelector
     table_id: int
     data_pages: int
     slot_directory_entries: int
@@ -382,7 +405,7 @@ class BloatReport:
 class TableVacuumReport:
     """Detached physical effects of one quiescent vacuum pass over one table."""
 
-    table: str
+    table: TableSelector
     table_id: int
     pages_scanned: int
     eligible_inline_versions: int
@@ -507,6 +530,29 @@ class CatalogView:
 
     table_definitions: tuple[TableDef, ...]
     space_definitions: tuple[EmbeddingSpaceDef, ...]
+    relationship_type_definitions: tuple[RelationshipTypeDef, ...] = ()
+
+    def relationship_types(self) -> tuple[RelationshipTypeDef, ...]:
+        """Return detached logical groups in name order, without live authority."""
+        return self.relationship_type_definitions
+
+    def relationship_tables(self, name: str) -> tuple[TableDef, ...]:
+        """Resolve a captured logical type without aliasing physical identities."""
+        wanted = _require_text("relationship_type", name)
+        for group in self.relationship_type_definitions:
+            if group.name == wanted:
+                return tuple(self.table_by_id(key) for key in group.table_ids)
+        grouped = {key for group in self.relationship_type_definitions for key in group.table_ids}
+        return tuple(table for table in self.table_definitions
+                     if table.name == wanted and table.kind == "rel" and table.table_id not in grouped)
+
+    def relationship_type_name(self, table_id: int) -> str:
+        """Return the captured logical type of a real relationship table."""
+        table = self.table_by_id(table_id)
+        if table.kind != "rel":
+            raise GrafxConfigurationError("A node table has no relationship type.", field="table_id")
+        return next((group.name for group in self.relationship_type_definitions
+                     if table.table_id in group.table_ids), table.name)
 
     def tables(self) -> tuple[TableDef, ...]:
         """Return captured tables in numeric identity order."""
@@ -516,22 +562,31 @@ class CatalogView:
         """Return captured embedding spaces in numeric identity order."""
         return self.space_definitions
 
-    def has_table(self, name: str) -> bool:
-        """Return whether a captured table has ``name``."""
+    def has_table(self, name: str, *, kind: str | None = None) -> bool:
+        """Return whether a physical name exists, optionally qualified by kind."""
         wanted = _require_text("table", name)
-        return any(table.name == wanted for table in self.table_definitions)
+        if kind is not None and (type(kind) is not str or kind not in {"node", "rel"}):
+            raise GrafxConfigurationError("Table kind must be node or rel.", field="kind")
+        return any(table.name == wanted and (kind is None or table.kind == kind)
+                   for table in self.table_definitions)
 
     def has_space(self, name: str) -> bool:
         """Return whether a captured embedding space has ``name``."""
         wanted = _require_text("space", name)
         return any(space.name == wanted for space in self.space_definitions)
 
-    def table(self, name: str) -> TableDef:
-        """Return a captured table by name."""
+    def table(self, name: str, *, kind: str | None = None) -> TableDef:
+        """Return a captured physical table; ambiguous unqualified names refuse."""
         wanted = _require_text("table", name)
-        for table in self.table_definitions:
-            if table.name == wanted:
-                return table
+        if kind is not None and (type(kind) is not str or kind not in {"node", "rel"}):
+            raise GrafxConfigurationError("Table kind must be node or rel.", field="kind")
+        matches = tuple(table for table in self.table_definitions
+                        if table.name == wanted and (kind is None or table.kind == kind))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise GrafxConfigurationError("Qualify an ambiguous physical table name with kind.",
+                                           field="table", value=wanted, reason="ambiguous_table_name")
         raise GrafxConfigurationError(
             f"There is no table named {wanted!r} in this catalog snapshot.",
             field="table",
@@ -881,6 +936,7 @@ class VectorIndexView:
     stale: bool
     stale_reason: str | None
     built_through_lsn: int | None
+    table_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -911,8 +967,11 @@ class VectorEngineView:
         """Return captured vector indexes in stable space-name order."""
         return self.registered_indexes
 
-    def index(self, space_name: str) -> VectorIndexView:
-        """Return the captured vector index of one embedding space."""
+    def index(self, space_name: str, *, table_id: int | None = None) -> VectorIndexView:
+        """Select a captured physical owner; an unqualified shared space refuses."""
+        if table_id is not None and (type(table_id) is not int or table_id < 1):
+            raise GrafxIndexError("Vector table identity must be a positive integer.",
+                                  field="table_id")
         if not issubclass(type(space_name), str):
             observed = _builtin_type_name(space_name)
             raise GrafxIndexError(
@@ -921,9 +980,16 @@ class VectorEngineView:
                 value=observed,
             )
         wanted = _builtin_text(space_name, field="space")
-        for index in self.registered_indexes:
-            if index.space_name == wanted:
-                return index
+        matches = tuple(index for index in self.registered_indexes
+                        if index.space_name == wanted
+                        and (table_id is None or index.table_id == table_id))
+        if len(matches) > 1:
+            raise GrafxIndexError(
+                "The embedding space has multiple physical owners; inspect indexes().",
+                field="space", value=wanted, reason="ambiguous_vector_owner",
+            )
+        if matches:
+            return matches[0]
         raise GrafxIndexError(
             f"Embedding space {wanted!r} has no index in this snapshot.",
             field="space",
@@ -1120,17 +1186,21 @@ def _dictionary_values(value: object, *, field: str) -> tuple[object, ...]:
 def _column_definition(value: Any) -> ColumnDef:
     """Rebuild one column with exact scalar and enum leaves."""
     value = _domain_value(value, ColumnDef, field="catalog.column")
+    declared = _domain_field(value, ColumnDef, "type")
     return ColumnDef(
         name=_builtin_text(
             _domain_field(value, ColumnDef, "name"), field="column.name", empty=False
         ),
         type=_integer_enum(
-            _domain_field(value, ColumnDef, "type"), ValueType, field="column.type"
+            declared, SchemaType if type(declared) is SchemaType else ValueType, field="column.type"
         ),
         nullable=_builtin_bool(_domain_field(value, ColumnDef, "nullable")),
         vector_space=_builtin_optional_text(
             _domain_field(value, ColumnDef, "vector_space"), field="column.vector_space"
         ),
+        decimal_precision=_domain_field(value, ColumnDef, "decimal_precision"),
+        decimal_scale=_domain_field(value, ColumnDef, "decimal_scale"),
+        stored_type=_domain_field(value, ColumnDef, "stored_type"),
     )
 
 
@@ -1161,6 +1231,12 @@ def _table_definition(value: Any) -> TableDef:
             _domain_field(value, TableDef, "to_table"), field="table.to_table"
         ),
         schema_version=_builtin_int(_domain_field(value, TableDef, "schema_version")),
+        flexible_properties=_builtin_bool(_domain_field(value, TableDef, "flexible_properties")),
+        unlabeled=_builtin_bool(_domain_field(value, TableDef, "unlabeled")),
+        vector_identity_names=_builtin_bool(_domain_field(value, TableDef, "vector_identity_names")),
+        extra_node_labels=tuple(_builtin_text(label, field="table.extra_node_labels", empty=False)
+                                for label in _tuple_items(_domain_field(value, TableDef, "extra_node_labels"),
+                                                          field="table.extra_node_labels")),
         schema_layouts=tuple(tuple(_builtin_int(n) for n in _tuple_items(pair, field="table.schema_layout"))
                              for pair in _tuple_items(_domain_field(value, TableDef, "schema_layouts"), field="table.schema_layouts")),
     )
@@ -1970,6 +2046,16 @@ def _query_value_snapshot(
         )
     if issubclass(value_type, (bytes, bytearray, memoryview)):
         return _builtin_bytes(value, field=field)
+    from okto_grafx.domain.model.temporal_values import (
+        DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue,
+    )
+    if value_type in (DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue):
+        from okto_grafx.domain.model.temporal_codec import encode_temporal_value, decode_temporal_value
+        return decode_temporal_value(encode_temporal_value(value))[0]
+    from okto_grafx.domain.model.decimal_values import DecimalValue
+    if value_type is DecimalValue:
+        from okto_grafx.domain.model.decimal_codec import encode_decimal_value, decode_decimal_value
+        return decode_decimal_value(encode_decimal_value(value))[0]
     if issubclass(value_type, Timestamp):
         source = _domain_value(value, Timestamp, field=field)
         micros = _builtin_int(
@@ -2040,6 +2126,7 @@ def _query_entity_snapshot(value: object, *, field: str, depth: int, active: set
     from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue
 
     def identity(source: object) -> EntityIdentity:
+        """Copy and validate detached entity identity metadata at the public result boundary."""
         if type(source) is not EntityIdentity:
             raise GrafxConfigurationError("Entity results require qualified identity metadata.", field=field)
         return EntityIdentity(*(_domain_field(source, EntityIdentity, name) for name in (
@@ -2057,7 +2144,9 @@ def _query_entity_snapshot(value: object, *, field: str, depth: int, active: set
     properties = _query_value_snapshot(_domain_field(value, kind, "properties"), field=field + ".properties",
                                        depth=depth + 1, active=active, max_string_characters=max_string_characters)
     if kind is NodeValue:
-        return NodeValue(entity_id, label, properties, provenance)  # type: ignore[return-value, arg-type]
+        labels = _query_value_snapshot(_domain_field(value, kind, "node_labels"), field=field + ".labels",
+                                      depth=depth + 1, active=active, max_string_characters=max_string_characters)
+        return NodeValue(entity_id, label, properties, provenance, node_labels=labels)  # type: ignore[return-value, arg-type]
     return RelationshipValue(entity_id, label, identity(_domain_field(value, kind, "source")),
                               identity(_domain_field(value, kind, "target")), properties, provenance)  # type: ignore[return-value, arg-type]
 
@@ -2234,10 +2323,12 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
         ArgumentRows,
         ApplyRows,
         SubqueryRows,
+        RestoreImports,
         ProcedureRows,
         CreateIndex,
         CreateNodeTable,
         CreateRelationships,
+        CreateSequence,
         CreateRelTable,
         CreateVectorSpace,
         DeleteEntities,
@@ -2283,6 +2374,10 @@ _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
         MapExpression,
         NullCheck,
         Parameter,
+        PatternPredicate,
+        ExistsSubquery,
+        PatternComprehension,
+        LabelPredicate,
         Property,
         Subscript,
         ListSlice,
@@ -2296,14 +2391,28 @@ _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
 
 _QUERY_PLAN_AUXILIARY_TYPES: frozenset[type[object]] = frozenset(
     {
+        StoredType,
         Aggregation,
+        Query,
+        UnionQuery,
+        MatchClause,
+        WithClause,
+        ReturnClause,
+        UnwindClause,
+        SubqueryClause,
+        ProcedureCall,
         CaseAlternative,
         ColumnDef,
         CreatedNode,
+        CreatedPattern,
         CreatedRelationship,
         MapEntry,
         NamedArgument,
+        PatternPath,
+        NodePattern,
+        RelationshipPattern,
         PropertyAssignment,
+        LabelAssignment,
         ReturnItem,
         SortItem,
         TableDef,
@@ -2679,6 +2788,10 @@ def _query_plan_field_snapshot(
         if value is None and type(None) in arguments:
             return None
         choices = tuple(item for item in arguments if item is not type(None))
+        if choices in ((ValueType, SchemaType), (Property, Variable), (Query, UnionQuery),
+                       (PropertyAssignment, LabelAssignment),
+                       (MatchClause, WithClause, UnwindClause, SubqueryClause, ProcedureCall, UpdatingClause)) and type(value) in choices:
+            choices = (type(value),)
         if len(choices) != 1:
             raise GrafxPlanError(
                 "A query plan field has an unsupported union grammar.",
@@ -3869,6 +3982,17 @@ def _catalog_view(store: Any) -> CatalogStoreView:
 def _catalog_view_from(store: Any, catalog: Any) -> CatalogStoreView:
     """Copy one caller-validated catalog value without retaining it or its store."""
     catalog = _domain_value(catalog, Catalog, field="catalog")
+    groups = []
+    for item in _dictionary_values(_domain_field(catalog, Catalog, "_relationship_types"),
+                                   field="catalog.relationship_types"):
+        group = _domain_value(item, RelationshipTypeDef, field="catalog.relationship_type")
+        members = _domain_field(group, RelationshipTypeDef, "table_ids")
+        if type(members) is not tuple:
+            raise GrafxConfigurationError("Relationship members must be an immutable tuple.", field="relationship_members")
+        groups.append(RelationshipTypeDef(
+            _builtin_text(_domain_field(group, RelationshipTypeDef, "name"), field="relationship_type", empty=False),
+            tuple(_builtin_int(key) for key in members),
+        ))
     tables = tuple(
         sorted(
             (
@@ -3896,7 +4020,7 @@ def _catalog_view_from(store: Any, catalog: Any) -> CatalogStoreView:
     return CatalogStoreView(
         _builtin_text(store.file, field="catalog.file", empty=False),
         _builtin_int(store.chunk_capacity),
-        CatalogView(tables, spaces),
+        CatalogView(tables, spaces, tuple(sorted(groups, key=lambda group: group.name))),
     )
 
 
@@ -4278,6 +4402,7 @@ def _vector_index_view(
         _builtin_bool(index.stale),
         _builtin_optional_text(index.stale_reason, field="vector.index.stale_reason"),
         built_through,
+        _builtin_int(definition.table_id, field="vector.index.table_id"),
     )
 
 

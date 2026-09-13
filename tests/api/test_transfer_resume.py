@@ -1,6 +1,8 @@
 """Resume real process crashes without exposing a partially imported destination."""
 
 import os
+import json
+import hashlib
 import subprocess
 import sys
 
@@ -11,11 +13,43 @@ from okto_grafx.errors import GrafxRecoveryRefused
 from okto_grafx.transfer import TransferLimits, export_graph, import_graph
 
 
-def artifact(tmp_path):
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("mutation", ["unknown_type", "unknown_column_field", "wrong_columns", "invalid_json"])
+def test_malformed_manifest_has_structured_error_before_any_destination_effect(tmp_path, resume, mutation):
+    artifact(tmp_path)
+    manifest_path = tmp_path / "artifact" / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    table = manifest["schema"]["tables"][0]
+    if mutation == "unknown_type":
+        table["columns"][0]["type"] = "FUTURE_UNSUPPORTED_TYPE"
+    elif mutation == "unknown_column_field":
+        table["columns"][0]["future_type_metadata"] = True
+    elif mutation == "wrong_columns":
+        table["columns"] = 7
+    manifest_path.write_text("{" if mutation == "invalid_json" else json.dumps(manifest), encoding="utf-8")
+
+    def snapshot():
+        return {p.relative_to(tmp_path).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
+                for p in tmp_path.rglob("*")}
+
+    before = snapshot()
+    kwargs = {"resume_directory": tmp_path / "workspace"} if resume else {}
+    with pytest.raises(GrafxRecoveryRefused) as error:
+        import_graph(tmp_path / "artifact", tmp_path / "target", **kwargs)
+    assert error.value.details["operation"] == "logical_transfer"
+    assert error.value.details["reason"] == "artifact_invalid"
+    assert isinstance(error.value.__cause__, (KeyError, TypeError, ValueError))
+    assert snapshot() == before
+
+
+def artifact(tmp_path, *, flexible=False):
     with connect(tmp_path / "source") as db:
+        if flexible:
+            db.maintenance.ensure_identity_indexes()
         with db.begin() as tx:
             tx.execute("CREATE NODE TABLE P(id INT64, body STRING, PRIMARY KEY(id))")
-            tx.execute("CREATE REL TABLE Link(FROM P TO P)")
+            if not flexible:
+                tx.execute("CREATE REL TABLE Link(FROM P TO P)")
             for i in range(6):
                 tx.execute(
                     "CREATE (:P {id:$id, body:$body})",
@@ -36,8 +70,9 @@ def artifact(tmp_path):
         "after_promotion",
     ],
 )
-def test_process_crash_resume_and_lost_ack(tmp_path, cut):
-    artifact(tmp_path)
+@pytest.mark.parametrize("flexible", [False, True])
+def test_process_crash_resume_and_lost_ack(tmp_path, cut, flexible):
+    artifact(tmp_path, flexible=flexible)
     code = """
 import os, sys
 from pathlib import Path

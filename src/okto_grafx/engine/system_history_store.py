@@ -22,8 +22,12 @@ from okto_grafx.domain.errors import (
     GrafxConfigurationError, GrafxCorruptionDetected, GrafxError, GrafxQueryBudgetExceeded,
 )
 from okto_grafx.domain.ids import NO_PAGE
-from okto_grafx.domain.model.catalog import _decode_table, _encode_table
-from okto_grafx.domain.model.schema import TableDef, decode_tuple, encode_tuple
+from okto_grafx.domain.model.catalog import Catalog, _decode_table, _encode_table
+from okto_grafx.domain.model.schema import TableDef, decode_tuple, encode_tuple, is_identifier
+from okto_grafx.domain.model.relationship_type import RelationshipTypeDef
+from okto_grafx.domain.model.node_labels import (
+    NODE_LABELS_CAPABILITY, decode_node_labels, encode_node_labels, validate_node_labels,
+)
 from okto_grafx.domain.page import Page, PageType
 from okto_grafx.domain.page.layout import validate_page_size
 from okto_grafx.domain.txn.commit_identity import CommitId
@@ -50,9 +54,45 @@ def _corrupt(field: str) -> GrafxCorruptionDetected:
     return GrafxCorruptionDetected("Invalid internal history image.", field=field, component="system_history")
 
 
-def _schema_bytes(table: TableDef) -> bytes:
-    return (_encode_table(table) + struct.pack("<H", len(table.schema_layouts))
-            + b"".join(struct.pack("<HH", *pair) for pair in table.schema_layouts))
+def _schema_bytes(table: TableDef, logical_type: str | None = None, *, explicit_labels: bool = False) -> bytes:
+    raw = (_encode_table(table) + struct.pack("<H", len(table.schema_layouts))
+           + b"".join(struct.pack("<HH", *pair) for pair in table.schema_layouts))
+    flags = int(table.flexible_properties) | (int(table.unlabeled) << 1) | (int(table.vector_identity_names) << 2)
+    if table.extra_node_labels or explicit_labels:
+        name = b"" if logical_type is None else logical_type.encode("ascii")
+        raw += b"GXHM03" + struct.pack("<BH", flags | (int(explicit_labels) << 3), len(name)) + name
+        raw += encode_node_labels(table.extra_node_labels)
+    elif flags or logical_type is not None:
+        name = b"" if logical_type is None else logical_type.encode("ascii")
+        marker = b"GXHM02" if table.vector_identity_names else b"GXHM01"
+        raw += marker + struct.pack("<BH", flags, len(name)) + name
+    return raw
+
+
+def historical_relationship_types(names: dict[int, str | None]) -> tuple[RelationshipTypeDef, ...]:
+    """Describe only the selected historical members, never current catalog membership."""
+    grouped = {}
+    for key, name in names.items():
+        if name is not None:
+            grouped.setdefault(name, []).append(key)
+    return tuple(RelationshipTypeDef(name, tuple(sorted(keys))) for name, keys in sorted(grouped.items()))
+
+
+def validate_history_model(change: HistoryChange, catalog: Catalog) -> None:
+    """Prove immutable model metadata against catalog authority; never fill lost metadata."""
+    current = catalog.table_by_id(change.table.table_id)
+    name = catalog.relationship_type_name(current.table_id) if current.kind == "rel" else current.name
+    logical = None if name == current.name else name
+    if (change.table.flexible_properties != current.flexible_properties
+            or change.table.vector_identity_names != current.vector_identity_names
+            or change.table.unlabeled != current.unlabeled or change.logical_type != logical):
+        raise _corrupt("historical_model_authority")
+    if change.table.extra_node_labels or change.node_labels is not None or change.redacted_node_labels:
+        if (NODE_LABELS_CAPABILITY not in catalog.required_capabilities()
+                or change.table.kind != "node"
+                or not current.admits_node_labels(change.table.extra_node_labels)
+                or change.node_labels is not None and not change.table.admits_node_labels(change.node_labels)):
+            raise _corrupt("historical_label_authority")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +110,9 @@ class HistoryChange:
     operation: int
     values: tuple[object, ...]
     redacted_bytes: int = 0
+    logical_type: str | None = None
+    node_labels: tuple[str, ...] | None = None
+    redacted_node_labels: bool = False
 
     def encode(self) -> bytes:
         """Detach a full historical schema plus native values, with explicit bounds."""
@@ -78,9 +121,23 @@ class HistoryChange:
                 or self.operation not in (1, 2, 3, 4, 5, 6) or type(self.values) is not tuple
                 or (self.record_id == 0) != (self.operation == 4)
                 or type(self.redacted_bytes) is not int or not 0 <= self.redacted_bytes <= _MAX_ROW
+                or type(self.redacted_node_labels) is not bool
+                or self.redacted_node_labels and (self.operation not in (5, 6)
+                    or self.table.kind != "node" or self.node_labels is not None)
                 or self.operation not in (5, 6) and self.redacted_bytes != 0):
             raise _invalid("change")
-        schema = _schema_bytes(self.table)
+        if self.logical_type is not None and (
+            type(self.logical_type) is not str or not is_identifier(self.logical_type)
+            or self.table.kind != "rel" or self.logical_type == self.table.name
+        ):
+            raise _invalid("logical_type")
+        if self.node_labels is not None:
+            validate_node_labels(self.node_labels)
+            if (self.operation not in (1, 2) or self.table.kind != "node"
+                    or not self.table.admits_node_labels(self.node_labels)):
+                raise _invalid("node_labels")
+        schema = _schema_bytes(self.table, self.logical_type,
+                               explicit_labels=self.node_labels is not None or self.redacted_node_labels)
         if len(schema) > _MAX_SCHEMA:
             raise _invalid("schema_bytes")
         if self.operation in (3, 4, 5, 6):
@@ -89,6 +146,8 @@ class HistoryChange:
             payload = bytes(self.redacted_bytes)
         else:
             payload = encode_tuple(self.table, self.values)
+            if self.node_labels is not None:
+                payload = encode_node_labels(self.node_labels) + payload
         if len(payload) > _MAX_ROW:
             raise _invalid("row_bytes")
         return _ROW.pack(self.operation, self.record_id, len(schema), len(payload)) + schema + payload
@@ -104,18 +163,45 @@ def _decode_change(raw: bytes) -> HistoryChange:
         table, offset = _decode_table(encoded_schema, 0)
         count = struct.unpack_from("<H", encoded_schema, offset)[0]
         offset += 2
-        if count > 64 or offset + count * 4 != len(encoded_schema):
+        if count > 64 or offset + count * 4 > len(encoded_schema):
             raise _corrupt("schema_layouts")
         table = replace(table, schema_layouts=tuple(
             struct.unpack_from("<HH", encoded_schema, offset + position * 4)
             for position in range(count)))
+        offset += count * 4
+        logical_type = None
+        explicit_labels = False
+        if offset < len(encoded_schema):
+            marker = encoded_schema[offset:offset+6]
+            if marker not in (b"GXHM01", b"GXHM02", b"GXHM03"):
+                raise _corrupt("schema_model")
+            flags, size = struct.unpack_from("<BH", encoded_schema, offset+6)
+            allowed_flags = 15 if marker == b"GXHM03" else 7 if marker == b"GXHM02" else 3
+            end = offset+9+size
+            if flags & ~allowed_flags or size > 128 or end > len(encoded_schema):
+                raise _corrupt("schema_model")
+            logical_type = encoded_schema[offset+9:end].decode("ascii") if size else None
+            candidates = ()
+            if marker == b"GXHM03":
+                candidates, end = decode_node_labels(encoded_schema, end)
+                explicit_labels = bool(flags & 8)
+            if end != len(encoded_schema):
+                raise _corrupt("schema_model")
+            table = replace(table, flexible_properties=bool(flags & 1), unlabeled=bool(flags & 2),
+                            vector_identity_names=bool(flags & 4), extra_node_labels=candidates)
         # Reuse the native binary schema grammar; reject normalization or trailing bytes.
-        if _schema_bytes(table) != encoded_schema:
+        if _schema_bytes(table, logical_type, explicit_labels=explicit_labels) != encoded_schema:
             raise _corrupt("schema_framing")
         payload = raw[_ROW.size + schema_size:]
+        node_labels = None
+        redacted_node_labels = explicit_labels and operation in (5, 6)
+        if explicit_labels and not redacted_node_labels:
+            node_labels, position = decode_node_labels(payload)
+            payload = payload[position:]
         change = HistoryChange(table, record_id, operation,
                                () if operation in (3, 4, 5, 6) else decode_tuple(table, payload),
-                               len(payload) if operation in (5, 6) else 0)
+                               len(payload) if operation in (5, 6) else 0, logical_type, node_labels,
+                               redacted_node_labels)
         if change.encode() != raw:
             raise _corrupt("change_framing")
         return change
