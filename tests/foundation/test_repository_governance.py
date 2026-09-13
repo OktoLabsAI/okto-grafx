@@ -39,4 +39,7 @@ def test_custom_license_and_addendum_remain_explicit():
 
 def test_local_browser_and_secret_artifacts_are_ignored():
     ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
-    assert {".playwright-mcp/", ".claude/", ".env", ".env.*"} <= set(ignored)
+    assert {
+        ".playwright-mcp/", ".claude/", ".env", ".env.*",
+        "grafx-v004-runtime-1000-nodes.png",
+    } <= set(ignored)

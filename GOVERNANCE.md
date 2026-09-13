@@ -63,6 +63,12 @@ enforcement**. GitHub enforces the review rules only after protection is applied
 
 ## Activation status and publication prerequisites
 
+The owner authorized eventual public visibility and **preparation** of history
+sanitization on 2026-09-13. The [0.0.6 sanitation rehearsal](docs/reports/V006_PUBLICATION_PREPARATION.md)
+records the isolated candidate, limited rewrite impact and remaining execution
+requirements. This authorization has not been treated as permission to bypass
+administrator review or force-rewrite the original remote branch.
+
 **The repository remains private during this preparation.** On 2026-09-13 GitHub
 returned HTTP 403 for Grafx branch protection/rulesets, requiring an eligible paid
 plan or public visibility. Fork-contributor workflow approval similarly returned

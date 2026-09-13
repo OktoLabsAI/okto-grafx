@@ -1,5 +1,7 @@
 # Evidence and report index
 
+- [0.0.6 publication preparation: isolated sanitation rehearsal and remaining approvals](V006_PUBLICATION_PREPARATION.md)
+
 - [Functional parity: final native regression, 22-contract reconciliation and explicit Neo4j deferral](FP_FINAL_NATIVE_QUALIFICATION.md)
 - [Final installed Pulse candidate: package, API, browser and MCP qualification](FP_FINAL_PULSE_QUALIFICATION.md)
 - [Final 0.0.6 native cost observations: exact fixtures, read/write boundaries and limitations](FP_NATIVE_COST_OBSERVATIONS.md)

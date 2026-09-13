@@ -17,6 +17,7 @@ bench/results/
 # Local agent/browser evidence and credentials must not enter public history.
 .claude/
 .playwright-mcp/
+grafx-v004-runtime-1000-nodes.png
 .env
 .env.*
 !.env.example
