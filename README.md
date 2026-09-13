@@ -116,6 +116,7 @@ historical evidence; integrating the library does not require reading the latter
 - [Performance and measurement boundaries](docs/PERFORMANCE.md)
 - **[Roadmap: evolution, known limitations and corrective work](ROADMAP.md)** — the sole active backlog
 - [Changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md), [security](SECURITY.md)
+- [Repository governance and public-release checklist](GOVERNANCE.md)
 
 ## Deployment and license
 
@@ -125,4 +126,7 @@ while participants are using them. OpenMetrics has no authentication/TLS; remote
 binding requires explicit consent. See [operational safety](docs/OPERATIONS.md).
 
 Licensed under [Elastic License 2.0 with the SaaS/Branding Addendum](LICENSE).
-Check those terms before offering a hosted service.
+This is a custom, source-available license, not unmodified ELv2 and not an
+OSI-approved open-source license. The addendum remains part of the terms;
+making the repository public does not remove it. Check the complete license
+before embedding, redistributing or offering a hosted service.

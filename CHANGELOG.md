@@ -9,6 +9,11 @@ including the on-disk format.
 
 ### Changed
 
+- Prepared public-repository governance: administrator-owned pull requests, a main-branch
+  protection payload that also enforces administrators, and a privacy/history publication
+  checklist. Retained the existing Elastic License 2.0 + SaaS/Branding Addendum unchanged.
+  Preparation does not change GitHub visibility or activate a protection unavailable on the plan.
+
 - Continuation after `a4dd85a`: opt-in immutable PageRank transition preparation and
   simple topology reuse; bounded deterministic read-only label propagation.
 - Optional NetworkX multigraph export/conformance and bounded Arrow projection/result

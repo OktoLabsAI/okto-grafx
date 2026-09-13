@@ -1,2 +1,4 @@
-# Pull request approvals are restricted to the designated OktoLabs maintainers.
+# Every path requires an approval from one of these designated administrators
+# WHEN the branch protection in main-protection.json is active. This file alone
+# does not protect main. Keep the roster aligned with GitHub administrator roles.
 * @jpbraga @Maheidem @oktolabsai-developer
