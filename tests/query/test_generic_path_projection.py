@@ -32,14 +32,15 @@ def test_identifiers_are_caller_defined_and_endpoints_remain_correlated(
         assert result.columns == (path,)
         assert len(result.rows) == 1
         value = result.rows[0][0]
-        assert [(node["_LABEL"], node["id"]) for node in value["_NODES"]] == [
+        assert type(value) is okto_grafx.PathValue
+        assert [(node.label, node.properties["id"]) for node in value.nodes] == [
             (source, "source"), (target, "target"),
         ]
-        relationship = value["_RELS"][0]
-        assert relationship["_LABEL"] == relation
-        assert relationship["reason"] == "evidence"
-        assert relationship["_SRC"] == value["_NODES"][0]["_ID"]
-        assert relationship["_DST"] == value["_NODES"][1]["_ID"]
+        relationship = value.relationships[0]
+        assert relationship.label == relation
+        assert relationship.properties["reason"] == "evidence"
+        assert relationship.source == value.nodes[0].identity
+        assert relationship.target == value.nodes[1].identity
 
 
 def test_wrong_declared_target_is_refused_even_with_arbitrary_identifiers(tmp_path):
@@ -52,24 +53,32 @@ def test_wrong_declared_target_is_refused_even_with_arbitrary_identifiers(tmp_pa
             db.execute("MATCH journey = (x:Person)-[edge:Links]->(y:Person) RETURN journey")
 
 
-def test_target_properties_cannot_shadow_path_metadata(tmp_path):
+def test_target_properties_no_longer_share_namespace_with_path_metadata(tmp_path):
     with okto_grafx.connect(tmp_path / "reserved-target") as db:
         with db.begin("write") as tx:
             tx.execute("CREATE NODE TABLE Person(id STRING, PRIMARY KEY(id))")
             tx.execute("CREATE NODE TABLE Topic(id STRING, _ID STRING, PRIMARY KEY(id))")
             tx.execute("CREATE REL TABLE Links(FROM Person TO Topic)")
-        with pytest.raises(GrafxPlanError, match="path-reserved"):
-            db.execute("MATCH journey = (x:Person)-[edge:Links]->(y:Topic) RETURN journey")
+        assert db.execute("MATCH journey = (x:Person)-[edge:Links]->(y:Topic) RETURN journey").rows == ()
+
+
+@pytest.mark.parametrize("query", [
+    "MATCH journey = (journey:Person)-[edge:Knows]->(y:Person) RETURN journey",
+])
+def test_generic_names_do_not_hide_unimplemented_range_or_name_collisions(query):
+    with pytest.raises(GrafxPlanError):
+        analyze(parse(query))
 
 
 @pytest.mark.parametrize("query", [
     "MATCH journey = (x:Person)<-[edge:Knows]-(y:Person) RETURN journey",
     "MATCH journey = (x:Person)-[edge:Knows]-(y:Person) RETURN journey",
-    "MATCH journey = (x:Person)-[edge:Knows*1..2]->(y:Person) RETURN journey",
-    "MATCH journey = (x:Person)-[edge:Knows]->(y:Person) RETURN journey AS renamed",
     "MATCH journey = (x:Person)-[edge:Knows]->(y:Person) WHERE x.id='x' RETURN journey",
-    "MATCH journey = (journey:Person)-[edge:Knows]->(y:Person) RETURN journey",
 ])
-def test_generic_names_do_not_widen_direction_range_or_projection(query):
-    with pytest.raises(GrafxPlanError):
-        analyze(parse(query))
+def test_generic_names_support_direction_and_predicates(query):
+    assert analyze(parse(query)).binding("journey").entity == "path"
+
+
+def test_generic_names_support_native_bounded_variable_capture():
+    query = "MATCH journey=(x:Person)-[edge:Knows*0..2]->(y:Person) RETURN journey"
+    assert analyze(parse(query)).binding("journey").entity == "path"

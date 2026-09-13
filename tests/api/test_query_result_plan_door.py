@@ -34,6 +34,20 @@ from okto_grafx.engine.query_engine import (
 STATEMENT = "RETURN 1 AS value"
 
 
+def test_map_assignment_plan_clones_closed_target_union_and_merge_flag():
+    from okto_grafx.domain.query.ast import Literal, Variable
+    from okto_grafx.domain.query.plan import PropertyAssignment, SetProperties
+    node = SetProperties(SingleRow(), (PropertyAssignment(Variable("n"), Literal({"v":1}), merge=True),))
+    cloned = public_views._query_plan_rebuild(node)
+    assert cloned is not node and cloned.assignments[0].target is not node.assignments[0].target
+    assert cloned.assignments[0].merge is True
+    assert cloned.assignments[0].target == Variable("n")
+    for invalid in (Literal(1), object()):
+        malformed = dataclasses.replace(node, assignments=(dataclasses.replace(node.assignments[0], target=invalid),))
+        with pytest.raises(GrafxPlanError):
+            public_views._query_plan_rebuild(malformed)
+
+
 class _RecipeSpy:
     """Count compilations of the owned clone recipe and every run of the recipes it produced."""
 

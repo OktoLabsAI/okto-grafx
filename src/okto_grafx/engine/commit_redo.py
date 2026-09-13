@@ -17,8 +17,10 @@ from okto_grafx.domain.errors import (
     GrafxIndexError,
     GrafxRecoveryRefused,
 )
-from okto_grafx.domain.ids import Lsn, NO_LSN, PROVISIONAL_CSN
+from okto_grafx.domain.ids import Lsn, NO_LSN, NO_PAGE, PROVISIONAL_CSN
+from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.records import IndexOperation, change_of
+from okto_grafx.domain.model.node_labels import NODE_LABELS_CAPABILITY
 from okto_grafx.domain.page.layout import PageType
 from okto_grafx.domain.page.slotted import Page
 from okto_grafx.domain.recovery.decision import (
@@ -37,6 +39,8 @@ from okto_grafx.engine.buffer_pool import (
 from okto_grafx.engine.catalog_store import CATALOG_FILE, CatalogStore, read_catalog_page_images
 from okto_grafx.engine.commit_catalog_store import CommitCatalogPageImage, CommitCatalogStore
 from okto_grafx.engine.fulltext_durable import replay_statistics
+from okto_grafx.engine.system_history_recovery import validate_system_history
+from okto_grafx.domain.txn.records import SYSTEM_HISTORY_FILE
 
 if TYPE_CHECKING:
     from okto_grafx.engine.index_manager import IndexManager
@@ -369,7 +373,11 @@ class CommitRedo:
         prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
         *, checkpoint_lsn: Lsn | None,
     ) -> None:
-        horizon = self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=checkpoint_lsn)
+        catalogs = []
+        horizon = self._validate_catalog_transitions(replay, prepared_pages, checkpoint_lsn=checkpoint_lsn,
+                                                       _catalogs=catalogs)
+        validate_system_history(self._pool, replay, prepared_pages, checkpoint_lsn=checkpoint_lsn,
+                                database_uuid=self._database_uuid, native_catalogs=catalogs)
         images = tuple(CommitCatalogPageImage(page.file, page.page_index, page.image)
                        for _position, page in prepared_pages if page.file in COMMIT_CATALOG_PAGE_FILES)
         if horizon is None:
@@ -403,7 +411,7 @@ class CommitRedo:
     def _validate_catalog_transitions(
         self, replay: CommittedReplay,
         prepared_pages: tuple[tuple[int, _PreparedPageEffect], ...],
-        *, checkpoint_lsn: Lsn | None = None,
+        *, checkpoint_lsn: Lsn | None = None, _catalogs: list | None = None,
     ) -> int | None:
         """Prove complete schema-catalog snapshots before native replay can mutate.
 
@@ -413,21 +421,62 @@ class CommitRedo:
         must be introduced by its own complete schema snapshot in this range.
         """
         if not replay.commit_records:
-            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn, _catalogs=_catalogs)
         grouped: dict[tuple[int, int], list[tuple[int, bytes]]] = {}
         for _position, prepared in prepared_pages:
             if prepared.file == CATALOG_FILE:
                 record = prepared.record
                 grouped.setdefault((record.epoch, record.txn_id), []).append((prepared.page_index, prepared.image))
         if not grouped:
-            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn)
+            return self._validate_catalog_without_schema_effects(replay, checkpoint_lsn, _catalogs=_catalogs)
         seen = False
         previous_horizon: int | None = None
+        previous_relationship_types: dict[str, tuple[tuple[object, ...], ...]] = {}
+        previous_property_models: dict[int, tuple[bool, bool, bool]] = {}
+        previous_node_labels: dict[int, frozenset[str]] = {}
+        previous_node_label_capability = False
         for terminal in replay.commit_records:
             images = grouped.get((terminal.epoch, terminal.txn_id))
             if images is None:
                 continue
             catalog = read_catalog_page_images(tuple(images), page_size=self._pool.page_size, sequence=terminal.lsn)
+            label_capability = catalog.requires_capability(NODE_LABELS_CAPABILITY)
+            if previous_node_label_capability and not label_capability:
+                raise GrafxRecoveryRefused("Catalog replay removes the native node-label capability.",
+                                          field="node_labels", lsn=terminal.lsn)
+            previous_node_label_capability = label_capability
+            models = {t.table_id: (t.flexible_properties, t.unlabeled, t.vector_identity_names) for t in catalog.tables()}
+            if any(key in previous_property_models and previous_property_models[key] != value
+                   for key, value in models.items()):
+                raise GrafxRecoveryRefused("Catalog replay redefines an established entity property/label model.",
+                                            field="flexible_properties", lsn=terminal.lsn)
+            previous_property_models.update(models)
+            node_labels = {t.table_id: frozenset(t.node_label_candidates) for t in catalog.tables() if t.kind == "node"}
+            if any(not labels <= node_labels.get(key, frozenset()) for key, labels in previous_node_labels.items()):
+                raise GrafxRecoveryRefused("Catalog replay removes established node-label candidates.",
+                                          field="node_labels", lsn=terminal.lsn)
+            previous_node_labels.update(node_labels)
+            relationship_types = {
+                group.name: tuple(
+                    (member.table_id, member.name, member.from_table, member.to_table)
+                    for key in group.table_ids for member in (catalog.table_by_id(key),)
+                )
+                for group in catalog.relationship_types()
+            }
+            flexible_names = {
+                group.name for group in catalog.relationship_types()
+                if all(catalog.table_by_id(key).flexible_properties for key in group.table_ids)
+            }
+            if any(relationship_types.get(name) != members and not (
+                name in flexible_names and relationship_types.get(name, ())[:len(members)] == members
+            ) for name, members in previous_relationship_types.items()):
+                raise GrafxRecoveryRefused(
+                    "Catalog replay removes or redefines established relationship type identity.",
+                    field="relationship_types", lsn=terminal.lsn,
+                )
+            previous_relationship_types = relationship_types
+            if _catalogs is not None:
+                _catalogs.append((terminal.lsn, catalog))
             horizon = catalog.commit_catalog_activation
             if (
                 horizon is not None and horizon > terminal.lsn
@@ -445,7 +494,7 @@ class CommitRedo:
         return previous_horizon
 
     def _validate_catalog_without_schema_effects(
-        self, replay: CommittedReplay, checkpoint_lsn: Lsn | None,
+        self, replay: CommittedReplay, checkpoint_lsn: Lsn | None, *, _catalogs: list | None = None,
     ) -> int | None:
         """Use current pages, never a mutable/stale adopted catalog, for native gaps.
 
@@ -469,7 +518,10 @@ class CommitRedo:
             return None  # Uninitialized/legacy stack; no history may be inferred.
         if empty and checkpoint_lsn == 0 and not replay.commit_records:
             return None  # Fresh empty file, before bootstrap; no COMMIT is being certified.
-        horizon = CatalogStore(self._pool).read_from_pages().commit_catalog_activation
+        catalog = CatalogStore(self._pool).read_from_pages()
+        if _catalogs is not None:
+            _catalogs.append((None, catalog))
+        horizon = catalog.commit_catalog_activation
         if horizon is None:
             if any(storage.exists(file) for file in COMMIT_CATALOG_PAGE_FILES):
                 raise GrafxRecoveryRefused(
@@ -555,7 +607,7 @@ class CommitRedo:
         meta_baselines: dict[tuple[str, int], Page | None] | None = None,
     ) -> tuple[bool, frozenset[int]]:
         """Classify one decoded page without granting authority to manager lookalikes."""
-        if file in COMMIT_CATALOG_PAGE_FILES:
+        if file in COMMIT_CATALOG_PAGE_FILES or file == SYSTEM_HISTORY_FILE:
             # Full journal validation is mandatory before this fact is consumed.
             # Audit history changes no heap/MVCC table watermark; treating it as
             # unknown would make every journal append scan all indexed tables.
@@ -897,7 +949,7 @@ class CommitRedo:
                     format_version=record.format_version,
                     flags=record.flags,
                 )
-                journal = write.file in COMMIT_CATALOG_PAGE_FILES
+                journal = write.file in COMMIT_CATALOG_PAGE_FILES or write.file == SYSTEM_HISTORY_FILE
                 if journal and not allow_commit_catalog:
                     raise GrafxRecoveryRefused(
                         "Commit catalog replay is not enabled by this build; no effect was applied.",
@@ -997,6 +1049,13 @@ class CommitRedo:
                         lsn=record.lsn,
                     )
                 max_key_bytes = getattr(index, "max_key_bytes", None)
+                if (getattr(index.definition, "layout", None) is IndexLayout.POSTING_HASH
+                        and change.operation is not IndexOperation.RESET
+                        and change.ref.page in (0, NO_PAGE)):
+                    raise GrafxCorruptionDetected(
+                        "Posting WAL references no heap data page; no effect was applied.",
+                        field="ref", index=change.index, lsn=record.lsn,
+                    )
                 if isinstance(max_key_bytes, int) and len(change.key) > max_key_bytes:
                     raise GrafxCorruptionDetected(
                         f"A record for index {change.index!r} carries a key of "

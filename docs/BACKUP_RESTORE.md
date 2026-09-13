@@ -1,5 +1,15 @@
 # Physical backup and offline replacement restore
 
+0.0.6 native system-time history is included as `system-history.dat` together with
+catalog activation, horizons and durable pins. Restore verifies temporal lineage
+and current-row agreement; it does not strip history or silently change UUIDs.
+See [history operations and retention](SYSTEM_TIME_HISTORY.md).
+The same file carries optional authenticated temporal access pages and compacted
+logical extents (required bits 17/18). Backup/restore retains these capabilities;
+an unused physical tail after interrupted compaction is not live history. Full
+history/index verification remains mandatory; restore does not reconstruct
+missing authoritative pages from an unqualified cache.
+
 Available in the **0.0.5 development line**, through `okto_grafx.backup`.
 This is a bounded local physical backup, not logical export or an independently
 writable fork. No application service, Pulse adapter, or agent is required.

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "profile": "grafx-local-first-fp-v1",
+  "status": "frozen_requirements_not_execution_evidence",
+  "policy": "Supplemental contracts are mandatory even if upstream scenarios using incompatible graph models are excluded. Each scenario requires executable evidence before FP-8 closes.",
+  "scenarios": [
+    {"id":"FP3-ENTITY-IDENTITY","owner":"FP-3","contract":"Nodes/edges/paths retain database, table, kind and incarnation identity across UNION, DISTINCT, grouping, nested values and snapshots; equal property values do not merge distinct entities."},
+    {"id":"FP3-ENTITY-DETACH","owner":"FP-3","contract":"Returned graph values do not retain transactions, cannot write through stale or foreign references, and serialize to detached tagged JSON."},
+    {"id":"FP3-GRAPH-SCALARS","owner":"FP-3","contract":"On explicit typed fixtures, labels/properties/type/nodes/relationships/length return exact values; absent nullable properties are not fabricated graph properties."},
+    {"id":"FP3-POLYMORPHIC","owner":"FP-3","contract":"Composed MATCH/OPTIONAL MATCH/subqueries enumerate compatible tables/type alternatives with exact multiplicity, absent-property NULL and stable identity."},
+    {"id":"FP3-PATH-TRAIL","owner":"FP-3","contract":"Named variable paths support both directions, undirected, zero length, cycles and explicit bounds; preserve relationship uniqueness per clause and repeated nodes where permitted; budget exhaustion is explicit, never truncation."},
+    {"id":"FP4-UNIT-CARDINALITY","owner":"FP-4","query":"UNWIND [1,2] AS n CALL (n) { CREATE (:T {id:n}) } RETURN n","setup":["CREATE NODE TABLE T(id INT64, PRIMARY KEY(id))"],"columns":["n"],"rows":[[1],[2]],"effects":{"nodes_added":2}},
+    {"id":"FP4-RETURNING-ZERO","owner":"FP-4","query":"UNWIND [1,2] AS n CALL (n) { WITH n WHERE n = 2 RETURN n AS selected } RETURN selected","columns":["selected"],"rows":[[2]]},
+    {"id":"FP4-LEADING-WITH-IMPORT","owner":"FP-4","query":"WITH 7 AS n CALL { WITH n RETURN n + 1 AS answer } RETURN answer","columns":["answer"],"rows":[[8]]},
+    {"id":"FP4-SCOPES","owner":"FP-4","contract":"Explicit imports, missing imports, imported-name shadowing/collisions, nested invocations and zero-row aggregation have validated compile/runtime cardinality contracts."},
+    {"id":"FP4-ATOMIC-WRITES","owner":"FP-4","contract":"Late inner write, iterator, final-result or cancellation failure rolls back every invocation of the statement; earlier successfully staged statements survive only after proven rollback; no inner commits."},
+    {"id":"FP4-READONLY-CONCURRENCY","owner":"FP-4","contract":"Read-only calls reject nested writes before effects; independent readers observe only committed changes; competing writes retain OCC conflicts and durability."},
+    {"id":"FP5-TEMPORAL-EXACT","owner":"FP-5","contract":"date/time/localtime/datetime/localdatetime/duration constructors, fields, conversions, comparisons and arithmetic cover exact pinned cases and independent month-end/leap/DST/negative-duration tests; no silent nanosecond loss."},
+    {"id":"FP5-TEMPORAL-PERSISTENCE","owner":"FP-5","contract":"Every declared temporal column survives rollback/commit/reopen, WAL recovery/verification, supported indexes, history, backup and typed logical transfer; old binaries safely refuse new layouts."},
+    {"id":"FP6-DECIMAL","owner":"FP-6","contract":"DECIMAL(p,s), 1<=p<=38 and 0<=s<=p: exact precision/scale, explicit rounding/overflow, arithmetic/aggregates/order/hash/casts independent of host decimal context and without DOUBLE conversion."},
+    {"id":"FP6-NESTED-STORAGE","owner":"FP-6","contract":"Typed LIST<T>, string-keyed MAP<T>, ARRAY<T,n> and STRUCT fields cover nullability/nesting/ownership/DDL/update/equality/serialization, depth and size bounds and mutation-proof snapshots."},
+    {"id":"FP6-TYPE-TRANSFER","owner":"FP-6","contract":"Support matrix and executable positive/negative transfer tests cover keys/indexes/parameters/results/Arrow/Pandas/Polars/Parquet/CSV/JSONL/SQLite/CLI/history/copy; unsupported combinations refuse before partial effects."},
+    {"id":"FP6-FORMAT-ADMISSION","owner":"FP-6","contract":"Pure/NumPy codec parity, malformed/truncated payloads, exact tagged JSON, concurrent reader/writer admission and installed old/new-reader upgrade tests preserve WAL/OCC and data."},
+    {"id":"FP7-WRITE-CAPABILITY","owner":"FP-7","contract":"Explicit read/write modes, permissions, types, determinism/effects and quotas; writing callbacks receive an expiring transaction-only capability, without commit/store-switch/nested-writer authority."},
+    {"id":"FP7-CALL-SHAPES","owner":"FP-7","contract":"Unit procedures, named YIELD/YIELD *, nesting and entity/new-value signatures execute; every yielded column is validated even when not selected."},
+    {"id":"FP7-FAILURE-ISOLATION","owner":"FP-7","contract":"Callback/iteration/close/output failures retain primary errors and roll back all graph effects; denied read-only/permission calls never invoke writes; callbacks are not implicitly retried or sandboxed."},
+    {"id":"FP8-PULSE","owner":"FP-8","contract":"Paired installed-wheel regression plus isolated Pulse API and real browser exercise source lifecycle, search/key decisions, KG paging/edges/counts, serialization, settings/schema/recovery; Core remains provider-agnostic."},
+    {"id":"FP8-COMPETITORS","owner":"FP-8","contract":"Execute equivalent bounded scenarios against immutable reference versions, report type/identity/multiplicity/error/effect differences and dialect adaptations, and withhold unverified comparative claims."}
+  ]
+}

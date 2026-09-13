@@ -34,7 +34,7 @@ def test_multiple_spaces_and_retired_held_picture_share_limit(tmp_path):
         with pytest.raises(GrafxQueryBudgetExceeded) as refused:
             search(db, "b")
         assert refused.value.details["resource"] == "vector_hnsw_total_memory"
-        index = db._vectors._by_space["a"]
+        index = db._vectors.index("a")
         held = index._snapshot
         index._retire(held)
         assert db.vector_total_memory_usage().reserved_bytes == resident

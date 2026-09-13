@@ -24,11 +24,20 @@ that owns it (A24), and this module only makes it reachable by its supported pat
 from __future__ import annotations
 
 from okto_grafx.api import ConnectOptions, connect
-from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult
+from okto_grafx.catalogs import CatalogInfo, CatalogPathPolicy, CatalogSession
+from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextHit, TextSearchResult, TextMatchPositions
 from okto_grafx.domain.query.hybrid import HybridHit, HybridSearchOptions, HybridSearchResult
+from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
+from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, PathValue, QueryValue
 from okto_grafx.domain.model import Timestamp, VectorValue
+from okto_grafx.domain.model.decimal_values import DecimalValue
+from okto_grafx.domain.model.stored_types import StoredType
+from okto_grafx.domain.model.temporal_values import (
+    DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue,
+)
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.txn.commit_identity import CommitId
+from okto_grafx.domain.temporal import TemporalCompactionReport, TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersion, TemporalVersions
 from okto_grafx.domain.txn.commit_metadata import CommitMetadata, MetadataLimits
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry, CommitKind
 from okto_grafx.domain.txn.commit_history import CommitHistoryPage
@@ -50,6 +59,9 @@ from okto_grafx.runtime.registry import PortRegistry
 
 __all__ = [
     "CancellationToken",
+    "CatalogInfo",
+    "CatalogPathPolicy",
+    "CatalogSession",
     "CommitCatalogEntry",
     "CommitHistoryPage",
     "CommitId",
@@ -61,22 +73,44 @@ __all__ = [
     "Database",
     "DatabaseConfig",
     "DatabaseIdentity",
+    "DateTimeValue",
+    "DateValue",
+    "DecimalValue",
+    "DurationValue",
+    "EntityIdentity",
+    "EntityProvenance",
     "ExecuteManyReport",
     "HybridHit",
     "HybridSearchOptions",
     "HybridSearchResult",
+    "LocalDateTimeValue",
+    "LocalTimeValue",
     "MetadataLimits",
+    "NodeValue",
+    "PathValue",
     "PortRegistry",
     "Query",
     "QueryCursor",
     "QueryResult",
+    "QueryValue",
+    "RelationshipValue",
     "ScanCursorV1",
     "ScanPageV1",
     "ScanRowV1",
+    "StoredType",
+    "TemporalCompactionReport",
+    "TemporalGraph",
+    "TemporalLimits",
+    "TemporalPin",
+    "TemporalPruneReport",
+    "TemporalVersion",
+    "TemporalVersions",
     "TextHit",
     "TextIndexOptions",
+    "TextMatchPositions",
     "TextSearchLimits",
     "TextSearchResult",
+    "TimeValue",
     "Timestamp",
     "Transaction",
     "VectorValue",
@@ -85,4 +119,4 @@ __all__ = [
     "prepare_commit_import",
 ]
 
-__version__: str = "0.0.5"
+__version__: str = "0.0.6"

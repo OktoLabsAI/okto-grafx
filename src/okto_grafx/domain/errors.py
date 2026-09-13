@@ -21,6 +21,8 @@ __all__ = [
     "GrafxDurabilityBarrierFailed",
     "GrafxRecoveryRefused",
     "GrafxSnapshotReclaimed",
+    "GrafxHistoryUnavailable",
+    "GrafxHistoryExpired",
     "GrafxBufferBudgetExceeded",
     "GrafxTransactionBudgetExceeded",
     "GrafxSchemaVersionMismatch",
@@ -186,6 +188,18 @@ class GrafxSnapshotReclaimed(GrafxError):
 
     code: str = "snapshot_reclaimed"
     retryable: bool = True
+
+
+class GrafxHistoryUnavailable(GrafxError):
+    """Requested table/time has no activated system-time history."""
+
+    code: str = "history_unavailable"
+
+
+class GrafxHistoryExpired(GrafxError):
+    """Requested time precedes the explicitly retained temporal horizon."""
+
+    code: str = "history_expired"
 
 
 class GrafxBufferBudgetExceeded(GrafxError):

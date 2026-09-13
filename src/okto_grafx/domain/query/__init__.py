@@ -1,8 +1,8 @@
 """The query language of Okto Grafx: lexer, parser, syntax, meaning and plan (D3).
 
-The dialect is openCypher as the Kuzu engine spells it, and that choice is the compatibility
-promise this project makes to anyone migrating off the reference engine -- so it is a fixed
-target rather than a design space. What lives here is only the language and the plan: reading
+The fixed semantic reference is openCypher TCK 2024.3, with Grafx's documented typed-table
+model, bounded execution and explicit extensions; full engine compatibility is not promised.
+What lives here is only the language and the plan: reading
 text into a statement, deciding what the statement means, and choosing the operator tree that
 answers it. Nothing in this package opens a page, holds a snapshot or touches a port; the engine
 module :mod:`okto_grafx.engine.query_engine` does that, and it is the only thing that does.
@@ -43,6 +43,7 @@ from okto_grafx.domain.query.ast import (
     DeleteClause,
     Direction,
     Expression,
+    ExistsSubquery,
     FunctionCall,
     ListExpression,
     Literal,
@@ -62,9 +63,14 @@ from okto_grafx.domain.query.ast import (
     ReturnItem,
     SetClause,
     SetItem,
+    LabelSetItem,
     SortItem,
     Statement,
     Subscript,
+    ListSlice,
+    ListIteration,
+    ProcedureCall,
+    SubqueryClause,
     UnaryOperation,
     UpdatingClause,
     UnionQuery,
@@ -78,6 +84,7 @@ from okto_grafx.domain.query.lexer import tokenize
 from okto_grafx.domain.query.limits import (
     DEFAULT_MAX_QUERY_VALUE_CHARACTERS,
     MAX_CLAUSES,
+    MAX_PIPELINE_CLAUSES,
     MAX_COLUMN_DEFINITIONS,
     MAX_EXPRESSION_DEPTH,
     MAX_LIST_ELEMENTS,
@@ -106,6 +113,8 @@ from okto_grafx.domain.query.plan import (
     CreateIndex,
     CreateNodeTable,
     CreateRelationships,
+    CreateSequence,
+    CreatedPattern,
     CreateRelTable,
     CreateVectorSpace,
     DeleteEntities,
@@ -120,6 +129,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    LabelAssignment,
     SetProperties,
     SingleRow,
     SkipRows,
@@ -166,6 +176,7 @@ __all__ = [
     "KEYWORDS",
     "LABEL_FUNCTION",
     "MAX_CLAUSES",
+    "MAX_PIPELINE_CLAUSES",
     "MAX_COLUMN_DEFINITIONS",
     "MAX_EXPRESSION_DEPTH",
     "MAX_LIST_ELEMENTS",
@@ -209,6 +220,8 @@ __all__ = [
     "CreateRelTable",
     "CreateRelTableStatement",
     "CreateRelationships",
+    "CreateSequence",
+    "CreatedPattern",
     "CreateVectorSpace",
     "CreateVectorSpaceStatement",
     "CreatedNode",
@@ -219,6 +232,7 @@ __all__ = [
     "DistinctRows",
     "EagerRows",
     "Expression",
+    "ExistsSubquery",
     "FilterRows",
     "FunctionCall",
     "IndexSeek",
@@ -242,6 +256,7 @@ __all__ = [
     "ProjectRows",
     "Property",
     "PropertyAssignment",
+    "LabelAssignment",
     "Query",
     "QueryAnalysis",
     "RelationshipPattern",
@@ -249,6 +264,7 @@ __all__ = [
     "ReturnItem",
     "SetClause",
     "SetItem",
+    "LabelSetItem",
     "SetProperties",
     "SimilarityUse",
     "SingleRow",
@@ -257,6 +273,10 @@ __all__ = [
     "SortRows",
     "Statement",
     "Subscript",
+    "ListSlice",
+    "ListIteration",
+    "ProcedureCall",
+    "SubqueryClause",
     "Token",
     "TokenKind",
     "TraverseRelationship",

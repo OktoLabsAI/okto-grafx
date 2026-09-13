@@ -40,6 +40,7 @@ from okto_grafx.domain.query.ast import (
     Property,
     ReturnItem,
     SortItem,
+    Variable,
 )
 from okto_grafx.domain.query.limits import MAX_EXPRESSION_DEPTH
 
@@ -47,10 +48,19 @@ __all__ = [
     "MAX_PLAN_DEPTH",
     "AggregateRows",
     "AllNodesScan",
+    "ArgumentRows",
+    "ApplyRows",
+    "CaptureNodePath",
+    "ZeroHopRelationship",
+    "SubqueryRows",
+    "RestoreImports",
+    "ProcedureRows",
     "CreateIndex",
     "CreateNodeTable",
     "CreateRelTable",
     "CreateRelationships",
+    "CreateSequence",
+    "CreatedPattern",
     "CreateVectorSpace",
     "CreatedNode",
     "CreatedRelationship",
@@ -69,6 +79,7 @@ __all__ = [
     "ProduceResults",
     "ProjectRows",
     "PropertyAssignment",
+    "LabelAssignment",
     "RelationshipScan",
     "RelationshipIncidentSeek",
     "SetProperties",
@@ -76,6 +87,7 @@ __all__ = [
     "SkipRows",
     "SortRows",
     "TraverseAnyRelationship",
+    "TraverseRelationshipAlternatives",
     "TraverseRelationship",
     "UnionRows",
     "UnwindRows",
@@ -89,9 +101,9 @@ MAX_PLAN_DEPTH: int = MAX_EXPRESSION_DEPTH * 4
 """How deep an operator tree may be before it is refused as malformed.
 
 It is a multiple of the expression bound rather than a number of its own: a plan grows one layer
-per pattern element and one per result-shaping clause, and both of those are already bounded by
-the parser. The ceiling exists to make the walk terminate on a tree nobody built through the
-planner, not to constrain a real query.
+per traversal element and per result-shaping clause. Consecutive CREATE patterns
+are a flat instruction sequence, not additional depth. Source-clause admission
+and physical depth are independent: an over-deep real query is also refused.
 """
 
 
@@ -190,6 +202,129 @@ class SingleRow(PlanNode):
     def details(self) -> Mapping[str, object]:
         """Return nothing; this operator has no settings."""
         return {}
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureNodePath(PlanNode):
+    """Capture one already matched node as a zero-edge path in the same snapshot."""
+
+    child: PlanNode
+    source: str
+    path: str
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Return the matched input without opening another source."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Expose the anchor and captured variable."""
+        return {"source": self.source, "path": self.path, "hops": "0"}
+
+
+@dataclass(frozen=True, slots=True)
+class ZeroHopRelationship(PlanNode):
+    """The zero-length branch of a range whose relationship table is absent."""
+
+    child: PlanNode
+    source: str
+    target: str
+    relationship: str | None
+    target_table: TableDef | None = None
+    target_bound: bool = False
+    path_variable: str | None = None
+    path_append: bool = False
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Retain the original input transaction and effects."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Expose the real source and zero-edge behavior without fake schema."""
+        return {"source": self.source, "target": self.target, "hops": "0",
+                "relationship": self.relationship, "path": self.path_variable}
+
+
+@dataclass(frozen=True, slots=True)
+class ArgumentRows(PlanNode):
+    """The current outer row of one explicitly correlated apply operator."""
+
+    slot: int
+    names: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreImports(PlanNode):
+    """Restore invocation-constant bindings without adding aggregation keys."""
+
+    child: PlanNode
+    slot: int
+    names: tuple[str, ...]
+    carry_columns: bool = True
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the input pipeline that receives restored global imports."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Describe the imported names, argument slot and column-carrying policy."""
+        return {"imports": self.names, "argument_slot": self.slot, "carry_columns": self.carry_columns}
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyRows(PlanNode):
+    """Run an inner read per outer row, null-extending its new bindings when empty."""
+
+    child: PlanNode
+    inner: PlanNode
+    slot: int
+    null_variables: tuple[str, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose both plans to budget, shape and explain validation."""
+        return self.child, self.inner
+
+
+@dataclass(frozen=True, slots=True)
+class ProcedureRows(PlanNode):
+    """A trusted, explicitly authorized tabular or unit call in the row pipeline."""
+
+    child: PlanNode
+    name: str
+    columns: tuple[tuple[str, str], ...]
+    max_rows: int
+    max_result_bytes: int
+    arguments: tuple[Expression, ...]
+    yields: tuple[ReturnItem, ...]
+    writes: bool = False
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the incoming rows to standard planner and budget validation."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Expose the signature, never callback identity or executable implementation."""
+        return {"procedure": self.name, "access": "transaction_write" if self.writes else
+                "pure_tabular" if self.columns else "pure_unit",
+                "columns": tuple(item.name for item in self.yields),
+                "effects": ("graph_mutation",) if self.writes else (),
+                "max_rows": self.max_rows, "max_result_bytes": self.max_result_bytes}
+
+
+@dataclass(frozen=True, slots=True)
+class SubqueryRows(PlanNode):
+    """Apply a returning/unit body per input row within the outer transaction."""
+
+    child: PlanNode
+    inner: PlanNode
+    slot: int
+    imports: tuple[tuple[str, str], ...]
+    outputs: tuple[str, ...]
+    unit: bool = False
+    writes: bool = False
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose both sides to explain and resource-bound traversal."""
+        return self.child, self.inner
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,7 +503,13 @@ class TraverseRelationship(PlanNode):
     target_table: TableDef | None = None
     target_bound: bool = False
     path_variable: str | None = None
-    """The exact named path this hop binds, when the frozen path projection asks for one."""
+    """The named walk this segment captures."""
+    path_append: bool = False
+    """Continue a previous segment of this same named pattern."""
+    relationship_list: bool = False
+    """A written range binds a list even when its bounds are exactly 1..1."""
+    upper_bound_omitted: bool = False
+    """Refuse an extendable trail at the ceiling instead of silently truncating it."""
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -386,6 +527,60 @@ class TraverseRelationship(PlanNode):
         }
         if self.path_variable is not None:
             details["path"] = self.path_variable
+        if self.path_append:
+            details["path_append"] = True
+        if self.relationship_list:
+            details["relationship_list"] = True
+        if self.upper_bound_omitted:
+            details["hops"] = f"{self.min_hops}.."
+            details["max_traversal_hops"] = self.max_hops
+            details["upper_bound_omitted"] = True
+        return details
+
+
+@dataclass(frozen=True, slots=True)
+class TraverseRelationshipAlternatives(PlanNode):
+    """A bounded heterogeneous trail over real eligible relationship tables."""
+
+    child: PlanNode
+    source: str
+    target: str
+    relationship: str | None
+    tables: tuple[TableDef, ...]
+    direction: Direction
+    min_hops: int
+    max_hops: int
+    target_table: TableDef | None = None
+    target_bound: bool = False
+    path_variable: str | None = None
+    path_append: bool = False
+    relationship_list: bool = True
+    upper_bound_omitted: bool = False
+    dynamic_types: tuple[str, ...] = ()
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """Expose the traversal's incoming row pipeline."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Describe alternative owners, direction, hop bounds and bound-target semantics."""
+        details: dict[str, object] = {
+            "source": self.source, "target": self.target,
+            "tables": ", ".join(table.name for table in self.tables),
+            "direction": self.direction.value,
+            "hops": f"{self.min_hops}..{self.max_hops}",
+            "target_bound": self.target_bound,
+            "relationship_list": self.relationship_list,
+        }
+        if self.dynamic_types:
+            details["dynamic_types"] = ", ".join(self.dynamic_types)
+        if self.path_variable is not None:
+            details["path"] = self.path_variable
+        if self.path_append:
+            details["path_append"] = True
+        if self.upper_bound_omitted:
+            details.update(hops=f"{self.min_hops}..", upper_bound_omitted=True,
+                           max_traversal_hops=self.max_hops)
         return details
 
 
@@ -418,6 +613,11 @@ class TraverseAnyRelationship(PlanNode):
     target_table: str | None = None
     relationship_polymorphic: bool = False
     predicate: Expression | None = None
+    target_bound: bool = False
+    path_variable: str | None = None
+    path_append: bool = False
+    relationship_list: bool = False
+    dynamic_types: tuple[str, ...] = ()
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator this traversal expands from."""
@@ -429,7 +629,12 @@ class TraverseAnyRelationship(PlanNode):
             "source": self.source,
             "target": self.target,
             "tables": ", ".join(table.name for table in self.tables),
+            "direction": self.direction.value,
         }
+        if self.dynamic_types:
+            details["dynamic_types"] = ", ".join(self.dynamic_types)
+        if self.path_variable is not None:
+            details["path"] = self.path_variable
         if self.optional:
             details["optional"] = "true"
             details["direction"] = self.direction.value
@@ -679,12 +884,19 @@ class WithRows(PlanNode):
     the clauses below still read its properties and can still write it, and a computed item
     arrives as the value it evaluated to.
 
+    A modifier projection can carry explicitly listed private input bindings until
+    its sort/window/filter completes. A second projection discards them before the
+    next stage. Private operator columns survive spill, not public exports; this
+    mechanism is never used for a DISTINCT/grouped projection.
+
     It streams one row in, one row out. The stage narrows what a row carries; it never holds
     rows back, which is why a WHERE above it filters as early as the projection allows.
     """
 
     child: PlanNode
     items: tuple[ReturnItem, ...]
+    # Private input bindings needed only until this WITH's ordering/window/filter ends.
+    ordering_inputs: tuple[str, ...] = ()
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows this stage projects."""
@@ -731,6 +943,7 @@ class EagerRows(PlanNode):
     """
 
     child: PlanNode
+    publish_read_phase: bool = False
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are drawn in full."""
@@ -779,7 +992,7 @@ class UnionRows(PlanNode):
     produced it. The operator maps position by position instead, which is also the only reading
     that works when both branches return the same name for different things.
 
-    Deduplication is NOT here. A single DistinctRows sits above, because the pair is one result
+    Deduplication is NOT here. Unless UNION ALL is selected, a single DistinctRows sits above, because the pair is one result
     and duplicates across branches are duplicates: removing them inside each branch would leave
     a row that appears once on each side appearing twice.
     """
@@ -787,6 +1000,7 @@ class UnionRows(PlanNode):
     left: PlanNode
     right: PlanNode
     columns: tuple[str, ...]
+    writes: bool = False
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the two pipelines, left branch first, which is evaluation order."""
@@ -849,6 +1063,7 @@ class SkipRows(PlanNode):
 
     child: PlanNode
     count: Expression
+    argument_slot: int | None = None
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose leading rows are dropped."""
@@ -865,6 +1080,7 @@ class LimitRows(PlanNode):
 
     child: PlanNode
     count: Expression
+    argument_slot: int | None = None
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are truncated."""
@@ -901,11 +1117,13 @@ class CreatedNode:
     variable: str | None
     table: TableDef | None
     properties: MapExpression | None
+    labels: tuple[str, ...] = ()
 
     def describe(self) -> str:
         """Return the node as it would be written back."""
-        table = self.table.name if self.table is not None else "bound"
-        return f"({self.variable or ''}:{table})"
+        names = self.labels or (() if self.table is None or self.table.unlabeled else (self.table.name,))
+        labels = "".join(":`" + name.replace("`", "``") + "`" for name in names)
+        return f"({self.variable or ''}{labels})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -913,15 +1131,47 @@ class CreatedRelationship:
     """One relationship a write operator must insert, between two of its nodes."""
 
     variable: str | None
-    table: TableDef
+    table: TableDef | None
     source: str
     target: str
     direction: Direction
     properties: MapExpression | None
+    candidate_tables: tuple[TableDef, ...] = ()
+    logical_type: str | None = None
 
     def describe(self) -> str:
         """Return the relationship as it would be written back."""
-        return f"({self.source})-[:{self.table.name}]->({self.target})"
+        names = self.logical_type or (self.table.name if self.table is not None else "|".join(table.name for table in self.candidate_tables))
+        return f"({self.source})-[:{names}]->({self.target})"
+
+
+@dataclass(frozen=True, slots=True)
+class CreatedPattern:
+    """One ordered CREATE instruction, without a recursive input operator."""
+
+    nodes: tuple[CreatedNode, ...]
+    relationships: tuple[CreatedRelationship, ...] = ()
+    path_variable: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CreateSequence(PlanNode):
+    """Run consecutive CREATE patterns iteratively for each incoming row."""
+
+    child: PlanNode
+    patterns: tuple[CreatedPattern, ...]
+
+    def children(self) -> tuple[PlanNode, ...]:
+        """The program has one input, not one nested input per pattern."""
+        return (self.child,)
+
+    def details(self) -> Mapping[str, object]:
+        """Expose ordered pattern descriptors while keeping plan depth bounded."""
+        return {"patterns": tuple({
+            "path": pattern.path_variable,
+            "nodes": ", ".join(node.describe() for node in pattern.nodes),
+            "relationships": ", ".join(edge.describe() for edge in pattern.relationships) or "none",
+        } for pattern in self.patterns)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -931,6 +1181,7 @@ class CreateRelationships(PlanNode):
     child: PlanNode
     nodes: tuple[CreatedNode, ...]
     relationships: tuple[CreatedRelationship, ...] = ()
+    path_variable: str | None = None
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows drive the insertion."""
@@ -939,6 +1190,7 @@ class CreateRelationships(PlanNode):
     def details(self) -> Mapping[str, object]:
         """Return what this operator inserts."""
         return {
+            "path": self.path_variable,
             "nodes": ", ".join(node.describe() for node in self.nodes),
             "relationships": ", ".join(item.describe() for item in self.relationships)
             or "none",
@@ -952,10 +1204,17 @@ class MergePattern(PlanNode):
     child: PlanNode
     nodes: tuple[CreatedNode, ...]
     relationships: tuple[CreatedRelationship, ...] = ()
+    node_match_tables: tuple[TableDef, ...] | None = None
+    on_create: tuple[tuple[PropertyAssignment | LabelAssignment, ...], ...] = ()
+    on_match: tuple[tuple[PropertyAssignment | LabelAssignment, ...], ...] = ()
+    path_variable: str | None = None
+    match_plan: PlanNode | None = None
+    match_slot: int | None = None
+    match_values: tuple[tuple[str, Expression], ...] = ()
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows drive the merge."""
-        return (self.child,)
+        return (self.child,) if self.match_plan is None else (self.child, self.match_plan)
 
     def details(self) -> Mapping[str, object]:
         """Return what this operator merges."""
@@ -963,6 +1222,9 @@ class MergePattern(PlanNode):
             "nodes": ", ".join(node.describe() for node in self.nodes),
             "relationships": ", ".join(item.describe() for item in self.relationships)
             or "none",
+            "on_create": tuple(tuple(item.describe() for item in action) for action in self.on_create),
+            "on_match": tuple(tuple(item.describe() for item in action) for action in self.on_match),
+            "path": self.path_variable,
         }
 
 
@@ -970,12 +1232,27 @@ class MergePattern(PlanNode):
 class PropertyAssignment:
     """One property a SET clause writes."""
 
-    target: Property
+    target: Property | Variable
     value: Expression
+    merge: bool = False
 
     def describe(self) -> str:
         """Return the assignment as it was written."""
-        return f"{self.target.describe()} = {self.value.describe()}"
+        return f"{self.target.describe()} {'+=' if self.merge else '='} {self.value.describe()}"
+
+
+@dataclass(frozen=True, slots=True)
+class LabelAssignment:
+    """One versioned node-label mutation, not a physical-table move."""
+
+    target: Variable
+    labels: tuple[str, ...]
+    remove: bool = False
+
+    def describe(self) -> str:
+        """Render a label assignment for EXPLAIN."""
+        return ("REMOVE " if self.remove else "") + self.target.describe() + ":" + ":".join(
+            "`" + name.replace("`", "``") + "`" for name in self.labels)
 
 
 @dataclass(frozen=True, slots=True)
@@ -983,7 +1260,7 @@ class SetProperties(PlanNode):
     """Write the properties one SET clause names, once per incoming row."""
 
     child: PlanNode
-    assignments: tuple[PropertyAssignment, ...]
+    assignments: tuple[PropertyAssignment | LabelAssignment, ...]
 
     def children(self) -> tuple[PlanNode, ...]:
         """Return the operator whose rows are updated."""
@@ -996,10 +1273,10 @@ class SetProperties(PlanNode):
 
 @dataclass(frozen=True, slots=True)
 class DeleteEntities(PlanNode):
-    """Remove the rows the named variables are bound to, once per incoming row."""
+    """Remove native entities/paths selected by expressions, once per identity."""
 
     child: PlanNode
-    variables: tuple[str, ...]
+    targets: tuple[Expression, ...]
     detach: bool = False
 
     def children(self) -> tuple[PlanNode, ...]:
@@ -1007,8 +1284,8 @@ class DeleteEntities(PlanNode):
         return (self.child,)
 
     def details(self) -> Mapping[str, object]:
-        """Return the variables deleted and whether relationships go with them."""
-        return {"variables": ", ".join(self.variables), "detach": self.detach}
+        """Return the target expressions and whether incident relationships go with them."""
+        return {"targets": ", ".join(target.describe() for target in self.targets), "detach": self.detach}
 
 
 # --- schema ---------------------------------------------------------------------------------------
@@ -1053,6 +1330,8 @@ class CreateNodeTable(PlanNode):
     name: str
     columns: tuple[ColumnDef, ...]
     primary_key: str | None
+    flexible_properties: bool = False
+    unlabeled: bool = False
 
     def details(self) -> Mapping[str, object]:
         """Return the table this operator installs."""
@@ -1073,11 +1352,14 @@ class CreateRelTable(PlanNode):
     from_table: str
     to_table: str
     columns: tuple[ColumnDef, ...]
+    endpoint_pairs: tuple[tuple[str, str], ...] = ()
+    flexible_properties: bool = False
 
     def details(self) -> Mapping[str, object]:
         """Return the table this operator installs and the tables it connects."""
         return {
             "table": self.name,
+            **({"endpoint_pairs": self.endpoint_pairs} if self.endpoint_pairs else {}),
             "from": self.from_table,
             "to": self.to_table,
             "columns": ", ".join(

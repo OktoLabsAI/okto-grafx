@@ -254,10 +254,12 @@ def test_a_back_quoted_name_longer_than_the_bound_is_refused() -> None:
     assert failure.value.details["field"] == "name"
 
 
-def test_an_empty_back_quoted_name_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        tokenize("``")
-    assert failure.value.details["field"] == "name"
+def test_an_empty_quoted_token_retains_its_extent_for_contextual_admission() -> None:
+    token = tokenize("``")[0]
+    assert token.text == ""
+    assert token.quoted
+    assert token.offset == 0
+    assert token.end_offset == 2
 
 
 def test_a_name_outside_ascii_is_refused_and_names_the_remedy() -> None:
@@ -272,10 +274,17 @@ def test_a_dollar_sign_with_no_name_is_refused() -> None:
     assert failure.value.details["field"] == "parameter"
 
 
-def test_a_parameter_may_not_start_with_a_digit() -> None:
+def test_a_digit_leading_alphanumeric_parameter_is_refused() -> None:
     with pytest.raises(GrafxParseError) as failure:
-        tokenize("$1")
+        tokenize("$1name")
     assert failure.value.details["field"] == "parameter"
+
+
+@pytest.mark.parametrize("name", ["0", "1", "001", "12345678901234567890"])
+def test_decimal_parameter_names_preserve_exact_spelling(name):
+    token = tokenize("$" + name)[0]
+    assert token.kind is TokenKind.PARAMETER
+    assert token.value == name
 
 
 def test_a_character_with_no_meaning_is_refused_with_its_position() -> None:

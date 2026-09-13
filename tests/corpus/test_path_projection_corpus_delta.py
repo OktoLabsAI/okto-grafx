@@ -1,4 +1,4 @@
-"""The finite Pulse-corpus ratchet produced by M-PULSE-2O and nothing else."""
+"""The pinned Pulse callsites, with explicit current-language verdict changes."""
 
 from __future__ import annotations
 
@@ -11,15 +11,15 @@ STILL_REFUSED = {
     "empty query",
     "non-mutating unsupported root",
     "unsupported clause after a supported root",
-    "REMOVE",
     "DROP",
     "ALTER",
     "LOAD CSV",
     "COPY",
+    "UNION",  # Historical probe returns n.id vs m.id, now a deliberate name mismatch.
 }
 
 
-def test_only_path_projection_moves_in_the_frozen_pulse_corpus() -> None:
+def test_path_projection_stays_admitted_and_union_name_change_is_explicit() -> None:
     frozen = json.loads(CORPUS.read_text(encoding="utf-8"))
     raw = frozen["public_raw_contract"]
     probes = raw["probes"]
@@ -41,7 +41,14 @@ def test_only_path_projection_moves_in_the_frozen_pulse_corpus() -> None:
         for probe in probes
         if probe["contract_disposition"] == "allowed"
         and probe["engine_verdict"] == "refused"
-    ] == []
+    ] == ["UNION"]
+    assert by_construct["UNION"]["acceptance_phase"] == "analysis_error"
+    assert "same column names" in by_construct["UNION"]["error"]
+    # Native REMOVE is now implemented; the frozen read-only Core contract
+    # still denies it. Engine capability does not broaden public write access.
+    assert by_construct["REMOVE"]["engine_verdict"] == "accepted"
+    assert by_construct["REMOVE"]["contract_disposition"] == "refused"
+    assert by_construct["REMOVE"]["contract_error_code"] == "unsafe_cypher"
     assert projected["probe"] == ADMITTED
     assert projected["contract_disposition"] == "allowed"
     assert projected["engine_verdict"] == "accepted"
@@ -53,5 +60,5 @@ def test_only_path_projection_moves_in_the_frozen_pulse_corpus() -> None:
     scoring = next(entry for entry in frozen["entries"] if entry["id"] == "I64")
     assert scoring["classification"] == "already_supported"
     assert scoring["expected"]["error"] is None
-    assert frozen["counts"]["classification:already_supported"] == 83
-    assert frozen["counts"]["classification:generic_gap"] == 12
+    assert frozen["counts"]["classification:already_supported"] == 84
+    assert frozen["counts"]["classification:generic_gap"] == 11

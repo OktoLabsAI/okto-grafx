@@ -37,7 +37,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxError, GrafxIndexError
+from okto_grafx.domain.errors import GrafxIndexError
 from okto_grafx.domain.txn import WalRecordType
 from okto_grafx.domain.txn.records import decode_page_write
 
@@ -112,9 +112,13 @@ def test_an_uncommitted_table_is_invisible_to_other_transactions(tmp_path: Path)
     with okto_grafx.connect(tmp_path / "db", page_size=512) as db:
         open_ddl = db.begin("write")
         open_ddl.execute("CREATE NODE TABLE Pending(id INT64, PRIMARY KEY(id))")
+        open_ddl.execute("CREATE (:Pending {id:7})")
         try:
-            with pytest.raises(GrafxError):
-                db.execute("MATCH (p:Pending) RETURN count(*)")
+            # FP-3 absent-table reads return an empty relation, not an error.
+            # An owner row distinguishes isolation from seeing a phantom empty table.
+            assert db.execute("MATCH (p:Pending) RETURN count(*)").rows == ((0,),)
+            assert not db.catalog.catalog.has_table("Pending")
+            assert open_ddl.execute("MATCH (p:Pending) RETURN p.id").rows == ((7,),)
         finally:
             open_ddl.rollback()
 

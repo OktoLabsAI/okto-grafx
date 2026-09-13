@@ -1,5 +1,10 @@
 # Durable commit history (0.0.5 development)
 
+Commit provenance alone does not retain graph row versions. The separate
+0.0.6 [system-time history](SYSTEM_TIME_HISTORY.md) capability now provides
+opt-in native row history, typed as-of/versions, pins and retention on top of this
+journal. It is a one-way required-capability upgrade, never activated implicitly.
+
 [API reference](API_REFERENCE.md) · [Roadmap](../ROADMAP.md)
 
 This capability is opt-in. Existing databases and ordinary connections do not

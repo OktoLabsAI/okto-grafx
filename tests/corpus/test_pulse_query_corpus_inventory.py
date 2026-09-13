@@ -681,7 +681,6 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
         "named path",
         "unbounded variable length",
         "OPTIONAL MATCH",
-        "UNION",
         "untyped relationship",
         "path projection",
         "map batch",
@@ -703,17 +702,27 @@ def test_the_raw_matrix_keeps_contract_and_engine_apart(frozen: dict) -> None:
     # follow the public NFKC execution path and closes the unsupported trailing-clause hole in
     # the Core authority, and M-PULSE-2M moves UNION. M-PULSE-2N then moves the untyped hop and
     # M-PULSE-2O moves the one exact path projection, closing the finite raw-contract debt.
+    # The authorized language replacement now requires identical output names.
+    # Preserve the historical probe text (n.id vs m.id) and record its refusal,
+    # rather than rewriting the baseline to hide this intentional breaking change.
+    # Native property REMOVE no longer needs a parser/engine refusal; the
+    # independent frozen read-only contract must still deny its write effects.
     assert len(accepted) == 79
     assert len(refused) == 8
-    assert owed == []
+    assert by_construct["REMOVE"]["engine_verdict"] == "accepted"
+    assert by_construct["REMOVE"]["contract_disposition"] == "refused"
+    assert by_construct["REMOVE"]["contract_error_code"] == "unsafe_cypher"
+    assert owed == ["UNION"]
+    assert by_construct["UNION"]["acceptance_phase"] == "analysis_error"
+    assert "same column names" in by_construct["UNION"]["error"]
     assert raw["contract_refused"] == 14
     assert raw["contract_error_codes"] == {
         "unsafe_cypher": 10,
         "unsupported_operation": 4,
     }
 
-    assert frozen["counts"]["classification:already_supported"] == 83
-    assert frozen["counts"]["classification:generic_gap"] == 12
+    assert frozen["counts"]["classification:already_supported"] == 84
+    assert frozen["counts"]["classification:generic_gap"] == 11
 
 
 def test_every_raw_probe_has_one_contract_and_engine_verdict(frozen: dict) -> None:

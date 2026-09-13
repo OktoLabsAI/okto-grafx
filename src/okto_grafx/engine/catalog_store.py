@@ -13,10 +13,13 @@ Saving rewrites the chain in place and only grows the file when the schema no lo
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
     GrafxTransactionStateError,
+    GrafxQueryBudgetExceeded,
 )
 from okto_grafx.domain.ids import NO_PAGE, PROVISIONAL_CSN, PageIndex
 from okto_grafx.domain.model.catalog import Catalog
@@ -101,6 +104,36 @@ def read_catalog_page_images(
         if index not in visited and (page.page_type != PageType.FREE or page.slot_count or page.next_page != NO_PAGE):
             raise refuse("catalog_image_unreferenced")
     return Catalog.deserialize(b"".join(chunks))
+
+
+def read_published_catalog(read: Callable[[str, int], bytes], *, page_size: int,
+                           max_bytes: int) -> tuple[Catalog, int]:
+    """Capture current metadata without adopting it into an older participant's schema view.
+
+    The caller supplies fresh reads and owns publication/stamp qualification.
+    Only the named catalog chain is read; no retained history is scanned and no
+    shared authority cache is created. Native complete-image grammar is reused.
+    """
+    raw = read(CATALOG_FILE, 0)
+    page = Page.from_bytes(raw, page_index=0)
+    header = FileHeaderPage.read(page)
+    if header.kind != FileKind.CATALOG or header.page_size != page_size:
+        raise GrafxCorruptionDetected("Invalid temporal metadata header.", field="catalog_header")
+    if header.payload_length > max_bytes:
+        raise GrafxQueryBudgetExceeded("Temporal metadata capture exceeds byte budget.", resource="history_scan")
+    images = [(0, raw)]
+    seen = {0}
+    number = header.root_page
+    while number != NO_PAGE:
+        if number in seen:
+            raise GrafxCorruptionDetected("Cyclic temporal metadata chain.", field="catalog_chain")
+        if (len(images) + 1) * page_size > max_bytes:
+            raise GrafxQueryBudgetExceeded("Temporal metadata capture exceeds byte budget.", resource="history_scan")
+        seen.add(number)
+        chunk = read(CATALOG_FILE, number)
+        images.append((number, chunk))
+        number = Page.from_bytes(chunk, page_index=number).next_page
+    return read_catalog_page_images(tuple(images), page_size=page_size, sequence=page.page_lsn), len(images) * page_size
 
 
 class CatalogStore:

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxConfigurationError, GrafxWriteConflict
+from okto_grafx.domain.errors import GrafxConfigurationError, GrafxPlanError, GrafxWriteConflict
 from okto_grafx.engine import heap_store as heap_store_module
 from okto_grafx.engine.heap_store import HeapStore
 
@@ -246,6 +246,41 @@ def test_a_refused_statement_savepoint_does_not_poison_the_cached_view(
         decodes.clear()
         assert sorted(txn.execute(TRAVERSE).rows) == expected
         assert decodes["B"] == 0
+
+
+def test_failed_data_phase_cannot_reuse_a_poisoned_landing_fingerprint(database, decodes):
+    _graph(database)
+    with database.begin("write") as txn:
+        expected = sorted(txn.execute(TRAVERSE).rows)
+        original_memo = database._queries._owner_memo[txn.txn_id]
+        with pytest.raises(GrafxPlanError):
+            txn.execute(
+                "MATCH(a:A {id:1}),(b:B {id:1}) SET b.tag='poison' "
+                "WITH a MATCH(a)-[:E]->(target:B) RETURN target.id,1/0"
+            )
+        # The schema is unchanged; reuse is still gated by full row-intent content.
+        assert database._queries._owner_memo[txn.txn_id] is original_memo
+        assert sorted(txn.execute(TRAVERSE).rows) == expected
+        decodes.clear()
+        assert sorted(txn.execute(TRAVERSE).rows) == expected
+        assert decodes["B"] == 0
+    assert database.verify("all").findings == ()
+
+
+def test_failed_schema_phase_retires_owner_landing_memo(database):
+    _graph(database)
+    database.ensure_identity_indexes()
+    with database.begin("write") as txn:
+        expected = sorted(txn.execute(TRAVERSE).rows)
+        with pytest.raises(GrafxPlanError):
+            txn.execute(
+                "CREATE(:Transient) WITH 1 AS ignored "
+                "MATCH(a:A)-[:E]->(b:B) WHERE a.id=1 RETURN b.id,1/0"
+            )
+        assert txn.txn_id not in database._queries._owner_memo
+        assert txn.execute("MATCH(n:Transient) RETURN count(n)").rows == ((0,),)
+        assert sorted(txn.execute(TRAVERSE).rows) == expected
+    assert database.verify("all").findings == ()
 
 
 # --- the memo is transaction-private, internally bounded, and settled --------------------------

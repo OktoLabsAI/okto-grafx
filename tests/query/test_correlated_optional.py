@@ -93,13 +93,13 @@ def test_polymorphic_target_and_relationship_properties(graph):
     assert result.rows == (("a", "t", 1), ("b", None, 0), ("isolated", None, 0))
 
 
-def test_incompatible_untyped_relationship_properties_refused_before_streaming(graph):
-    from okto_grafx.errors import GrafxPlanError
-
+def test_untyped_relationship_properties_keep_per_row_types(graph):
     with graph.begin("write") as tx:
         tx.execute("CREATE REL TABLE Conflict(FROM Person TO Topic, weight STRING)")
-    with pytest.raises(GrafxPlanError, match="tables do not agree"):
-        graph.execute("MATCH (p:Person) OPTIONAL MATCH (p)-[r]->() RETURN r.weight")
+        tx.execute("MATCH(p:Person {id:'b'}),(t:Topic) CREATE(p)-[:Conflict {weight:'text'}]->(t)")
+    result = graph.execute("MATCH (p:Person) OPTIONAL MATCH (p)-[r]->() "
+                           "RETURN r.weight AS weight ORDER BY weight").rows
+    assert result == (("text",),(1,),(2,),(None,),(None,))
 
 
 def test_anchor_without_relationship_tables_and_empty_root(tmp_path):
@@ -114,13 +114,13 @@ def test_anchor_without_relationship_tables_and_empty_root(tmp_path):
         assert db.execute(query).rows == (("alone", 0),)
 
 
-def test_self_loop_matches_both_incident_directions(graph):
-    # Matches existing typed traversal and the legacy Pulse engine's semantics.
+def test_self_loop_is_one_physical_match_not_two_directions(graph):
+    # FP-3 trail identity counts a physical self-loop once, as in typed traversal.
     with graph.begin("write") as tx:
         tx.execute("MATCH (a:Person {id:'isolated'}) CREATE (a)-[:Knows {weight:5}]->(a)")
     result = graph.execute("MATCH (a:Person {id:'isolated'}) OPTIONAL MATCH (a)-[r]-() "
                            "RETURN count(r), count(DISTINCT r)")
-    assert result.rows == ((2, 1),)
+    assert result.rows == ((1, 1),)
 
 
 def test_optional_expansion_keeps_query_budgets(tmp_path):
@@ -132,6 +132,8 @@ def test_optional_expansion_keeps_query_budgets(tmp_path):
             tx.execute("CREATE REL TABLE R(FROM P TO P)")
         with db.begin("write") as tx:
             tx.execute("CREATE (:P {id:'a'})")
+            tx.execute("MATCH (a:P) CREATE (a)-[:R]->(a)")
+            # Two distinct physical edges, not a duplicate orientation of one loop.
             tx.execute("MATCH (a:P) CREATE (a)-[:R]->(a)")
         with pytest.raises(GrafxQueryBudgetExceeded):
             db.execute("MATCH (p:P) OPTIONAL MATCH (p)-[r]-() RETURN count(r)")

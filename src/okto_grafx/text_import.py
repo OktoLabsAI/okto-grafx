@@ -19,6 +19,11 @@ from okto_grafx.tabular import _limit
 from okto_grafx.projections import _Work
 from okto_grafx.domain.query.control import CancellationToken
 from okto_grafx.domain.model.value import Timestamp, Uuid, encode_value
+from okto_grafx.domain.model.temporal_interchange import TEMPORAL_CLASSES_BY_NAME, temporal_from_json_value
+from okto_grafx.domain.model.decimal_interchange import decimal_from_json_value
+from okto_grafx.domain.model.stored_types import StoredType, encode_stored_type, decode_stored_type
+from okto_grafx.collection_json import collection_from_json_value
+from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.engine.database import Transaction, ExecuteManyReport
 from okto_grafx.errors import (
     GrafxConfigurationError,
@@ -71,21 +76,34 @@ def _declarations(columns, types, limits):
         type(types) is not tuple
         or len(types) != len(columns)
         or any(
-            type(t) is not str
-            or t
-            not in ("BOOL", "INT64", "DOUBLE", "STRING", "BYTES", "UUID", "TIMESTAMP")
+            type(t) is not StoredType and (type(t) is not str
+            or t not in ("BOOL", "INT64", "DOUBLE", "STRING", "BYTES", "UUID", "TIMESTAMP", "DECIMAL", *TEMPORAL_CLASSES_BY_NAME))
             for t in types
         )
     ):
         raise GrafxConfigurationError(
-            "Declare one supported scalar type per column.", field="types"
+            "Declare one supported scalar or collection type per column.", field="types"
         )
     if type(limits) is not TextImportLimits:
         raise GrafxConfigurationError("Expected TextImportLimits.", field="limits")
+    owned = []
+    for kind in types:
+        if type(kind) is StoredType:
+            kind = decode_stored_type(encode_stored_type(kind))
+            if kind.kind not in ("LIST", "MAP", "ARRAY", "STRUCT"):
+                raise GrafxConfigurationError("StoredType text declarations require a collection root.", field="types")
+        owned.append(kind)
+    return tuple(owned)
 
 
 def _value(value, kind, text, row, column, limits):
     try:
+        if type(kind) is StoredType:
+            if type(value) is str:
+                if len(value) > limits.max_field_bytes or len(value.encode("utf-8")) > limits.max_field_bytes:
+                    raise GrafxQueryBudgetExceeded("Collection field bound exceeded.", resource="text_field", row=row, column=column)
+                value = json.loads(value, object_pairs_hook=_unique_object, parse_constant=_nonfinite_json)
+            return collection_from_json_value(kind, value, max_bytes=limits.max_field_bytes)
         if value is None:
             return None
         if type(value) is str and len(value.encode("utf-8")) > limits.max_field_bytes:
@@ -95,7 +113,16 @@ def _value(value, kind, text, row, column, limits):
                 row=row,
                 column=column,
             )
-        if kind == "STRING":
+        if kind in TEMPORAL_CLASSES_BY_NAME or kind == "DECIMAL":
+            if type(value) is str:
+                value = json.loads(value, object_pairs_hook=_unique_object, parse_constant=_nonfinite_json)
+            # Canonical native admission bounds the shape before serializing its
+            # primitive JSON fields to charge an object-valued JSONL cell.
+            native = decimal_from_json_value(value) if kind == "DECIMAL" else temporal_from_json_value(kind, value)
+            if len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > limits.max_field_bytes:
+                raise GrafxQueryBudgetExceeded("Native text field bound exceeded.", resource="text_field", row=row, column=column)
+            value = native
+        elif kind == "STRING":
             if type(value) is not str:
                 raise ValueError("expected string")
         elif kind == "BOOL":
@@ -145,10 +172,24 @@ def _value(value, kind, text, row, column, limits):
             value = Uuid(parsed.bytes)
         encode_value(value)
         return value
-    except (ValueError, TypeError, OverflowError, UnicodeError) as failure:
+    except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError, SchemaMismatchError) as failure:
         raise GrafxUnsupportedOperation(
             "Invalid typed text field.", field="types", row=row, column=column
         ) from failure
+
+
+def _unique_object(items: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate keys at every depth, including encoded native scalar cells."""
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
+def _nonfinite_json(value: str) -> NoReturn:
+    raise ValueError("nonstandard numeric constant")
 
 
 def _lines(path, allowed_root, limits, work):
@@ -224,6 +265,9 @@ def _batches(rows, columns, types, limits, work, text, null_token=None):
             )
             for name, kind, value in zip(columns, types, values)
         }
+        for name, kind in zip(columns, types, strict=True):
+            if type(kind) is StoredType:
+                work.step(len(encode_value(converted[name])))
         charge += 512 * len(columns) + sum(
             16 * len(encode_value(value)) for value in converted.values()
         )
@@ -255,14 +299,14 @@ def read_csv_batches(
     *,
     allowed_root: str | os.PathLike[str],
     columns: tuple[str, ...],
-    types: tuple[str, ...],
+    types: tuple[str | StoredType, ...],
     delimiter: str = ",",
     null_token: str = "\\N",
     limits: TextImportLimits = TextImportLimits(),
     cancellation: CancellationToken | None = None,
 ) -> Iterator[tuple[dict[str, object], ...]]:
     """Read header-required UTF-8 CSV with double quotes; close the iterator on early exit."""
-    _declarations(columns, types, limits)
+    types = _declarations(columns, types, limits)
     if (
         type(delimiter) is not str
         or len(delimiter) != 1
@@ -326,27 +370,19 @@ def read_jsonl_batches(
     *,
     allowed_root: str | os.PathLike[str],
     columns: tuple[str, ...],
-    types: tuple[str, ...],
+    types: tuple[str | StoredType, ...],
     limits: TextImportLimits = TextImportLimits(),
     cancellation: CancellationToken | None = None,
 ) -> Iterator[tuple[dict[str, object], ...]]:
-    """Read one exact scalar object per UTF-8 line; missing and duplicate keys are errors."""
-    _declarations(columns, types, limits)
+    """Read one typed row per UTF-8 line; missing and duplicate keys are errors.
+
+    Explicit temporal/DECIMAL types accept canonical tagged objects or encoded JSON text;
+    StoredType collection declarations decode exact nested values. Undeclared
+    nested properties and implicit ISO/zone conversion are not inferred.
+    """
+    types = _declarations(columns, types, limits)
     work = _Work(limits.max_work, cancellation)
     work.step(0)
-
-    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-        """Reject repeated keys before a dictionary could silently overwrite them."""
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError("duplicate key")
-            result[key] = value
-        return result
-
-    def constant(value: str) -> NoReturn:
-        """Reject JSON parser extensions for nonfinite numeric literals."""
-        raise ValueError("nonstandard numeric constant")
 
     with closing(_lines(path, allowed_root, limits, work)) as lines:
 
@@ -355,15 +391,16 @@ def read_jsonl_batches(
             for index, line in enumerate(lines, 1):
                 try:
                     obj = json.loads(
-                        line, object_pairs_hook=pairs, parse_constant=constant
+                        line, object_pairs_hook=_unique_object, parse_constant=_nonfinite_json
                     )
                     if type(obj) is not dict or set(obj) != set(columns):
                         raise ValueError("object keys differ")
-                    if any(type(v) in (dict, list) for v in obj.values()):
+                    if any(type(kind) is not StoredType and (type(obj[name]) is list or type(obj[name]) is dict and kind not in (*TEMPORAL_CLASSES_BY_NAME, "DECIMAL"))
+                           for name, kind in zip(columns, types)):
                         raise ValueError("nested value")
                 except (ValueError, RecursionError) as failure:
                     raise GrafxUnsupportedOperation(
-                        "Malformed scalar JSONL object.", field="jsonl", row=index
+                        "Malformed typed JSONL object.", field="jsonl", row=index
                     ) from failure
                 yield tuple(obj[c] for c in columns)
 
@@ -388,7 +425,7 @@ def import_csv(
     *,
     allowed_root: str | os.PathLike[str],
     columns: tuple[str, ...],
-    types: tuple[str, ...],
+    types: tuple[str | StoredType, ...],
     delimiter: str = ",",
     null_token: str = "\\N",
     limits: TextImportLimits = TextImportLimits(),
@@ -418,7 +455,7 @@ def import_jsonl(
     *,
     allowed_root: str | os.PathLike[str],
     columns: tuple[str, ...],
-    types: tuple[str, ...],
+    types: tuple[str | StoredType, ...],
     limits: TextImportLimits = TextImportLimits(),
     cancellation: CancellationToken | None = None,
 ) -> ExecuteManyReport:

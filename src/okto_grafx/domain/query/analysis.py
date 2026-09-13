@@ -22,11 +22,20 @@ exists to forbid.
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.entity_scalars import ENTITY_SCALARS
+from okto_grafx.domain.query.percentiles import PERCENTILE_FUNCTIONS
+from okto_grafx.domain.query.effects import is_deterministic
+from okto_grafx.domain.query.projection_scope import projected_reference, returned_reference
+from okto_grafx.domain.query.binding_inference import EMPTY_LIST, NODE_LIST, RELATIONSHIP_LIST, entity_sources
+
+from okto_grafx.domain.query.scalars import NATIVE_SCALARS, scalar_arity
+
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
 from okto_grafx.domain.query.ast import (
+    ListIteration,
     CaseExpression,
     CreateClause,
     CreateIndexStatement,
@@ -36,6 +45,7 @@ from okto_grafx.domain.query.ast import (
     DeleteClause,
     Direction,
     Expression,
+    ExistsSubquery,
     FunctionCall,
     Literal,
     MapExpression,
@@ -43,25 +53,36 @@ from okto_grafx.domain.query.ast import (
     MergeClause,
     NodePattern,
     Parameter,
+    SortItem,
+    UnaryOperation,
     PatternPath,
+    PatternPredicate,
+    PatternComprehension,
+    LabelPredicate,
     Property,
     Query,
     RelationshipPattern,
     ReturnClause,
     UnionQuery,
+    SubqueryClause,
+    ProcedureCall,
     ReturnItem,
     SetClause,
+    LabelSetItem,
     Statement,
     UnwindClause,
     Variable,
     WithClause,
     free_variables,
-    optional_clause_defect,
     walk,
 )
 from okto_grafx.domain.query.lexer import tokenize
+from okto_grafx.domain.query.structure import validate_structure
 from okto_grafx.domain.query.limits import (
+    MAX_CLAUSES,
+    MAX_PIPELINE_CLAUSES,
     MAX_PARAMETERS,
+    MAX_PROJECTION_ITEMS,
     MAX_TRAVERSAL_HOPS,
 )
 from okto_grafx.domain.query.tokens import (
@@ -82,6 +103,7 @@ __all__ = [
     "NAMED_PATH_SHAPE",
     "POLYMORPHIC_NODE_SHAPE",
     "ENTITY_RELATIONSHIP",
+    "ENTITY_RELATIONSHIP_LIST",
     "ENTITY_PROJECTED",
     "ENTITY_UNWOUND",
     "Aggregation",
@@ -100,12 +122,15 @@ __all__ = [
 
 ENTITY_NODE: str = "node"
 ENTITY_PATH: str = "path"
-"""The one exact named path this subset projects as a result value."""
+"""A named walk binding, materialized as an owned native path at output."""
 ENTITY_RELATIONSHIP: str = "relationship"
+ENTITY_RELATIONSHIP_LIST: str = RELATIONSHIP_LIST
 ENTITY_UNWOUND: str = "unwound value"
 """What UNWIND binds: one element of a list, which is a value and not a matched row."""
 ENTITY_PROJECTED: str = "expression alias"
 """What a WITH item with AS binds: a value the projection computed for this row."""
+ENTITY_NULL: str = "null alias"
+"""A proven NULL alias can be a read-pattern anchor, but never a fresh scan."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,10 +216,9 @@ class QueryAnalysis:
 
 
 POLYMORPHIC_NODE_SHAPE: str = (
-    "one MATCH of one named node with no label, no relationship and no inline property map, "
-    "no UNWIND, no clause that writes, and a RETURN"
+    "composed read-only standalone node patterns, including inline maps, UNWIND and OPTIONAL MATCH"
 )
-"""The only shape a node written without a label is read in."""
+"""Current admission boundary for standalone label-free node reads."""
 
 
 def polymorphic_node(query: Query) -> NodePattern | None:
@@ -208,11 +232,27 @@ def polymorphic_node(query: Query) -> NodePattern | None:
     keeps the refusal it already had rather than being re-explained as a shape rule.
     """
     bound: set[str] = set()
-    for clause in query.match_clauses:
-        for pattern in clause.patterns:
+    for clause in query.ordered_clauses():
+        if isinstance(clause, WithClause):
+            bound = (bound if clause.include_existing else set()) | {item.name for item in clause.items}
+            continue
+        if isinstance(clause, UnwindClause):
+            bound.add(clause.alias)
+            continue
+        if isinstance(clause, ProcedureCall):
+            bound.update(item.name for item in clause.yields)
+            continue
+        if isinstance(clause, SubqueryClause):
+            branches = clause.query.branches() if isinstance(clause.query, UnionQuery) else (clause.query,)
+            if branches[0].return_clause is not None:
+                bound.update(branches[0].return_clause.column_names())
+            continue
+        patterns = ((clause.pattern,) if isinstance(clause, MergeClause) else
+                    clause.patterns if isinstance(clause, (MatchClause, CreateClause)) else ())
+        for pattern in patterns:
             first = pattern.nodes[0]
             if (
-                not pattern.relationships
+                isinstance(clause, MatchClause) and not pattern.relationships
                 and not first.labels
                 and (first.variable is None or first.variable not in bound)
             ):
@@ -227,7 +267,7 @@ def polymorphic_node(query: Query) -> NodePattern | None:
 
 
 def polymorphic_node_refusal(query: Query) -> tuple[str, str] | None:
-    """Return the refusal a label-free node earns outside its one shape, or None.
+    """Return a remaining polymorphic write restriction, or None.
 
     One function, asked by the analysis and asked again by the planner. Both need the answer --
     a tree that never passed the parser reaches the first, and a caller's own analysis walks
@@ -241,46 +281,26 @@ def polymorphic_node_refusal(query: Query) -> tuple[str, str] | None:
     if reason is None:
         return None
     return (
-        "A node that names no label matches every node table, and this subset reads one in "
-        f"exactly one shape: {POLYMORPHIC_NODE_SHAPE}. {reason}",
+        "A node that names no label matches every node table; supported reads use "
+        f"{POLYMORPHIC_NODE_SHAPE}. {reason}",
         driver.describe(),
     )
 
 
 def _polymorphic_shape_reason(query: Query, driver: NodePattern) -> str | None:
-    """Return what this statement does that the one shape does not allow, or None."""
-    if driver.variable is None:
-        return (
-            "This one carries no name, so nothing below it could read what it matched."
-        )
-    if driver.properties is not None:
-        return (
-            "This one carries an inline property map, and which column that matches depends "
-            "on the table."
-        )
-    if query.unwind_clause is not None:
-        return "This one follows an UNWIND."
-    if len(query.match_clauses) != 1:
-        return f"This query has {len(query.match_clauses)} MATCH clauses."
-    pattern = query.match_clauses[0].patterns
-    if len(pattern) != 1:
-        return f"This MATCH carries {len(pattern)} patterns."
-    if pattern[0].relationships:
-        return (
-            "This one is an end of a relationship, which names the table at each end."
-        )
-    if query.updating_clauses:
-        return "This query writes, and a write needs one table to write into."
-    if query.return_clause is None:
+    """Keep dynamic write-target admission separate from expanded read composition."""
+    # Read polymorphism does not choose a creation target. CREATE still requires
+    # labels/types, and writes to bound entities validate the actual row's schema.
+    if query.return_clause is None and not query.updating_clauses:
         return "This query has no RETURN, so it would read every table for nothing."
     return None
 
 
 NAMED_PATH_SHAPE: str = (
-    "one MATCH of one named path over one named outgoing hop of one type, both ends named and "
-    "carrying exactly one label, no inline map and no written range, and a RETURN"
+    "composed MATCH/OPTIONAL MATCH captures over typed bounded segments, "
+    "including zero length, direction, aliases, predicates and subquery scope"
 )
-"""The only shape a named path is admitted in."""
+"""Current capture shape; untyped alternatives remain assigned to FP-3."""
 
 
 def hop_range_refusal(query: Query) -> tuple[str, str] | None:
@@ -297,6 +317,14 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
     nothing at all.
     """
     for relationship in _relationships_of(query):
+        if type(relationship.upper_bound_omitted) is not bool:
+            return (
+                "An omitted upper bound requires a written range and the execution ceiling.",
+                "upper_bound_omitted",
+            )
+        if (type(relationship.both_directions_written) is not bool
+                or relationship.both_directions_written and relationship.direction is not Direction.UNDIRECTED):
+            return ("Double-arrow syntax requires a boolean and undirected semantics.", "both_directions_written")
         if type(relationship.hop_range_written) is not bool:
             return (
                 "A relationship records whether a hop range was written as a boolean.",
@@ -313,16 +341,18 @@ def hop_range_refusal(query: Query) -> tuple[str, str] | None:
                 "max_hops",
             )
         if (
-            not 1
-            <= relationship.min_hops
-            <= relationship.max_hops
-            <= MAX_TRAVERSAL_HOPS
+            not 0 <= relationship.min_hops <= MAX_TRAVERSAL_HOPS
+            or not 0 <= relationship.max_hops <= MAX_TRAVERSAL_HOPS
         ):
             return (
-                "A hop range runs from at least one hop to at most "
-                f"{MAX_TRAVERSAL_HOPS}, and starts at or below where it ends.",
+                "A hop range runs from zero hops to at most "
+                f"{MAX_TRAVERSAL_HOPS}; inverted bounds describe an empty interval.",
                 "hops",
             )
+        if relationship.upper_bound_omitted and (
+            not relationship.hop_range_written or relationship.max_hops != MAX_TRAVERSAL_HOPS
+        ):
+            return ("An omitted upper bound requires the execution ceiling.", "upper_bound_omitted")
         if not relationship.hop_range_written and (
             relationship.min_hops != 1 or relationship.max_hops != 1
         ):
@@ -352,77 +382,48 @@ def _relationships_of(query: Query) -> Iterator[RelationshipPattern]:
 
 
 def union_refusal(statement: UnionQuery) -> tuple[str, str] | None:
-    """Return the refusal a union earns outside the one admitted shape, or None.
-
-    Asked wherever a union is about to be given a meaning, and for a tree nobody parsed as
-    readily as for one that was. The parser can only build the admitted shape, so for parsed
-    text this asks a question already answered; a caller who hands ``analyze`` or ``build_plan``
-    a statement of its own has answered nothing.
-
-    Nothing is interpolated into the message. A branch of a forged type would be asked to render
-    itself while the refusal was being built, and a refusal that raises reports nothing at all.
-    """
-    for branch in (statement.left, statement.right):
+    """Validate the bounded tree before traversing potentially forged ASTs."""
+    pending: list[object] = [statement]
+    seen: set[int] = set()
+    columns: tuple[str, ...] | None = None
+    unit: bool | None = None
+    leaves = 0
+    while pending:
+        branch = pending.pop()
+        if id(branch) in seen:
+            return ("A UNION tree cannot contain cycles or shared branch occurrences.", "branch")
+        seen.add(id(branch))
+        if type(branch) is UnionQuery:
+            if type(branch.all) is not bool:
+                return ("UNION ALL selection must be a boolean.", "all")
+            if branch.all is not statement.all:
+                return ("A UNION chain cannot mix UNION and UNION ALL; use a separate subquery scope.", "composition")
+            if len(seen) > MAX_CLAUSES * 2:
+                return ("Too many UNION branches.", "branch")
+            pending.extend((branch.right, branch.left))
+            continue
         if type(branch) is not Query:
-            return (
-                "A UNION joins two reading queries; each branch is a query.",
-                "branch",
-            )
-    for branch in (statement.left, statement.right):
-        if branch.updating_clauses:
-            return (
-                "A UNION joins two queries that only read; neither branch may write.",
-                "branch",
-            )
-        if any(clause.optional for clause in branch.match_clauses):
-            return (
-                "An OPTIONAL MATCH is not composed with UNION in this subset.",
-                "branch",
-            )
-        if any(
-            not hop.types
-            for clause in branch.match_clauses
-            for pattern in clause.patterns
-            for hop in pattern.relationships
-        ):
-            # An untyped hop is admitted as a whole TOP-LEVEL statement and nothing smaller.
-            # Without this a union branch would smuggle it in, because each branch is planned
-            # by a planner of its own that sees only the branch -- and the pair would then
-            # answer for a composition this subset never froze.
-            return (
-                "A relationship without a type is read as a whole query in this subset, not "
-                "as a branch of a UNION.",
-                "branch",
-            )
-        if exact_path_projection(branch) is not None:
-            # Path projection is admitted only as the whole frozen query.  A branch is planned
-            # by a planner of its own, which otherwise sees the branch as a whole statement and
-            # would admit a composition this milestone never measured.
-            return (
-                "A path is projected as a whole query in this subset, not as a branch of a "
-                "UNION.",
-                "branch",
-            )
-        if branch.return_clause is None:
-            return (
-                "Each branch of a UNION ends with RETURN, because a union is made of rows.",
-                "branch",
-            )
-    left = statement.left.return_clause
-    right = statement.right.return_clause
-    if left is None or right is None:  # pragma: no cover - the loop above settled this
-        return (
-            "Each branch of a UNION ends with RETURN, because a union is made of rows.",
-            "branch",
-        )
-    if len(left.items) != len(right.items):
-        # The arity is the first thing a reader of the result relies on, and two branches that
-        # disagree about it cannot be reconciled by any rule about types: there is no column to
-        # compare against.
-        return (
-            "Both branches of a UNION return the same number of columns.",
-            "columns",
-        )
+            return ("Each UNION branch must be a query.", "branch")
+        leaves += 1
+        if leaves > MAX_CLAUSES:
+            return ("Too many UNION branches.", "branch")
+        branch_unit = branch.return_clause is None
+        if unit is None:
+            unit = branch_unit
+        elif unit != branch_unit:
+            return ("UNION branches cannot mix returning and unit queries.", "columns")
+        if branch_unit:
+            if not branch.writes:
+                return ("A unit UNION branch must write.", "branch")
+            continue
+        if branch.return_clause.include_existing:
+            # Visible columns are known only after lexical binding analysis.
+            continue
+        names = branch.return_clause.column_names()
+        if columns is None:
+            columns = names
+        elif names != columns:
+            return ("UNION branches must return the same column names in the same order.", "columns")
     return None
 
 
@@ -434,7 +435,7 @@ def _union_parameters(statement: UnionQuery) -> tuple[str, ...]:
     statement rather than two that happen to run together.
     """
     seen: list[str] = []
-    for branch in (statement.left, statement.right):
+    for branch in statement.branches():
         for name in _Analyzer(branch).run().parameters:
             if name not in seen:
                 if len(seen) >= MAX_PARAMETERS:
@@ -447,153 +448,70 @@ def _union_parameters(statement: UnionQuery) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def analyze_union(statement: UnionQuery) -> QueryAnalysis:
+def analyze_union(statement: UnionQuery, bindings: tuple[Binding, ...] = (), depth: int = 0) -> QueryAnalysis:
     """Return what a union means, refusing one this engine cannot answer.
 
     Each branch is analysed on its own, because each is a whole query: its own bindings, its own
     grouping, its own similarity. What the UNION contributes is what survives it -- the column
-    names of the left branch and the parameters of both -- and nothing else does. No variable
-    crosses the boundary, so the combined analysis binds none: a name that meant a matched row
-    inside a branch has no meaning above the union, and carrying it up would say otherwise.
+    names of the left branch and the parameters of both. Branch-local variables never cross
+    the boundary. Exported columns retain native entity kind only when every non-null branch
+    proves that same kind; a shared spelling alone grants no entity authority.
     """
     refusal = union_refusal(statement)
     if refusal is not None:
         message, value = refusal
+        if value == "columns":
+            raise GrafxPlanError(message, field="union", value=value,
+                                 reason="different_columns_in_union", query_phase="planning")
+        if value == "composition":
+            raise GrafxPlanError(message, field="union", value=value,
+                                 reason="mixed_union_composition", query_phase="planning")
         raise GrafxPlanError(message, field="union", value=value)
-    left = _Analyzer(statement.left).run()
-    _Analyzer(statement.right).run()
+    branches = statement.branches()
+    analyses = tuple(_Analyzer(branch, bindings, depth).run() for branch in branches)
+    if any(item.output_columns != analyses[0].output_columns for item in analyses[1:]):
+        raise GrafxPlanError("UNION branches must return the same column names in the same order.",
+                             field="union", value="columns", reason="different_columns_in_union",
+                             query_phase="planning")
+    expanded = {id(branch): item.statement for branch, item in zip(branches, analyses, strict=True)}
+    def expand_tree(tree: Query | UnionQuery) -> Query | UnionQuery:
+        """Rebuild the UNION tree with each branch's expanded analysis statement."""
+        if isinstance(tree, Query):
+            return expanded[id(tree)]
+        return replace(tree, left=expand_tree(tree.left), right=expand_tree(tree.right))
+    statement = expand_tree(statement)
+    parameters = tuple(dict.fromkeys(name for item in analyses for name in item.parameters))
+    if len(parameters) > MAX_PARAMETERS:
+        raise GrafxPlanError("Too many parameters across UNION branches.", field="parameters")
+    # Entity authority survives only when every branch proves the same kind
+    # (NULL alternatives are neutral). Scalars/maps cannot acquire it by name.
+    outputs = []
+    for position, name in enumerate(analyses[0].output_columns):
+        proven = []
+        for item in analyses:
+            expression = item.statement.return_clause.items[position].expression
+            if isinstance(expression, Variable):
+                binding = item.binding(expression.name)
+            elif isinstance(expression, Literal) and expression.value is None:
+                binding = Binding(name=name, entity=ENTITY_NULL, labels=(), created=False)
+            else:
+                binding = None
+            proven.append(binding)
+        kinds = {binding.entity for binding in proven if binding is not None and binding.entity != ENTITY_NULL}
+        if all(binding is not None for binding in proven) and len(kinds) == 1:
+            kind = next(iter(kinds))
+            if kind in (ENTITY_NODE, ENTITY_RELATIONSHIP, ENTITY_PATH, NODE_LIST, RELATIONSHIP_LIST):
+                labels = {binding.labels for binding in proven if binding.entity != ENTITY_NULL}
+                outputs.append(Binding(name=name, entity=kind, labels=next(iter(labels)) if len(labels) == 1 else (),
+                                       created=False))
     return QueryAnalysis(
         statement=statement,
-        parameters=_union_parameters(statement),
-        output_columns=left.output_columns,
+        parameters=parameters,
+        output_columns=analyses[0].output_columns,
+        bindings=tuple(outputs),
     )
 
 
-_UNTYPED_HOP_SOURCE = "a"
-_UNTYPED_HOP_RELATIONSHIP = "r"
-_UNTYPED_HOP_TARGET = "b"
-_UNTYPED_HOP_LABEL = "Decision"
-_UNTYPED_HOP_PROPERTY = "id"
-"""The literal statement an untyped hop is admitted as, spelled out rather than generalised.
-
-Naming the pieces is what makes the narrowness reviewable: a reader can see that this admits one
-statement and can count the ways it could have admitted more.
-"""
-
-
-def untyped_one_hop_source(query: Query) -> NodePattern | None:
-    """Return the source node when this statement is the one untyped hop this engine reads.
-
-    A relationship without a type names no table, and a table is what a traversal walks. Exactly
-    one statement is admitted, and it is admitted LITERALLY -- ``MATCH (a:Decision)-[r]->(b)
-    RETURN a.id``, those names and that label -- rather than as a family that resembles it. The
-    difference is not pedantry: a rule written for "any label, any names" admits a whole class of
-    statements this milestone never measured, and a milestone that admits what it did not measure
-    is one that shipped a guess. The tables the hop could live in are the relationship tables
-    leaving ``Decision``, and the answer is their union in a fixed order.
-
-    Everything else stays refused where it was refused before. This function does not REFUSE
-    anything: it recognises, and a statement it does not recognise reaches the same message it
-    reached before this milestone -- which is what keeps every other untyped shape, and the text
-    a caller already sees for it, exactly as it was.
-
-    Every field is checked for its exact type, because a tree built by hand can carry anything
-    in any of them and this decides whether a traversal fans out across tables.
-    """
-    # Every container and flag below is checked for its EXACT type, not merely for a length or
-    # for truthiness. A tree built by hand can carry a list where a tuple belongs and ``0`` where
-    # a bool belongs, and both slip past ``len(...)`` and ``or flag`` while meaning something
-    # this milestone never measured. The narrowness of this form is the whole reason it is
-    # admitted, so the shape it claims has to be the shape it has.
-    if type(query) is not Query:
-        return None
-    if query.unwind_clause is not None:
-        return None
-    for container in (query.match_clauses, query.with_clauses, query.updating_clauses):
-        if type(container) is not tuple:
-            return None
-    if query.with_clauses or query.updating_clauses:
-        return None
-    if len(query.match_clauses) != 1:
-        return None
-    clause = query.match_clauses[0]
-    if type(clause) is not MatchClause:
-        return None
-    if type(clause.optional) is not bool or clause.optional:
-        return None
-    if clause.predicate is not None:
-        return None
-    if type(clause.patterns) is not tuple or len(clause.patterns) != 1:
-        return None
-    pattern = clause.patterns[0]
-    if type(pattern) is not PatternPath or pattern.variable is not None:
-        return None
-    if type(pattern.nodes) is not tuple or len(pattern.nodes) != 2:
-        return None
-    if type(pattern.relationships) is not tuple or len(pattern.relationships) != 1:
-        return None
-    source, target = pattern.nodes
-    hop = pattern.relationships[0]
-    if type(source) is not NodePattern or type(target) is not NodePattern:
-        return None
-    if type(hop) is not RelationshipPattern:
-        return None
-    if type(hop.types) is not tuple or type(source.labels) is not tuple:
-        return None
-    if type(target.labels) is not tuple:
-        return None
-    if hop.direction is not Direction.OUTGOING:
-        return None
-    if hop.types or hop.properties is not None:
-        return None
-    if type(hop.hop_range_written) is not bool or hop.hop_range_written:
-        return None
-    if type(hop.min_hops) is not int or type(hop.max_hops) is not int:
-        return None
-    if hop.min_hops != 1 or hop.max_hops != 1:
-        return None
-    if type(hop.variable) is not str or not hop.variable:
-        return None
-    if hop.variable != _UNTYPED_HOP_RELATIONSHIP:
-        return None
-    if type(source.variable) is not str or source.variable != _UNTYPED_HOP_SOURCE:
-        return None
-    if len(source.labels) != 1 or type(source.labels[0]) is not str:
-        return None
-    if source.labels[0] != _UNTYPED_HOP_LABEL:
-        return None
-    if source.properties is not None:
-        return None
-    if type(target.variable) is not str or target.variable != _UNTYPED_HOP_TARGET:
-        return None
-    if target.labels or target.properties is not None:
-        return None
-    returned = query.return_clause
-    if type(returned) is not ReturnClause:
-        return None
-    if type(returned.distinct) is not bool or returned.distinct:
-        return None
-    if type(returned.sort_items) is not tuple or returned.sort_items:
-        return None
-    if returned.skip is not None or returned.limit is not None:
-        return None
-    if type(returned.items) is not tuple or len(returned.items) != 1:
-        return None
-    item = returned.items[0]
-    if type(item) is not ReturnItem or item.alias is not None:
-        return None
-    if type(item.expression) is not Property:
-        return None
-    subject = item.expression.subject
-    if type(subject) is not Variable or type(subject.name) is not str:
-        return None
-    if subject.name != _UNTYPED_HOP_SOURCE:
-        return None
-    if type(item.expression.key) is not str:
-        return None
-    if item.expression.key != _UNTYPED_HOP_PROPERTY:
-        return None
-    return source
 
 
 def _is_literal_row_count(value: object) -> bool:
@@ -620,11 +538,12 @@ def exact_path_projection(query: Query) -> PatternPath | None:
     """Return the path when ``query`` is a typed one-hop path projection, else None.
 
     The admitted shape is ``MATCH path = (a:Label)-[r:Type]->``
-    ``(b:Label) RETURN path`` at the AST boundary, optionally followed by ``LIMIT`` and a
-    literal non-negative integer.  Lexical trivia the parser discards --
+    ``(b:Label) RETURN expression`` at the AST boundary, with at least one expression
+    using the path. Aliases and native path functions are permitted, optionally followed
+    by ``LIMIT`` and a literal non-negative integer. Lexical trivia the parser discards --
     whitespace, keyword case and a trailing semicolon -- is deliberately not reconstructed.
     Every semantic field, class, container, flag and identifier is checked exactly so a tree a
-    caller built cannot widen it into ranges, arbitrary joins or path expressions.
+    caller built cannot widen it into ranges or arbitrary joins.
     Names and schema identifiers are caller-defined; catalog binding proves both endpoints.
 
     This recognises and never refuses.  A miss reaches the pre-existing named-path refusal, which
@@ -699,15 +618,23 @@ def exact_path_projection(query: Query) -> PatternPath | None:
         return None
     if returned.limit is not None and not _is_literal_row_count(returned.limit):
         return None
-    if type(returned.items) is not tuple or len(returned.items) != 1:
+    if type(returned.items) is not tuple or not returned.items:
         return None
-    item = returned.items[0]
-    if type(item) is not ReturnItem or item.alias is not None:
+    if any(type(item) is not ReturnItem for item in returned.items):
         return None
-    expression = item.expression
-    if type(expression) is not Variable or type(expression.name) is not str:
+    for item in returned.items:
+        for expression in walk(item.expression):
+            if (isinstance(expression, Property) and isinstance(expression.subject, Variable)
+                    and expression.subject.name == pattern.variable):
+                return None
+            if (isinstance(expression, FunctionCall) and expression.name.upper() == SIZE_FUNCTION
+                    and any(isinstance(arg, Variable) and arg.name == pattern.variable
+                            for arg in expression.arguments)):
+                return None
+    if any(isinstance(node, Variable) and (type(node) is not Variable or type(node.name) is not str)
+           for item in returned.items for node in walk(item.expression)):
         return None
-    if expression.name != pattern.variable:
+    if not any(pattern.variable in free_variables(item.expression) for item in returned.items):
         return None
     return pattern
 
@@ -763,45 +690,34 @@ def optional_match_refusal(query: Query) -> tuple[str, str] | None:
     asked to render itself while the refusal was being built, and a refusal that raises reports
     nothing at all.
     """
+    pipeline = query.clause_pipeline
+    if type(pipeline) is not tuple:
+        return "A query pipeline is an immutable tuple of clauses.", "pipeline"
+    if len(query.ordered_clauses()) + (query.return_clause is not None) > MAX_PIPELINE_CLAUSES:
+        return "A query exceeds its written pipeline clause limit.", "clauses"
+    if pipeline:
+        accepted = (MatchClause, WithClause, UnwindClause, SubqueryClause, ProcedureCall,
+                    CreateClause, MergeClause, SetClause, DeleteClause)
+        if any(type(clause) not in accepted for clause in pipeline):
+            return "A query pipeline contains an unknown clause.", "pipeline"
+        if (tuple(c for c in pipeline if isinstance(c, MatchClause)) != query.match_clauses
+                or tuple(c for c in pipeline if isinstance(c, WithClause)) != query.with_clauses
+                or tuple(c for c in pipeline if isinstance(c, (CreateClause, MergeClause, SetClause, DeleteClause))) != query.updating_clauses
+                or next((c for c in pipeline if isinstance(c, UnwindClause)), None) != query.unwind_clause):
+            return "A query pipeline must agree with its clause inventory and write classification.", "pipeline"
     order = query.read_clause_order
     if type(order) is not tuple or any(type(kind) is not str or kind not in ("match", "with") for kind in order):
         return "A reading pipeline records only MATCH and WITH clause kinds.", "clause"
     if order and (order.count("match") != len(query.match_clauses)
                   or order.count("with") != len(query.with_clauses)):
         return "A reading pipeline must include each MATCH and WITH exactly once.", "clause"
-    if order and not correlated_optional_pipeline(query):
-        return "Interleaved projections require correlated optional incident reads.", "clause"
     for clause in query.match_clauses:
         if type(clause.optional) is not bool:
             return (
                 "A MATCH clause records whether it was written OPTIONAL as a boolean.",
                 "optional",
             )
-    optional = [clause for clause in query.match_clauses if clause.optional]
-    if not optional:
-        return None
-    if correlated_optional_pipeline(query):
-        return None
-    if len(query.match_clauses) != 1:
-        return (
-            "A chained OPTIONAL MATCH requires one labelled anchor and one correlated hop.",
-            "clause",
-        )
-    if query.unwind_clause is not None or query.with_clauses or query.updating_clauses:
-        return (
-            "An OPTIONAL MATCH begins a query that only reads: no UNWIND, WITH or writing "
-            "clause may accompany it.",
-            "clause",
-        )
-    if query.return_clause is None:
-        # The admitted form is a query that ANSWERS. A statement that only reads and returns
-        # nothing has no rows to extend, and admitting it would make the extension a write the
-        # caller never sees rather than a row it reads.
-        return (
-            "An OPTIONAL MATCH belongs to a query that ends with RETURN.",
-            "clause",
-        )
-    return optional_clause_defect(optional[0])
+    return None
 
 
 def correlated_optional_pipeline(query: Query) -> bool:
@@ -877,89 +793,46 @@ def _is_written_path_name(value: object) -> bool:
     )
 
 
-def _named_path_detail(named: PatternPath) -> str:
-    """Return a refusal detail that is safe on a tree already known to be malformed.
 
-    The pattern is NOT written back here. By the time this is asked the shape has already been
-    judged wrong, and a wrong shape is exactly the one ``describe()`` cannot walk: a path with
-    one node and one relationship indexes past its own nodes. A refusal that raises while
-    building its own message is worse than the mistake it was reporting.
-    """
-    variable = named.variable
-    return variable if _is_written_path_name(variable) else "a named path"
 
 
 def named_path_refusal(query: Query) -> tuple[str, str] | None:
-    """Return the refusal a named path earns outside its one shape, or None.
-
-    One function, asked by the analysis and asked again by the planner: a tree that never
-    passed the parser reaches the first, and a caller's own analysis walks past it to the
-    second. The name is decorative, so admitting it in one written form costs nothing at
-    runtime -- and admitting it anywhere else would mean deciding what READING one means.
-    """
-    named = named_path(query)
-    if named is None:
-        return None
-    reason = _named_path_shape_reason(query, named)
-    if reason is None:
-        return None
-    return (
-        "A named path is written and never read in this subset, and it is admitted in exactly "
-        f"one shape: {NAMED_PATH_SHAPE}. {reason}",
-        _named_path_detail(named),
-    )
+    """Admit composed read captures; retain explicit bounds for unimplemented paths."""
+    refusal = _named_path_refusal_detail(query)
+    return None if refusal is None else refusal[:2]
 
 
-def _named_path_shape_reason(query: Query, named: PatternPath) -> str | None:
-    """Return what this statement does that the one shape does not allow, or None."""
-    if not _is_written_path_name(named.variable):
-        return "A path is named with a name the parser could have written."
-    for node in named.nodes:
-        if node.variable is not None and type(node.variable) is not str:
-            return "A node of a named path is named with a name the parser could have written."
-        if node.variable == named.variable:
-            return "The name of a path is not the name of a node in it."
-    for relationship in named.relationships:
-        if relationship.variable is not None and type(relationship.variable) is not str:
-            return (
-                "A relationship of a named path is named with a name the parser could have "
-                "written."
-            )
-        if relationship.variable == named.variable:
-            return "The name of a path is not the name of a relationship in it."
-    if query.unwind_clause is not None:
-        return "This one follows an UNWIND."
-    if query.with_clauses:
-        return "This query carries a WITH."
-    if query.updating_clauses:
-        return "This query writes, and a pattern being written is not one to refer back to."
-    if query.return_clause is None:
-        return "This query has no RETURN."
-    if len(query.match_clauses) != 1:
-        return f"This query has {len(query.match_clauses)} MATCH clauses."
-    patterns = query.match_clauses[0].patterns
-    if len(patterns) != 1:
-        return f"This MATCH carries {len(patterns)} patterns."
-    if patterns[0] is not named:
-        return "The named path is not the pattern this MATCH reads."
-    if len(named.relationships) != 1 or len(named.nodes) != 2:
-        return "A named path here spans exactly one hop between two nodes."
-    relationship = named.relationships[0]
-    if relationship.variable is None or len(relationship.types) != 1:
-        return "The hop of a named path is named and carries exactly one type."
-    if relationship.direction is not Direction.OUTGOING:
-        return "A named path points one way, from its first node to its second."
-    if relationship.variable_length or relationship.hop_range_written:
-        return "A named path spans one hop, so it carries no range."
-    if relationship.properties is not None:
-        return "The hop of a named path carries no inline property map."
-    for node in named.nodes:
-        if node.variable is None:
-            return "Both ends of a named path are named."
-        if len(node.labels) != 1:
-            return "Both ends of a named path name exactly one label."
-        if node.properties is not None:
-            return "Neither end of a named path carries an inline property map."
+def _named_path_refusal_detail(query: Query) -> tuple[str, str, str | None] | None:
+    """Retain raise-site evidence without changing the public two-field summary."""
+    for clause in query.updating_clauses:
+        patterns = clause.patterns if isinstance(clause, CreateClause) else (
+            (clause.pattern,) if isinstance(clause, MergeClause) else ())
+        for pattern in patterns:
+            if pattern.variable is not None:
+                if not _is_written_path_name(pattern.variable):
+                    return "A path needs a parser-compatible name.", "path", None
+                if len(pattern.nodes) != len(pattern.relationships) + 1:
+                    return "Named capture requires alternating nodes and relationship segments.", pattern.variable, None
+    for clause in query.match_clauses:
+        for pattern_position, pattern in enumerate(clause.patterns):
+            if pattern.variable is None:
+                continue
+            if not _is_written_path_name(pattern.variable):
+                return "A path needs a parser-compatible name.", "path", None
+            if len(pattern.nodes) != len(pattern.relationships) + 1:
+                return "Named capture requires alternating nodes and relationship segments.", pattern.variable, None
+            # Capture follows its own entities and earlier comma-separated
+            # patterns. Later entity use of an existing path is a type conflict,
+            # not a second path declaration. Preserve this source-order distinction.
+            preceding_patterns = clause.patterns[:pattern_position + 1]
+            for node in (node for candidate in preceding_patterns for node in candidate.nodes):
+                if (node.variable is not None and type(node.variable) is not str) or node.variable == pattern.variable:
+                    return ("A path name must differ from its node variables.", pattern.variable,
+                            "variable_already_bound" if node.variable == pattern.variable else None)
+            for edge in (edge for candidate in preceding_patterns for edge in candidate.relationships):
+                if (edge.variable is not None and type(edge.variable) is not str) or edge.variable == pattern.variable:
+                    return ("A path name must differ from its relationship variable.", pattern.variable,
+                            "variable_already_bound" if edge.variable == pattern.variable else None)
     return None
 
 
@@ -976,8 +849,11 @@ def contains_aggregate(expression: Expression) -> bool:
     return any(is_aggregate(node) for node in walk(expression))
 
 
-def analyze(statement: Statement) -> QueryAnalysis:
+def analyze(statement: Statement, *, bindings: tuple[Binding, ...] = (), depth: int = 0) -> QueryAnalysis:
     """Return what a statement means, refusing one that parses but cannot be answered."""
+    validate_structure(statement)
+    if depth > 16:
+        raise GrafxPlanError("Subqueries may nest at most 16 levels.", field="subquery_depth")
     if isinstance(
         statement,
         (
@@ -991,14 +867,14 @@ def analyze(statement: Statement) -> QueryAnalysis:
             statement=statement, parameters=_parameters_of_schema(statement)
         )
     if type(statement) is UnionQuery:
-        return analyze_union(statement)
+        return analyze_union(statement, bindings, depth)
     if not isinstance(statement, Query):
         raise GrafxPlanError(
             f"A statement of type {type(statement).__name__} cannot be planned.",
             field="statement",
             value=type(statement).__name__,
         )
-    return _Analyzer(statement).run()
+    return _Analyzer(statement, bindings, depth).run()
 
 
 def _parameters_of_schema(statement: Statement) -> tuple[str, ...]:
@@ -1027,23 +903,27 @@ class _Analyzer:
         "_query",
         "_bindings",
         "_discarded",
-        "_projected_path",
-        "_path_names",
         "_parameters",
         "_similarity",
         "_scores",
+        "_depth",
     )
 
-    def __init__(self, query: Query) -> None:
+    def __init__(self, query: Query, bindings: tuple[Binding, ...] = (), depth: int = 0) -> None:
         self._query = query
-        self._bindings: list[Binding] = []
+        available = {binding.name for binding in bindings}
+        if query.scope_imports is not None:
+            if len(set(query.scope_imports)) != len(query.scope_imports) or not set(query.scope_imports) <= available:
+                raise GrafxPlanError("Query imports require their enclosing lexical bindings.", field="imports")
+            bindings = tuple(binding for binding in bindings if binding.name in query.scope_imports)
+        if (len(set(query.global_imports)) != len(query.global_imports)
+                or not set(query.global_imports) <= {binding.name for binding in bindings}):
+            raise GrafxPlanError("Global imports require their enclosing lexical bindings.", field="imports")
+        self._bindings: list[Binding] = list(bindings)
+        self._depth = depth
         # The names a WITH stopped carrying, kept only so that reading one below it
         # is refused for what it is rather than as a variable nothing ever bound.
         self._discarded: set[str] = set()
-        self._projected_path = exact_path_projection(query)
-        # Every other path name is recorded so a collision is a refusal and a read earns the
-        # established path-specific error rather than looking like an ordinary unbound name.
-        self._path_names: set[str] = set()
         self._parameters: list[str] = []
         self._similarity: SimilarityUse | None = None
         self._scores = False
@@ -1054,9 +934,12 @@ class _Analyzer:
         if refusal is not None:
             message, value = refusal
             raise self._refuse(message, field="hops", value=value)
-        refusal = named_path_refusal(self._query)
+        refusal = _named_path_refusal_detail(self._query)
         if refusal is not None:
-            message, value = refusal
+            message, value, reason = refusal
+            if reason is not None:
+                raise self._refuse(message, field="pattern", value=value,
+                                   reason=reason, query_phase="planning")
             raise self._refuse(message, field="pattern", value=value)
         refusal = polymorphic_node_refusal(self._query)
         if refusal is not None:
@@ -1066,32 +949,37 @@ class _Analyzer:
         if refusal is not None:
             message, value = refusal
             raise self._refuse(message, field="clause", value=value)
-        if self._query.unwind_clause is not None and self._query.with_clauses:
-            # The parser refuses this text, but the parser is one door and not the only one:
-            # a tree handed straight to analyze() never passed it, and the meaning of a
-            # statement is decided here.
-            raise self._refuse(
-                "UNWIND hands its elements straight to the clauses below it in this subset; "
-                "WITH may not reshape them.",
-                field="clause",
-                value="WITH",
-            )
-        if self._query.unwind_clause is not None:
-            self._unwind_clause(self._query.unwind_clause)
-        for clause in self._query.ordered_read_clauses():
+        for clause in self._query.ordered_clauses():
+            if isinstance(clause, UnwindClause):
+                self._unwind_clause(clause)
+                continue
             if isinstance(clause, MatchClause):
-                if clause.optional and len(self._query.match_clauses) > 1:
-                    source = clause.patterns[0].nodes[0].variable
-                    self._require_bound(source, "a correlated OPTIONAL MATCH")
-                    for name in (clause.patterns[0].nodes[1].variable,
-                                 clause.patterns[0].relationships[0].variable):
-                        if name and (self._binding(name) is not None or name in self._discarded):
-                            raise self._refuse("An optional incident hop introduces fresh endpoint and relationship names.", field="variable", value=name)
                 self._match_clause(clause)
-            else:
+            elif isinstance(clause, WithClause):
                 self._with_clause(clause)
-        for clause in self._query.updating_clauses:
-            self._updating_clause(clause)
+            elif isinstance(clause, SubqueryClause):
+                self._subquery_clause(clause)
+            elif isinstance(clause, ProcedureCall):
+                for argument in clause.arguments:
+                    self._check_expression(argument, where="a procedure argument")
+                    self._refuse_aggregate(argument, "CALL")
+                for item in clause.yields:
+                    if not isinstance(item.expression, Variable):
+                        raise self._refuse("YIELD must bind a new name to a declared output column.", field="yield")
+                    if self._binding(item.name) is not None:
+                        raise self._refuse("YIELD cannot replace an existing binding.", field="yield",
+                                           value=item.name, reason="variable_already_bound", query_phase="planning")
+                    kind = {"NODE": ENTITY_NODE, "RELATIONSHIP": ENTITY_RELATIONSHIP, "PATH": ENTITY_PATH,
+                            "LIST<NODE>": NODE_LIST, "LIST<RELATIONSHIP>": RELATIONSHIP_LIST}.get(
+                                dict(clause.result_types).get(item.expression.name), ENTITY_PROJECTED)
+                    self._bind(item.name, kind, (), created=False)
+                if clause.predicate is not None:
+                    self._check_expression(clause.predicate, where="YIELD WHERE")
+                    self._refuse_aggregate(clause.predicate, "YIELD WHERE")
+            else:
+                self._updating_clause(clause)
+        if self._query.return_clause is None and not self._query.writes:
+            raise self._refuse("A read query must end in RETURN.", field="clause", value="RETURN")
         grouping, aggregations = self._return_clause()
         if (self._similarity is not None and self._query.with_clauses
                 and any(clause.optional for clause in self._query.match_clauses)):
@@ -1125,39 +1013,146 @@ class _Analyzer:
     def _match_clause(self, clause: MatchClause) -> None:
         """Bind the variables of a MATCH clause and check its predicate."""
         for pattern in clause.patterns:
+            self._require_read_pattern(pattern)
+        for pattern in clause.patterns:
             self._name_path(pattern)
         for pattern in clause.patterns:
             self._bind_pattern(pattern, created=False)
         if clause.predicate is not None:
             self._check_expression(clause.predicate, where="a WHERE predicate")
-            if contains_aggregate(clause.predicate):
+            self._refuse_aggregate(clause.predicate, "WHERE", field="predicate")
+
+    def _require_read_pattern(self, pattern: PatternPath) -> None:
+        """Validate ranges and relationship uniqueness, including expression-local patterns."""
+        refusal = hop_range_refusal(Query(match_clauses=(MatchClause(patterns=(pattern,)),)))
+        if refusal is not None:
+            raise self._refuse(refusal[0], field="hops", value=refusal[1])
+        seen: set[str] = set()
+        for relationship in pattern.relationships:
+            name = relationship.variable
+            if name is not None and name in seen:
                 raise self._refuse(
-                    "An aggregate cannot appear in WHERE, because there is no group to "
-                    "aggregate over until the rows are projected.",
-                    field="predicate",
-                    value=clause.predicate.describe(),
+                    "A relationship variable cannot occur twice in one connected read pattern.",
+                    field="variable", value=name,
+                    reason="relationship_uniqueness_violation", query_phase="planning",
                 )
+            if name is not None:
+                seen.add(name)
+
+    def _subquery_clause(self, clause: SubqueryClause) -> None:
+        """Check imported scope independently and publish only explicit RETURN columns."""
+        original = clause
+        if clause.import_mode not in ("explicit", "all", "with", "with_resolved"):
+            raise self._refuse("Unknown subquery import mode.", field="imports")
+        if clause.import_mode == "all":
+            if clause.imports or clause.outer_names:
+                raise self._refuse("Wildcard imports cannot include explicit mappings.", field="imports")
+            clause = replace(clause, imports=tuple(binding.name for binding in self._bindings), import_mode="explicit")
+        if clause.import_mode == "with":
+            from okto_grafx.domain.query.subquery_scope import resolve_with_imports
+            query, names = resolve_with_imports(clause.query, tuple(binding.name for binding in self._bindings))
+            clause = replace(clause, query=query, imports=names, import_mode="with_resolved")
+        elif clause.import_mode == "explicit":
+            from okto_grafx.domain.query.subquery_scope import scope_branches
+            clause = replace(clause, query=scope_branches(clause.query, clause.imports, persistent=True))
+        if len(clause.imports) > MAX_PROJECTION_ITEMS:
+            raise self._refuse("Too many imported variables.", field="imports", value=MAX_PROJECTION_ITEMS)
+        if clause is not original:
+            self._query = replace(self._query, clause_pipeline=tuple(
+                clause if candidate is original else candidate for candidate in self._query.ordered_clauses()))
+        if (type(clause.imports) is not tuple or len(set(clause.imports)) != len(clause.imports)
+                or any(type(name) is not str for name in clause.imports)):
+            raise self._refuse("Subquery imports must be unique variable names.", field="imports")
+        outer = clause.outer_names or clause.imports
+        if len(outer) != len(clause.imports):
+            raise self._refuse("Subquery import mapping has wrong arity.", field="imports")
+        imported = []
+        for source, target in zip(outer, clause.imports, strict=True):
+            self._require_bound(source, "a subquery import")
+            binding = self._binding(source)
+            assert binding is not None
+            imported.append(replace(binding, name=target))
+        inner = analyze(clause.query, bindings=tuple(imported), depth=self._depth + 1)
+        if inner.statement is not clause.query:
+            updated = replace(clause, query=inner.statement)
+            self._query = replace(self._query, clause_pipeline=tuple(
+                updated if candidate is clause else candidate for candidate in self._query.ordered_clauses()))
+            clause = updated
+        exported = clause.output_aliases or inner.output_columns
+        if len(exported) != len(inner.output_columns):
+            raise self._refuse("Subquery output mapping has wrong arity.", field="subquery")
+        for position, name in enumerate(exported):
+            if self._binding(name) is not None:
+                raise self._refuse("A subquery cannot overwrite an outer variable.", field="variable", value=name)
+            carried = None
+            if isinstance(clause.query, UnionQuery):
+                carried = inner.binding(inner.output_columns[position])
+            if isinstance(clause.query, Query) and clause.query.return_clause is not None:
+                expression = clause.query.return_clause.items[position].expression
+                if isinstance(expression, Variable):
+                    carried = inner.binding(expression.name)
+                elif isinstance(expression, Literal) and expression.value is None:
+                    carried = Binding(name=name, entity=ENTITY_NULL, labels=(), created=False)
+            if carried is not None:
+                self._bindings.append(replace(carried, name=name))
+            else:
+                self._bind(name, ENTITY_PROJECTED, (), created=False)
+        for name in inner.parameters:
+            if name not in self._parameters:
+                self._parameters.append(name)
+        if len(self._parameters) > MAX_PARAMETERS:
+            raise self._refuse("Too many parameters across subqueries.", field="parameters")
 
     def _updating_clause(self, clause: object) -> None:
         """Bind and check one clause that writes."""
         if isinstance(clause, CreateClause):
             for pattern in clause.patterns:
                 self._require_writable_pattern(pattern, "CREATE")
+                self._name_path(pattern)
                 self._bind_pattern(pattern, created=True)
             return
         if isinstance(clause, MergeClause):
+            if len(clause.on_create) + len(clause.on_match) > MAX_CLAUSES:
+                raise self._refuse("Too many MERGE actions.", field="clauses")
             self._require_writable_pattern(clause.pattern, "MERGE")
+            self._name_path(clause.pattern)
             self._bind_pattern(clause.pattern, created=True)
+            for action in (*clause.on_create, *clause.on_match):
+                self._updating_clause(action)
             return
         if isinstance(clause, SetClause):
+            if clause.keyword not in ("SET", "REMOVE"):
+                raise self._refuse("Invalid mutation keyword.", field="clause")
             for item in clause.items:
-                self._require_bound_subject(item.target, "SET")
+                if isinstance(item, LabelSetItem):
+                    if item.remove != (clause.keyword == "REMOVE"):
+                        raise self._refuse("Label mutation disagrees with its clause.", field="clause")
+                    self._require_bound(item.target.name, "REMOVE" if item.remove else "SET")
+                    binding = self._binding(item.target.name)
+                    if binding is not None and binding.entity == ENTITY_RELATIONSHIP:
+                        raise self._refuse("Labels can only be changed on nodes.", field="target",
+                                           reason="label_assignment_type", query_phase="planning")
+                    if not item.labels or any(not name for name in item.labels):
+                        raise self._refuse("A label assignment needs nonempty names.", field="label")
+                    continue
+                if clause.keyword == "REMOVE" and (item.merge or item.value != Literal(None)):
+                    raise self._refuse("Property REMOVE cannot assign a value.", field="clause")
+                if isinstance(item.target, Variable):
+                    self._require_bound_entity(item.target.name, "SET")
+                else:
+                    if item.merge:
+                        raise self._refuse("SET += requires a whole entity target.", field="target")
+                    self._require_bound_subject(item.target, "SET")
                 self._check_expression(item.value, where="a SET value")
                 self._refuse_aggregate(item.value, "SET")
             return
         if isinstance(clause, DeleteClause):
             for target in clause.targets:
-                self._require_bound_entity(target.name, "DELETE")
+                self._check_expression(target, where="a DELETE target")
+                self._refuse_aggregate(target, "DELETE")
+                if isinstance(target, LabelPredicate):
+                    raise self._refuse("DELETE cannot remove a label or relationship type.",
+                                       field="target", reason="invalid_delete", query_phase="planning")
             return
         raise self._refuse(
             f"A clause of type {type(clause).__name__} cannot be planned.",
@@ -1170,7 +1165,21 @@ class _Analyzer:
         clause = self._query.return_clause
         if clause is None:
             return (), ()
+        if type(clause.include_existing) is not bool:
+            raise self._refuse("RETURN wildcard flag must be a boolean.", field="include_existing")
+        if clause.include_existing:
+            names = sorted(binding.name for binding in self._bindings)
+            if not names:
+                raise self._refuse("RETURN * requires variables in scope.", field="return_star",
+                                   reason="no_variables_in_scope", query_phase="planning")
+            items = tuple(ReturnItem(expression=Variable(name)) for name in names) + clause.items
+            if len(items) > MAX_PROJECTION_ITEMS:
+                raise self._refuse("Expanded RETURN exceeds the projection limit.", field="items",
+                                   value=MAX_PROJECTION_ITEMS)
+            clause = replace(clause, items=items, include_existing=False)
+            self._query = replace(self._query, return_clause=clause)
         self._require_unique_output_columns(clause)
+        self._check_grouping_expressions(clause.items, clause.sort_items)
         grouping: list[int] = []
         aggregations: list[Aggregation] = []
         for position, item in enumerate(clause.items):
@@ -1181,7 +1190,25 @@ class _Analyzer:
                 continue
             for call in found:
                 aggregations.append(Aggregation(position=position, call=call))
-        self._check_sort_keys(clause, bool(aggregations))
+        incoming = self._bindings
+        alias_bindings = []
+        for item in clause.items:
+            if item.alias is None:
+                continue
+            if isinstance(item.expression, Variable):
+                carried = self._binding(item.expression.name)
+                assert carried is not None
+                alias_bindings.append(replace(carried, name=item.alias))
+            else:
+                proof = entity_sources(item.expression, lambda name: self._binding(name).entity if self._binding(name) else None)
+                alias_bindings.append(Binding(name=item.alias, entity=proof[0] if proof else ENTITY_PROJECTED,
+                                              labels=(), created=False))
+        alias_names = {binding.name for binding in alias_bindings}
+        self._bindings = alias_bindings + [binding for binding in incoming if binding.name not in alias_names]
+        try:
+            self._check_sort_keys(clause, bool(aggregations))
+        finally:
+            self._bindings = incoming
         self._check_row_window(clause.skip, "SKIP")
         self._check_row_window(clause.limit, "LIMIT")
         if self._scores and self._similarity is None:
@@ -1205,6 +1232,7 @@ class _Analyzer:
                     "must identify exactly one item.",
                     field="alias" if explicit_collision else "column",
                     value=name,
+                    reason="column_name_conflict", query_phase="planning",
                 )
             seen[name] = item.alias is not None
 
@@ -1218,7 +1246,26 @@ class _Analyzer:
         """
         aliases = {item.alias for item in clause.items if item.alias is not None}
         projected = {item.expression for item in clause.items}
+        projected_variables = {item.expression.name for item in clause.items if isinstance(item.expression, Variable)} | aliases
         for key in clause.sort_items:
+            if aggregated or clause.distinct:
+                # These rows no longer grant access to discarded input bindings.
+                # Reuse complete projected expressions inside compound keys first,
+                # then validate the remainder against the actual output scope.
+                normalized = returned_reference(key.expression, clause.items)
+                incoming = self._bindings
+                self._bindings = [
+                    replace(carried, name=item.name) if (carried := self._binding(item.alias or
+                        (item.expression.name if isinstance(item.expression, Variable) else item.name))) is not None
+                    else Binding(name=item.name, entity=ENTITY_PROJECTED, labels=(), created=False)
+                    for item in clause.items
+                ]
+                try:
+                    self._check_expression(normalized, where="an ORDER BY key")
+                    self._refuse_aggregate(normalized, "the ORDER BY of a grouped or DISTINCT RETURN")
+                finally:
+                    self._bindings = incoming
+                continue
             if isinstance(key.expression, Variable) and key.expression.name in aliases:
                 # An alias names a column of this clause's own result, so it is resolved before
                 # the key is treated as an expression over bound variables -- otherwise every
@@ -1227,44 +1274,39 @@ class _Analyzer:
             self._check_expression(key.expression, where="an ORDER BY key")
             if key.expression in projected:
                 continue
+            if (isinstance(key.expression, Property) and isinstance(key.expression.subject, Variable)
+                    and key.expression.subject.name in projected_variables):
+                # A plain RETURN retains the incoming entity for sorting.
+                continue
             if contains_aggregate(key.expression):
                 raise self._refuse(
                     "An ORDER BY key that aggregates must be projected first and sorted by its "
                     f"name; {key.expression.describe()} is not one of the returned items.",
                     field="sort_item",
                     value=key.expression.describe(),
-                )
-            if aggregated or clause.distinct:
-                raise self._refuse(
-                    f"ORDER BY {key.expression.describe()} reads something this clause does not "
-                    "return, and after DISTINCT or an aggregate there is no row left to read "
-                    "it from.",
-                    field="sort_item",
-                    value=key.expression.describe(),
+                    reason="invalid_aggregation_context", query_phase="planning",
                 )
 
     def _check_row_window(self, expression: Expression | None, keyword: str) -> None:
-        """Refuse a SKIP or LIMIT that is not a whole number of rows."""
+        """Admit row-independent windows; literal failures are compile-time evidence."""
         if expression is None:
             return
-        if isinstance(expression, Parameter):
-            self._note_parameter(expression.name)
-            return
-        if isinstance(expression, Literal) and isinstance(expression.value, int):
-            if isinstance(expression.value, bool) or expression.value < 0:
-                raise self._refuse(
-                    f"{keyword} takes a count of rows that is zero or more; got "
-                    f"{expression.describe()}.",
-                    field=keyword.lower(),
-                    value=expression.describe(),
-                )
-            return
-        raise self._refuse(
-            f"{keyword} takes a whole number of rows or a parameter; got "
-            f"{expression.describe()}.",
-            field=keyword.lower(),
-            value=expression.describe(),
-        )
+        if set(free_variables(expression)) - set(self._query.global_imports) or contains_aggregate(expression):
+            raise self._refuse(f"{keyword} cannot depend on input rows.",
+                               field=keyword.lower(), reason="non_constant_window", query_phase="planning")
+        literal = expression
+        sign = 1
+        while isinstance(literal, UnaryOperation) and literal.operator in ("+", "-"):
+            sign *= -1 if literal.operator == "-" else 1
+            literal = literal.operand
+        if isinstance(literal, Literal):
+            value = literal.value
+            reason = ("window_argument_type" if type(value) is not int
+                      else "negative_window" if sign * value < 0 else None)
+            if reason is not None:
+                raise self._refuse(f"{keyword} takes a nonnegative whole number of rows.",
+                                   field=keyword.lower(), reason=reason, query_phase="planning")
+        self._check_expression(expression, where=f"{keyword} window")
 
     # --- patterns ----------------------------------------------------------------------------
 
@@ -1273,16 +1315,10 @@ class _Analyzer:
         name = pattern.variable
         if name is None:
             return
-        if pattern is self._projected_path:
-            # The exact recogniser proved both the whole statement and that this name cannot be
-            # read anywhere except its sole RETURN item.  Giving it a real binding keeps the
-            # published analysis honest without making any decorative named path readable.
-            self._bind(name, ENTITY_PATH, (), created=False)
-            return
-        # A name shared with a node or a relationship is refused by the shape gate, over the
-        # STATEMENT and before any of this runs, so that a caller supplying its own analysis
-        # meets the same rule. Recording the name here is what makes reading it refusable.
-        self._path_names.add(name)
+        if self._binding(name) is not None:
+            raise self._refuse("A captured path needs a new variable in this scope.", field="variable", value=name,
+                               reason="variable_already_bound", query_phase="planning")
+        self._bind(name, ENTITY_PATH, (), created=False)
 
     def _bind_pattern(self, pattern: PatternPath, *, created: bool) -> None:
         """Record every variable a pattern binds and check its inline property maps."""
@@ -1292,7 +1328,7 @@ class _Analyzer:
         for relationship in pattern.relationships:
             self._bind(
                 relationship.variable,
-                ENTITY_RELATIONSHIP,
+                ENTITY_RELATIONSHIP_LIST if relationship.hop_range_written else ENTITY_RELATIONSHIP,
                 relationship.types,
                 created=created,
             )
@@ -1316,7 +1352,10 @@ class _Analyzer:
         self._check_expression(clause.expression, where="an UNWIND list")
         # There is no group before the source, so an aggregate here has nothing to summarise.
         self._refuse_aggregate(clause.expression, "UNWIND")
-        self._bind(clause.alias, ENTITY_UNWOUND, (), created=False)
+        proof = entity_sources(clause.expression, lambda name: self._binding(name).entity if self._binding(name) else None)
+        kind = ({NODE_LIST: ENTITY_NODE, RELATIONSHIP_LIST: ENTITY_RELATIONSHIP}.get(proof[0], ENTITY_UNWOUND)
+                if proof is not None else ENTITY_UNWOUND)
+        self._bind(clause.alias, kind, (), created=False)
 
     def _with_clause(self, clause: WithClause) -> None:
         """Replace the scope with what this stage projects, then check the WHERE it carries.
@@ -1327,14 +1366,24 @@ class _Analyzer:
         those names arrive together; and a variable this stage did not carry is unreadable
         below it, because it is no longer in the scope the clauses under it are checked in.
 
-        The predicate is checked AFTER the substitution, because it belongs to this stage: it
-        reads the aliases just created and it runs once the projection has produced them.
+        Attached modifiers see output aliases and, for plain projection, incoming
+        bindings. DISTINCT/grouping modifiers reuse projected expressions instead
+        of reopening discarded rows. Only the projected scope survives the stage.
         """
 
         incoming = tuple(self._bindings)
+        if type(clause.include_existing) is not bool:
+            raise self._refuse("WITH include_existing must be boolean.", field="include_existing")
+        grouping_items = tuple(ReturnItem(expression=Variable(binding.name)) for binding in incoming) if clause.include_existing else ()
+        self._check_grouping_expressions(grouping_items + clause.items, clause.sort_items)
         created = {item.alias for item in clause.items if item.alias is not None}
-        projected: list[Binding] = []
+        projected: list[Binding] = list(incoming) if clause.include_existing else []
+        if len(projected) + len(clause.items) > MAX_PROJECTION_ITEMS:
+            raise self._refuse(f"A WITH clause may project at most {MAX_PROJECTION_ITEMS} items after star expansion.",
+                               field="items", value=MAX_PROJECTION_ITEMS)
         for item in clause.items:
+            if item.name in self._query.global_imports and item.expression != Variable(item.name):
+                raise self._refuse("An explicit subquery import cannot be redeclared.", field="imports", value=item.name)
             binding = self._projected_binding(item, created)
             if any(carried.name == binding.name for carried in projected):
                 raise self._refuse(
@@ -1342,17 +1391,101 @@ class _Analyzer:
                     "name once.",
                     field="item",
                     value=binding.name,
+                    reason="column_name_conflict", query_phase="planning",
                 )
             projected.append(binding)
+        names = {binding.name for binding in projected}
+        projected.extend(binding for binding in incoming
+                         if binding.name in self._query.global_imports and binding.name not in names)
         self._bindings = projected
         names = {binding.name for binding in projected}
         self._discarded.update(
             binding.name for binding in incoming if binding.name not in names
         )
         self._discarded.difference_update(names)
-        if clause.predicate is not None:
-            self._check_expression(clause.predicate, where="the WHERE of a WITH")
-            self._refuse_aggregate(clause.predicate, "the WHERE of a WITH")
+        normalized = replace(clause,
+                             sort_items=tuple(replace(key, expression=projected_reference(key.expression, clause.items))
+                                              for key in clause.sort_items),
+                             predicate=projected_reference(clause.predicate, clause.items))
+        self._query = replace(self._query, clause_pipeline=tuple(
+            normalized if candidate is clause else candidate for candidate in self._query.ordered_clauses()))
+        clause = normalized
+        grouped = any(contains_aggregate(item.expression) for item in clause.items)
+        for key in clause.sort_items:
+            # No aggregate is valid in this normalized, non-grouped sort context.
+            # Prove that before resolving arguments against the projected scope;
+            # otherwise a dropped argument masks the real invalid aggregation.
+            if grouped:
+                # Aggregation has discarded the input scope. Resolve surviving
+                # names before deciding whether a new aggregate is legal here.
+                for name in free_variables(key.expression):
+                    self._require_bound(name, "the ORDER BY of a grouped WITH")
+            self._refuse_aggregate(key.expression, "the ORDER BY of a WITH")
+        # Plain projection modifiers can read their input as well as their output;
+        # output aliases shadow input names. DISTINCT/grouping have discarded
+        # that input identity and cannot reopen it for ordering.
+        if not clause.distinct and not grouped:
+            self._bindings = projected + [binding for binding in incoming if binding.name not in names]
+        try:
+            for key in clause.sort_items:
+                self._check_expression(key.expression, where="the ORDER BY of a WITH")
+            if clause.predicate is not None:
+                self._check_expression(clause.predicate, where="the WHERE of a WITH")
+                self._refuse_aggregate(clause.predicate, "the WHERE of a WITH")
+        finally:
+            self._bindings = projected
+        self._check_row_window(clause.skip, "SKIP")
+        self._check_row_window(clause.limit, "LIMIT")
+
+    def _check_grouping_expressions(self, items: tuple[ReturnItem, ...], sort_items: tuple[SortItem, ...]) -> None:
+        """Reject implicit grouping leaves that were not independently projected.
+
+        Returning a composite key does not also group by each of its components.
+        Aggregate arguments themselves belong to the incoming rows, not this check.
+        """
+        grouping = tuple(item.expression for item in items if not contains_aggregate(item.expression))
+        variables = {expression.name for expression in grouping if isinstance(expression, Variable)} | set(self._query.global_imports)
+        properties = tuple(expression for expression in grouping if isinstance(expression, Property))
+
+        def check(expression: Expression, aliases: set[str]) -> None:
+            """Validate free references outside aggregates against grouped, aliased and local names."""
+            pending = [(expression, frozenset())]
+            while pending:
+                node, local = pending.pop()
+                if is_aggregate(node):
+                    continue
+                if isinstance(node, Variable):
+                    if node.name in variables | aliases | local:
+                        continue
+                    raise self._refuse("An aggregate expression uses an ungrouped value.",
+                                       field="aggregation", reason="ambiguous_aggregation_expression", query_phase="planning")
+                if isinstance(node, Property) and node in properties:
+                    continue
+                if isinstance(node, ListIteration):
+                    bound = local | {node.variable}
+                    if node.accumulator is not None:
+                        bound |= {node.accumulator}
+                    pending.append((node.source, local))
+                    if node.initial is not None:
+                        pending.append((node.initial, local))
+                    if node.predicate is not None:
+                        pending.append((node.predicate, bound))
+                    pending.append((node.body, bound))
+                else:
+                    pending.extend((child, local) for child in node.children())
+
+        for item in items:
+            if contains_aggregate(item.expression):
+                check(item.expression, set())
+        # Composite grouping keys need this check before modifier substitution
+        # can hide an illegal implicit grouping leaf. Other missing sort variables
+        # are diagnosed by the normal post-group scope resolver.
+        if any(not isinstance(expression, (Variable, Property, Literal, Parameter)) and free_variables(expression)
+               for expression in grouping):
+            aliases = {item.alias for item in items if item.alias is not None}
+            for key in sort_items:
+                if contains_aggregate(key.expression):
+                    check(key.expression, aliases)
 
     def _projected_binding(self, item: ReturnItem, created: set[str]) -> Binding:
         """Check one WITH item against the incoming scope and return what it leaves bound."""
@@ -1364,19 +1497,8 @@ class _Analyzer:
             assert carried is not None  # _require_bound refused when nothing bound it
             if item.alias is None or item.alias == expression.name:
                 return carried
-            if carried.entity in (ENTITY_NODE, ENTITY_RELATIONSHIP):
-                # A matched row keeps the name its pattern gave it. The planner resolved that
-                # name to a table when the pattern bound it, and a rename here would leave the
-                # scope and the tables disagreeing about which variable names which row.
-                raise self._refuse(
-                    f"WITH carries a matched {carried.entity} under the name its pattern gave "
-                    f"it; {expression.name!r} cannot be renamed to {item.alias!r}.",
-                    field="item",
-                    value=item.describe(),
-                )
-            self._refuse_shadowed_alias(item)
             return Binding(
-                name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False
+                name=item.alias, entity=carried.entity, labels=carried.labels, created=carried.created
             )
         if item.alias is None:
             raise self._refuse(
@@ -1384,13 +1506,18 @@ class _Analyzer:
                 f"{expression.describe()} needs AS.",
                 field="item",
                 value=expression.describe(),
+                reason="no_expression_alias", query_phase="planning",
             )
         self._check_expression(expression, where="a WITH item")
+        proof = entity_sources(expression, lambda name: self._binding(name).entity if self._binding(name) else None)
+        if proof is not None:
+            return Binding(name=item.alias, entity=proof[0], labels=(), created=False)
         # Aggregate calls are validated by _check_expression, exactly as in RETURN.
         # The planner inserts the same budgeted grouping operator before WITH.
-        self._refuse_shadowed_alias(item)
         return Binding(
-            name=item.alias, entity=ENTITY_PROJECTED, labels=(), created=False
+            name=item.alias,
+            entity=ENTITY_NULL if isinstance(expression, Literal) and expression.value is None else ENTITY_PROJECTED,
+            labels=(), created=False
         )
 
     def _refuse_same_stage_alias(self, item: ReturnItem, created: set[str]) -> None:
@@ -1403,35 +1530,9 @@ class _Analyzer:
                 "read it; a WITH below this one can.",
                 field="variable",
                 value=name,
+                reason="undefined_variable", query_phase="planning",
             )
 
-    def _refuse_shadowed_alias(self, item: ReturnItem) -> None:
-        """Refuse an alias that reuses a name this query has already given something.
-
-        Not only a name still in scope: a name an earlier stage DROPPED cannot come back
-        either. One name would then stand for two different things in one query, and everything
-        that answers a question about a name -- the type of ``parts[1]``, say -- would have to
-        know which stage it was standing in before it could answer correctly.
-        """
-
-        if item.alias is None:
-            return
-        existing = self._binding(item.alias)
-        if existing is not None:
-            raise self._refuse(
-                f"WITH would bind {item.alias!r} to {item.expression.describe()} while it "
-                f"already names {existing.describe()}; a stage renames nothing it carries.",
-                field="item",
-                value=item.describe(),
-            )
-        if item.alias in self._discarded:
-            raise self._refuse(
-                f"WITH would bind {item.alias!r} to {item.expression.describe()}, and an "
-                "earlier stage already used that name for something else; a name a stage "
-                "dropped is not reused.",
-                field="item",
-                value=item.describe(),
-            )
 
     def _bind(
         self, name: str | None, entity: str, labels: tuple[str, ...], *, created: bool
@@ -1446,12 +1547,25 @@ class _Analyzer:
             )
             return
         if existing.entity != entity:
+            if existing.entity == ENTITY_NULL and entity == ENTITY_NODE and not created:
+                return
+            if existing.entity == EMPTY_LIST and entity == ENTITY_RELATIONSHIP_LIST and not created:
+                return  # Only the range pattern supplies relationship-list context.
             raise self._refuse(
                 f"The variable {name!r} is bound to a {existing.entity} and used again as a "
                 f"{entity}.",
                 field="variable",
                 value=name,
+                reason="variable_type_conflict", query_phase="planning",
             )
+        if entity == ENTITY_NODE and not created:
+            if labels and not existing.labels:
+                self._bindings[self._bindings.index(existing)] = replace(existing, labels=labels)
+            return  # A later label set is a membership test, not a type conflict.
+        if entity in (ENTITY_RELATIONSHIP, ENTITY_RELATIONSHIP_LIST) and not created:
+            # Read patterns constrain an existing edge; a different type may
+            # yield no rows but must neither rebind it nor rewrite its proof.
+            return
         if labels and existing.labels and labels != existing.labels:
             raise self._refuse(
                 f"The variable {name!r} is bound with labels {list(existing.labels)} and used "
@@ -1466,46 +1580,194 @@ class _Analyzer:
 
     def _require_writable_pattern(self, pattern: PatternPath, keyword: str) -> None:
         """Refuse a pattern that says what to look for but not what to write."""
+        declared_nodes: set[str] = set()
         for node in pattern.nodes:
-            if node.variable is not None and self._binding(node.variable) is not None:
+            if pattern.variable is not None and node.variable == pattern.variable:
+                raise self._refuse("A path and a node cannot declare the same variable.",
+                                   field="variable", value=node.variable,
+                                   reason="variable_already_bound", query_phase="planning")
+            if node.variable is not None and (
+                self._binding(node.variable) is not None or node.variable in declared_nodes
+            ):
+                if not pattern.relationships or node.labels or node.properties is not None:
+                    raise self._refuse(f"{keyword} cannot redeclare a bound node; reference its bare name as an endpoint.",
+                                       field="variable", value=node.variable,
+                                       reason="variable_already_bound", query_phase="planning")
                 continue
-            if len(node.labels) != 1:
-                raise self._refuse(
-                    f"{keyword} needs exactly one label on every new node, because a row is "
-                    f"stored in exactly one table; got {node.describe()}.",
-                    field="labels",
-                    value=node.describe(),
-                )
+            if node.variable is not None:
+                declared_nodes.add(node.variable)
+        declared_relationships: set[str] = set()
         for relationship in pattern.relationships:
+            if relationship.variable is not None and (
+                    self._binding(relationship.variable) is not None
+                    or relationship.variable in declared_relationships
+                    or relationship.variable in declared_nodes
+                    or relationship.variable == pattern.variable):
+                raise self._refuse(f"{keyword} cannot redeclare a bound relationship or path.",
+                                   field="variable", value=relationship.variable,
+                                   reason="variable_already_bound", query_phase="planning")
+            if relationship.variable is not None:
+                declared_relationships.add(relationship.variable)
             if len(relationship.types) != 1:
                 raise self._refuse(
                     f"{keyword} needs exactly one relationship type on every new relationship; "
                     f"got {relationship.describe()}.",
                     field="types",
                     value=relationship.describe(),
+                    reason="no_single_relationship_type", query_phase="planning",
                 )
-            if relationship.variable_length:
+            if relationship.variable_length or relationship.hop_range_written:
                 raise self._refuse(
                     f"{keyword} writes one relationship at a time, so a hop range has no "
                     f"meaning here; got {relationship.describe()}.",
                     field="hops",
                     value=relationship.describe(),
+                    reason="creating_variable_length", query_phase="planning",
                 )
-            if relationship.direction is Direction.UNDIRECTED:
+            if relationship.direction is Direction.UNDIRECTED and (keyword != "MERGE" or relationship.both_directions_written):
                 raise self._refuse(
                     f"{keyword} needs a direction on every new relationship; got "
                     f"{relationship.describe()}.",
                     field="direction",
                     value=relationship.describe(),
+                    reason="requires_directed_relationship", query_phase="planning",
                 )
 
     # --- expressions -------------------------------------------------------------------------
 
+    def _semantic_expression_nodes(self, expression: Expression) -> Iterator[tuple[Expression, dict[str, str]]]:
+        """Walk this scope; comprehension bodies receive their own semantic pass."""
+        from okto_grafx.domain.query.existential import element_kind
+        pending = [(expression, {})]
+        while pending:
+            node, local = pending.pop()
+            yield node, local
+            if isinstance(node, PatternComprehension):
+                continue
+            if isinstance(node, ListIteration):
+                def resolve(name: str) -> str | None:
+                    """Resolve list-local names before consulting the enclosing query bindings."""
+                    binding = self._binding(name)
+                    return local.get(name, binding.entity if binding else None)
+                inner = {**local, node.variable: element_kind(node.source, resolve) or ENTITY_PROJECTED}
+                if node.accumulator is not None:
+                    inner[node.accumulator] = ENTITY_PROJECTED
+                children = [(node.source, local)]
+                if node.initial is not None:
+                    children.append((node.initial, local))
+                if node.predicate is not None:
+                    children.append((node.predicate, inner))
+                children.append((node.body, inner))
+                pending.extend(reversed(children))
+            else:
+                pending.extend((child, local) for child in reversed(node.children()))
+
+    def _check_pattern_comprehension(self, expression: PatternComprehension, list_locals: frozenset[str]) -> None:
+        """Bind local pattern entities without leaking them into the enclosing query."""
+        pattern = expression.pattern
+        self._require_read_pattern(pattern)
+        if not pattern.relationships or len(pattern.nodes) != len(pattern.relationships) + 1:
+            raise self._refuse("A pattern comprehension needs a connected relationship pattern.",
+                               field="pattern", reason="pattern_comprehension_shape", query_phase="planning")
+        saved = self._bindings
+        self._bindings = [binding for binding in saved if binding.name not in list_locals]
+        self._bindings.extend(Binding(name=name, entity=ENTITY_PROJECTED, labels=(), created=False)
+                              for name in sorted(list_locals))
+        try:
+            self._name_path(pattern)
+            for node in pattern.nodes:
+                binding = self._binding(node.variable) if node.variable is not None else None
+                if node.variable in list_locals and binding is not None and binding.entity == ENTITY_PROJECTED:
+                    # The catalog-aware pass must validate the collection's
+                    # element type; runtime still requires a genuine node binding.
+                    self._bindings = [binding for binding in self._bindings if binding.name != node.variable]
+                self._bind(node.variable, ENTITY_NODE, node.labels, created=False)
+            for edge in pattern.relationships:
+                self._bind(edge.variable, ENTITY_RELATIONSHIP_LIST if edge.hop_range_written else ENTITY_RELATIONSHIP,
+                           edge.types, created=False)
+            for element in (*pattern.nodes, *pattern.relationships):
+                self._check_properties(element.properties)
+            if expression.predicate is not None:
+                self._check_expression(expression.predicate, where="a WHERE predicate")
+                self._refuse_aggregate(expression.predicate, "a pattern comprehension")
+            self._check_expression(expression.projection, where="a pattern comprehension projection")
+            self._refuse_aggregate(expression.projection, "a pattern comprehension")
+        finally:
+            self._bindings = saved
+
+    def _check_exists(self, expression: ExistsSubquery, list_locals: dict[str, str]) -> None:
+        """Validate the entire read body even when the outer stream is empty."""
+        from okto_grafx.domain.query.existential import read_query
+        visible = {binding.name: binding for binding in self._bindings if binding.name not in list_locals}
+        visible.update({name: Binding(name=name, entity=entity, labels=(), created=False)
+                        for name, entity in list_locals.items()})
+        mappings = expression.imports or tuple((name, name) for name in visible)
+        if len({target for target, _source in mappings}) != len(mappings):
+            raise self._refuse("EXISTS imports must have unique targets.", field="imports")
+        imported = []
+        for target, source in mappings:
+            if source not in visible:
+                self._require_bound(source, "an EXISTS import")
+            imported.append(replace(visible[source], name=target))
+        inner = analyze(read_query(expression.query, tuple(binding.name for binding in imported)),
+                        bindings=tuple(imported), depth=self._depth + 1)
+        for name in inner.parameters:
+            self._note_parameter(name)
+
     def _check_expression(self, expression: Expression, *, where: str) -> None:
         """Check one expression: its variables are bound and its aggregates are not nested."""
-        for node in walk(expression):
-            if isinstance(node, Variable):
-                self._require_bound(node.name, where)
+        for name in free_variables(expression):
+            self._require_bound(name, where)
+        if where in ("a WHERE predicate", "the WHERE of a WITH") and isinstance(expression, Variable):
+            binding = self._binding(expression.name)
+            if binding is not None and binding.entity in (ENTITY_NODE, ENTITY_RELATIONSHIP, ENTITY_PATH):
+                raise self._refuse("A graph entity is not a boolean predicate.", field="predicate",
+                                   reason="predicate_argument_type", query_phase="planning")
+        for node, local_names in self._semantic_expression_nodes(expression):
+            if isinstance(node, LabelPredicate):
+                if not node.labels or any(not label for label in node.labels):
+                    raise self._refuse("A label predicate requires nonempty labels.", field="label")
+            elif isinstance(node, ExistsSubquery):
+                self._check_exists(node, local_names)
+            elif isinstance(node, PatternComprehension):
+                self._check_pattern_comprehension(node, frozenset(local_names))
+            elif isinstance(node, PatternPredicate):
+                if where != "a WHERE predicate" and where != "the WHERE of a WITH":
+                    raise self._refuse("A pattern predicate belongs to WHERE, not a value projection.",
+                                       field="pattern", reason="pattern_predicate_context", query_phase="planning")
+                pattern = node.pattern
+                self._require_read_pattern(pattern)
+                if (pattern.variable is not None or not pattern.relationships
+                        or len(pattern.nodes) != len(pattern.relationships) + 1):
+                    raise self._refuse("A pattern predicate needs an unnamed connected relationship pattern.",
+                                       field="pattern", reason="pattern_predicate_shape", query_phase="planning")
+                for element, entity in (
+                    *((item, ENTITY_NODE) for item in pattern.nodes),
+                    *((item, ENTITY_RELATIONSHIP_LIST if item.hop_range_written else ENTITY_RELATIONSHIP)
+                      for item in pattern.relationships),
+                ):
+                    if element.variable is not None:
+                        binding = self._binding(element.variable)
+                        if binding is not None and binding.entity not in (entity, ENTITY_NULL):
+                            raise self._refuse("A pattern reference has the wrong entity kind.",
+                                               field="variable", value=element.variable,
+                                               reason="pattern_reference_type", query_phase="planning")
+                if any(contains_aggregate(item.properties) for item in (*pattern.nodes, *pattern.relationships)
+                       if item.properties is not None):
+                    raise self._refuse("Pattern properties cannot contain aggregates.", field="pattern")
+            elif isinstance(node, ListIteration):
+                if node.mode not in ("map", "all", "any", "none", "single", "reduce"):
+                    raise self._refuse("Unknown list iteration mode.", field="iteration")
+                if (node.mode == "reduce") != (node.accumulator is not None and node.initial is not None):
+                    raise self._refuse("A reduction needs an accumulator and initial value.", field="iteration")
+                if node.mode != "reduce" and (node.accumulator is not None or node.initial is not None):
+                    raise self._refuse("Only a reduction declares an accumulator and initial value.", field="iteration")
+                if node.accumulator == node.variable or (node.mode != "map" and node.predicate is not None):
+                    raise self._refuse("Invalid list iteration bindings.", field="iteration")
+                for body in (node.predicate, node.body):
+                    if body is not None and contains_aggregate(body):
+                        raise self._refuse("List-local expressions cannot contain row aggregates.", field="iteration",
+                                           reason="invalid_aggregation_context", query_phase="planning")
             elif isinstance(node, Parameter):
                 self._note_parameter(node.name)
             elif isinstance(node, FunctionCall):
@@ -1521,6 +1783,13 @@ class _Analyzer:
     def _check_call(self, call: FunctionCall, *, where: str) -> None:
         """Check one function call: aggregate nesting, the star form and the two extensions."""
         name = call.name.upper()
+        if name in ENTITY_SCALARS or name in ("LENGTH", "NODES", "RELATIONSHIPS"):
+            self._check_positional_call(call, arguments=1)
+            return
+        if name in NATIVE_SCALARS:
+            scalar_arity(name, len(call.arguments))
+            self._check_positional_call(call, arguments=len(call.arguments))
+            return
         if name == "UDF":
             if call.star or call.distinct or call.named_arguments or not 1 <= len(call.arguments) <= 33:
                 raise self._refuse("udf(name, ...) needs 1..33 positional arguments.", field="function", value=call.name)
@@ -1528,15 +1797,18 @@ class _Analyzer:
                 raise self._refuse("udf needs a literal registered name.", field="function", value=call.name)
             return
         if is_aggregate(call):
+            if call.named_arguments:
+                raise self._refuse("Aggregates accept positional arguments only.", field="function", value=call.name)
             if call.star and name != "COUNT":
                 raise self._refuse(
                     f"Only count is written as count(*); got {call.describe()}.",
                     field="function",
                     value=call.name,
                 )
-            if not call.star and len(call.arguments) != 1:
+            arity = 2 if name in PERCENTILE_FUNCTIONS else 1
+            if not call.star and len(call.arguments) != arity:
                 raise self._refuse(
-                    f"The aggregate {call.name} takes exactly one argument; got "
+                    f"The aggregate {call.name} takes exactly {arity} argument(s); got "
                     f"{len(call.arguments)}.",
                     field="function",
                     value=call.name,
@@ -1548,7 +1820,11 @@ class _Analyzer:
                         f"{call.describe()}.",
                         field="function",
                         value=call.name,
+                        reason="nested_aggregation", query_phase="planning",
                     )
+                if not is_deterministic(argument):
+                    raise self._refuse("An aggregate argument must be deterministic; project volatile values with WITH first.",
+                                       field="aggregation", reason="non_deterministic_aggregate_argument", query_phase="planning")
             return
         if name == SIMILARITY_SCORE_FUNCTION:
             if call.arguments or call.named_arguments:
@@ -1579,7 +1855,7 @@ class _Analyzer:
                     value=call.name,
                 )
             return
-        if name == STRING_SPLIT_FUNCTION:
+        if name in (STRING_SPLIT_FUNCTION, "SPLIT"):
             self._check_positional_call(call, arguments=2)
             return
         if name == LABEL_FUNCTION:
@@ -1595,12 +1871,10 @@ class _Analyzer:
             self._check_similarity_call(call)
             return
         raise self._refuse(
-            f"There is no function named {call.name!r} in this dialect; it reads "
-            f"{', '.join(sorted(function.lower() for function in AGGREGATE_FUNCTIONS))}, "
-            f"{COALESCE_FUNCTION.lower()}, {LABEL_FUNCTION.lower()}, "
-            f"{SIZE_FUNCTION.lower()}, "
-            f"{SIMILARITY_FUNCTION.lower()}, {SIMILARITY_SCORE_FUNCTION.lower()} and "
-            f"{STRING_SPLIT_FUNCTION.lower()} and {TIMESTAMP_FUNCTION.lower()}.",
+            f"There is no function named {call.name!r} in the native query catalog. "
+            "Native functions include coalesce, lower, split, abs and similarity. "
+            "See QUERY_LANGUAGE.md for supported functions and COMPOSABLE_QUERIES.md "
+            "for separately registered tabular CALL/YIELD procedures.",
             field="function",
             value=call.name,
             where=where,
@@ -1709,14 +1983,15 @@ class _Analyzer:
             )
         self._similarity = use
 
-    def _refuse_aggregate(self, expression: Expression, keyword: str) -> None:
+    def _refuse_aggregate(self, expression: Expression, keyword: str, *, field: str = "expression") -> None:
         """Refuse an aggregate in a place that has no group to aggregate over."""
         if contains_aggregate(expression):
             raise self._refuse(
                 f"An aggregate cannot appear in {keyword}, because it summarises a group of "
                 "result rows and nothing here has produced one.",
-                field="expression",
+                field=field,
                 value=expression.describe(),
+                reason="invalid_aggregation_context", query_phase="planning",
             )
 
     # --- variables ---------------------------------------------------------------------------
@@ -1745,19 +2020,13 @@ class _Analyzer:
         """Refuse a variable no pattern bound."""
         if self._binding(name) is not None:
             return
-        if name in self._path_names:
-            raise self._refuse(
-                f"The path {name!r} is written and never read in this subset, so {where} "
-                "cannot ask what it contains.",
-                field="variable",
-                value=name,
-            )
         if name in self._discarded:
             raise self._refuse(
                 f"The variable {name!r} used in {where} was dropped by a WITH "
                 "clause; only the names a WITH projects stay in scope below it.",
                 field="variable",
                 value=name,
+                reason="undefined_variable", query_phase="planning",
             )
         known = ", ".join(binding.name for binding in self._bindings) or "none"
         raise self._refuse(
@@ -1765,6 +2034,7 @@ class _Analyzer:
             f"query binds are {known}.",
             field="variable",
             value=name,
+            reason="undefined_variable", query_phase="planning",
         )
 
     def _require_bound_subject(self, target: Property, keyword: str) -> None:

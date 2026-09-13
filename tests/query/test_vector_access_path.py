@@ -564,8 +564,9 @@ def test_return_limit_never_reduces_the_rows_deleted_by_a_vector_match() -> None
     result = stack.engine.execute(
         "MATCH (n:Chunk) "
         "WHERE similarity(n.embedding, $q, space => 'minilm_v2') > -2.0 "
+        "WITH n, n.id AS id "
         "DELETE n "
-        "RETURN n.id, similarity_score() AS score ORDER BY score DESC LIMIT 1",
+        "RETURN id, similarity_score() AS score ORDER BY score DESC LIMIT 1",
         transaction,
         {"q": [1.0, 0.0, 0.0, 0.0]},
     )

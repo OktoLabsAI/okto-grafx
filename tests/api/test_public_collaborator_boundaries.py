@@ -111,7 +111,7 @@ _SCALAR_DATABASE_PROPERTIES: frozenset[str] = frozenset(
 )
 """Public database values that are already immutable scalars or frozen domain reports."""
 
-_OPERATIONAL_DATABASE_PROPERTIES: frozenset[str] = frozenset({"maintenance"})
+_OPERATIONAL_DATABASE_PROPERTIES: frozenset[str] = frozenset({"maintenance", "views"})
 """Public database properties that deliberately return a narrow operational facade."""
 
 _TRANSACTION_PROPERTIES: frozenset[str] = frozenset(

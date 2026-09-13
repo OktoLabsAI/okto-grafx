@@ -23,9 +23,9 @@ from okto_grafx.transfer import (
     _report,
     _json,
     _promote,
+    _row_payload,
 )
 from okto_grafx.domain.model.schema import TableDef, EmbeddingSpaceDef
-from okto_grafx.domain.model.value import encode_values
 from okto_grafx.engine.database import Database
 
 __all__: list[str] = []
@@ -38,18 +38,25 @@ def validated_inventory(
     tables: tuple[TableDef, ...],
     spaces: tuple[EmbeddingSpaceDef, ...],
     limits: TransferLimits,
-) -> dict[str, tuple[int, ...]]:
+) -> dict[tuple[str, str], tuple[int, ...]]:
     """Prove every existing row is an exact committed source prefix before appending."""
     catalog = db._catalog.catalog
     actual = _schema(catalog)
     expected = manifest["schema"]
+    def logical_groups(schema: dict) -> list[tuple[str, tuple[int, ...]]]:
+        """Canonicalize logical relationship group names and member identities for resume comparison."""
+        return sorted((group["name"], tuple(sorted(group["members"])))
+                      for group in schema.get("relationship_types", ()))
+
+    if logical_groups(actual) != logical_groups(expected):
+        raise _refuse("resume_relationship_types_mismatch")
 
     def logical_table(item: dict) -> dict:
         """Physical table IDs are intentionally remapped."""
         return {k: v for k, v in item.items() if k != "table_id"}
 
-    if sorted(map(logical_table, actual["tables"]), key=lambda x: x["name"]) != sorted(
-        map(logical_table, expected["tables"]), key=lambda x: x["name"]
+    if sorted(map(logical_table, actual["tables"]), key=lambda x: (x["kind"], x["name"])) != sorted(
+        map(logical_table, expected["tables"]), key=lambda x: (x["kind"], x["name"])
     ):
         raise _refuse("resume_schema_mismatch")
     if {s.name for s in spaces} != {s.name for s in catalog.spaces()}:
@@ -73,6 +80,7 @@ def validated_inventory(
             raise _refuse("resume_index_mismatch")
     inventory = {}
     observed = {}
+    objects = {t.table_id: o for t, o in zip(tables, manifest["objects"], strict=True)}
     count = 0
     with db.begin("read") as reader:
         for table in tables:
@@ -80,47 +88,48 @@ def validated_inventory(
             cursor = None
             while True:
                 page = reader.scan_rows_v1(
-                    table.name, limit=limits.batch_rows, cursor=cursor
+                    table.name, kind=table.kind, limit=limits.batch_rows, cursor=cursor
                 )
                 for row in page.rows:
                     count += 1
                     if count > limits.max_rows:
                         raise _refuse("resume_row_budget")
                     rows.append(row.record_id)
-                    observed[table.name, row.record_id] = hashlib.sha256(
-                        encode_values(row.values)
+                    observed[table.kind, table.name, row.record_id] = hashlib.sha256(
+                        _row_payload(table, row.values, node_labels=row.node_labels,
+                                     labels_format=objects[table.table_id].get("node_labels", False))
                     ).digest()
                 cursor = page.next_cursor
                 if cursor is None:
                     break
-            inventory[table.name] = tuple(sorted(rows))
+            inventory[table.kind, table.name] = tuple(sorted(rows))
     identity = {}
     space_map = {s.space_id: catalog.space(s.name).space_id for s in spaces}
-    objects = {t.name: o for t, o in zip(tables, manifest["objects"], strict=True)}
     for table in sorted(tables, key=lambda t: t.kind != "node"):
-        prior = inventory[table.name]
+        prior = inventory[table.kind, table.name]
         source_count = 0
-        for ordinal, (rid, values) in enumerate(
-            _rows(storage, objects[table.name], table, limits)
+        for ordinal, (rid, values, labels) in enumerate(
+            _rows(storage, objects[table.table_id], table, limits)
         ):
             source_count += 1
             if ordinal >= len(prior):
                 continue
             target_id = prior[ordinal]
-            identity[table.name, rid] = target_id
+            identity[table.kind, table.name, rid] = target_id
             values = _remap(values, space_map)
             if table.kind == "rel":
                 try:
                     values = (
-                        identity[table.from_table, values[0]],
-                        identity[table.to_table, values[1]],
+                        identity["node", table.from_table, values[0]],
+                        identity["node", table.to_table, values[1]],
                         *values[2:],
                     )
                 except KeyError as error:
                     raise _refuse("resume_endpoint_prefix_missing") from error
             if (
-                observed.pop((table.name, target_id))
-                != hashlib.sha256(encode_values(values)).digest()
+                observed.pop((table.kind, table.name, target_id))
+                != hashlib.sha256(_row_payload(table, values, node_labels=labels,
+                        labels_format=objects[table.table_id].get("node_labels", False))).digest()
             ):
                 raise _refuse("resume_row_mismatch")
         if len(prior) > source_count:
@@ -280,17 +289,17 @@ def resume_import(
                         )
                         mapping = []
                         objects = {
-                            t.name: o
+                            t.table_id: o
                             for t, o in zip(tables, manifest["objects"], strict=True)
                         }
                         for t in sorted(tables, key=lambda t: t.kind != "node"):
-                            pairs = _rows(storage, objects[t.name], t, limits)
-                            if objects[t.name]["rows"] != len(inventory[t.name]):
+                            pairs = _rows(storage, objects[t.table_id], t, limits)
+                            if objects[t.table_id]["rows"] != len(inventory[t.kind, t.name]):
                                 raise _refuse("resume_incomplete_publication")
                             mapping.extend(
-                                RecordIdMapping(t.name, rid, target_id)
-                                for (rid, _), target_id in zip(
-                                    pairs, inventory[t.name], strict=True
+                                RecordIdMapping(t.name, rid, target_id, kind=t.kind)
+                                for (rid, _, _labels), target_id in zip(
+                                    pairs, inventory[t.kind, t.name], strict=True
                                 )
                             )
                         if db.verify("all").findings:

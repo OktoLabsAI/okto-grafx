@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from collections.abc import Sequence
 from unicodedata import ucd_3_2_0
 from okto_grafx.domain.index.text_casefold import CASEFOLD_15_1
+from okto_grafx.domain.index.text_positions import position_keys
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -18,7 +19,7 @@ from okto_grafx.domain.errors import (
     GrafxQueryBudgetExceeded,
 )
 
-__all__ = ["TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult"]
+__all__ = ["TextIndexOptions", "TextSearchLimits", "TextHit", "TextSearchResult", "TextMatchPositions"]
 
 FULLTEXT_CAPABILITY = "fulltext_indexes_v1"
 FULLTEXT_STATISTICS_CAPABILITY = "fulltext_statistics_v1"
@@ -27,6 +28,8 @@ PREFIX = "fulltext_v1_"
 STATISTICS_PREFIX = "fulltext_v2_"
 HISTORY_PREFIX = "fulltext_v3_"
 PREFIX_POSTINGS = "fulltext_v4_"
+POSITION_POSTINGS = "fulltext_v5_"
+FULLTEXT_POSITIONS_CAPABILITY = "fulltext_positions_v1"
 FULLTEXT_PREFIX_CAPABILITY = "fulltext_prefixes_v1"
 ANALYZERS = ("standard", "keyword", "code_identifier", "whitespace")
 _HEADER = struct.Struct("<BBBBHII")
@@ -61,9 +64,12 @@ class TextIndexOptions:
     statistics_mode: str = "wal"
     statistics_history_entries: int = 0
     prefix_max_characters: int = 0
+    positions: bool = False
 
     def __post_init__(self) -> None:
         """Capture bounded immutable field weights and exact supported analyzer semantics."""
+        if type(self.positions) is not bool:
+            raise _bad("positions")
         if type(self.prefix_max_characters) is not int or not 0 <= self.prefix_max_characters <= 32:
             raise _bad("prefix_max_characters")
         if type(self.statistics_mode) is not str or self.statistics_mode not in ("wal", "durable"):
@@ -126,13 +132,13 @@ class TextIndexOptions:
             self.max_document_tokens,
         )
         return (
-            (PREFIX_POSTINGS if self.prefix_max_characters else HISTORY_PREFIX if self.statistics_history_entries else
+            (POSITION_POSTINGS if self.positions else PREFIX_POSTINGS if self.prefix_max_characters else HISTORY_PREFIX if self.statistics_history_entries else
              STATISTICS_PREFIX if self.statistics_mode == "durable" else PREFIX)
             + (
                 raw
                 + struct.pack("<" + "d" * len(self.field_weights), *self.field_weights)
                 + (bytes((int(self.statistics_mode == "durable"), self.statistics_history_entries,
-                          self.prefix_max_characters)) if self.prefix_max_characters else
+                          self.prefix_max_characters)) if self.positions or self.prefix_max_characters else
                    bytes((self.statistics_history_entries,)) if self.statistics_history_entries else b"")
             ).hex()
         )
@@ -144,14 +150,14 @@ def decode_options(derivation: str) -> TextIndexOptions:
         raw = bytes.fromhex(derivation[len(PREFIX) :])
         prefix_size = 0
         mode = "durable" if derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX)) else "wal"
-        if derivation.startswith(PREFIX_POSTINGS):
+        if derivation.startswith((PREFIX_POSTINGS, POSITION_POSTINGS)):
             mode_code, prefix_history, prefix_size = raw[-3:]
-            if mode_code not in (0, 1) or not prefix_size:
+            if mode_code not in (0, 1) or (not prefix_size and derivation.startswith(PREFIX_POSTINGS)):
                 raise ValueError("invalid prefix metadata")
             mode = "durable" if mode_code else "wal"
             raw = raw[:-3]
         history = raw[-1] if derivation.startswith(HISTORY_PREFIX) else 0
-        if prefix_size:
+        if derivation.startswith((PREFIX_POSTINGS, POSITION_POSTINGS)):
             history = prefix_history
         if derivation.startswith(HISTORY_PREFIX):
             raw = raw[:-1]
@@ -171,6 +177,7 @@ def decode_options(derivation: str) -> TextIndexOptions:
             statistics_mode=mode,
             statistics_history_entries=history,
             prefix_max_characters=prefix_size,
+            positions=derivation.startswith(POSITION_POSTINGS),
         )
         if derivation != options.derivation():
             raise ValueError("noncanonical")
@@ -183,18 +190,18 @@ def decode_options(derivation: str) -> TextIndexOptions:
 
 def is_fulltext(derivation: str) -> bool:
     """Recognize the reserved family; decoding still validates the complete identity."""
-    return derivation.startswith((PREFIX, STATISTICS_PREFIX, HISTORY_PREFIX, PREFIX_POSTINGS))
+    return derivation.startswith((PREFIX, STATISTICS_PREFIX, HISTORY_PREFIX, PREFIX_POSTINGS, POSITION_POSTINGS))
 
 
 def has_durable_statistics(derivation: str) -> bool:
     """Recognize the opt-in derivation requiring native persisted corpus totals."""
     return derivation.startswith((STATISTICS_PREFIX, HISTORY_PREFIX)) or (
-        derivation.startswith(PREFIX_POSTINGS) and decode_options(derivation).statistics_mode == "durable")
+        derivation.startswith((PREFIX_POSTINGS, POSITION_POSTINGS)) and decode_options(derivation).statistics_mode == "durable")
 
 
 def has_historical_statistics(derivation: str) -> bool:
     """Recognize the opt-in bounded historical-summary derivation."""
-    return derivation.startswith(HISTORY_PREFIX) or (derivation.startswith(PREFIX_POSTINGS)
+    return derivation.startswith(HISTORY_PREFIX) or (derivation.startswith((PREFIX_POSTINGS, POSITION_POSTINGS))
         and decode_options(derivation).statistics_history_entries > 0)
 
 
@@ -324,10 +331,10 @@ def entry_keys(
     """One length-statistics entry plus one posting per distinct analyzed term."""
     options = decode_options(derivation)
     fields = field_tokens(values, positions, options)
-    return keys_from_fields(fields, prefix_max_characters=options.prefix_max_characters)
+    return keys_from_fields(fields, prefix_max_characters=options.prefix_max_characters, positions=options.positions)
 
 
-def keys_from_fields(fields: tuple[tuple[str, ...], ...], *, prefix_max_characters: int = 0) -> tuple[bytes, ...]:
+def keys_from_fields(fields: tuple[tuple[str, ...], ...], *, prefix_max_characters: int = 0, positions: bool = False) -> tuple[bytes, ...]:
     """Encode already-analyzed fields without invoking the analyzer again."""
     stats = b"\x00" + struct.pack("<" + "I" * len(fields), *(len(f) for f in fields))
     prefixes = set()
@@ -347,6 +354,7 @@ def keys_from_fields(fields: tuple[tuple[str, ...], ...], *, prefix_max_characte
             for token in sorted({t for f in fields for t in f})
         ),
         *(b"\x02" + token.encode("utf-8") for token in sorted(prefixes)),
+        *(position_keys(fields) if positions else ()),
     )
 
 
@@ -407,6 +415,7 @@ class TextAnalysisMemo:
         return keys_from_fields(
             self.fields(values, positions, decode_options(derivation)),
             prefix_max_characters=decode_options(derivation).prefix_max_characters,
+            positions=decode_options(derivation).positions,
         )
 
 
@@ -422,6 +431,8 @@ class TextSearchLimits:
     max_statistics_wal_records: int = 4096
     max_statistics_wal_bytes: int = 8 * 1024 * 1024
     max_expanded_terms: int = 128
+    max_position_results: int = 100_000
+    max_proximity_work: int = 1_000_000
 
     def __post_init__(self) -> None:
         """Reject disabled, forged or unbounded counters."""
@@ -434,10 +445,21 @@ class TextSearchLimits:
             "max_statistics_wal_records",
             "max_statistics_wal_bytes",
             "max_expanded_terms",
+            "max_position_results",
+            "max_proximity_work",
         ):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= 2**31:
                 raise _bad(name)
+
+
+@dataclass(frozen=True, slots=True)
+class TextMatchPositions:
+    """Validated zero-based analyzed token ordinals for one field/term, not character offsets."""
+
+    field: str
+    term: str
+    positions: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,6 +470,7 @@ class TextHit:
     score: float
     matched_fields: tuple[str, ...]
     matched_terms: tuple[str, ...]
+    positions: tuple[TextMatchPositions, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -18,6 +18,8 @@ from okto_grafx.domain.errors import (
 
 # CONTRACT.md section 2, transcribed as data: class name, code, retryable.
 CONTRACT_TABLE: tuple[tuple[str, str, bool], ...] = (
+    ("GrafxHistoryUnavailable", "history_unavailable", False),
+    ("GrafxHistoryExpired", "history_expired", False),
     ("GrafxWriteConflict", "write_conflict", True),
     ("GrafxLeaseTimeout", "lease_timeout", True),
     ("GrafxLeaseStolen", "lease_stolen", False),

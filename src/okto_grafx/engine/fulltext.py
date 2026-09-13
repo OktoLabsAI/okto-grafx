@@ -20,6 +20,7 @@ from okto_grafx.domain.index.fulltext import (
     TextIndexOptions,
     TextSearchLimits,
     TextHit,
+    TextMatchPositions,
     TextSearchResult,
     analyze,
     decode_options,
@@ -55,6 +56,8 @@ def create_text_index(
     *,
     options: TextIndexOptions | None,
     bucket_count: int,
+    kind: str | None = None,
+    _replace_existing: bool = False,
 ) -> IndexView:
     """Publish a complete nonced generation through the existing detached build protocol."""
     if (
@@ -84,7 +87,7 @@ def create_text_index(
             from okto_grafx.engine.fulltext_durable import require_statistics_capacity
             require_statistics_capacity(selected.derivation(), database._pool.page_size)
         with database._transactions.page_access_section(fresh_read_view=True):
-            definition = database._catalog.catalog.table(table)
+            definition = database._catalog.catalog.table(table, kind=kind)
             positions = tuple(definition.column_index(column) for column in columns)
             if any(
                 definition.columns[p].type is not ValueType.STRING for p in positions
@@ -101,13 +104,43 @@ def create_text_index(
                 transaction._context,
                 name=name,
                 table_name=table,
+                table_kind=definition.kind,
                 positions=positions,
                 bucket_count=bucket_count,
                 expected_cardinality=None,
                 key_derivation=selected.derivation(),
+                replace_text=_replace_existing,
             )
         database._refresh_index_inventory()
         return database._committed_index_receipt(name)
+
+
+def _phrase_failure(pattern: tuple[str, ...]) -> tuple[int, ...]:
+    """KMP prefix lengths; O(query tokens) bounded temporary state."""
+    result = [0] * len(pattern)
+    matched = 0
+    for i in range(1, len(pattern)):
+        while matched and pattern[i] != pattern[matched]:
+            matched = result[matched - 1]
+        if pattern[i] == pattern[matched]:
+            matched += 1
+        result[i] = matched
+    return tuple(result)
+
+
+def _contains_phrase(tokens: tuple[str, ...], pattern: tuple[str, ...], failure: tuple[int, ...]) -> bool:
+    """Verify contiguous analyzed token positions in one field; never cross fields."""
+    if not pattern:
+        return False
+    matched = 0
+    for token in tokens:
+        while matched and token != pattern[matched]:
+            matched = failure[matched - 1]
+        if token == pattern[matched]:
+            matched += 1
+            if matched == len(pattern):
+                return True
+    return False
 
 
 def search_text(
@@ -124,12 +157,23 @@ def search_text(
     timeout_seconds: float | None,
     cancellation: CancellationToken | None,
     prefix: bool = False,
+    phrase: bool = False,
+    return_positions: bool = False,
+    slop: int = 0,
     _control: _ReadControl | None = None,
     _memory: Callable[[int], None] | None = None,
 ) -> TextSearchResult:
     """Return BM25 matches only after one complete pre/post index/heap certificate."""
     if type(prefix) is not bool:
         raise GrafxConfigurationError("prefix must be exactly bool.", field="prefix")
+    if type(phrase) is not bool:
+        raise GrafxConfigurationError("phrase must be exactly bool.", field="phrase")
+    if type(return_positions) is not bool:
+        raise GrafxConfigurationError("return_positions must be exactly bool.", field="return_positions")
+    if type(slop) is not int or not 0 <= slop <= 65_535 or (slop and not phrase):
+        raise GrafxConfigurationError("slop requires phrase=True and an integer in 0..65535.", field="slop")
+    if phrase and prefix:
+        raise GrafxUnsupportedOperation("Phrase and prefix modes cannot be combined.", field="phrase")
     if reader._database is not database or not reader.active or reader.mode != "read":
         raise GrafxTransactionStateError(
             "Text search requires an active reader of this database.",
@@ -191,13 +235,16 @@ def search_text(
                     "The named index is not a full-text index.", field="index"
                 )
             options = decode_options(definition.key_derivation)
+            if (return_positions or slop) and not options.positions:
+                raise GrafxUnsupportedOperation("Position results require durable positional postings.", field="return_positions")
             query_options = replace(
                 options,
                 max_document_tokens=min(
                     options.max_document_tokens, budget.max_query_tokens
                 ),
             )
-            query_terms = tuple(sorted(set(analyze(query, query_options))))
+            ordered_terms = analyze(query, query_options)
+            query_terms = tuple(sorted(set(ordered_terms)))
             if prefix and (not options.prefix_max_characters or
                            any(len(term) > options.prefix_max_characters for term in query_terms)):
                 raise GrafxUnsupportedOperation("Prefix search requires configured prefix postings and eligible token lengths.", field="prefix")
@@ -211,6 +258,15 @@ def search_text(
             memory = 0 if allowed is None else len(allowed) * 64
             analysis = TextAnalysisMemo(min(1_048_576, budget.max_memory_bytes // 4))
             wal_reservation = 0
+            proximity_work = 0
+
+            def proximity(amount: int) -> None:
+                """Bound all ordered matching attempts, including certificate retries."""
+                nonlocal proximity_work
+                proximity_work += amount
+                if proximity_work > budget.max_proximity_work:
+                    raise GrafxQueryBudgetExceeded("Proximity work budget exceeded.", resource="text_proximity")
+                check()
 
             def check(charge: int = 0, *, posting: bool = False) -> None:
                 """Charge attempted work, including certificate retries, before more work."""
@@ -244,6 +300,10 @@ def search_text(
                 """Execute statistics, candidates and ranking under the same certificate."""
                 nonlocal memory, wal_reservation
                 memory = 0 if allowed is None else len(allowed) * 64
+                if phrase:
+                    check(128 + sum(64 + len(t.encode("utf-8")) for t in ordered_terms)
+                          + 16 * len(ordered_terms) + 16 * len(definition.positions))
+                phrase_failure = _phrase_failure(ordered_terms) if phrase and not options.positions else ()
                 database._indexes._prepare_heap_view(store.file, certificate)
                 cache_key = (store.file, certificate, snapshot.read_lsn)
                 cached = database._text_stats_cache.get(cache_key)
@@ -344,11 +404,21 @@ def search_text(
                     terms = tuple(sorted(expanded))
                 frequencies = {}
                 matches = {}
+                phrase_positions = {}
                 for term in terms:
                     key = b"\x01" + term.encode("utf-8")
                     docs = set()
+                    documents = {}
+                    positional = None
+                    if (phrase or return_positions) and options.positions:
+                        from okto_grafx.engine.fulltext_positions import PositionEvidence
+                        positional = PositionEvidence(term, check)
                     for entry in entries(bucket_of(key, definition.bucket_count)):
-                        if entry.key != key:
+                        position_key = False
+                        if positional is not None and entry.key[:1] == b"\x03":
+                            from okto_grafx.domain.index.text_positions import decode_position
+                            position_key = decode_position(entry.key)[0] == term
+                        if entry.key != key and not position_key:
                             continue
                         version = database._heap.read(entry.ref)
                         if version.table_id != definition.table_id:
@@ -360,6 +430,9 @@ def search_text(
                         fields = analysis.fields(
                             version.values, definition.positions, options
                         )
+                        if position_key:
+                            positional.add(entry, fields)
+                            continue
                         if not any(term in f for f in fields):
                             raise GrafxCorruptionDetected(
                                 "Full-text posting differs from its heap row.",
@@ -372,6 +445,9 @@ def search_text(
                             )
                         check(64)
                         docs.add(rid)
+                        if positional is not None:
+                            check(128)
+                            documents[rid] = (entry.ref, fields)
                         if allowed is not None and rid not in allowed:
                             continue
                         if rid not in matches:
@@ -390,6 +466,10 @@ def search_text(
                             )
                             matches[rid] = fields
                     frequencies[term] = len(docs)
+                    if positional is not None:
+                        for rid, positions in positional.finish(documents).items():
+                            if rid in matches:
+                                phrase_positions.setdefault(rid, {})[term] = positions
                     memory -= len(docs) * 64
                 if any(df > count for df in frequencies.values()):
                     raise GrafxCorruptionDetected(
@@ -397,6 +477,14 @@ def search_text(
                     )
                 hits = []
                 for rid, fields in matches.items():
+                    phrase_fields = tuple(_contains_phrase(tokens, ordered_terms, phrase_failure) for tokens in fields) if phrase and not options.positions else ()
+                    if phrase and options.positions:
+                        from okto_grafx.engine.fulltext_positions import phrase_fields as positional_phrase_fields
+                        check(128 + 64 * sum(len(field) for field in fields))
+                        phrase_fields = positional_phrase_fields(phrase_positions.get(rid, {}), ordered_terms, len(fields), slop=slop, work=proximity)
+                    check()
+                    if phrase and not any(phrase_fields):
+                        continue
                     frequency_bytes = 128 + len(fields) * (64 + 64 * len(terms))
                     check(frequency_bytes)
                     term_counts = query_term_frequencies(fields, terms)
@@ -407,6 +495,8 @@ def search_text(
                         df = frequencies[term]
                         idf = math.log1p((count - df + 0.5) / (df + 0.5))
                         for position, tokens in enumerate(fields):
+                            if phrase and not phrase_fields[position]:
+                                continue
                             tf = term_counts[position][term]
                             if not tf:
                                 continue
@@ -439,11 +529,29 @@ def search_text(
                 chosen = tuple(
                     sorted(hits, key=lambda hit: (-hit.score, hit.record_id))[:k]
                 )
+                if return_positions:
+                    enriched = []
+                    position_count = 0
+                    for hit in chosen:
+                        locations = []
+                        for term in hit.matched_terms:
+                            for field, ordinals in enumerate(phrase_positions[hit.record_id][term]):
+                                name = table.columns[definition.positions[field]].name
+                                if not ordinals or name not in hit.matched_fields:
+                                    continue
+                                position_count += len(ordinals)
+                                if position_count > budget.max_position_results:
+                                    raise GrafxQueryBudgetExceeded("Position output budget exceeded.", resource="text_positions")
+                                check(128 + 8 * len(ordinals) + len(name.encode("utf-8")) + len(term.encode("utf-8")))
+                                locations.append(TextMatchPositions(name, term, ordinals))
+                        enriched.append(replace(hit, positions=tuple(locations)))
+                    chosen = tuple(enriched)
                 explanation = sum(
                     sum(
                         len(v.encode("utf-8"))
                         for v in (*hit.matched_fields, *hit.matched_terms)
                     )
+                    + sum(16 + len(p.field.encode("utf-8")) + len(p.term.encode("utf-8")) + 8 * len(p.positions) for p in hit.positions)
                     for hit in chosen
                 )
                 if explanation > budget.max_explanation_bytes:
@@ -454,7 +562,7 @@ def search_text(
                 return (
                     TextSearchResult(
                         chosen,
-                        "prefix_index" if prefix else "exact_index",
+                        ("proximity_positions" if slop else "phrase_positions" if options.positions else "phrase_verified") if phrase else ("prefix_index" if prefix else "exact_index"),
                         certificate.header.built_through_lsn,
                         snapshot.read_lsn,
                         visited,

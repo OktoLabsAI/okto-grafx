@@ -2,7 +2,7 @@
 
 Every version of every record starts with the same 40 bytes inside its slot:
 
-    0  u8  flags          bit 0 deleted, bit 1 has_overflow
+    0  u8  flags          bit 0 deleted, bit 1 has_overflow, bit 2 node_labels_v1
     1  u8  reserved
     2  u16 schema_version
     4  u32 payload_len
@@ -42,6 +42,7 @@ __all__ = [
     "RECORD_HEADER_SIZE",
     "RECORD_FLAG_DELETED",
     "RECORD_FLAG_HAS_OVERFLOW",
+    "RECORD_FLAG_NODE_LABELS",
     "NO_PREVIOUS_VERSION",
     "OVERFLOW_POINTER_SIZE",
     "RecordHeader",
@@ -58,6 +59,9 @@ RECORD_FLAG_DELETED: int = 0x01
 
 RECORD_FLAG_HAS_OVERFLOW: int = 0x02
 """Bit 1 of the flag byte: the payload lives in an overflow chain, not in this slot."""
+
+RECORD_FLAG_NODE_LABELS: int = 0x04
+"""Bit 2: GXL1 label membership precedes the positional tuple; requires node_labels_v1."""
 
 NO_PREVIOUS_VERSION: int = 0
 """The end of a version chain, written as the literal zero (amendment A2)."""
@@ -221,6 +225,7 @@ class HeapVersion:
     schema_version: int
     deleted: bool
     table_id: int
+    node_labels: tuple[str, ...] | None = None
     _stored_payload_bytes: int | None = field(
         default=None,
         init=False,

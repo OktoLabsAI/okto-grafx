@@ -24,11 +24,10 @@ from okto_grafx.domain.query.ast import (
     Query,
     SetClause,
     Subscript,
-    UnaryOperation,
     Variable,
 )
 from okto_grafx.domain.query.limits import (
-    MAX_CLAUSES,
+    MAX_PIPELINE_CLAUSES,
     MAX_EXPRESSION_DEPTH,
     MAX_LIST_ELEMENTS,
     MAX_MAP_ENTRIES,
@@ -241,6 +240,8 @@ def test_ascending_is_the_default_sort_direction() -> None:
         ("MATCH (a:Person)-->(b:Person) RETURN a.id", Direction.OUTGOING),
         ("MATCH (a:Person)<--(b:Person) RETURN a.id", Direction.INCOMING),
         ("MATCH (a:Person)--(b:Person) RETURN a.id", Direction.UNDIRECTED),
+        ("MATCH (a:Person)<-->(b:Person) RETURN a.id", Direction.UNDIRECTED),
+        ("MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id", Direction.UNDIRECTED),
     ],
 )
 def test_every_arrow_form_reads_its_direction(text: str, expected: Direction) -> None:
@@ -262,16 +263,11 @@ def test_every_hop_range_form_reads_its_bounds(
     assert (relationship.min_hops, relationship.max_hops) == expected
 
 
-@pytest.mark.parametrize("written", ["*0", "*0..2", "*0..0"])
-def test_a_zero_length_path_is_refused_rather_than_answered_as_one_hop(written: str) -> None:
-    """openCypher gives ``*0..k`` the start node itself; this dialect starts at one hop.
-
-    An accepted zero used to be executed from depth 1 -- ``*0..1`` answered as ``*1..1`` -- a
-    third answer that is neither dialect's. Refusing at the door is the honest outcome.
-    """
-    with pytest.raises(GrafxParseError) as refusal:
-        parse(f"MATCH (a:Person)-[:Knows{written}]->(b:Person) RETURN b.name")
-    assert refusal.value.details["field"] == "min_hops"
+@pytest.mark.parametrize("written,upper", [("*0", 0), ("*0..2", 2), ("*0..0", 0)])
+def test_zero_length_range_is_preserved_without_rewriting_to_one(written, upper):
+    statement = parse(f"MATCH (a:Person)-[:Knows{written}]->(b:Person) RETURN b.name")
+    hop = statement.match_clauses[0].patterns[0].relationships[0]
+    assert (hop.min_hops, hop.max_hops, hop.hop_range_written) == (0, upper, True)
 
 
 def test_a_pattern_may_carry_inline_properties() -> None:
@@ -314,9 +310,9 @@ def test_multiplication_binds_more_tightly_than_addition() -> None:
     assert expression.describe() == "(1 + (2 * 3))"
 
 
-def test_exponentiation_is_right_associative() -> None:
+def test_exponentiation_is_left_associative() -> None:
     expression = only_item("RETURN 2 ^ 3 ^ 2")
-    assert expression.describe() == "(2 ^ (3 ^ 2))"
+    assert expression.describe() == "((2 ^ 3) ^ 2)"
 
 
 def test_addition_is_left_associative() -> None:
@@ -338,11 +334,10 @@ def test_a_sign_in_front_of_a_number_folds_into_the_literal() -> None:
     assert only_item("RETURN -5") == Literal(value=-5)
 
 
-def test_exponentiation_binds_more_tightly_than_a_sign() -> None:
-    # Folding "-2" first would make this the square of minus two, which is a different number.
+def test_sign_binds_more_tightly_than_exponentiation() -> None:
     expression = only_item("RETURN -2 ^ 2")
-    assert isinstance(expression, UnaryOperation)
-    assert expression.describe() == "-(2 ^ 2)"
+    assert isinstance(expression, BinaryOperation)
+    assert expression.describe() == "(-2 ^ 2)"
 
 
 def test_the_most_negative_integer_is_writable() -> None:
@@ -467,17 +462,16 @@ def test_a_match_after_a_write_is_refused() -> None:
 
 
 def test_the_unsupported_clause_is_named_rather_than_puzzled_over() -> None:
-    # A plain WITH is part of the subset now; the deduplicating one is not, and the refusal
-    # names the clause it read rather than the token it happened to stop on.
+    # WITH DISTINCT is now supported; external LOAD remains outside the language contract.
     with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person) WITH DISTINCT a RETURN a.id")
-    assert failure.value.details["value"] == "WITH DISTINCT"
+        parse("LOAD CSV FROM 'file.csv' AS row RETURN row")
+    assert failure.value.details["value"] == "LOAD"
 
 
-def test_comparisons_do_not_chain() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        parse("RETURN 1 = 2 = 3")
-    assert failure.value.details["field"] == "operator"
+def test_comparisons_chain_as_adjacent_conjunctions() -> None:
+    chained = parse("RETURN 1 = 2 = 3")
+    expanded = parse("RETURN 1 = 2 AND 2 = 3")
+    assert chained == expanded
 
 
 def test_an_integer_one_past_the_range_is_refused_when_it_carries_no_sign() -> None:
@@ -486,18 +480,15 @@ def test_an_integer_one_past_the_range_is_refused_when_it_carries_no_sign() -> N
     assert failure.value.details["field"] == "integer"
 
 
-def test_an_omitted_upper_bound_is_read_as_the_default_rather_than_as_none() -> None:
-    # The guarantee these two cases were written for -- a traversal is never unbounded -- is
-    # kept by giving the omission the bound the public endpoint already gives it, rather than
-    # by refusing the text. What would break the guarantee is an absent upper, and there is
-    # none: the pattern carries one either way.
+def test_an_omitted_upper_bound_has_an_explicit_resource_policy() -> None:
     hop = (
         parse("MATCH (a:Person)-[:Knows*]->(b:Person) RETURN a.id")
         .match_clauses[0]
         .patterns[0]
         .relationships[0]
     )
-    assert (hop.min_hops, hop.max_hops) == (1, 20)
+    assert (hop.min_hops, hop.max_hops) == (1, MAX_TRAVERSAL_HOPS)
+    assert hop.upper_bound_omitted
 
 
 def test_a_hop_range_with_no_upper_bound_keeps_the_lower_one_it_wrote() -> None:
@@ -507,13 +498,15 @@ def test_a_hop_range_with_no_upper_bound_keeps_the_lower_one_it_wrote() -> None:
         .patterns[0]
         .relationships[0]
     )
-    assert (hop.min_hops, hop.max_hops) == (2, 20)
+    assert (hop.min_hops, hop.max_hops) == (2, MAX_TRAVERSAL_HOPS)
+    assert hop.upper_bound_omitted
 
 
-def test_a_lower_bound_above_the_default_is_an_empty_range_and_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person)-[:Knows*25..]->(b:Person) RETURN a.id")
-    assert failure.value.details["field"] == "min_hops"
+def test_a_lower_bound_above_twenty_is_not_an_empty_omitted_range() -> None:
+    query = parse("MATCH (a:Person)-[:Knows*25..]->(b:Person) RETURN a.id")
+    hop = query.match_clauses[0].patterns[0].relationships[0]
+    assert hop.min_hops == 25
+    assert hop.upper_bound_omitted
 
 
 def test_a_hop_range_beyond_the_ceiling_is_refused() -> None:
@@ -531,16 +524,16 @@ def test_a_hop_range_at_the_ceiling_is_accepted() -> None:
     assert isinstance(statement, Query)
 
 
-def test_a_backwards_hop_range_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person)-[:Knows*3..1]->(b:Person) RETURN a.id")
-    assert failure.value.details["field"] == "min_hops"
+def test_a_backwards_hop_range_preserves_empty_bounds() -> None:
+    statement = parse("MATCH (a:Person)-[:Knows*3..1]->(b:Person) RETURN a.id")
+    edge = statement.match_clauses[0].patterns[0].relationships[0]
+    assert (edge.min_hops, edge.max_hops, edge.hop_range_written) == (3,1,True)
 
 
-def test_an_arrow_pointing_both_ways_is_refused() -> None:
-    with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id")
-    assert failure.value.details["field"] == "direction"
+def test_an_arrow_pointing_both_ways_has_canonical_undirected_semantics() -> None:
+    statement = parse("MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id")
+    assert statement.match_clauses[0].patterns[0].relationships[0].direction is Direction.UNDIRECTED
+    assert statement.describe() == "MATCH (a:Person)<-[:Knows]->(b:Person) RETURN a.id"
 
 
 def test_a_star_on_something_that_is_not_an_aggregate_is_refused() -> None:
@@ -590,9 +583,14 @@ def test_a_vector_space_statement_without_options_is_refused() -> None:
         parse("CREATE VECTOR SPACE s")
 
 
-def test_set_must_assign_to_a_property() -> None:
+def test_set_accepts_whole_entity_target_but_not_a_literal_target() -> None:
+    statement = parse("MATCH (p:Person) SET p = {name:'Ada'}, p += {v:1}")
+    assignments = statement.updating_clauses[0].items
+    assert assignments[0].target.describe() == "p"
+    assert assignments[0].merge is False
+    assert assignments[1].merge is True
     with pytest.raises(GrafxParseError) as failure:
-        parse("MATCH (p:Person) SET p = 1")
+        parse("MATCH (p:Person) SET 1 = p")
     assert failure.value.details["field"] == "target"
 
 
@@ -604,7 +602,7 @@ def test_set_must_assign_to_a_property() -> None:
     [
         "RETURN " + "(" * 400 + "1" + ")" * 400,
         "RETURN " + "NOT " * 400 + "true",
-        "RETURN " + "2^" * 400 + "2",
+        "RETURN " + "2^(" * 400 + "2" + ")" * 400,
         "RETURN " + "-" * 400 + "2",
         "RETURN " + "[" * 400 + "1" + "]" * 400,
         "RETURN " + "{a: " * 400 + "1" + "}" * 400,
@@ -623,14 +621,21 @@ def test_nesting_at_the_ceiling_still_parses() -> None:
     assert isinstance(parse("RETURN " + "(" * depth + "1" + ")" * depth), Query)
 
 
-def test_a_long_flat_chain_costs_no_depth_at_all() -> None:
+@pytest.mark.parametrize("operator", ("+", "^"))
+def test_a_long_flat_chain_costs_no_parser_recursion(operator) -> None:
     # Precedence climbing consumes same-precedence operators in a loop, so this is the property
     # that makes an ordinary long predicate parse at all.
-    assert isinstance(parse("RETURN " + " + ".join(["1"] * 2000)), Query)
+    from okto_grafx.domain.query.analysis import analyze
+    from okto_grafx.domain.errors import GrafxPlanError
+    statement = parse("RETURN " + f" {operator} ".join(["1"] * 2000))
+    assert isinstance(statement, Query)
+    with pytest.raises(GrafxPlanError) as failure:
+        analyze(statement)
+    assert failure.value.details["field"] == "depth"
 
 
 def test_too_many_clauses_are_refused() -> None:
-    text = " ".join(["MATCH (p:Person)"] * (MAX_CLAUSES + 1)) + " RETURN p.id"
+    text = " ".join(["MATCH (p:Person)"] * (MAX_PIPELINE_CLAUSES + 1)) + " RETURN p.id"
     with pytest.raises(GrafxParseError) as failure:
         parse(text)
     assert failure.value.details["field"] == "clauses"

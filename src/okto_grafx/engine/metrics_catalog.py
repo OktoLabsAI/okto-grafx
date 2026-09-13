@@ -218,6 +218,8 @@ _ERROR_CODE = LabelSpec(
             "lease_stolen",
             "stale_epoch",
             "snapshot_reclaimed",
+            "history_unavailable",
+            "history_expired",
             "corruption_detected",
             "device_full",
             "durability_barrier_failed",

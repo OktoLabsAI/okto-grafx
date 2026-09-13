@@ -5,11 +5,50 @@ snapshot isolation, WAL-backed durability, verification and fail-closed recovery
 No database server is required. The base installation includes NumPy and native CRC-32C;
 engine/domain mechanisms remain isolated behind ports.
 
-**Version: 0.0.5, pre-alpha — published on PyPI.** See the
+**Source version: 0.0.6, pre-alpha — in development.** Latest published release: 0.0.5. See the
 [publication receipt](docs/reports/PYPI_0_0_5_PUBLICATION.md). API and persistent-format compatibility
 must be checked before upgrading; see [operations](docs/OPERATIONS.md).
 
+Development procedures now support [explicit native schema authority](docs/specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md),
+including flexible CREATE/MERGE and catalog-v2 index/DML composition within the
+caller's transaction. See [qualification](docs/reports/FP7_SCHEMA_QUALIFICATION.md)
+and the [roadmap](ROADMAP.md) for remaining parity and deployment work.
+
 ## Install and start
+
+Development [typed collection columns](docs/specs/TYPED_COLLECTIONS_V1.md) add
+the types summarized in the [consolidated support/refusal matrix](docs/TYPE_SUPPORT.md).
+The implementation includes
+LIST/MAP element types, fixed ARRAY length and named STRUCT fields, including
+nested nullability, decimals and temporals. Native DDL/writes, schema, history,
+copy and logical transfer preserve descriptors. [Exact JSON/CSV/JSONL/SQLite
+collection interchange](docs/COLLECTION_JSON.md) now uses explicit schemas/tags
+and whole-call rollback. [Exact nested columnar interchange](docs/COLLECTION_COLUMNAR.md)
+adds Arrow/Pandas/Polars/Parquet with owned descriptors, full type metadata and
+bounded atomic imports. [Installed type readers](docs/reports/FP6_TYPE_WHEEL_QUALIFICATION.md)
+and [native label-format readers](docs/reports/FP_NODE_LABEL_WHEEL_QUALIFICATION.md)
+are qualified for their recorded candidates. The complete
+[V3 query profile](docs/reports/FP_V3_INTEGRATED_QUERY_QUALIFICATION.md) passes all
+3,896 required cases; final integrated delivery status remains in the roadmap.
+
+The [final complete regression](docs/reports/FP_FINAL_NATIVE_QUALIFICATION.md)
+passes 25,077 tests with 19 attributed skips and all 20 native supplemental maps.
+[Isolated installed Pulse API/UI/MCP checks](docs/reports/FP_FINAL_PULSE_QUALIFICATION.md)
+also pass. Neo4j comparative execution was explicitly deferred by the user and
+does not block this delivery; this is not a
+released version, full upstream conformance or an unrestricted Cypher claim.
+
+The 0.0.6 development line also has [native decimal storage](docs/specs/DECIMAL_VALUES_V1.md#native-storage-contract-development).
+It includes exact decimal query arithmetic, aggregation, ordering/grouping and typed
+equality-index seeks, plus [exact history/copy/logical transfer](docs/reports/FP6_DECIMAL_CONSUMER_QUALIFICATION.md).
+CLI JSON, typed local text/SQLite imports and registered procedure values now have
+an [exact decimal interface contract](docs/specs/DECIMAL_VALUES_V1.md#json-local-imports-and-procedure-signatures).
+Arrow, Pandas, Polars and Parquet also support
+[exact decimal128 interchange](docs/EXTENSIONS_AND_ARROW.md#exact-native-decimals-006-development)
+through `ArrowDecimalType(p,s)`, with explicit metadata and atomic native imports.
+The [combined type-package qualification](docs/reports/FP6_TYPE_WHEEL_QUALIFICATION.md)
+covers installed codecs, durable recovery and old-reader refusal. Supported and
+refused consumers are explicit in the type matrix; this is not full Cypher parity.
 
 Python 3.11–3.13; local Windows and POSIX filesystems.
 
@@ -46,19 +85,32 @@ context exit commits, and an exceptional exit rolls back. See
 
 | Capability | Consumer documentation |
 | --- | --- |
+| Native temporal constructors, scoped clocks, fields, arithmetic/order and typed/ANY stored values (0.0.6 development) | [Temporal values, query usage and qualified consumers](docs/TEMPORAL_VALUES.md) |
+| Bounded position results/proximity, atomic analyzer replacement, endpoint-closed copy (0.0.6 development) | [Text contracts](docs/FULL_TEXT_SEARCH.md), [copy](docs/CATALOG_COPY.md) |
+| System-time diff, optional persistent temporal access tree and quiescent history compaction (0.0.6 development) | [History usage, limits and maintenance](docs/SYSTEM_TIME_HISTORY.md) |
+| Native opt-in system-time history, typed as-of/versions, pins and bounded retention (0.0.6 development) | [Temporal APIs and operations](docs/SYSTEM_TIME_HISTORY.md) |
+| Durable positional phrase postings and explicit catalog/workspace CLI inventory (0.0.6 development) | [FTS](docs/FULL_TEXT_SEARCH.md), [CLI](docs/CLI.md) |
+| Opt-in page-local repeated-key posting indexes (0.0.6 development) | [Posting hash](docs/POSTING_HASH.md) |
+| Exact analyzed phrase search with bounded same-snapshot candidate verification (0.0.6 development) | [Phrase semantics and limitations](docs/FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development) |
+| Bounded existing-target copy with atomic data/receipt and indexed idempotent replay (0.0.6 development) | [Catalog copy](docs/CATALOG_COPY.md) |
+| Durable typed logical read views with atomic replacement and snapshot execution (0.0.6 development) | [Logical views](docs/LOGICAL_VIEWS.md) |
+| Append nullable columns with explicit old-row layouts and no heap rewrite (0.0.6 development) | [Schema evolution](docs/NULLABLE_COLUMNS.md) |
+| Named catalog-pinned transactions and optional bounded workspace resolution (0.0.6 development) | [Catalogs and workspace policies](docs/CATALOGS_AND_WORKSPACES.md) |
 | Opt-in sparse hash directories, bounded repeated-key decoding and indexed retired-page discovery (0.0.5 development) | [Index layouts](docs/INDEXES_AND_VECTORS.md#sparse-exact-hash-indexes-and-repeated-keys), [operations](docs/OPERATIONS.md) |
-| Explicit trusted typed scalar UDFs and optional scalar/vector Arrow batch import/export (0.0.5 development) | [Extensions and Arrow](docs/EXTENSIONS_AND_ARROW.md), [compatibility evidence](docs/V005_COMPATIBILITY.md) |
+| Explicit trusted typed scalar UDFs and optional scalar/vector Arrow batches; exact temporal struct transport added in 0.0.6 development | [Extensions and Arrow](docs/EXTENSIONS_AND_ARROW.md), [compatibility evidence](docs/V005_COMPATIBILITY.md) |
 | Explicit Arrow-backed Pandas/Polars frames and bounded local Parquet import/export (0.0.5 development) | [Tabular interoperability](docs/TABULAR_AND_PARQUET.md) |
-| Typed bounded local CSV/JSONL readers and whole-call atomic import staging (0.0.5 development) | [Local text ingestion](docs/LOCAL_TEXT_IMPORT.md) |
+| Typed bounded CSV/JSONL readers and whole-call atomic staging; exact temporal tag ingestion added in 0.0.6 development | [Local text ingestion](docs/LOCAL_TEXT_IMPORT.md) |
 | Detached NetworkX multigraph and node/edge/result Arrow batch export (0.0.5 development) | [Graph exchange](docs/GRAPH_EXCHANGE.md) |
 | Bounded prefix search and full-text over relationship properties (0.0.5 development) | [Full-text options and upgrade contract](docs/FULL_TEXT_SEARCH.md#prefix-search-and-relationship-properties) |
 | Batched weighted projections; reusable identity/CSR/transition/simple topology, WCC/SCC, BFS/Dijkstra, personalized PageRank with opt-in NumPy, linear k-core and label propagation (0.0.5 development) | [Graph projections](docs/GRAPH_PROJECTIONS.md), [scan contract](docs/INTEGRATION.md#bounded-physical-scans) |
 | Configurable repeated-key cache, batched sparse heads and aggregate HNSW admission (0.0.5 development) | [Memory and maintenance](docs/INDEXES_AND_VECTORS.md#continuation-after-69ed311-bounded-maintenance-and-memory) |
 | Multi-process/multi-thread access, snapshot transactions, optimistic conflicts and writer fencing | [Concurrency and recovery](docs/OPERATIONS.md) |
-| Typed nodes/relationships, parameters, writes, traversal, aggregates, limited OPTIONAL MATCH and UNION | [Supported query language](docs/QUERY_LANGUAGE.md) |
+| Typed/flexible nodes and relationships, native heterogeneous properties, zero/one/multiple labels, bounded polymorphic paths, OPTIONAL MATCH and read/write/unit UNION | [Supported query language](docs/QUERY_LANGUAGE.md), [entity values](docs/ENTITY_VALUES.md) |
 | Atomic `executemany`, streaming results and snapshot-bound physical scan cursors | [Integration recipes](docs/INTEGRATION.md) |
 | Automatic PK/endpoint/identity indexes; custom hash/ordered indexes; foreground rebuild/rehash | [Indexes and vectors](docs/INDEXES_AND_VECTORS.md) |
 | Exact and approximate vector search with declared space, metric and precision | [Indexes and vectors](docs/INDEXES_AND_VECTORS.md) |
+| 0.0.6 development: table-qualified shared-space vector/hybrid retrieval, typed vector SET and collision-free durable owner names | [Physical vector ownership](docs/specs/VECTOR_PHYSICAL_OWNERS_V1.md), [durable naming and qualification](docs/specs/VECTOR_OWNER_NAMES_V1.md) |
+| 0.0.6 development: owner-qualified vector memory/rebuild operations, detached physical IDs and explicit missing-index repair | [Maintenance contract](docs/specs/VECTOR_QUALIFIED_MAINTENANCE_V1.md), [legacy repair qualification](docs/reports/VECTOR_OWNER_REPAIR_QUALIFICATION.md) |
 | Native full-text indexes, versioned analyzers, weighted BM25 and bounded snapshot search (0.0.5 development) | [Full-text search](docs/FULL_TEXT_SEARCH.md) |
 | Snapshot-consistent weighted RRF text/vector fusion with bounded graph evidence (0.0.5 development) | [Hybrid search](docs/HYBRID_SEARCH.md) |
 | Indexed hybrid BFS, aggregate search-memory diagnostics and cooperative vector controls; opt-in durable FTS totals (0.0.5 development) | [Hybrid contracts](docs/HYBRID_SEARCH.md), [FTS modes](docs/FULL_TEXT_SEARCH.md) |
@@ -72,13 +124,24 @@ context exit commits, and an exceptional exit rolls back. See
 | Streaming logical export/import, opt-in crash resumption, fresh identities and verified promotion (0.0.5 development) | [Logical transfer](docs/LOGICAL_TRANSFER.md) |
 | Cooperative read cancellation/deadlines and quiescent orphan-index inventory/removal (0.0.5 development) | [Read control and cleanup](docs/READ_CONTROL_AND_INDEX_CLEANUP.md) |
 | Embedded Python, machine-readable CLI, configurable ports/adapters | [API](docs/API_REFERENCE.md), [CLI](docs/CLI.md), [ports](docs/PORTS.md) |
+| 0.0.6: CLI schema/index inventory and text/vector/hybrid search; JS/TS recipe | [CLI and contracts](docs/CLI.md) |
+| 0.0.6: native scalar/list expressions, ordered clauses, multi-branch read/write and unit UNION, returning/read-write and unit writing subqueries, explicit/wildcard/leading-WITH imports, typed CALL/YIELD (development) | [Composable queries](docs/COMPOSABLE_QUERIES.md), [updating UNION](docs/COMPOSABLE_QUERIES.md#updating-union-branches), [import scopes](docs/COMPOSABLE_QUERIES.md#subquery-import-scopes), [compatibility](docs/CYPHER_COMPATIBILITY.md) |
+| 0.0.6: trusted unit procedures, no result columns, input-cardinality preservation and statement rollback (development) | [Unit CALL contract](docs/specs/UNIT_PROCEDURES_V1.md), [complete native profile and follow-up](docs/reports/FP_FULL_PROFILE_20260912.md) |
+| 0.0.6: explicit writing procedures, short-lived mutation capability, shared budgets and outer-statement rollback (development; bounded DML door) | [Writing procedure contract](docs/specs/WRITING_PROCEDURES_V1.md), [qualification](docs/reports/FP7_WRITING_QUALIFICATION.md) |
+| 0.0.6: native temporal, LIST/MAP/ANY and vector procedure signatures with bounded ownership and transactional persistence (development) | [Native value signatures](docs/specs/PROCEDURE_NATIVE_VALUES_V1.md), [qualification](docs/reports/FP7_NATIVE_VALUES_QUALIFICATION.md) |
+| 0.0.6: NODE/RELATIONSHIP/PATH procedure signatures and typed entity lists with invocation-scoped native identity (development) | [Entity signatures and usage](docs/specs/PROCEDURE_ENTITY_SIGNATURES_V1.md), [qualification](docs/reports/FP7_ENTITY_QUALIFICATION.md) |
+| 0.0.6: permissioned procedure readers and native returning-query authority with shared budgets, snapshot and rollback (development) | [Query authority API](docs/specs/PROCEDURE_QUERY_AUTHORITY_V1.md), [qualification](docs/reports/FP7_QUERY_QUALIFICATION.md) |
+| 0.0.6: recursive native CALL with inherited depth/root budgets and explicit callback determinism (development) | [Nesting and effects](docs/specs/PROCEDURE_NESTING_EFFECTS_V1.md), [qualification](docs/reports/FP7_NESTING_QUALIFICATION.md) |
+| 0.0.6: standalone CALL with declared implicit argument names, automatic/wildcard outputs and native signature diagnostics (development) | [Invocation contract](docs/specs/PROCEDURE_INVOCATION_V1.md), [qualification](docs/reports/FP7_INVOCATION_QUALIFICATION.md) |
+| 0.0.6: NUMBER procedure inputs/results and validated integer-to-DOUBLE widening; all 52 original procedure cases pass (development; writing/query/schema authority documented above) | [Numeric signatures and qualification](docs/specs/PROCEDURE_NUMERIC_SIGNATURES_V1.md) |
+| 0.0.6: bounded SQLite ingestion, offline HTML viewer, topological ordering | [SQLite](docs/LOCAL_SQLITE_IMPORT.md), [HTML](docs/HTML_SNAPSHOTS.md), [algorithms](docs/GRAPH_PROJECTIONS.md) |
 
 Concurrent transactions do not imply lock-free commits: publication has an exclusive
 section, different rows can conflict on physical pages, and operations may wait or
 time out. Recovery repairs only states that the WAL and durable identity prove safe;
 it does not silently rebuild or discard damaged authoritative data.
 
-There is no native async/HTTP/MCP server, SQLAlchemy backend, public time-travel API
+There is no native async/HTTP/MCP server, SQLAlchemy backend, valid-time/bitemporal API
 or no-pause streaming hot-backup API in this release surface. Proposed capabilities
 are explicitly separated in the [roadmap](ROADMAP.md).
 
@@ -112,10 +175,15 @@ historical evidence; integrating the library does not require reading the latter
 - [Public API and result types](docs/API_REFERENCE.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [Query language](docs/QUERY_LANGUAGE.md)
+- [Native temporal values: query functions, operators, Python API and persistence](docs/TEMPORAL_VALUES.md)
+- [Composable queries, CALL/YIELD and migration semantics](docs/COMPOSABLE_QUERIES.md)
+- [Fixed Cypher compatibility target and TCK evidence](docs/CYPHER_COMPATIBILITY.md)
 - [Operations, concurrency, errors and upgrades](docs/OPERATIONS.md)
 - [Performance and measurement boundaries](docs/PERFORMANCE.md)
+- [Feature comparison: Grafx vs Ladybug vs Neo4j](docs/FEATURE_COMPARISON.md)
 - **[Roadmap: evolution, known limitations and corrective work](ROADMAP.md)** — the sole active backlog
 - [Changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md), [security](SECURITY.md)
+- [Repository governance and public-release checklist](GOVERNANCE.md)
 
 ## Deployment and license
 
@@ -125,4 +193,7 @@ while participants are using them. OpenMetrics has no authentication/TLS; remote
 binding requires explicit consent. See [operational safety](docs/OPERATIONS.md).
 
 Licensed under [Elastic License 2.0 with the SaaS/Branding Addendum](LICENSE).
-Check those terms before offering a hosted service.
+This is a custom, source-available license, not unmodified ELv2 and not an
+OSI-approved open-source license. The addendum remains part of the terms;
+making the repository public does not remove it. Check the complete license
+before embedding, redistributing or offering a hosted service.

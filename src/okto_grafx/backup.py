@@ -48,6 +48,7 @@ _BASE_FILES = frozenset(
         "catalog.dat",
         "commits.dir",
         "commits.dat",
+        "system-history.dat",
         "control/commit.state",
         "control/writer.lease",
         "bootstrap/first-open.complete",

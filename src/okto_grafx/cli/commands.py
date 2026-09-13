@@ -30,6 +30,8 @@ and re-opens the file by a freshly built path before it reports success.
 
 from __future__ import annotations
 
+from okto_grafx.domain.model.stored_types import stored_type_to_json
+
 import datetime
 import hashlib
 import json
@@ -676,6 +678,48 @@ def _optional_component(database: Database, name: str) -> object | None:
 
 
 # --- status ---------------------------------------------------------------------------------
+
+
+def _schema(invocation: Invocation) -> Report:
+    """Inspect a single detached catalog, without scanning graph records."""
+    return _on_database(invocation, lambda database: _schema_body(invocation, database))
+
+
+def _schema_body(invocation: Invocation, database: Database) -> Report:
+    from okto_grafx.cli.discovery import dto
+
+    catalog = database.catalog.catalog
+    tables = catalog.tables()
+    spaces = catalog.spaces()
+    selected_spaces = spaces[:invocation.number("limit", 100)]
+    selected = tables[:invocation.number("limit", 100)]
+    definitions = [
+        {
+            "table_id": table.table_id, "name": table.name, "kind": table.kind,
+            "schema_version": table.schema_version, "primary_key": table.primary_key,
+            "from_table": table.from_table, "to_table": table.to_table,
+            "columns": [
+                {"name": column.name, "type": column.type.name,
+                 "nullable": column.nullable, "vector_space": column.vector_space,
+                 **({"decimal_precision": column.decimal_precision, "decimal_scale": column.decimal_scale}
+                    if column.type.name == "DECIMAL" else {}),
+                 **({"stored_type": stored_type_to_json(column.stored_type)} if column.stored_type is not None else {})}
+                for column in table.columns
+            ],
+        }
+        for table in selected
+    ]
+    truncated = len(selected) < len(tables) or len(selected_spaces) < len(spaces)
+    return Report(
+        exit_code=OK,
+        payload={**_head(invocation), "schema_version": 1, "read_only": True,
+                 "tables": definitions, "total_tables": len(tables),
+                 "returned_tables": len(selected), "truncated": truncated,
+                 "spaces": dto(selected_spaces), "total_spaces": len(spaces),
+                 "returned_spaces": len(selected_spaces)},
+        lines=(f"tables {len(selected)}/{len(tables)}; truncated={str(truncated).lower()}",
+               *(f"{table.table_id} {table.kind} {table.name}" for table in selected)),
+    )
 
 
 def _status(invocation: Invocation) -> Report:
@@ -1891,7 +1935,28 @@ def _write_evidence(output: str, body: bytes) -> dict[str, object]:
     }
 
 
+def _discovery(invocation: Invocation) -> Report:
+    from okto_grafx.cli.discovery import capabilities, inspect_indexes, search, catalog_inventory, workspace_resolution
+
+    if invocation.spec.name == "capabilities":
+        return capabilities(invocation)
+    if invocation.spec.name == "catalogs":
+        return catalog_inventory(invocation)
+    if invocation.spec.name == "workspace":
+        return workspace_resolution(invocation)
+    operation = inspect_indexes if invocation.spec.name == "indexes" else search
+    return _on_database(invocation, lambda database: operation(invocation, database))
+
+
 _HANDLERS: Mapping[str, Callable[[Invocation], Report]] = {
+    "catalogs": _discovery,
+    "workspace resolve": _discovery,
+    "capabilities": _discovery,
+    "indexes": _discovery,
+    "search text": _discovery,
+    "search vector": _discovery,
+    "search hybrid": _discovery,
+    "schema": _schema,
     "status": _status,
     "verify": _verify,
     "query": _query,

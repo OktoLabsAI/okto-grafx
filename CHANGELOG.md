@@ -7,7 +7,93 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Added (0.0.6 development)
+
+- Authorized eight-item language round (locally validated): fixed openCypher
+  TCK 2024.3 inventory; ordered clauses and lexical scopes; correlated typed OPTIONAL
+  MATCH; up to 64 UNION branches; returning read subqueries; native scalar/list and
+  one-hop path functions; atomic composed writes; trusted typed CALL/YIELD.
+  Breaking semantics include zero-based indexing, case-sensitive map keys, lazy
+  CASE/COALESCE without implicit result coercion, exact integer SUM, list ordering,
+  operator precedence and connected-node DELETE refusal. Pulse owner-reference
+  queries migrate together, with Community pinned to Grafx 0.0.6. Persistent formats,
+  multi-reader/writer OCC and WAL durability are unchanged. See the
+  [compatibility contract](docs/CYPHER_COMPATIBILITY.md) and
+  [consumer contracts](docs/COMPOSABLE_QUERIES.md); full Cypher is not claimed.
+
+- Refreshed the Ladybug/Neo4j comparison against the validated 0.0.6 development
+  capabilities, with explicit release, concurrency, temporal/search and evidence
+  boundaries; the comparison is included in the consumer documentation checks.
+- NHC-1–8: bounded matched token positions and ordered phrase slop; opt-in
+  endpoint-closed selected copies; typed system-time graph diff; optional native
+  temporal access tree for versions/as-of (required bit 17); atomic same-name
+  analyzer replacement; quiescent physical history compaction (required bit 18).
+  Both new storage capabilities are explicit, one-way operations. Connection
+  defaults, multi-reader/writer, OCC and WAL durability guarantees are unchanged.
+- Corrected current-only temporal copy admission: the commit-history lookup no
+  longer shadows the caller's explicit `history` policy.
+
+- Follow-up 1–3: native opt-in system-time activation and atomic current/history
+  COMMIT; typed as-of/versions, schema and delete/recreate lineage; verification,
+  physical backup/restore, explicit current-only transfer and durable pins with
+  bounded payload retention. Bit 15 and qualified history WAL flags fence old builds.
+- Follow-up 4–5: JSON catalogs/workspace inventory; bounded selected-RID copy and
+  explicit skip-node-conflict policy with durable inserted/skipped receipt counts.
+- Follow-up 6–7: opt-in durable positional FTS chunks (bit 16) with validated phrase
+  coverage; bounded immutable content-keyed posting-hash decode memo.
+- Follow-up 8: real installed-wheel 0.0.5/0.0.6 upgrade/refusal/pure-accelerated
+  matrix and Windows/POSIX Python-version CI definition. Final evidence is separate
+  from release, install or platform claims.
+
+- Continuation 7: opt-in `posting_hash` property indexes with page-local key
+  dictionaries, stable reference slots and bounded same-key INSERT preparation.
+  Native WAL, snapshots, generation fencing and maintenance remain in force.
+- Earlier continuation 8 prototype: bounded event codec and append-image plans;
+  superseded by the native history follow-up above, not a separate consumer API.
+
+- Capability continuation 1–2: named catalog sessions with explicit ownership and
+  permissions, and bounded opt-in workspace/path resolution.
+- Continuation 3: bounded existing-target native copy with atomic data/receipt,
+  indexed idempotent replay and source/target commit provenance.
+- Continuation 4: exact analyzed phrase verification in snapshot-bound FTS
+  candidates; still the default path. Optional persisted positions are added by
+  follow-up 6 above; no slop operator is exposed.
+- Continuation 5: durable typed logical read views with checksum/dependency
+  validation, snapshot execution and atomic create/replace/drop.
+- Continuation 6: typed nullable-column append with exact prior decode layouts,
+  required capability bit 13, no heap rewrite and stale-writer refusal. Physical
+  backup preserves layouts; logical transfer exports decoded current rows into
+  fresh schema version 1. Native temporal-history integration and posting-layout
+  delivery are recorded above.
+
+- MP-1: read-only JSON table/space and secondary/vector index inventories;
+  path-free build CLI capabilities, explicit truncation and stale metadata.
+- MP-2/3: snapshot-owned text/vector/hybrid CLI search and bounded JS/TS subprocess
+  recipe, including typed envelopes, failure cleanup and unsafe-integer refusal.
+- MP-4: native Unicode lower/upper/trim and numeric abs, with static/bound/runtime
+  type checks, NULL propagation and finite/INT64 overflow refusal.
+- MP-5/6: offline script-free HTML graph/schema pictures and bounded read-only
+  SQLite ingestion with closed-source, whole-call atomic Grafx staging.
+- MP-7: two-branch read-only UNION ALL preserving duplicate rows, type promotion,
+  snapshot ownership and shared intermediate/result budgets.
+- MP-8: O(V+E) deterministic topological ordering with typed DAG/cycle results,
+  logical work/memory bounds and cancellation.
+- Comparative feature-gap register and ordered MP-1–MP-8 minimum-parity roadmap.
+
+### Fixed (0.0.6 development)
+
+- Full-text verification now detects missing/extra live multi-key coverage and
+  duplicate physical postings, including positional chunks.
+- Temporal error codes are admitted by the existing bounded metrics label domain.
+- Public annotations, exports, code docstrings and executable documentation were
+  reconciled with the complete feature surface, including preceding checkpoints.
+
 ### Changed
+
+- Prepared public-repository governance: administrator-owned pull requests, a main-branch
+  protection payload that also enforces administrators, and a privacy/history publication
+  checklist. Retained the existing Elastic License 2.0 + SaaS/Branding Addendum unchanged.
+  Preparation does not change GitHub visibility or activate a protection unavailable on the plan.
 
 - Continuation after `a4dd85a`: opt-in immutable PageRank transition preparation and
   simple topology reuse; bounded deterministic read-only label propagation.

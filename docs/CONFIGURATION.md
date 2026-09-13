@@ -1,5 +1,249 @@
 # Configuration reference
 
+The [consolidated type-support matrix](TYPE_SUPPORT.md) separates schema declarations,
+native/query/procedure values, indexes and transport options. StoredType, p/s and
+native capability bits are not connection tuning knobs.
+
+Typed collection Arrow/Pandas/Polars/Parquet uses explicit `StoredType` entries and
+existing operation-local row/batch/frame/file limits. No connection option is
+added. Metadata size, nested occurrences and ANY payload expansion are charged
+before conversion; limits are logical workspace estimates, not RSS ceilings.
+[Full columnar configuration/transport contract](COLLECTION_COLUMNAR.md#bounds-and-failures).
+
+Collection JSON helpers have operation-local `max_bytes=65536` (exact integer
+1..2^31), not a connection option. CSV/JSONL/SQLite use existing max_field_bytes
+and additionally charge max_work by native encoded collection bytes. Descriptors
+remain schema values, not mutable reader settings. [Budget and transport contract](COLLECTION_JSON.md).
+
+Typed collection columns add no connection option. Explicit catalog-v2 activation
+precedes DDL; capability `typed_collections_v1` is durable metadata, not a user
+toggle. Nested type descriptors are bounded at depth 64, 4,096 expanded nodes,
+256 fields per STRUCT and 65,536 encoded bytes. Actual values remain subject to
+existing row/capture/transaction/query budgets. ARRAY length is an exact schema
+constraint, not an allocation reservation. [Full contract](specs/TYPED_COLLECTIONS_V1.md).
+
+Native decimal storage adds no tuning option. Explicit `ensure_identity_indexes()`
+is the catalog-v2 prerequisite; `decimal_values_v1` is a persistent capability,
+not a toggle. Precision/scale belong to `DECIMAL(p,s)`/`ColumnDef`, not connection
+defaults. Existing codec and transaction budgets apply. [Contract and remaining scope](specs/DECIMAL_VALUES_V1.md).
+Decimal numeric queries additionally use existing query memory/work/row and spill
+budgets. Exact aggregate coefficient growth is accounted for by the bounded
+workspace; no decimal-specific budget, automatic rounding toggle or retry option
+is added. Rounding is an explicit function argument, not ambient configuration.
+Decimal history/copy/logical transfer likewise reuse `TemporalLimits`, `CopyLimits`
+and `TransferLimits`; matching copy schemas and exact stored p/s validation are
+mandatory, not configurable coercion policies. See the
+[consumer contract](specs/DECIMAL_VALUES_V1.md#history-copy-and-logical-transfer-consumption).
+Tagged decimal imports reuse `TextImportLimits`/`SQLiteImportLimits` and exact
+target assignment. Procedure DECIMAL/NUMBER cells use the existing value/result
+budgets, charging 19 bytes for each native decimal occurrence before copying.
+There is no implicit decimal-to-DOUBLE option or ambient rounding configuration.
+Columnar APIs additionally accept `ArrowDecimalType(precision, scale)` in their
+existing `types` tuple. This is a transport descriptor, not a connection setting.
+Exact metadata is mandatory; existing batch/frame/row/file limits apply. Decimal
+cells add 1,024 logical bytes to the existing accounting (including NULL);
+Arrow import also uses its structured 16x physical-byte multiplier. No default
+or allocator/RSS guarantee changes. [Columnar contract](EXTENSIONS_AND_ARROW.md#exact-native-decimals-006-development).
+
+General unbound/fixed multi-hop MERGE retains the complete match set per input
+under `query_memory_budget_bytes` when configured (`operator="merge_matches"`).
+The buffer does not spill; insufficient memory refuses before conditional actions,
+with whole-statement rollback rather than truncated results. No new knob/default
+is added. [Semantics and qualification](specs/GENERAL_MERGE_V1.md).
+
+Vector diagnostic/rebuild owner selection is an **operation argument**, not a
+connection setting: use `table="Document"` or `table=("rel", "Related")` on
+`vector_memory_usage` / `rebuild_vector_index`. No configuration changes the
+ambiguity refusal or disables the rebuild coverage fence. See
+[qualified vector maintenance](specs/VECTOR_QUALIFIED_MAINTENANCE_V1.md).
+Missing derived vector artifacts require an explicit selected-owner rebuild;
+there is no automatic-repair toggle. Read-only opening does not recreate them.
+CLI `search vector --table NAME --table-kind node|rel` expresses the same per-query
+selection; it is not a connection option or persistent owner preference.
+
+Expression/path DELETE prepares potentially overlapping inputs before deleting;
+a direct predicate-free node scan with literal variable targets stays streaming.
+Its non-spilling buffer
+uses existing `query_memory_budget_bytes` (operator `delete_inputs`) and
+intermediate-row limits; insufficient memory refuses before deletion rather than
+committing batches. No new setting is added. [Details](specs/DELETE_EXPRESSIONS_V1.md).
+
+`RETURN *` uses the existing fixed maximum of 256 projected items after expansion;
+it adds no connection setting. All query memory, cancellation and transaction
+budgets still apply. [Scope rules](QUERY_LANGUAGE.md#returning-the-visible-scope).
+
+Native implicit single-label creation, unlabeled nodes and automatic flexible relationship types add no tuning
+flag. Their `flexible_graph_v1`
+capability is installed transactionally on first creation; a pristine empty
+catalog can activate it in that statement. A nonempty v1 catalog needs explicit
+catalog-v2 activation first. See [format, bounds and usage](architecture/FLEXIBLE_GRAPH_V1.md).
+
+Fresh-store logical transfer selects artifact format 2 automatically for flexible
+models or relationship groups. It reuses `TransferLimits`; no connection setting
+or durability relaxation is added. [Format and compatibility](LOGICAL_TRANSFER.md#artifact-v2-flexible-models-and-relationship-groups).
+
+Opt-in history on flexible/grouped tables also activates required catalog bit 22,
+`system_history_models_v1`; this is a compatibility fence, not a tuning option.
+Existing `TemporalLimits` and explicit per-table history activation remain in force.
+[Historical model contract](SYSTEM_TIME_HISTORY.md#flexible-models-and-historical-relationship-groups).
+
+Heterogeneous `ANY` properties add no runtime tuning flag. They require catalog-v2
+activation via `db.maintenance.ensure_identity_indexes()` before DDL and install
+the durable `heterogeneous_properties_v1` capability. Resource/durability limits
+are unchanged; see the [contract](architecture/HETEROGENEOUS_PROPERTIES_V1.md).
+
+Logical relationship groups add no configuration knob. They require explicit
+catalog-v2 admission (`maintenance.ensure_identity_indexes()` when needed), then
+use existing DDL transaction, query cancellation, traversal, result and spill
+budgets across all physical members. There is no automatic inner commit or
+relaxed durability mode. [DDL and current limits](QUERY_LANGUAGE.md#relationship-types-spanning-endpoint-tables).
+
+Heterogeneous relationship ranges add no knob. The fixed 30-hop resource ceiling,
+`max_traversal_expansions`, `max_traversal_paths`, intermediate-row, value,
+memory/spill and cancellation limits remain cumulative across all selected types.
+An omitted upper bound refuses an extendable trail rather than silently truncating;
+the completeness probe can consume expansion/path budget too. See
+[bounded range rules](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges).
+
+Generic untyped/alternative-type single hops add no configuration. They use the
+same intermediate-row, expansion/path, memory/spill and cancellation budgets as
+typed traversal, cumulatively across all candidate tables. Endpoint indexes
+remain subject to their existing freshness/owner-overlay checks. See
+[single-hop consumption](QUERY_LANGUAGE.md#untyped-and-alternative-type-single-hops).
+
+Absent-table MATCH/OPTIONAL reads add no option or schema-creation mode. Their
+zero-hop branch shares `max_traversal_paths` and query cancellation; no edge
+expansion is charged for a zero-edge path. Empty patterns retain upstream work
+and its quotas. See [read-pattern semantics](QUERY_LANGUAGE.md#absent-tables-in-read-patterns).
+
+`properties()`, `labels()` and `type()` add no options. `properties()` demands all
+user property values (including vectors) under existing query value, memory, row
+and cancellation limits. Resource refusal does not return a partial property map.
+These functions share the current snapshot and transaction authority. See
+[native entity functions](QUERY_LANGUAGE.md#native-entity-scalar-consumption).
+
+Native node/relationship result DTOs introduce no new setting or legacy-output
+toggle. `max_query_value_characters` still governs string admission, including
+materialized entity properties; conversion failure does not commit partial writes.
+Returning an entire entity materializes its properties, whereas scalar projections
+can retain the closed-column fast paths. Aggregate/sort/DISTINCT spill preserves
+identity and version metadata under `query_memory_budget_bytes`, including entity
+UNION outputs. Entity aggregate values are charged for their encoded properties,
+not just their record IDs. The fixed alias-expanded expression-depth bound still
+applies to UNION typing; it introduces no new setting. See [entity results](ENTITY_VALUES.md).
+
+Native `PathValue` uses the same materialization and spill limits. A
+node-only capture (`MATCH p=(n)`) adds no setting: each demanded capture consumes
+one `max_traversal_paths` unit, zero edge expansions, and shares cancellation and
+row/value/spill limits. Explicit LIMIT or cursor close stops unused input.
+Its owned representation admits at most 1,024 nodes and exactly one fewer relationships;
+typed explicit ranges accept zero through 30 hops per segment and can concatenate
+segments. Complete general path enumeration is not enabled by constructing the DTO.
+`nodes()`/`relationships()` return entity
+tuples rather than metadata maps; there is no path-output compatibility toggle.
+Composed bounded captures and clause-level relationship uniqueness add no
+configuration switch. They share traversal, cancellation and expression-work
+budgets, including list comparisons between variable-hop segments. Structural
+AST validation is independent of query syntax admission: mutable inventories,
+foreign AST subclasses and cycles are refused, not enabled by any compatibility flag.
+Omitted upper bounds have a fixed 30-hop resource ceiling, not an implicit result
+bound. A valid extension beyond it raises `query_budget_exceeded` with
+`field=max_traversal_hops`; existing expansion/path quotas may fail first.
+No new connection option or legacy-20 switch is introduced. See
+[traversal semantics](QUERY_LANGUAGE.md) for LIMIT/cursor behavior. Depth-first
+streaming removes breadth-wide path retention. Existing adjacency fallback caches,
+result/spill limits, cancellation and path/expansion quotas still apply.
+
+The fixed numeric-token ceiling is 2,048 characters (excluding a unary sign),
+allowing long finite DOUBLE spellings. It is not a `connect()` setting. INT64
+admission, non-finite literal/storage refusal, query text/token limits and runtime value budgets
+remain independent; see [numeric rules](QUERY_LANGUAGE.md#values-and-python-mapping).
+
+Expression NaN is enabled without a compatibility flag. Storage remains finite,
+including nested LIST/MAP values and vector components; no connection option can
+override it. See [NaN boundaries](QUERY_LANGUAGE.md#nan-expressions-versus-persistent-properties).
+
+Existential pattern predicates introduce no settings. Inner read operators share
+the statement's traversal expansion/path and intermediate-row limits, memory
+budget and cancellation control; they do not acquire fresh per-row allowances.
+A witness allows early close, but exhaustion of a budget never means "no match".
+
+`WITH *` introduces no setting: the existing fixed 256-item projection ceiling
+applies to carried variables plus explicit items after star expansion. IN operand
+validation likewise has no compatibility toggle or additional budget.
+
+Query-language semantics have no legacy compatibility switch. Host-owned tabular/unit
+procedure settings (`argument_names`, `required_permissions`, `max_rows`, `max_result_bytes`,
+`max_value_bytes`) belong to each immutable `ExtensionRegistry`, not persisted
+database configuration. See [procedure configuration and safety limits](COMPOSABLE_QUERIES.md#typed-tabular-procedures).
+
+NHC operation-local additions (no new `connect` defaults):
+
+| Option / operation | Default | Consumer contract |
+| --- | --- | --- |
+| `search_text(return_positions, slop)` | `False`, `0` | [Matched positions and proximity](FULL_TEXT_SEARCH.md#position-results-and-ordered-proximity) |
+| `TextSearchLimits.max_position_results` / `max_proximity_work` | 100,000 / 1,000,000 | Aggregate output ordinals / ordered matching work; fail without partial results |
+| `replace_text_index(name, options=...)` | Explicit only | Fresh complete generation; table/fields/sizing unchanged |
+| `capture_copy(include_endpoints)` | `False` | [One-hop selected relationship closure](CATALOG_COPY.md#automatic-endpoint-closure) |
+| `TemporalLimits.access_path` | `"auto"` | `auto`, `scan`, `index`; [eligibility and costs](SYSTEM_TIME_HISTORY.md#persistent-temporal-access-path) |
+| `system_diff(max_changes)` | 100,000 | 1–1,000,000 schema/row/property entries, plus shared input limits |
+| `enable_system_history_index(max_bytes)` | 16 MiB | Explicit one-way native index build; 1–2 GiB capture limit |
+| `compact_system_history(confirm_quiescent, max_bytes)` | `False`, 16 MiB | Requires explicit stopped-other-process assertion and no local transaction; 1–2 GiB capture limit |
+
+0.0.6 adds explicit `enable_system_history(tables)`, temporal query limits,
+durable pins and bounded prune budgets; none is enabled by connecting. See the
+[temporal configuration table](SYSTEM_TIME_HISTORY.md#configuration-and-bounded-cost).
+`TextIndexOptions.positions=False` controls persisted positional postings; opting
+in is a required-capability upgrade, not a transient query flag. See
+[positional FTS](FULL_TEXT_SEARCH.md#durable-positional-postings-006-development).
+The posting-hash pure decode LRU has fixed 64-image/1 MiB per-handle bounds,
+documented in [posting hash](POSTING_HASH.md); it is not an authority cache.
+
+`Database.create_index(..., layout="posting_hash")` is an explicit per-index
+physical layout, not a connection flag. See [eligibility, limits and trade-offs](POSTING_HASH.md).
+
+`Database.add_nullable_column` takes a native nullable `ColumnDef` and explicitly
+requires v2 identity indexes; it activates one-way `nullable_columns_v1` format
+compatibility. It adds no connection option. See [scope and fixed limits](NULLABLE_COLUMNS.md#supported-scope).
+The qualified table selectors accepted by that method and by `maintenance.bloat`
+and `maintenance.vacuum` are per-operation arguments, not connection settings.
+They do not relax vacuum quiescence or change transaction/recovery policy.
+
+`Database.views` has operation-local preparation, typed parameter declarations,
+replacement, pagination and query-timeout options, not connection flags. See
+[logical view semantics and limits](LOGICAL_VIEWS.md#semantics-and-limits).
+
+`Database.search_text(..., phrase=False)` is an operation-local boolean for
+[exact analyzed phrases](FULL_TEXT_SEARCH.md#exact-analyzed-phrases-006-development).
+It reuses existing FTS limits and cannot be combined with prefix mode; it adds no
+connection option. Persistent positional postings use the separate `positions`
+index option described above; phrase search itself also works without that opt-in.
+
+For whole-package copy bounds and idempotency/metadata options, see
+[CopyLimits and results](CATALOG_COPY.md#configuration-and-result-contracts).
+They do not override native transaction quotas or add connection flags.
+Typed-group copy adds no tuning switch: logical type names are package metadata
+charged against `CopyLimits.max_bytes`, and target membership is validated by
+logical name and endpoint pair. See [grouped copy](CATALOG_COPY.md#typed-logical-relationship-groups).
+Expanded flexible/no-PK copy shares the whole operation's `max_statement_writes`
+and `max_intermediate_rows`, including its private node-to-edge phase, without
+resetting those limits. [Identity and quota contract](CATALOG_COPY.md#flexible-and-no-pk-entity-identity).
+
+For operation-local `CatalogPathPolicy` and `WorkspacePolicy`, see the complete
+[catalog/workspace option table](CATALOGS_AND_WORKSPACES.md#path-and-workspace-configuration).
+These are not connection options and do not enable scopes implicitly.
+
+## 0.0.6 operation-local additions
+
+No `connect`/`DatabaseConfig` fields or defaults change in MP-1–MP-8.
+[CLI discovery/search](CLI.md) adds metadata `--limit` (100), search `--k` (20,
+maximum 1000), optional record-ID `--filter`, and `--timeout-seconds` (30).
+[SQLiteImportLimits](LOCAL_SQLITE_IMPORT.md) bounds detached ingestion rows,
+bytes, field size and work. [HtmlSnapshotLimits](HTML_SNAPSHOTS.md) bounds shown
+nodes/edges, output bytes and rendering work. [Topological ordering](GRAPH_PROJECTIONS.md)
+reuses `ProjectionLimits` and optional cancellation. These are per-operation
+arguments, not persisted settings or new promises of RSS/OS-call preemption.
+
 In the September 10, 2026 0.0.5 development revision, the base install includes
 NumPy and google-crc32c. New connections default to `codec="numpy"` and
 `vector_math="numpy"`; `checksum="auto"` still validates and selects native CRC.
@@ -8,6 +252,15 @@ there is no silent NumPy fallback. Existing explicitly saved settings are not
 rewritten. Page bytes and transactional guarantees do not change. NumPy vector
 results follow the documented floating-point tolerances, not pure bit equality.
 Operation-local algorithm options (such as PageRank's `backend`) are unchanged.
+
+Native temporal queries and storage in the 0.0.6 development worktree additionally
+declare `tzdata>=2024.1`. The provider loads package-backed IANA rules, identifies
+their version and never selects the machine's implicit timezone. Query clocks
+default to UTC; explicit timezone maps select a named/fixed zone per call.
+No connection-level timezone option is exposed. Native DATE/TIME/local/zoned
+values and DURATION preserve their declared coordinates across persistence and
+supported transports. See [public usage](TEMPORAL_VALUES.md),
+[type support/refusal matrix](TYPE_SUPPORT.md) and [format admission](V006_COMPATIBILITY.md).
 
 The continuation after `a4dd85a` adds only operation-local options: opt-in
 `with_pagerank(backend="python", weighted=False)`, `with_simple_topology()` and
@@ -53,6 +306,14 @@ explicit `ArrowVectorType` descriptors. All are **operation-local**; see
 [algorithm options](GRAPH_PROJECTIONS.md#algorithms-and-controls) and
 [vector Arrow contracts](EXTENSIONS_AND_ARROW.md#explicit-native-vectors).
 No new connection default, environment variable or durable format is introduced.
+
+`search_vectors(table=...)` is a per-operation physical-owner selector, not a
+connection option. It accepts a unique table name or `(kind, name)`, refuses
+ambiguous omitted selection, and leaves snapshot/OCC and read-control settings
+unchanged. See [vector ownership](specs/VECTOR_PHYSICAL_OWNERS_V1.md).
+`TableDef.vector_identity_names` records the [persisted naming policy](specs/VECTOR_OWNER_NAMES_V1.md)
+selected for colliding/overlong automatic vector names. It activates capability
+25 in catalog v2; it is not a `connect` option or an in-place migration switch.
 
 The eight-item continuation adds operation-local `search_vectors(timeout_seconds=,
 cancellation=)` and `HybridSearchOptions.graph_access` (`auto`/`scan`). Hybrid
@@ -148,7 +409,7 @@ custom provider registration and runtime configuration errors are unchanged.
 | `max_statement_writes` | `None` | Optional hard limit on logical row writes retained by one statement |
 | `max_result_rows` | `None` | Optional hard limit on public result rows; row N+1 is refused before it is retained and before any remaining input is consumed |
 | `max_intermediate_rows` | `None` | Optional hard limit per non-terminal physical operator over one execution; it is not a cumulative query-wide count |
-| `query_memory_budget_bytes` | `None` | Optional logical retained-byte ceiling per blocking sort, result-DISTINCT or aggregate operator; enables safe adapter-backed external spill without measuring RSS |
+| `query_memory_budget_bytes` | `None` | Optional logical retained-byte ceiling per blocking sort, result-DISTINCT or aggregate operator; enables safe adapter-backed external spill without measuring RSS. Also bounds cumulative pattern-comprehension materialization per statement (lists themselves do not spill); see [query contract](QUERY_LANGUAGE.md#pattern-comprehensions) |
 | `max_traversal_expansions` | `None` | Optional cumulative per-query limit on relationship candidates examined by graph-pattern operators; candidate N+1 is refused before derived landing/filter work |
 | `max_traversal_paths` | `None` | Optional cumulative per-query limit on visible paths admitted by graph-pattern operators; path N+1 is refused before frontier retention or return |
 | `max_query_value_characters` | `65536` | Per-string parameter/result boundary; configurable from 1 through the hard 1,048,576-character guard; query-source literals keep their separate 16,384-character ceiling |
@@ -172,6 +433,12 @@ custom provider registration and runtime configuration errors are unchanged.
 | `read_only` | `False` | No replay/repair; requires checkpoint-complete state and may refuse after a newer acknowledged commit. Distinct from `db.execute()`'s read transaction |
 
 ## Types, ranges and persistence
+
+There is no new setting for range streaming: the native generated-list ceiling
+remains 100,000 elements. Materialized `range(...)` checks total size before
+allocation; direct `UNWIND range(...)` checks consumed elements per incoming row.
+The existing `max_intermediate_rows`, result/write limits and read cancellation
+still apply. See [range and LIMIT semantics](QUERY_LANGUAGE.md#values-and-python-mapping).
 
 Integer settings reject booleans. Time settings accept finite positive int/float
 seconds, not booleans, infinity or NaN. Optional integer limits accept `None` or a
@@ -201,6 +468,14 @@ Custom registries supply their own adapters; selector presence does not override
 caller-owned resources. See [ports](PORTS.md).
 
 ## Tuning guidance
+
+Source-query bounds are not connection settings: 65,536 characters, 32,768 lexer
+tokens, 1,024 pipeline clauses including RETURN, 64 UNION branches, 64 conditional
+SET actions per MERGE, expression depth 48 and physical-plan depth 192. Consecutive
+CREATE patterns use a flat native program; other long operator chains can still
+reach the depth guard. These do not replace `max_statement_writes`, transaction
+quotas or memory controls and never cause silent truncation or split commits.
+[Full contract](specs/WRITE_PATTERN_CONTRACTS_V1.md#large-create-pipelines).
 
 - Start with `[accel]`, strict identity validation and defaults; measure before
   raising buffer sizes. Three independent 64 MiB handles have a 192 MiB nominal
@@ -299,11 +574,12 @@ graph-pattern operator in one query. Variable and untyped traversal charge an ex
 candidate yielded by their selected endpoint source, before repeat-edge and landing checks; a
 fixed relationship scan charges each stored or pending relationship it encounters, before its
 pushed predicate and endpoint checks. A path is charged only after the applicable pushed predicate
-and landing visibility checks, immediately before the path can enter a variable-length frontier or
+and landing visibility checks, immediately before the path can enter variable-length expansion or
 be returned by a one-hop scan. The first over-limit unit is refused before it is retained or
 returned. These limits cover Cypher relationship traversal and scans, not the separate internal
 HNSW navigation performed by a vector-search operator. Physical rows read once to construct a
 grouped endpoint fallback are auxiliary scan work and are not charged as candidate expansions.
+Each zero-length anchor path consumes one path unit, but no expansion unit.
 When disabled the limits do not add traversal counters to `QueryResult.statistics`; when enabled,
 the corresponding `traversal_expansions` or `traversal_paths` statistic records admitted work on
 successful queries.
@@ -328,6 +604,12 @@ result-DISTINCT adds 128 bytes plus its versioned detached values. Python object
 arenas, encoding/comparison temporaries, OS caches and the final caller-owned result are
 deliberately outside this portable accounting model.
 
+Exact percentileDisc/percentileCont share this setting: `None` retains and sorts
+the samples in memory; a configured ceiling uses external numeric runs, with only
+the selected positions retained in the accumulator. DISTINCT samples use the
+same external deduplication passes. No separate percentile budget or approximate
+mode is introduced. See [query semantics and costs](QUERY_LANGUAGE.md#percentile-aggregates).
+
 Spill records use purpose- and version-tagged `Value` encodings and a versioned run header; they
 never use pickle. Files live in an isolated adapter temporary directory, outside the database
 namespace; binary merge levels keep their in-memory path metadata O(log N), and all artifacts are
@@ -344,5 +626,55 @@ enabled. This first byte-budget boundary does not cover `EagerRows`, vector-sear
 materialisation, deadlines, RSS or public result retention; use the row limits and cursor API for
 those separate boundaries. It changes no snapshot, transaction, WAL, OCC, durable format,
 multiwriter or multireader rule.
+
+The 0.0.6 language round adds no legacy compatibility switch. List iteration and
+concatenation have fixed 100,000-element limits; nested iterations share a
+100,000-step statement ceiling. Native range generation has the same element cap.
+These limits are independent of spill accounting, which does not cover arbitrary
+expression temporaries. Composed write phases share `max_statement_writes` and
+transaction quotas; obtaining private endpoint identities never resets a quota
+or makes an intermediate commit. UNION is bounded to 64 read/write or unit branches and
+returning subquery nesting to 16. Procedure registration adds explicit per-call
+row/value/result-byte budgets, detailed in [composable queries](COMPOSABLE_QUERIES.md).
+Explicit writing procedures also declare `mode="write"`, nonempty permissions
+and `max_write_statements` (default 128, range 1..1024). Writing output and operation
+budgets aggregate across invocations within one outer statement; native mutation
+and traversal budgets are shared. These are trusted Python registration options,
+not DatabaseConfig fields. [Complete contract](specs/WRITING_PROCEDURES_V1.md).
+Native temporal/container/vector procedure signatures add no settings. Their
+existing `max_value_bytes` becomes a recursively charged ownership budget, while
+result-byte quotas still use actual encoding. Depth, list/map cardinality and
+native value validation are not bypassed. [Tariffs and errors](specs/PROCEDURE_NATIVE_VALUES_V1.md).
+
+Entity signatures use those same descriptor limits, including a logical entity
+header and complete property/path observations. They add no global setting or
+storage capability flag. [Entity tariffs and admission](specs/PROCEDURE_ENTITY_SIGNATURES_V1.md#budgets-configuration-and-limitations).
+
+Procedure graph queries add descriptor-only `graph_read=False` (permissioned read
+opt-in), `max_query_statements=128` (1..1024), `max_query_rows=10000` (1..2^31) and
+`max_query_bytes=8388608` (1..2^31). Limits are exact integers, exclude bool and
+accumulate across native query calls/input rows of the same procedure in an outer
+statement. Cell limits and native query budgets still apply; writing query calls
+also consume the existing write-statement allowance. No global connect field is
+added. [Choosing limits and API semantics](specs/PROCEDURE_QUERY_AUTHORITY_V1.md).
+
+Schema procedures add descriptor `schema_write=False` (exact bool) and
+`max_schema_statements=32` (exact int 1..1024). Enabling schema requires write mode,
+literal `schema` permission and schema-enabled ancestors. Actual explicit/implicit
+schema operations share the per-name schema counter and charge
+`max_write_statements`. These are not DatabaseConfig/environment fields and do not
+relax index-build or staging limits. [Usage and contract](specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md).
+
+Native procedure nesting adds descriptor `max_call_depth=8` (exact int 1..16,
+outer callback counts as 1, minimum of every active ancestor/callee) and
+`deterministic=False` (exact bool; True rejected for writers). Native query/write/
+result/traversal accounting remains shared across the chain. Default volatile
+callbacks are not assumed safe for deterministic expression reuse. No connect
+setting or storage flag changes. [Policies, limits and upgrade guidance](specs/PROCEDURE_NESTING_EFFECTS_V1.md).
+
+Native `EXISTS { ... }` adds no setting. It inherits the outer read deadline,
+cancellation token, traversal and memory ceilings, plus existing subquery nesting
+and syntax limits. Short-circuiting does not bypass aggregation/window semantics
+or open an independent snapshot. See [execution and API contract](specs/EXISTS_SUBQUERIES_V1.md).
 
 ---

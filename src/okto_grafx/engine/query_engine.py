@@ -52,14 +52,31 @@ its chain, which is exactly what section 8.5 step 4 needs in order to log the wr
 
 from __future__ import annotations
 
+from okto_grafx.domain.query.entity_scalars import ENTITY_SCALARS, entity_scalar_error, entity_scalar_type
+from okto_grafx.domain.model.relationship_type import RelationshipTypeDef
+from okto_grafx.domain.model.decimal_values import DecimalValue, DecimalTotal, decimal_negate, decimal_from_number
+from okto_grafx.domain.query.decimal_numeric import (
+    DecimalOrderKey, decimal_group_key, decimal_numeric_compare, decimal_arithmetic, decimal_arithmetic_type,
+)
+
+from okto_grafx.domain.query.scalars import (
+    MAX_GENERATED_LIST_ELEMENTS, NATIVE_SCALARS, range_values, scalar_type, scalar_value,
+)
+from okto_grafx.domain.query.effects import is_deterministic
+
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from heapq import heappop, heappush, heapreplace
 from types import MappingProxyType
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from math import isnan
+from hashlib import blake2b
 from typing import cast
+
+from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
+from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, PathValue, QueryValue
+from okto_grafx.domain.query.limits import MAX_LIST_ELEMENTS, MAX_MAP_ENTRIES, MAX_TRAVERSAL_HOPS
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -111,6 +128,9 @@ from okto_grafx.engine.vector_engine import VectorEngine
 from okto_grafx.domain.model.errors import SchemaMismatchError
 from okto_grafx.domain.model.record import HeapVersion
 from okto_grafx.domain.model.schema import (
+    SchemaType,
+    FLEXIBLE_PROPERTIES_COLUMN,
+    _check_column_value,
     ENDPOINT_COLUMNS,
     ENDPOINT_COLUMN_COUNT,
     ColumnDef,
@@ -125,6 +145,7 @@ from okto_grafx.domain.model.schema import (
 from okto_grafx.domain.model.value import (
     INT64_MAX,
     INT64_MIN,
+    MAX_VALUE_DEPTH,
     VECTOR_VALUE_TYPES,
     Timestamp,
     Value,
@@ -135,6 +156,13 @@ from okto_grafx.domain.model.value import (
     value_type_of,
 )
 from okto_grafx.domain.ports.clock import Clock
+from okto_grafx.domain.query.temporal_functions import (
+    TEMPORAL_CLASSES, temporal_arithmetic_type, temporal_property_type,
+)
+from okto_grafx.domain.model.temporal_values import DurationValue
+from okto_grafx.domain.temporal_access import temporal_field
+from okto_grafx.domain.temporal_arithmetic import add_duration, subtract_duration, scale_duration
+from okto_grafx.domain.temporal_comparison import temporal_order_key, temporal_predicate
 from okto_grafx.domain.ports.metrics import MetricDescriptor, MetricsSink
 from okto_grafx.domain.ports.query_spill import (
     QuerySpillFactory,
@@ -154,18 +182,29 @@ from okto_grafx.domain.txn.context import (
 from okto_grafx.domain.txn.intents import reduce_row_intents
 from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.domain.wal.commit import partition_key
-from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, analyze
+from okto_grafx.domain.query.analysis import Aggregation, QueryAnalysis, is_aggregate
+from okto_grafx.domain.query.extensions import TabularProcedure, _procedure_argument_accepts
+from okto_grafx.domain.query.procedure_resolution import resolve_procedure_calls
+from okto_grafx.domain.query.procedure_writer import ProcedureWriter, ProcedureReader, ProcedureResult
+from okto_grafx.domain.query.procedure_values import owned_procedure_value, procedure_result_size
+from okto_grafx.domain.query.percentiles import (
+    PERCENTILE_FUNCTIONS, percentile_argument, percentile_sample, percentile_positions, percentile_interpolate,
+)
 from okto_grafx.domain.query.ast import (
     Direction,
     BinaryOperation,
     CaseExpression,
     CreateClause,
     CreateIndexStatement,
+    CreateNodeTableStatement,
+    CreateRelTableStatement,
+    CreateVectorSpaceStatement,
     DeleteClause,
     Expression,
     FunctionCall,
     ListExpression,
     Literal,
+    MapEntry,
     MapExpression,
     MatchClause,
     MergeClause,
@@ -173,6 +212,10 @@ from okto_grafx.domain.query.ast import (
     NullCheck,
     Parameter,
     PatternPath,
+    PatternPredicate,
+    ExistsSubquery,
+    PatternComprehension,
+    LabelPredicate,
     Property,
     Query,
     RelationshipPattern,
@@ -180,8 +223,11 @@ from okto_grafx.domain.query.ast import (
     SortItem,
     Statement,
     Subscript,
+    ListSlice,
+    ListIteration,
     UnaryOperation,
     UnionQuery,
+    SubqueryClause,
     Variable,
     free_variables,
     walk,
@@ -195,11 +241,19 @@ from okto_grafx.domain.query.parser import parse as parse_text
 from okto_grafx.domain.query.plan import (
     AggregateRows,
     AllNodesScan,
+    ApplyRows,
+    ArgumentRows,
+    SubqueryRows,
+    RestoreImports,
+    ProcedureRows,
     CreateIndex,
+    CaptureNodePath,
+    ZeroHopRelationship,
     CreateNodeTable,
     CreatedNode,
     CreatedRelationship,
     CreateRelationships,
+    CreateSequence,
     CreateRelTable,
     CreateVectorSpace,
     DeleteEntities,
@@ -217,6 +271,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    LabelAssignment,
     RelationshipIncidentSeek,
     RelationshipScan,
     SetProperties,
@@ -224,6 +279,7 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseAnyRelationship,
+    TraverseRelationshipAlternatives,
     TraverseRelationship,
     UnionRows,
     UnwindRows,
@@ -233,10 +289,11 @@ from okto_grafx.domain.query.plan import (
 )
 from okto_grafx.domain.query.planner import (
     RELATIONSHIP_LOOKUP_FRONTIER_LIMIT,
-    union_common_type,
     SCORE_COLUMN,
     PlannedQuery,
     build_plan,
+    boolean_argument_types,
+    membership_argument_type,
     case_comparison_type,
     case_result_type,
     coalesce_result_type,
@@ -433,6 +490,15 @@ class _WholeVectorTableFilter:
         return True
 
 
+def _flexible_properties(table: TableDef, values: tuple[Value, ...]) -> Mapping[str, Value]:
+    """Read the complete native property bag without exposing its physical column."""
+    bag = values[-1] if values else None
+    if not isinstance(bag, Mapping):
+        raise GrafxPlanError("Flexible properties require the complete validated property map.",
+                             field="projection", table=table.name)
+    return bag
+
+
 @dataclass(frozen=True, slots=True)
 class RowBinding:
     """One variable of a result row, bound to one version of one stored row."""
@@ -443,6 +509,8 @@ class RowBinding:
     version: HeapVersion
     polymorphic: bool = False
     """Whether the pattern that bound this row named no label."""
+    pending_observation: bool = False
+    """Private-overlay provenance retained when spill strips physical authority."""
 
     @property
     def record_id(self) -> int:
@@ -457,6 +525,8 @@ class RowBinding:
         not declare is null here rather than a refusal -- refusing would make a query answer
         for one table and fail for the next one in the same scan.
         """
+        if self.table.flexible_properties:
+            return _flexible_properties(self.table, self.version.values).get(key)
         position = self.table.column_positions.get(key)
         if position is not None:
             if position >= len(self.version.values):
@@ -488,39 +558,11 @@ class RowBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class _PathIdentity:
-    """One capability-free, opaque identity carried by a projected path."""
-
-    offset: int
-    table: int
-
-
-@dataclass(frozen=True, slots=True)
-class _PathNodeValue:
-    """One detached node inside the engine's private path result marker."""
-
-    identity: _PathIdentity
-    label: str
-    properties: tuple[tuple[str, Value], ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _PathRelationshipValue:
-    """One detached relationship inside the engine's private path result marker."""
-
-    source: _PathIdentity
-    target: _PathIdentity
-    label: str
-    identity: _PathIdentity
-    properties: tuple[tuple[str, Value], ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _PathValue:
-    """A nominal one-hop path marker consumed only by the public result snapshot."""
+    """An execution-private ordered path; detached only at the result boundary."""
 
-    nodes: tuple[_PathNodeValue, _PathNodeValue]
-    relationships: tuple[_PathRelationshipValue]
+    nodes: tuple[RowBinding, ...]
+    relationships: tuple[RowBinding, ...]
 
 
 @dataclass(slots=True)
@@ -567,7 +609,7 @@ class QueryResult:
     """
 
     columns: tuple[str, ...] = ()
-    rows: tuple[tuple[Value, ...], ...] = ()
+    rows: tuple[tuple[QueryValue, ...], ...] = ()
     plan: PlanNode | None = None
     statistics: Mapping[str, int] = field(default_factory=dict)
 
@@ -731,7 +773,7 @@ class QueryResult:
         """Iterate the rows in the order the query produced them."""
         return iter(self.rows)
 
-    def dictionaries(self) -> tuple[dict[str, Value], ...]:
+    def dictionaries(self) -> tuple[dict[str, QueryValue], ...]:
         """Return the rows as mappings from column name to value."""
         return tuple(dict(zip(self.columns, row)) for row in self.rows)
 
@@ -806,12 +848,40 @@ class _Row:
     columns: dict[str, object] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AddNullableColumn(PlanNode):
+    """Internal typed-only DDL; never accepted as user query text or a persisted plan."""
+
+    table: str | tuple[str, str]
+    column: ColumnDef
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmitNodeLabels(PlanNode):
+    """Native label operators' private schema admission in the outer statement."""
+
+    table_id: int
+    labels: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _AttachRelationshipType(PlanNode):
+    """Import-owned logical authority over already journaled physical members."""
+
+    name: str
+    members: tuple[str, ...]
+
+
 _WRITE_PLAN_NODES: tuple[type[PlanNode], ...] = (
+    _AddNullableColumn,
+    _AdmitNodeLabels,
+    _AttachRelationshipType,
     CreateIndex,
     CreateNodeTable,
     CreateRelTable,
     CreateVectorSpace,
     CreateRelationships,
+    CreateSequence,
     MergePattern,
     SetProperties,
     DeleteEntities,
@@ -824,8 +894,8 @@ def _plan_writes(root: PlanNode) -> bool:
 
     A result cursor may be closed before exhaustion.  Incremental execution is therefore safe
     only for a read plan: otherwise closing after the first batch would have to choose between
-    committing a prefix and silently discarding a statement.  The planner has only unary and
-    binary operator links, so this bounded walk covers the complete executable tree without
+    committing a prefix and silently discarding a statement. Operator-owned children include
+    nested CALL bodies, so this bounded walk covers the complete executable tree without
     inspecting expression objects that happen to be dataclasses too.
     """
     pending: list[PlanNode] = [root]
@@ -836,12 +906,9 @@ def _plan_writes(root: PlanNode) -> bool:
         if identity in seen:
             continue
         seen.add(identity)
-        if isinstance(node, _WRITE_PLAN_NODES):
+        if isinstance(node, _WRITE_PLAN_NODES) or isinstance(node, ProcedureRows) and node.writes:
             return True
-        for name in ("child", "left", "right"):
-            child = getattr(node, name, None)
-            if isinstance(child, PlanNode):
-                pending.append(child)
+        pending.extend(node.children())
     return False
 
 
@@ -926,7 +993,7 @@ class _QueryResultCursor:
                         limit=configured,
                         observed=observed,
                     )
-                produced.append(_projected(row, self.columns))
+                produced.append(_projected(row, self.columns, self._context))
                 self._seen = observed
         except GrafxError as failure:
             self._engine._count_error(failure)
@@ -1039,6 +1106,7 @@ class _HeldRow:
     reference: object
     token: int | None = None
     encoding_proof: object = None
+    node_labels: tuple[str, ...] | None = None
 
 
 class _RevisionList(list[object]):
@@ -1241,27 +1309,55 @@ class _Context:
     # than parsed again for every row.  Keyed by the call, so nothing replaces the
     # parameter the caller passed.
     timestamp_values: dict[FunctionCall, object]
+    temporal_context: object | None = None
     # The catalog this statement was PLANNED against. Inside a transaction that has declared
     # schema of its own, that is the transaction's working copy, and execution must resolve
     # tables and spaces from the same picture the planner did -- a row materialised for a table
     # whose vector space exists only in the working copy cannot ask the live catalog for it.
     catalog: Catalog | None = None
+    implicit_node_tables: dict[str, TableDef] = field(default_factory=dict)
     read_control: _ReadControl | None = None
     result_node: PlanNode | None = None
-    union_coercions: tuple[bool, ...] = ()
     intermediate_rows: dict[int, int] = field(default_factory=dict)
     traversal_expansions: int = 0
     traversal_paths: int = 0
     staged_rows: list[_HeldRow] = field(default_factory=_RevisionList)  # type: ignore[arg-type]
+    phase_rows: tuple[_HeldRow, ...] = ()
+    plain_node_deletes: list[tuple[TableDef, object]] = field(default_factory=list)
+    phase_results: dict[int, tuple[_Row, ...]] = field(default_factory=dict)
+    arguments: dict[int, _Row] = field(default_factory=dict)
+    pattern_predicates: dict[int, tuple[PatternPredicate, PlanNode, int, tuple[str, ...]]] = field(default_factory=dict)
+    pattern_comprehensions: dict[int, tuple[PatternComprehension, PlanNode, int, tuple[str, ...]]] = field(default_factory=dict)
+    existential_queries: dict[int, tuple[ExistsSubquery, PlanNode, int]] = field(default_factory=dict)
+    comprehension_memory: LogicalMemoryBudget | None = None
     staged_partitions: list[tuple[int, bytes]] = field(default_factory=list)
     staged_reads: list[tuple[int, bytes]] = field(default_factory=list)
     tokens_issued: int = 0
-    pending_tokens: dict[int, int] = field(default_factory=dict)
+    # Retain the exact object alongside its ID: unit calls can release all row
+    # references before the next invocation, allowing Python to reuse that ID.
+    pending_tokens: dict[int, tuple[HeapVersion, int]] = field(default_factory=dict)
+    published_refs: dict[int, PendingRowRef] = field(default_factory=dict)
+    released_writes: int = 0
+    atomic_staging: bool = False
+    procedure_parent: _Context | None = None
+    procedure_stack: tuple[tuple[str, int], ...] = ()
+    procedure_statements: dict[str, int] = field(default_factory=dict)
+    procedure_outputs: dict[str, tuple[int, int]] = field(default_factory=dict)
+    procedure_query_statements: dict[str, int] = field(default_factory=dict)
+    procedure_query_outputs: dict[str, tuple[int, int]] = field(default_factory=dict)
+    procedure_schema_statements: dict[str, int] = field(default_factory=dict)
+    procedure_schema_scope: _ProcedureEntities | None = None
     cancelled_insert_tokens: set[int] = field(default_factory=set)
     ends_held: set[object] = field(default_factory=set)
     _ends_staged: frozenset[object] | None = None
-    path_identities: dict[tuple[object, ...], int] = field(default_factory=dict)
-    path_identities_issued: int = 0
+    deleted_ref_queue: list[object] = field(default_factory=list)
+    deleted_refs_resolved: set[object] = field(default_factory=set)
+    deleted_record_ids: set[tuple[int, int]] = field(default_factory=set)
+    entity_sequence: int = 0
+    entity_overlays: dict[int, dict[object, tuple[Value, ...] | None]] = field(default_factory=dict)
+    entity_overlay_revision: tuple[object, ...] | None = None
+    node_label_overlays: dict[int, dict[object, tuple[str, ...]]] = field(default_factory=dict)
+    node_label_overlay_revision: tuple[object, ...] | None = None
     # The identity door chooses its access path once per complete table identity.  ``None`` is
     # a deliberate, statement-stable canonical fallback; a store value is the exact ACTIVE
     # generation this statement selected and must never be replaced by a quiet fallback later.
@@ -1321,17 +1417,74 @@ class _Context:
                 for intent in intents
                 if getattr(intent, "operation", None) is RowOperation.DELETE
             )
+            self.deleted_ref_queue.extend(self._ends_staged)
         return reference in self._ends_staged
+
+    def require_entity_content(self, binding: RowBinding) -> None:
+        """Refuse live property/label access after an owner delete, not immutable type/identity.
+
+        Common bindings use their exact version reference. Spill deliberately drops
+        physical write authority; only that read path lazily resolves deleted
+        headers to qualified record identities, once per deleted reference.
+        """
+        # Live row bindings enter through owner-visible scans and cannot cross a
+        # public statement boundary. Without a deletion in this execution there
+        # is no stale live content to invalidate, nor a reason to scan intents.
+        if not self.ends_held and not self.cancelled_insert_tokens:
+            return
+        binding = self.resolve_binding(binding)
+        ended = self.already_ended(binding.ref)
+        if binding.ref is None and binding.record_id == 0:
+            token = self.pending_token(binding.version)
+            ended = token is not None and token in self.cancelled_insert_tokens
+        elif binding.ref is None:
+            while self.deleted_ref_queue:
+                reference = self.deleted_ref_queue.pop()
+                if reference in self.deleted_refs_resolved:
+                    continue
+                self.deleted_refs_resolved.add(reference)
+                if isinstance(reference, RecordRef):
+                    metadata = self.engine.heap.read_landing(reference)
+                    self.deleted_record_ids.add((metadata.table_id, metadata.record_id))
+            ended = (binding.table.table_id, binding.record_id) in self.deleted_record_ids
+        if ended:
+            raise GrafxPlanError("Entity content cannot be read after its deletion in this transaction.",
+                                 field="entity", reason="deleted_entity_access", query_phase="execution",
+                                 entity_kind="relationship" if binding.table.kind == "rel" else "node")
+
+    def node_table(self, table: TableDef) -> TableDef | None:
+        """Resolve only a plan-declared prospective model to its native runtime ID."""
+        prototype = self.implicit_node_tables.get(table.name)
+        if prototype is None or table != prototype:
+            return table
+        catalog = self.schema()
+        if not catalog.has_table(table.name, kind="node"):
+            return None
+        actual = catalog.table(table.name, kind="node")
+        if replace(actual, table_id=prototype.table_id, extra_node_labels=prototype.extra_node_labels) != prototype:
+            raise GrafxPlanError("Implicit node creation cannot reinterpret an existing schema.",
+                                 field="implicit_node_schema", table=table.name)
+        return actual
 
     def note_ended(self, reference: object) -> None:
         """Record that this statement is holding the end of that exact version."""
         self.ends_held.add(reference)
+        self.deleted_ref_queue.append(reference)
 
     def schema(self) -> Catalog:
         """Return the catalog this statement resolves names from."""
         if self.catalog is not None:
             return self.catalog
         return self.engine._catalog.catalog
+
+    def pending_token(self, version: HeapVersion) -> int | None:
+        """Look up only the exact registered version, never a reused object ID."""
+        entry = self.pending_tokens.get(id(version))
+        return entry[1] if entry is not None and entry[0] is version else None
+
+    def register_pending_token(self, version: HeapVersion, token: int) -> None:
+        """Keep the identity witness alive for this bounded statement's lifetime."""
+        self.pending_tokens[id(version)] = (version, token)
 
     def token_for(self, binding: RowBinding) -> int:
         """Return the token that ties a pending binding to the held insert it stands for.
@@ -1342,12 +1495,11 @@ class _Context:
         was C10 round-3 B2: two created rows with identical values, and a second SET clause
         landed on the wrong one.
         """
-        marker = id(binding.version)
-        token = self.pending_tokens.get(marker)
+        token = self.pending_token(binding.version)
         if token is None:
             self.tokens_issued += 1
             token = self.tokens_issued
-            self.pending_tokens[marker] = token
+            self.register_pending_token(binding.version, token)
         return token
 
     def hold(
@@ -1359,6 +1511,7 @@ class _Context:
         *,
         token: int | None = None,
         encoding_proof: object = None,
+        node_labels: tuple[str, ...] | None = None,
     ) -> None:
         """Hold one row until the whole statement has been built without refusing.
 
@@ -1378,6 +1531,7 @@ class _Context:
                 None,
                 token,
                 encoding_proof,
+                node_labels,
             )
         )
         self.staged_partitions.append((table.table_id, key))
@@ -1390,6 +1544,7 @@ class _Context:
         key: bytes,
         *,
         previous_keys: Sequence[bytes] = (),
+        node_labels: tuple[str, ...] | None = None,
     ) -> None:
         """Hold a new version of an existing row under the same statement discipline.
 
@@ -1400,7 +1555,7 @@ class _Context:
         Declaring both makes the two commits meet where step 3.3 can see them.
         """
         self._require_statement_write_capacity()
-        self.staged_rows.append(_HeldRow(_HELD_UPDATE, table, values, None, reference))
+        self.staged_rows.append(_HeldRow(_HELD_UPDATE, table, values, None, reference, node_labels=node_labels))
         self.staged_partitions.append((table.table_id, key))
         for previous in previous_keys:
             if previous != key:
@@ -1428,7 +1583,8 @@ class _Context:
     def _require_statement_write_capacity(self) -> None:
         """Refuse the next logical write before this statement retains it."""
         limit = self.engine._max_statement_writes
-        observed = len(self.staged_rows) + 1
+        owner = self.statement_owner()
+        observed = owner.released_writes + len(self.staged_rows) + 1
         if limit is None or observed <= limit:
             return
         raise GrafxTransactionBudgetExceeded(
@@ -1465,24 +1621,28 @@ class _Context:
         mark = take_mark() if callable(take_mark) else None
         try:
             for held in self.staged_rows:
+                label_options = {} if held.node_labels is None else {"node_labels": held.node_labels}
                 if held.operation is _HELD_INSERT:
                     proved_stage = getattr(
                         transaction, "_stage_row_insert_with_encoding_proof", None
                     )
                     if held.encoding_proof is not None and callable(proved_stage):
-                        proved_stage(
+                        pending = proved_stage(
                             held.table,
                             held.values or (),
                             record_id=held.identity,
                             encoding_proof=held.encoding_proof,
+                            **label_options,
                         )
                     else:
-                        transaction.stage_row_insert(
-                            held.table, held.values or (), record_id=held.identity
+                        pending = transaction.stage_row_insert(
+                            held.table, held.values or (), record_id=held.identity, **label_options
                         )
+                    if held.token is not None and isinstance(pending, PendingRowRef):
+                        self.published_refs[held.token] = pending
                 elif held.operation is _HELD_UPDATE:
                     transaction.stage_row_update(
-                        held.table, held.reference, held.values or ()
+                        held.table, held.reference, held.values or (), **label_options
                     )
                 else:
                     transaction.stage_row_delete(held.table, held.reference)
@@ -1501,10 +1661,30 @@ class _Context:
                 discard(mark)
             raise
         moved = len(self.staged_rows)
+        self.released_writes += moved
+        if self.procedure_parent is not None:
+            self.statement_owner().released_writes += moved
         self.staged_rows.clear()
         self.staged_partitions.clear()
         self.staged_reads.clear()
+        self.phase_rows = ()
+        self._ends_staged = None
         return moved
+
+    def resolve_binding(self, value: object) -> object:
+        """Replace an execution-local insert token with its authenticated staged identity."""
+        if isinstance(value, RowBinding) and value.ref is None:
+            token = self.pending_token(value.version)
+            reference = self.published_refs.get(token) if token is not None else None
+            if reference is not None:
+                return replace(value, ref=reference)
+        return value
+
+    def publish_phase(self) -> None:
+        """Expose held intents only inside the enclosing rollback-capable statement mark."""
+        if not self.atomic_staging:
+            raise GrafxUnsupportedOperation("Composed endpoint writes require atomic statement staging.", operation="relationship_endpoint")
+        self.release()
 
     @property
     def snapshot(self) -> object:
@@ -1543,6 +1723,13 @@ class _Context:
             )
         self.intermediate_rows[identity] = observed
 
+    def statement_owner(self) -> _Context:
+        """Find the outer statement's budget owner across the bounded native call chain."""
+        owner = self
+        while owner.procedure_parent is not None:
+            owner = owner.procedure_parent
+        return owner
+
     def admit_traversal_expansion(self) -> None:
         """Charge one candidate edge before traversal performs work derived from it."""
         if self.read_control is not None:
@@ -1550,7 +1737,8 @@ class _Context:
         limit = self.engine._max_traversal_expansions
         if limit is None:
             return
-        observed = self.traversal_expansions + 1
+        owner = self.statement_owner()
+        observed = owner.traversal_expansions + 1
         if observed > limit:
             raise GrafxQueryBudgetExceeded(
                 f"Query would exceed max_traversal_expansions: limit {limit}, "
@@ -1559,7 +1747,7 @@ class _Context:
                 limit=limit,
                 observed=observed,
             )
-        self.traversal_expansions = observed
+        owner.traversal_expansions = observed
         self.count("traversal_expansions")
 
     def admit_traversal_path(self) -> None:
@@ -1569,7 +1757,8 @@ class _Context:
         limit = self.engine._max_traversal_paths
         if limit is None:
             return
-        observed = self.traversal_paths + 1
+        owner = self.statement_owner()
+        observed = owner.traversal_paths + 1
         if observed > limit:
             raise GrafxQueryBudgetExceeded(
                 f"Query would exceed max_traversal_paths: limit {limit}, observed {observed}.",
@@ -1577,7 +1766,7 @@ class _Context:
                 limit=limit,
                 observed=observed,
             )
-        self.traversal_paths = observed
+        owner.traversal_paths = observed
         self.count("traversal_paths")
 
 
@@ -2163,8 +2352,10 @@ def _owner_landing_result_bytes(
     if found is None:
         return _OWNER_LANDING_MISS_BYTES
     values = found[1].values
+    labels = found[1].node_labels
+    label_charge = 0 if labels is None else 64 + sum(72 + 4 * len(name) for name in labels)
     charge = _OWNER_LANDING_RESULT_BASE_BYTES + (
-        _OWNER_LANDING_SCALAR_BYTES + _OWNER_LANDING_TUPLE_SLOT_BYTES * len(values)
+        _OWNER_LANDING_SCALAR_BYTES + _OWNER_LANDING_TUPLE_SLOT_BYTES * len(values) + label_charge
     )
     compound = False
     for column, value in zip(table.columns, values):
@@ -2174,7 +2365,7 @@ def _owner_landing_result_bytes(
         if value is None:
             charge += _OWNER_LANDING_TUPLE_SLOT_BYTES
             continue
-        kind = column.type
+        kind = value_type_of(value) if column.type is SchemaType.ANY else column.type
         if kind is ValueType.STRING:
             charge += (
                 _OWNER_LANDING_STRING_BASE_BYTES
@@ -2204,12 +2395,23 @@ def _owner_landing_result_bytes(
         return charge
     authenticated = found[1].stored_payload_bytes
     if authenticated is not None:
+        if found[1].schema_version != table.schema_version:
+            prior_count = next((count for version, count in table.schema_layouts
+                                if version == found[1].schema_version), None)
+            if prior_count is None:
+                return None  # unproved optional retention must not undercharge
+            # Each virtual appended NULL has one byte in the logical encoding.
+            # The authenticated physical length deliberately remains unchanged.
+            authenticated += len(table.columns) - prior_count
         return (
             _OWNER_LANDING_RESULT_BASE_BYTES
             + authenticated * _OWNER_LANDING_PAYLOAD_MULTIPLIER
         )
     try:
         stored_bytes = len(encode_tuple(table, values))
+        if labels is not None:
+            from okto_grafx.domain.model.node_labels import encode_node_labels
+            stored_bytes += len(encode_node_labels(labels))
     except (GrafxError, MemoryError):
         # Accounting is optional acceleration.  The version was already decoded and validated by
         # the heap (or built by the owner's validated intent reducer), so a failure to size a
@@ -2248,6 +2450,9 @@ def _owner_landing_fingerprint_charge(
                     payload_bytes += len(
                         encode_tuple(table, cast(tuple[Value, ...], values))
                     )
+                    if item[-1] is not None:
+                        from okto_grafx.domain.model.node_labels import encode_node_labels
+                        payload_bytes += len(encode_node_labels(item[-1]))
     except (GrafxError, MemoryError):
         return None
     return (
@@ -2874,6 +3079,15 @@ def _closed_statement_tables(
 
     selected: dict[tuple[int, str], TableDef] = {}
     for query in queries:
+        from okto_grafx.domain.query.scopes import _owned_nodes
+        if any(isinstance(node, (PatternComprehension, PatternPredicate, ExistsSubquery)) for node in _owned_nodes(query)):
+            # Expression subplans may land outside the outer MATCH's tables.
+            # Keep full catalog-fenced authority until closure includes their scopes.
+            return None
+        if any(isinstance(clause, SubqueryClause) for clause in query.clause_pipeline):
+            # Nested table dependencies require the full authority picture until the closed
+            # projection proves the complete imported scope, not merely the outer patterns.
+            return None
         if (
             type(query.match_clauses) is not tuple
             or type(query.updating_clauses) is not tuple
@@ -2993,6 +3207,12 @@ def _closed_statement_tables(
             elif type(clause) is MergeClause:
                 if not visit(clause.pattern):
                     return None
+                if any(type(item.target) is not Property
+                       or type(item.target.subject) is not Variable
+                       or item.target.subject.name not in bound
+                       for action in (*clause.on_create, *clause.on_match)
+                       for item in action.items):
+                    return None
             elif type(clause) is SetClause:
                 if type(clause.items) is not tuple or any(
                     type(item.target) is not Property
@@ -3097,9 +3317,9 @@ def _dirty_primary_key_seek_definition(definition: object, catalog: Catalog) -> 
         return False
     if definition.visibility is not IndexVisibility.EXACT:
         return False
-    if not catalog.has_table(definition.table_name):
+    if not catalog.has_table(definition.table_name, kind="node"):
         return False
-    table = catalog.table(definition.table_name)
+    table = catalog.table(definition.table_name, kind="node")
     if (
         table.kind != "node"
         or table.table_id != definition.table_id
@@ -3235,6 +3455,12 @@ class QueryEngine:
         "_compiled_predicates",
         "_compiled_predicates_lock",
         "_tuple_encoding_proofs",
+        "_random_source",
+        "_temporal_resolver",
+        "_entity_database_uuid",
+        "_entity_namespace",
+        "_entity_sequence",
+        "_execution_identity",
     )
 
     def __init__(
@@ -3245,6 +3471,11 @@ class QueryEngine:
         pool: BufferPool,
         metrics: MetricsSink,
         clock: Clock,
+        random_source: Callable[[], float] | None = None,
+        temporal_resolver: object | None = None,
+        execution_identity: Callable[[], object] | None = None,
+        database_uuid: bytes | None = None,
+        entity_namespace: bytes | None = None,
         indexes: object = None,
         vectors: object = None,
         page_stager: Callable[[object, str, int, bytes], None] | None = None,
@@ -3265,6 +3496,15 @@ class QueryEngine:
     ) -> None:
         """Adopt one catalog, one heap, one pool and whichever engines this composition has."""
         self._catalog = catalog
+        self._random_source = random_source
+        self._temporal_resolver = temporal_resolver
+        self._execution_identity = execution_identity
+        for name, identity in (("database_uuid", database_uuid), ("entity_namespace", entity_namespace)):
+            if identity is not None and (type(identity) is not bytes or len(identity) != 16):
+                raise GrafxConfigurationError("Entity identity composition needs 16 immutable bytes.", field=name)
+        self._entity_database_uuid = database_uuid
+        self._entity_namespace = entity_namespace
+        self._entity_sequence = 0
         self._extensions = None
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._heap = heap
@@ -3399,6 +3639,8 @@ class QueryEngine:
             return cached
         try:
             statement = parse_text(text)
+            if self._extensions is not None and self._extensions.procedures:
+                statement = resolve_procedure_calls(statement, self._procedure_types())
         except GrafxError as failure:
             self._count_error(failure)
             raise
@@ -3516,17 +3758,16 @@ class QueryEngine:
             )
             plan = None if key is None else self._cached_prepared_plan(key)
             if plan is None:
-                analysis = analyze(statement)
                 plan = build_plan(
                     statement,
                     scalar_types=self._scalar_types(statement),
+                    procedures=self._procedure_types(),
                     catalog=catalog,
                     indexes=self._index_definitions(
                         catalog=catalog,
                         without_indexes_for=dirty_tables,
                         authority=authority,
                     ),
-                    analysis=analysis,
                 )
                 if key is not None:
                     plan = self._remember_prepared_plan(key, plan)
@@ -3542,19 +3783,42 @@ class QueryEngine:
             fn.name: ValueType[fn.return_type] for fn in self._extensions.scalars
         }
 
+    def _validate_procedure_parameters(self, plan: PlannedQuery, parameters: Mapping[str, object]) -> None:
+        """Check bound procedure signatures before any operator or callback is entered."""
+        if self._extensions is None or not self._extensions.procedures:
+            return
+        procedures = self._procedure_types()
+        static_types = _bound_static_types(plan, parameters)
+        for node in plan.root.walk():
+            if not isinstance(node, ProcedureRows):
+                continue
+            procedure = procedures.get(node.name)
+            if procedure is None:
+                raise GrafxPlanError("Procedure permissions are not granted.", field="procedure")
+            for expression, expected in zip(node.arguments, procedure.argument_types, strict=True):
+                actual = _bound_pulse_expression_type(expression, static_types, parameters, owner="procedure argument")
+                if not _procedure_argument_accepts(actual, expected):
+                    raise GrafxPlanError("Procedure argument type mismatch.", field="procedure_type")
+
+    def _procedure_types(self) -> dict:
+        """Expose only registrations whose explicit permission set the host granted."""
+        return {} if self._extensions is None else {
+            item.name: item for item in self._extensions.procedures
+            if item.required_permissions <= self._extensions.procedure_permissions
+        }
+
     def planned(self, statement: Statement) -> PlannedQuery:
         """Return the plan together with the analysis it was built from."""
         started = self._reading()
         try:
             catalog = self._catalog.catalog
             authority = self._statement_index_authority(catalog, statement=statement)
-            analysis = analyze(statement)
             plan = build_plan(
                 statement,
                 scalar_types=self._scalar_types(statement),
+                procedures=self._procedure_types(),
                 catalog=catalog,
                 indexes=self._index_definitions(catalog=catalog, authority=authority),
-                analysis=analysis,
             )
         except GrafxError as failure:
             self._count_error(failure)
@@ -3607,7 +3871,9 @@ class QueryEngine:
         parameters: Mapping[str, object] | None = None,
         *,
         cache_text: str | None = None,
+        procedure_parent: _Context | None = None,
         read_control: _ReadControl | None = None,
+        procedure_scope: _ProcedureEntities | None = None,
     ) -> QueryResult:
         """Run a parsed statement while still planning against current transaction state.
 
@@ -3636,6 +3902,10 @@ class QueryEngine:
             authority=authority,
             cache_text=cache_text,
         )
+        if (procedure_parent is not None and plan.implicit_node_tables
+                and (procedure_scope is None or not procedure_scope.procedure.schema_write)):
+            raise GrafxPlanError("Procedure writes require previously declared node tables.",
+                                 field="procedure_write_query")
         started = self._reading()
         try:
             if read_control is not None:
@@ -3647,6 +3917,8 @@ class QueryEngine:
                 catalog=working,
                 index_authority=authority,
                 read_control=read_control,
+                procedure_parent=procedure_parent,
+                procedure_scope=procedure_scope,
             )
             if read_control is not None:
                 read_control.check()
@@ -3719,6 +3991,7 @@ class QueryEngine:
             bound = self._bind_parameters(plan, parameters)
             coalesce_types = _bound_coalesce_types(plan, bound)
             case_types = _bound_case_types(plan, bound)
+            self._validate_procedure_parameters(plan, bound)
             statistics: dict[str, int] = {}
             context = _Context(
                 engine=self,
@@ -3728,11 +4001,16 @@ class QueryEngine:
                 statistics=statistics,
                 coalesce_types=coalesce_types,
                 timestamp_values={},
+                temporal_context=(txn._temporal_context.begin_statement()
+                                  if getattr(txn, "_temporal_context", None) is not None else None),
                 case_types=case_types,
+                pattern_predicates={id(item[0]): item for item in plan.pattern_predicates},
+                pattern_comprehensions={id(item[0]): item for item in plan.pattern_comprehensions},
+                existential_queries={id(item[0]): item for item in plan.existential_queries},
+                implicit_node_tables={t.name: t for t in plan.implicit_node_tables},
                 catalog=working,
                 read_control=read_control,
                 result_node=root.child,
-                union_coercions=_bound_union_columns(plan, bound),
                 index_authority=authority,
                 node_scan_projections=_closed_node_scan_projections(root.child),
                 vector_free_landings=_closed_vector_free_landings(root.child),
@@ -3808,7 +4086,10 @@ class QueryEngine:
                     continue
                 if not catalog.has_table(definition.table_name):
                     continue
-                table = catalog.table(definition.table_name)
+                try:
+                    table = catalog.table_by_id(definition.table_id)
+                except GrafxCorruptionDetected:
+                    continue  # A prospective table is not part of committed authority yet.
                 if (
                     table.table_id == definition.table_id
                     and index_definition_matches_table(definition, table)
@@ -4108,9 +4389,9 @@ class QueryEngine:
                     f"The query needs the parameter ${name}, and the call supplied {known}.",
                     field="parameter",
                     value=name,
+                    reason="missing_parameter", query_phase="planning",
                 )
             bound[name] = supplied[name]  # type: ignore[assignment]
-        _validate_parameter_maps(bound)
         return bound
 
     # --- running -----------------------------------------------------------------------------
@@ -4123,10 +4404,46 @@ class QueryEngine:
         catalog: Catalog | None = None,
         index_authority: _IndexAuthorityProjection | None = None,
         read_control: _ReadControl | None = None,
+        procedure_parent: _Context | None = None,
+        procedure_scope: _ProcedureEntities | None = None,
     ) -> QueryResult:
-        """Walk the plan and produce the result."""
+        """Run a logical statement under one rollback boundary, including early intent phases."""
+        statement = plan.analysis.statement
+        writing = isinstance(statement, (Query, UnionQuery)) and statement.writes
+        take_mark = getattr(txn, "staging_mark", None)
+        discard = getattr(txn, "discard_since", None)
+        settle = getattr(txn, "settle_staging_mark", None)
+        atomic = writing and all(callable(method) for method in (take_mark, discard, settle))
+        mark = take_mark() if atomic else None
+        schema_mark = self._schema_statement_mark(txn) if atomic else None
+        try:
+            result = self._run_unpublished(plan, txn, parameters, catalog, index_authority, read_control,
+                                           atomic_staging=atomic, procedure_parent=procedure_parent,
+                                           procedure_scope=procedure_scope)
+            if atomic:
+                settle(mark)
+            return result
+        except BaseException as failure:
+            if atomic:
+                try:
+                    discard(mark)
+                    self._restore_schema_statement(txn, schema_mark)
+                except BaseException as cleanup:
+                    failure.add_note(f"Statement rollback failed: {type(cleanup).__name__}")
+                    raise cleanup from failure
+            raise
+
+    def _run_unpublished(
+        self, plan: PlannedQuery, txn: object, parameters: dict[str, Value],
+        catalog: Catalog | None = None,
+        index_authority: _IndexAuthorityProjection | None = None,
+        read_control: _ReadControl | None = None, *, atomic_staging: bool = False,
+        procedure_parent: _Context | None = None,
+        procedure_scope: _ProcedureEntities | None = None,
+    ) -> QueryResult:
+        """Evaluate and validate; staged intents remain invisible to other participants."""
         root = plan.root
-        statistics: dict[str, int] = {}
+        statistics: dict[str, int] = {} if procedure_parent is None else procedure_parent.statistics
         if isinstance(
             root, (CreateIndex, CreateNodeTable, CreateRelTable, CreateVectorSpace)
         ):
@@ -4138,8 +4455,14 @@ class QueryEngine:
                 field="plan",
                 value=root.label,
             )
+        if getattr(txn, "mode", None) is TransactionMode.READ and _plan_writes(root):
+            raise GrafxTransactionStateError(
+                "A read transaction cannot execute a write plan, even when it would match no writes.",
+                field="transaction", mode="read",
+            )
         coalesce_types = _bound_coalesce_types(plan, parameters)
         case_types = _bound_case_types(plan, parameters)
+        self._validate_procedure_parameters(plan, parameters)
         context = _Context(
             engine=self,
             txn=txn,
@@ -4148,38 +4471,115 @@ class QueryEngine:
             statistics=statistics,
             coalesce_types=coalesce_types,
             timestamp_values={},
+            temporal_context=(procedure_parent.temporal_context if procedure_parent is not None else txn._temporal_context.begin_statement()
+                              if getattr(txn, "_temporal_context", None) is not None else None),
             case_types=case_types,
+            pattern_predicates={id(item[0]): item for item in plan.pattern_predicates},
+            pattern_comprehensions={id(item[0]): item for item in plan.pattern_comprehensions},
+            existential_queries={id(item[0]): item for item in plan.existential_queries},
+            implicit_node_tables={t.name: t for t in plan.implicit_node_tables},
             catalog=catalog,
             read_control=read_control,
             result_node=root.child if root.columns else None,
-            union_coercions=_bound_union_columns(plan, parameters),
             index_authority=index_authority,
             short_circuit_traversals=_short_circuit_traversals(root.child),
             node_scan_projections=_closed_node_scan_projections(root.child),
             vector_free_landings=_closed_vector_free_landings(root.child),
+            atomic_staging=atomic_staging,
+            procedure_parent=procedure_parent,
+            procedure_stack=() if procedure_scope is None else procedure_scope.stack,
+            procedure_statements={} if procedure_parent is None else procedure_parent.procedure_statements,
+            procedure_outputs={} if procedure_parent is None else procedure_parent.procedure_outputs,
+            procedure_query_statements={} if procedure_parent is None else procedure_parent.procedure_query_statements,
+            procedure_query_outputs={} if procedure_parent is None else procedure_parent.procedure_query_outputs,
+            procedure_schema_statements={} if procedure_parent is None else procedure_parent.procedure_schema_statements,
+            procedure_schema_scope=procedure_scope,
+            intermediate_rows={} if procedure_parent is None else procedure_parent.intermediate_rows,
         )
         _bind_timestamp_values(plan, context)
         _validate_bound_subscript_types(plan, parameters)
         _validate_bound_label_arguments(plan, parameters)
+        # Prepare explicit write/read boundaries bottom-up before any parent scan
+        # captures its owner overlay. Native transaction intents remain private and
+        # the enclosing statement mark rolls all phases back on any later failure.
+        self._prepare_read_phases(self._read_phase_boundaries(root.child), context)
         stream = self._rows(root.child, context)
         stream_failure: BaseException | None = None
         try:
-            rows = self._collect_result_rows(stream) if root.columns else tuple(stream)
+            rows = self._collect_result_rows(stream, procedure_scope=procedure_scope) if root.columns else tuple(stream)
         except BaseException as caught:
             stream_failure = caught
             raise
         finally:
             _close_iterator(stream, stream_failure)
-        context.release()
         produced: tuple[tuple[Value, ...], ...] = ()
+        if root.columns and context.atomic_staging:
+            # Give returned inserts their authenticated transaction-local reference
+            # before detachment. This is private intent staging, not COMMIT: the
+            # enclosing statement mark remains active through conversion/checks.
+            context.publish_phase()
         if root.columns:
-            produced = tuple(_projected(row, root.columns) for row in rows)
-        return _owned_query_result(
+            if procedure_scope is not None:
+                for reference in context.ends_held:
+                    procedure_scope.context.note_ended(reference)
+                produced = tuple(procedure_scope.project(row, root.columns, context) for row in rows)
+            else:
+                produced = tuple(_projected(row, root.columns, context) for row in rows)
+        result = _owned_query_result(
             columns=root.columns,
             rows=produced,
             plan=root,
             statistics=dict(statistics),
         )
+        for table, identity in context.plain_node_deletes:
+            for edge_table, edge_ref, _endpoints in _incident_edges(self, context, table, identity):
+                if not context.already_ended(edge_ref):
+                    raise GrafxQueryError(
+                        "DELETE cannot remove a node with live relationships; use DETACH DELETE or delete the edges.",
+                        reason="connected_node_delete", query_phase="execution", table=table.name, relationship_table=edge_table.name,
+                    )
+        # Publishing to the transaction is the final fallible phase: output detachment and
+        # referential checks must not fail after a caught statement error has staged effects.
+        context.release()
+        if procedure_parent is not None:
+            # A callback's native DML has its own evaluation context, but owner
+            # aliases must still observe deletions made by that successful child.
+            # Child-local insert tokens are not transferable authority.
+            for reference in context.ends_held:
+                procedure_parent.note_ended(reference)
+            procedure_parent._ends_staged = None
+        return result
+
+    @staticmethod
+    def _read_phase_boundaries(root: PlanNode) -> tuple[EagerRows, ...]:
+        """Postorder in this invocation only: CALL bodies need their own arguments."""
+        pending = [(root, False)]
+        boundaries = []
+        while pending:
+            node, visited = pending.pop()
+            if visited:
+                if isinstance(node, EagerRows) and node.publish_read_phase:
+                    boundaries.append(node)
+                continue
+            pending.append((node, True))
+            children = (() if isinstance(node, UnionRows) and node.writes else
+                        (node.child,) if isinstance(node, SubqueryRows) else node.children())
+            pending.extend((child, False) for child in reversed(children))
+        return tuple(boundaries)
+
+    def _prepare_read_phases(self, boundaries: tuple[EagerRows, ...], context: _Context) -> None:
+        """Stage private phase effects under the caller's unchanged statement mark."""
+        for boundary in boundaries:
+            phase = tuple(self._rows(boundary.child, context))
+            if context.atomic_staging:
+                context.publish_phase()
+                phase = tuple(_Row(
+                    bindings={name: _current_entity_value(self, context, value) for name, value in row.bindings.items()},
+                    computed=row.computed, columns=row.columns,
+                ) for row in phase)
+            else:
+                context.phase_rows = tuple(context.staged_rows)
+            context.phase_results[id(boundary)] = phase
 
     def _rows(self, node: PlanNode, context: _Context) -> Iterator[_Row]:
         """Return the rows one operator produces."""
@@ -4193,7 +4593,10 @@ class QueryEngine:
         rows = handler(self, node, context)
         if context.read_control is not None:
             rows = self._controlled_rows(rows, context.read_control)
-        if self._max_intermediate_rows is None or node is context.result_node:
+        # UNION ALL removes DistinctRows, not the pair's shared UnionRows budget.
+        if self._max_intermediate_rows is None or (
+            node is context.result_node and type(node) is not UnionRows
+        ):
             return rows
         return self._admit_intermediate_rows(node, context, rows)
 
@@ -4246,15 +4649,15 @@ class QueryEngine:
             )
         return workspace, budget
 
-    def _collect_result_rows(self, rows: Iterator[_Row]) -> tuple[_Row, ...]:
+    def _collect_result_rows(self, rows: Iterator[_Row], *, procedure_scope: _ProcedureEntities | None = None) -> tuple[_Row, ...]:
         """Collect public results incrementally, refusing before retaining row limit + 1."""
         limit = self._max_result_rows
-        if limit is None:
+        if limit is None and procedure_scope is None:
             return tuple(rows)
         accepted: list[_Row] = []
         for row in rows:
             observed = len(accepted) + 1
-            if observed > limit:
+            if limit is not None and observed > limit:
                 raise GrafxQueryBudgetExceeded(
                     f"Query would exceed max_result_rows: limit {limit}, "
                     f"observed {observed}.",
@@ -4262,6 +4665,8 @@ class QueryEngine:
                     limit=limit,
                     observed=observed,
                 )
+            if procedure_scope is not None:
+                procedure_scope.reserve_row()
             accepted.append(row)
         return tuple(accepted)
 
@@ -4274,6 +4679,26 @@ class QueryEngine:
             yield row
 
     # --- schema ------------------------------------------------------------------------------
+
+    def add_nullable_column(self, txn: object, table: str | tuple[str, str], column: ColumnDef) -> TableDef:
+        """Stage typed append-only DDL using the native schema statement journal."""
+        self._schema(_AddNullableColumn(table, column), txn, {})
+        from okto_grafx.domain.model.table_selection import select_table
+        return select_table(self._working_catalog(txn), table)
+
+    def _admit_node_labels(self, txn: object, table_id: int, labels: tuple[str, ...]) -> TableDef:
+        """Journal label candidates without publishing schema before outer COMMIT."""
+        from okto_grafx.domain.model.node_labels import NODE_LABELS_CAPABILITY, normalize_node_labels
+
+        if getattr(getattr(txn, "mode", None), "value", None) != "write":
+            raise GrafxTransactionStateError("Label admission requires a write transaction.", field="mode")
+        labels = normalize_node_labels(labels)
+        catalog = self._working_catalog(txn)
+        table = catalog.table_by_id(table_id)
+        if catalog.requires_capability(NODE_LABELS_CAPABILITY) and table.admits_node_labels(labels):
+            return table
+        self._schema(_AdmitNodeLabels(table_id, labels), txn, {})
+        return self._working_catalog(txn).table_by_id(table_id)
 
     def _schema(self, node: PlanNode, txn: object, statistics: dict[str, int]) -> None:
         """Install one schema change and stage the catalog pages it wrote.
@@ -4307,7 +4732,8 @@ class QueryEngine:
                 field="transaction",
                 value=type(txn).__name__,
             )
-        if isinstance(node, CreateIndex):
+        if (isinstance(node, CreateIndex)
+                and self._working_catalog(txn).format_version == CATALOG_LEGACY_FORMAT_VERSION):
             prepare = self._custom_index_preparer
             if not callable(prepare):
                 raise GrafxUnsupportedOperation(
@@ -4408,6 +4834,33 @@ class QueryEngine:
         undo: list[_SchemaEffect],
     ) -> None:
         """Apply one schema statement to the working CLONE, journalling external effects."""
+        if (isinstance(node, CreateNodeTable) and node.flexible_properties
+                and catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION and not catalog.tables()):
+            catalog.upgrade_index_catalog(())
+        if catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION and (
+            isinstance(node, CreateNodeTable) and catalog.relationship_tables(node.name)
+            or isinstance(node, CreateRelTable) and catalog.has_table(node.name, kind="node")
+        ):
+            raise GrafxUnsupportedOperation(
+                "Overlapping graph names require catalog v2; run maintenance.ensure_identity_indexes() first.",
+                operation="create table", field="format_version",
+                required=CATALOG_FORMAT_VERSION, remedy="maintenance.ensure_identity_indexes",
+            )
+        if (isinstance(node, (CreateNodeTable, CreateRelTable))
+                and any(c.type is SchemaType.ANY for c in node.columns)
+                and catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION):
+            raise GrafxUnsupportedOperation(
+                "ANY properties require catalog v2; run maintenance.ensure_identity_indexes() first.",
+                operation="create table", field="format_version",
+                required=CATALOG_FORMAT_VERSION, remedy="maintenance.ensure_identity_indexes",
+            )
+        if (isinstance(node, CreateRelTable) and node.endpoint_pairs
+                and catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION):
+            raise GrafxUnsupportedOperation(
+                "Relationship groups require catalog v2; run maintenance.ensure_identity_indexes() first.",
+                operation="create relationship group", field="format_version",
+                required=CATALOG_FORMAT_VERSION, remedy="maintenance.ensure_identity_indexes",
+            )
         if (
             self._automatic_index_expected_cardinality is not None
             and catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION
@@ -4422,7 +4875,35 @@ class QueryEngine:
                 required=CATALOG_FORMAT_VERSION,
                 remedy="maintenance.ensure_identity_indexes",
             )
-        if isinstance(node, CreateVectorSpace):
+        if isinstance(node, CreateIndex):
+            # The same schema journal already composes detached endpoint identity
+            # generations with pending DML. A custom v2 generation follows that
+            # protocol too: fence the durable base, build an unreachable nonce,
+            # observe it only in this txn, and let normal row WAL add its deltas.
+            table = catalog.table_by_id(node.table.table_id)
+            if table != node.table:
+                raise GrafxTransactionStateError("Index schema changed after planning.", field="table")
+            committed = self._committed_table_matching(table)
+            if committed is None and any(item.table_id == table.table_id for item in self._catalog.catalog.tables()):
+                raise GrafxUnsupportedOperation(
+                    "Custom index construction needs a new table or an unchanged committed schema.",
+                    field="table", table=table.name,
+                )
+            definition = IndexDefinition(
+                name=node.name, table_id=table.table_id, table_name=table.name,
+                positions=node.positions, visibility=IndexVisibility.EXACT,
+                bucket_count=node.bucket_count, layout=node.layout, key_derivation=node.key_derivation,
+            )
+            if committed is not None:
+                self._declare_complete_table_read(txn, committed)
+            runtime = self._plan_catalog_exact_generation(
+                definition, catalog, expected_cardinality=node.expected_cardinality, automatic=False,
+            )
+            self._validate_index_build_entry_budget(((runtime, committed),), self._published_lsn_for_new_index(), txn)
+            catalog.serialize()  # Complete authority validation precedes physical creation.
+            self._materialize_catalog_exact_generation(runtime, txn, undo, committed_table=committed)
+            statistics["indexes_created"] = statistics.get("indexes_created", 0) + 1
+        elif isinstance(node, CreateVectorSpace):
             catalog.add_space(
                 EmbeddingSpaceDef(
                     space_id=catalog.next_space_id(),
@@ -4443,6 +4924,8 @@ class QueryEngine:
                     kind="node",
                     columns=node.columns,
                     primary_key=node.primary_key,
+                    flexible_properties=node.flexible_properties,
+                    unlabeled=node.unlabeled,
                 )
             )
             self._attach_primary_key_index(
@@ -4455,51 +4938,109 @@ class QueryEngine:
             self._attach_vector_columns(installed, statistics, catalog, undo, txn)
             statistics["tables_created"] = statistics.get("tables_created", 0) + 1
         elif isinstance(node, CreateRelTable):
-            installed = catalog.add_table(
-                TableDef(
-                    table_id=catalog.next_table_id(),
-                    name=node.name,
-                    kind="rel",
-                    columns=node.columns,
-                    from_table=node.from_table,
-                    to_table=node.to_table,
+            if node.endpoint_pairs:
+                # The working catalog is a statement-local clone. Member/index
+                # attachment and logical authority share its existing unwind.
+                members = []
+                for source, target in node.endpoint_pairs:
+                    key = catalog.next_table_id()
+                    name = f"_gx_rel_{key:08x}"
+                    installed = catalog.add_table(TableDef(
+                        table_id=key, name=name, kind="rel", columns=node.columns,
+                        from_table=source, to_table=target,
+                        flexible_properties=node.flexible_properties,
+                    ))
+                    self._attach_endpoint_indexes(installed, statistics, undo, txn, catalog=catalog)
+                    self._attach_vector_columns(installed, statistics, catalog, undo, txn)
+                    members.append(key)
+                if node.flexible_properties and any(group.name == node.name for group in catalog.relationship_types()):
+                    catalog.extend_flexible_relationship_type(node.name, tuple(members))
+                else:
+                    catalog.add_relationship_type(RelationshipTypeDef(node.name, tuple(members)))
+                    statistics["relationship_types_created"] = statistics.get("relationship_types_created", 0) + 1
+                statistics["tables_created"] = statistics.get("tables_created", 0) + len(members)
+                # Stage the complete logical/physical definition once below.
+            else:
+                self._create_physical_relationship_table(node, txn, statistics, catalog, undo)
+        elif isinstance(node, _AddNullableColumn):
+            catalog.add_nullable_column(node.table, node.column)
+        elif isinstance(node, _AdmitNodeLabels):
+            if catalog.format_version == CATALOG_LEGACY_FORMAT_VERSION:
+                raise GrafxUnsupportedOperation(
+                    "Versioned node labels require catalog v2; run maintenance.ensure_identity_indexes() first.",
+                    operation="admit node labels", field="format_version",
+                    required=CATALOG_FORMAT_VERSION, remedy="maintenance.ensure_identity_indexes",
                 )
-            )
-            self._attach_endpoint_indexes(
-                installed,
-                statistics,
-                undo,
-                txn,
-                catalog=catalog,
-            )
-            statistics["tables_created"] = statistics.get("tables_created", 0) + 1
+            catalog.extend_node_labels(node.table_id, node.labels)
+        elif isinstance(node, _AttachRelationshipType):
+            catalog.add_relationship_type(RelationshipTypeDef(
+                node.name, tuple(sorted(catalog.table(name, kind="rel").table_id for name in node.members)),
+            ))
+            statistics["relationship_types_created"] = statistics.get("relationship_types_created", 0) + 1
         else:  # pragma: no cover - the caller checked the type
             raise GrafxPlanError(
                 f"The operator {node.label} is not a schema change.",
                 field="operator",
                 value=node.label,
             )
-        # The staged door, not save(). save() wrote through the pool the moment it was
-        # called, so a DDL that was then ROLLED BACK had already made its pages reachable: the
-        # next flush of anyone carried them to the device, and the rolled-back table survived a
-        # reopen -- an uncommitted schema change made durable, measured through connect() alone.
-        # And save() returns the CHAIN pages only, so the file header reached the device outside
-        # every log record and a crash between the barrier and the flush lost the schema with no
-        # refusal anywhere. stage() answers with VALUES -- chain, freed pages, and page 0,
-        # unconditionally -- and staging them on the transaction puts all three in the log.
-        #
-        # Restaging on a second DDL statement of the same transaction supersedes by page key,
-        # which is complete because a schema only ever GROWS within a transaction (there is no
-        # drop): the payload is monotonic, so a later staging never names fewer pages.
+        # Stage complete chain/header images on the transaction, never save()
+        # physical pages before COMMIT. Restaging supersedes images by page key.
         staged = self._catalog.stage(catalog)
         for page_index, image in staged:
             self._stage_page_image(txn, self._catalog.file, page_index, image)
         statistics["pages_staged"] = statistics.get("pages_staged", 0) + len(staged)
 
-    def _unwind_schema_statement(self, undo: list[_SchemaEffect]) -> None:
+    def _create_physical_relationship_table(
+        self, node: CreateRelTable, txn: object, statistics: dict[str, int],
+        catalog: Catalog, undo: list[_SchemaEffect],
+    ) -> None:
+        """Attach a single ordinary relationship definition inside the DDL unwind."""
+        installed = catalog.add_table(TableDef(
+            table_id=catalog.next_table_id(), name=node.name, kind="rel",
+            columns=node.columns, from_table=node.from_table, to_table=node.to_table,
+            flexible_properties=node.flexible_properties,
+        ))
+        self._attach_endpoint_indexes(installed, statistics, undo, txn, catalog=catalog)
+        self._attach_vector_columns(installed, statistics, catalog, undo, txn)
+        statistics["tables_created"] = statistics.get("tables_created", 0) + 1
+
+    def _schema_statement_mark(self, txn: object) -> tuple[object, Catalog | None, int]:
+        """Capture the adopted immutable catalog and precise journal suffix boundary."""
+        txn_id = getattr(txn, "txn_id", None)
+        return txn, self._working.get(txn_id), len(self._txn_effects.get(txn_id, ()))
+
+    def _restore_schema_statement(self, txn: object, mark: tuple[object, Catalog | None, int]) -> None:
+        """Undo only this logical statement's schema effects, never prior statements."""
+        owner, prior, position = mark
+        txn_id = getattr(txn, "txn_id", None)
+        effects = self._txn_effects.get(txn_id, [])
+        if owner is not txn or len(effects) < position:
+            raise GrafxTransactionStateError("Invalid schema statement restoration boundary.", field="schema_mark")
+        suffix = effects[position:]
+        unchanged_schema = not suffix and self._working.get(txn_id) is prior
+        if suffix:
+            # Retain the journal for whole-transaction cleanup if proof fails.
+            self._unwind_schema_statement(suffix, strict=True)
+        if prior is None:
+            self._working.pop(txn_id, None)
+        else:
+            self._working[txn_id] = prior
+        del effects[position:]
+        # Owner landing reuse already proves snapshot/schema identity, heap epoch
+        # and the full intent/held-row content fingerprint on every access. A
+        # data-only rollback can retain that bounded memo; changed staged content
+        # still forces its normal rebuild. Schema effects must retire it.
+        if not unchanged_schema:
+            self._settle_owner_memo(txn_id)
+        self._settle_endpoint_memo(txn_id)
+        self._settle_primary_key_memo(txn_id)
+
+    def _unwind_schema_statement(self, undo: list[_SchemaEffect], *, strict: bool = False) -> None:
         """Reverse one refused schema statement's out-of-transaction effects, newest first.
 
-        Runs while the refusal is already unwinding, so nothing here may raise. Each entry names
+        Usually runs during full rollback and preserves its original error. Strict
+        statement restoration instead reports failed cleanup so a caller cannot
+        continue an unproven transaction. Each entry names
         exactly one thing this statement did -- an index registered, a space attached, a table
         added to the skip report -- so another open transaction's attachments are untouched.
         """
@@ -4508,6 +5049,7 @@ class QueryEngine:
             if self._schema_artifact_section is not None
             else nullcontext()
         )
+        failed = None
         with boundary:  # type: ignore[attr-defined]
             for effect in reversed(undo):
                 try:
@@ -4544,13 +5086,17 @@ class QueryEngine:
                             self._skip_claims.pop(effect.table, None)
                             if effect.table not in self._durable_skips:
                                 self._skipped_indexes.discard(effect.table)
-                except GrafxError:
+                except GrafxError as failure:
+                    if strict and failed is None:
+                        failed = failure
                     continue
             # A foreign process can publish an unindexed table while this process still owns a
             # speculative skip token.  Local refcounts cannot observe that publication, but the
             # freshly rebased catalog above can.  Recompute after token release so rollback never
             # erases the durable diagnostic merely because its publisher had another registry.
             self._refresh_durable_skips()
+        if failed is not None:
+            raise failed
 
     def _needs_committed_artifact_sync(self) -> bool:
         """Detect a durable automatic artifact or vector-map mismatch."""
@@ -4901,6 +5447,7 @@ class QueryEngine:
         *,
         expected_cardinality: int | None = None,
         previous: CatalogIndexDefinition | None = None,
+        automatic: bool = True,
     ) -> IndexDefinition:
         """Add one ACTIVE nonced generation to the transaction's v2 catalog clone."""
         nonce = self._allocate_catalog_generation_nonce(catalog)
@@ -4918,7 +5465,7 @@ class QueryEngine:
                 visibility=definition.visibility,
                 key_derivation=definition.key_derivation,
                 layout=definition.layout,
-                automatic=True,
+                automatic=automatic,
                 expected_cardinality=expected_cardinality,
                 generations=(generation,),
             )
@@ -4960,6 +5507,14 @@ class QueryEngine:
                 candidate = OrderedIndex(
                     definition, self._pool, self._metrics.sink
                 )
+            elif definition.layout is IndexLayout.SPARSE_HASH:
+                from okto_grafx.engine.sparse_hash import SparseHashIndex
+
+                candidate = SparseHashIndex(definition, self._pool, self._metrics.sink)
+            elif definition.layout is IndexLayout.POSTING_HASH:
+                from okto_grafx.engine.posting_hash import PostingHashIndex
+
+                candidate = PostingHashIndex(definition, self._pool, self._metrics.sink)
             else:
                 candidate = HashIndex(
                     definition, self._pool, self._metrics.sink
@@ -5083,7 +5638,7 @@ class QueryEngine:
         seen: set[int] = set()
         published = self._published_lsn_for_new_index()
         for endpoint_name in (relation.from_table, relation.to_table):
-            endpoint = catalog.table(str(endpoint_name))
+            endpoint = catalog.table(str(endpoint_name), kind="node")
             if endpoint.table_id in seen:
                 continue
             seen.add(endpoint.table_id)
@@ -5605,6 +6160,545 @@ def _single_row(
     yield _Row(bindings={})
 
 
+def _capture_node_path(engine: QueryEngine, node: CaptureNodePath, context: _Context) -> Iterator[_Row]:
+    """Capture an existing qualified binding; NULL is not a zero-edge path."""
+    if (type(node.source) is not str or not node.source
+            or type(node.path) is not str or not node.path or node.path == node.source):
+        raise GrafxPlanError("A node path requires distinct nonempty binding names.", field="path")
+    incoming = engine._rows(node.child, context)
+    with _iterator_cleanup(lambda: (incoming,)):
+        for row in incoming:
+            anchor = row.bindings.get(node.source)
+            if anchor is None:
+                continue
+            if not isinstance(anchor, RowBinding) or anchor.table.kind != "node":
+                raise GrafxPlanError("A node path requires a matched node binding.", field="path")
+            if node.path in row.bindings:
+                raise GrafxPlanError("A path capture cannot overwrite an existing binding.", field="path")
+            context.admit_traversal_path()
+            yield replace(row, bindings={**row.bindings, node.path: _PathValue((anchor,), ())})
+
+
+def _zero_hop_relationship(engine: QueryEngine, node: ZeroHopRelationship, context: _Context) -> Iterator[_Row]:
+    """No relationship exists, but a zero-length range can still match its anchor."""
+    if (any(type(name) is not str or not name for name in (node.source, node.target))
+            or any(name is not None and (type(name) is not str or not name)
+                   for name in (node.relationship, node.path_variable))
+            or type(node.target_bound) is not bool or type(node.path_append) is not bool
+            or (node.path_append and node.path_variable is None)
+            or (node.relationship is not None and node.relationship in (node.source, node.target))
+            or (node.path_variable is not None and node.path_variable in (node.source, node.target, node.relationship))):
+        raise GrafxPlanError("A zero-hop range requires canonical binding fields.", field="plan")
+    if node.target_table is not None and node.target_table.kind != "node":
+        raise GrafxPlanError("A zero-hop target must name a node table.", field="plan")
+    target_table = None if node.target_table is None else context.node_table(node.target_table)
+    if node.target_table is not None and target_table is None:
+        return
+    incoming = engine._rows(node.child, context)
+    with _iterator_cleanup(lambda: (incoming,)):
+        for row in incoming:
+            anchor = row.bindings.get(node.source)
+            if anchor is None:
+                continue
+            if not isinstance(anchor, RowBinding) or anchor.table.kind != "node":
+                raise GrafxPlanError("A zero-hop range requires a node anchor.", field="path")
+            if target_table is not None and anchor.table.table_id != target_table.table_id:
+                continue
+            target = row.bindings.get(node.target)
+            if node.target_bound and (not isinstance(target, RowBinding)
+                                      or _binding_identity(target) != _binding_identity(anchor)):
+                continue
+            context.admit_traversal_path()
+            bindings = {**row.bindings, node.target: anchor}
+            if node.relationship is not None:
+                if node.relationship in row.bindings:
+                    raise GrafxPlanError("A zero-hop range cannot overwrite a relationship binding.", field="plan")
+                bindings[node.relationship] = ()
+            if node.path_variable is not None:
+                prefix = row.bindings.get(node.path_variable)
+                if node.path_append:
+                    if (type(prefix) is not _PathValue or not prefix.nodes
+                            or _binding_identity(prefix.nodes[-1]) != _binding_identity(anchor)):
+                        raise GrafxPlanError("A zero-hop continuation requires its original prefix.", field="path")
+                    bindings[node.path_variable] = prefix
+                else:
+                    if node.path_variable in row.bindings:
+                        raise GrafxPlanError("A zero-hop capture cannot overwrite a path binding.", field="path")
+                    bindings[node.path_variable] = _PathValue((anchor,), ())
+            yield replace(row, bindings=bindings)
+
+
+def _argument_rows(engine: QueryEngine, node: ArgumentRows, context: _Context) -> Iterator[_Row]:
+    """Read the current outer binding without creating a second snapshot or transaction."""
+    if node.slot not in context.arguments:
+        raise GrafxPlanError("A correlated argument has no active outer row.", field="plan")
+    row = context.arguments[node.slot]
+    yield row if node.names is None else _Row(bindings={name: row.bindings[name] for name in node.names})
+
+
+def _restore_imports(engine: QueryEngine, node: RestoreImports, context: _Context) -> Iterator[_Row]:
+    if node.slot not in context.arguments:
+        raise GrafxPlanError("Global imports have no active invocation.", field="imports")
+    stream = engine._rows(node.child, context)
+    failure = None
+    try:
+        for row in stream:
+            values = {name: _current_entity_value(engine, context, context.arguments[node.slot].bindings[name])
+                      for name in node.names}
+            yield _Row(bindings={**row.bindings, **values}, computed=row.computed,
+                       columns={**(row.columns or {}), **values} if node.carry_columns else row.columns)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(stream, failure)
+
+
+def _apply_rows(engine: QueryEngine, node: ApplyRows, context: _Context) -> Iterator[_Row]:
+    """Correlate a complete inner read and close both streams even on cancellation."""
+    outer_stream = engine._rows(node.child, context)
+    outer_failure: BaseException | None = None
+    try:
+        for outer in outer_stream:
+            previous = context.arguments.get(node.slot)
+            context.arguments[node.slot] = outer
+            stream = engine._rows(node.inner, context)
+            failure: BaseException | None = None
+            found = False
+            try:
+                for row in stream:
+                    found = True
+                    yield row
+                if not found:
+                    yield replace(
+                        outer,
+                        bindings={**outer.bindings, **dict.fromkeys(node.null_variables)},
+                    )
+            except BaseException as caught:
+                failure = caught
+                raise
+            finally:
+                try:
+                    _close_iterator(stream, failure)
+                finally:
+                    if previous is None:
+                        context.arguments.pop(node.slot, None)
+                    else:
+                        context.arguments[node.slot] = previous
+    except BaseException as caught:
+        outer_failure = caught
+        raise
+    finally:
+        _close_iterator(outer_stream, outer_failure)
+
+
+def _procedure_write(engine: QueryEngine, context: _Context, scope: _ProcedureEntities,
+                     text: str, parameters: Mapping[str, object] | None) -> None:
+    """Execute bounded result-free DML within the unchanged outer transaction and savepoint."""
+    from okto_grafx.engine.public_views import _query_parameters_snapshot
+
+    procedure = scope.procedure
+    if type(text) is not str:
+        raise GrafxPlanError("Procedure mutation text must be a string.", field="procedure_write_query")
+    if parameters is not None and type(parameters) is not dict:
+        raise GrafxPlanError("Procedure mutation parameters must be an exact dict.", field="procedure_write_parameters")
+    count = context.procedure_statements.get(procedure.name, 0) + 1
+    if count > procedure.max_write_statements:
+        raise GrafxQueryBudgetExceeded("Procedure statement budget exceeded.", resource="procedure_statements",
+                                       limit=procedure.max_write_statements, observed=count)
+    context.procedure_statements[procedure.name] = count
+    statement = engine.parse(text)
+    if (not isinstance(statement, Query) or not statement.writes
+            or (statement.return_clause is not None and statement.return_clause.items)):
+        raise GrafxPlanError("ProcedureWriter.execute accepts result-free graph mutations, not DDL, RETURN or root UNION.",
+                             field="procedure_write_query")
+    supplied = _query_parameters_snapshot(parameters)
+    context.publish_phase()
+    engine._execute_parsed(statement, context.txn, supplied, cache_text=text, procedure_parent=context, procedure_scope=scope)
+    # Nested operations share the owner's snapshot and private intents. Drop local
+    # visibility memo authority before refreshing incoming entity bindings.
+    context._ends_staged = None
+
+
+def _procedure_query(engine: QueryEngine, context: _Context, scope: _ProcedureEntities,
+                     text: str, parameters: Mapping[str, object] | None, *, writing: bool) -> ProcedureResult:
+    """Execute same-snapshot native queries with bounded results and no independent commit."""
+    from okto_grafx.engine.public_views import _query_parameters_snapshot
+
+    procedure = scope.procedure
+    if type(text) is not str or (parameters is not None and type(parameters) is not dict):
+        raise GrafxPlanError("Procedure query needs exact text and dict parameters.", field="procedure_query")
+    count = context.procedure_query_statements.get(procedure.name, 0) + 1
+    if count > procedure.max_query_statements:
+        raise GrafxQueryBudgetExceeded("Procedure query statement budget exceeded.", resource="procedure_queries")
+    context.procedure_query_statements[procedure.name] = count
+    statement = engine.parse(text)
+    if not isinstance(statement, (Query, UnionQuery)):
+        raise GrafxPlanError("Procedure queries exclude DDL and transaction control.", field="procedure_query")
+    if statement.writes and not writing:
+        raise GrafxTransactionStateError("Procedure reader cannot execute graph writes.", field="procedure_authority")
+    if procedure.deterministic and not is_deterministic(statement):
+        raise GrafxPlanError("A deterministic procedure cannot invoke a volatile native query or procedure.",
+                             field="procedure_effect", reason="nondeterministic_query")
+    if statement.writes:
+        count = context.procedure_statements.get(procedure.name, 0) + 1
+        if count > procedure.max_write_statements:
+            raise GrafxQueryBudgetExceeded("Procedure write statement budget exceeded.", resource="procedure_statements")
+        context.procedure_statements[procedure.name] = count
+    supplied = _query_parameters_snapshot(parameters)
+    if context.atomic_staging:
+        context.publish_phase()
+    result = engine._execute_parsed(statement, context.txn, supplied, cache_text=text, procedure_parent=context,
+                                    procedure_scope=scope, read_control=context.read_control)
+    context._ends_staged = None
+    return ProcedureResult(result.columns, result.rows)
+
+
+def _procedure_schema(engine: QueryEngine, context: _Context, scope: _ProcedureEntities,
+                      text: str, parameters: Mapping[str, object] | None) -> None:
+    """Stage one explicitly authorized native DDL operation with ancestor-local adoption."""
+    if not scope.procedure.schema_write or type(text) is not str or parameters is not None:
+        raise GrafxTransactionStateError("Procedure schema authority is unavailable.", field="procedure_schema")
+    statement = engine.parse(text)
+    if type(statement) not in (CreateNodeTableStatement, CreateRelTableStatement, CreateIndexStatement, CreateVectorSpaceStatement):
+        raise GrafxPlanError("Procedure schema accepts native CREATE table/index/vector-space DDL.", field="procedure_schema")
+    scope.admit_schema()
+    context.publish_phase()
+    engine._execute_parsed(statement, context.txn, {}, procedure_parent=context, procedure_scope=scope)
+    _adopt_implicit_schema(engine, context)
+
+
+class _ProcedureEntities:
+    """Bind detached callback observations to exact native references in one invocation."""
+
+    def __init__(self, context: _Context, procedure: TabularProcedure) -> None:
+        """Retain witnesses privately; metadata alone never grants entity authority."""
+        self.context = context
+        self.procedure = procedure
+        self.stack = (*context.procedure_stack, (procedure.name, procedure.max_call_depth))
+        if procedure.schema_write and any(not context.engine._procedure_types()[name].schema_write
+                                           for name, _depth in context.procedure_stack):
+            raise GrafxTransactionStateError("A procedure cannot escalate an ancestor's schema authority.",
+                                             field="procedure_schema")
+        limit = min(depth for _name, depth in self.stack)
+        if len(self.stack) > limit:
+            raise GrafxQueryBudgetExceeded("Procedure call depth exceeded its inherited limit.",
+                                           resource="procedure_call_depth", limit=limit, observed=len(self.stack))
+        self.witnesses: dict[int, tuple[object, object]] = {}
+
+    def admit_schema(self) -> None:
+        """Charge one actual explicit/implicit schema operation before native effects."""
+        if not self.procedure.schema_write:
+            raise GrafxTransactionStateError("Procedure schema authority is unavailable.", field="procedure_schema")
+        name = self.procedure.name
+        count = self.context.procedure_schema_statements.get(name, 0) + 1
+        if count > self.procedure.max_schema_statements:
+            raise GrafxQueryBudgetExceeded("Procedure schema statement budget exceeded.", resource="procedure_schema_statements")
+        writes = self.context.procedure_statements.get(name, 0) + 1
+        if writes > self.procedure.max_write_statements:
+            raise GrafxQueryBudgetExceeded("Procedure write statement budget exceeded.", resource="procedure_statements")
+        self.context.procedure_schema_statements[name] = count
+        self.context.procedure_statements[name] = writes
+
+    def reserve_row(self) -> None:
+        """Charge a child result row before retaining it, across all owner invocations."""
+        rows, size = self.context.procedure_query_outputs.get(self.procedure.name, (0, 0))
+        if rows + 1 > self.procedure.max_query_rows:
+            raise GrafxQueryBudgetExceeded("Procedure query row budget exceeded.", resource="procedure_query_rows")
+        self.context.procedure_query_outputs[self.procedure.name] = (rows + 1, size)
+
+    def project(self, row: _Row, columns: tuple[str, ...], child: _Context) -> tuple[object, ...]:
+        """Own child output cells and retain only native entity witnesses, never its plan."""
+        cells = []
+        for name in columns:
+            native = _current_entity_value(child.engine, child, (row.columns or {}).get(name))
+            value = self.capture(native)
+            value = owned_procedure_value(value, "ANY", max_bytes=self.procedure.max_value_bytes,
+                                           procedure=self.procedure.name, entity_resolver=self.resolve)
+            count, size = self.context.procedure_query_outputs.get(self.procedure.name, (0, 0))
+            size += procedure_result_size(value)
+            if size > self.procedure.max_query_bytes:
+                raise GrafxQueryBudgetExceeded("Procedure query byte budget exceeded.", resource="procedure_query_bytes")
+            self.context.procedure_query_outputs[self.procedure.name] = (count, size)
+            cells.append(value)
+        return tuple(cells)
+
+    def observe(self, binding: object, *, remaining: int | None = None) -> object:
+        """Export current private-overlay content, registering path components separately."""
+        remaining = self.procedure.max_value_bytes if remaining is None else remaining
+        if remaining < 256:
+            raise GrafxQueryBudgetExceeded("Procedure entity byte budget exceeded.", resource="procedure_value")
+        if type(binding) is _PathValue:
+            remaining -= 64
+            components = []
+            for item in (*binding.nodes, *binding.relationships):
+                observed = self.observe(item, remaining=remaining)
+                remaining -= procedure_result_size(observed)
+                components.append(observed)
+            value = PathValue(tuple(components[:len(binding.nodes)]), tuple(components[len(binding.nodes):]))
+        else:
+            self.context.require_entity_content(binding)
+            value = _entity_result_value(binding, self.context, procedure=self.procedure,
+                                         procedure_bytes=remaining - 256)
+        self.witnesses[id(value)] = (value, binding)
+        return value
+
+    def resolve(self, value: object) -> object:
+        """Refresh only an exact observation issued by this still-active invocation."""
+        witness = self.witnesses.get(id(value))
+        if witness is None or witness[0] is not value:
+            raise GrafxPlanError("Procedure returned an entity outside its invocation authority.",
+                                 field="procedure_value", reason="entity_authority")
+        return self.observe(witness[1])
+
+    def capture(self, value: object) -> object:
+        """Bound recursive inputs before exporting or copying callback-owned values."""
+        if not isinstance(value, RowBinding) and type(value) is not _PathValue and type(value) is not list and type(value) is not tuple and type(value) is not dict:
+            # Preserve scalar signature diagnostics and avoid duplicate scalar
+            # validation/copying; invoke owns that established boundary.
+            return value
+        active: set[int] = set()
+        used = 0
+
+        def visit(item: object, depth: int) -> object:
+            """Walk exact native containers, charging before the next allocation."""
+            nonlocal used
+            if depth > MAX_VALUE_DEPTH or id(item) in active:
+                raise GrafxPlanError("Procedure input nesting is invalid.", field="procedure_value", reason="depth")
+            if type(item) is list or type(item) is tuple or type(item) is dict:
+                if len(item) > (MAX_MAP_ENTRIES if type(item) is dict else MAX_LIST_ELEMENTS):
+                    raise GrafxPlanError("Procedure input container exceeds its limit.", field="procedure_value")
+                used += 5
+                if used > self.procedure.max_value_bytes:
+                    raise GrafxQueryBudgetExceeded("Procedure value byte budget exceeded.", resource="procedure_value")
+                active.add(id(item))
+                try:
+                    if type(item) is dict:
+                        return {visit(key, depth + 1): visit(child, depth + 1) for key, child in item.items()}
+                    return [visit(child, depth + 1) for child in item]
+                finally:
+                    active.remove(id(item))
+            if isinstance(item, RowBinding) or type(item) is _PathValue:
+                result = self.observe(item, remaining=self.procedure.max_value_bytes - used)
+                size = procedure_result_size(result)
+            else:
+                if used >= self.procedure.max_value_bytes:
+                    raise GrafxQueryBudgetExceeded("Procedure value byte budget exceeded.", resource="procedure_value")
+                result = owned_procedure_value(item, "ANY", max_bytes=self.procedure.max_value_bytes - used,
+                                               procedure=self.procedure.name)
+                size = procedure_result_size(result)
+            used += size
+            if used > self.procedure.max_value_bytes:
+                raise GrafxQueryBudgetExceeded("Procedure value byte budget exceeded.", resource="procedure_value")
+            return result
+
+        return visit(value, 0)
+
+    def restore(self, value: object) -> object:
+        """Replace validated observations with native references before downstream execution."""
+        if type(value) is NodeValue or type(value) is RelationshipValue or type(value) is PathValue:
+            witness = self.witnesses.get(id(value))
+            if witness is None or witness[0] is not value:
+                raise GrafxPlanError("Procedure entity authority expired.", field="procedure_value")
+            return _current_entity_value(self.context.engine, self.context, witness[1])
+        if type(value) is list or type(value) is tuple:
+            return tuple(self.restore(item) for item in value)
+        if type(value) is dict:
+            return {key: self.restore(item) for key, item in value.items()}
+        return value
+
+
+def _procedure_rows(engine: QueryEngine, node: ProcedureRows, context: _Context) -> Iterator[_Row]:
+    """Invoke authorized callbacks and revoke supplied mutation authority before downstream rows."""
+    incoming = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    procedure = engine._procedure_types().get(node.name)
+    if procedure is None:
+        raise GrafxPlanError("Procedure is no longer authorized on this handle.", field="procedure")
+    positions = {name: position for position, (name, _kind) in enumerate(node.columns)}
+    try:
+        for row in incoming:
+            entities = _ProcedureEntities(context, procedure)
+            arguments = tuple(entities.capture(_evaluate(argument, row, context)) for argument in node.arguments)
+            writer = None
+            reader = None
+            if node.writes:
+                if not context.atomic_staging or engine._execution_identity is None:
+                    raise GrafxTransactionStateError("Writing procedures require native statement authority.",
+                                                     field="procedure_authority")
+                writer = ProcedureWriter(lambda text, supplied: _procedure_write(engine, context, entities, text, supplied),
+                                         engine._execution_identity,
+                                         query_operation=lambda text, supplied: _procedure_query(
+                                             engine, context, entities, text, supplied, writing=True),
+                                         schema_operation=(lambda text, supplied: _procedure_schema(
+                                             engine, context, entities, text, supplied)) if procedure.schema_write else None)
+            elif procedure.graph_read:
+                if engine._execution_identity is None:
+                    raise GrafxTransactionStateError("Graph-reading procedures require native execution authority.",
+                                                     field="procedure_authority")
+                reader = ProcedureReader(lambda text, supplied: _procedure_query(
+                    engine, context, entities, text, supplied, writing=False), engine._execution_identity)
+            stream = procedure.invoke(arguments, writer=writer, entity_resolver=entities.resolve, reader=reader)
+            inner_failure: BaseException | None = None
+            try:
+                if writer is not None:
+                    # Drain and validate all outputs (including cleanup) before the
+                    # capability can escape into downstream query evaluation.
+                    try:
+                        values_snapshot = []
+                        for values in stream:
+                            rows_used, bytes_used = context.procedure_outputs.get(procedure.name, (0, 0))
+                            rows_used += 1
+                            bytes_used += sum(procedure_result_size(value) for value in values)
+                            if rows_used > procedure.max_rows or bytes_used > procedure.max_result_bytes:
+                                raise GrafxQueryBudgetExceeded("Writing procedure output budget exceeded across invocations.",
+                                                               resource="procedure_outputs")
+                            context.procedure_outputs[procedure.name] = (rows_used, bytes_used)
+                            values_snapshot.append(values)
+                        writer._check()
+                    finally:
+                        writer._expire()
+                    stream = iter(values_snapshot)
+                    row = _Row(bindings={name: _current_entity_value(engine, context, value)
+                                         for name, value in row.bindings.items()})
+                for values in stream:
+                    if reader is not None:
+                        reader._check()
+                    yield _Row(bindings={**row.bindings, **{
+                        item.name: entities.restore(values[positions[item.expression.name]]) for item in node.yields
+                    }})
+                if reader is not None:
+                    reader._check()
+                if not node.columns:
+                    yield row
+            except BaseException as caught:
+                inner_failure = caught
+                raise
+            finally:
+                try:
+                    _close_iterator(stream, inner_failure)
+                    if reader is not None and inner_failure is None:
+                        reader._check()
+                finally:
+                    if writer is not None:
+                        writer._expire()
+                    if reader is not None:
+                        reader._expire()
+                    entities.witnesses.clear()
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(incoming, failure)
+
+
+def _subquery_rows(engine: QueryEngine, node: SubqueryRows, context: _Context) -> Iterator[_Row]:
+    """Execute each subquery in the current statement, closing both sides on every exit."""
+    outer_stream = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    try:
+        for outer in outer_stream:
+            previous = context.arguments.get(node.slot)
+            context.arguments[node.slot] = _Row(bindings={
+                target: _current_entity_value(engine, context, outer.bindings[source])
+                for source, target in node.imports
+            })
+            boundaries = engine._read_phase_boundaries(node.inner)
+            inner = None
+            inner_failure: BaseException | None = None
+            try:
+                engine._prepare_read_phases(boundaries, context)
+                inner = engine._rows(node.inner, context)
+                for row in inner:
+                    if node.unit:
+                        continue
+                    values = tuple((row.columns or {}).values())
+                    if len(values) != len(node.outputs):
+                        raise GrafxPlanError("Subquery result arity differs from its plan.", field="subquery")
+                    yield _Row(bindings={**outer.bindings, **dict(zip(node.outputs, values, strict=True))})
+                if node.writes:
+                    # Subsequent invocations read these intents, never a new snapshot.
+                    context.publish_phase()
+                if node.unit:
+                    yield _Row(bindings={name: _current_entity_value(engine, context, value)
+                                         for name, value in outer.bindings.items()})
+            except BaseException as caught:
+                inner_failure = caught
+                raise
+            finally:
+                try:
+                    if inner is not None:
+                        _close_iterator(inner, inner_failure)
+                finally:
+                    for boundary in boundaries:
+                        context.phase_results.pop(id(boundary), None)
+                    if previous is None:
+                        context.arguments.pop(node.slot, None)
+                    else:
+                        context.arguments[node.slot] = previous
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(outer_stream, failure)
+
+
+def _current_entity_value(engine: QueryEngine, context: _Context, value: object) -> object:
+    """Refresh native entity carriers at a phase/import boundary, not scalar snapshots."""
+    memo: dict[int, object] = {}
+    active: set[int] = set()
+
+    def visit(item: object, depth: int) -> object:
+        """Refresh nested entity carriers from the statement overlay with bounded traversal."""
+        if isinstance(item, RowBinding):
+            return _unwound_entity(engine, context, item)
+        if type(item) not in (_PathValue, tuple, list, dict):
+            return item
+        if depth > MAX_VALUE_DEPTH or id(item) in active:
+            raise GrafxPlanError("Imported values must be acyclic and within the value nesting limit.",
+                                 field="value_depth", limit=MAX_VALUE_DEPTH)
+        if id(item) in memo:
+            return memo[id(item)]
+        active.add(id(item))
+        if type(item) is _PathValue:
+            result = _PathValue(tuple(visit(child, depth+1) for child in item.nodes),
+                                tuple(visit(child, depth+1) for child in item.relationships))
+        elif type(item) is dict:
+            values = {key: visit(child, depth+1) for key, child in item.items()}
+            result = item if all(item[key] is child for key, child in values.items()) else values
+        else:
+            values = tuple(visit(child, depth+1) for child in item)
+            result = item if all(a is b for a, b in zip(item, values)) else type(item)(values)
+        active.remove(id(item))
+        memo[id(item)] = result
+        return result
+
+    return visit(value, 0)
+
+
+def _unwound_entity(engine: QueryEngine, context: _Context, value: object) -> object:
+    """Reacquire stored spill authority and observe the owner's latest entity values."""
+    binding = context.resolve_binding(value)
+    if not isinstance(binding, RowBinding):
+        return binding
+    if binding.ref is None and binding.record_id > 0:
+        found = _visible_identity_with_ref(engine, context, binding.table, binding.record_id)
+        if found is None:
+            raise GrafxCorruptionDetected("An unwound stored entity has no snapshot-visible identity.",
+                                         field="entity_identity", table=binding.table.name,
+                                         record_id=binding.record_id)
+        reference, version = found
+        binding = replace(binding, ref=reference, version=version)
+    values = _current_values(context, binding)
+    if values is binding.version.values:
+        return binding
+    version = replace(binding.version, values=values)
+    token = context.pending_token(binding.version)
+    if token is not None:
+        context.register_pending_token(version, token)
+    return replace(binding, version=version)
+
+
 def _unwind_rows(
     engine: QueryEngine, node: UnwindRows, context: _Context
 ) -> Iterator[_Row]:
@@ -5621,21 +6715,30 @@ def _unwind_rows(
     writes nothing rather than failing.
     """
 
-    for row in engine._rows(node.child, context):
-        carrier = _evaluate(node.expression, row, context)
-        if not isinstance(carrier, (list, tuple)):
-            named = "null" if carrier is None else type(carrier).__name__
-            message = (
-                f"{node.expression.describe()} is expanded by UNWIND, so it has to be a "
-                f"list; got {named}."
-            )
-            raise GrafxPlanError(
-                message,
-                field="unwind",
-                value=node.alias,
-            )
-        for element in carrier:
-            yield _Row(bindings={**row.bindings, node.alias: element})
+    incoming = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    streamed_range = isinstance(node.expression, FunctionCall) and node.expression.name.upper() == "RANGE"
+    try:
+        for row in incoming:
+            carrier = (range_values(*(_evaluate(argument, row, context) for argument in node.expression.arguments))
+                       if streamed_range else _evaluate(node.expression, row, context))
+            if carrier is None:
+                continue
+            if not isinstance(carrier, (list, tuple, range) if streamed_range else (list, tuple)):
+                raise GrafxPlanError(
+                    f"{node.expression.describe()} is expanded by UNWIND, so it has to be a "
+                    f"list; got {type(carrier).__name__}.", field="unwind", value=node.alias,
+                )
+            for index, element in enumerate(carrier):
+                if streamed_range and index >= MAX_GENERATED_LIST_ELEMENTS:
+                    raise GrafxQueryBudgetExceeded("UNWIND range exceeds its consumed element budget.",
+                                                   resource="generated_list")
+                yield _Row(bindings={**row.bindings, node.alias: _unwound_entity(engine, context, element)})
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(incoming, failure)
 
 
 def _with_rows(
@@ -5646,7 +6749,9 @@ def _with_rows(
     Every item is evaluated against the row that ARRIVED, all of them before any is bound, so
     an item cannot read what another item of the same stage is producing.
 
-    What leaves carries nothing else. A variable this stage did not name is gone from the row,
+    A modifier projection may temporarily retain declared input bindings; a closing
+    projection discards them before downstream clauses. Ordinary projections carry
+    nothing else. A variable this stage did not name is then gone from the row,
     which is what makes reading it below the stage a refusal rather than an accident of what
     the executor happened to still be holding. A matched row carried under its own name keeps
     the binding it had, so the clauses below still read its properties and still write it.
@@ -5656,7 +6761,13 @@ def _with_rows(
         projected = {
             item.name: _evaluate(item.expression, row, context) for item in node.items
         }
-        yield _Row(bindings=projected)
+        bindings = ({**{name: row.bindings[name] for name in node.ordering_inputs}, **projected}
+                    if node.ordering_inputs else projected)
+        # Plain WITH modifiers may still need these inputs after a bounded sort.
+        # Keep them in private operator columns so the existing authenticated spill
+        # codec preserves them; the closing projection removes them before export.
+        # DISTINCT/grouped WITH never receives private input names.
+        yield _Row(bindings=bindings, columns=bindings)
 
 
 def _scanned_node_versions(
@@ -5689,7 +6800,7 @@ def _all_nodes_scan(
     snapshot = context.snapshot
     views = [
         (table, *_transaction_row_view(context, table, include_held=False))
-        for table in node.tables
+        for planned in node.tables if (table := context.node_table(planned)) is not None
     ]
     single_source = isinstance(node.child, SingleRow)
     projections = getattr(context, "node_scan_projections", {}).get(id(node), {})
@@ -5737,17 +6848,20 @@ def _node_scan(
     insert-delete is no row at all.
     """
     snapshot = context.snapshot
-    changed, inserted = _transaction_row_view(context, node.table, include_held=False)
+    table = context.node_table(node.table)
+    if table is None:
+        return
+    changed, inserted = _transaction_row_view(context, table, include_held=False)
     single_source = isinstance(node.child, SingleRow)
     projection = (
         getattr(context, "node_scan_projections", {})
         .get(id(node), {})
-        .get(node.table.table_id)
+        .get(table.table_id)
     )
     for row in engine._rows(node.child, context):
         yield from _logical_node_rows_for_input(
             engine,
-            table=node.table,
+            table=table,
             variable=node.variable,
             input_row=row,
             context=context,
@@ -5844,6 +6958,35 @@ def _string_probe_frontier(
     return len(distinct)
 
 
+def _decimal_probe_values(table: TableDef, positions: Sequence[int], values: tuple[Value, ...]) -> tuple[Value, ...] | None:
+    """Canonicalize typed decimal seeks only with exact equality proof.
+
+    Stored DECIMAL frames carry the declared p/s. An inexact, overflowing or
+    nonnumeric probe cannot equal any value of that column. Other column families
+    keep their existing encoding-completeness decisions and scan fallback.
+    """
+    converted = None
+    for index, position in enumerate(positions):
+        column = table.columns[position]
+        if column.type is not ValueType.DECIMAL:
+            continue
+        value = values[index]
+        try:
+            if type(value) is DecimalValue:
+                normalized = column.normalize_value(value)
+            elif type(value) in (int, float):
+                normalized = decimal_from_number(value, column.decimal_precision, column.decimal_scale)
+            else:
+                return None
+        except SchemaMismatchError:
+            return None
+        if normalized is not value:
+            if converted is None:
+                converted = list(values)
+            converted[index] = normalized
+    return values if converted is None else tuple(converted)
+
+
 def _exact_probe_is_encoding_complete(
     table: TableDef,
     positions: Sequence[int],
@@ -5867,6 +7010,10 @@ def _exact_probe_is_encoding_complete(
         if observed is not declared:
             return False
         if observed in _ENCODING_COMPLETE_EXACT_TYPES:
+            continue
+        if observed is ValueType.DECIMAL and (value.precision, value.scale) == (
+            table.columns[position].decimal_precision, table.columns[position].decimal_scale
+        ):
             continue
         if observed is ValueType.DOUBLE:
             number = float(value)  # type: ignore[arg-type]
@@ -5997,6 +7144,9 @@ def _index_seek(
         # ``x = NULL`` is UNKNOWN for every x, including NULL.  The durable key format can
         # encode NULL, but probing it would turn that unknown predicate into matching rows.
         if any(value is None for value in values):
+            continue
+        values = _decimal_probe_values(node.table, positions, values)
+        if values is None:
             continue
         if not _exact_probe_is_encoding_complete(node.table, positions, values):
             # Decide the scan fallback before resolving or consuming the active store.  The
@@ -6441,6 +7591,8 @@ def _closed_node_scan_projections(
     else:
         return {}
 
+    if any(table.flexible_properties for table in tables):
+        return {}  # Property keys live inside the map, not at static column offsets.
     property_names: set[str] = required_properties
     pending = list(expressions)
     while pending:
@@ -6650,6 +7802,8 @@ def _edge_steps(
                 owner = owner_version(ref, version)
                 if owner is None:
                     continue
+                if outgoing and from_table.table_id == to_table.table_id and owner.values[0] == owner.values[1]:
+                    continue  # The outgoing arm already emitted this self-loop.
                 yield ref, owner, from_table, owner.values[0]
 
     maps: list[tuple[dict, dict]] = []
@@ -6691,6 +7845,8 @@ def _edge_steps(
                 yield ref, version, to_table, version.values[1]
         if incoming:
             for ref, version in by_target.get(record_id, ()):
+                if outgoing and from_table.table_id == to_table.table_id and version.values[0] == version.values[1]:
+                    continue
                 yield ref, version, from_table, version.values[0]
 
     if not indexed or not bounded_frontier:
@@ -6867,7 +8023,7 @@ def _batched_landing_steps(
 
 
 def _traverse(
-    engine: QueryEngine, node: TraverseRelationship, context: _Context
+    engine: QueryEngine, node: TraverseRelationship | TraverseRelationshipAlternatives, context: _Context
 ) -> Iterator[_Row]:
     """Expand each incoming row along the relationship table, one hop or a bounded range.
 
@@ -6886,6 +8042,11 @@ def _traverse(
     ``MATCH (a), (b) ... (a)-[]->(b)`` -- is a filter: the path counts only when it lands on that
     very row.
     """
+    if isinstance(node, TraverseRelationshipAlternatives) and node.dynamic_types:
+        node = replace(node, tables=_runtime_relationship_tables(context, node.tables, node.dynamic_types), dynamic_types=())
+    target_table = None if node.target_table is None else context.node_table(node.target_table)
+    if node.target_table is not None and target_table is None:
+        return
     path_variable = node.path_variable
     charge_expansions = engine._max_traversal_expansions is not None
     charge_paths = engine._max_traversal_paths is not None
@@ -6896,30 +8057,21 @@ def _traverse(
                 field="path_variable",
                 value=repr(path_variable),
             )
-        if (
-            node.min_hops != 1
-            or node.max_hops != 1
-            or node.direction is not Direction.OUTGOING
-            or node.relationship is None
-        ):
-            raise GrafxPlanError(
-                "A projected path is exactly one named, typed, outgoing relationship hop.",
-                field="path_variable",
-                value=path_variable,
-            )
+    if (type(node.min_hops) is not int or type(node.max_hops) is not int
+            or not 0 <= node.min_hops <= node.max_hops <= MAX_TRAVERSAL_HOPS
+            or type(node.path_append) is not bool or type(node.relationship_list) is not bool
+            or type(node.target_bound) is not bool
+            or type(node.upper_bound_omitted) is not bool
+            or node.upper_bound_omitted and (
+                not node.relationship_list or node.max_hops != MAX_TRAVERSAL_HOPS)):
+        raise GrafxPlanError("Traversal requires bounded exact hop counts and flags.", field="hops")
     catalog = context.schema()
-    relationship = node.table
+    relationships = (node.table,) if type(node) is TraverseRelationship else node.tables
     dirty_tables = _intent_table_ids(engine, context.txn)
     # The owner reads its own staged work. Everything this transaction has done to the three
     # tables a hop touches -- a committed edge whose properties it replaced, an edge it created,
     # a node it created, updated or ended -- folds into one view here, and a reader outside the
     # transaction never reaches this code at all.
-    relationship_changes: Mapping[object, tuple[Value, ...] | None] = {}
-    pending_edges: tuple[tuple[object, HeapVersion], ...] = ()
-    if relationship.table_id in dirty_tables:
-        relationship_changes, pending_edges = _owner_edges(context, relationship)
-    from_table = catalog.table(relationship.from_table)
-    to_table = catalog.table(relationship.to_table)
     landing_views: dict[int, _OwnerLandingView] = {}
 
     ended = _ended_by_this_transaction(context)
@@ -6931,7 +8083,7 @@ def _traverse(
         and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
         and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
     )
-    batch_landings = vector_free and _admits_batched_landings(engine, node, context)
+    batch_landings = type(node) is TraverseRelationship and vector_free and _admits_batched_landings(engine, node, context)
 
     def view_at(table: TableDef) -> _OwnerLandingView:
         """Reuse one endpoint landing view per table within this operation."""
@@ -6951,115 +8103,171 @@ def _traverse(
 
     outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
     incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
-    steps = _edge_steps(
-        engine,
-        context,
-        relationship,
-        from_table,
-        to_table,
-        outgoing,
-        incoming,
-        ended,
-        relationship_changes,
-        pending_edges,
-        bounded_frontier=(
-            _frontier_is_bounded(node.child, node.source)
-            or id(node) in context.short_circuit_traversals
-        ),
-    )
+    walkers = []
+    for relationship in relationships:
+        from_table = catalog.table(relationship.from_table, kind="node")
+        to_table = catalog.table(relationship.to_table, kind="node")
+        relationship_changes: Mapping[object, tuple[Value, ...] | None] = {}
+        pending_edges: tuple[tuple[object, HeapVersion], ...] = ()
+        if relationship.table_id in dirty_tables:
+            relationship_changes, pending_edges = _owner_edges(context, relationship)
+        steps = _edge_steps(
+            engine, context, relationship, from_table, to_table, outgoing, incoming,
+            ended, relationship_changes, pending_edges,
+            bounded_frontier=(_frontier_is_bounded(node.child, node.source)
+                              or id(node) in context.short_circuit_traversals),
+        )
+        walkers.append((relationship, from_table, to_table, steps))
 
-    for row in engine._rows(node.child, context):
-        start = row.bindings.get(node.source)
-        if not isinstance(start, RowBinding):
-            raise GrafxPlanError(
-                f"The traversal from {node.source!r} found no bound row to start from.",
-                field="variable",
-                value=node.source,
-            )
-        bound_target = row.bindings.get(node.target) if node.target_bound else None
-        # (current record id, current table, edges taken so far)
-        frontier: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = [
-            (_overlay_identity(start), start.table, ())
-        ]
-        for depth in range(1, node.max_hops + 1):
-            reached: list[tuple[object, TableDef, tuple[RowBinding, ...]]] = []
-            for record_id, _table, path in frontier:
-                taken = {edge.ref for edge in path}
-                candidates = steps(record_id)
-                resolved = (
-                    _batched_landing_steps(engine, context, iter(candidates), view_at)
-                    if batch_landings else
-                    ((*candidate, False, None) for candidate in candidates)
+    incoming_rows = engine._rows(node.child, context)
+    with _iterator_cleanup(lambda: (incoming_rows,)):
+        for row in incoming_rows:
+            start = row.bindings.get(node.source)
+            if start is None and node.source in row.bindings:
+                continue  # An OPTIONAL null anchor cannot produce a real hop.
+            if not isinstance(start, RowBinding):
+                raise GrafxPlanError(
+                    f"The traversal from {node.source!r} found no bound row to start from.",
+                    field="variable",
+                    value=node.source,
                 )
-                for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
-                    if charge_expansions:
-                        context.admit_traversal_expansion()
-                    if ref in taken:
+            bound_target = row.bindings.get(node.target) if node.target_bound else None
+            if node.target_bound and not isinstance(bound_target, RowBinding):
+                continue
+            prefix = row.bindings.get(path_variable) if node.path_append else None
+            if node.path_append:
+                if (type(prefix) is not _PathValue or not prefix.nodes
+                        or _binding_identity(prefix.nodes[-1]) != _binding_identity(start)):
+                    raise GrafxPlanError("A continued path must start at its previous endpoint.", field="path_variable")
+            elif path_variable is not None and path_variable in row.bindings:
+                raise GrafxPlanError("A path cannot overwrite an existing binding.", field="path_variable")
+
+            def successors(current: RowBinding, path: tuple[RowBinding, ...]) -> Iterator[tuple[RowBinding, RowBinding]]:
+                """Yield eligible adjacent edges and endpoints without reusing an edge in the path."""
+                record_id, current_table = _overlay_identity(current), current.table
+                taken = {_binding_identity(edge) for edge in path}
+                if prefix is not None:
+                    taken.update(_binding_identity(edge) for edge in prefix.relationships)
+                for relationship, from_table, to_table, steps in walkers:
+                    if not ((outgoing and current_table.table_id == from_table.table_id)
+                            or (incoming and current_table.table_id == to_table.table_id)):
                         continue
-                    if prevalidated:
-                        landing = batch_landing
-                    elif (
-                        isinstance(bound_target, RowBinding)
-                        and _overlay_identity(bound_target) == next_id
-                        and bound_target.table.table_id == next_table.table_id
-                    ):
-                        # The landing IS the bound row, which arrived through operators that
-                        # already validated its visibility -- so even the lazy identity proof
-                        # node_at would take to re-prove it is not paid.
-                        landing = (bound_target.ref, bound_target.version)
-                    else:
-                        landing = node_at(next_table, next_id)
-                    if landing is None:
-                        continue
+                    candidates = steps(record_id)
+                    resolved = (
+                        _batched_landing_steps(engine, context, iter(candidates), view_at)
+                        if batch_landings else
+                        ((*candidate, False, None) for candidate in candidates)
+                    )
+                    with _iterator_cleanup(lambda: (resolved, candidates)):
+                        for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
+                            if charge_expansions:
+                                context.admit_traversal_expansion()
+                            elif context.read_control is not None:
+                                context.read_control.step()
+                            endpoints = version.values[:2]
+                            if not (
+                                (outgoing and current_table.table_id == from_table.table_id
+                                 and endpoints[0] == record_id and next_table.table_id == to_table.table_id
+                                 and endpoints[1] == next_id)
+                                or (incoming and current_table.table_id == to_table.table_id
+                                    and endpoints[1] == record_id and next_table.table_id == from_table.table_id
+                                    and endpoints[0] == next_id)
+                            ):
+                                continue
+                            edge = RowBinding(variable=node.relationship or "", table=relationship,
+                                              ref=ref, version=version,
+                                              polymorphic=type(node) is TraverseRelationshipAlternatives)
+                            if _binding_identity(edge) in taken:
+                                continue
+                            if prevalidated:
+                                landing = batch_landing
+                            elif (isinstance(bound_target, RowBinding)
+                                  and _overlay_identity(bound_target) == next_id
+                                  and bound_target.table.table_id == next_table.table_id):
+                                landing = (bound_target.ref, bound_target.version)
+                            else:
+                                landing = node_at(next_table, next_id)
+                            if landing is None:
+                                continue
+                            if charge_paths:
+                                context.admit_traversal_path()
+                            landing_ref, landing_version = landing
+                            target = RowBinding(variable=node.target, table=next_table,
+                                                ref=landing_ref, version=landing_version,
+                                                polymorphic=node.target_table is None)
+                            yield edge, target
+
+            def walks() -> Iterator[tuple[tuple[RowBinding, ...], tuple[RowBinding, ...]]]:
+                # Depth-first streaming retains one sibling iterator per depth, never a
+                # breadth-wide collection of complete paths. Unordered result order is
+                # not a shortest-path guarantee; ORDER BY defines caller-visible order.
+                """Enumerate bounded variable-length paths, including an admitted zero-hop path."""
+                if node.min_hops == 0:
                     if charge_paths:
                         context.admit_traversal_path()
-                    edge = RowBinding(
-                        variable=node.relationship or "",
-                        table=relationship,
-                        ref=ref,
-                        version=version,
-                    )
-                    extended = (*path, edge)
-                    reached.append((next_id, next_table, extended))
-                    if depth < node.min_hops:
+                    yield (), (start,)
+                stack = []
+                if node.max_hops:
+                    stack.append((iter(successors(start, ())), (), (start,)))
+                with _iterator_cleanup(lambda: (item[0] for item in reversed(stack))):
+                    while stack:
+                        iterator, path, nodes = stack[-1]
+                        try:
+                            edge, target = next(iterator)
+                        except StopIteration:
+                            stack.pop()
+                            _close_iterator(iterator)
+                            continue
+                        extended, visited = (*path, edge), (*nodes, target)
+                        if len(extended) >= node.min_hops:
+                            yield extended, visited
+                        if len(extended) < node.max_hops:
+                            stack.append((iter(successors(target, extended)), extended, visited))
+                        elif node.upper_bound_omitted:
+                            # Probe only on demand, after yielding the ceiling-length row.
+                            # LIMIT/cursor close may legitimately stop without requesting
+                            # complete enumeration. A valid further edge disproves it.
+                            probe = iter(successors(target, extended))
+                            with _iterator_cleanup(lambda: (probe,)):
+                                if next(probe, None) is not None:
+                                    raise GrafxQueryBudgetExceeded(
+                                        "An omitted-upper traversal exceeds the hop resource ceiling.",
+                                        field="max_traversal_hops", limit=node.max_hops,
+                                        observed=len(extended) + 1,
+                                        operator=type(node).__name__,
+                                    )
+
+            iterator = walks()
+            with _iterator_cleanup(lambda: (iterator,)):
+                for path, visited in iterator:
+                    target_binding = visited[-1]
+                    if target_table is not None and target_table.table_id != target_binding.table.table_id:
                         continue
-                    landing_ref, landing_version = landing
-                    if isinstance(bound_target, RowBinding) and (
-                        _overlay_identity(bound_target) != next_id
-                        or bound_target.table.table_id != next_table.table_id
-                    ):
+                    if isinstance(bound_target, RowBinding) and _binding_identity(bound_target) != _binding_identity(target_binding):
                         continue
                     bindings = dict(row.bindings)
-                    target_binding = RowBinding(
-                        variable=node.target,
-                        table=next_table,
-                        ref=landing_ref,
-                        version=landing_version,
-                    )
                     bindings[node.target] = target_binding
                     if node.relationship is not None:
                         bindings[node.relationship] = (
-                            edge
-                            if node.max_hops == 1 and node.min_hops == 1
-                            else extended
+                            path if node.relationship_list or node.min_hops != 1 or node.max_hops != 1 else path[0]
                         )
                     if path_variable is not None:
-                        if path_variable in bindings:
-                            raise GrafxPlanError(
-                                "A projected path cannot reuse a node or relationship variable.",
-                                field="path_variable",
-                                value=path_variable,
-                            )
-                        bindings[path_variable] = _one_hop_path_value(
-                            context, start, edge, target_binding
-                        )
+                        nodes = (*prefix.nodes, *visited[1:]) if prefix is not None else visited
+                        edges = (*prefix.relationships, *path) if prefix is not None else path
+                        if len(nodes) > MAX_LIST_ELEMENTS:
+                            raise GrafxQueryBudgetExceeded("A captured path exceeds the owned node limit.",
+                                                           field="path_nodes", limit=MAX_LIST_ELEMENTS)
+                        bindings[path_variable] = _PathValue(nodes=nodes, relationships=edges)
                     context.count("rows_scanned")
-                    yield _Row(
-                        bindings=bindings, computed=row.computed, columns=row.columns
-                    )
-            frontier = reached
-            if not frontier:
-                break
+                    yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+
+
+def _runtime_relationship_tables(context: _Context, tables: tuple[TableDef, ...], names: tuple[str, ...]) -> tuple[TableDef, ...]:
+    """Resolve only this statement's declared flexible types after its write barrier."""
+    selected = {table.table_id: table for table in tables}
+    for name in names:
+        selected.update((table.table_id, table) for table in context.schema().relationship_tables(name))
+    return tuple(selected[key] for key in sorted(selected))
 
 
 def _traverse_any(
@@ -7071,9 +8279,11 @@ def _traverse_any(
     child being redrawn per table: the rows a caller receives are the same either way, but the
     work and the budget are not, and the freeze asks for one admission point.
 
-    A single hop cannot revisit an edge, so the isomorphism bookkeeping a range needs is absent
-    here by construction rather than by omission.
+    A captured continuation excludes edges already in its prefix. The surrounding
+    MATCH plan also enforces disjoint relationships across separate pattern segments.
     """
+    if node.dynamic_types:
+        node = replace(node, tables=_runtime_relationship_tables(context, node.tables, node.dynamic_types), dynamic_types=())
     catalog = context.schema()
     charge_expansions = engine._max_traversal_expansions is not None
     charge_paths = engine._max_traversal_paths is not None
@@ -7113,8 +8323,8 @@ def _traverse_any(
                     engine,
                     context,
                     table,
-                    catalog.table(table.from_table),
-                    catalog.table(table.to_table),
+                    catalog.table(table.from_table, kind="node"),
+                    catalog.table(table.to_table, kind="node"),
                     node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
                     and (node.source_table is None or table.from_table == node.source_table),
                     node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
@@ -7127,56 +8337,88 @@ def _traverse_any(
             )
         )
 
-    for row in engine._rows(node.child, context):
-        start = row.bindings.get(node.source)
-        if not isinstance(start, RowBinding):
-            raise GrafxPlanError(
-                f"The traversal from {node.source!r} found no bound row to start from.",
-                field="variable",
-                value=node.source,
-            )
-        identity = _overlay_identity(start)
-        matched = False
-        for table, steps in walkers:
-            for ref, version, next_table, next_id in steps(identity):
-                if charge_expansions:
-                    context.admit_traversal_expansion()
-                if node.target_table is not None and next_table.name != node.target_table:
+    incoming_rows = engine._rows(node.child, context)
+    with _iterator_cleanup(lambda: (incoming_rows,)):
+        for row in incoming_rows:
+            start = row.bindings.get(node.source)
+            if start is None and node.source in row.bindings:
+                if node.optional:
+                    bindings = {**row.bindings, node.relationship: None}
+                    if not node.target_bound:
+                        bindings[node.target] = None
+                    yield replace(row, bindings=bindings)
+                continue
+            if not isinstance(start, RowBinding) or start.table.kind != "node":
+                raise GrafxPlanError("An incident traversal requires a node anchor.", field="variable", value=node.source)
+            bound_target = row.bindings.get(node.target) if node.target_bound else None
+            prefix = row.bindings.get(node.path_variable) if node.path_append else None
+            if node.path_append:
+                if (type(prefix) is not _PathValue or not prefix.nodes
+                        or _binding_identity(prefix.nodes[-1]) != _binding_identity(start)):
+                    raise GrafxPlanError("A continued path must start at its previous endpoint.", field="path_variable")
+            elif node.path_variable is not None and node.path_variable in row.bindings:
+                raise GrafxPlanError("A path cannot overwrite an existing binding.", field="path_variable")
+            taken = {_binding_identity(edge) for edge in prefix.relationships} if prefix is not None else set()
+            identity = _overlay_identity(start)
+            matched = False
+            for table, steps in walkers:
+                outgoing = node.direction in (Direction.OUTGOING, Direction.UNDIRECTED)
+                incoming = node.direction in (Direction.INCOMING, Direction.UNDIRECTED)
+                # Reject wrong-table anchors before looking up equal table-local ids.
+                if not ((outgoing and start.table.name == table.from_table)
+                        or (incoming and start.table.name == table.to_table)):
                     continue
-                landing = node_at(next_table, next_id)
-                if landing is None:
-                    continue
-                if charge_paths:
-                    context.admit_traversal_path()
-                landing_ref, landing_version = landing
-                bindings = dict(row.bindings)
-                bindings[node.target] = RowBinding(
-                    variable=node.target,
-                    table=next_table,
-                    ref=landing_ref,
-                    version=landing_version,
-                    polymorphic=node.optional and node.target_table is None,
-                )
-                bindings[node.relationship] = RowBinding(
-                    variable=node.relationship,
-                    table=table,
-                    ref=ref,
-                    version=version,
-                    polymorphic=node.relationship_polymorphic,
-                )
-                context.count("rows_scanned")
-                candidate = _Row(
-                    bindings=bindings, computed=row.computed, columns=row.columns
-                )
-                if node.predicate is not None and not _predicate_admits(node.predicate, candidate, context):
-                    continue
-                matched = True
-                yield candidate
-        if node.optional and not matched:
-            bindings = dict(row.bindings)
-            bindings[node.target] = None
-            bindings[node.relationship] = None
-            yield _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+                candidates = steps(identity)
+                with _iterator_cleanup(lambda: (candidates,)):
+                    for ref, version, next_table, next_id in candidates:
+                        if charge_expansions:
+                            context.admit_traversal_expansion()
+                        elif context.read_control is not None:
+                            context.read_control.step()
+                        endpoints = version.values[:2]
+                        if not ((outgoing and start.table.name == table.from_table
+                                 and endpoints[0] == identity and next_table.name == table.to_table
+                                 and endpoints[1] == next_id)
+                                or (incoming and start.table.name == table.to_table
+                                    and endpoints[1] == identity and next_table.name == table.from_table
+                                    and endpoints[0] == next_id)):
+                            continue
+                        if node.target_table is not None and next_table.name != node.target_table:
+                            continue
+                        edge = RowBinding(variable=node.relationship, table=table, ref=ref, version=version,
+                                          polymorphic=node.relationship_polymorphic)
+                        if _binding_identity(edge) in taken:
+                            continue
+                        landing = node_at(next_table, next_id)
+                        if landing is None:
+                            continue
+                        landing_ref, landing_version = landing
+                        target = RowBinding(variable=node.target, table=next_table, ref=landing_ref,
+                                            version=landing_version, polymorphic=node.target_table is None)
+                        if node.target_bound and (not isinstance(bound_target, RowBinding)
+                                                  or _binding_identity(bound_target) != _binding_identity(target)):
+                            continue
+                        if charge_paths:
+                            context.admit_traversal_path()
+                        bindings = {**row.bindings, node.target: target,
+                                    node.relationship: (edge,) if node.relationship_list else edge}
+                        if node.path_variable is not None:
+                            bindings[node.path_variable] = (
+                                _PathValue((*prefix.nodes, target), (*prefix.relationships, edge))
+                                if prefix is not None else _PathValue((start, target), (edge,)))
+                        context.count("rows_scanned")
+                        candidate = replace(row, bindings=bindings)
+                        if node.predicate is not None and not _predicate_admits(node.predicate, candidate, context):
+                            continue
+                        matched = True
+                        yield candidate
+            if node.optional and not matched:
+                bindings = {**row.bindings, node.relationship: None}
+                if not node.target_bound:
+                    bindings[node.target] = None
+                if node.path_variable is not None:
+                    bindings[node.path_variable] = None
+                yield replace(row, bindings=bindings)
 
 
 def _relationship_scan(
@@ -8506,7 +9748,7 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
         # A subtree that reaches the canonical walk anywhere is never memoized: the walk does
         # not count the mapping reads it performs, so a repeated fallback could turn two
         # observable reads into one.
-        if counts.get(key, 0) < 2 or not instrumented[id(node)]:
+        if counts.get(key, 0) < 2 or not instrumented[id(node)] or not is_deterministic(node):
             return function
         slot = slot_of.get(key)
         if slot is None:
@@ -8570,12 +9812,13 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
                 if value is None:
                     return None
                 if type(value) is RowBinding:
+                    ctx.require_entity_content(value)
                     return value.value(key)
                 # A mapping subject or a refusal, decided from the value already obtained (the
                 # subject is never evaluated twice); the read is counted so no memo slot keeps it.
                 if memo is not None:
                     memo[-1] += 1  # type: ignore[index]
-                return _property_of(value, node)
+                return _property_of(value, node, ctx)
 
             return prop
         if kind is NullCheck:
@@ -8690,8 +9933,11 @@ def _compile_predicate(expression: Expression, context: _Context) -> _CompiledPr
 
             def coalesce(row: _Row, ctx: _Context, memo: object) -> object:
                 """Evaluate the selected arguments under canonical coalesce semantics."""
-                values = tuple(argument(row, ctx, memo) for argument in arguments)
-                return _coalesce_selected(node, values, ctx)
+                for argument in arguments:
+                    value = argument(row, ctx, memo)
+                    if value is not None:
+                        return _coalesce_selected(node, (value,), ctx)
+                return None
 
             return coalesce
 
@@ -8872,7 +10118,7 @@ def _direct_vector_search(
     space = _space_name(node, (), context)
     query_vector = _query_vector(node, (), context)
     wanted = max(min(requested, candidate_count), 1)
-    result = vectors.search(  # type: ignore[attr-defined]
+    result = _search_vector_owner(vectors, scan.table.table_id,
         space=space,
         query=query_vector,
         k=wanted,
@@ -9271,6 +10517,14 @@ def _filtered_vector_search(
     return tuple(rows)
 
 
+def _search_vector_owner(vectors: object, table_id: int | None, **kwargs):
+    """Carry native physical ownership while retaining explicit collaborator doors."""
+    owned = getattr(vectors, "search_for_table", None)
+    if callable(owned) and table_id is not None:
+        return owned(table_id=table_id, **kwargs)
+    return vectors.search(**kwargs)
+
+
 def _materialised_vector_search(
     engine: QueryEngine, vectors: object, node: VectorSearch, context: _Context
 ) -> Iterator[_Row]:
@@ -9336,7 +10590,8 @@ def _materialised_vector_search(
             sealed = None
         if sealed is not None:
             candidate_filter = sealed
-    result = vectors.search(  # type: ignore[attr-defined]
+    result = _search_vector_owner(
+        vectors, physical_pair[0] if physical_pair is not None and not physical_pair_ambiguous else None,
         space=space,
         query=query_vector,
         k=wanted,
@@ -9493,6 +10748,7 @@ def _passes(operator: str | None, score: float, threshold: float) -> bool:
 _SPILL_KEY_HEADER = b"OGQK\x01"
 _SPILL_PAYLOAD_HEADER = b"OGQP\x01"
 _SPILL_BIG_INTEGER = b"OGQI\x01"
+_SPILL_DECIMAL_ORDER = b"OGQD\x01"
 _SPILL_NAN_IDENTITY = b"OGQN\x01"
 _SPILL_VECTOR_IDENTITY = b"OGQW\x01"
 _SPILL_VALUE_SCALAR = b"OGQV\x01"
@@ -9602,6 +10858,8 @@ def _spill_pack_internal(
     nan_identities: _NaNIdentityRegistry | None = None,
 ) -> Value:
     """Map engine-private comparison/signature shapes onto the safe Value codec."""
+    if type(value) is DecimalOrderKey:
+        return (_SPILL_DECIMAL_ORDER, value.value)
     if type(value) is int and not INT64_MIN <= value <= INT64_MAX:
         return (_SPILL_BIG_INTEGER, str(value))
     if isinstance(value, float):
@@ -9647,6 +10905,10 @@ def _spill_pack_internal(
 def _spill_unpack_internal(value: Value) -> object:
     """Reverse :func:`_spill_pack_internal` for trusted comparison records."""
     if isinstance(value, tuple):
+        if len(value) == 2 and value[0] == _SPILL_DECIMAL_ORDER:
+            if type(value[1]) is not DecimalValue:
+                raise GrafxCorruptionDetected("Invalid decimal ordering spill marker.", field="query_spill.key")
+            return DecimalOrderKey(value[1])
         if len(value) == 2 and value[0] == _SPILL_BIG_INTEGER:
             encoded = value[1]
             if not isinstance(encoded, str):
@@ -9696,41 +10958,16 @@ def _spill_signature(
     )
 
 
-def _spill_path_value(value: _PathValue) -> Value:
-    """Encode one capability-free path DTO without collapsing its nominal validation."""
-
-    def identity(item: _PathIdentity) -> Value:
-        """Expose the path identity as its canonical offset and table pair."""
-        return (item.offset, item.table)
-
-    nodes: tuple[Value, ...] = tuple(
-        (
-            identity(node.identity),
-            node.label,
-            tuple((name, _spill_detach_value(item)) for name, item in node.properties),
-        )
-        for node in value.nodes
-    )
-    relationships: tuple[Value, ...] = tuple(
-        (
-            identity(relationship.source),
-            identity(relationship.target),
-            relationship.label,
-            identity(relationship.identity),
-            tuple(
-                (name, _spill_detach_value(item))
-                for name, item in relationship.properties
-            ),
-        )
-        for relationship in value.relationships
-    )
-    return (_SPILL_VALUE_PATH, nodes, relationships)
+def _spill_path_value(value: _PathValue, codec: _SpillRowCodec) -> Value:
+    """Keep authenticated row identity and source versions in temporary paths."""
+    return (_SPILL_VALUE_PATH, tuple(codec._detach(node) for node in value.nodes),
+            tuple(codec._detach(edge) for edge in value.relationships))
 
 
 def _spill_detach_value(value: object) -> Value:
     """Remove row/page capabilities before a value crosses into the spill adapter."""
     if type(value) is _PathValue:
-        return _spill_path_value(value)
+        raise GrafxPlanError("Path spill requires an authenticated row codec.", field="query_spill.path")
     if isinstance(value, RowBinding):
         return _spill_detach_value(_as_value(value))
     if isinstance(value, (list, tuple)):
@@ -9749,110 +10986,25 @@ def _spill_detach_value(value: object) -> Value:
     return (_SPILL_VALUE_SCALAR, cast(Value, value))
 
 
-def _spill_restore_identity(value: Value, *, field: str) -> _PathIdentity:
-    if (
-        not isinstance(value, tuple)
-        or len(value) != 2
-        or type(value[0]) is not int
-        or type(value[1]) is not int
-    ):
-        raise GrafxCorruptionDetected(
-            "A temporary projected-path identity is malformed.",
-            field=field,
-            value="path_identity",
-        )
-    return _PathIdentity(offset=value[0], table=value[1])
-
-
-def _spill_restore_properties(
-    value: Value, *, field: str
-) -> tuple[tuple[str, Value], ...]:
-    if not isinstance(value, tuple):
-        raise GrafxCorruptionDetected(
-            "Temporary projected-path properties are malformed.",
-            field=field,
-            value="path_properties",
-        )
-    restored: list[tuple[str, Value]] = []
-    for position, pair in enumerate(value):
-        if (
-            not isinstance(pair, tuple)
-            or len(pair) != 2
-            or not isinstance(pair[0], str)
-        ):
-            raise GrafxCorruptionDetected(
-                "A temporary projected-path property is malformed.",
-                field=field,
-                value=position,
-            )
-        restored.append((pair[0], _spill_restore_value(pair[1])))
-    return tuple(restored)
-
-
-def _spill_restore_path(value: tuple[Value, ...]) -> _PathValue:
-    if (
-        len(value) != 3
-        or not isinstance(value[1], tuple)
-        or not isinstance(value[2], tuple)
-    ):
-        raise GrafxCorruptionDetected(
-            "A temporary projected path is malformed.",
-            field="query_spill.path",
-            value="path",
-        )
-    nodes: list[_PathNodeValue] = []
-    for position, item in enumerate(value[1]):
-        if (
-            not isinstance(item, tuple)
-            or len(item) != 3
-            or not isinstance(item[1], str)
-        ):
-            raise GrafxCorruptionDetected(
-                "A temporary projected path node is malformed.",
-                field="query_spill.path",
-                value=position,
-            )
-        nodes.append(
-            _PathNodeValue(
-                identity=_spill_restore_identity(
-                    item[0], field="query_spill.path.node_identity"
-                ),
-                label=item[1],
-                properties=_spill_restore_properties(
-                    item[2], field="query_spill.path.node_properties"
-                ),
-            )
-        )
-    relationships: list[_PathRelationshipValue] = []
-    for position, item in enumerate(value[2]):
-        if (
-            not isinstance(item, tuple)
-            or len(item) != 5
-            or not isinstance(item[2], str)
-        ):
-            raise GrafxCorruptionDetected(
-                "A temporary projected path relationship is malformed.",
-                field="query_spill.path",
-                value=position,
-            )
-        relationships.append(
-            _PathRelationshipValue(
-                source=_spill_restore_identity(
-                    item[0], field="query_spill.path.relationship_source"
-                ),
-                target=_spill_restore_identity(
-                    item[1], field="query_spill.path.relationship_target"
-                ),
-                label=item[2],
-                identity=_spill_restore_identity(
-                    item[3], field="query_spill.path.relationship_identity"
-                ),
-                properties=_spill_restore_properties(
-                    item[4], field="query_spill.path.relationship_properties"
-                ),
-            )
-        )
-    return _PathValue(nodes=tuple(nodes), relationships=tuple(relationships))  # type: ignore[arg-type]
+def _spill_restore_path(value: tuple[Value, ...], codec: _SpillRowCodec) -> _PathValue:
+    if (len(value) != 3 or type(value[1]) is not tuple or type(value[2]) is not tuple
+            or not 1 <= len(value[1]) <= MAX_LIST_ELEMENTS
+            or len(value[2]) != len(value[1]) - 1):
+        raise GrafxCorruptionDetected("A temporary path has invalid cardinality.", field="query_spill.path")
+    nodes = tuple(codec._restore(item) for item in value[1])
+    edges = tuple(codec._restore(item) for item in value[2])
+    if (any(type(node) is not RowBinding or node.table.kind != "node" for node in nodes)
+            or any(type(edge) is not RowBinding or edge.table.kind != "rel" for edge in edges)):
+        raise GrafxCorruptionDetected("A temporary path has invalid entity types.", field="query_spill.path")
+    for source, edge, target in zip(nodes, edges, nodes[1:]):
+        actual = ((source.table.name, _overlay_identity(source)), (target.table.name, _overlay_identity(target)))
+        endpoints = edge.version.values[:2]
+        if len(endpoints) != 2:
+            raise GrafxCorruptionDetected("A temporary path lacks endpoint identities.", field="query_spill.path")
+        declared = ((edge.table.from_table, endpoints[0]), (edge.table.to_table, endpoints[1]))
+        if actual not in (declared, declared[::-1]):
+            raise GrafxCorruptionDetected("A temporary path has disconnected endpoints.", field="query_spill.path")
+    return _PathValue(nodes=nodes, relationships=edges)
 
 
 def _spill_restore_value(value: Value) -> Value:
@@ -9889,7 +11041,7 @@ def _spill_restore_value(value: Value) -> Value:
                 ) from failure
         return restored
     if tag == _SPILL_VALUE_PATH:
-        return cast(Value, _spill_restore_path(value))
+        raise GrafxCorruptionDetected("Path spill requires an authenticated row codec.", field="query_spill.path")
     raise GrafxCorruptionDetected(
         "A temporary detached query value has an unknown tag or shape.",
         field="query_spill.value",
@@ -10042,6 +11194,9 @@ class _SpillRowCodec:
         token = len(self._held_by_token)
         detached_values = self._detach(version.values)
         charge = _HELD_BINDING_OVERHEAD + len(_spill_encode(detached_values, key=False))
+        if version.node_labels is not None:
+            from okto_grafx.domain.model.node_labels import encode_node_labels
+            charge += len(encode_node_labels(version.node_labels))
         self._workspace.reserve(charge, reason="distinct_held_binding_identity")
         try:
             self._held_by_identity[identity] = (version, token, charge)
@@ -10081,6 +11236,9 @@ class _SpillRowCodec:
                 _spill_pack_internal(value.record_id),
                 self._detach(value.version.values),
                 value.polymorphic,
+                _spill_pack_internal(value.version.xmin),
+                value.pending_observation or value.ref in _entity_overlay(self._context, value.table),
+                _current_node_labels(self._context, value) if value.table.kind == "node" else None,
             )
         if isinstance(value, PendingRowRef):
             return (
@@ -10090,7 +11248,7 @@ class _SpillRowCodec:
                 _spill_pack_internal(value.token),
             )
         if type(value) is _PathValue:
-            return _spill_path_value(value)
+            return _spill_path_value(value, self)
         if isinstance(value, (list, tuple)):
             return (
                 _SPILL_VALUE_SEQUENCE,
@@ -10150,7 +11308,7 @@ class _SpillRowCodec:
                     ) from failure
             return restored
         if tag == _SPILL_VALUE_PATH:
-            return _spill_restore_path(value)
+            return _spill_restore_path(value, self)
         raise GrafxCorruptionDetected(
             "A temporary detached operator value has an unknown tag or shape.",
             field="query_spill.value",
@@ -10173,15 +11331,19 @@ class _SpillRowCodec:
                 field="query_spill.row.binding",
                 value="pending_domain",
             )
+        resolver = getattr(self._context.txn, "_pending_reference_for_query", None)
+        if callable(resolver):
+            return resolver(txn_id, table_id, token)
         return PendingRowRef(txn_id=txn_id, table_id=table_id, token=token)
 
     def _restore_binding(self, value: tuple[Value, ...]) -> RowBinding:
         if (
-            len(value) != 7
+            len(value) != 10
             or not isinstance(value[1], str)
             or type(value[2]) is not int
             or not isinstance(value[3], tuple)
             or type(value[6]) is not bool
+            or type(value[8]) is not bool
         ):
             raise GrafxCorruptionDetected(
                 "A temporary row binding is malformed.",
@@ -10189,7 +11351,20 @@ class _SpillRowCodec:
                 value="binding_shape",
             )
         table = self._context.schema().table_by_id(value[2])
+        labels = value[9]
+        if labels is not None:
+            from okto_grafx.domain.model.node_labels import validate_node_labels
+            try:
+                validate_node_labels(labels)
+                if table.kind != "node" or not table.admits_node_labels(labels):
+                    raise GrafxConfigurationError("Temporary labels exceed their physical owner.")
+            except GrafxConfigurationError as failure:
+                raise GrafxCorruptionDetected("Temporary node labels are malformed.",
+                                              field="query_spill.row.binding.labels") from failure
         record_id = _spill_private_int(value[4], field="query_spill.row.binding")
+        version_lsn = _spill_private_int(value[7], field="query_spill.row.binding.version")
+        if not 0 <= version_lsn <= self._context.snapshot.read_lsn:
+            raise GrafxCorruptionDetected("A spilled entity version is outside its snapshot.", field="query_spill.row.binding.version")
         restored_values = self._restore(value[5])
         if not isinstance(restored_values, tuple) or len(restored_values) > table.arity:
             raise GrafxCorruptionDetected(
@@ -10213,9 +11388,10 @@ class _SpillRowCodec:
         else:
             version = HeapVersion(
                 record_id=record_id,
-                xmin=0,
+                xmin=version_lsn,
                 xmax=0,
                 values=cast(tuple[Value, ...], restored_values),
+                node_labels=labels,
                 prev=None,
                 schema_version=table.schema_version,
                 deleted=False,
@@ -10251,6 +11427,7 @@ class _SpillRowCodec:
             ref=ref,
             version=version,
             polymorphic=value[6],
+            pending_observation=value[8],
         )
 
     def _named_values(
@@ -10564,6 +11741,9 @@ def _aggregate_rows(
         return
     groups: dict[object, tuple[list[object], dict[Expression, _Accumulator]]] = {}
     order: list[object] = []
+    # Multiple result positions may reference one identical aggregate expression.
+    # Its shared accumulator must fold each input exactly once, not once per use.
+    aggregations = tuple({item.call: item for item in node.aggregations}.values())
     for row in engine._rows(node.child, context):
         keys = [_evaluate(item.expression, row, context) for item in node.grouping]
         signature = tuple(_freeze(key) for key in keys)
@@ -10572,7 +11752,7 @@ def _aggregate_rows(
             state = (list(keys), {})
             groups[signature] = state
             order.append(signature)
-        for aggregation in node.aggregations:
+        for aggregation in aggregations:
             accumulator = state[1].get(aggregation.call)
             if accumulator is None:
                 accumulator = _Accumulator(aggregation)
@@ -10583,14 +11763,14 @@ def _aggregate_rows(
         # this a "how many are there" query over an empty table would return no row at all.
         computed: dict[Expression, object] = {
             aggregation.call: _Accumulator(aggregation).result()
-            for aggregation in node.aggregations
+            for aggregation in aggregations
         }
         yield _Row(bindings={}, computed=computed)
         return
     for signature in order:
         keys, accumulators = groups[signature]
         computed = {item.expression: value for item, value in zip(node.grouping, keys)}
-        for aggregation in node.aggregations:
+        for aggregation in aggregations:
             accumulator = accumulators.get(aggregation.call)
             computed[aggregation.call] = (
                 accumulator.result() if accumulator is not None else None
@@ -10608,17 +11788,23 @@ class _Accumulator:
         "_values",
         "_count",
         "_total",
+        "_decimal_total",
+        "_numeric_families",
         "_extreme",
         "_extreme_key",
+        "_percentile",
     )
 
     def __init__(self, aggregation: Aggregation) -> None:
         self._aggregation = aggregation
         self._function = aggregation.function
         self._seen: set[object] | None = set() if aggregation.call.distinct else None
-        self._values: list[object] | None = [] if self._function == "COLLECT" else None
+        self._values: list[object] | None = [] if self._function == "COLLECT" or self._function in PERCENTILE_FUNCTIONS else None
+        self._percentile: float | None = None
         self._count = 0
-        self._total: float = 0.0
+        self._total: int | float = 0
+        self._decimal_total: DecimalTotal | None = None
+        self._numeric_families = 0
         self._extreme: object = None
         self._extreme_key: tuple[int, object] | None = None
 
@@ -10629,6 +11815,11 @@ class _Accumulator:
             self._count += 1
             return
         value = _evaluate(call.arguments[0], row, context)
+        if self._function in PERCENTILE_FUNCTIONS and value is not None:
+            percentile_sample(value)
+            fraction = _evaluate(call.arguments[1], row, context)
+            if self._percentile is None:
+                self._percentile = percentile_argument(fraction)
         self.add_value(value)
 
     def add_value(
@@ -10641,6 +11832,7 @@ class _Accumulator:
         """Fold one pre-evaluated value, optionally already externally deduplicated."""
         if value is None:
             return
+        self.observe_numeric_family(value)
         call = self._aggregation.call
         if apply_distinct and call.distinct:
             frozen = _freeze(value)
@@ -10651,7 +11843,7 @@ class _Accumulator:
             seen.add(frozen)
         self._count += 1
         name = self._function
-        if name == "COLLECT":
+        if name == "COLLECT" or name in PERCENTILE_FUNCTIONS:
             values = self._values
             assert values is not None
             values.append(value)
@@ -10663,28 +11855,71 @@ class _Accumulator:
             ):
                 self._extreme = value
                 self._extreme_key = key
-        elif (
-            name in ("SUM", "AVG")
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-        ):
-            self._total += float(value)
+        elif name in ("SUM", "AVG"):
+            if self._decimal_total is not None:
+                self._decimal_total.add(value)
+            else:
+                self._total += value
+
+    def observe_numeric_family(self, value: object) -> None:
+        """Validate all aggregate inputs before DISTINCT, identically in memory/spill."""
+        if self._function not in ("SUM", "AVG"):
+            return
+        if type(value) not in (int, float, DecimalValue):
+            raise GrafxPlanError("Numeric aggregates require numeric values or NULL.",
+                                 field="function", value=self._function)
+        self._numeric_families |= 1 if type(value) is DecimalValue else 2 if type(value) is float else 0
+        if self._numeric_families == 3:
+            raise GrafxPlanError("Decimal aggregates never implicitly promote DOUBLE.", field="function",
+                                 value=self._function, reason="decimal_operand_type", query_phase="execution")
+        if type(value) is DecimalValue and self._decimal_total is None:
+            # Observing a discarded DISTINCT decimal still fixes the result family.
+            # Otherwise INT/DECIMAL duplicate order would change SUM/AVG's type.
+            self._decimal_total = DecimalTotal(self._total)
+
+        if type(value) is DecimalValue:
+            assert self._decimal_total is not None
+            self._decimal_total.observe_scale(value.scale)
+
+    def decimal_state_bytes(self, value: object) -> int:
+        """Bound the next exact total before a spill workspace retains it."""
+        if self._function not in ("SUM", "AVG") or (self._decimal_total is None and type(value) is not DecimalValue):
+            return 0
+        total = self._decimal_total
+        scale = 0 if total is None else total.scale
+        coefficient = self._total if total is None else total.coefficient
+        incoming_scale = value.scale if type(value) is DecimalValue else 0
+        target = max(scale, incoming_scale)
+        incoming = value.coefficient if type(value) is DecimalValue else value
+        combined = coefficient * 10 ** (target - scale) + incoming * 10 ** (target - incoming_scale)
+        return 32 + (abs(combined).bit_length() + 7) // 8
 
     def result(self) -> object:
         """Return what this aggregate reports for its group."""
         name = self._function
+        if name in ("SUM", "AVG") and self._decimal_total is not None:
+            try:
+                return self._decimal_total.result(count=self._count if name == "AVG" else None)
+            except SchemaMismatchError as failure:
+                raise GrafxPlanError("Decimal aggregate result exceeds its exact envelope.", field="function",
+                                     value=name, reason=failure.details.get("reason"), query_phase="execution") from failure
         if name == "COUNT":
             return self._count
         if name == "COLLECT":
             values = self._values
             assert values is not None
             return tuple(values)
-        if not self._count:
-            return None
         if name == "SUM":
             return self._total
+        if not self._count:
+            return None
         if name == "AVG":
             return self._total / self._count
+        if name in PERCENTILE_FUNCTIONS:
+            assert self._values is not None and self._percentile is not None
+            ordered = sorted(self._values, key=_sort_key)
+            low, high, weight = percentile_positions(name, self._count, self._percentile)
+            return percentile_interpolate(name, ordered[low], ordered[high], weight)
         return self._extreme
 
 
@@ -10719,10 +11954,17 @@ def _aggregate_input_payload(
         if raw is None:
             entries.append(("null",))
             continue
+        if aggregation.function in PERCENTILE_FUNCTIONS:
+            percentile_sample(raw)
+            pair = (raw, _evaluate(call.arguments[1], row, context))
+            entries.append(("value", group_codec._detach(pair) if group_codec is not None else _spill_detach_value(pair),
+                            _spill_signature(raw, nan_identities) if call.distinct else b"",
+                            _spill_pack_internal(_sort_key(raw))))
+            continue
         entries.append(
             (
                 "value",
-                _spill_detach_value(raw),
+                group_codec._detach(raw) if group_codec is not None else _spill_detach_value(raw),
                 _spill_signature(raw, nan_identities) if call.distinct else b"",
                 _spill_pack_internal(_sort_key(raw)),
             )
@@ -10757,6 +11999,7 @@ def _decode_aggregate_input(
 
 def _decode_aggregate_entry(
     entry: Value,
+    codec: _SpillRowCodec | None = None,
 ) -> tuple[str, Value | None, bytes | None, tuple[int, object] | None]:
     if not isinstance(entry, tuple) or not entry or not isinstance(entry[0], str):
         raise GrafxCorruptionDetected(
@@ -10784,7 +12027,7 @@ def _decode_aggregate_entry(
             field="query_spill.key",
             value="aggregate_sort_key",
         )
-    return kind, _spill_restore_value(entry[1]), entry[2], (unpacked[0], unpacked[1])
+    return kind, (codec._restore(entry[1]) if codec is not None else _spill_restore_value(entry[1])), entry[2], (unpacked[0], unpacked[1])
 
 
 def _aggregate_distinct_payload(
@@ -10792,13 +12035,14 @@ def _aggregate_distinct_payload(
     ordinal: int,
     value: Value,
     sort_key: tuple[int, object],
+    codec: _SpillRowCodec | None = None,
 ) -> bytes:
     return _spill_encode(
         (
             "aggregate-distinct-value",
             index,
             ordinal,
-            _spill_detach_value(value),
+            codec._detach(value) if codec is not None else _spill_detach_value(value),
             _spill_pack_internal(sort_key),
         ),
         key=False,
@@ -10807,6 +12051,7 @@ def _aggregate_distinct_payload(
 
 def _decode_aggregate_distinct_payload(
     payload: bytes,
+    codec: _SpillRowCodec | None = None,
 ) -> tuple[int, int, Value, tuple[int, object]]:
     value = _spill_decode(payload, key=False)
     if (
@@ -10837,9 +12082,34 @@ def _decode_aggregate_distinct_payload(
     return (
         value[1],
         value[2],
-        _spill_restore_value(value[3]),
+        codec._restore(value[3]) if codec is not None else _spill_restore_value(value[3]),
         (unpacked[0], unpacked[1]),
     )
+
+
+@contextmanager
+def _iterator_cleanup(iterators):
+    """Close a dynamic iterator inventory while preserving the original failure.
+
+    The inventory is evaluated on exit so a DFS stack closes only still-live
+    streams. No interpreter-global exception state or platform service is read.
+    A first cleanup failure must not prevent remaining streams from closing.
+    """
+    primary = None
+    try:
+        yield
+    except BaseException as failure:
+        primary = failure
+        raise
+    finally:
+        cleanup_failure = None
+        for iterator in iterators():
+            try:
+                _close_iterator(iterator, primary if primary is not None else cleanup_failure)
+            except BaseException as failure:
+                cleanup_failure = failure
+        if primary is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 def _close_iterator(iterator: object, primary: BaseException | None = None) -> None:
@@ -10867,11 +12137,13 @@ class _SpilledAggregateState:
         keys: tuple[Value, ...],
         first_ordinal: int,
         workspace: QuerySpillWorkspace,
+        codec: _SpillRowCodec | None = None,
     ) -> None:
         self._node = node
         self.keys = keys
         self.first_ordinal = first_ordinal
         self._workspace = workspace
+        self._codec = codec
         self._accumulators = [_Accumulator(item) for item in node.aggregations]
         self._extra = [0 for _item in node.aggregations]
         self._base = (
@@ -10881,6 +12153,7 @@ class _SpilledAggregateState:
         )
         workspace.reserve(self._base, reason="aggregate_group_state")
         self._distinct: QuerySpillSorter | None = None
+        self._percentiles: dict[int, QuerySpillSorter] = {}
         self._closed = False
 
     def add(self, entries: tuple[Value, ...], ordinal: int) -> None:
@@ -10895,13 +12168,22 @@ class _SpilledAggregateState:
         for index, (aggregation, entry) in enumerate(
             zip(self._node.aggregations, entries)
         ):
-            kind, value, signature, sort_key = _decode_aggregate_entry(entry)
+            kind, value, signature, sort_key = _decode_aggregate_entry(entry, self._codec)
             if kind == "star":
                 self._accumulators[index]._count += 1
                 continue
             if kind == "null":
                 continue
             assert value is not None and signature is not None and sort_key is not None
+            self._accumulators[index].observe_numeric_family(value)
+            if aggregation.function in PERCENTILE_FUNCTIONS:
+                if not isinstance(value, tuple) or len(value) != 2:
+                    raise GrafxCorruptionDetected("A temporary percentile input is malformed.", field="query_spill.record", value="percentile")
+                value, fraction = value
+                percentile_sample(value)
+                accumulator = self._accumulators[index]
+                if accumulator._percentile is None:
+                    accumulator._percentile = percentile_argument(fraction)
             if aggregation.call.distinct:
                 if self._distinct is None:
                     self._distinct = self._workspace.sorter(
@@ -10909,7 +12191,7 @@ class _SpilledAggregateState:
                     )
                 self._distinct.append(
                     _spill_encode(("distinct", index, signature, ordinal), key=True),
-                    _aggregate_distinct_payload(index, ordinal, value, sort_key),
+                    _aggregate_distinct_payload(index, ordinal, value, sort_key, self._codec),
                 )
                 continue
             self._fold(index, value, sort_key)
@@ -10956,7 +12238,7 @@ class _SpilledAggregateState:
             try:
                 for _key, payload in ordered:
                     index, _ordinal, value, sort_key = (
-                        _decode_aggregate_distinct_payload(payload)
+                        _decode_aggregate_distinct_payload(payload, self._codec)
                     )
                     if not 0 <= index < len(self._accumulators):
                         raise GrafxCorruptionDetected(
@@ -10984,12 +12266,39 @@ class _SpilledAggregateState:
                 if failure is None and cleanup_failure is not None:
                     raise cleanup_failure
 
-        results = tuple(accumulator.result() for accumulator in self._accumulators)
+        percentile_results: dict[int, object] = {}
+        for index, sorter in self._percentiles.items():
+            accumulator = self._accumulators[index]
+            assert accumulator._percentile is not None
+            lower, upper, weight = percentile_positions(accumulator._function, accumulator._count, accumulator._percentile)
+            low = high = None
+            observed = 0
+            records = sorter.records()
+            failure = None
+            try:
+                for position, (_key, payload) in enumerate(records):
+                    observed += 1
+                    if position == lower:
+                        low = _spill_unpack_internal(_spill_decode(payload, key=False))
+                    if position == upper:
+                        high = _spill_unpack_internal(_spill_decode(payload, key=False))
+                if low is None or high is None or observed != accumulator._count:
+                    raise GrafxCorruptionDetected("A percentile run is shorter than its count.", field="query_spill.record", value="percentile_count")
+                percentile_sample(low)
+                percentile_sample(high)
+                percentile_results[index] = percentile_interpolate(accumulator._function, low, high, weight)
+            except BaseException as caught:
+                failure = caught
+                raise
+            finally:
+                _close_iterator(records, failure)
+        results = tuple(percentile_results[index] if index in percentile_results else accumulator.result()
+                        for index, accumulator in enumerate(self._accumulators))
         payload = _spill_encode(
             (
                 "aggregate-output",
                 _spill_detach_value(self.keys),
-                _spill_detach_value(results),
+                self._detach_value(results),
             ),
             key=False,
         )
@@ -11000,20 +12309,44 @@ class _SpilledAggregateState:
         """Release retained aggregate workspace allocations idempotently."""
         if self._closed:
             return
+        failure = None
+        for sorter in self._percentiles.values():
+            try:
+                _close_iterator(sorter)
+            except BaseException as caught:
+                if failure is None:
+                    failure = caught
+                else:
+                    failure.add_note(f"Another percentile sorter cleanup failed: {type(caught).__name__}")
         for amount in self._extra:
             if amount:
                 self._workspace.release(amount)
         self._workspace.release(self._base)
         self._closed = True
+        if failure is not None:
+            raise failure
+
+    def _detach_value(self, value: object) -> Value:
+        return self._codec._detach(value) if self._codec is not None else _spill_detach_value(value)
 
     def _fold(self, index: int, value: Value, sort_key: tuple[int, object]) -> None:
         accumulator = self._accumulators[index]
         name = accumulator._function
+        if name in PERCENTILE_FUNCTIONS:
+            sorter = self._percentiles.get(index)
+            if sorter is None:
+                sorter = self._workspace.sorter(_compare_sort_spill_keys)
+                self._percentiles[index] = sorter
+            rank, comparable = sort_key
+            sorter.append(_spill_encode(("sort", ((rank, _spill_pack_internal(comparable), False),), accumulator._count), key=True),
+                          _spill_encode(_spill_pack_internal(value), key=False))
+            accumulator._count += 1
+            return
         old_charge = self._extra[index]
         new_charge = old_charge
         if name == "COLLECT":
             new_charge += _AGGREGATE_VALUE_OVERHEAD + len(
-                _spill_encode(_spill_detach_value(value), key=False)
+                _spill_encode(self._detach_value(value), key=False)
             )
         elif name in ("MIN", "MAX"):
             extreme_key = accumulator._extreme_key
@@ -11022,9 +12355,12 @@ class _SpilledAggregateState:
             )
             if replaces:
                 new_charge = _AGGREGATE_VALUE_OVERHEAD + len(
-                    _spill_encode(_spill_detach_value(value), key=False)
+                    _spill_encode(self._detach_value(value), key=False)
                 )
         difference = new_charge - old_charge
+        if name in ("SUM", "AVG"):
+            new_charge = accumulator.decimal_state_bytes(value)
+            difference = new_charge - old_charge
         if difference > 0:
             self._workspace.reserve(difference, reason="aggregate_value_state")
         elif difference < 0:
@@ -11049,7 +12385,7 @@ def _decode_aggregate_output(payload: bytes, node: AggregateRows,
             value="aggregate_output",
         )
     keys = _spill_restore_value(value[1])
-    results = _spill_restore_value(value[2])
+    results = group_codec._restore(value[2]) if group_codec is not None else _spill_restore_value(value[2])
     if (
         not isinstance(keys, tuple)
         or len(keys) != len(node.grouping)
@@ -11080,7 +12416,7 @@ def _spilled_aggregate_rows(
     """Group through bounded external passes, retaining only one aggregate state in core."""
     workspace, _budget = engine._spill_workspace(node.label)
     nan_identities = _NaNIdentityRegistry(workspace)
-    group_codec = _SpillRowCodec(context, workspace) if node.preserve_group_bindings else None
+    group_codec = _SpillRowCodec(context, workspace)
     source = workspace.sorter(_compare_group_spill_keys)
     output = workspace.sorter(_compare_ordinal_spill_keys)
     current: _SpilledAggregateState | None = None
@@ -11124,7 +12460,7 @@ def _spilled_aggregate_rows(
                     output.append(
                         _spill_encode(current.first_ordinal, key=True), current.finish()
                     )
-                current = _SpilledAggregateState(node, keys, ordinal, workspace)
+                current = _SpilledAggregateState(node, keys, ordinal, workspace, group_codec)
                 current_signature = signature
             assert current is not None
             current.add(entries, ordinal)
@@ -11218,7 +12554,12 @@ def _eager_rows(
     engine: QueryEngine, node: EagerRows, context: _Context
 ) -> Iterator[_Row]:
     """Draw every row of the child before yielding the first, so nothing above can stop it."""
-    yield from tuple(engine._rows(node.child, context))
+    if node.publish_read_phase:
+        if id(node) not in context.phase_results:
+            raise GrafxPlanError("A write/read phase must be prepared before a downstream scan.", field="plan")
+        yield from context.phase_results[id(node)]
+    else:
+        yield from tuple(engine._rows(node.child, context))
 
 
 def _optional_rows(
@@ -11241,33 +12582,33 @@ def _optional_rows(
 def _union_rows(
     engine: QueryEngine, node: UnionRows, context: _Context
 ) -> Iterator[_Row]:
-    """Yield the left branch's rows and then the right branch's, under one set of names.
-
-    Position, not name, is what joins the two: the right branch may have written different
-    aliases, and its projection produced them in the order it wrote them. Each branch ends in a
-    projection of exactly this arity, so the values of a row arrive in column order and the
-    mapping is exact.
-
-    Widening happens HERE, before the distinct above can look at anything, because 1 and 1.0
-    are the same row of a widened column and two different rows of an unwidened one. Doing it
-    after the distinct would answer both.
-    """
-    coercions = context.union_coercions
+    """Stream branches with validated common columns and no lossy coercion."""
     for child in (node.left, node.right):
-        for row in engine._rows(child, context):
-            values = tuple((row.columns or {}).values())
-            columns = {
-                name: (
-                    float(value)
-                    if position < len(coercions)
-                    and coercions[position]
-                    and isinstance(value, int)
-                    and not isinstance(value, bool)
-                    else value
-                )
-                for position, (name, value) in enumerate(zip(node.columns, values))
-            }
-            yield _Row(bindings={}, computed=None, columns=columns)
+        boundaries = engine._read_phase_boundaries(child) if node.writes else ()
+        stream = None
+        failure: BaseException | None = None
+        try:
+            engine._prepare_read_phases(boundaries, context)
+            stream = engine._rows(child, context)
+            for row in stream:
+                if not node.columns:
+                    continue  # Unit branches execute fully without exporting rows.
+                values = tuple((row.columns or {}).values())
+                if len(values) != len(node.columns):
+                    raise GrafxPlanError("UNION row arity differs from its plan.", field="union")
+                yield _Row(bindings={}, columns=dict(zip(node.columns, values, strict=True)))
+            if node.writes:
+                context.publish_phase()
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            try:
+                if stream is not None:
+                    _close_iterator(stream, failure)
+            finally:
+                for boundary in boundaries:
+                    context.phase_results.pop(id(boundary), None)
 
 
 def _distinct_rows(
@@ -11406,8 +12747,8 @@ def _sort_rows(
     yield from rows
 
 
-def _sort_row_payload(row: _Row) -> bytes:
-    """Encode one projected row after detaching every page-backed capability."""
+def _sort_row_payload(row: _Row, codec: _SpillRowCodec) -> bytes:
+    """Encode projected values and only the native bindings this projection retained."""
     if row.columns is None:
         raise GrafxPlanError(
             "A spillable SortRows must consume projected columns.",
@@ -11415,19 +12756,21 @@ def _sort_row_payload(row: _Row) -> bytes:
             value="unprojected_row",
         )
     columns: tuple[Value, ...] = tuple(
-        (name, _spill_detach_value(value)) for name, value in row.columns.items()
+        (name, codec._detach(value)) for name, value in row.columns.items()
     )
-    return _spill_encode(("sorted-row", columns), key=False)
+    binding_names = tuple(name for name in row.columns if name in row.bindings)
+    return _spill_encode(("sorted-row", columns, binding_names), key=False)
 
 
-def _decode_sort_row(payload: bytes) -> _Row:
-    """Rebuild a capability-free projected row from one complete spill payload."""
+def _decode_sort_row(payload: bytes, codec: _SpillRowCodec) -> _Row:
+    """Restore retained bindings through the transaction-qualified private value codec."""
     value = _spill_decode(payload, key=False)
     if (
         not isinstance(value, tuple)
-        or len(value) != 2
+        or len(value) != 3
         or value[0] != "sorted-row"
         or not isinstance(value[1], tuple)
+        or not isinstance(value[2], tuple)
     ):
         raise GrafxCorruptionDetected(
             "A temporary sorted row is malformed.",
@@ -11448,8 +12791,19 @@ def _decode_sort_row(payload: bytes) -> _Row:
                 field="query_spill.record",
                 value=position,
             )
-        columns[pair[0]] = _spill_restore_value(pair[1])
-    return _Row(bindings={}, columns=columns)
+        columns[pair[0]] = codec._restore(pair[1])
+    bindings: dict[str, object] = {}
+    for name in value[2]:
+        if type(name) is not str or name not in columns or name in bindings:
+            raise GrafxCorruptionDetected("A temporary sorted row carries invalid binding names.",
+                                          field="query_spill.record", value="sorted_bindings")
+        bindings[name] = columns[name]
+    if bindings:
+        context = codec._context
+        bindings = {name: _current_entity_value(context.engine, context, item)
+                    for name, item in bindings.items()}
+        columns.update(bindings)
+    return _Row(bindings=bindings, columns=columns)
 
 
 def _spilled_sort_rows(
@@ -11458,6 +12812,7 @@ def _spilled_sort_rows(
     """Order projected rows through a bounded adapter-owned external merge."""
     workspace, _budget = engine._spill_workspace(node.label)
     sorter = workspace.sorter(_compare_sort_spill_keys)
+    row_codec = _SpillRowCodec(context, workspace)
     records: Iterator[tuple[bytes, bytes]] | None = None
     failure: BaseException | None = None
     try:
@@ -11481,11 +12836,11 @@ def _spilled_sort_rows(
             )
             sorter.append(
                 _spill_encode(("sort", components, ordinal), key=True),
-                _sort_row_payload(row),
+                _sort_row_payload(row, row_codec),
             )
         records = sorter.records()
         for _key, payload in records:
-            yield _decode_sort_row(payload)
+            yield _decode_sort_row(payload, row_codec)
     except BaseException as caught:
         failure = caught
         raise
@@ -11501,16 +12856,17 @@ def _spilled_sort_rows(
                     "A query spill iterator also failed to close with "
                     f"{type(close_failure).__name__}: {close_failure}"
                 )
-        try:
-            workspace.close()
-        except BaseException as close_failure:
-            if cleanup_failure is None:
-                cleanup_failure = close_failure
-            else:
-                cleanup_failure.add_note(
-                    "Query spill workspace cleanup also failed with "
-                    f"{type(close_failure).__name__}: {close_failure}"
-                )
+        for resource in (row_codec, workspace):
+            try:
+                resource.close()
+            except BaseException as close_failure:
+                if cleanup_failure is None:
+                    cleanup_failure = close_failure
+                else:
+                    cleanup_failure.add_note(
+                        "Query spill workspace cleanup also failed with "
+                        f"{type(close_failure).__name__}: {close_failure}"
+                    )
         if failure is None and cleanup_failure is not None:
             raise cleanup_failure
 
@@ -11865,6 +13221,19 @@ def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:
         # is not an optimisation: after DISTINCT or a group the row no longer carries what the
         # expression was computed from, so re-evaluating it would refuse.
         return columns[expression.name]
+    if columns is not None:
+        shadowed = {name for name in free_variables(expression)
+                    if name in columns and name in row.bindings and columns[name] is not row.bindings[name]}
+        if shadowed:
+            # Compound sort expressions obey the same alias precedence as a bare
+            # sort variable. Drop cached input expressions that depended on a
+            # shadowed name, retaining aggregate results computed for the group.
+            computed = None if row.computed is None else {
+                item: value for item, value in row.computed.items()
+                if is_aggregate(item) or not shadowed.intersection(free_variables(item))
+            }
+            row = _Row(bindings={**row.bindings, **{name: columns[name] for name in shadowed}},
+                       columns=columns, computed=computed)
     return _evaluate(expression, row, context)
 
 
@@ -11874,7 +13243,7 @@ def _skip_rows(
     """Drop the first rows the query asked to skip."""
     rows = engine._rows(node.child, context)
     dropped = 0
-    wanted = _window(node.count, context, "SKIP")
+    wanted = _window(node.count, context, "SKIP", node.argument_slot)
     for row in rows:
         if dropped < wanted:
             dropped += 1
@@ -11886,29 +13255,49 @@ def _limit_rows(
     engine: QueryEngine, node: LimitRows, context: _Context
 ) -> Iterator[_Row]:
     """Produce at most the number of rows the query asked for."""
-    wanted = _window(node.count, context, "LIMIT")
-    produced = 0
-    for row in engine._rows(node.child, context):
-        if produced >= wanted:
-            return
-        produced += 1
-        yield row
+    wanted = _window(node.count, context, "LIMIT", node.argument_slot)
+    incoming = engine._rows(node.child, context)
+    failure: BaseException | None = None
+    try:
+        # Final RETURN LIMIT 0 cannot suppress preceding writes. The planner's
+        # eager barrier normally runs on the first pull; preserve it explicitly
+        # when no output row is wanted. Read-only LIMIT 0 does not pull at all.
+        if wanted == 0 and _plan_writes(node.child):
+            for _row in incoming:
+                pass
+        for _index in range(wanted):
+            try:
+                row = next(incoming)
+            except StopIteration:
+                return
+            yield row
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(incoming, failure)
 
 
-def _window(expression: Expression, context: _Context, keyword: str) -> int:
+def _window(expression: Expression, context: _Context, keyword: str, argument_slot: int | None = None) -> int:
     """Return a row window as a count, refusing anything that is not a whole number of rows."""
-    value = _evaluate(expression, _Row(bindings={}), context)
+    bindings = {} if argument_slot is None else {
+        name: _current_entity_value(context.engine, context, value)
+        for name, value in context.arguments[argument_slot].bindings.items()
+    }
+    value = _evaluate(expression, _Row(bindings=bindings), context)
     if isinstance(value, bool) or not isinstance(value, int):
         raise GrafxPlanError(
             f"{keyword} takes a whole number of rows; got {type(value).__name__}.",
             field=keyword.lower(),
             value=type(value).__name__,
+            reason="window_argument_type", query_phase="execution",
         )
     if value < 0:
         raise GrafxPlanError(
             f"{keyword} takes a count of rows that is zero or more; got {value}.",
             field=keyword.lower(),
             value=value,
+            reason="negative_window", query_phase="execution",
         )
     return value
 
@@ -11916,22 +13305,286 @@ def _window(expression: Expression, context: _Context, keyword: str) -> int:
 def _write_rows(
     engine: QueryEngine, node: PlanNode, context: _Context
 ) -> Iterator[_Row]:
-    """Build every row a write operator would store, then refuse for the seam that is missing.
+    """Validate and stage each input under the enclosing logical-statement boundary."""
+    source = engine._rows(node.child, context)
+    failure = None
+    try:
+        for row in source:
+            if isinstance(node, MergePattern) and node.match_plan is not None:
+                yield from _merge_whole_pattern_rows(engine, node, row, context)
+            elif isinstance(node, MergePattern) and node.node_match_tables is not None:
+                yield from _merge_node_rows(engine, node, row, context)
+            elif (isinstance(node, MergePattern) and len(node.relationships) == 1
+                  and all(written.table is None for written in node.nodes)):
+                yield from _merge_relationship_rows(engine, node, row, context)
+            else:
+                yield _write_one(engine, node, row, context)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(source, failure)
 
-    The ORDER is the whole point and it is the shape the finished write path will keep. Every
-    refusal a write can produce -- a property the table does not declare, a null in a column that
-    forbids one, a value of the wrong type, a vector of the wrong dimension or one that names a
-    retired space -- happens HERE, against rows that exist only in memory, before anything is
-    handed to a transaction. Nothing becomes reachable in the heap, in an index or in a counter
-    until every step that can still refuse has succeeded, which is the constraint C1 and C4 were
-    each rejected for missing.
 
-    When the two seams this refusal names arrive, the ``raise`` at the end is replaced by the
-    staging call and NOTHING ELSE MOVES: the materialised rows are already validated, so the
-    handover cannot be the step that discovers a problem.
+def _merge_whole_pattern_rows(
+    engine: QueryEngine, node: MergePattern, row: _Row, context: _Context,
+) -> Iterator[_Row]:
+    """Freeze complete matches before actions; an empty match creates all unbound entities."""
+    context.publish_phase()
+    bindings = {name: context.resolve_binding(value) for name, value in row.bindings.items()}
+    row = _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+    for name, expression in node.match_values:
+        value = _evaluate(expression, row, context)
+        if value is None:
+            raise GrafxPlanError("MERGE cannot match or create a null property value.", field="properties",
+                                 reason="merge_null_property", query_phase="execution")
+        bindings[name] = value
+    slot = node.match_slot
+    if slot is None or slot in context.arguments:
+        raise GrafxPlanError("MERGE requires an unused correlated argument slot.", field="plan")
+    context.arguments[slot] = row
+    matches: list[_Row] = []
+    limit = engine._query_memory_budget_bytes
+    budget = None if limit is None else LogicalMemoryBudget(limit, operator="merge_matches")
+    stream = engine._rows(node.match_plan, context)
+    failure = None
+    try:
+        for matched in stream:
+            if budget is not None:
+                budget.reserve(128)
+                for value in (matched.bindings, matched.columns, matched.computed):
+                    _charge_comprehension_value(value, budget)
+            matches.append(matched)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        try:
+            _close_iterator(stream, failure)
+        finally:
+            context.arguments.pop(slot, None)
+    if matches:
+        for matched in matches:
+            matched = _Row(bindings={name: _current_entity_value(engine, context, value)
+                                    for name, value in matched.bindings.items()},
+                           computed=matched.computed, columns=matched.columns)
+            context.count("rows_matched", sum(written.table is not None for written in node.nodes))
+            context.count("relationships_matched", len(node.relationships))
+            yield _apply_merge_actions(engine, node, matched, context, created=False)
+        return
+    # CREATE, not per-element MERGE: partial matches do not authorize reuse.
+    inserted = _write_pattern(engine, CreateRelationships(child=node.child, nodes=node.nodes,
+        relationships=node.relationships, path_variable=node.path_variable), row, context)
+    yield _apply_merge_actions(engine, node, inserted, context, created=True)
+
+
+def _merge_node_rows(
+    engine: QueryEngine, node: MergePattern, row: _Row, context: _Context,
+) -> Iterator[_Row]:
+    """Emit every node match; the empty branch uses its typed or native unlabeled target.
+
+    Each input fixes its property expressions and owner-visible candidates before
+    yielding. Later pipeline writes cannot change that invocation's match set.
+    The existing statement boundary owns staging, failure and result conversion.
     """
-    for row in engine._rows(node.child, context):
-        yield _write_one(engine, node, row, context)
+    written = node.nodes[0]
+    variable = str(written.variable)
+    if context.atomic_staging and context.staged_rows:
+        # Give every prior held insertion a stable owner-private reference before
+        # freezing this invocation. This is not an inner commit.
+        context.publish_phase()
+    if context.published_refs:
+        row = _Row(bindings={name: context.resolve_binding(value) for name, value in row.bindings.items()},
+                   computed=row.computed, columns=row.columns)
+    expected = tuple((entry.key, _evaluate(entry.value, row, context))
+                     for entry in written.properties.entries) if written.properties else ()
+    if any(value is None for _key, value in expected):
+        raise GrafxPlanError("MERGE cannot match or create a null property value.", field="properties",
+                             reason="merge_null_property", query_phase="execution")
+    requested = written.labels or (() if written.table is None or written.table.unlabeled else (written.table.name,))
+    wanted = set(requested)
+    match_tables = tuple(table for table in context.schema().tables()
+                         if table.kind == "node" and wanted <= set(table.node_label_candidates))
+    matches_found: list[RowBinding] = []
+    limit = engine._query_memory_budget_bytes
+    budget = None if limit is None else LogicalMemoryBudget(limit, operator="merge_matches")
+
+    def retain(binding: RowBinding) -> None:
+        """Retain a budgeted MERGE match with its pre-action label membership."""
+        labels = _current_node_labels(context, binding)
+        if not wanted <= set(labels):
+            return
+        # Freeze membership before conditional actions can alter other candidates.
+        token = context.pending_token(binding.version)
+        binding = replace(binding, version=replace(binding.version, node_labels=labels))
+        if token is not None:
+            context.register_pending_token(binding.version, token)
+        if budget is not None:
+            _charge_comprehension_value(binding, budget)
+        matches_found.append(binding)
+
+    views = tuple((table, *_transaction_row_view(context, table)) for table in match_tables)
+    for table, changed, inserted in views:
+        positions = tuple(table.column_positions.get(key) for key, _value in expected)
+        if not table.flexible_properties and any(position is None for position in positions):
+            continue
+        def matches(values: tuple[Value, ...]) -> bool:
+            """Match MERGE properties against either a flexible property bag or typed columns."""
+            if table.flexible_properties:
+                bag = _flexible_properties(table, values)
+                return all(_equal(bag.get(key), value) for key, value in expected)
+            return all(_equal(values[position], value) for position, (_key, value) in zip(positions, expected))
+
+        candidates = engine.heap.scan(table, context.snapshot)
+        failure = None
+        try:
+            for ref, version in candidates:
+                context.count("rows_scanned")
+                if ref in changed:
+                    latest = changed[ref]
+                    if latest is None:
+                        continue
+                    version = replace(version, values=latest)
+                if not matches(version.values):
+                    continue
+                binding = RowBinding(variable=variable, table=table, ref=ref, version=version,
+                                     polymorphic=len(match_tables) != 1 or written.table is None or written.table.unlabeled)
+                retain(binding)
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            _close_iterator(candidates, failure)
+        for reference, values in inserted:
+            context.count("rows_scanned")
+            if matches(values):
+                binding = _matched_pending_binding(context, variable, table, values, reference)
+                if len(match_tables) != 1 or written.table is None or written.table.unlabeled:
+                    binding = replace(binding, polymorphic=True)
+                retain(binding)
+    if matches_found:
+        for binding in matches_found:
+            context.count("rows_matched")
+            matched = _Row(bindings={**row.bindings, variable: binding}, computed=row.computed, columns=row.columns)
+            yield _apply_merge_actions(engine, node, matched, context, created=False)
+        return
+    if written.table is None:
+        raise GrafxPlanError("MERGE found no node; creation requires an explicit table label.", field="labels")
+    # Reuse the evaluated expressions even for nondeterministic/correlated input.
+    properties = MapExpression(entries=tuple(MapEntry(key=key, value=Literal(value=value)) for key, value in expected))
+    created = replace(written, properties=properties)
+    inserted = _write_one(engine, CreateRelationships(child=node.child, nodes=(created,)), row, context)
+    yield _apply_merge_actions(engine, node, inserted, context, created=True)
+
+
+def _capture_written_path(node: CreateRelationships | MergePattern, row: _Row, context: _Context) -> _Row:
+    """Capture path order from the written pattern, retaining actual edge direction/identity."""
+    if node.path_variable is None:
+        return row
+    nodes = tuple(context.resolve_binding(row.bindings[item.variable]) for item in node.nodes)
+    relationships = tuple(context.resolve_binding(row.bindings[item.variable]) for item in node.relationships)
+    path = _PathValue(nodes, relationships)
+    return _Row(bindings={**row.bindings,node.path_variable:path},computed=row.computed,columns=row.columns)
+
+
+def _apply_merge_actions(engine: QueryEngine, node: MergePattern, row: _Row,
+                         context: _Context, *, created: bool) -> _Row:
+    """Run only the selected outcome's SET clauses under the outer statement mark."""
+    row = _capture_written_path(node, row, context)
+    for assignments in node.on_create if created else node.on_match:
+        row = _write_assignments(engine, SetProperties(child=node.child, assignments=assignments), row, context)
+    return row
+
+
+def _merge_relationship_rows(engine: QueryEngine, node: MergePattern, row: _Row,
+                             context: _Context) -> Iterator[_Row]:
+    """Emit every matching edge between the bound endpoints; create only if empty."""
+    edge = node.relationships[0]
+    expected = tuple((entry.key, _evaluate(entry.value, row, context))
+                     for entry in edge.properties.entries) if edge.properties else ()
+    if any(value is None for _key, value in expected):
+        raise GrafxPlanError("MERGE cannot match or create a null property value.", field="properties",
+                             reason="merge_null_property", query_phase="execution")
+    edge = replace(edge, properties=MapExpression(entries=tuple(MapEntry(key,Literal(value)) for key,value in expected)))
+    bindings = dict(row.bindings)
+    if any(isinstance(bindings.get(name), RowBinding) and bindings[name].ref is None
+           for name in (edge.source, edge.target)):
+        context.publish_phase()
+    if context.published_refs:
+        bindings = {name: context.resolve_binding(value) for name, value in bindings.items()}
+    row = _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+    if edge.direction is Direction.UNDIRECTED:
+        matches = _undirected_merge_matches(engine, edge, bindings, row, context)
+    else:
+        table, values, proof = _materialise_edge(engine, edge, bindings, row, context)
+        matches = _matching_edges(engine, edge, (table, values), context)
+    found, failure = False, None
+    try:
+        for binding in matches:
+            found = True
+            context.count("relationships_matched")
+            matched = dict(bindings)
+            if edge.variable is not None:
+                matched[edge.variable] = binding
+            yield _apply_merge_actions(engine, node,
+                _Row(bindings=matched, computed=row.computed, columns=row.columns), context, created=False)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(matches, failure)
+    if found:
+        return
+    if edge.direction is Direction.UNDIRECTED:
+        # Only an empty match set may install a flexible endpoint-pair member.
+        # The written left-to-right pair is the sole creation orientation.
+        table, values, proof = _materialise_edge(engine, replace(edge,direction=Direction.OUTGOING), bindings, row, context)
+    pending = _pending_binding(edge.variable or "\x00created_edge", table, values)
+    context.hold(table, values, _partition_key(table, values), None,
+                 token=context.token_for(pending), encoding_proof=proof)
+    context.count("relationships_created")
+    if edge.variable is not None:
+        bindings[edge.variable] = pending
+    yield _apply_merge_actions(engine, node,
+        _Row(bindings=bindings, computed=row.computed, columns=row.columns), context, created=True)
+
+
+def _undirected_merge_matches(engine: QueryEngine, edge: CreatedRelationship,
+                               bindings: dict[str, object], row: _Row,
+                               context: _Context) -> Iterator[RowBinding]:
+    """Search both existing endpoint orientations without creating schema on a read branch."""
+    source, target = bindings.get(edge.source), bindings.get(edge.target)
+    if (type(source) is not RowBinding or type(target) is not RowBinding
+            or source.table.kind != "node" or target.table.kind != "node"):
+        raise GrafxPlanError("MERGE requires two native node endpoints.", field="endpoint")
+    context.require_entity_content(source)
+    context.require_entity_content(target)
+    tables = (context.schema().relationship_tables(edge.logical_type) if edge.logical_type is not None
+              else (edge.table,) if edge.table is not None else edge.candidate_tables)
+    candidates, views = [], {}
+    same_endpoint = _binding_identity(source) == _binding_identity(target)
+    orientations = ((edge.source,edge.target),) if same_endpoint else ((edge.source,edge.target),(edge.target,edge.source))
+    for left,right in orientations:
+        for table in tables:
+            if (table.from_table,table.to_table) != (bindings[left].table.name,bindings[right].table.name):
+                continue
+            oriented = replace(edge,table=table,candidate_tables=(),logical_type=None,
+                               source=left,target=right,direction=Direction.OUTGOING)
+            actual,values,_proof = _materialise_edge(engine,oriented,bindings,row,context)
+            if actual.table_id not in views:
+                views[actual.table_id] = _transaction_row_view(context,actual)
+            candidates.append((oriented,(actual,values),views[actual.table_id]))
+    # Freeze every owner view before the first conditional action can mutate it.
+    for oriented,materialised,view in candidates:
+        matches = _matching_edges(engine,oriented,materialised,context,row_view=view)
+        failure = None
+        try:
+            yield from matches
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            _close_iterator(matches,failure)
 
 
 def _write_one(
@@ -11939,15 +13592,21 @@ def _write_one(
 ) -> _Row:
     """Materialise everything one write operator stores for one row, then stage it.
 
-    Two phases, in this order and never interleaved. Everything that can still refuse -- a
-    property the table does not declare, a null in a column that forbids one, a value of the
-    wrong type, a vector of the wrong dimension, an edge naming a row this snapshot cannot see --
-    happens against values held in memory. Only when the whole set is built does anything reach
-    the transaction. So a statement that refuses has staged nothing at all, rather than half of
-    itself.
+    Validation precedes private staging. Early endpoint/read phases never commit;
+    the enclosing statement mark discards every phase if later validation fails.
     """
+    if context.published_refs:
+        row = _Row(bindings={name: context.resolve_binding(value) for name, value in row.bindings.items()},
+                   computed=row.computed, columns=row.columns)
     if isinstance(node, (CreateRelationships, MergePattern)):
         return _write_pattern(engine, node, row, context)
+    if type(node) is CreateSequence:
+        for pattern in node.patterns:
+            context.count("create_patterns_executed")
+            row = _write_one(engine, CreateRelationships(
+                child=node.child, nodes=pattern.nodes, relationships=pattern.relationships,
+                path_variable=pattern.path_variable), row, context)
+        return row
     if isinstance(node, SetProperties):
         return _write_assignments(engine, node, row, context)
     if isinstance(node, DeleteEntities):
@@ -11969,17 +13628,88 @@ def _write_assignments(
     and two assignments to the same row must both land -- writing one version per assignment
     would make the last one win and silently drop the others.
 
-    The row that leaves here still carries the binding it arrived with, so a RETURN above a SET
-    projects the values the statement matched. That is openCypher's rule: the projection reads
-    the row as the statement saw it, and the new version becomes visible at the commit number.
+    The outgoing row carries the updated values for subsequent clauses and RETURN. Other
+    participants still see their own snapshot until this transaction durably commits.
     """
     # Keyed by the stored ROW, not by the variable: `MATCH (n {id:1}), (m {id:1}) SET n.a = 1,
     # m.b = 2` names one row twice, and one version per variable made the last one win (C10
     # round-2 B4). The base is this transaction's latest staged version of the row, else the
     # snapshot's, so a second SET clause -- or a second statement -- builds on the first.
     updated: dict[object, tuple[RowBinding, list[Value]]] = {}
+    property_counts: dict[object, int] = {}
+    label_updates: dict[object, tuple[str, ...]] = {}
     for assignment in node.assignments:
-        binding, position, value = _prepare_assignment(engine, assignment, row, context)
+        if isinstance(assignment, LabelAssignment):
+            from okto_grafx.domain.model.node_labels import normalize_node_labels
+            binding = _evaluate(assignment.target, row, context)
+            if binding is None:
+                continue
+            if not isinstance(binding, RowBinding) or binding.table.kind != "node":
+                raise GrafxPlanError("Labels can only be changed on nodes or NULL.", field="target",
+                                     reason="label_assignment_type", query_phase="execution")
+            binding = context.resolve_binding(binding)
+            context.require_entity_content(binding)
+            if binding.ref is None and binding.record_id > 0:
+                binding = _unwound_entity(engine, context, binding)
+            key = binding.ref if binding.ref is not None else ("pending", id(binding.version))
+            before = label_updates.get(key)
+            if before is None:
+                before = _current_node_labels(context, binding)
+            requested = normalize_node_labels(assignment.labels)
+            after = normalize_node_labels(tuple(set(before).difference(requested) if assignment.remove
+                                                else set(before).union(requested)))
+            if before == after:
+                continue
+            actual = _admit_query_node_labels(engine, context, binding.table.table_id, after)
+            label_updates[key] = after
+            overlay_key = binding.ref if binding.ref is not None else ("held", context.pending_token(binding.version))
+            context.node_label_overlays[binding.table.table_id][overlay_key] = after
+            if key not in updated:
+                updated[key] = (replace(binding, table=actual), list(_current_values(context, binding)))
+            else:
+                updated[key] = (replace(updated[key][0], table=actual), updated[key][1])
+            context.count("labels_removed" if assignment.remove else "labels_added", len(set(before) ^ set(after)))
+            continue
+        if isinstance(assignment.target, Variable):
+            prepared_map = _prepare_map_assignment(engine, assignment, row, context)
+            if prepared_map is None:
+                continue
+            binding, properties = prepared_map
+            if assignment.merge and not properties:
+                continue
+            row_key = binding.ref if binding.ref is not None else ("pending", id(binding.version))
+            held = updated.get(row_key)
+            if held is None:
+                held = (binding, list(_current_values(context, binding)))
+                updated[row_key] = held
+            table = binding.table
+            if table.flexible_properties:
+                before = _flexible_properties(table, tuple(held[1]))
+                bag = dict(before) if assignment.merge else {}
+                for key, value in properties.items():
+                    if value is None:
+                        bag.pop(key, None)
+                    else:
+                        bag[key] = value
+                _check_stored_value(engine, table, table.columns[-1], bag, context)
+                count = len(set(properties) | (set(before) if not assignment.merge else set()))
+                held[1][-1] = bag
+            else:
+                first = ENDPOINT_COLUMN_COUNT if table.kind == "rel" else 0
+                changes = dict(properties)
+                if not assignment.merge:
+                    changes = {column.name: None for column in table.columns[first:]} | changes
+                for key, value in changes.items():
+                    column = _column_named(table, key)
+                    value = _check_stored_value(engine, table, column, value, context)
+                    held[1][table.column_index(key)] = value
+                count = len(changes)
+            property_counts[row_key] = property_counts.get(row_key, 0) + count
+            continue
+        prepared = _prepare_assignment(engine, assignment, row, context)
+        if prepared is None:
+            continue
+        binding, position, value = prepared
         row_key = (
             binding.ref if binding.ref is not None else ("pending", id(binding.version))
         )
@@ -11987,16 +13717,25 @@ def _write_assignments(
         if held is None:
             held = (binding, list(_current_values(context, binding)))
             updated[row_key] = held
-        held[1][position] = value
-    for binding, values in updated.values():
+        if binding.table.flexible_properties:
+            bag = dict(held[1][position])
+            if value is None:
+                bag.pop(assignment.target.key, None)
+            else:
+                bag[assignment.target.key] = value
+            held[1][position] = bag
+        else:
+            held[1][position] = value
+        property_counts[row_key] = property_counts.get(row_key, 0) + 1
+    for key, (binding, values) in updated.items():
         settled = tuple(values)
         if binding.ref is None:
             # A row THIS statement created (MERGE ... SET, CREATE ... SET): there is no stored
             # version to replace, so the held insert itself is rewritten. Checking the new key
             # against the statement's own held copy of the row would refuse the row for being
             # itself, which is what happened (C10 round-2 B5, the MERGE-then-SET shape).
-            _rewrite_held_insert(engine, context, binding, settled)
-            context.count("properties_set", len(node.assignments))
+            _rewrite_held_insert(engine, context, binding, settled, node_labels=label_updates.get(key))
+            context.count("properties_set", property_counts.get(key, 0))
             context.count("rows_updated")
             continue
         _require_unique_primary_key(
@@ -12012,10 +13751,34 @@ def _write_assignments(
             settled,
             _partition_key(binding.table, settled),
             previous_keys=previous_keys,
+            node_labels=label_updates.get(key),
         )
-        context.count("properties_set", len(node.assignments))
+        context.count("properties_set", property_counts.get(key, 0))
         context.count("rows_updated")
-    return row
+    def refreshed(current: object) -> object:
+        """Refresh entity and path bindings after prior assignments in the same statement."""
+        if type(current) is _PathValue:
+            return _PathValue(
+                tuple(refreshed(item) for item in current.nodes),
+                tuple(refreshed(item) for item in current.relationships),
+            )
+        current = context.resolve_binding(current)
+        if not isinstance(current, RowBinding):
+            return current
+        if current.ref is None and current.record_id > 0:
+            current = _unwound_entity(engine, context, current)
+        key = current.ref if current.ref is not None else ("pending", id(current.version))
+        changed = updated.get(key)
+        if changed is None:
+            return current
+        version = replace(current.version, values=tuple(changed[1]),
+                          node_labels=label_updates.get(key, current.version.node_labels))
+        token = context.pending_token(current.version)
+        if token is not None:
+            context.register_pending_token(version, token)
+        return replace(current, version=version)
+    bindings = {name: refreshed(current) for name, current in row.bindings.items()}
+    return _Row(bindings=bindings, computed=row.computed, columns=row.columns)
 
 
 def _rewrite_held_insert(
@@ -12023,6 +13786,8 @@ def _rewrite_held_insert(
     context: _Context,
     binding: RowBinding,
     settled: tuple[Value, ...],
+    *,
+    node_labels: tuple[str, ...] | None = None,
 ) -> None:
     """Replace the values of a row this statement holds as an insert, keeping it an insert.
 
@@ -12044,12 +13809,13 @@ def _rewrite_held_insert(
             position,
             _HeldRow(
                 _HELD_INSERT,
-                held.table,
+                binding.table,
                 settled,
                 held.identity,
                 None,
                 held.token,
                 None,
+                held.node_labels if node_labels is None else node_labels,
             ),
         )
         new_key = _partition_key(binding.table, settled)
@@ -12072,7 +13838,7 @@ def _held_insert_position(context: _Context, binding: RowBinding) -> int | None:
     them. A pending binding whose row was created by an EARLIER statement has no token here --
     that row is already on the transaction -- and the answer is None.
     """
-    token = context.pending_tokens.get(id(binding.version))
+    token = context.pending_token(binding.version)
     if token is None:
         return None
     for position, held in enumerate(context.staged_rows):
@@ -12136,6 +13902,7 @@ def _incident_edges(
                 )
 
     for candidate, leaves, lands in candidates:
+        engine._declare_complete_table_read(context.txn, candidate)
         # The edges earlier statements created come first, and ending one CANCELS it: the
         # transaction's own reducer folds an insert followed by a delete into no row at all, so
         # the node and everything hanging from it leave together with nothing to publish.
@@ -12158,6 +13925,7 @@ def _incident_edges(
         for ref, endpoints in engine.heap.scan_relationship_endpoints(
             candidate, snapshot
         ):
+            context.count("delete_edge_checks")
             incident = (leaves and endpoints[0] == endpoint_identity) or (
                 lands and endpoints[1] == endpoint_identity
             )
@@ -12166,8 +13934,61 @@ def _incident_edges(
             yield candidate, ref, endpoints
 
 
+def _delete_bindings(node: DeleteEntities, row: _Row, context: _Context) -> tuple[RowBinding, ...]:
+    """Resolve expressions without creating entity authority from scalar/container data."""
+    bindings = []
+    for target in node.targets:
+        value = _evaluate(target, row, context)
+        if value is None:
+            continue
+        if type(value) is RowBinding:
+            bindings.append(value)
+        elif type(value) is _PathValue:
+            bindings.extend((*value.relationships, *value.nodes))
+        else:
+            raise GrafxPlanError("DELETE requires a native node, relationship, path or NULL.",
+                                 field="target", reason="delete_argument_type", query_phase="execution")
+    return tuple(_unwound_entity(context.engine, context, binding)
+                 if binding.ref is None and binding.record_id > 0 else binding for binding in bindings)
+
+
+def _delete_rows(engine: QueryEngine, node: DeleteEntities, context: _Context) -> Iterator[_Row]:
+    """Freeze input predicates/targets before deletes invalidate their live properties."""
+    child = node.child
+    if (type(child) in (NodeScan, AllNodesScan) and type(child.child) is SingleRow
+            and all(type(target) is Variable and target.name == child.variable for target in node.targets)):
+        # A single predicate-free scan visits each node once. Its literal variable
+        # targets cannot observe another target's deleted properties. Preserve this
+        # streaming path (and downstream spill budgets), without exempting filters,
+        # Cartesian inputs, traversals or expression selectors from preparation.
+        yield from _write_rows(engine, node, context)
+        return
+    source = engine._rows(node.child, context)
+    pending = []
+    limit = engine._query_memory_budget_bytes
+    budget = None if limit is None else LogicalMemoryBudget(limit, operator="delete_inputs")
+    failure = None
+    try:
+        for row in source:
+            bindings = _delete_bindings(node, row, context)
+            if budget is not None:
+                budget.reserve(128)
+                for value in (row.bindings, row.columns, row.computed, bindings):
+                    _charge_comprehension_value(value, budget)
+            pending.append((row, bindings))
+        for row, bindings in pending:
+            yield _write_deletions(engine, node, row, context, bindings)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        pending.clear()
+        _close_iterator(source, failure)
+
+
 def _write_deletions(
-    engine: QueryEngine, node: DeleteEntities, row: _Row, context: _Context
+    engine: QueryEngine, node: DeleteEntities, row: _Row, context: _Context,
+    prepared: tuple[RowBinding, ...] | None = None,
 ) -> _Row:
     """End every row one DELETE names, under the same hold-until-complete discipline.
 
@@ -12177,20 +13998,15 @@ def _write_deletions(
     number the version had already stopped at, which is not a stronger statement of the same fact
     but a second fact that is not true.
 
-    DETACH is what decides the fate of the relationships hanging from a node. With the keyword
-    they end WITH it, physically, in the same statement. Without it only the node ends, and its
-    edges stay on the pages as rows no traversal will follow: a landing whose snapshot cannot see
-    the node is not reached, so the absence an ordinary DELETE promises is a logical one. Ending
-    those edges anyway without being asked would turn a tombstone into a cascade.
+    DETACH explicitly ends incident edges. A plain node DELETE is validated after the complete
+    statement, so DELETE n, r is independent of target order and live dangling edges are refused.
     """
-    for variable in node.variables:
-        binding = row.bindings.get(variable)
-        if not isinstance(binding, RowBinding):
-            raise GrafxPlanError(
-                f"DELETE names {variable!r}, which the rows reaching it do not carry.",
-                field="variable",
-                value=variable,
-            )
+    if context.atomic_staging and any(held.table.kind == "rel" for held in context.staged_rows):
+        context.publish_phase()
+        row = _Row(bindings={name: context.resolve_binding(value) for name, value in row.bindings.items()},
+                   computed=row.computed, columns=row.columns)
+    for original in _delete_bindings(node, row, context) if prepared is None else prepared:
+        binding = context.resolve_binding(original)
         if binding.ref is None:
             # A row THIS statement created: deleting it is creating nothing. The held insert is
             # taken back. A refusal here would have been the honest alternative; what must not
@@ -12199,17 +14015,17 @@ def _write_deletions(
             # caller's commit made the rest of the statement durable (C10 round-3 B1).
             position = _held_insert_position(context, binding)
             if position is None:
-                token = context.pending_tokens.get(id(binding.version))
+                token = context.pending_token(binding.version)
                 if token is not None and token in context.cancelled_insert_tokens:
                     continue
                 raise GrafxUnsupportedOperation(
-                    f"DELETE names {variable!r}, a row created by an earlier statement of this "
-                    f"transaction; a row's identity is allocated by the commit (W5b), so it "
-                    f"cannot be ended before then. Commit first, then delete it.",
+                    "DELETE names a row created by an earlier statement of this "
+                    "transaction; a row's identity is allocated by the commit (W5b), so it "
+                    "cannot be ended before then. Commit first, then delete it.",
                     field="variable",
-                    value=variable,
+                    value=binding.table.name,
                 )
-            token = context.pending_tokens.get(id(binding.version))
+            token = context.pending_token(binding.version)
             if token is not None:
                 context.cancelled_insert_tokens.add(token)
             del context.staged_rows[position]
@@ -12218,6 +14034,9 @@ def _write_deletions(
         if context.already_ended(binding.ref):
             continue
         context.note_ended(binding.ref)
+        if not node.detach and binding.table.kind != "rel":
+            context.plain_node_deletes.append((binding.table, binding.ref if isinstance(binding.ref, PendingRowRef)
+                                              else binding.record_id))
         if node.detach and binding.table.kind != "rel":
             # Incident edges are settled BEFORE the node they hang from is held, so the whole
             # detach is one statement's worth of staged work: either every edge and the node
@@ -12248,6 +14067,51 @@ def _write_deletions(
     return row
 
 
+def _adopt_implicit_schema(engine: QueryEngine, context: _Context) -> None:
+    """Adopt own DDL plus newly created index authorities, preserving prior selections.
+
+    An implicit relationship can create endpoint identity indexes mid-instruction.
+    Only authorities absent from the previous catalog may be added; already
+    selected stores and cached endpoint access paths never switch generations.
+    """
+    previous = context.schema()
+    current = engine._working_catalog(context.txn)
+    fresh = engine._statement_index_authority(current, txn=context.txn)
+    prior = context.index_authority
+    if prior is None:
+        authority = fresh
+    else:
+        additions = []
+        for index in fresh.indexes:
+            name = index.definition.name
+            if prior.named(name) is not None:
+                continue
+            if (previous.has_index_definition(name)
+                    and previous.index_definition(name).active_generation() is not None):
+                continue
+            additions.append(index)
+        authority = _IndexAuthorityProjection.build((*prior.indexes, *additions),
+                                                    planning_indexes=prior.planning_indexes)
+    context.catalog = current
+    context.index_authority = authority
+    if context.procedure_parent is not None:
+        _adopt_implicit_schema(engine, context.procedure_parent)
+
+
+def _admit_query_node_labels(engine: QueryEngine, context: _Context, table_id: int,
+                             labels: tuple[str, ...]) -> TableDef:
+    """Share scoped schema admission between CREATE and label mutation."""
+    working = engine._working_catalog(context.txn)
+    if (context.procedure_schema_scope is not None
+            and (not working.requires_capability("node_labels_v1")
+                 or not working.table_by_id(table_id).admits_node_labels(labels))):
+        context.procedure_schema_scope.admit_schema()
+    actual = engine._admit_node_labels(context.txn, table_id, labels)
+    if context.schema() is not engine._working_catalog(context.txn):
+        _adopt_implicit_schema(engine, context)
+    return actual
+
+
 def _write_pattern(
     engine: QueryEngine,
     node: CreateRelationships | MergePattern,
@@ -12257,13 +14121,33 @@ def _write_pattern(
     """Materialise and stage the nodes and edges one written pattern names."""
     merging = isinstance(node, MergePattern)
     bindings = dict(row.bindings)
-    staged: list[tuple[TableDef, tuple[Value, ...], int | None, int, object]] = []
-    fresh: set[str] = set()
+    staged: list[tuple[TableDef, tuple[Value, ...], int | None, int, object, tuple[str, ...] | None]] = []
     for written in node.nodes:
         if written.variable is None:
             continue
         if written.table is None:
             continue
+        if context.implicit_node_tables.get(written.table.name) == written.table:
+            actual = context.node_table(written.table)
+            if actual is None:
+                _require_write_transaction(context.txn)
+                if context.procedure_schema_scope is not None:
+                    context.procedure_schema_scope.admit_schema()
+                engine._schema(CreateNodeTable(written.table.name, written.table.columns, None,
+                                               flexible_properties=True, unlabeled=written.table.unlabeled),
+                               context.txn, context.statistics)
+                _adopt_implicit_schema(engine, context)
+                actual = context.node_table(written.table)
+            written = replace(written, table=actual)
+        node_labels = None
+        if written.labels:
+            from okto_grafx.domain.model.node_labels import normalize_node_labels
+            requested = normalize_node_labels(written.labels)
+            implicit = () if written.table.unlabeled else (written.table.name,)
+            if requested != implicit:
+                actual = _admit_query_node_labels(engine, context, written.table.table_id, requested)
+                written = replace(written, table=actual)
+                node_labels = requested
         values, encoding_proof = _materialise_row_with_proof(
             engine, written.table, written.properties, row, context
         )
@@ -12274,9 +14158,10 @@ def _write_pattern(
                 context.count("rows_matched")
                 continue
         _require_unique_primary_key(
-            engine, written.table, values, context, also=[held[1] for held in staged]
+            engine, written.table, values, context,
+            also=[held[1] for held in staged if held[0].table_id == written.table.table_id],
         )
-        pending = _pending_binding(written.variable, written.table, values)
+        pending = _pending_binding(written.variable, written.table, values, node_labels=node_labels)
         staged.append(
             (
                 written.table,
@@ -12284,40 +14169,51 @@ def _write_pattern(
                 None,
                 context.token_for(pending),
                 encoding_proof,
+                node_labels,
             )
         )
-        fresh.add(written.variable)
         bindings[written.variable] = pending
-    edges: list[tuple[TableDef, tuple[Value, ...], object]] = []
+    _require_write_transaction(context.txn)
+    for table, values, identity, token, encoding_proof, node_labels in staged:
+        context.hold(table, values, _partition_key(table, values), identity,
+                     token=token, encoding_proof=encoding_proof, node_labels=node_labels)
+        context.count("rows_created")
+    if node.relationships and any(
+        isinstance(bindings.get(variable), RowBinding) and bindings[variable].ref is None
+        for edge in node.relationships for variable in (edge.source, edge.target)
+    ):
+        context.publish_phase()
+        bindings = {name: context.resolve_binding(value) for name, value in bindings.items()}
+    edges: list[tuple[TableDef, tuple[Value, ...], object, int | None]] = []
     for edge in node.relationships:
         table, values, encoding_proof = _materialise_edge(
-            engine, edge, bindings, fresh, row, context
+            engine, edge, bindings, row, context
         )
-        if merging and _matching_edge(engine, edge, (table, values), context):
-            context.count("relationships_matched")
-            continue
-        edges.append((table, values, encoding_proof))
-    _require_write_transaction(context.txn)
-    for table, values, identity, token, encoding_proof in staged:
-        context.hold(
-            table,
-            values,
-            _partition_key(table, values),
-            identity,
-            token=token,
-            encoding_proof=encoding_proof,
-        )
-        context.count("rows_created")
-    for table, values, encoding_proof in edges:
+        if merging:
+            existing_edge = _matching_edge(engine, edge, (table, values), context)
+            if existing_edge is not None:
+                if edge.variable is not None:
+                    bindings[edge.variable] = existing_edge
+                context.count("relationships_matched")
+                continue
+        pending_edge = _pending_binding(edge.variable or "\x00created_edge", table, values)
+        edge_token = context.token_for(pending_edge)
+        if edge.variable is not None:
+            bindings[edge.variable] = pending_edge
+        edges.append((table, values, encoding_proof, edge_token))
+    for table, values, encoding_proof, edge_token in edges:
         context.hold(
             table,
             values,
             _partition_key(table, values),
             None,
+            token=edge_token,
             encoding_proof=encoding_proof,
         )
         context.count("relationships_created")
-    return _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+    result = _Row(bindings=bindings, computed=row.computed, columns=row.columns)
+    return (_apply_merge_actions(engine, node, result, context, created=bool(staged or edges))
+            if merging else _capture_written_path(node, result, context))
 
 
 def _endpoint_txn_memo(
@@ -12724,30 +14620,58 @@ def _materialise_edge(
     engine: QueryEngine,
     edge: CreatedRelationship,
     bindings: dict[str, object],
-    fresh: set[str],
     row: _Row,
     context: _Context,
 ) -> tuple[TableDef, tuple[Value, ...], object]:
-    """Return the stored tuple of one edge, refusing endpoints that cannot be named yet.
+    """Validate committed or authenticated owner-private identities for both endpoints.
 
-    An endpoint is a RecordId, and the identity of a row created by THIS statement does not
-    exist until the commit allocates it -- so an edge to a node the same statement creates is
-    refused rather than staged against a number nobody has issued. It is a refusal with a
-    remedy: match the endpoints first.
-
-    The visibility of both endpoints is then the heap's own door, asked BEFORE anything is
-    staged, so an edge naming a row this snapshot cannot see leaves nothing behind.
+    Fresh endpoints carry PendingRowRef issued by this transaction's staging door;
+    commit resolves them before applying heap pages. An arbitrary guessed identity
+    or an endpoint not visible to this owner is refused.
     """
-    for end, variable in (("source", edge.source), ("target", edge.target)):
-        if variable in fresh:
-            raise GrafxUnsupportedOperation(
-                f"The {end} of a {edge.table.name!r} edge is {variable!r}, which this statement "
-                "is creating: its row identity is allocated by the commit and does not exist "
-                "yet. Create the nodes first and match them, then create the edge.",
-                field=end,
-                value=variable,
-            )
     catalog = context.schema()
+    if edge.logical_type is not None:
+        source, target = bindings.get(edge.source), bindings.get(edge.target)
+        if (not isinstance(source, RowBinding) or not isinstance(target, RowBinding)
+                or source.table.kind != "node" or target.table.kind != "node"):
+            raise GrafxPlanError("Flexible relationships require two native node bindings.", field="endpoint")
+        name = edge.logical_type
+        members = catalog.relationship_tables(name)
+        if members and not all(member.flexible_properties for member in members):
+            raise GrafxPlanError("A flexible write cannot redefine a typed relationship type.", field="type", value=name)
+        selected = tuple(member for member in members
+                         if (member.from_table, member.to_table) == (source.table.name, target.table.name))
+        if not selected:
+            if (context.procedure_parent is not None and (context.procedure_schema_scope is None
+                    or not context.procedure_schema_scope.procedure.schema_write)):
+                raise GrafxPlanError("Procedure writes require previously declared relationship endpoint pairs.",
+                                     field="procedure_write_query")
+            _require_write_transaction(context.txn)
+            if context.procedure_schema_scope is not None:
+                context.procedure_schema_scope.admit_schema()
+            engine._schema(CreateRelTable(
+                name, source.table.name, target.table.name,
+                (ColumnDef(FLEXIBLE_PROPERTIES_COLUMN, SchemaType.ANY, nullable=False),),
+                endpoint_pairs=((source.table.name, target.table.name),), flexible_properties=True,
+            ), context.txn, context.statistics)
+            _adopt_implicit_schema(engine, context)
+            catalog = context.schema()
+            selected = tuple(member for member in catalog.relationship_tables(name)
+                             if (member.from_table, member.to_table) == (source.table.name, target.table.name))
+        if len(selected) != 1:
+            raise GrafxPlanError("Flexible type must resolve one actual endpoint pair.", field="endpoint")
+        edge = replace(edge, table=selected[0], logical_type=None, candidate_tables=())
+    if edge.table is None:
+        source, target = bindings.get(edge.source), bindings.get(edge.target)
+        if not isinstance(source, RowBinding) or not isinstance(target, RowBinding):
+            raise GrafxPlanError("Relationship creation requires two bound node identities.", field="endpoint")
+        candidates = tuple(table for table in edge.candidate_tables
+                           if table.from_table == source.table.name and table.to_table == target.table.name)
+        if len(candidates) != 1:
+            raise GrafxPlanError("No unique relationship member matches these endpoint identities.", field="endpoint")
+        # Resolve only from the planner's closed candidate set, then retain every
+        # ordinary catalog/identity/pending-row/OCC proof below for the actual pair.
+        edge = replace(edge, table=candidates[0], candidate_tables=())
     endpoint_specs = (
         ("source", edge.source, edge.table.from_table, ENDPOINT_COLUMNS[0]),
         ("target", edge.target, edge.table.to_table, ENDPOINT_COLUMNS[1]),
@@ -12763,7 +14687,7 @@ def _materialise_edge(
                 table=edge.table.name,
                 field=endpoint_column,
             )
-        endpoint_table = catalog.table(table_name)
+        endpoint_table = catalog.table(table_name, kind="node")
         binding = bindings.get(variable)
         if not isinstance(binding, RowBinding):
             raise GrafxPlanError(
@@ -12772,8 +14696,11 @@ def _materialise_edge(
                 field=end,
                 value=variable,
             )
+        # Label admission changes only the conservative membership summary, not
+        # physical endpoint identity/schema. Earlier bindings in this statement
+        # may predate a later node's admission to the same physical table.
         if (
-            binding.table != endpoint_table
+            replace(binding.table, extra_node_labels=endpoint_table.extra_node_labels) != endpoint_table
             or binding.version.table_id != endpoint_table.table_id
         ):
             raise GrafxPlanError(
@@ -12897,6 +14824,7 @@ def _pending_binding(
     *,
     reference: object = None,
     polymorphic: bool = False,
+    node_labels: tuple[str, ...] | None = None,
 ) -> RowBinding:
     """Return a binding for a row this statement staged but has not yet given an identity.
 
@@ -12920,8 +14848,27 @@ def _pending_binding(
             schema_version=table.schema_version,
             deleted=False,
             table_id=table.table_id,
+            node_labels=node_labels,
         ),
     )
+
+
+def _matched_pending_binding(context: _Context, variable: str, table: TableDef,
+                             values: tuple[Value, ...], reference: object) -> RowBinding:
+    """Keep a matched private row's identity, without equating unrelated equal tuples."""
+    binding = _pending_binding(variable, table, values, reference=reference)
+    if reference is None:
+        for held in context.staged_rows:
+            if (held.operation is _HELD_INSERT and held.table.table_id == table.table_id
+                    and held.values is values and held.token is not None):
+                context.register_pending_token(binding.version, held.token)
+                # Reusing an unpublished entity needs one authenticated identity
+                # for every alias. Unique MERGE insertions do not flush here.
+                if context.atomic_staging:
+                    context.publish_phase()
+                    binding = context.resolve_binding(binding)
+                break
+    return binding
 
 
 def _transaction_row_view(
@@ -12975,8 +14922,8 @@ def _transaction_row_view(
             logical_intents.append(intent)
     else:
         logical_intents = list(indexed)
-    if include_held:
-        for held in context.staged_rows:
+    if include_held or context.phase_rows:
+        for held in context.staged_rows if include_held else context.phase_rows:
             if held.table.table_id != table.table_id:
                 continue
             operation = {
@@ -13057,6 +15004,7 @@ def _primary_key_table_identity(table: TableDef, position: int) -> tuple[object,
         table.schema_version,
         table.primary_key,
         position,
+        table.columns[position],
     )
 
 
@@ -13688,6 +15636,45 @@ def _uncommitted_rows(
         yield values
 
 
+def _current_node_labels(context: _Context, binding: RowBinding) -> tuple[str, ...]:
+    """Read a version's labels plus only its owner's staged replacements.
+
+    Build one label overlay per table/revision, not one scan of every intent for
+    every output row. None means inherit; an explicit empty tuple must survive.
+    The catalog is only a candidate summary, never row-membership authority.
+    """
+    binding = context.resolve_binding(binding)
+    if binding.table.kind != "node":
+        raise GrafxPlanError("Only nodes have a label set.", field="label")
+    intents = getattr(context.txn, "row_intents", ())
+    revision = (id(intents), len(intents), getattr(intents, "rewrite_revision", None),
+                len(context.staged_rows), context.staged_rows.rewrite_revision)
+    if context.node_label_overlay_revision != revision:
+        context.node_label_overlays.clear()
+        context.node_label_overlay_revision = revision
+    state = context.node_label_overlays.get(binding.table.table_id)
+    if state is None:
+        state = {}
+        indexed = _indexed_row_intents(context, binding.table)
+        selected = indexed if indexed is not None else (
+            intent for intent in intents if intent.table.table_id == binding.table.table_id)
+        for intent in reduce_row_intents(tuple(selected)):
+            if intent.operation is not RowOperation.DELETE and intent.node_labels is not None:
+                state[intent.reference] = intent.node_labels
+        for held in context.staged_rows:
+            if held.table.table_id == binding.table.table_id and held.node_labels is not None:
+                key = held.reference if held.reference is not None else ("held", held.token)
+                state[key] = held.node_labels
+        context.node_label_overlays[binding.table.table_id] = state
+    if state and binding.ref is None and binding.record_id > 0:
+        binding = _unwound_entity(context.engine, context, binding)
+    key = binding.ref if binding.ref is not None else ("held", context.pending_token(binding.version))
+    labels = state.get(key, binding.version.node_labels)
+    if labels is not None:
+        return labels
+    return () if binding.table.unlabeled else (binding.table.name,)
+
+
 def _current_values(context: _Context, binding: RowBinding) -> tuple[Value, ...]:
     """Return the values a SET must build on: this transaction's latest, else the snapshot's.
 
@@ -13794,12 +15781,12 @@ def _landing_fingerprint(context: _Context, table: TableDef) -> tuple:
     """
     table_id = table.table_id
     intents = tuple(
-        (intent.operation, intent.reference, intent.record_id, intent.values)
+        (intent.operation, intent.reference, intent.record_id, intent.values, intent.node_labels)
         for intent in getattr(context.txn, "row_intents", ())
         if getattr(getattr(intent, "table", None), "table_id", None) == table_id
     )
     held = tuple(
-        (row.operation, row.reference, row.identity, row.values, row.token)
+        (row.operation, row.reference, row.identity, row.values, row.token, row.node_labels)
         for row in context.staged_rows
         if row.table.table_id == table_id
     )
@@ -14033,9 +16020,7 @@ def _matching_row(
         if len(pending) == len(values) and all(
             _equal(pending[at], values[at]) for at in positions
         ):
-            return _pending_binding(
-                written.variable, table, pending, reference=reference
-            )
+            return _matched_pending_binding(context, written.variable, table, pending, reference)
     for reference, latest in state.items():
         if latest is None or len(latest) != len(values):
             continue
@@ -14067,8 +16052,23 @@ def _matching_edge(
     edge: CreatedRelationship,
     materialised: tuple[TableDef, tuple[Value, ...]],
     context: _Context,
-) -> bool:
-    """Return True when the edge a MERGE names already exists.
+) -> RowBinding | None:
+    """Return one match for the scalar pattern writer, closing its iterator."""
+    candidates = _matching_edges(engine, edge, materialised, context)
+    failure = None
+    try:
+        return next(candidates, None)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(candidates, failure)
+
+
+def _matching_edges(engine: QueryEngine, edge: CreatedRelationship,
+                    materialised: tuple[TableDef, tuple[Value, ...]],
+                    context: _Context, *, row_view=None) -> Iterator[RowBinding]:
+    """Yield all latest owner-visible edges a MERGE names.
 
     An edge is identified by the pair it connects, which leads its stored tuple, plus whatever
     properties the pattern named -- so ``MERGE (a)-[:KNOWS]->(b)`` matches any KNOWS edge between
@@ -14078,20 +16078,50 @@ def _matching_edge(
     """
     table, values = materialised
     positions = [0, 1]
-    if edge.properties is not None:
+    flexible_keys = tuple(entry.key for entry in edge.properties.entries) if table.flexible_properties and edge.properties else ()
+    desired_properties = _flexible_properties(table, values) if table.flexible_properties else {}
+    if any(key not in desired_properties for key in flexible_keys):
+        raise GrafxPlanError("MERGE relationship properties cannot be NULL.", field="properties")
+    if edge.properties is not None and not table.flexible_properties:
         positions.extend(
             table.column_index(entry.key) for entry in edge.properties.entries
         )
     wanted = tuple(positions)
-    for pending in _uncommitted_rows(context, table):
-        if len(pending) == len(values) and all(
-            _equal(pending[at], values[at]) for at in wanted
-        ):
-            return True
-    for _ref, version in engine.heap.scan(table, context.snapshot):
-        if all(_equal(version.values[at], values[at]) for at in wanted):
-            return True
-    return False
+
+    def matches(candidate: tuple[object, ...]) -> bool:
+        """Match the selected typed columns and flexible properties of an edge candidate."""
+        if not all(_equal(candidate[at], values[at]) for at in wanted):
+            return False
+        if table.flexible_properties:
+            properties = _flexible_properties(table, candidate)
+            return all(_equal(properties.get(key), desired_properties[key]) for key in flexible_keys)
+        return True
+
+    variable = edge.variable or "\x00merged_edge"
+    state, inserted = _transaction_row_view(context, table) if row_view is None else row_view
+    for reference, pending in inserted:
+        context.count("rows_scanned")
+        if len(pending) == len(values) and matches(pending):
+            yield _matched_pending_binding(context, variable, table, pending, reference)
+    for reference, latest in state.items():
+        context.count("rows_scanned")
+        if latest is not None and matches(latest):
+            yield RowBinding(variable=variable, table=table, ref=reference,
+                              version=replace(engine.heap.read(reference), values=latest))
+    source = engine.heap.scan(table, context.snapshot)
+    failure = None
+    try:
+        for ref, version in source:
+            context.count("rows_scanned")
+            if ref in state:
+                continue
+            if matches(version.values):
+                yield RowBinding(variable=variable, table=table, ref=ref, version=version)
+    except BaseException as caught:
+        failure = caught
+        raise
+    finally:
+        _close_iterator(source, failure)
 
 
 def _require_write_transaction(txn: object) -> object:
@@ -14131,15 +16161,45 @@ def _partition_key(table: TableDef, values: tuple[Value, ...]) -> bytes:
     return b""
 
 
+def _prepare_map_assignment(engine: QueryEngine, assignment: PropertyAssignment,
+                            row: _Row, context: _Context) -> tuple[RowBinding, dict[str, Value]] | None:
+    """Evaluate one property map, never granting its data entity-write authority."""
+    name = assignment.target.name
+    binding = row.bindings.get(name)
+    if binding is None and name in row.bindings:
+        return None
+    if not isinstance(binding, RowBinding):
+        raise GrafxPlanError("SET requires a native node or relationship binding.", field="target")
+    context.require_entity_content(binding)
+    if binding.ref is None and binding.record_id > 0:
+        binding = _unwound_entity(engine, context, binding)
+    value = _evaluate(assignment.value, row, context)
+    if isinstance(value, RowBinding):
+        value = _binding_properties(value, context)
+    if not isinstance(value, Mapping):
+        raise GrafxPlanError("SET requires a map or native entity property source.",
+                             field="value", reason="set_map_type", query_phase="execution")
+    properties = dict(value)
+    for key in properties:
+        if type(key) is not str:
+            raise GrafxPlanError("SET property maps require string keys.", field="key", query_phase="execution")
+        if binding.table.kind == "rel" and key in ENDPOINT_COLUMNS:
+            raise GrafxPlanError("SET cannot modify physical relationship endpoints.", field="column", value=key)
+    return binding, properties
+
+
 def _prepare_assignment(
     engine: QueryEngine, assignment: PropertyAssignment, row: _Row, context: _Context
-) -> tuple[RowBinding, int, Value]:
+) -> tuple[RowBinding, int, Value] | None:
     """Check one SET assignment against the column it writes, and return what it writes.
 
     Nothing is stored here. The caller collects every assignment of the statement first, so a
     SET whose second assignment refuses leaves the transaction exactly as it found it.
+    A present NULL entity binding returns None: optional null extension is a no-op.
     """
     target = assignment.target
+    if assignment.merge:
+        raise GrafxPlanError("SET += requires a whole entity target.", field="target")
     if not isinstance(target.subject, Variable):
         raise GrafxPlanError(
             f"SET assigns to a property of a matched variable; got {target.describe()}.",
@@ -14147,12 +16207,15 @@ def _prepare_assignment(
             value=target.describe(),
         )
     binding = row.bindings.get(target.subject.name)
+    if binding is None and target.subject.name in row.bindings:
+        return None
     if not isinstance(binding, RowBinding):
         raise GrafxPlanError(
             f"SET names {target.subject.name!r}, which the rows reaching it do not carry.",
             field="variable",
             value=target.subject.name,
         )
+    context.require_entity_content(binding)
     if binding.table.kind == "rel" and target.key in ENDPOINT_COLUMNS:
         raise GrafxPlanError(
             f"{target.key!r} is the layout's own endpoint column of a relationship table, so "
@@ -14161,9 +16224,16 @@ def _prepare_assignment(
             value=target.key,
             table=binding.table.name,
         )
+    if binding.ref is None and binding.record_id > 0:
+        binding = _unwound_entity(engine, context, binding)
+    if binding.table.flexible_properties:
+        value = _evaluate(assignment.value, row, context)
+        column = binding.table.columns[-1]
+        _check_stored_value(engine, binding.table, column, {} if value is None else {target.key: value}, context)
+        return binding, len(binding.table.columns) - 1, value
     column = _column_named(binding.table, target.key)
     value = _evaluate(assignment.value, row, context)
-    _check_stored_value(engine, binding.table, column, value, context)
+    value = _check_stored_value(engine, binding.table, column, value, context)
     return binding, binding.table.column_index(target.key), value
 
 
@@ -14216,7 +16286,16 @@ def _materialise_row_with_proof(
     values: list[Value] = [None] * table.arity
     if endpoints is not None:
         values[0], values[1] = endpoints
-    if properties is not None:
+    if table.flexible_properties:
+        bag = {}
+        for entry in properties.entries if properties is not None else ():
+            value = _evaluate(entry.value, row, context)
+            if value is None:
+                bag.pop(entry.key, None)
+            else:
+                bag[entry.key] = value
+        values[-1] = bag
+    elif properties is not None:
         for entry in properties.entries:
             if entry.key in ENDPOINT_COLUMNS:
                 raise GrafxPlanError(
@@ -14306,7 +16385,7 @@ def _stored_value(
     the vector subsystem's own door, so this asks it rather than repeating the rule (VEC BR-5).
     """
     if not column.is_vector or value is None:
-        return value  # type: ignore[return-value]
+        return column.normalize_value(value)  # type: ignore[arg-type,return-value]
     space = context.schema().space(str(column.vector_space))
     stored = value if type(value) is VectorValue else None
     if isinstance(value, VectorValue):
@@ -14349,13 +16428,14 @@ def _check_stored_value(
             )
         return stored
     observed = value_type_of(stored)
-    if observed is not column.type:
+    if column.type is not SchemaType.ANY and observed is not column.type:
         raise GrafxPlanError(
             f"The column {table.name}.{column.name} stores {column.type.name} and the value "
             f"written to it is {observed.name}.",
             field="column",
             value=column.name,
         )
+    _check_column_value(table, table.column_index(column.name), column, stored)
     return stored
 
 
@@ -14363,6 +16443,13 @@ _Handler = Callable[[QueryEngine, PlanNode, _Context], Iterator[_Row]]
 
 _HANDLERS: dict[type, _Handler] = {
     SingleRow: _single_row,  # type: ignore[dict-item]
+    CaptureNodePath: _capture_node_path,  # type: ignore[dict-item]
+    ZeroHopRelationship: _zero_hop_relationship,  # type: ignore[dict-item]
+    ArgumentRows: _argument_rows,  # type: ignore[dict-item]
+    ApplyRows: _apply_rows,  # type: ignore[dict-item]
+    SubqueryRows: _subquery_rows,  # type: ignore[dict-item]
+    RestoreImports: _restore_imports,  # type: ignore[dict-item]
+    ProcedureRows: _procedure_rows,  # type: ignore[dict-item]
     UnwindRows: _unwind_rows,  # type: ignore[dict-item]
     WithRows: _with_rows,  # type: ignore[dict-item]
     AllNodesScan: _all_nodes_scan,  # type: ignore[dict-item]
@@ -14371,6 +16458,7 @@ _HANDLERS: dict[type, _Handler] = {
     OrderedNodeMerge: _ordered_node_merge,  # type: ignore[dict-item]
     IndexSeek: _index_seek,  # type: ignore[dict-item]
     TraverseAnyRelationship: _traverse_any,  # type: ignore[dict-item]
+    TraverseRelationshipAlternatives: _traverse,  # type: ignore[dict-item]
     TraverseRelationship: _traverse,  # type: ignore[dict-item]
     RelationshipScan: _relationship_scan,  # type: ignore[dict-item]
     RelationshipIncidentSeek: _relationship_incident_seek,  # type: ignore[dict-item]
@@ -14386,9 +16474,10 @@ _HANDLERS: dict[type, _Handler] = {
     SkipRows: _skip_rows,  # type: ignore[dict-item]
     LimitRows: _limit_rows,  # type: ignore[dict-item]
     CreateRelationships: _write_rows,  # type: ignore[dict-item]
+    CreateSequence: _write_rows,  # type: ignore[dict-item]
     MergePattern: _write_rows,  # type: ignore[dict-item]
     SetProperties: _write_rows,  # type: ignore[dict-item]
-    DeleteEntities: _write_rows,  # type: ignore[dict-item]
+    DeleteEntities: _delete_rows,  # type: ignore[dict-item]
 }
 """Which function answers which operator, looked up by type rather than by a chain of checks."""
 
@@ -14408,6 +16497,69 @@ def _evaluate(expression: Expression, row: _Row, context: _Context) -> object:
     if computed is not None and expression in computed:
         return computed[expression]
     kind = type(expression)
+    if kind is LabelPredicate:
+        subject = _evaluate(expression.subject, row, context)
+        if subject is None:
+            return None
+        if not isinstance(subject, RowBinding):
+            raise GrafxPlanError("A label/type predicate requires a node, relationship or NULL.", field="label",
+                                 reason="label_argument_type", query_phase="execution")
+        context.require_entity_content(subject)
+        if subject.table.kind == "rel":
+            name = context.schema().relationship_type_name(subject.table.table_id)
+            return all(label == name for label in expression.labels)
+        labels = _current_node_labels(context, subject)
+        return all(label in labels for label in expression.labels)
+    if kind is PatternComprehension:
+        return _evaluate_pattern_comprehension(expression, row, context)
+    if kind is ExistsSubquery:
+        descriptor = context.existential_queries.get(id(expression))
+        if descriptor is None or descriptor[0] is not expression:
+            raise GrafxPlanError("EXISTS has no planned read descriptor.", field="subquery")
+        _, root, slot = descriptor
+        if slot in context.arguments:
+            raise GrafxPlanError("EXISTS argument slot is already active.", field="subquery")
+        context.arguments[slot] = _Row(bindings={target: _current_entity_value(
+            context.engine, context, _evaluate_variable(Variable(source), row, context, computed))
+            for target, source in expression.imports})
+        stream = None
+        failure = None
+        try:
+            stream = context.engine._rows(root, context)
+            return next(stream, None) is not None
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            try:
+                if stream is not None:
+                    _close_iterator(stream, failure)
+            finally:
+                context.arguments.pop(slot, None)
+    if kind is PatternPredicate:
+        descriptor = context.pattern_predicates.get(id(expression))
+        if descriptor is None or descriptor[0] is not expression:
+            raise GrafxPlanError("Pattern predicate has no planned read descriptor.", field="pattern")
+        _, root, slot, names = descriptor
+        if any(name not in row.bindings for name in names):
+            raise GrafxPlanError("A planned pattern reference has no incoming binding.", field="pattern")
+        if any(row.bindings.get(name) is None for name in names):
+            return None
+        if slot in context.arguments:
+            raise GrafxPlanError("Pattern predicate argument is already active.", field="pattern")
+        context.arguments[slot] = row
+        stream = context.engine._rows(root, context)
+        failure: BaseException | None = None
+        try:
+            return next(stream, None) is not None
+        except BaseException as caught:
+            failure = caught
+            raise
+        finally:
+            try:
+                _close_iterator(stream, failure)
+            finally:
+                context.arguments.pop(slot, None)
     if kind is Literal:
         # The most frequent leaf, and the one node for which one identity test beats both the
         # table lookup and the first question of the walk; the answer is the walk's.
@@ -14452,6 +16604,19 @@ def _evaluate_by_kind(
         return _case(expression, row, context)
     if isinstance(expression, Subscript):
         return _subscript(expression, row, context)
+    if isinstance(expression, ListIteration):
+        return _evaluate_list_iteration(expression, row, context)
+    if isinstance(expression, ListSlice):
+        subject = _evaluate(expression.subject, row, context)
+        start = None if expression.start is None else _evaluate(expression.start, row, context)
+        end = None if expression.end is None else _evaluate(expression.end, row, context)
+        if subject is not None and type(subject) not in (list, tuple):
+            raise GrafxPlanError("A list slice requires a list.", field="slice")
+        if any(value is not None and type(value) is not int for value in (start, end)):
+            raise GrafxPlanError("List slice bounds require integers.", field="slice")
+        if subject is None or (expression.start is not None and start is None) or (expression.end is not None and end is None):
+            return None
+        return tuple(subject[start:end])
     if isinstance(expression, FunctionCall):
         return _call(expression, row, context)
     raise GrafxPlanError(
@@ -14491,7 +16656,7 @@ def _evaluate_variable(
     context: _Context,
     computed: Mapping[Expression, object] | None,
 ) -> object:
-    return _read_variable(expression, row, computed)
+    return context.resolve_binding(_read_variable(expression, row, computed))
 
 
 def _evaluate_property(
@@ -14506,12 +16671,15 @@ def _evaluate_property(
     if type(subject) is RowBinding:
         # KGRUN-M1: the matched row is the common case; the abstract Mapping test below walks
         # the ABC registry and is only reached by a map subject or a refusal.
+        context.require_entity_content(subject)
         return subject.value(expression.key)
-    return _property_of(subject, expression)
+    return _property_of(subject, expression, context)
 
 
-def _property_of(subject: object, expression: Property) -> object:
+def _property_of(subject: object, expression: Property, context: _Context) -> object:
     """Read one property of an already evaluated, non-null subject."""
+    if type(subject) in TEMPORAL_CLASSES:
+        return temporal_field(subject, expression.key)
     if isinstance(subject, Mapping):
         return _map_property_value(subject, expression)
     if not isinstance(subject, RowBinding):
@@ -14520,7 +16688,9 @@ def _property_of(subject: object, expression: Property) -> object:
             f"{type(subject).__name__}.",
             field="property",
             value=expression.key,
+            reason="property_subject_type", query_phase="execution",
         )
+    context.require_entity_content(subject)
     return subject.value(expression.key)
 
 
@@ -14532,6 +16702,136 @@ def _evaluate_null_check(
 ) -> object:
     value = _evaluate(expression.operand, row, context)
     return (value is not None) if expression.negated else (value is None)
+
+
+def _charge_comprehension_value(value: object, budget: LogicalMemoryBudget) -> None:
+    """Conservative cumulative logical allocation, without encoding or detaching entities."""
+    if isinstance(value, RowBinding):
+        budget.reserve(128)
+        _charge_comprehension_value(value.version.values, budget)
+        if value.version.node_labels is not None:
+            _charge_comprehension_value(value.version.node_labels, budget)
+    elif isinstance(value, _PathValue):
+        budget.reserve(64)
+        _charge_comprehension_value(value.nodes, budget)
+        _charge_comprehension_value(value.relationships, budget)
+    elif isinstance(value, (tuple, list)):
+        budget.reserve(64 + 8 * len(value))
+        for child in value:
+            _charge_comprehension_value(child, budget)
+    elif isinstance(value, Mapping):
+        budget.reserve(64 + 64 * len(value))
+        for key, child in value.items():
+            _charge_comprehension_value(key, budget)
+            _charge_comprehension_value(child, budget)
+    elif isinstance(value, str):
+        budget.reserve(64 + 4 * len(value))
+    elif isinstance(value, bytes):
+        budget.reserve(64 + len(value))
+    elif isinstance(value, VectorValue):
+        budget.reserve(128 + 32 * len(value.values))
+    else:
+        budget.reserve(64)
+
+
+def _evaluate_pattern_comprehension(expression: PatternComprehension, row: _Row, context: _Context) -> object:
+    """Materialize a correlated native projection under the statement's read authority."""
+    descriptor = context.pattern_comprehensions.get(id(expression))
+    if descriptor is None or descriptor[0] is not expression:
+        raise GrafxPlanError("Pattern comprehension has no planned read descriptor.", field="pattern")
+    _, root, slot, names = descriptor
+    for name in names:
+        if name not in row.bindings:
+            raise GrafxPlanError("Pattern comprehension is missing a correlated binding.", field="pattern")
+        if row.bindings[name] is None:
+            return None
+        if not isinstance(row.bindings[name], RowBinding):
+            raise GrafxPlanError("Pattern comprehension requires a graph entity anchor.", field="pattern")
+        expected_kind = "node" if any(node.variable == name for node in expression.pattern.nodes) else "rel"
+        if row.bindings[name].table.kind != expected_kind:
+            raise GrafxPlanError("Pattern comprehension anchor has the wrong entity kind.", field="pattern")
+    if slot in context.arguments:
+        raise GrafxPlanError("Pattern comprehension argument slot is already active.", field="pattern")
+    limit = context.engine._query_memory_budget_bytes
+    if limit is not None:
+        if context.comprehension_memory is None:
+            context.comprehension_memory = LogicalMemoryBudget(limit, operator="pattern_comprehension")
+        context.comprehension_memory.reserve(64)
+    context.arguments[slot] = row
+    stream = None
+    values = []
+    failure = None
+    try:
+        stream = context.engine._rows(root, context)
+        for projected in stream:
+            context.count("list_iterations")
+            if context.statistics["list_iterations"] > MAX_GENERATED_LIST_ELEMENTS:
+                raise GrafxQueryBudgetExceeded("Pattern comprehension exceeds the statement element budget.", resource="generated_list")
+            value = projected.columns["value"]
+            if context.comprehension_memory is not None:
+                context.comprehension_memory.reserve(8)
+                _charge_comprehension_value(value, context.comprehension_memory)
+            values.append(value)
+        return tuple(values)
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            _close_iterator(stream, failure)
+        finally:
+            context.arguments.pop(slot, None)
+
+
+def _evaluate_list_iteration(expression: ListIteration, row: _Row, context: _Context) -> object:
+    """Run a lexical list scope with three-valued predicates and cooperative limits."""
+    from okto_grafx.domain.query.scalars import MAX_GENERATED_LIST_ELEMENTS
+
+    source = _evaluate(expression.source, row, context)
+    initial = None if expression.initial is None else _evaluate(expression.initial, row, context)
+    if source is None:
+        return None
+    if type(source) not in (list, tuple):
+        raise GrafxPlanError("List iteration requires a list.", field="iteration")
+    if len(source) > MAX_GENERATED_LIST_ELEMENTS:
+        raise GrafxQueryBudgetExceeded("List iteration exceeds its element budget.", resource="generated_list")
+    values = []
+    matched = 0
+    unknown = False
+    accumulator = initial
+    for value in source:
+        context.count("list_iterations")
+        if context.statistics["list_iterations"] > MAX_GENERATED_LIST_ELEMENTS:
+            raise GrafxQueryBudgetExceeded("Nested list iteration exceeds the statement element budget.", resource="generated_list")
+        local = _Row(bindings={**row.bindings, expression.variable: value})
+        if expression.accumulator is not None:
+            local.bindings[expression.accumulator] = accumulator
+        if expression.mode == "reduce":
+            accumulator = _evaluate(expression.body, local, context)
+            continue
+        predicate = expression.predicate if expression.mode == "map" else expression.body
+        selected = True if predicate is None else _evaluate(predicate, local, context)
+        if selected is not None and type(selected) is not bool:
+            raise GrafxPlanError("List predicates require booleans.", field="iteration")
+        if expression.mode == "map":
+            if selected is True:
+                values.append(_evaluate(expression.body, local, context))
+            continue
+        unknown = unknown or selected is None
+        matched += selected is True
+        if expression.mode == "all" and selected is False:
+            return False
+        if expression.mode in ("any", "none") and selected is True:
+            return expression.mode == "any"
+        if expression.mode == "single" and matched > 1:
+            return False
+    if expression.mode == "map":
+        return tuple(values)
+    if expression.mode == "reduce":
+        return accumulator
+    if unknown:
+        return None
+    return (matched == 1 if expression.mode == "single" else expression.mode in ("all", "none"))
 
 
 def _evaluate_list(
@@ -14622,26 +16922,20 @@ _EXACT_EVALUATORS: Mapping[type, Callable[..., object]] = MappingProxyType(
 
 
 def _case(expression: CaseExpression, row: _Row, context: _Context) -> object:
-    """Evaluate every CASE expression eagerly, then select its first matching arm."""
+    """Evaluate conditions in order and only the selected result arm.
+
+    Static scope/type checking still covers every branch. Runtime effects and errors
+    of an unselected expression must not escape a conditional expression.
+    """
     operand = (
         _evaluate(expression.operand, row, context)
         if expression.operand is not None
         else None
     )
-    alternatives: list[tuple[object, object]] = []
+    chosen = expression.fallback
     for alternative in expression.alternatives:
         condition = _evaluate(alternative.condition, row, context)
-        result = _evaluate(alternative.result, row, context)
-        alternatives.append((condition, result))
-    fallback = (
-        _evaluate(expression.fallback, row, context)
-        if expression.fallback is not None
-        else None
-    )
-
-    selected = fallback
-    if expression.operand is None:
-        for condition, result in alternatives:
+        if expression.operand is None:
             if condition is not None and not isinstance(condition, bool):
                 message = (
                     f"A searched CASE tests booleans or nulls; got "
@@ -14652,32 +16946,47 @@ def _case(expression: CaseExpression, row: _Row, context: _Context) -> object:
                     field="case",
                     value=expression.describe(),
                 )
-            if condition is True:
-                selected = result
-                break
-    else:
-        for condition, result in alternatives:
-            equal = (
-                operand is None
-                and condition is None
-                or operand is not None
+            matches = condition is True
+        else:
+            matches = (
+                operand is not None
                 and condition is not None
-                and _equal(operand, condition)
+                and _query_equal(operand, condition) is True
             )
-            if equal:
-                selected = result
-                break
+        if matches:
+            chosen = alternative.result
+            break
 
-    result_type = context.case_types.get(id(expression))
-    if result_type is ValueType.DOUBLE and selected is not None:
-        return float(selected)
+    selected = _evaluate(chosen, row, context) if chosen is not None else None
+
     return selected
 
 
 def _subscript(expression: Subscript, row: _Row, context: _Context) -> object:
-    """Extract one element with Ladybug's one-based positive and negative positions."""
+    """Extract a zero-based position, or a negative position counted from the end."""
     subject = _evaluate(expression.subject, row, context)
     index = _evaluate(expression.index, row, context)
+    if isinstance(subject, RowBinding) and index is not None:
+        if not isinstance(index, str):
+            raise GrafxPlanError("An entity property subscript needs a string key.",
+                                 field="subscript", value=expression.describe(),
+                                 reason="map_key_type", query_phase="execution")
+        subject = context.resolve_binding(subject)
+        context.require_entity_content(subject)
+        state = _entity_overlay(context, subject.table)
+        values = _current_values(context, subject) if subject.ref is None else state.get(subject.ref)
+        if values is None:
+            values = subject.version.values
+        if subject.table.flexible_properties:
+            return _flexible_properties(subject.table, values).get(index)
+        position = subject.table.column_positions.get(index)
+        if position is None or (subject.table.kind == "rel" and position < ENDPOINT_COLUMN_COUNT):
+            return None
+        value = values[position] if position < len(values) else None
+        if _is_unmaterialized_column(value):
+            raise GrafxPlanError("Dynamic property lookup requires a complete property projection.",
+                                 field="projection", table=subject.table.name, value=index)
+        return value
     return _subscript_value(expression, subject, index)
 
 
@@ -14685,12 +16994,18 @@ def _subscript_value(expression: Subscript, subject: object, index: object) -> o
     """Extract one already evaluated list element under the public subscript contract."""
     if subject is None or index is None:
         return None
+    if isinstance(subject, Mapping):
+        if not isinstance(index, str):
+            raise GrafxPlanError("A map subscript needs a string key.", field="subscript", value=expression.describe(),
+                                 reason="map_key_type", query_phase="execution")
+        return subject.get(index)
     if not isinstance(subject, (list, tuple)):
         message = f"A subscript extracts from a list; got {type(subject).__name__}."
         raise GrafxPlanError(
             message,
             field="subscript",
             value=expression.describe(),
+            reason="subscript_subject_type", query_phase="execution",
         )
     if isinstance(index, bool) or not isinstance(index, int):
         message = (
@@ -14700,53 +17015,18 @@ def _subscript_value(expression: Subscript, subject: object, index: object) -> o
             message,
             field="subscript",
             value=expression.describe(),
+            reason="list_index_type", query_phase="execution",
         )
-    if index == 0:
-        message = "A list subscript uses one-based positions; zero is not a position."
-        raise GrafxPlanError(
-            message,
-            field="subscript",
-            value=index,
-        )
-    offset = index - 1 if index > 0 else index
-    if not -len(subject) <= offset < len(subject):
-        message = (
-            f"The list subscript {index} is out of range for {len(subject)} elements."
-        )
-        raise GrafxPlanError(
-            message,
-            field="subscript",
-            value=index,
-        )
-    return subject[offset]
+    if not -len(subject) <= index < len(subject):
+        return None
+    return subject[index]
 
 
 def _map_property_value(
     subject: Mapping[object, object], expression: Property
 ) -> object:
-    """Read one case-insensitive map key, refusing an ambiguous parameter map."""
-    folded = expression.key.lower()
-    matches = tuple(
-        (key, value)
-        for key, value in subject.items()
-        if isinstance(key, str) and key.lower() == folded
-    )
-    if len(matches) > 1:
-        keys = ", ".join(repr(key) for key, _value in sorted(matches))
-        message = f"The map in {expression.describe()} has colliding keys {keys}."
-        raise GrafxPlanError(
-            message,
-            field="property",
-            value=expression.key,
-        )
-    if matches:
-        return matches[0][1]
-    message = f"The map in {expression.describe()} has no key {expression.key!r}."
-    raise GrafxPlanError(
-        message,
-        field="property",
-        value=expression.key,
-    )
+    """Read one case-sensitive map key, returning NULL when it does not exist."""
+    return subject.get(expression.key)
 
 
 def _read_variable(
@@ -14779,6 +17059,10 @@ def _unary(expression: UnaryOperation, row: _Row, context: _Context) -> object:
         return None if truth is None else (not truth)
     if value is None:
         return None
+    if type(value) is DurationValue:
+        return scale_duration(value, -1) if expression.operator == "-" else value
+    if type(value) is DecimalValue:
+        return decimal_negate(value) if expression.operator == "-" else value
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise GrafxPlanError(
             f"A sign applies to a number; got {type(value).__name__}.",
@@ -14801,9 +17085,10 @@ def _binary(expression: BinaryOperation, row: _Row, context: _Context) -> object
             return None
         return left_truth != right_truth
     if operator == "=":
-        return None if left is None or right is None else _equal(left, right)
+        return _query_equal(left, right)
     if operator == "<>":
-        return None if left is None or right is None else not _equal(left, right)
+        equal = _query_equal(left, right)
+        return None if equal is None else not equal
     if operator in ("<", "<=", ">", ">="):
         return _ordered(operator, left, right)
     if operator == "IN":
@@ -14814,7 +17099,7 @@ def _binary(expression: BinaryOperation, row: _Row, context: _Context) -> object
         return _membership(left, right)
     if operator in ("STARTS WITH", "ENDS WITH", "CONTAINS"):
         return _text(operator, left, right)
-    return _arithmetic(operator, left, right)
+    return _arithmetic(operator, left, right, resolver=context.engine._temporal_resolver)
 
 
 def _logical(
@@ -14838,6 +17123,30 @@ def _logical(
 
 def _ordered(operator: str, left: object, right: object) -> object:
     """Return an ordering comparison, which is unknown across kinds that have no order."""
+    if type(left) is DecimalValue or type(right) is DecimalValue:
+        if type(left) not in (DecimalValue, int, float) or type(right) not in (DecimalValue, int, float):
+            return None
+        comparison = decimal_numeric_compare(left, right)
+        if comparison is None:
+            return False  # NaN is unordered, not NULL.
+        return {"<": comparison < 0, "<=": comparison <= 0, ">": comparison > 0, ">=": comparison >= 0}[operator]
+    if type(left) in TEMPORAL_CLASSES or type(right) in TEMPORAL_CLASSES:
+        if type(left) not in TEMPORAL_CLASSES or type(right) not in TEMPORAL_CLASSES:
+            return None
+        return temporal_predicate(left, right, operator)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        # Lexicographic comparison decides at the first unequal element. An
+        # unknown later element cannot erase a decision made by an earlier one.
+        for lhs, rhs in zip(left, right):
+            if _query_equal(lhs, rhs) is True:
+                continue
+            less = _ordered("<", lhs, rhs)
+            greater = _ordered(">", lhs, rhs)
+            if less is None or greater is None:
+                return None
+            if less or greater:
+                return less if operator in ("<", "<=") else greater
+        return _ordered(operator, len(left), len(right))
     if left is None or right is None or not _comparable(left, right):
         return None
     if isinstance(left, Timestamp) and isinstance(right, Timestamp):
@@ -14852,6 +17161,31 @@ def _ordered(operator: str, left: object, right: object) -> object:
     return left >= right  # type: ignore[operator]
 
 
+def _query_equal(left: object, right: object) -> bool | None:
+    """Compare query values with recursive three-valued equality, distinct from grouping.
+
+    A known difference dominates an unknown element. Two nulls are grouped together
+    by DISTINCT but never become TRUE through the query equality operator.
+    """
+    pending = [(left, right)]
+    unknown = False
+    while pending:
+        lhs, rhs = pending.pop()
+        if lhs is None or rhs is None:
+            unknown = True
+        elif isinstance(lhs, (list, tuple)) and isinstance(rhs, (list, tuple)):
+            if len(lhs) != len(rhs):
+                return False
+            pending.extend(zip(lhs, rhs, strict=True))
+        elif isinstance(lhs, Mapping) and isinstance(rhs, Mapping):
+            if lhs.keys() != rhs.keys():
+                return False
+            pending.extend((lhs[key], rhs[key]) for key in lhs)
+        elif not _equal(lhs, rhs):
+            return False
+    return None if unknown else True
+
+
 def _membership(left: object, right: object) -> object:
     """Return whether a value appears in a list, which is unknown when either side is null."""
     if right is None:
@@ -14861,15 +17195,16 @@ def _membership(left: object, right: object) -> object:
             f"IN looks inside a list; got {type(right).__name__}.",
             field="operator",
             value="IN",
+            reason="membership_operand_type",
+            query_phase="execution",
         )
-    if left is None:
-        return None
     unknown = False
     for element in right:
-        if element is None:
+        equal = _query_equal(left, element)
+        if equal is None:
             unknown = True
             continue
-        if _equal(left, element):
+        if equal:
             # A match decides the answer whatever follows: a later null only matters when
             # nothing matched, so the walk ends here rather than comparing the rest.
             return True
@@ -14911,7 +17246,7 @@ def _build_in_list_memo(value: object, context: _Context) -> _InListMemo | None:
             keys.add(_freeze(element))
         elif kind is float or (kind is int and INT64_MIN <= element <= INT64_MAX):
             has_numbers = True
-            number = float(element)
+            number = element
             # Python set membership can match an identical NaN object; query equality cannot.
             if not isnan(number):
                 keys.add(("in_numeric", number))
@@ -14927,16 +17262,16 @@ def _memo_membership(left: object, memo: _InListMemo) -> object:
     """Answer IN over a hashed list exactly as the linear walk over the same list would.
 
     Exact text/bytes retain frozen-key equality. Supported numeric probes use the same
-    float normalization as the canonical comparison, not Python's int/float set equality.
+    exact int/float comparison as the canonical comparator, without losing INT64 bits.
     Other values retain the walk, including custom conversion/comparison behavior.
     """
     if left is None:
-        return None
+        return None if memo.values else False
     kind = type(left)
     if memo.has_numbers and (
         kind is float or (kind is int and INT64_MIN <= cast(int, left) <= INT64_MAX)
     ):
-        number = float(cast(int | float, left))
+        number = cast(int | float, left)
         if not isnan(number) and ("in_numeric", number) in memo.keys:
             return True
         return None if memo.has_null else False
@@ -14960,18 +17295,37 @@ def _text(operator: str, left: object, right: object) -> object:
     return right in left
 
 
-def _arithmetic(operator: str, left: object, right: object) -> object:
+def _arithmetic(operator: str, left: object, right: object, *, resolver=None) -> object:
     """Return the value of an arithmetic operation, refusing one that has no meaning."""
     if left is None or right is None:
         return None
+    if operator == "+" and (type(left) in (list, tuple) or type(right) in (list, tuple)):
+        from okto_grafx.domain.query.scalars import MAX_GENERATED_LIST_ELEMENTS
+        lhs = left if type(left) in (list, tuple) else (left,)
+        rhs = right if type(right) in (list, tuple) else (right,)
+        if len(lhs) + len(rhs) > MAX_GENERATED_LIST_ELEMENTS:
+            raise GrafxQueryBudgetExceeded("List concatenation exceeds its element budget.", resource="generated_list")
+        return (*lhs, *rhs)
     if operator == "+" and isinstance(left, str) and isinstance(right, str):
         return left + right
+    if operator in ("+", "-") and type(left) in TEMPORAL_CLASSES and type(right) is DurationValue:
+        operation = add_duration if operator == "+" else subtract_duration
+        return operation(left, right, resolver=resolver)
+    if operator == "+" and type(left) is DurationValue and type(right) in TEMPORAL_CLASSES:
+        return add_duration(right, left, resolver=resolver)
+    if operator in ("*", "/") and type(left) is DurationValue and type(right) in (int, float):
+        return scale_duration(left, right, divide=operator == "/")
+    if operator == "*" and type(right) is DurationValue and type(left) in (int, float):
+        return scale_duration(right, left)
+    if type(left) is DecimalValue or type(right) is DecimalValue:
+        return decimal_arithmetic(operator, left, right)
     if not _numbers(left, right):
         raise GrafxPlanError(
             f"The operator {operator!r} applies to numbers; got {type(left).__name__} and "
             f"{type(right).__name__}.",
             field="operator",
             value=operator,
+            reason="arithmetic_operand_type", query_phase="execution",
         )
     if operator == "+":
         return left + right
@@ -14981,6 +17335,9 @@ def _arithmetic(operator: str, left: object, right: object) -> object:
         return left * right
     if operator in ("/", "%"):
         if right == 0:
+            if (operator == "/" and (isinstance(left, float) or isinstance(right, float))
+                    and (left == 0 or isinstance(left, float) and isnan(left))):
+                return float("nan")
             raise GrafxPlanError(
                 f"The operator {operator!r} divides by zero in this query.",
                 field="operator",
@@ -15017,60 +17374,6 @@ def _coalesce_value_type(expression: FunctionCall, value: object) -> ValueType:
             field="function",
             value=expression.name,
         ) from failure
-
-
-def _validate_parameter_maps(parameters: Mapping[str, object]) -> None:
-    """Refuse case-insensitive map-key collisions deterministically during binding."""
-    for name in sorted(parameters):
-        _validate_parameter_map_value(parameters[name], parameter=name, seen=set())
-
-
-def _validate_parameter_map_value(
-    value: object, *, parameter: str, seen: set[int]
-) -> None:
-    """Validate every nested map carried by one referenced parameter."""
-    # Endpoint batches carry hundreds of scalar IDs per layout. Exact built-in
-    # leaves cannot contain map collisions; avoid dynamic Mapping checks for each
-    # one. Subclasses/custom containers still take the complete recursive path.
-    if value is None or type(value) in (str, int, float, bool):
-        return
-    if not isinstance(value, (Mapping, list, tuple)):
-        return
-    marker = id(value)
-    if marker in seen:
-        return
-    seen.add(marker)
-    if isinstance(value, Mapping):
-        by_folded: dict[str, list[str]] = {}
-        for key in value:
-            if isinstance(key, str):
-                by_folded.setdefault(key.lower(), []).append(key)
-        collisions = tuple(
-            sorted(
-                (folded, tuple(sorted(keys)))
-                for folded, keys in by_folded.items()
-                if len(keys) > 1
-            )
-        )
-        if collisions:
-            keys = ", ".join(repr(key) for key in collisions[0][1])
-            message = (
-                f"Parameter ${parameter} contains map keys {keys} that collide "
-                "case-insensitively."
-            )
-            raise GrafxPlanError(
-                message,
-                field="parameter",
-                value=parameter,
-            )
-        ordered = sorted(
-            value.items(), key=lambda item: (type(item[0]).__name__, repr(item[0]))
-        )
-        for _key, item in ordered:
-            _validate_parameter_map_value(item, parameter=parameter, seen=seen)
-        return
-    for item in value:
-        _validate_parameter_map_value(item, parameter=parameter, seen=seen)
 
 
 def _bound_value_type(
@@ -15130,20 +17433,26 @@ def _static_postfix_target_expression(expression: Expression) -> Expression | No
         subject = _static_postfix_target_expression(expression.subject)
         if not isinstance(subject, MapExpression):
             return None
-        return subject.entry(expression.key)
+        entry = subject.entry(expression.key)
+        return entry if entry is not None else Literal(value=None)
     if isinstance(expression, Subscript):
         subject = _static_postfix_target_expression(expression.subject)
+        if isinstance(subject, MapExpression) and isinstance(expression.index, Literal):
+            key = expression.index.value
+            if isinstance(key, str):
+                entry = subject.entry(key)
+                return entry if entry is not None else Literal(value=None)
         if not isinstance(subject, ListExpression):
             return None
         index = expression.index
         if not isinstance(index, Literal):
             return None
         value = index.value
-        if isinstance(value, bool) or not isinstance(value, int) or value == 0:
+        if isinstance(value, bool) or not isinstance(value, int):
             return None
-        offset = value - 1 if value > 0 else value
+        offset = value
         if not -len(subject.elements) <= offset < len(subject.elements):
-            return None
+            return Literal(value=None)
         return subject.elements[offset]
     return expression
 
@@ -15170,6 +17479,8 @@ def _bound_postfix_value(
         subject = _bound_postfix_value(expression.subject, parameters, owner=owner)
         if subject is None:
             return None
+        if type(subject) in TEMPORAL_CLASSES:
+            return temporal_field(subject, expression.key)
         if isinstance(subject, Mapping):
             return _map_property_value(subject, expression)
     elif isinstance(expression, Subscript):
@@ -15237,6 +17548,20 @@ def _infer_bound_pulse_expression_type(
             )
         if any(isinstance(node, Variable) for node in walk(expression.subject)):
             return static_type
+        if not _binder_resolvable(expression):
+            subject_type = _bound_pulse_expression_type(
+                expression.subject, static_types, parameters, owner=owner, _resolved=resolved,
+            )
+            temporal_type = temporal_property_type(subject_type, expression.key)
+            if temporal_type is not None:
+                return temporal_type
+            if subject_type not in (None, ValueType.NULL, ValueType.MAP):
+                raise GrafxPlanError("Property access requires a map, graph entity or NULL.",
+                                     field="property", value=expression.key,
+                                     reason="property_subject_type", query_phase="execution")
+            # A row-independent expression is not necessarily bind-time evaluable:
+            # calls/CASE must execute at their actual query position, not as probes.
+            return ValueType.NULL if subject_type is ValueType.NULL else static_type
         value = _bound_postfix_value(expression, parameters, owner=owner)
         return _bound_value_type(expression, value, owner=owner)
     if isinstance(expression, NullCheck):
@@ -15257,8 +17582,9 @@ def _infer_bound_pulse_expression_type(
             _resolved=resolved,
         )
         if expression.operator == "NOT":
+            boolean_argument_types("NOT", operand_type, phase="execution")
             return ValueType.BOOL
-        if operand_type in (ValueType.NULL, ValueType.INT64, ValueType.DOUBLE):
+        if operand_type in (ValueType.NULL, ValueType.INT64, ValueType.DOUBLE, ValueType.DURATION, ValueType.DECIMAL):
             return operand_type
         if operand_type is None:
             return static_type
@@ -15283,10 +17609,10 @@ def _infer_bound_pulse_expression_type(
             owner=owner,
             _resolved=resolved,
         )
+        if expression.operator in ("AND", "OR", "XOR"):
+            boolean_argument_types(expression.operator, left, right, phase="execution")
+            return ValueType.BOOL
         if expression.operator in (
-            "AND",
-            "OR",
-            "XOR",
             "=",
             "<>",
             "<",
@@ -15299,18 +17625,20 @@ def _infer_bound_pulse_expression_type(
         ):
             return ValueType.BOOL
         if expression.operator == "IN":
-            if right not in (None, ValueType.NULL, ValueType.LIST):
-                message = f"IN looks inside a list; got {right.name}."
-                raise GrafxPlanError(
-                    message,
-                    field="operator",
-                    value=expression.operator,
-                )
+            membership_argument_type(right, phase="execution")
             return ValueType.BOOL
         if left is None or right is None:
             return static_type
         if ValueType.NULL in (left, right):
             return ValueType.NULL
+        if expression.operator == "+" and ValueType.LIST in (left, right):
+            return ValueType.LIST
+        temporal_type = temporal_arithmetic_type(expression.operator, left, right)
+        if temporal_type is not None:
+            return temporal_type
+        decimal_type = decimal_arithmetic_type(expression.operator, left, right)
+        if decimal_type is not None:
+            return decimal_type
         if (
             expression.operator == "+"
             and left is ValueType.STRING
@@ -15332,9 +17660,14 @@ def _infer_bound_pulse_expression_type(
             message,
             field="operator",
             value=expression.operator,
+            reason="arithmetic_operand_type", query_phase="execution",
         )
     if isinstance(expression, FunctionCall):
         name = expression.name.upper()
+        if name in ENTITY_SCALARS:
+            # Result shape is known independently of its runtime argument. Do
+            # not evaluate/refuse an unselected CASE arm or a zero-row call.
+            return entity_scalar_type(name, None)
         argument_types = tuple(
             _bound_pulse_expression_type(
                 argument,
@@ -15352,7 +17685,13 @@ def _infer_bound_pulse_expression_type(
             ):
                 return ValueType.NULL
             return result_type
-        if name == STRING_SPLIT_FUNCTION:
+        if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
+            if argument_types[0] not in (None, ValueType.NULL):
+                raise GrafxPlanError("Path functions require a bound path or NULL.", field="function", value=name)
+            return ValueType.INT64 if name == "LENGTH" else ValueType.LIST
+        if name in NATIVE_SCALARS:
+            return scalar_type(name, *argument_types)
+        if name in (STRING_SPLIT_FUNCTION, "SPLIT"):
             wrong = tuple(
                 value_type
                 for value_type in argument_types
@@ -15421,13 +17760,35 @@ def _infer_bound_pulse_expression_type(
             return ValueType.INT64
         if name == "COUNT":
             return ValueType.INT64
-        if name in ("AVG", "SUM"):
-            return ValueType.DOUBLE
+        if name in ("SUM", "AVG", "PERCENTILEDISC", "PERCENTILECONT"):
+            if name in ("SUM", "AVG") and argument_types[0] is ValueType.DECIMAL:
+                return ValueType.DECIMAL
+            if argument_types[0] not in (None, ValueType.NULL, ValueType.INT64, ValueType.DOUBLE):
+                raise GrafxPlanError("Numeric aggregates require numeric values or NULL.",
+                                     field="function", value=name)
+            return (ValueType.DOUBLE if name in ("AVG", "PERCENTILECONT") else
+                    ValueType.INT64 if argument_types[0] is ValueType.NULL else argument_types[0])
         if name in ("MIN", "MAX"):
             return argument_types[0]
         if name == "COLLECT":
             return ValueType.LIST
         return static_type
+    if isinstance(expression, ListIteration):
+        source_type = _bound_pulse_expression_type(expression.source, static_types, parameters, owner=owner, _resolved=resolved)
+        if source_type not in (None, ValueType.NULL, ValueType.LIST):
+            raise GrafxPlanError("List iteration requires a list.", field="iteration")
+        predicate = expression.body if expression.mode in ("all", "any", "none", "single") else expression.predicate
+        if predicate is not None and _bound_pulse_expression_type(predicate, static_types, parameters, owner=owner, _resolved=resolved) not in (None, ValueType.NULL, ValueType.BOOL):
+            raise GrafxPlanError("List predicates require booleans.", field="iteration")
+        return ValueType.LIST if expression.mode == "map" else None if expression.mode == "reduce" else ValueType.BOOL
+    if isinstance(expression, ListSlice):
+        subject_type = _bound_pulse_expression_type(expression.subject, static_types, parameters, owner=owner, _resolved=resolved)
+        if subject_type not in (None, ValueType.NULL, ValueType.LIST):
+            raise GrafxPlanError("A list slice requires a list.", field="slice")
+        for bound in (expression.start, expression.end):
+            if bound is not None and _bound_pulse_expression_type(bound, static_types, parameters, owner=owner, _resolved=resolved) not in (None, ValueType.NULL, ValueType.INT64):
+                raise GrafxPlanError("List slice bounds require integers.", field="slice")
+        return ValueType.LIST
     if isinstance(expression, ListExpression):
         for element in expression.elements:
             _bound_pulse_expression_type(
@@ -15463,7 +17824,7 @@ def _infer_bound_pulse_expression_type(
             owner=owner,
             _resolved=resolved,
         )
-        subscript_argument_types(expression, subject_type, index_type)
+        subscript_argument_types(expression, subject_type, index_type, phase="execution")
         # Only shapes the binder can actually evaluate are materialized here.  Absence of a
         # Variable is not the same question: string_split('a,b', ',')[1] has none and is still
         # outside the postfix vocabulary, so the old guard sent it to _bound_postfix_value and
@@ -15557,7 +17918,8 @@ def _bound_list_element_type(
     assert common is not None  # narrowed by the guard above
     for value_type in element_types[1:]:
         assert value_type is not None  # narrowed by the guard above
-        common, _normalise = union_common_type(0, common, value_type)
+        if common is not value_type:
+            return None
     return common
 
 
@@ -15567,354 +17929,24 @@ def _required_bound_expression_type(
     parameters: Mapping[str, object],
     *,
     owner: str,
-) -> ValueType:
-    """Return a fully bound scalar type, refusing metadata that still depends on a row."""
+) -> ValueType | None:
+    """Resolve parameter types, leaving heterogeneous row-dependent types for evaluation."""
     value_type = _bound_pulse_expression_type(
         expression, static_types, parameters, owner=owner
     )
-    if value_type is not None:
-        return value_type
-    message = (
-        f"The plan left the type of {expression.describe()} in {owner} unresolved."
-    )
-    raise GrafxPlanError(
-        message,
-        field="expression",
-        value=expression.describe(),
-    )
+    return value_type
 
 
-def _bound_union_columns(
-    plan: PlannedQuery, parameters: Mapping[str, object]
-) -> tuple[bool, ...]:
-    """Prove the two branches agree about every column, and say which ones must widen.
-
-    Run once, before the first row, because a pair that disagrees about a column disagrees
-    whether or not anything matched: discovering it mid-stream would mean a caller had already
-    read rows from a result that was never coherent.
-
-    The compatibility rule lives in :func:`union_common_type`, so planning and bound parameters
-    cannot drift: an identical pair keeps its type, NULL takes the other side's, and INT64 beside
-    DOUBLE widens to DOUBLE. Anything else is refused -- notably BOOL beside INT64, which some
-    dialects treat as one family and this one does not.
-    """
-    static_types = {
-        id(expression): value_type
-        for expression, value_type in plan.pulse_expression_types
-    }
-    if plan.union_columns and len(plan.union_unwind_sources) != 2:
-        raise GrafxPlanError(
-            "A UNION plan carries the UNWIND source metadata of exactly two branches.",
-            field="plan",
-            value="union_unwind_sources",
+def _bound_static_types(plan: PlannedQuery, parameters: Mapping[str, object]) -> dict[int, ValueType | None]:
+    """Resolve parameter-derived WITH aliases without evaluating the query's row pipeline."""
+    types = {id(expression): value_type for expression, value_type in plan.pulse_expression_types}
+    for expression, source in plan.type_alias_sources:
+        types[id(expression)] = _bound_pulse_expression_type(
+            source, types, parameters, owner=expression.describe(),
         )
-    unwind_carriers = tuple(
-        None
-        if unwind is None
-        else _bound_unwind_carrier(
-            unwind[1],
-            parameters,
-            owner="a UNION branch",
-        )
-        for unwind in plan.union_unwind_sources
-    )
-    coercions: list[bool] = []
-    for position, left, _left_type, right, _right_type in plan.union_columns:
-        owner = f"column {position + 1} of a UNION"
-        # The same door the rest of the engine uses to turn a planned type into a bound one,
-        # and the same refusal when the bind cannot finish it. Asking it here is what makes the
-        # parameter case work without this function knowing anything about parameters.
-        resolved: list[ValueType] = []
-        for expression, unwind, carrier in zip(
-            (left, right),
-            plan.union_unwind_sources,
-            unwind_carriers,
-            strict=True,
-        ):
-            resolved.append(
-                _required_bound_union_branch_type(
-                    expression,
-                    static_types,
-                    parameters,
-                    unwind=unwind,
-                    carrier=carrier,
-                    owner=owner,
-                )
-            )
-        first, second = resolved
-        _common, normalise_double = union_common_type(position, first, second)
-        coercions.append(normalise_double)
-    return tuple(coercions)
+    return types
 
 
-def _bound_unwind_carrier(
-    source: Expression,
-    parameters: Mapping[str, object],
-    *,
-    owner: str,
-) -> tuple[object, ...] | None:
-    """Materialise the finite binder vocabulary for one UNWIND source, validating its shape."""
-    if not _binder_resolvable(source):
-        # A row-independent literal/function shape may already have a static type in the plan.
-        # This helper materialises only the binder's deliberately finite postfix vocabulary.
-        return None
-    carrier = _bound_postfix_value(source, parameters, owner=owner)
-    if not isinstance(carrier, (list, tuple)):
-        named = "null" if carrier is None else type(carrier).__name__
-        raise GrafxPlanError(
-            f"UNWIND reads a list or tuple; got {named}.",
-            field="unwind",
-            value=named,
-        )
-    return tuple(carrier)
-
-
-def _required_bound_union_branch_type(
-    expression: Expression,
-    static_types: Mapping[int, ValueType | None],
-    parameters: Mapping[str, object],
-    *,
-    unwind: tuple[str, Expression] | None,
-    carrier: tuple[object, ...] | None,
-    owner: str,
-) -> ValueType:
-    """Resolve one branch column, using each UNWIND element only when the column reads it."""
-    if unwind is None or carrier is None:
-        return _required_bound_expression_type(
-            expression,
-            static_types,
-            parameters,
-            owner=owner,
-        )
-    alias, _source = unwind
-    if not _union_output_depends_on_alias(expression, alias, static_types):
-        return _required_bound_expression_type(
-            expression,
-            static_types,
-            parameters,
-            owner=owner,
-        )
-    if not carrier:
-        # An invariant outer type such as ``x IS NULL`` remains provable without a row.  A bare
-        # ``x`` stays unresolved and therefore fail-closed, since an empty carrier supplies no
-        # evidence about the column's type.
-        return _required_bound_expression_type(
-            expression,
-            static_types,
-            parameters,
-            owner=owner,
-        )
-
-    output_types: list[ValueType] = []
-    for element in carrier:
-        typed_expression = _replace_bound_unwind_alias(
-            expression,
-            alias=alias,
-            element=element,
-        )
-        output_types.append(
-            _required_bound_expression_type(
-                typed_expression,
-                static_types,
-                parameters,
-                owner=owner,
-            )
-        )
-    common = output_types[0]
-    for value_type in output_types[1:]:
-        common, _normalise = union_common_type(0, common, value_type)
-    return common
-
-
-def _union_output_depends_on_alias(
-    expression: Expression,
-    alias: str,
-    static_types: Mapping[int, ValueType | None],
-) -> bool:
-    """Whether this column's ValueType still needs the runtime UNWIND element."""
-    static_type = static_types.get(id(expression))
-    if isinstance(expression, Variable):
-        return expression.name == alias and static_type is None
-    if isinstance(expression, (Property, Subscript)):
-        return static_type is None and any(
-            isinstance(node, Variable) and node.name == alias
-            for node in walk(expression.subject)
-        )
-    if isinstance(expression, NullCheck):
-        return False
-    if isinstance(expression, UnaryOperation):
-        return expression.operator != "NOT" and _union_output_depends_on_alias(
-            expression.operand,
-            alias,
-            static_types,
-        )
-    if isinstance(expression, BinaryOperation):
-        invariant = expression.operator in (
-            "AND",
-            "OR",
-            "XOR",
-            "=",
-            "<>",
-            "<",
-            "<=",
-            ">",
-            ">=",
-            "IN",
-            "STARTS WITH",
-            "ENDS WITH",
-            "CONTAINS",
-        )
-        return not invariant and (
-            _union_output_depends_on_alias(expression.left, alias, static_types)
-            or _union_output_depends_on_alias(expression.right, alias, static_types)
-        )
-    if isinstance(expression, (ListExpression, MapExpression)):
-        return False
-    if isinstance(expression, CaseExpression):
-        return any(
-            _union_output_depends_on_alias(result, alias, static_types)
-            for result in expression.result_expressions()
-        )
-    if isinstance(expression, FunctionCall):
-        fixed = expression.name.upper() in (
-            STRING_SPLIT_FUNCTION,
-            LABEL_FUNCTION,
-            TIMESTAMP_FUNCTION,
-            SIZE_FUNCTION,
-            SIMILARITY_FUNCTION,
-            SIMILARITY_SCORE_FUNCTION,
-            "COUNT",
-            "AVG",
-            "SUM",
-            "COLLECT",
-        )
-        return not fixed and any(
-            _union_output_depends_on_alias(child, alias, static_types)
-            for child in expression.children()
-        )
-    return False
-
-
-def _replace_bound_unwind_alias(
-    expression: Expression,
-    *,
-    alias: str,
-    element: object,
-) -> Expression:
-    """Substitute one UNWIND element into a non-executable branch typing expression."""
-    if isinstance(expression, Variable):
-        return Literal(value=element) if expression.name == alias else expression
-
-    def substituted(child: Expression) -> Expression:
-        """Substitute the bound UNWIND alias recursively in one child."""
-        return _replace_bound_unwind_alias(child, alias=alias, element=element)
-
-    if isinstance(expression, Property):
-        subject = substituted(expression.subject)
-        return (
-            expression
-            if subject is expression.subject
-            else replace(expression, subject=subject)
-        )
-    if isinstance(expression, UnaryOperation):
-        operand = substituted(expression.operand)
-        return (
-            expression
-            if operand is expression.operand
-            else replace(expression, operand=operand)
-        )
-    if isinstance(expression, BinaryOperation):
-        left = substituted(expression.left)
-        right = substituted(expression.right)
-        if left is expression.left and right is expression.right:
-            return expression
-        return replace(expression, left=left, right=right)
-    if isinstance(expression, NullCheck):
-        operand = substituted(expression.operand)
-        return (
-            expression
-            if operand is expression.operand
-            else replace(expression, operand=operand)
-        )
-    if isinstance(expression, Subscript):
-        subject = substituted(expression.subject)
-        index = substituted(expression.index)
-        if subject is expression.subject and index is expression.index:
-            return expression
-        return replace(expression, subject=subject, index=index)
-    if isinstance(expression, FunctionCall):
-        arguments = tuple(substituted(argument) for argument in expression.arguments)
-        named_arguments = tuple(
-            argument
-            if (value := substituted(argument.value)) is argument.value
-            else replace(argument, value=value)
-            for argument in expression.named_arguments
-        )
-        if all(
-            new is old for new, old in zip(arguments, expression.arguments, strict=True)
-        ) and all(
-            new is old
-            for new, old in zip(
-                named_arguments, expression.named_arguments, strict=True
-            )
-        ):
-            return expression
-        return replace(
-            expression,
-            arguments=arguments,
-            named_arguments=named_arguments,
-        )
-    if isinstance(expression, ListExpression):
-        elements = tuple(substituted(item) for item in expression.elements)
-        if all(
-            new is old for new, old in zip(elements, expression.elements, strict=True)
-        ):
-            return expression
-        return replace(expression, elements=elements)
-    if isinstance(expression, MapExpression):
-        entries = tuple(
-            entry
-            if (value := substituted(entry.value)) is entry.value
-            else replace(entry, value=value)
-            for entry in expression.entries
-        )
-        if all(
-            new is old for new, old in zip(entries, expression.entries, strict=True)
-        ):
-            return expression
-        return replace(expression, entries=entries)
-    if isinstance(expression, CaseExpression):
-        operand = (
-            None if expression.operand is None else substituted(expression.operand)
-        )
-        alternatives = []
-        for alternative in expression.alternatives:
-            condition = substituted(alternative.condition)
-            result = substituted(alternative.result)
-            alternatives.append(
-                alternative
-                if condition is alternative.condition and result is alternative.result
-                else replace(alternative, condition=condition, result=result)
-            )
-        fallback = (
-            None if expression.fallback is None else substituted(expression.fallback)
-        )
-        if (
-            operand is expression.operand
-            and fallback is expression.fallback
-            and all(
-                new is old
-                for new, old in zip(alternatives, expression.alternatives, strict=True)
-            )
-        ):
-            return expression
-        return replace(
-            expression,
-            operand=operand,
-            alternatives=tuple(alternatives),
-            fallback=fallback,
-        )
-    return expression
 
 
 def _bound_case_types(
@@ -15925,10 +17957,15 @@ def _bound_case_types(
         id(expression): planned_types
         for expression, planned_types in plan.case_comparison_types
     }
-    static_types = {
-        id(expression): value_type
-        for expression, value_type in plan.pulse_expression_types
-    }
+    static_types = _bound_static_types(plan, parameters)
+    for expression, _value_type in plan.pulse_expression_types:
+        if (isinstance(expression, UnaryOperation) and expression.operator == "NOT"
+                or isinstance(expression, BinaryOperation) and expression.operator in {"AND", "OR", "XOR", "IN"}):
+            _bound_pulse_expression_type(expression, static_types, parameters, owner="logical/membership operator")
+        if isinstance(expression, (ListSlice, ListIteration)):
+            _bound_pulse_expression_type(expression, static_types, parameters, owner="slice")
+        if isinstance(expression, FunctionCall) and expression.name.upper() in NATIVE_SCALARS | ENTITY_SCALARS | PERCENTILE_FUNCTIONS | {"LENGTH", "NODES", "RELATIONSHIPS", "SUM", "AVG"}:
+            _bound_pulse_expression_type(expression, static_types, parameters, owner=expression.name)
     resolved: dict[int, ValueType | None] = {}
     for expression, planned_results in plan.case_result_types:
         compared = (
@@ -15992,10 +18029,7 @@ def _validate_bound_subscript_types(
     plan: PlannedQuery, parameters: Mapping[str, object]
 ) -> None:
     """Complete list and index parameter types before the first row is read."""
-    static_types = {
-        id(expression): value_type
-        for expression, value_type in plan.pulse_expression_types
-    }
+    static_types = _bound_static_types(plan, parameters)
     for expression, planned_types in plan.subscript_types:
         subject_type = _required_bound_expression_type(
             expression.subject,
@@ -16009,7 +18043,7 @@ def _validate_bound_subscript_types(
             parameters,
             owner=expression.describe(),
         )
-        subscript_argument_types(expression, subject_type, index_type)
+        subscript_argument_types(expression, subject_type, index_type, phase="execution")
         if _binder_resolvable(expression):
             # Evaluating it here is what turns "zero rows" back into a refusal: the position
             # and the list are both bound, so an out-of-range subscript is already wrong
@@ -16344,7 +18378,7 @@ def _timestamp_bindable(expression: Expression) -> bool:
     if isinstance(expression, FunctionCall):
         return expression.name.upper() in (
             COALESCE_FUNCTION,
-            STRING_SPLIT_FUNCTION,
+            STRING_SPLIT_FUNCTION, "SPLIT",
         ) and all(_timestamp_bindable(argument) for argument in expression.arguments)
     if isinstance(expression, CaseExpression):
         compared = (
@@ -16419,13 +18453,15 @@ def _bound_coalesce_types(
             if planned_type is not None:
                 argument_types.append(planned_type)
                 continue
+            if isinstance(argument, FunctionCall) and argument.name.upper() in NATIVE_SCALARS:
+                static_types = {id(item): value_type for item, value_type in plan.pulse_expression_types}
+                argument_types.append(_bound_pulse_expression_type(
+                    argument, static_types, parameters, owner=expression.name))
+                continue
             if not isinstance(argument, Parameter):
-                message = f"{expression.name} could not resolve the type of {argument.describe()}."
-                raise GrafxPlanError(
-                    message,
-                    field="function",
-                    value=expression.name,
-                )
+                # A heterogeneous expression is valid; its selected value is runtime typed.
+                argument_types.append(None)
+                continue
             argument_types.append(
                 _coalesce_value_type(expression, parameters[argument.name])
             )
@@ -16434,34 +18470,105 @@ def _bound_coalesce_types(
 
 
 def _coalesce(expression: FunctionCall, row: _Row, context: _Context) -> object:
-    """Return the first non-null scalar after eagerly evaluating every argument."""
-    values = tuple(
-        _evaluate(argument, row, context) for argument in expression.arguments
-    )
-    return _coalesce_selected(expression, values, context)
+    """Return the first non-null value without executing later arguments."""
+    for argument in expression.arguments:
+        value = _evaluate(argument, row, context)
+        if value is not None:
+            return _coalesce_selected(expression, (value,), context)
+    return None
 
 
 def _coalesce_selected(
     expression: FunctionCall, values: tuple[object, ...], context: _Context
 ) -> object:
-    """Select and coerce the coalesce answer from already evaluated arguments."""
-    selected = next((value for value in values if value is not None), None)
-    if selected is None:
-        return None
-    result_type = context.coalesce_types.get(id(expression))
-    if result_type is None:
-        runtime_types = tuple(
-            _coalesce_value_type(expression, value) for value in values
-        )
-        result_type = coalesce_result_type(expression.name, runtime_types)
-    if result_type is ValueType.DOUBLE:
-        return float(selected)
-    return selected
+    """Preserve the selected value and its exact type; storage coercion is a separate boundary."""
+    return next((value for value in values if value is not None), None)
+
+
+def _binding_properties(subject: RowBinding, context: _Context) -> Mapping[str, Value]:
+    """Expose only owner-visible logical properties, excluding physical endpoints."""
+    context.require_entity_content(subject)
+    subject = context.resolve_binding(subject)
+    state = _entity_overlay(context, subject.table)
+    values = _current_values(context, subject) if subject.ref is None else state.get(subject.ref)
+    if values is None:
+        values = subject.version.values
+    if subject.table.flexible_properties:
+        return _flexible_properties(subject.table, values)
+    first = ENDPOINT_COLUMN_COUNT if subject.table.kind == "rel" else 0
+    properties = {}
+    for position, column in enumerate(subject.table.columns):
+        if position < first:
+            continue
+        item = values[position] if position < len(values) else None
+        if _is_unmaterialized_column(item):
+            raise GrafxPlanError("properties() requires complete property projection.", field="projection")
+        if item is not None:
+            properties[column.name] = item
+    return properties
 
 
 def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
     """Return the value of a function call: the score, or an aggregate already computed."""
     name = expression.name.upper()
+    if name in ENTITY_SCALARS:
+        subject = _evaluate(expression.arguments[0], row, context)
+        if subject is None:
+            return None
+        if name in {"PROPERTIES", "KEYS"} and isinstance(subject, Mapping):
+            return tuple(subject) if name == "KEYS" else dict(subject)
+        if not isinstance(subject, RowBinding):
+            raise entity_scalar_error(name, "execution")
+        kind = "relationship" if subject.table.kind == "rel" else "node"
+        entity_scalar_type(name, None, entity_kind=kind, phase="execution")
+        if name != "TYPE":
+            context.require_entity_content(subject)
+        if name == "LABELS":
+            return _current_node_labels(context, subject)
+        if name == "TYPE":
+            return context.schema().relationship_type_name(subject.table.table_id)
+        if name in {"STARTNODE", "ENDNODE"}:
+            subject = context.resolve_binding(subject)
+            position = 0 if name == "STARTNODE" else 1
+            table_name = subject.table.from_table if position == 0 else subject.table.to_table
+            table = context.schema().table(table_name,kind="node")
+            identity = _current_values(context,subject)[position]
+            view = _owner_landing_view(context.engine,context,table,_ended_by_this_transaction(context))
+            found = view.get(identity,context)
+            if found is None:
+                raise GrafxPlanError("Relationship endpoint is not visible to this transaction.",
+                                     field="entity", reason="endpoint_not_visible", query_phase="execution")
+            reference,version = found
+            return RowBinding(variable="\x00endpoint",table=table,ref=reference,version=version,polymorphic=True)
+        properties = _binding_properties(subject, context)
+        return tuple(properties) if name == "KEYS" else dict(properties)
+    if name == "RAND":
+        source = context.engine._random_source
+        if source is None:
+            raise GrafxPlanError("No random source was supplied to this query engine.", field="function", value=name)
+        try:
+            value = source()
+        except Exception as error:
+            raise GrafxPlanError("The random source failed.", field="function", value=name) from error
+        if type(value) is not float or not 0.0 <= value < 1.0:
+            raise GrafxPlanError("The random source must return a finite DOUBLE in [0, 1).", field="function", value=name)
+        return value
+    if name in ("LENGTH", "NODES", "RELATIONSHIPS"):
+        path = _evaluate(expression.arguments[0], row, context)
+        if path is None:
+            return None
+        if type(path) is not _PathValue:
+            raise GrafxPlanError("Path functions require a bound path or NULL.", field="function", value=name)
+        if name == "LENGTH":
+            return len(path.relationships)
+        return path.nodes if name == "NODES" else path.relationships
+    if name in NATIVE_SCALARS:
+        from okto_grafx.domain.query.temporal_functions import TEMPORAL_ARITIES, temporal_function
+        arguments = tuple(_evaluate(argument, row, context) for argument in expression.arguments)
+        if name in TEMPORAL_ARITIES:
+            return temporal_function(name, arguments, context=context.temporal_context,
+                                     resolver=context.engine._temporal_resolver)
+        return scalar_value(name, *arguments)
     if name == "UDF":
         registry = context.engine._extensions
         if registry is None:
@@ -16470,7 +18577,7 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
         return registry.call_scalar(arguments[0], arguments[1:])
     if name == COALESCE_FUNCTION:
         return _coalesce(expression, row, context)
-    if name == STRING_SPLIT_FUNCTION:
+    if name in (STRING_SPLIT_FUNCTION, "SPLIT"):
         text = _evaluate(expression.arguments[0], row, context)
         separator = _evaluate(expression.arguments[1], row, context)
         if text is None or separator is None:
@@ -16486,22 +18593,8 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
                 value=expression.name,
             )
         if not separator:
-            if not text:
-                message = f"{expression.name} cannot split an empty string with an empty separator."
-                raise GrafxPlanError(
-                    message,
-                    field="function",
-                    value=expression.name,
-                )
-            return tuple(text)
-        pieces = str.split(text, separator)
-        if len(pieces) == 1:
-            return tuple(pieces)
-        trailing_empty = pieces[-1] == ""
-        result = [piece for piece in pieces if piece]
-        if trailing_empty:
-            result.append("")
-        return tuple(result)
+            return tuple(text) if text else ("",)
+        return tuple(str.split(text, separator))
     if name == TIMESTAMP_FUNCTION:
         if expression in context.timestamp_values:
             return context.timestamp_values[expression]
@@ -16524,7 +18617,7 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
                 field="function",
                 value=expression.name,
             )
-        return subject.table.name
+        return None if subject.table.unlabeled else subject.table.name
     if name == SIZE_FUNCTION:
         value = _evaluate(expression.arguments[0], row, context)
         if value is None:
@@ -16577,10 +18670,109 @@ def _call(expression: FunctionCall, row: _Row, context: _Context) -> object:
 # --- value helpers ------------------------------------------------------------------------------
 
 
-def _projected(row: _Row, columns: tuple[str, ...]) -> tuple[Value, ...]:
+def _projected(row: _Row, columns: tuple[str, ...], context: _Context) -> tuple[Value, ...]:
     """Return the projected values of one row, in column order."""
     values = row.columns if row.columns is not None else {}
-    return tuple(_as_value(values.get(name)) for name in columns)
+    return tuple(_entity_result_value(values.get(name), context) for name in columns)
+
+
+def _entity_overlay(context: _Context, table: TableDef) -> dict[object, tuple[Value, ...] | None]:
+    """Share one reduced overlay per table/revision, not an O(writes) scan per output."""
+    intents = getattr(context.txn, "row_intents", ())
+    revision = (id(intents), len(intents), getattr(intents, "rewrite_revision", None),
+                len(context.staged_rows), context.staged_rows.rewrite_revision)
+    if context.entity_overlay_revision != revision:
+        context.entity_overlays.clear()
+        context.entity_overlay_revision = revision
+    state = context.entity_overlays.get(table.table_id)
+    if state is None:
+        updated, inserted = _transaction_row_view(context, table)
+        state = dict(updated)
+        state.update(inserted)
+        context.entity_overlays[table.table_id] = state
+    return state
+
+
+def _qualified_entity_identity(context: _Context, binding: RowBinding) -> EntityIdentity:
+    """Qualify an entity without returning any PendingRowRef/transaction authority."""
+    database_uuid = context.engine._entity_database_uuid
+    if database_uuid is None:
+        raise GrafxConfigurationError("Entity results need the owning database UUID.", field="database_uuid")
+    kind = "relationship" if binding.table.kind == "rel" else "node"
+    reference = binding.ref
+    if not isinstance(reference, PendingRowRef) and binding.record_id > 0:
+        return EntityIdentity(database_uuid, binding.table.table_id, kind, record_id=binding.record_id)
+    namespace = context.engine._entity_namespace
+    if namespace is None:
+        raise GrafxConfigurationError("Pending entity results need a composition-owned namespace.", field="entity_namespace")
+    if isinstance(reference, PendingRowRef):
+        owns = getattr(context.txn, "owns_pending_row_ref", None)
+        if not callable(owns) or not owns(reference) or reference.table_id != binding.table.table_id:
+            raise GrafxConfigurationError("A provisional entity needs an authentic local reference.", field="entity_identity")
+        logical = ("pending", reference.txn_id, reference.table_id, reference.token)
+    else:
+        # An insertion cancelled in its own statement has no published reference.
+        # Its observation still gets an opaque, execution-unique identity.
+        if not context.entity_sequence:
+            with context.engine._endpoint_guard:
+                context.engine._entity_sequence += 1
+                context.entity_sequence = context.engine._entity_sequence
+        logical = ("held", context.entity_sequence, binding.table.table_id, context.token_for(binding))
+    nonce = blake2b(repr(logical).encode("ascii"), key=namespace, digest_size=16).digest()
+    return EntityIdentity(database_uuid, binding.table.table_id, kind, provisional_id=nonce)
+
+
+def _entity_result_value(value: object, context: _Context, *, procedure: TabularProcedure | None = None,
+                         procedure_bytes: int | None = None) -> Value:
+    """Materialize returned graph bindings, including nested entity-valued results."""
+    if type(value) is _PathValue:
+        return PathValue(tuple(_entity_result_value(item, context) for item in value.nodes),
+                         tuple(_entity_result_value(item, context) for item in value.relationships))  # type: ignore[return-value, arg-type]
+    if isinstance(value, RowBinding):
+        binding = context.resolve_binding(value)
+        assert isinstance(binding, RowBinding)
+        identity = _qualified_entity_identity(context, binding)
+        state = _entity_overlay(context, binding.table)
+        values = _current_values(context, binding) if binding.ref is None else state.get(binding.ref)
+        if values is None:
+            values = binding.version.values
+        pending = binding.pending_observation or not identity.committed or binding.ref in state or binding.version.xmin == NO_CSN
+        provenance = EntityProvenance(
+            context.snapshot.read_lsn, binding.table.schema_version,
+            binding.version.xmin if binding.version.xmin != NO_CSN else None, pending=pending,
+        )
+        first = ENDPOINT_COLUMN_COUNT if binding.table.kind == "rel" else 0
+        properties = {}
+        for position, column in enumerate(binding.table.columns):
+            if position < first:
+                continue
+            item = values[position] if position < len(values) else None
+            if _is_unmaterialized_column(item):
+                raise GrafxPlanError("Entity materialization requires its complete property projection.", field="projection")
+            properties[column.name] = item
+        if binding.table.flexible_properties:
+            properties = dict(_flexible_properties(binding.table, values))
+        if procedure is not None:
+            properties = owned_procedure_value(properties, "MAP", max_bytes=max(1, procedure_bytes or 1),
+                                               procedure=procedure.name)
+        if binding.table.kind == "node":
+            labels = _current_node_labels(context, binding)
+            return NodeValue(identity, labels[0] if labels else None, properties, provenance, node_labels=labels)  # type: ignore[return-value]
+        endpoints = []
+        for table_name, endpoint in zip((binding.table.from_table, binding.table.to_table), values[:2], strict=True):
+            table = context.schema().table(table_name, kind="node")
+            if isinstance(endpoint, PendingRowRef):
+                endpoint_binding = _pending_binding("endpoint", table, (), reference=endpoint)
+                endpoints.append(_qualified_entity_identity(context, endpoint_binding))
+            else:
+                endpoints.append(EntityIdentity(identity.database_uuid, table.table_id, "node", record_id=endpoint))
+        return RelationshipValue(identity, context.schema().relationship_type_name(binding.table.table_id),
+                                 *endpoints, properties, provenance)  # type: ignore[return-value]
+    if isinstance(value, (tuple, list)):
+        return tuple(_entity_result_value(item, context) for item in value)
+    if isinstance(value, dict):
+        return {key: _entity_result_value(item, context) for key, item in value.items()}
+    return _as_value(value)
 
 
 def _binding_identity(binding: RowBinding) -> tuple[object, ...]:
@@ -16593,111 +18785,14 @@ def _binding_identity(binding: RowBinding) -> tuple[object, ...]:
     return ("stored", binding.table.table_id, binding.record_id)
 
 
-def _path_identity(context: _Context, binding: RowBinding) -> _PathIdentity:
-    """Return a public-shaped opaque identity without exposing a pending reference.
 
-    Durable identities already fit the query value domain in ordinary databases and remain
-    stable across executions. A pending row has only a transaction-private negative token, and
-    a theoretical durable u64 above the signed query domain cannot be published directly. Both
-    receive a collision-free negative identity allocated from this execution's context. The
-    allocation depends only on encounter order; it neither copies nor transforms the private
-    token.
-    """
-    if (
-        not isinstance(binding.ref, PendingRowRef)
-        and 1 <= binding.record_id <= INT64_MAX
-    ):
-        offset = binding.record_id
-    else:
-        logical = _binding_identity(binding)
-        offset = context.path_identities.get(logical)
-        if offset is None:
-            context.path_identities_issued += 1
-            offset = INT64_MIN + context.path_identities_issued - 1
-            context.path_identities[logical] = offset
-    return _PathIdentity(offset=offset, table=binding.table.table_id)
-
-
-def _path_properties(binding: RowBinding) -> tuple[tuple[str, Value], ...]:
-    """Return every user property in schema order, padding an old short version with nulls."""
-    first = ENDPOINT_COLUMN_COUNT if binding.table.kind == "rel" else 0
-    values = binding.version.values
-    return tuple(
-        (
-            column.name,
-            values[position] if position < len(values) else None,
-        )
-        for position, column in enumerate(binding.table.columns)
-        if position >= first
-    )
-
-
-def _one_hop_path_value(
-    context: _Context,
-    source: RowBinding,
-    relationship: RowBinding,
-    target: RowBinding,
-) -> _PathValue:
-    """Detach the exact visible hop into a nominal, capability-free result marker."""
-    if source.table.kind != "node" or target.table.kind != "node":
-        raise GrafxPlanError(
-            "A projected path begins and ends at node tables.",
-            field="path",
-            value="non_node_endpoint",
-        )
-    if relationship.table.kind != "rel":
-        raise GrafxPlanError(
-            "A projected path carries a relationship table between its nodes.",
-            field="path",
-            value="non_relationship_hop",
-        )
-    if (
-        relationship.table.from_table != source.table.name
-        or relationship.table.to_table != target.table.name
-    ):
-        raise GrafxPlanError(
-            "A projected outgoing path must preserve its relationship table's endpoints.",
-            field="path",
-            value=relationship.table.name,
-        )
-
-    source_identity = _path_identity(context, source)
-    target_identity = _path_identity(context, target)
-    relationship_identity = _path_identity(context, relationship)
-    return _PathValue(
-        nodes=(
-            _PathNodeValue(
-                identity=source_identity,
-                label=source.table.name,
-                properties=_path_properties(source),
-            ),
-            _PathNodeValue(
-                identity=target_identity,
-                label=target.table.name,
-                properties=_path_properties(target),
-            ),
-        ),
-        relationships=(
-            _PathRelationshipValue(
-                source=source_identity,
-                target=target_identity,
-                label=relationship.table.name,
-                identity=relationship_identity,
-                properties=_path_properties(relationship),
-            ),
-        ),
-    )
 
 
 def _as_value(value: object) -> Value:
-    """Detach bindings recursively so no private pending reference reaches a result value.
+    """Adapt legacy internal scalar carriers, never the public entity result door.
 
-    A node matched WITHOUT a label detaches as a map of its label and its properties. It has to
-    carry the label: the caller asked across tables and the row alone would not say which one it
-    came from. It carries no identity at all -- no record id, no reference, no version, no table
-    id -- because those are owner-private and a caller who received one could do nothing correct
-    with it. A node matched under a label keeps answering the identity it always answered; this
-    path is additive rather than a change to what was already published.
+    Public entity/path results must use _entity_result_value with their owning
+    context. This helper remains for internal scalar/property operations.
     """
     if isinstance(value, RowBinding):
         if value.polymorphic:
@@ -16710,9 +18805,7 @@ def _as_value(value: object) -> Value:
             }
         return value.record_id
     if type(value) is _PathValue:
-        # The public result snapshot recognizes this exact nominal marker and rebuilds it into
-        # ordinary maps and tuples after page access has ended.
-        return value  # type: ignore[return-value]
+        raise GrafxPlanError("Path results require their owning materialization context.", field="path")
     if isinstance(value, (list, tuple)):
         return tuple(_as_value(item) for item in value)
     if isinstance(value, dict):
@@ -16725,13 +18818,22 @@ def _freeze(value: object) -> object:
 
     The kind tag is what makes this usable for equality as well as for duplicates: ``1`` and
     ``"1"`` carry different tags and can never collide, while a dictionary and any other mapping
-    of the same pairs carry the same tag and do. The scalar tag keeps the Python class name, so
-    an integer and a double stay distinguishable for DISTINCT even though ``=`` treats them as
-    one number -- those are two different questions and the numeric branch of :func:`_equal`
-    answers the second one before it ever reaches here.
+    of the same pairs carry the same tag and do. Numeric values share a key without converting
+    INT64 to DOUBLE; booleans stay distinct. Nested NULLs group together, unlike query equality.
     """
     if isinstance(value, RowBinding):
         return ("binding", _binding_identity(value))
+    if type(value) is _PathValue:
+        return ("path", tuple(_binding_identity(node) for node in value.nodes),
+                tuple(_binding_identity(edge) for edge in value.relationships))
+    if type(value) in (int, float):
+        # Equal numeric keys must have identical encodings in the byte-keyed spill store.
+        # Never round an integer through float: convert only exactly integral floats.
+        if type(value) is float and value.is_integer():
+            value = int(value)
+        return ("number", value)
+    if type(value) is DecimalValue:
+        return decimal_group_key(value)
     if isinstance(value, (bytes, bytearray)):
         return ("bytes", bytes(value))
     if isinstance(value, (list, tuple)):
@@ -16768,22 +18870,32 @@ def _sort_key(value: object) -> tuple[int, object]:
     direction is reversed.
     """
     if value is None:
-        return (6, 0)
+        return (12, 0)
+    if isinstance(value, Mapping):
+        return (0, tuple((key, _sort_key(item)) for key, item in sorted(value.items())))
+    if isinstance(value, RowBinding):
+        return (1 if value.table.kind == "node" else 2, _binding_identity(value))
+    if type(value) is _PathValue:
+        return (4, _freeze(value))
+    if isinstance(value, (list, tuple)):
+        return (3, tuple(_sort_key(item) for item in value))
+    if isinstance(value, str):
+        return (5, value)
     if isinstance(value, bool):
-        return (0, int(value))
+        return (6, int(value))
     if isinstance(value, (int, float)):
         if isinstance(value, float) and isnan(value):
-            return (1, (1, 0.0))
-        return (1, (0, value))
-    if isinstance(value, str):
-        return (2, value)
+            return (7, (1, 0.0))
+        return (7, (0, value))
+    if type(value) is DecimalValue:
+        return (7, (0, DecimalOrderKey(value)))
     if isinstance(value, (bytes, bytearray)):
-        return (3, bytes(value))
+        return (10, bytes(value))
     if isinstance(value, Timestamp):
-        return (4, value.micros)
-    if isinstance(value, RowBinding):
-        return (5, _binding_identity(value))
-    return (7, repr(value))
+        return (9, value.micros)
+    if type(value) in TEMPORAL_CLASSES:
+        return (8, temporal_order_key(value))
+    return (11, repr(value))
 
 
 def _truth(value: object) -> bool | None:
@@ -16792,7 +18904,8 @@ def _truth(value: object) -> bool | None:
         return None
     if isinstance(value, bool):
         return value
-    return None
+    raise GrafxPlanError("Boolean operators require BOOL or NULL operands.",
+                         field="operator", reason="boolean_operand_type", query_phase="execution")
 
 
 def _numbers(left: object, right: object) -> bool:
@@ -16851,12 +18964,16 @@ def _equal(left: object, right: object) -> bool:
     # _freeze. Proved over every pair of a spread of values: removing this line changed no
     # answer in 576 comparisons.
     kind = type(left)
+    if kind is DecimalValue or type(right) is DecimalValue:
+        if kind not in (DecimalValue, int, float) or type(right) not in (DecimalValue, int, float):
+            return False
+        return decimal_numeric_compare(left, right) == 0
     if kind is type(right) and (kind is str or kind is bytes):
         # One exact built-in kind on both sides: _freeze would tag both identically and compare
         # the payloads, so the payload comparison is the same answer without two tuples.
         return left == right
     if _numbers(left, right):
-        return float(left) == float(right)
+        return left == right
     if isinstance(left, RowBinding) or isinstance(right, RowBinding):
         return (
             isinstance(left, RowBinding)

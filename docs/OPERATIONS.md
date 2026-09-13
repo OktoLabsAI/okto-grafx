@@ -1,5 +1,15 @@
 # Operations, concurrency and recovery
 
+Opt-in [native system history](SYSTEM_TIME_HISTORY.md) participates in the same
+COMMIT/recovery protocol and physical backup. Its named retention pins are
+independent of MVCC/WAL reader registration. Pruning is an explicit bounded
+payload-redaction operation, not disk compaction or autonomous recovery.
+The separate `compact_system_history(confirm_quiescent=True)` reclaims expired
+payload extents/obsolete temporal paths only after native replacement and
+checkpoint, with all other processes stopped. Optional temporal indexes share
+the history COMMIT, verification and recovery; they are not permission caches.
+See [0.0.6 wheel compatibility](V006_COMPATIBILITY.md) before enabling new bits.
+
 [Logical export/import](LOGICAL_TRANSFER.md) creates a separately writable fresh-UUID
 store; [physical restore](BACKUP_RESTORE.md) remains an offline same-UUID replacement.
 Neither copies live participants into a fork. [FTS operations](FULL_TEXT_SEARCH.md#operations-and-compatibility)
@@ -34,6 +44,25 @@ Use `descriptor_revalidation="strict"` unless the generation-mode prerequisites
 are met. Neither mode makes concurrent external file replacement a supported restore.
 
 ## Concurrency contract
+
+### ACID scope
+
+Grafx implements ACID transaction properties within one supported local store,
+with snapshot isolation and optimistic conflict validation. This describes the
+implemented contract, not independent certification or universal serializability.
+
+| Property | Implemented guarantee and boundary | Evidence |
+| --- | --- | --- |
+| Atomicity | A transaction's changes commit together or roll back; recovery must not promote effects without a valid durable COMMIT. A failure after the durable barrier is not a rollback. | [Commit/rollback protocol tests](../tests/txn/test_commit_protocol.py), [committed redo](../tests/recovery/test_commit_redo.py). |
+| Consistency | Supported type, primary-key, endpoint, schema and storage invariants are enforced by the corresponding operations. Arbitrary business invariants are not inferred or enforced automatically. | [Typed query/write contract](QUERY_LANGUAGE.md), [native protocol](architecture/CONTRACT.md). |
+| Isolation | Readers use MVCC snapshots; writers must pass optimistic logical and physical validation. Do not infer general predicate locking or serializability for every application invariant. | [Visibility tests](../tests/txn/test_snapshot.py), [OCC tests](../tests/txn/test_occ.py). |
+| Durability | A successful durable write acknowledges its WAL barrier; verified recovery handles committed effects. Guarantees depend on supported filesystem/storage behavior. `:memory:` is not power-loss durable. | [WAL ordering and post-barrier outcomes](../tests/txn/test_commit_protocol.py), [recovery tests](../tests/recovery/test_commit_redo.py). |
+
+ACID does not mean distributed transactions, zero possible corruption, automatic
+repair of arbitrary damage, or identical isolation levels across products.
+Host side effects, other databases and remote calls are outside this transaction.
+For read-dependent business rules, validate the specific concurrent workload and
+enforcement strategy; do not assume snapshot isolation alone prevents every anomaly.
 
 Independent processes/threads can own concurrent transactions. Each reader sees
 its snapshot and each writer uses optimistic validation. A writer lease and an
@@ -202,6 +231,14 @@ pins. It reports ended versions and record-slot bytes that are eligible or retai
 horizon, but deliberately excludes overflow-page bytes and keeps
 `vacuum_safety_established=False`: observing potential bloat neither mutates the database nor
 certifies that physical reclamation is safe.
+
+For `bloat` and `vacuum`, `table` accepts `None` (all tables), a unique string
+name, or `("node", name)` / `("rel", name)`. A bare ambiguous name refuses before
+mutation or capability activation. Each table report retains `table_id`; its
+`table` field is a qualified pair only when the current catalog contains both
+kinds with that name, otherwise the original string. Code serializing reports
+must handle both selector shapes. Qualification does not change the global
+reclamation horizon, quiescence requirement or snapshot-floor consequences.
 
 `db.maintenance.vacuum(table=None, *, confirm_quiescent=False, max_versions=None)` is the
 separate mutating operation. Vacuum v1 is manual and foreground. It refuses catalog v1,

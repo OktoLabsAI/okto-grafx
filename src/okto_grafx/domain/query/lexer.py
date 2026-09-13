@@ -170,6 +170,7 @@ def tokenize(text: str) -> tuple[Token, ...]:
         Token(
             kind=TokenKind.END,
             text="",
+            end_offset=scanner.index,
             offset=scanner.index,
             line=scanner.line,
             column=scanner.column,
@@ -274,6 +275,7 @@ def _read_name(scanner: _Scanner) -> Token:
     return Token(
         kind=TokenKind.NAME,
         text=name,
+        end_offset=scanner.index,
         offset=offset,
         line=line,
         column=column,
@@ -312,14 +314,8 @@ def _read_quoted_name(scanner: _Scanner) -> Token:
             )
         characters.append(character)
     name = "".join(characters)
-    if not name:
-        raise _refuse(
-            "A back-quoted name may not be empty",
-            line=line,
-            column=column,
-            offset=offset,
-            field="name",
-        )
+    # Empty quoted text is a legitimate map key. Whether this token names a
+    # variable, schema object or map key belongs to parsing/semantic admission.
     return Token(
         kind=TokenKind.NAME,
         text=name,
@@ -328,6 +324,7 @@ def _read_quoted_name(scanner: _Scanner) -> Token:
         column=column,
         value=name,
         quoted=True,
+        end_offset=scanner.index,
     )
 
 
@@ -345,7 +342,7 @@ def _require_name_length(name: str, *, line: int, column: int, offset: int) -> N
 
 
 def _read_parameter(scanner: _Scanner) -> Token:
-    """Read a ``$name`` parameter reference."""
+    """Read a named, quoted or decimal-integer parameter reference without renaming it."""
     line, column, offset = scanner.line, scanner.column, scanner.index
     scanner.advance()
     if scanner.peek() == _BACK_QUOTE:
@@ -353,6 +350,7 @@ def _read_parameter(scanner: _Scanner) -> Token:
         return Token(
             kind=TokenKind.PARAMETER,
             text=inner.text,
+            end_offset=scanner.index,
             offset=offset,
             line=line,
             column=column,
@@ -366,9 +364,9 @@ def _read_parameter(scanner: _Scanner) -> Token:
             continue
         break
     name = "".join(characters)
-    if not name or name[0] in _DIGITS:
+    if not name or (name[0] in _DIGITS and not name.isdecimal()):
         raise _refuse(
-            "A parameter is written as a dollar sign followed by a name, as in $limit",
+            "A parameter requires a name or decimal integer after the dollar sign, as in $limit or $1",
             line=line,
             column=column,
             offset=offset,
@@ -378,6 +376,7 @@ def _read_parameter(scanner: _Scanner) -> Token:
     return Token(
         kind=TokenKind.PARAMETER,
         text=name,
+        end_offset=scanner.index,
         offset=offset,
         line=line,
         column=column,
@@ -387,6 +386,8 @@ def _read_parameter(scanner: _Scanner) -> Token:
 
 def _read_number(scanner: _Scanner) -> Token:
     """Read an integer or a double, refusing one too long to convert or not finite."""
+    if scanner.peek() == "0" and scanner.peek(1) in ("x", "X", "o"):
+        return _read_based_integer(scanner)
     line, column, offset = scanner.line, scanner.column, scanner.index
     characters: list[str] = []
     is_double = False
@@ -444,6 +445,7 @@ def _double_token(literal: str, *, line: int, column: int, offset: int) -> Token
     return Token(
         kind=TokenKind.DOUBLE,
         text=literal,
+        end_offset=offset + len(literal),
         offset=offset,
         line=line,
         column=column,
@@ -451,9 +453,44 @@ def _double_token(literal: str, *, line: int, column: int, offset: int) -> Token
     )
 
 
-def _integer_token(literal: str, *, line: int, column: int, offset: int) -> Token:
+def _read_based_integer(scanner: _Scanner) -> Token:
+    """Read reference hexadecimal/octal spellings without rounding through DOUBLE.
+
+    The lexer admits magnitude 2**63 so a following parser sign can form INT64_MIN.
+    All other overflow and invalid digits are rejected before any statement effects.
+    """
+    line, column, offset = scanner.line, scanner.column, scanner.index
+    prefix = scanner.advance(2)
+    base = 16 if prefix[1] in ("x", "X") else 8
+    allowed = _HEX_DIGITS if base == 16 else frozenset("01234567")
+    characters: list[str] = []
+    while not scanner.done and (scanner.peek().isalnum() or scanner.peek() == "_"):
+        if scanner.index - offset >= MAX_NUMBER_CHARACTERS:
+            raise _refuse(f"A numeric literal may carry at most {MAX_NUMBER_CHARACTERS} characters",
+                          line=line, column=column, offset=offset, field="number",
+                          value=MAX_NUMBER_CHARACTERS)
+        characters.append(scanner.advance())
+    digits = "".join(characters)
+    valid = bool(digits) and digits[-1] != "_" and "__" not in digits
+    valid = valid and all(character in allowed or character == "_" for character in digits)
+    if not valid or not digits.replace("_", ""):
+        raise _refuse("Invalid based integer literal", line=line, column=column, offset=offset,
+                      field="number_literal", value=prefix + digits)
+    return _integer_token(prefix + digits, line=line, column=column, offset=offset, base=base)
+
+
+def _integer_token(literal: str, *, line: int, column: int, offset: int, base: int = 10) -> Token:
     """Return the token of an integer literal, refusing a magnitude no signed word can hold."""
-    number = int(literal)
+    if base == 10:
+        # Convert at most 19 significant digits. A longer finite DOUBLE spelling
+        # is legal, but increasing its lexical budget must not permit expensive
+        # decimal integer conversion or leak CPython's host-configured ValueError.
+        significant = literal.lstrip("0") or "0"
+        bound = str(INTEGER_MAGNITUDE_LIMIT)
+        oversized = len(significant) > len(bound) or (len(significant) == len(bound) and significant > bound)
+        number = INTEGER_MAGNITUDE_LIMIT + 1 if oversized else int(significant)
+    else:
+        number = int(literal, base)
     if number > INTEGER_MAGNITUDE_LIMIT:
         raise _refuse(
             f"The literal {literal} is outside the range a 64-bit integer can hold",
@@ -466,6 +503,7 @@ def _integer_token(literal: str, *, line: int, column: int, offset: int) -> Toke
     return Token(
         kind=TokenKind.INTEGER,
         text=literal,
+        end_offset=offset + len(literal),
         offset=offset,
         line=line,
         column=column,
@@ -508,6 +546,7 @@ def _read_string(scanner: _Scanner) -> Token:
     return Token(
         kind=TokenKind.STRING,
         text=body,
+        end_offset=scanner.index,
         offset=offset,
         line=line,
         column=column,
@@ -609,6 +648,7 @@ def _read_symbol(scanner: _Scanner) -> Token:
             return Token(
                 kind=TokenKind.SYMBOL,
                 text=symbol,
+                end_offset=scanner.index,
                 offset=offset,
                 line=line,
                 column=column,
@@ -622,4 +662,5 @@ def _read_symbol(scanner: _Scanner) -> Token:
         offset=offset,
         field="character",
         value=character,
+        reason="unsupported_query_character", query_phase="planning",
     )

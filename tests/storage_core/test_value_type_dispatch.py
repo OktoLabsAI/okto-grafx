@@ -10,6 +10,7 @@ import pytest
 
 import okto_grafx.domain.model.value as value_module
 from okto_grafx.domain.model.errors import SchemaMismatchError
+from okto_grafx.domain.model.decimal_values import DecimalValue
 from okto_grafx.domain.model.value import (
     Timestamp,
     Uuid,
@@ -109,12 +110,15 @@ def test_table_and_walk_agree_on_type_and_bytes(value: object) -> None:
         value_module._EXACT_VALUE_TYPES = saved
 
 
-def test_table_keys_are_exact_classes_the_walk_answers_unconditionally() -> None:
+def test_legacy_table_keys_are_exact_classes_the_walk_answers_unconditionally() -> None:
     table = value_module._EXACT_VALUE_TYPES
     assert isinstance(table, MappingProxyType)
     with pytest.raises(TypeError):
         table[Opaque] = ValueType.NULL  # type: ignore[index]
-    assert set(table) == {
+    # Native temporal/decimal DTOs intentionally admit exact classes only; the
+    # older isinstance fallback is for builtins and the original wrappers.
+    native_only = {*value_module.TEMPORAL_VALUE_TYPES, ValueType.DECIMAL}
+    assert {key for key, kind in table.items() if kind not in native_only} == {
         bool,
         int,
         float,
@@ -143,6 +147,20 @@ def test_table_keys_are_exact_classes_the_walk_answers_unconditionally() -> None
     for kind, sample in samples.items():
         assert type(sample) is kind
         assert table[kind] is _walk(sample)
+
+
+def test_native_decimal_dispatch_is_exact_and_does_not_admit_host_subclasses() -> None:
+    class HostDecimal(DecimalValue):
+        pass
+
+    value = DecimalValue(12500, 12, 4)
+    assert value_module._EXACT_VALUE_TYPES[DecimalValue] is ValueType.DECIMAL
+    assert value_type_of(value) is ValueType.DECIMAL
+    assert encode_value(value)[0] == int(ValueType.DECIMAL)
+    with pytest.raises(SchemaMismatchError):
+        value_type_of(HostDecimal(12500, 12, 4))
+    with pytest.raises(SchemaMismatchError):
+        _walk(value)
 
 
 def test_bool_stays_bool_and_int_subclasses_stay_int64() -> None:

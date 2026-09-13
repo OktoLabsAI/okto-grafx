@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxParseError, GrafxQueryError, GrafxWriteConflict
+from okto_grafx.domain.errors import GrafxQueryError, GrafxWriteConflict
 
 SCHEMA: tuple[str, ...] = (
     "CREATE NODE TABLE P(id INT64, a INT64, b INT64, c INT64, PRIMARY KEY(id))",
@@ -82,7 +82,7 @@ def test_a_set_and_a_delete_through_a_target_map_touch_only_the_named_row(fan: s
     """The consequence that made it data loss: SET/DELETE above the traversal hit every row."""
     _write(fan, "MATCH (x:P {id: 1})-[:R]->(y:P {id: 2}) SET y.a = 7")
     assert _live(fan) == [(1, None, None, None), (2, 7, None, None), (3, None, None, None)]
-    _write(fan, "MATCH (x:P {id: 1})-[:R]->(y:P {id: 2}) DELETE y")
+    _write(fan, "MATCH (x:P {id: 1})-[:R]->(y:P {id: 2}) DETACH DELETE y")
     assert [row[0] for row in _live(fan)] == [1, 3]
 
 
@@ -186,14 +186,14 @@ def test_a_second_row_under_a_key_this_transaction_still_holds_is_refused(path: 
         handle.close()
 
 
-# --- B6: zero-length paths are refused, not answered as one hop ---------------------------------
+# --- B6: zero-length paths are distinct from one-hop paths --------------------------------------
 
 
-def test_a_zero_hop_pattern_is_refused_at_the_door(fan: str) -> None:
+def test_a_zero_hop_pattern_includes_the_anchor_and_one_hop_landings(fan: str) -> None:
     handle = okto_grafx.connect(fan)
     try:
-        with pytest.raises(GrafxParseError):
-            handle.execute("MATCH (x:P {id: 1})-[:R*0..1]->(y:P) RETURN y.id")
+        rows = handle.execute("MATCH (x:P {id: 1})-[:R*0..1]->(y:P) RETURN y.id").rows
+        assert sorted(rows) == [(1,), (2,), (3,)]
     finally:
         handle.close()
 
@@ -208,7 +208,7 @@ def test_a_row_this_transaction_deleted_is_invisible_through_a_traversal_too(fan
     handle = okto_grafx.connect(fan)
     try:
         with handle.begin("write") as txn:
-            txn.execute("MATCH (y:P {id: 2}) DELETE y")
+            txn.execute("MATCH (y:P {id: 2}) DETACH DELETE y")
             rows = txn.execute("MATCH (x:P {id: 1})-[:R]->(y:P) RETURN y.id").rows
             assert sorted(rows) == [(3,)]
     finally:

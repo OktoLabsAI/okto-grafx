@@ -46,8 +46,13 @@ def test_frame_refusals_nan_does_not_become_null_and_late_failure_atomicity():
             with pytest.raises(GrafxUnsupportedOperation):
                 import_pandas(tx, "CREATE (:N {id:$id})", pd.DataFrame({"id": [1]}), types=("INT64",))
         with db.begin() as tx:
-            import_pandas(tx, "CREATE (:N {id:$id,f:$f})", frame, types=("INT64", "DOUBLE"), max_batch_rows=1)
-        assert math.isnan(db.execute("MATCH (n:N) WHERE n.id=2 RETURN n.f").rows[0][0])
+            with pytest.raises(GrafxError):
+                import_pandas(tx, "CREATE (:N {id:$id,f:$f})", frame, types=("INT64", "DOUBLE"), max_batch_rows=1)
+            assert tx.execute("MATCH (n:N) RETURN n.id").rows == ((99,),)
+        # Exporting a transient expression preserves NaN versus NULL; importing
+        # it as a graph property must refuse, including after a valid first batch.
+        exported = to_pandas(db.execute("RETURN 0.0/0.0 AS f"), types=("DOUBLE",))
+        assert math.isnan(exported.iloc[0, 0])
         source = QueryResult(columns=("id",), rows=((1,), (2,)))
         with pytest.raises(GrafxQueryBudgetExceeded):
             to_pandas(source, types=("INT64",), max_rows=1)

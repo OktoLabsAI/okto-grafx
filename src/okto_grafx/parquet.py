@@ -11,10 +11,12 @@ import stat
 import tempfile
 from typing import TYPE_CHECKING
 
-from okto_grafx.arrow import ArrowVectorType, to_arrow_batches, import_arrow_batches
+from okto_grafx.arrow import ArrowVectorType, ArrowDecimalType, to_arrow_batches, import_arrow_batches
 from okto_grafx.tabular import _arrow, _schema, _match_schema, _limit, _charge
 from okto_grafx.engine.database import Transaction, QueryCursor, ExecuteManyReport
 from okto_grafx.engine.query_engine import QueryResult
+from okto_grafx.domain.model.stored_types import StoredType
+from okto_grafx._arrow_values import _own_collections
 from okto_grafx.errors import GrafxConfigurationError, GrafxUnsupportedOperation, GrafxQueryBudgetExceeded
 
 if TYPE_CHECKING:
@@ -105,13 +107,14 @@ def _read_schema(observed, schema, types, pa):
 
 
 def read_parquet_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str],
-                         types: tuple[str | ArrowVectorType, ...], max_batch_rows: int = 256,
+                         types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int = 256,
                          max_batch_bytes: int = 16 * 1024 * 1024, max_rows: int = 1_000_000,
                          max_batches: int = 4096, max_file_bytes: int = 256 * 1024 * 1024,
                          max_row_group_bytes: int = 64 * 1024 * 1024) -> Iterator[RecordBatch]:
     """Read typed batches from one permitted local file; close the iterator on early exit."""
     _options(max_batch_rows, max_batch_bytes, max_rows, max_batches, max_file_bytes)
     _limit("max_row_group_bytes", max_row_group_bytes)
+    types = _own_collections(types)
     pa = _arrow()
     import pyarrow.parquet as pq
     try:
@@ -152,12 +155,13 @@ def read_parquet_batches(path: str | os.PathLike[str], *, allowed_root: str | os
 
 
 def import_parquet(transaction: Transaction, statement: str, path: str | os.PathLike[str], *,
-                   allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...],
+                   allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...],
                    max_batch_rows: int = 256, max_batch_bytes: int = 16 * 1024 * 1024,
                    max_rows: int = 1_000_000, max_batches: int = 4096,
                    max_file_bytes: int = 256 * 1024 * 1024,
                    max_row_group_bytes: int = 64 * 1024 * 1024) -> ExecuteManyReport:
     """Stage one complete local Parquet import atomically; never commit or retry for the caller."""
+    types = _own_collections(types)
     with closing(read_parquet_batches(path, allowed_root=allowed_root, types=types,
             max_batch_rows=max_batch_rows, max_batch_bytes=max_batch_bytes, max_rows=max_rows,
             max_batches=max_batches, max_file_bytes=max_file_bytes, max_row_group_bytes=max_row_group_bytes)) as batches:
@@ -166,7 +170,7 @@ def import_parquet(transaction: Transaction, statement: str, path: str | os.Path
 
 
 def write_parquet(source: QueryResult | QueryCursor, path: str | os.PathLike[str], *,
-                  allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...],
+                  allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...],
                   batch_rows: int = 256, max_batch_bytes: int = 16 * 1024 * 1024,
                   max_rows: int = 1_000_000, max_batches: int = 4096,
                   max_file_bytes: int = 256 * 1024 * 1024) -> ParquetExportReport:
@@ -176,6 +180,7 @@ def write_parquet(source: QueryResult | QueryCursor, path: str | os.PathLike[str
         raise GrafxConfigurationError("Parquet export requires a native result or cursor.", field="source")
     pa = _arrow()
     import pyarrow.parquet as pq
+    types = _own_collections(types)
     schema = _schema(source.columns, types, pa)
     physical = _physical_schema(schema, types, pa)
     temporary = None

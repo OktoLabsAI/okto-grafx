@@ -243,11 +243,11 @@ class IndexDefinition:
         object.__setattr__(
             self, "bucket_count", validate_bucket_count(self.bucket_count)
         )
-        if self.layout is IndexLayout.SPARSE_HASH and (
+        if self.layout in (IndexLayout.SPARSE_HASH, IndexLayout.POSTING_HASH) and (
             self.visibility is not IndexVisibility.EXACT
             or self.key_derivation != COLUMN_KEY_DERIVATION
         ):
-            raise GrafxIndexError("Sparse hash requires an exact property index.", field="layout")
+            raise GrafxIndexError("Compact hash requires an exact property index.", field="layout")
         if is_fulltext(self.key_derivation):
             options = decode_options(self.key_derivation)
             if len(options.field_weights) != len(self.positions) or self.layout is not IndexLayout.HASH or self.visibility is not IndexVisibility.EXACT:
@@ -395,6 +395,14 @@ class IndexDefinition:
             )
         return index_key(values, self.positions)
 
+    def bucket_for(self, key: bytes) -> int:
+        """Route this persisted derivation; positional chunks share their term bucket."""
+        from okto_grafx.domain.index.keys import bucket_of
+        if self.key_derivation.startswith("fulltext_v5_"):
+            from okto_grafx.domain.index.text_positions import position_bucket_key
+            key = position_bucket_key(key)
+        return bucket_of(key, self.bucket_count)
+
     def key_for_record(self, record_id: object, values: Sequence[Value]) -> bytes:
         """Return this definition's key with the complete heap-version identity available.
 
@@ -496,6 +504,13 @@ class IndexDefinition:
         ).digest()
 
 
+def vector_index_name(table: TableDef, position: int) -> str:
+    """Derive the schema-declared vector identity, independent of catalog order."""
+    if table.vector_identity_names:
+        return f"_grafx_vec_t{table.table_id}_p{position}"
+    return f"vector_{table.name}_{table.columns[position].vector_space}"
+
+
 def _automatic_index_projection(
     table: TableDef,
 ) -> tuple[tuple[IndexDefinition, ...], Mapping[str, IndexDefinition]]:
@@ -554,7 +569,7 @@ def _automatic_index_projection(
         try:
             definitions.append(
                 VectorIndexDefinition(
-                    name=f"vector_{table.name}_{column.vector_space}",
+                    name=vector_index_name(table, position),
                     table_id=table.table_id,
                     table_name=table.name,
                     positions=(position,),
@@ -617,5 +632,11 @@ def index_definition_matches_table(
             and definition.key_derivation == expected.key_derivation
             and definition.layout is expected.layout
         )
+    # Vector indexes are schema-derived, not generic custom positional indexes.
+    # An old spelling cannot become valid just because the same column exists.
+    from okto_grafx.domain.vector.key import VectorIndexDefinition
+
+    if isinstance(definition, VectorIndexDefinition):
+        return False
     stored_arity = len(table.columns) + (2 if table.kind == "rel" else 0)
     return all(position < stored_arity for position in definition.positions)

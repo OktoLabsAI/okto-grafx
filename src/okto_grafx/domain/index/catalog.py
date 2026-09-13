@@ -306,10 +306,10 @@ class CatalogIndexDefinition:
             options = decode_options(self.key_derivation)
             if self.automatic or layout is not IndexLayout.HASH or len(options.field_weights) != len(self.positions):
                 raise GrafxIndexError("Invalid full-text catalog definition.", field="definition")
-        if layout is IndexLayout.SPARSE_HASH and (
+        if layout in (IndexLayout.SPARSE_HASH, IndexLayout.POSTING_HASH) and (
             self.automatic or self.key_derivation != COLUMN_KEY_DERIVATION
         ):
-            raise GrafxIndexError("Sparse hash requires an explicit property index.", field="layout")
+            raise GrafxIndexError("Compact hash requires an explicit property index.", field="layout")
         if layout is IndexLayout.ORDERED:
             if self.key_derivation != ORDERED_KEY_DERIVATION:
                 raise GrafxIndexError(

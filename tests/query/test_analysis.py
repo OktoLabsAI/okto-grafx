@@ -70,10 +70,10 @@ def test_a_variable_cannot_be_a_node_and_a_relationship() -> None:
     assert failure.value.details["field"] == "variable"
 
 
-def test_a_variable_cannot_carry_two_different_labels() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        analysis_of("MATCH (a:Person), (a:Doc) RETURN a.id")
-    assert failure.value.details["value"] == "a"
+def test_a_second_label_is_a_membership_constraint_not_a_type_conflict() -> None:
+    found = analysis_of("MATCH (a:Person), (a:Doc) RETURN a.id")
+    assert found.binding("a").entity == "node"
+    assert found.binding("a").labels == ("Person",)
 
 
 def test_a_second_mention_may_add_the_label_the_first_left_out() -> None:
@@ -216,13 +216,19 @@ def test_an_order_by_key_may_repeat_a_projected_expression() -> None:
 def test_an_order_by_key_that_distinct_dropped_is_refused() -> None:
     with pytest.raises(GrafxPlanError) as failure:
         analysis_of("MATCH (p:Person) RETURN DISTINCT p.age ORDER BY p.name")
-    assert failure.value.details["field"] == "sort_item"
+    assert failure.value.details["field"] == "variable"
+    assert failure.value.details["value"] == "p"
+    assert failure.value.details["reason"] == "undefined_variable"
+    assert failure.value.details["query_phase"] == "planning"
 
 
 def test_an_order_by_key_that_a_group_dropped_is_refused() -> None:
     with pytest.raises(GrafxPlanError) as failure:
         analysis_of("MATCH (p:Person) RETURN count(*) AS total ORDER BY p.name")
-    assert failure.value.details["field"] == "sort_item"
+    assert failure.value.details["field"] == "variable"
+    assert failure.value.details["value"] == "p"
+    assert failure.value.details["reason"] == "undefined_variable"
+    assert failure.value.details["query_phase"] == "planning"
 
 
 def test_an_aggregate_written_directly_in_order_by_is_refused() -> None:
@@ -239,14 +245,16 @@ def test_an_order_by_key_over_a_bound_variable_is_allowed_without_aggregation() 
 def test_two_items_may_not_be_given_the_same_name() -> None:
     with pytest.raises(GrafxPlanError) as failure:
         analysis_of("MATCH (p:Person) RETURN p.age AS x, p.name AS x")
-    assert failure.value.details == {"field": "alias", "value": "x"}
+    assert failure.value.details == {"field": "alias", "value": "x",
+                                     "reason": "column_name_conflict", "query_phase": "planning"}
 
 
 @pytest.mark.parametrize("text", ["RETURN 1, 1", "RETURN 1, 2 AS `1`"])
 def test_two_items_may_not_share_a_derived_or_explicit_output_name(text: str) -> None:
     with pytest.raises(GrafxPlanError) as failure:
         analysis_of(text)
-    assert failure.value.details == {"field": "column", "value": "1"}
+    assert failure.value.details == {"field": "column", "value": "1",
+                                     "reason": "column_name_conflict", "query_phase": "planning"}
 
 
 @pytest.mark.parametrize("keyword", ["SKIP", "LIMIT"])
@@ -362,10 +370,10 @@ def test_the_score_projection_is_recorded_when_a_search_exists() -> None:
 # --- writes ---------------------------------------------------------------------------------
 
 
-def test_a_written_node_needs_exactly_one_label() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        analysis_of("CREATE (n)")
-    assert failure.value.details["field"] == "labels"
+def test_a_written_node_allows_empty_and_multiple_labels() -> None:
+    assert analysis_of("CREATE (n)").statement.writes
+    assert analysis_of("CREATE (n)").binding("n").labels == ()
+    assert analysis_of("CREATE (n:A:B)").binding("n").labels == ("A", "B")
 
 
 def test_a_written_relationship_needs_exactly_one_type() -> None:

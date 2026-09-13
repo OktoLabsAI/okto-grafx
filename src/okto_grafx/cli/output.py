@@ -136,12 +136,23 @@ def jsonable(value: object, *, depth: int = 0) -> object:
 
     Nothing is dropped silently: bytes become a hexadecimal string, a value that nests deeper
     than :data:`MAX_JSON_DEPTH` becomes a marked placeholder, a non-finite float becomes its
-    en-US name, and any other object becomes its description. A consumer that finds a string
+    en-US name, temporal values use explicit component tags, and any other object becomes its description. A consumer that finds a string
     where it expected a number is looking at a value the format could not hold, which is a
     statement worth making rather than an omission.
     """
     if depth > MAX_JSON_DEPTH:
         return "<nested deeper than this report renders>"
+    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, PathValue
+    from okto_grafx.domain.model.temporal_interchange import TEMPORAL_CLASSES_BY_NAME, temporal_json_value
+    from okto_grafx.domain.model.decimal_values import DecimalValue
+    from okto_grafx.domain.model.decimal_interchange import decimal_json_value
+
+    if type(value) in (NodeValue, RelationshipValue, PathValue):
+        return value.to_dict()
+    if type(value) in TEMPORAL_CLASSES_BY_NAME.values():
+        return temporal_json_value(value)
+    if type(value) is DecimalValue:
+        return decimal_json_value(value)
     if value is None or isinstance(value, (bool, str)):
         return value
     if isinstance(value, int):

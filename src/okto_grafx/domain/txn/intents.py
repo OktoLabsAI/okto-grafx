@@ -16,7 +16,7 @@ the same verdict, and two implementations of one rule eventually disagree.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from okto_grafx.domain.errors import GrafxTransactionStateError
 from okto_grafx.domain.model.schema import ENDPOINT_COLUMN_COUNT
@@ -66,6 +66,7 @@ def reduce_row_intents(intents: Sequence[RowIntent]) -> tuple[RowIntent, ...]:
                     # a proof attached to that replacement; retaining the insert proof here
                     # would let equal-looking but different bytes cross the commit boundary.
                     _encoding_proof=intent._encoding_proof,
+                    node_labels=previous.node_labels if intent.node_labels is None else intent.node_labels,
                 )
                 continue
             if intent.operation is RowOperation.DELETE:
@@ -83,6 +84,8 @@ def reduce_row_intents(intents: Sequence[RowIntent]) -> tuple[RowIntent, ...]:
                 field="reference",
                 value=repr(reference),
             )
+        if intent.operation is RowOperation.UPDATE and intent.node_labels is None and previous.node_labels is not None:
+            intent = replace(intent, node_labels=previous.node_labels)
         outcomes[reference] = intent
 
     placed = list(passthrough)

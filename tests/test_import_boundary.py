@@ -100,6 +100,24 @@ the exact consumer/origin/symbol triple in ``EXACT_RUNTIME_OBSERVATION_IMPORTS``
 TYPE_ONLY_MODULES: frozenset[str] = frozenset({"uuid"})
 """Modules the pure core may name for typing only, under a trustworthy TYPE_CHECKING guard."""
 
+EXACT_PURE_ALGORITHM_IMPORTS: frozenset[tuple[str, str, str, str | None]] = frozenset({
+    ("okto_grafx.domain.temporal_arithmetic", "fractions", "Fraction", None),
+    ("okto_grafx.domain.temporal_components", "fractions", "Fraction", None),
+    ("okto_grafx.domain.temporal_text", "fractions", "Fraction", None),
+    ("okto_grafx.domain.temporal_text", "re", "compile", "_compile_pattern"),
+    ("okto_grafx.domain.temporal_text", "re", "fullmatch", "_fullmatch"),
+    ("okto_grafx.domain.temporal_text", "re", "search", "_search"),
+    ("okto_grafx.domain.temporal_text", "re", "split", "_split"),
+    ("okto_grafx.domain.model.temporal_interchange", "re", "fullmatch", "_fullmatch"),
+})
+"""Exact deterministic temporal algorithms, not blanket stdlib namespace access.
+
+Fraction preserves exact rational arithmetic without ambient decimal context.
+The regex consumers use fixed ASCII grammars with bounded temporal input. No
+clock, randomness, device or adapter dependency is admitted. Keep symbol and
+binding names explicit, especially to distinguish regex compilation from eval.
+"""
+
 EXACT_RUNTIME_OBSERVATION_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
     {
         (
@@ -312,6 +330,11 @@ def scan_source(module_name: str, source: str) -> list[str]:
                 in EXACT_RUNTIME_OBSERVATION_IMPORTS
             )
             if exact_observation:
+                continue
+            if node.names and all(
+                (module_name, imported, alias.name, alias.asname)
+                in EXACT_PURE_ALGORITHM_IMPORTS for alias in node.names
+            ):
                 continue
             if not _is_allowed_import(
                 imported, type_checking=type_checking, forbidden=forbidden
@@ -708,3 +731,27 @@ def test_the_runtime_layer_really_does_import_the_domain() -> None:
     registry_source = (PACKAGE_ROOT / "runtime" / "registry.py").read_text(encoding="utf-8")
     assert "from okto_grafx.domain.ports import" in registry_source
     assert "from okto_grafx.domain.errors import" in registry_source
+
+
+@pytest.mark.parametrize("consumer,origin,symbol,binding", sorted(EXACT_PURE_ALGORITHM_IMPORTS))
+def test_exact_temporal_algorithm_import_is_admitted(consumer, origin, symbol, binding):
+    alias = "" if binding is None else f" as {binding}"
+    assert scan_source(consumer, f"from {origin} import {symbol}{alias}") == []
+
+
+@pytest.mark.parametrize("consumer,source", [
+    ("okto_grafx.domain.temporal_text", "import re"),
+    ("okto_grafx.domain.temporal_text", "import fractions"),
+    ("okto_grafx.domain.temporal_text", "from fractions import Fraction as Other"),
+    ("okto_grafx.domain.temporal_text", "from fractions import Fraction, Decimal"),
+    ("okto_grafx.domain.temporal_text", "from re import *"),
+    ("okto_grafx.domain.temporal_text", "from re import fullmatch"),
+    ("okto_grafx.domain.temporal_text", "from re import fullmatch as _fullmatch, purge"),
+    ("okto_grafx.domain.temporal_text", "from decimal import getcontext"),
+    ("okto_grafx.domain.temporal_text", "from re import fullmatch as _fullmatch\nimport os"),
+    ("okto_grafx.engine.query_engine", "from re import fullmatch as _fullmatch"),
+    ("okto_grafx.domain.model.temporal_interchange", "from fractions import Fraction"),
+    ("okto_grafx.domain.model.temporal_interchange", "from re import compile as _compile_pattern"),
+])
+def test_temporal_algorithm_admission_does_not_broaden_boundary(consumer, source):
+    assert scan_source(consumer, source)

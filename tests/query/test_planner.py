@@ -442,7 +442,9 @@ def test_a_created_node_that_reuses_a_binding_carries_no_table() -> None:
 def test_properties_may_not_be_given_to_a_node_an_earlier_clause_bound() -> None:
     with pytest.raises(GrafxPlanError) as failure:
         plan_text("MATCH (a:Person) CREATE (a {age: 1})-[:Knows]->(b:Person)")
-    assert failure.value.details["field"] == "properties"
+    assert failure.value.details["field"] == "variable"
+    assert failure.value.details["reason"] == "variable_already_bound"
+    assert failure.value.details["query_phase"] == "planning"
 
 
 def test_a_relationship_written_between_the_wrong_tables_is_refused() -> None:
@@ -462,7 +464,7 @@ def test_a_delete_clause_carries_the_detach_flag() -> None:
     planned = plan_text("MATCH (p:Person) DETACH DELETE p")
     write = find_operator(planned.root, "DeleteEntities")
     assert isinstance(write, DeleteEntities)
-    assert write.variables == ("p",)
+    assert tuple(target.describe() for target in write.targets) == ("p",)
     assert write.detach is True
 
 
@@ -482,18 +484,20 @@ def test_a_merge_of_a_relationship_between_bound_nodes_plans() -> None:
     assert len(merge.relationships) == 1
 
 
-def test_a_merge_of_a_relationship_with_an_unmatched_end_is_refused() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text("MERGE (a:Person)-[:Knows]->(b:Person)")
-    assert failure.value.details["field"] == "pattern"
+def test_a_merge_of_a_relationship_with_unmatched_ends_plans_a_complete_match() -> None:
+    planned = plan_text("MERGE (a:Person)-[:Knows]->(b:Person)")
+    merge = find_operator(planned.root, "MergePattern")
+    assert isinstance(merge, MergePattern)
+    assert merge.match_plan is not None
+    assert len(merge.nodes) == 2
 
 
-def test_a_merge_of_a_longer_path_is_refused() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text(
-            "MATCH (a:Person), (b:Person), (c:Person) MERGE (a)-[:Knows]->(b)-[:Knows]->(c)"
-        )
-    assert failure.value.details["field"] == "pattern"
+def test_a_merge_of_a_longer_path_plans_a_complete_match() -> None:
+    planned = plan_text("MATCH (a:Person), (b:Person), (c:Person) MERGE (a)-[:Knows]->(b)-[:Knows]->(c)")
+    merge = find_operator(planned.root, "MergePattern")
+    assert isinstance(merge, MergePattern)
+    assert merge.match_plan is not None
+    assert len(merge.relationships) == 2
 
 
 # --- schema ---------------------------------------------------------------------------------
@@ -737,37 +741,31 @@ def test_a_vector_space_option_of_the_wrong_kind_is_refused(options: str) -> Non
 # --- catalog binding ------------------------------------------------------------------------
 
 
-def test_a_node_pattern_with_no_label_is_refused_outside_its_one_shape() -> None:
-    # A named label-free node on its own is the polymorphic scan; beside a second pattern it is
-    # not, and the refusal says which shape it is missing rather than naming the label rule.
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text("MATCH (n), (m:Person) RETURN n.id")
-    assert failure.value.details["field"] == "pattern"
-    assert "exactly one shape" in str(failure.value)
+def test_a_node_pattern_with_no_label_composes_with_a_typed_pattern() -> None:
+    plan = plan_text("MATCH (n), (m:Person) RETURN n.id")
+    assert any(node.label == "AllNodesScan" for node in plan.root.walk())
 
 
-def test_a_node_pattern_with_two_labels_is_refused() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text("MATCH (n:Person:Doc) RETURN n.id")
-    assert failure.value.details["field"] == "labels"
+def test_a_node_pattern_with_two_labels_has_no_candidates_in_separate_tables() -> None:
+    planned = plan_text("MATCH (n:Person:Doc) RETURN n.id")
+    scans = [node for node in planned.root.walk() if node.label == "AllNodesScan"]
+    assert len(scans) == 1 and scans[0].tables == ()
+    assert "FilterRows" in operators(planned.root)
 
 
-def test_a_relationship_pattern_with_no_type_is_refused() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text("MATCH (a:Person)-[r]->(b:Person) RETURN b.id")
-    assert failure.value.details["field"] == "types"
+def test_a_relationship_pattern_with_no_type_uses_native_polymorphic_traversal() -> None:
+    planned = plan_text("MATCH (a:Person)-[r]->(b:Person) RETURN b.id")
+    assert "TraverseAnyRelationship" in operators(planned.root)
 
 
-def test_a_label_that_names_a_relationship_table_is_refused() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text("MATCH (n:Knows) RETURN n.since")
-    assert failure.value.details["field"] == "label"
+def test_relationship_name_alone_leaves_node_label_absent() -> None:
+    planned = plan_text("MATCH (n:Knows) RETURN n.since")
+    assert find_operator(planned.root, "FilterRows").predicate == Literal(False)
 
 
-def test_a_type_that_names_a_node_table_is_refused() -> None:
-    with pytest.raises(GrafxPlanError) as failure:
-        plan_text("MATCH (a:Person)-[:Doc]->(b:Person) RETURN b.id")
-    assert failure.value.details["field"] == "type"
+def test_node_label_alone_leaves_relationship_type_absent() -> None:
+    planned = plan_text("MATCH (a:Person)-[:Doc]->(b:Person) RETURN b.id")
+    assert find_operator(planned.root, "FilterRows").predicate == Literal(False)
 
 
 def test_a_traversal_that_could_match_nothing_is_refused_rather_than_run() -> None:

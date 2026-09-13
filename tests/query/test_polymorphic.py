@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxPlanError, GrafxQueryBudgetExceeded
+from okto_grafx.domain.errors import GrafxQueryBudgetExceeded, GrafxTransactionStateError
 from okto_grafx.domain.query.analysis import (
     ENTITY_NODE,
     Binding,
@@ -202,10 +202,10 @@ def test_a_property_no_table_declares_reads_as_null_everywhere(
     )
 
 
-def test_tables_that_disagree_about_a_property_refuse_before_any_row(
+def test_different_property_families_are_dynamic_not_invalid_reads(
     tmp_path: Path,
 ) -> None:
-    """The refusal cannot depend on which table the scan happened to reach first."""
+    """Each row retains its declared property type; the query need not share one."""
     handle = okto_grafx.connect(tmp_path / "conflict")
     try:
         with handle.begin("write") as schema:
@@ -214,17 +214,15 @@ def test_tables_that_disagree_about_a_property_refuse_before_any_row(
             )
             schema.execute("CREATE NODE TABLE B(id STRING, tag INT64, PRIMARY KEY(id))")
 
-        # No rows exist at all, so nothing could have refused per row.
-        with pytest.raises(GrafxPlanError) as raised:
-            handle.explain("MATCH (n) RETURN n.tag")
-        assert raised.value.details == {"field": "property", "value": "tag"}
-        assert "A.tag is STRING" in str(raised.value)
-        assert "B.tag is INT64" in str(raised.value)
-
-        with pytest.raises(GrafxPlanError):
-            handle.execute("MATCH (n) RETURN coalesce(n.tag, '') AS t")
+        assert handle.explain("MATCH (n) RETURN n.tag") is not None
+        assert handle.execute("MATCH (n) RETURN coalesce(n.tag, '') AS t").rows == ()
         # A property they DO agree on is unaffected.
         assert handle.execute("MATCH (n) RETURN n.id").rows == ()
+        with handle.begin("write") as seed:
+            seed.execute("CREATE(:A {id:'a',tag:'text'}),(:B {id:'b',tag:7})")
+        result = handle.execute("MATCH(n) RETURN n.tag ORDER BY n.id").rows
+        assert result == (("text",),(7,))
+        assert type(result[1][0]) is int
     finally:
         handle.close()
 
@@ -255,28 +253,25 @@ def test_an_integer_and_a_double_column_promote_rather_than_disagree(
 # --- what the caller receives --------------------------------------------------------------------
 
 
-def test_a_node_matched_without_a_label_detaches_as_a_map(database: object) -> None:
+def test_a_node_matched_without_a_label_detaches_as_a_qualified_entity(database: object) -> None:
     """It carries the label and the properties, and nothing owner-private at all."""
     rows = database.execute("MATCH (n) WHERE label(n) = 'Bug' RETURN n").rows
 
-    assert rows == (
-        (
-            {
-                "label": "Bug",
-                "properties": {
+    assert len(rows) == 1
+    node = rows[0][0]
+    assert type(node) is okto_grafx.NodeValue
+    assert node.label == "Bug"
+    assert node.properties == {
                     "id": "b1",
                     "title": "bug",
                     "created_at": "2026-01-02",
                     "relevance_score": 0.8,
                     "graph_layer": "canonical",
-                },
-            },
-        ),
-    )
-    node = rows[0][0]
-    assert set(node) == {"label", "properties"}
-    for private in ("record_id", "ref", "version", "table_id", "id"):
-        assert private not in node
+    }
+    assert node.identity.database_uuid == database.identity.database_uuid
+    assert node.identity.committed
+    for private in ("ref", "version", "txn", "table"):
+        assert not hasattr(node, private)
 
 
 def test_a_node_this_transaction_staged_detaches_the_same_way(database: object) -> None:
@@ -287,28 +282,29 @@ def test_a_node_this_transaction_staged_detaches_the_same_way(database: object) 
         )
         staged = transaction.execute("MATCH (n) WHERE n.id = 'b2' RETURN n").rows
 
-    assert staged == (
-        (
-            {
-                "label": "Bug",
-                "properties": {
+    assert len(staged) == 1
+    node = staged[0][0]
+    assert type(node) is okto_grafx.NodeValue
+    assert node.label == "Bug"
+    assert node.properties == {
                     "id": "b2",
                     "title": "pending",
                     "created_at": "2026-01-04",
                     "relevance_score": 0.5,
                     "graph_layer": "working",
-                },
-            },
-        ),
-    )
-    # A row this statement staged has no identity yet, and none is invented for the caller.
-    assert "record_id" not in staged[0][0]
+    }
+    assert node.identity.record_id is None
+    assert node.identity.provisional_id is not None
+    assert node.provenance.pending
 
 
-def test_the_map_the_caller_receives_is_its_own(database: object) -> None:
+def test_the_entity_properties_are_immutable_and_json_is_owned(database: object) -> None:
     rows = database.execute("MATCH (n) WHERE label(n) = 'Bug' RETURN n").rows
-    rows[0][0]["properties"]["title"] = "mutated"
-    rows[0][0]["label"] = "NotATable"
+    with pytest.raises(TypeError):
+        rows[0][0].properties["title"] = "mutated"
+    copied = rows[0][0].to_dict()
+    copied["properties"]["title"] = "mutated"
+    copied["label"] = "NotATable"
 
     assert database.execute("MATCH (n) WHERE label(n) = 'Bug' RETURN n.title").rows == (
         ("bug",),
@@ -380,46 +376,33 @@ def test_the_budget_counts_the_union_and_not_each_table(tmp_path: Path) -> None:
         refused.close()
 
 
-# --- the one shape it is read in -------------------------------------------------------------------
+# --- polymorphic writes still require explicit write authority -----------------------------------
 
 
 @pytest.mark.parametrize(
     "query",
     [
-        "MATCH () RETURN 1",
-        "MATCH (n), (m:Bug) RETURN n.id",
-        "MATCH (n) MATCH (m:Bug) RETURN n.id",
         "MATCH (n) CREATE (:Bug {id: 'x'})",
         "MATCH (n) SET n.title = 'x'",
         "MATCH (n) DELETE n",
-        "MATCH (n {id: 'd1'}) RETURN n.id",
-        "UNWIND $rows AS r MATCH (n) RETURN n.id",
     ],
 )
-def test_every_shape_but_the_one_is_refused_before_a_table_is_read(
+def test_dynamic_polymorphic_writes_remain_refused_in_read_transactions(
     database: object, query: str
 ) -> None:
-    with pytest.raises(GrafxPlanError) as raised:
+    with pytest.raises(GrafxTransactionStateError) as raised:
         database.execute(query, {"rows": [1]})
-    assert raised.value.details["field"] == "pattern"
-    assert "exactly one shape" in str(raised.value)
+    assert raised.value.details["field"] == "transaction"
 
 
-def test_a_node_at_the_end_of_a_hop_keeps_the_refusal_it_already_had(
+def test_a_label_free_hop_source_uses_native_endpoint_inference(
     database: object,
 ) -> None:
-    """A path names the table at each end, so a label-free end is not this feature at all.
-
-    The distinction matters beyond tidiness: were the shape rule to claim these too, every
-    frozen path form in the corpus would change its recorded refusal without anything about it
-    having changed.
-    """
-
-    with pytest.raises(GrafxPlanError) as raised:
-        database.execute("MATCH (n)-[:Touches]->(b:Bug) RETURN n.id")
-
-    assert raised.value.details["field"] == "labels"
-    assert "exactly one label" in str(raised.value)
+    """The native endpoint schema can prove an unnamed source's table."""
+    assert database.execute("MATCH (n)-[:Touches]->(b:Bug) RETURN n.id").rows == ()
+    with database.begin('write') as tx:
+        tx.execute("MATCH(n:Decision {id:'d1'}),(b:Bug) CREATE(n)-[:Touches]->(b)")
+    assert database.execute("MATCH (n)-[:Touches]->(b:Bug) RETURN n.id").rows == (('d1',),)
     assert polymorphic_node(parse("MATCH (n)-[:Touches]->(b:Bug) RETURN n.id")) is None
 
 
@@ -442,7 +425,7 @@ def test_a_name_an_earlier_pattern_bound_is_not_a_second_polymorphic_scan(
 
 
 def _polymorphic_write() -> Query:
-    """Return MATCH (n) SET n.title = 'x' as a tree, which no parser here would hand on."""
+    """Build the same bound-entity write shape a parser can produce."""
     pattern = PatternPath(nodes=(NodePattern(variable="n"),), relationships=())
     return Query(
         match_clauses=(MatchClause(patterns=(pattern,)),),
@@ -464,16 +447,15 @@ def _polymorphic_write() -> Query:
     )
 
 
-def test_a_tree_nobody_parsed_is_refused_by_the_analysis() -> None:
-    with pytest.raises(GrafxPlanError) as raised:
-        analyze(_polymorphic_write())
-    assert raised.value.details["field"] == "pattern"
+def test_caller_built_polymorphic_write_has_the_same_analysis_contract() -> None:
+    analyzed = analyze(_polymorphic_write())
+    assert analyzed.bindings[0].entity == ENTITY_NODE
 
 
-def test_a_caller_supplying_its_own_analysis_is_refused_by_the_planner(
+def test_caller_supplied_analysis_preserves_the_polymorphic_scan_and_write(
     catalog: object, indexes: tuple
 ) -> None:
-    """build_plan takes an analysis, so the shape has to hold at that door too."""
+    """No fixed table is invented for the bound write variable."""
     statement = _polymorphic_write()
     supplied = QueryAnalysis(
         statement=statement,
@@ -481,6 +463,6 @@ def test_a_caller_supplying_its_own_analysis_is_refused_by_the_planner(
         output_columns=("n.id",),
     )
 
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(statement, catalog=catalog, indexes=indexes, analysis=supplied)
-    assert raised.value.details["field"] == "pattern"
+    plan = build_plan(statement, catalog=catalog, indexes=indexes, analysis=supplied)
+    labels = {node.label for node in plan.root.walk()}
+    assert {"AllNodesScan", "SetProperties"} <= labels

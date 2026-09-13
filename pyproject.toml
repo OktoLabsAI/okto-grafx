@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "okto-grafx"
-version = "0.0.5"
+version = "0.0.6"
 description = "Okto Grafx - embedded graph database for Python: multi-process safe, verifiable on disk, recoverable by construction"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,7 +38,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 # Accelerators are installed by default; engine mechanisms remain behind ports.
-dependencies = ["numpy>=1.24", "google-crc32c>=1.5"]
+dependencies = ["numpy>=1.24", "google-crc32c>=1.5", "tzdata>=2024.1"]
 
 [project.urls]
 Homepage = "https://github.com/OktoLabsAI/okto-grafx"
@@ -79,6 +79,7 @@ dev = [
     "pytest-timeout",
     "ruff==0.15.1",
     "PyYAML>=6",
+    "gherkin-official==37.0.0",
 ]
 
 [project.scripts]

@@ -1,5 +1,52 @@
 # Trusted extensions and Arrow import/export
 
+[Schema-enabled procedures](specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md) add explicit
+`schema_write=True`, literal `schema` permission and `ProcedureWriter.schema()`.
+Native table/vector-space/index DDL and implicit flexible CREATE/MERGE retain
+whole-statement rollback. Catalog-v2 indexes compose with pending DML; the contract
+covers quotas, compiled-scan visibility and legacy activation prerequisites.
+
+[Nested native procedures and effects](specs/PROCEDURE_NESTING_EFFECTS_V1.md) now
+support recursive CALL under inherited depth and shared budgets. Procedure
+determinism defaults to False and must be declared truthfully for deterministic
+effect admission; ScalarFunction's independent contract is unchanged.
+
+Native [procedure query authority](specs/PROCEDURE_QUERY_AUTHORITY_V1.md) adds
+permissioned opt-in readers and writer queries with results, same-snapshot graph
+access and cumulative query budgets. Ordinary read callbacks remain pure by
+default. No authority can commit independently or escape its invocation lifetime.
+
+The 0.0.6 development line also supports trusted typed tabular procedures through
+`ExtensionRegistry(procedures=..., procedure_permissions=...)`. See the complete
+[CALL/YIELD contract and example](COMPOSABLE_QUERIES.md#typed-tabular-procedures).
+This is distinct from CALL subqueries. Explicit
+[writing procedures](specs/WRITING_PROCEDURES_V1.md) now supply a short-lived native
+mutation capability with named permissions, shared budgets and outer-statement
+rollback; the bounded door is not arbitrary procedure parity.
+An empty output schema now declares a [unit procedure](specs/UNIT_PROCEDURES_V1.md):
+the callback returns None, CALL preserves incoming rows and standalone execution
+returns no result rows. Default `mode="read"` supplies no graph-writing authority;
+`mode="write"` receives an engine-issued ProcedureWriter first.
+Standalone calls can also use [declared implicit argument names and automatic or
+wildcard outputs](specs/PROCEDURE_INVOCATION_V1.md); callbacks are never inspected
+or invoked to discover their signatures.
+Procedure [numeric signatures](specs/PROCEDURE_NUMERIC_SIGNATURES_V1.md) now support
+NUMBER inputs/outputs and validated integer-to-DOUBLE widening. This does not alter
+the stricter scalar UDF contract below or introduce a stored NUMBER column type.
+The subsequent [native value signature contract](specs/PROCEDURE_NATIVE_VALUES_V1.md)
+adds temporal, DECIMAL, LIST/MAP/ANY and vector procedure values, owned callback copies,
+recursive budgets and native persistence. This does not widen ScalarFunction or
+the independent interchange type contracts below.
+NUMBER now also preserves native DECIMAL cells without casting; DOUBLE does not
+accept them implicitly. DECIMAL uses a 19-byte ownership/result charge and retains
+its p/s through native query/write callbacks. See the
+[decimal interface contract](specs/DECIMAL_VALUES_V1.md#json-local-imports-and-procedure-signatures).
+
+[Entity procedure signatures](specs/PROCEDURE_ENTITY_SIGNATURES_V1.md) add NODE,
+RELATIONSHIP, PATH and typed node/relationship lists. Native CALL supplies detached
+observations and restores only references witnessed in that invocation; copied,
+foreign and previous-call entities are refused. Existing descriptor budgets apply.
+
 For typed DataFrames and local Parquet files, see [Pandas/Parquet](TABULAR_AND_PARQUET.md).
 Those optional adapters reuse this native batch contract and whole-call savepoint;
 they do not add Cypher external scans or a second graph backup format.
@@ -85,10 +132,11 @@ with db.begin("write") as transaction:
 The iterable must yield exact PyArrow `RecordBatch` objects. Fields are named
 parameters in the supplied statement. All batches have the same ordered, unique,
 nonempty field names (at most 256 characters each) and 1..256 columns. `types` is
-an explicit tuple using the scalar names/mappings or `ArrowVectorType` below. Exact
+an explicit tuple using the scalar names/mappings, `ArrowVectorType`,
+`ArrowDecimalType` or a collection-root `StoredType`. Exact
 Arrow types are required: no int32 widening, dictionary decoding, timezone/unit
 inference, arbitrary nested types or lossy coercion. Optional scalar `grafx.type`
-field metadata must agree; vector metadata is mandatory. NULL is
+field metadata must agree; vector, temporal, decimal and collection metadata are mandatory. NULL is
 accepted according to the native target schema; timestamp microseconds, including
 negative values, and UUID bytes retain exact native meanings. Query DDL spells the
 binary property type `BLOB`, whereas this scalar interop type is `BYTES`.
@@ -109,7 +157,8 @@ streaming ingestion. The report is `ExecuteManyReport`, not one result per row.
 
 Bool is not an integer option. Before Python scalar conversion, a batch is charged
 256 + 256 per column + 80 per row/column cell + four times `batch.nbytes` (16 times
-when any column is a vector, reserving component-conversion workspace). One batch
+when any column is a vector, temporal struct, decimal or collection, reserving conversion workspace).
+Decimal columns additionally charge 1,024 bytes per row/cell as specified below. One batch
 is consumed at a time. This is not RSS, caller-owned Arrow buffers, whole-transaction
 staging memory, or a deadline on arbitrary input producers. The source is neither
 closed nor retried by Grafx. Unsupported/mismatched types are typed unsupported
@@ -132,7 +181,7 @@ with db.query("MATCH (d:Document) RETURN d.id, d.title ORDER BY d.id").cursor() 
 
 `source` is an exact native `QueryResult` or `QueryCursor`. `types` is an explicit
 tuple, one entry per column, including empty/all-NULL results. It uses the scalar
-type names above or vector descriptors below; arbitrary lists/maps/entities are refused rather than
+type names above or vector/decimal descriptors below; arbitrary lists/maps/entities are refused rather than
 converted to lossy JSON. Mappings: BOOL→bool, INT64→int64, DOUBLE→float64,
 STRING→UTF-8, BYTES→binary, TIMESTAMP→timestamp[us, UTC], UUID→fixed-size binary[16].
 Every field is nullable and carries `grafx.type` metadata. No numeric/string
@@ -141,7 +190,7 @@ inference, bool-to-int or precision-losing coercion is performed.
 `batch_rows` is 1..65,536 (default 256). `max_batch_bytes` is 1..2^31 (default
 16 MiB), a conservative per-batch logical budget: 256 fixed +256 per column,
 then 64 per cell plus four bytes per STRING character, BYTES length or 16 for
-fixed/null cells. It excludes the already-detached source rows and PyArrow/allocator
+fixed/null legacy scalar cells. Temporal cells use the tariff below. It excludes the already-detached source rows and PyArrow/allocator
 overheads; it is not an RSS cap. Conversion retains at most one fetched batch.
 The generator validates on first iteration. Failure emits no partial current batch,
 but earlier yielded batches remain valid. Empty input yields no batches.
@@ -152,6 +201,141 @@ export does not turn it into a streaming query or acquire a snapshot. A cursor
 uses its existing fixed MVCC snapshot and fetch budget. The caller owns and must
 context-manage/close that cursor on early break or conversion failure; export does
 not transfer or silently close it. Do not concurrently consume one cursor.
+
+### Exact native temporal values (0.0.6 development)
+
+Both functions accept `DATE`, `LOCALTIME`, `TIME`, `LOCALDATETIME`, `DATETIME`
+and `DURATION` in `types`. Values must be the exact corresponding
+[native Python classes](TEMPORAL_VALUES.md), not strings or host `datetime` objects.
+Their Arrow representation is a **struct of primitive coordinates**, not Arrow's
+narrow date/timestamp types. This preserves the full native year range, nanoseconds,
+recorded per-row zones/offsets and independent duration components.
+
+| Native type | Ordered Arrow struct fields |
+| --- | --- |
+| DATE | `epoch_day: int64` |
+| LOCALTIME | `nanoseconds: int64` |
+| TIME | `nanoseconds: int64`, `offset_seconds: int32` |
+| LOCALDATETIME | `epoch_day: int64`, `nanoseconds: int64` |
+| DATETIME | `epoch_seconds: int64`, `nanosecond: int32`, `offset_seconds: int32`, `zone: string` |
+| DURATION | `months: int64`, `days: int64`, `seconds: int64`, `nanoseconds: int32` |
+
+Every temporal field requires `grafx.type=<UPPERCASE TYPE>` and
+`grafx.temporal=components-v1` metadata. Missing/mismatched/unknown tags refuse;
+the same physical struct is not authority to infer a type. Field order, names and
+integer widths are exact. Physical struct children are nullable for transport
+portability, but **inside a non-NULL value only `zone` may be NULL**. Native decoding
+checks ranges and canonical duration nanos (`0..999999999`) without normalization,
+string parsing or zone lookup. A parent NULL remains a native NULL. The recorded
+zone need not be installed or currently resolvable. TIMESTAMP retains its separate
+microsecond-UTC contract; it is not substituted for DATETIME.
+These coordinate structs are transport representations, not a promise that a
+consumer's struct sorting/arithmetic reproduces Grafx temporal operators (especially
+duration ordering or calendar arithmetic). Use the documented native semantics.
+
+```python
+from okto_grafx import QueryResult, DateValue
+from okto_grafx.arrow import to_arrow_batches, import_arrow_batches
+
+batches = list(to_arrow_batches(
+    QueryResult(columns=("day",), rows=((DateValue(2024, 2, 29),), (None,))),
+    types=("DATE",),
+))
+# Destination Event(day DATE) must already exist in catalog v2.
+with db.begin() as tx:
+    report = import_arrow_batches(tx, "CREATE (:Event {day:$day})", batches, types=("DATE",))
+```
+
+Late temporal metadata/component failures roll back the **whole import call**,
+not just the last batch. Earlier caller staging remains subject to the normal
+savepoint/transaction contract. Export charges 1,024 bytes per temporal cell
+(including NULL), plus four bytes per DATETIME zone character, on top of the fixed
+64-byte cell charge. Import uses the structured multiplier of **16 × batch.nbytes**
+whenever a temporal or vector column is present, plus the usual fixed/row/column
+charges. These are bounded logical workspace estimates, not allocator/RSS limits.
+
+Pandas, Polars and Parquet use this same schema and native import validation; see
+[tabular consumption](TABULAR_AND_PARQUET.md). Arbitrary nested property maps and
+entity DTOs remain outside this typed scalar transport. This does not qualify
+UDF declarations or materialized-view key types. Temporal CSV/JSONL/SQLite
+consumption has a separate [tagged local-input contract](LOCAL_TEXT_IMPORT.md#native-temporal-fields-006-development).
+
+### Exact native decimals (0.0.6 development)
+
+`okto_grafx.arrow.ArrowDecimalType(precision, scale)` is an immutable descriptor
+accepted in the `types` tuple by Arrow, Pandas, Polars and Parquet import/export.
+Both fields are exact integers (bool refused), with `1 <= precision <= 38` and
+`0 <= scale <= precision`. Constructing it does not import PyArrow or activate
+storage. The physical type is `pyarrow.decimal128(precision, scale)`, with mandatory
+field metadata `grafx.type=DECIMAL` and `grafx.decimal=decimal128-v1` (byte keys and
+values). Precision/scale are authoritative in the physical type, not redundant
+free-form metadata. External producers must explicitly attach this schema too.
+
+Export requires exact native `DecimalValue` objects with **matching p/s**, even
+when different declarations would represent the same number. Use an explicit
+native `decimal(value,p,s)` query cast or `value.rescale(p,s)` first if changing
+the declaration is intentional. INT64, DOUBLE, strings, host `decimal.Decimal`,
+decimal256, dictionary encodings, missing/unknown tags and mismatched declarations
+are not inferred. Whole-value NULL is supported; all-NULL input does not activate
+the decimal storage capability. Empty materialized frames/files retain their schema;
+empty Arrow export yields no batches, as before.
+
+The boundary constructs/extracts a host Decimal's digit tuple without decimal
+arithmetic. It never uses float, `quantize`, `scaleb` or the ambient decimal context;
+38-digit coefficients, signs and trailing-zero scale remain exact. Native Grafx
+codecs/arithmetic still do not depend on the host decimal module. Arrow's
+[scaled-integer decimal type](https://arrow.apache.org/docs/python/generated/pyarrow.decimal128.html)
+and Python's [exact tuple constructor](https://docs.python.org/3/library/decimal.html#decimal.Decimal)
+define the external representations used here. Import validates each coefficient
+against the declared precision, including malformed buffers that Arrow can expose.
+
+```python
+from okto_grafx import DecimalValue, QueryResult, connect
+from okto_grafx.arrow import ArrowDecimalType, to_arrow_batches, import_arrow_batches
+
+kinds = ("INT64", ArrowDecimalType(12, 4))
+source = QueryResult(columns=("id", "amount"),
+                     rows=((1, DecimalValue(1234500, 12, 4)), (2, None)))
+batches = list(to_arrow_batches(source, types=kinds, batch_rows=1))
+with connect(":memory:") as db:
+    db.ensure_identity_indexes()
+    with db.begin() as tx:
+        tx.execute("CREATE NODE TABLE Invoice(id INT64,amount DECIMAL(12,4),PRIMARY KEY(id))")
+        imported = import_arrow_batches(tx,
+            "CREATE(:Invoice {id:$id,amount:$amount})", batches, types=kinds)
+        assert imported.statements == 2
+    assert db.execute("MATCH(n:Invoice) RETURN n.amount ORDER BY n.id").rows == (
+        (DecimalValue(1234500, 12, 4),), (None,))
+```
+
+Transport preserves its declared p/s. A differently declared **destination column**
+may then apply normal exact native assignment: DECIMAL(3,2) 1.25 can enter
+DECIMAL(12,4) as 1.2500, but a nonzero discarded digit or overflow refuses the whole
+import call. ANY destinations retain the offered declaration. This is not rounding
+or a per-batch commit. Prior caller statements, WAL/OCC, rollback and cursor ownership
+are unchanged. Recovery after a proven-durable commit is native Grafx recovery;
+an import report alone is not a durability receipt.
+
+Each decimal export cell adds **1,024 logical bytes**, including NULL, on top of
+the fixed 64-byte cell charge. Arrow import uses its structured multiplier
+**16 × batch.nbytes** and adds **1,024 bytes per decimal cell** to fixed/row/column
+charges. Pandas/Polars/Parquet batch/frame accounting uses the same extra cell
+tariff, including for untagged physical input inspected before admission. Existing
+batch/frame limits apply; no new connection option or storage format is introduced.
+These are workspace estimates, not hard third-party allocator/RSS limits.
+
+[Tabular metadata and file rules](TABULAR_AND_PARQUET.md) ·
+[Native decimal contract](specs/DECIMAL_VALUES_V1.md) ·
+[Qualification](reports/FP6_DECIMAL_COLUMNAR_QUALIFICATION.md).
+
+### Exact typed collections (0.0.6 development)
+
+The [columnar collection contract](COLLECTION_COLUMNAR.md) documents collection-root
+`StoredType` declarations across Arrow/Pandas/Polars/Parquet, native typed children,
+exact descriptor metadata, NULL/empty distinctions, ANY payloads and additional
+bounded conversion tariffs. Declared structure remains columnar; metadata loss,
+inexact conversion and malformed late values refuse with whole-call rollback.
+This is explicit native collection transport, not arbitrary nested/entity inference.
 
 ### Explicit native vectors
 
@@ -189,7 +373,7 @@ Space IDs are **store-local**, not universal embedding/model identifiers. This
 interop performs no cross-store space mapping; equal numeric IDs in different
 stores do not prove semantic equivalence. Establish matching target definitions
 explicitly, or use [logical graph transfer](LOGICAL_TRANSFER.md) for graph/space
-mapping. Arbitrary nested data, graph entity export, zero-copy and external scans
+mapping. Untyped nested inference, graph entity export, zero-copy and external scans
 remain out of scope.
 
 ```python

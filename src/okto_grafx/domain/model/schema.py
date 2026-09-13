@@ -16,14 +16,21 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
+from enum import IntEnum
 from math import isfinite
 from types import MappingProxyType
 
 from okto_grafx.domain.errors import GrafxConfigurationError, GrafxCorruptionDetected
 from okto_grafx.domain.ids import RecordId
 from okto_grafx.domain.model.errors import SchemaMismatchError
+from okto_grafx.domain.model.decimal_values import DecimalValue
+from okto_grafx.domain.model.node_labels import validate_node_labels, normalize_node_labels
+from okto_grafx.domain.model.stored_types import (
+    StoredType, encode_stored_type, decode_stored_type, normalize_typed_value, validate_typed_value,
+)
 from okto_grafx.domain.model.value import (
     MAX_VECTOR_DIMENSION,
+    MAX_VALUE_DEPTH,
     VECTOR_DTYPES,
     VECTOR_VALUE_TYPES,
     Value,
@@ -57,6 +64,7 @@ __all__ = [
     "SPACE_STATE_RETIRED",
     "STORAGE_DTYPES",
     "ColumnDef",
+    "SchemaType",
     "TableDef",
     "EmbeddingSpaceDef",
     "is_identifier",
@@ -134,21 +142,52 @@ def _require_identifier(field: str, name: object) -> str:
     return str(name)
 
 
+class SchemaType(IntEnum):
+    """Schema-only declarations, never tags in a stored or expression value.
+
+    ANY preserves each value's concrete ValueType tag. Its catalog tag requires
+    heterogeneous_properties_v1; the generic value codec must still refuse 255.
+    """
+
+    ANY = 255
+
+
+HETEROGENEOUS_PROPERTIES_CAPABILITY = "heterogeneous_properties_v1"
+FLEXIBLE_GRAPH_CAPABILITY = "flexible_graph_v1"
+FLEXIBLE_PROPERTIES_COLUMN = "_properties"
+
+
 @dataclass(frozen=True, slots=True)
 class ColumnDef:
     """One column of a table: a name, a stored type, nullability and, for vectors, its space."""
 
     name: str
-    type: ValueType
+    type: ValueType | SchemaType
     nullable: bool = True
     vector_space: str | None = None
+    decimal_precision: int | None = None
+    decimal_scale: int | None = None
+    stored_type: StoredType | None = None
 
     def __post_init__(self) -> None:
         """Refuse a column that could not be stored or read back."""
         _require_identifier("name", self.name)
-        if not isinstance(self.type, ValueType):
+        if self.stored_type is not None:
+            descriptor = decode_stored_type(encode_stored_type(self.stored_type))
+            if (descriptor.kind not in ("LIST", "MAP", "ARRAY", "STRUCT")
+                    or descriptor.value_type is not self.type or descriptor.nullable != self.nullable):
+                raise GrafxConfigurationError("Collection descriptor must match column family/nullability.", field="stored_type")
+            object.__setattr__(self, "stored_type", descriptor)
+        if self.type is ValueType.DECIMAL:
+            try:
+                DecimalValue(0, self.decimal_precision, self.decimal_scale)
+            except SchemaMismatchError as failure:
+                raise GrafxConfigurationError("DECIMAL columns require valid precision/scale.", field="decimal_type") from failure
+        elif self.decimal_precision is not None or self.decimal_scale is not None:
+            raise GrafxConfigurationError("Only DECIMAL columns carry precision/scale.", field="decimal_type")
+        if not isinstance(self.type, (ValueType, SchemaType)):
             raise GrafxConfigurationError(
-                f"Column {self.name!r} needs a ValueType; got {self.type!r}.",
+                f"Column {self.name!r} needs a ValueType or SchemaType; got {self.type!r}.",
                 field="type",
                 value=repr(self.type),
             )
@@ -174,6 +213,20 @@ class ColumnDef:
                 value=repr(self.vector_space),
             )
 
+    def normalize_value(self, value: Value) -> Value:
+        """Return an exact typed assignment, never rounding a decimal implicitly."""
+        if self.stored_type is not None:
+            return normalize_typed_value(self.stored_type, value)
+        if value is not None and self.type is ValueType.DECIMAL:
+            if type(value) is not DecimalValue:
+                raise SchemaMismatchError("DECIMAL assignment requires a native decimal.", field="decimal")
+            # Revalidate even exact native objects: forged slots are not storage authority.
+            DecimalValue(value.coefficient, value.precision, value.scale)
+            if value.precision == self.decimal_precision and value.scale == self.decimal_scale:
+                return value
+            return value.rescale(self.decimal_precision, self.decimal_scale)
+        return value
+
     @property
     def is_vector(self) -> bool:
         """Return True when this column stores an embedding."""
@@ -183,10 +236,14 @@ class ColumnDef:
 class _TableDefColumnCache:
     """Reserve non-domain slots for immutable, derived column plans."""
 
-    __slots__ = ("_automatic_index_projection", "_column_positions", "_decode_plan")
+    __slots__ = ("_automatic_index_projection", "_column_positions", "_decode_plan", "_typed_assignments",
+                 "_node_label_candidates", "_node_label_candidate_set")
     _automatic_index_projection: object | None
     _column_positions: Mapping[str, int]
-    _decode_plan: tuple[tuple[int, ValueType, bool, ColumnDef], ...]
+    _decode_plan: tuple[tuple[int, ValueType | SchemaType, bool, ColumnDef], ...]
+    _typed_assignments: tuple[tuple[int, ColumnDef], ...]
+    _node_label_candidates: tuple[str, ...]
+    _node_label_candidate_set: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +258,11 @@ class TableDef(_TableDefColumnCache):
     from_table: str | None = None
     to_table: str | None = None
     schema_version: int = 1
+    schema_layouts: tuple[tuple[int, int], ...] = ()
+    flexible_properties: bool = False
+    unlabeled: bool = False
+    vector_identity_names: bool = False
+    extra_node_labels: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse a table whose shape contradicts the kind it declares.
@@ -216,6 +278,9 @@ class TableDef(_TableDefColumnCache):
         columns -- comes back unchanged.
         """
         object.__setattr__(self, "_automatic_index_projection", None)
+        validate_node_labels(self.extra_node_labels)
+        if self.extra_node_labels and self.kind != "node":
+            raise GrafxConfigurationError("Only node tables have label candidates.", field="extra_node_labels")
         if self.kind == "rel" and isinstance(self.columns, tuple):
             object.__setattr__(self, "columns", relationship_columns(self.columns))
         if isinstance(self.table_id, bool) or not isinstance(self.table_id, int):
@@ -279,6 +344,10 @@ class TableDef(_TableDefColumnCache):
             for position, column in enumerate(self.columns)
             if column.name in ENDPOINT_COLUMNS
         }
+        object.__setattr__(self, "_typed_assignments", tuple(
+            (position, column) for position, column in enumerate(self.columns)
+            if column.type is ValueType.DECIMAL or column.stored_type is not None
+        ))
         if self.kind == "rel":
             if reserved_positions != set(range(ENDPOINT_COLUMN_COUNT)):
                 # Normalisation put them at 0 and 1, so reaching here means the caller supplied
@@ -323,8 +392,33 @@ class TableDef(_TableDefColumnCache):
                 field="schema_version",
                 value=self.schema_version,
             )
+        if type(self.schema_layouts) is not tuple or len(self.schema_layouts) > 64:
+            raise GrafxConfigurationError("At most 64 prior append-only layouts are supported.", field="schema_layouts")
+        for position, layout in enumerate(self.schema_layouts):
+            if (type(layout) is not tuple or len(layout) != 2
+                    or any(type(n) is not int for n in layout)):
+                raise GrafxConfigurationError("Invalid prior schema layout.", field="schema_layouts")
+            version, count = layout
+            remaining = len(self.schema_layouts) - position
+            if (version != self.schema_version - remaining or version < 1
+                    or count != len(self.columns) - remaining or count < (2 if self.kind == "rel" else 1)):
+                raise GrafxConfigurationError("Prior layouts must be contiguous one-column additions.", field="schema_layouts")
+        if self.schema_layouts and any(not c.nullable for c in self.columns[self.schema_layouts[0][1]:]):
+            raise GrafxConfigurationError("Appended columns must be nullable.", field="schema_layouts")
+        if self.schema_layouts:
+            base_count = self.schema_layouts[0][1]
+            if (self.primary_key is not None and self.primary_key not in {c.name for c in self.columns[:base_count]}
+                    or any(c.type in VECTOR_VALUE_TYPES for c in self.columns[base_count:])):
+                raise GrafxConfigurationError("Prior layouts cannot imply a new PK or vector column.", field="schema_layouts")
         if self.primary_key is not None:
             _require_identifier("primary_key", self.primary_key)
+            if any(c.name == self.primary_key and c.stored_type is not None for c in self.columns):
+                raise GrafxConfigurationError("Typed collections are not primary keys.", field="primary_key")
+            if any(c.name == self.primary_key and c.type is SchemaType.ANY for c in self.columns):
+                raise GrafxConfigurationError(
+                    "An ANY property is not yet an admissible primary key.",
+                    field="primary_key", value=self.primary_key,
+                )
             if self.primary_key not in seen:
                 raise GrafxConfigurationError(
                     f"Table {self.name!r} names {self.primary_key!r} as its primary key, which "
@@ -332,6 +426,21 @@ class TableDef(_TableDefColumnCache):
                     field="primary_key",
                     value=self.primary_key,
                 )
+        if type(self.flexible_properties) is not bool or type(self.unlabeled) is not bool:
+            raise GrafxConfigurationError("Flexible graph flags must be exact booleans.", field="flexible_properties")
+        if type(self.vector_identity_names) is not bool or (
+            self.vector_identity_names and not any(column.is_vector for column in self.columns)
+        ):
+            raise GrafxConfigurationError("Identity vector names require a vector table and an exact boolean.",
+                                          field="vector_identity_names")
+        if self.unlabeled and (self.kind != "node" or not self.flexible_properties):
+            raise GrafxConfigurationError("An unlabeled table must hold flexible nodes.", field="unlabeled")
+        if self.flexible_properties:
+            properties = self.columns[2:] if self.kind == "rel" else self.columns
+            if (properties != (ColumnDef(FLEXIBLE_PROPERTIES_COLUMN, SchemaType.ANY, nullable=False),)
+                    or self.primary_key is not None or self.schema_layouts):
+                raise GrafxConfigurationError("Flexible entities require one non-null ANY property map and no column key/layouts.",
+                                              field="flexible_properties")
         if self.kind == "rel":
             if self.from_table is None or self.to_table is None:
                 raise GrafxConfigurationError(
@@ -354,6 +463,10 @@ class TableDef(_TableDefColumnCache):
                 field="from_table",
                 value=repr(self.from_table),
             )
+        candidates = (normalize_node_labels((*(() if self.unlabeled else (self.name,)), *self.extra_node_labels))
+                      if self.kind == "node" else ())
+        object.__setattr__(self, "_node_label_candidates", candidates)
+        object.__setattr__(self, "_node_label_candidate_set", frozenset(candidates))
 
     @property
     def arity(self) -> int:
@@ -364,6 +477,19 @@ class TableDef(_TableDefColumnCache):
         in encode_tuple catches anyone who forgot an end.
         """
         return len(self.columns)
+
+    @property
+    def node_label_candidates(self) -> tuple[str, ...]:
+        """Conservative possible membership, not the actual labels of each row."""
+        return self._node_label_candidates
+
+    def admits_node_labels(self, labels: tuple[str, ...]) -> bool:
+        """Test already validated labels against cached conservative candidates.
+
+        This predicate does not validate canonical encoding or prove actual node
+        membership. It costs O(labels in this row), not O(candidates in the table).
+        """
+        return self.kind == "node" and all(label in self._node_label_candidate_set for label in labels)
 
     @property
     def endpoint_columns(self) -> tuple[ColumnDef, ...]:
@@ -565,6 +691,19 @@ def _reject(table: TableDef, column: ColumnDef, position: int, detail: str) -> S
     )
 
 
+def _nonfinite_storage_value(value: Value, depth: int = 0) -> bool:
+    """Inspect nested storage admission with O(depth), not O(elements), work space."""
+    if depth > MAX_VALUE_DEPTH:
+        raise SchemaMismatchError("Stored collection exceeds the value depth limit.", field="depth")
+    if isinstance(value, float):
+        return not isfinite(float(value))
+    if isinstance(value, Mapping):
+        return any(_nonfinite_storage_value(item, depth + 1) for pair in value.items() for item in pair)
+    if isinstance(value, (list, tuple)):
+        return any(_nonfinite_storage_value(item, depth + 1) for item in value)
+    return False
+
+
 def _check_column_value(
     table: TableDef, position: int, column: ColumnDef, value: Value
 ) -> ValueType:
@@ -574,14 +713,36 @@ def _check_column_value(
             return ValueType.NULL
         raise _reject(table, column, position, "a null is not allowed in this column.")
     observed = value_type_of(value)
-    if observed is not column.type:
+    if table.flexible_properties and column.name == FLEXIBLE_PROPERTIES_COLUMN:
+        if observed is not ValueType.MAP or any(item is None for item in value.values()):
+            raise _reject(table, column, position, "flexible properties require a map with absent, not null, removed entries.")
+    if column.type is not SchemaType.ANY and observed is not column.type:
         raise _reject(
             table,
             column,
             position,
             f"a {observed.name} value cannot be stored in a {column.type.name} column.",
         )
+    if observed is ValueType.DOUBLE and not isfinite(float(value)):
+        raise _reject(table, column, position, "nonfinite numbers are expression values, not stored properties.")
+    if observed in (ValueType.LIST, ValueType.MAP) and _nonfinite_storage_value(value):
+        raise _reject(table, column, position, "nonfinite numbers cannot be nested in stored properties.")
+    if column.type is SchemaType.ANY and _contains_embedding(value):
+        raise _reject(table, column, position, "embeddings require a declared vector column and its space authority.")
     return observed
+
+
+def _contains_embedding(value: Value, depth: int = 0) -> bool:
+    """Do not turn a heterogeneous property into an unchecked vector-space route."""
+    if depth > MAX_VALUE_DEPTH:
+        raise SchemaMismatchError("Stored collection exceeds the value depth limit.", field="depth")
+    if isinstance(value, VectorValue):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_embedding(item, depth + 1) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_embedding(item, depth + 1) for item in value)
+    return False
 
 
 def endpoint_column_defs() -> tuple[ColumnDef, ColumnDef]:
@@ -658,6 +819,8 @@ def encode_tuple(table: TableDef, values: Sequence[Value]) -> bytes:
     encoded = bytearray()
     for position, (column, value) in enumerate(zip(table.columns, values)):
         kind = _check_column_value(table, position, column, value)
+        if column.type is ValueType.DECIMAL or column.stored_type is not None:
+            value = column.normalize_value(value)
         _append_encoded_value(encoded, value, kind=kind)
     return bytes(encoded)
 
@@ -882,6 +1045,46 @@ def _decode_tuple(
         materialize = (
             materialized_positions is None or position in materialized_positions
         )
+        if column.stored_type is not None:
+            value, offset = decode_value(buf, offset)
+            try:
+                _check_column_value(table, position, column, value)
+                validate_typed_value(column.stored_type, value)
+            except SchemaMismatchError as failure:
+                raise GrafxCorruptionDetected("Stored collection disagrees with its declared type.",
+                                              field="stored_type", table=table.name, column=column.name) from failure
+            if materialize:
+                if preserve_positions:
+                    values[position] = value
+                else:
+                    values.append(value)
+            continue
+        if expected_type is ValueType.DECIMAL:
+            value, offset = decode_value(buf, offset)
+            try:
+                _check_column_value(table, position, column, value)
+            except SchemaMismatchError as failure:
+                raise GrafxCorruptionDetected("Stored decimal column has an invalid value type.",
+                                              field="decimal_type", table=table.name, column=column.name) from failure
+            if value is not None and (value.precision != column.decimal_precision or value.scale != column.decimal_scale):
+                raise GrafxCorruptionDetected("Stored decimal metadata disagrees with its column.", field="decimal_type", table=table.name, column=column.name)
+            if materialize:
+                if preserve_positions:
+                    values[position] = value
+                else:
+                    values.append(value)
+            continue
+        if expected_type is SchemaType.ANY:
+            # Even an omitted projection must validate the actual tag, all nested
+            # values and storage admission. No schema-only tag is a value tag.
+            value, offset = decode_value(buf, offset)
+            _check_column_value(table, position, column, value)
+            if materialize:
+                if preserve_positions:
+                    values[position] = value
+                else:
+                    values.append(value)
+            continue
         if offset >= len(buf):
             # Keep the generic oracle's classified short-tag refusal verbatim.
             value, offset = decode_value(buf, offset)

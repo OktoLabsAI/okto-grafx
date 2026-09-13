@@ -620,6 +620,8 @@ def build_query_stack(
     # genuinely complete for everything this fixture can have installed at that ceiling.
     indexes.mark_built_through(FIXTURE_READ_LSN)
     engine = QueryEngine(
+        database_uuid=b"q" * 16,
+        entity_namespace=b"s" * 16,
         catalog=catalog_store,
         heap=heap,
         pool=pool,

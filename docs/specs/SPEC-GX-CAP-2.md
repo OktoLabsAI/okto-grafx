@@ -1,7 +1,22 @@
 # SPEC-GX-CAP-2 — Catalog sessions and workspace scopes
 
-Status: specified / implementation not certified. Date: 2026-09-08.
+Status: bounded slices implemented and locally validated; full scope remains partial.
+Original specification: 2026-09-08; implementation status reconciled 2026-09-10.
 Dependencies: M1 lifecycle; GX-CAP-0; GX-CAP-1 for promotion receipts.
+
+September 10, 2026 checkpoint: the 0.0.6 development line implements the
+non-persisting `CatalogSession` and optional bounded workspace resolver. See
+[consumer contract](../CATALOGS_AND_WORKSPACES.md) and
+[active execution status](../../ROADMAP.md#approved-capability-continuation-after-4ee4d2e).
+The full CAP-2 scope is **not complete**. The subsequent bounded existing-target
+[copy/receipt slice](../CATALOG_COPY.md) is implemented; arbitrary subgraph
+selection by arbitrary predicates, automatic endpoint closure, merge policies and
+anonymous-node copy remain pending. The latest follow-up also delivers explicit
+selected RIDs, skip-node conflicts and catalog/workspace JSON CLI inventory.
+[Latest acceptance](../reports/V006_NATIVE_HISTORY_ROUND.md) supersedes the initial
+checkpoint for those named slices, not for the entire CAP-2 specification.
+[Local acceptance](../reports/V006_CATALOG_WORKSPACE_ACCEPTANCE.md): 437 affected
+regression tests passed; full repository/POSIX/release matrices are not inferred.
 
 ## Normative scope
 

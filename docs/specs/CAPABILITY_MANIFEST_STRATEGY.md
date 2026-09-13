@@ -27,6 +27,12 @@ Bit 11 (`fulltext_prefixes_v1`, requires bit 5) adds opt-in bounded
 [relationship text indexes](FTS_RELATIONSHIPS_V1.md). Both preserve the existing
 catalog-before-effects WAL protocol and remain required after index removal.
 Arrow import and detached projections add no persisted format or required bit.
+The 0.0.6 nullable-column development slice uses required bit 13
+(`nullable_columns_v1`) for bounded prior table layouts. Its catalog bytes and
+atomic activation/refusal rules are specified in [Nullable columns v1](NULLABLE_COLUMNS_V1.md).
+Bit 14 (`posting_hash_v1`) selects explicit exact property indexes with page-local
+key dictionaries; [Posting hash v1](POSTING_HASH_V1.md) freezes the layout and
+unchanged native WAL/visibility boundaries.
 `tests/storage_core/test_catalog_v2.py` and
 `tests/index/test_ordered_format_discrimination.py` exercise unknown/missing bits
 and older-reader discrimination. The subsequent layouts are specified in

@@ -21,7 +21,7 @@ def test_a_failed_vector_attach_returns_no_unjournaled_registry_or_map_claim(
     original_publish = engine_type._publish_space_metrics
 
     def refuse_attached_map(engine: VectorEngine) -> None:
-        if engine is database._vectors and "s" in database._vectors._by_space:
+        if engine is database._vectors and any(key[0] == "s" for key in database._vectors._by_space):
             raise GrafxIndexError(
                 "Injected vector attach publication refusal.",
                 field="metrics",
@@ -129,16 +129,17 @@ def test_failed_outer_attach_preserves_an_identical_reentrant_adopter(
         assert artifact is not None
         assert database._indexes.indexes() == (index,)
         assert database._indexes._artifact_claims == {index: {artifact.owner}}
-        assert database._vectors._by_space == {"s": index}
-        assert database._vectors._map_claims == {"s": {index: {owner}}}
-        assert set(database._vectors._map_epochs) == {"s"}
-        assert set(database._vectors._maintained_at) == {"s"}
+        key = ("s", index.definition.table_id)
+        assert database._vectors._by_space == {key: index}
+        assert database._vectors._map_claims == {key: {index: {owner}}}
+        assert set(database._vectors._map_epochs) == {key}
+        assert set(database._vectors._maintained_at) == {key}
         assert database._vectors._durable_by_space == {}
         pages_before_settlement = physical_pages(index.file)
 
         transaction.rollback()
         assert database._indexes.indexes() == (index,)
-        assert database._vectors._by_space == {"s": index}
+        assert database._vectors._by_space == {key: index}
 
         assert database._vectors._settle_attachment(
             "s",

@@ -52,6 +52,31 @@ def test_required_journal_refuses_before_valid_prefix_moves_until_replay_is_wire
     assert calls == [] and pool.flush_calls == []
 
 
+@pytest.mark.parametrize("compress", [False, True])
+def test_internal_history_file_is_not_admitted_even_with_a_commit_and_valid_prefix(
+    compress: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from okto_grafx.domain.recovery.decision import committed_replay
+    from okto_grafx.engine.system_history_store import SystemHistoryStore
+
+    store = SystemHistoryStore(lambda *_: pytest.fail("Unexpected history read"),
+                               database_uuid=bytes(16), page_size=512)
+    image = store.initialize(3)
+    encoded = encode_page_write_record(image.file, 0, image.raw, compress=compress)
+    effect = WalRecord(
+        WalRecordType.WRITE_PAGE, encoded.payload, lsn=2, epoch=1, txn_id=7,
+        format_version=encoded.format_version, flags=encoded.flags,
+    )
+    commit = WalRecord(WalRecordType.COMMIT, b"", lsn=3, epoch=1, txn_id=7)
+    calls = []
+    monkeypatch.setattr(commit_redo_module, "apply_page_image", lambda *args: calls.append(args))
+    pool = _PoolDouble()
+    with pytest.raises(GrafxRecoveryRefused):
+        CommitRedo(pool).apply(committed_replay((_page_record(), effect, commit)))
+    assert pool.codec.decode_calls == 1
+    assert calls == [] and pool.flush_calls == []
+
+
 @dataclass(frozen=True)
 class _IndexDefinitionDouble:
     versioned: bool = False
@@ -193,6 +218,28 @@ def _reset_record(lsn: int = 1) -> WalRecord:
     return wal_record_for(change, epoch=1, txn_id=7, descriptor=DESCRIPTOR).with_lsn(
         lsn
     )
+
+
+@pytest.mark.parametrize("page", [0, 0xFFFFFFFF])
+def test_posting_reference_refuses_before_any_valid_prefix_is_applied(monkeypatch, page):
+    from types import SimpleNamespace
+    from okto_grafx.domain.index.layout import IndexLayout
+
+    events = []
+    pool = _PoolDouble()
+    manager = _IndexManagerDouble(events)
+    manager.named = replace(manager.named, definition=SimpleNamespace(
+        versioned=False, layout=IndexLayout.POSTING_HASH))
+    change = IndexChange(index="by_name", operation=IndexOperation.INSERT,
+                         key=b"Ada", ref=RecordRef(page, 0))
+    effect = wal_record_for(change, epoch=1, txn_id=7, descriptor=DESCRIPTOR).with_lsn(2)
+    monkeypatch.setattr(commit_redo_module, "apply_page_image",
+                        lambda *args: events.append("unexpected page mutation"))
+    with pytest.raises(GrafxCorruptionDetected) as refusal:
+        CommitRedo(pool, manager).apply(CommittedReplay(
+            effects=(_page_record(), effect), last_committed_lsn=3))
+    assert refusal.value.details["field"] == "ref"
+    assert events == [] and pool.flush_calls == []
 
 
 def _commit_record(lsn: int = 4) -> WalRecord:

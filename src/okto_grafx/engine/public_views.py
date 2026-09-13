@@ -56,7 +56,9 @@ from okto_grafx.domain.ledger.entry import (
 )
 from okto_grafx.domain.ledger.payload import LedgerPayload, decode_payload
 from okto_grafx.domain.model.catalog import CATALOG_LEGACY_FORMAT_VERSION, Catalog
-from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
+from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef, SchemaType
+from okto_grafx.domain.model.stored_types import StoredType
+from okto_grafx.domain.model.relationship_type import RelationshipTypeDef
 from okto_grafx.domain.model.value import (
     INT64_MAX,
     INT64_MIN,
@@ -73,11 +75,22 @@ from okto_grafx.domain.page.layout import MAX_U32, MAX_U64
 from okto_grafx.domain.page.checksum import crc32c_implementation
 from okto_grafx.domain.ports.vectormath import DistanceMetric
 from okto_grafx.domain.query.analysis import Aggregation
+from okto_grafx.domain.model.table_selection import TableSelector
 from okto_grafx.domain.query.ast import (
     BinaryOperation,
     CaseAlternative,
     CaseExpression,
     Expression,
+    ExistsSubquery,
+    Query,
+    UnionQuery,
+    MatchClause,
+    WithClause,
+    ReturnClause,
+    UnwindClause,
+    SubqueryClause,
+    ProcedureCall,
+    UpdatingClause,
     FunctionCall,
     ListExpression,
     Literal,
@@ -86,10 +99,18 @@ from okto_grafx.domain.query.ast import (
     NamedArgument,
     NullCheck,
     Parameter,
+    PatternPredicate,
+    PatternComprehension,
+    LabelPredicate,
+    PatternPath,
+    NodePattern,
+    RelationshipPattern,
     Property,
     ReturnItem,
     SortItem,
     Subscript,
+    ListSlice,
+    ListIteration,
     UnaryOperation,
     Variable,
 )
@@ -107,6 +128,11 @@ from okto_grafx.domain.query.limits import (
 )
 from okto_grafx.domain.query.plan import (
     AllNodesScan,
+    ArgumentRows,
+    ApplyRows,
+    SubqueryRows,
+    RestoreImports,
+    ProcedureRows,
     MAX_PLAN_DEPTH,
     AggregateRows,
     CreateIndex,
@@ -114,6 +140,8 @@ from okto_grafx.domain.query.plan import (
     CreatedNode,
     CreatedRelationship,
     CreateRelationships,
+    CreateSequence,
+    CreatedPattern,
     CreateRelTable,
     CreateVectorSpace,
     DeleteEntities,
@@ -131,6 +159,7 @@ from okto_grafx.domain.query.plan import (
     ProduceResults,
     ProjectRows,
     PropertyAssignment,
+    LabelAssignment,
     RelationshipIncidentSeek,
     RelationshipScan,
     SetProperties,
@@ -138,7 +167,10 @@ from okto_grafx.domain.query.plan import (
     SkipRows,
     SortRows,
     TraverseAnyRelationship,
+    TraverseRelationshipAlternatives,
     TraverseRelationship,
+    CaptureNodePath,
+    ZeroHopRelationship,
     UnionRows,
     UnwindRows,
     VectorSearch,
@@ -326,7 +358,7 @@ class TableBloatReport:
     never presented as bloat.
     """
 
-    table: str
+    table: TableSelector
     table_id: int
     data_pages: int
     slot_directory_entries: int
@@ -373,7 +405,7 @@ class BloatReport:
 class TableVacuumReport:
     """Detached physical effects of one quiescent vacuum pass over one table."""
 
-    table: str
+    table: TableSelector
     table_id: int
     pages_scanned: int
     eligible_inline_versions: int
@@ -498,6 +530,29 @@ class CatalogView:
 
     table_definitions: tuple[TableDef, ...]
     space_definitions: tuple[EmbeddingSpaceDef, ...]
+    relationship_type_definitions: tuple[RelationshipTypeDef, ...] = ()
+
+    def relationship_types(self) -> tuple[RelationshipTypeDef, ...]:
+        """Return detached logical groups in name order, without live authority."""
+        return self.relationship_type_definitions
+
+    def relationship_tables(self, name: str) -> tuple[TableDef, ...]:
+        """Resolve a captured logical type without aliasing physical identities."""
+        wanted = _require_text("relationship_type", name)
+        for group in self.relationship_type_definitions:
+            if group.name == wanted:
+                return tuple(self.table_by_id(key) for key in group.table_ids)
+        grouped = {key for group in self.relationship_type_definitions for key in group.table_ids}
+        return tuple(table for table in self.table_definitions
+                     if table.name == wanted and table.kind == "rel" and table.table_id not in grouped)
+
+    def relationship_type_name(self, table_id: int) -> str:
+        """Return the captured logical type of a real relationship table."""
+        table = self.table_by_id(table_id)
+        if table.kind != "rel":
+            raise GrafxConfigurationError("A node table has no relationship type.", field="table_id")
+        return next((group.name for group in self.relationship_type_definitions
+                     if table.table_id in group.table_ids), table.name)
 
     def tables(self) -> tuple[TableDef, ...]:
         """Return captured tables in numeric identity order."""
@@ -507,22 +562,31 @@ class CatalogView:
         """Return captured embedding spaces in numeric identity order."""
         return self.space_definitions
 
-    def has_table(self, name: str) -> bool:
-        """Return whether a captured table has ``name``."""
+    def has_table(self, name: str, *, kind: str | None = None) -> bool:
+        """Return whether a physical name exists, optionally qualified by kind."""
         wanted = _require_text("table", name)
-        return any(table.name == wanted for table in self.table_definitions)
+        if kind is not None and (type(kind) is not str or kind not in {"node", "rel"}):
+            raise GrafxConfigurationError("Table kind must be node or rel.", field="kind")
+        return any(table.name == wanted and (kind is None or table.kind == kind)
+                   for table in self.table_definitions)
 
     def has_space(self, name: str) -> bool:
         """Return whether a captured embedding space has ``name``."""
         wanted = _require_text("space", name)
         return any(space.name == wanted for space in self.space_definitions)
 
-    def table(self, name: str) -> TableDef:
-        """Return a captured table by name."""
+    def table(self, name: str, *, kind: str | None = None) -> TableDef:
+        """Return a captured physical table; ambiguous unqualified names refuse."""
         wanted = _require_text("table", name)
-        for table in self.table_definitions:
-            if table.name == wanted:
-                return table
+        if kind is not None and (type(kind) is not str or kind not in {"node", "rel"}):
+            raise GrafxConfigurationError("Table kind must be node or rel.", field="kind")
+        matches = tuple(table for table in self.table_definitions
+                        if table.name == wanted and (kind is None or table.kind == kind))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise GrafxConfigurationError("Qualify an ambiguous physical table name with kind.",
+                                           field="table", value=wanted, reason="ambiguous_table_name")
         raise GrafxConfigurationError(
             f"There is no table named {wanted!r} in this catalog snapshot.",
             field="table",
@@ -872,6 +936,7 @@ class VectorIndexView:
     stale: bool
     stale_reason: str | None
     built_through_lsn: int | None
+    table_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -902,8 +967,11 @@ class VectorEngineView:
         """Return captured vector indexes in stable space-name order."""
         return self.registered_indexes
 
-    def index(self, space_name: str) -> VectorIndexView:
-        """Return the captured vector index of one embedding space."""
+    def index(self, space_name: str, *, table_id: int | None = None) -> VectorIndexView:
+        """Select a captured physical owner; an unqualified shared space refuses."""
+        if table_id is not None and (type(table_id) is not int or table_id < 1):
+            raise GrafxIndexError("Vector table identity must be a positive integer.",
+                                  field="table_id")
         if not issubclass(type(space_name), str):
             observed = _builtin_type_name(space_name)
             raise GrafxIndexError(
@@ -912,9 +980,16 @@ class VectorEngineView:
                 value=observed,
             )
         wanted = _builtin_text(space_name, field="space")
-        for index in self.registered_indexes:
-            if index.space_name == wanted:
-                return index
+        matches = tuple(index for index in self.registered_indexes
+                        if index.space_name == wanted
+                        and (table_id is None or index.table_id == table_id))
+        if len(matches) > 1:
+            raise GrafxIndexError(
+                "The embedding space has multiple physical owners; inspect indexes().",
+                field="space", value=wanted, reason="ambiguous_vector_owner",
+            )
+        if matches:
+            return matches[0]
         raise GrafxIndexError(
             f"Embedding space {wanted!r} has no index in this snapshot.",
             field="space",
@@ -1111,17 +1186,21 @@ def _dictionary_values(value: object, *, field: str) -> tuple[object, ...]:
 def _column_definition(value: Any) -> ColumnDef:
     """Rebuild one column with exact scalar and enum leaves."""
     value = _domain_value(value, ColumnDef, field="catalog.column")
+    declared = _domain_field(value, ColumnDef, "type")
     return ColumnDef(
         name=_builtin_text(
             _domain_field(value, ColumnDef, "name"), field="column.name", empty=False
         ),
         type=_integer_enum(
-            _domain_field(value, ColumnDef, "type"), ValueType, field="column.type"
+            declared, SchemaType if type(declared) is SchemaType else ValueType, field="column.type"
         ),
         nullable=_builtin_bool(_domain_field(value, ColumnDef, "nullable")),
         vector_space=_builtin_optional_text(
             _domain_field(value, ColumnDef, "vector_space"), field="column.vector_space"
         ),
+        decimal_precision=_domain_field(value, ColumnDef, "decimal_precision"),
+        decimal_scale=_domain_field(value, ColumnDef, "decimal_scale"),
+        stored_type=_domain_field(value, ColumnDef, "stored_type"),
     )
 
 
@@ -1152,6 +1231,14 @@ def _table_definition(value: Any) -> TableDef:
             _domain_field(value, TableDef, "to_table"), field="table.to_table"
         ),
         schema_version=_builtin_int(_domain_field(value, TableDef, "schema_version")),
+        flexible_properties=_builtin_bool(_domain_field(value, TableDef, "flexible_properties")),
+        unlabeled=_builtin_bool(_domain_field(value, TableDef, "unlabeled")),
+        vector_identity_names=_builtin_bool(_domain_field(value, TableDef, "vector_identity_names")),
+        extra_node_labels=tuple(_builtin_text(label, field="table.extra_node_labels", empty=False)
+                                for label in _tuple_items(_domain_field(value, TableDef, "extra_node_labels"),
+                                                          field="table.extra_node_labels")),
+        schema_layouts=tuple(tuple(_builtin_int(n) for n in _tuple_items(pair, field="table.schema_layout"))
+                             for pair in _tuple_items(_domain_field(value, TableDef, "schema_layouts"), field="table.schema_layouts")),
     )
 
 
@@ -1874,274 +1961,22 @@ def _query_text_snapshot(value: object) -> str:
     return text
 
 
-def _path_exact_value(value: object, expected: type[object], *, field: str) -> Any:
-    """Return one exact private path DTO, refusing subclasses and forged nested shapes."""
-    if type(value) is not expected:
-        raise GrafxConfigurationError(
-            f"The {field} of a projected path must be {_builtin_class_name(expected)}; got "
-            f"{_builtin_type_name(value)}.",
-            field=field,
-            value=_builtin_type_name(value),
-        )
-    return value
-
-
-def _path_identity_snapshot(
-    value: object, expected: type[object], *, field: str
-) -> dict[Value, Value]:
-    """Rebuild one opaque path identity from exact signed integers."""
-    source = _path_exact_value(value, expected, field=field)
-    offset = _builtin_int(
-        _domain_field(source, expected, "offset"), field=f"{field}.offset"
-    )
-    table = _builtin_int(
-        _domain_field(source, expected, "table"), field=f"{field}.table"
-    )
-    if not INT64_MIN <= offset <= INT64_MAX:
-        raise GrafxConfigurationError(
-            "A projected path offset must fit in 64 signed bits.",
-            field=f"{field}.offset",
-            value=offset,
-            minimum=INT64_MIN,
-            maximum=INT64_MAX,
-        )
-    if not 1 <= table <= MAX_U32:
-        raise GrafxConfigurationError(
-            "A projected path table identity must fit in the catalog table domain.",
-            field=f"{field}.table",
-            value=table,
-            minimum=1,
-            maximum=MAX_U32,
-        )
-    return {"offset": offset, "table": table}
-
-
-def _path_label_snapshot(value: object, *, field: str) -> str:
-    """Return one exact bounded node label or relationship type."""
-    label = _builtin_text(value, field=field, empty=False)
-    if len(label) > MAX_NAME_CHARACTERS:
-        raise GrafxConfigurationError(
-            f"A projected path label may carry at most {MAX_NAME_CHARACTERS} characters.",
-            field=field,
-            value=len(label),
-            limit=MAX_NAME_CHARACTERS,
-        )
-    return label
-
-
-def _path_properties_snapshot(
-    value: object,
-    *,
-    field: str,
-    depth: int,
-    active: set[int],
-    detached: dict[Value, Value],
-    max_string_characters: int,
-) -> None:
-    """Append exact ordered user properties to one path entity map."""
-    pairs = _tuple_items(value, field=field)
-    if len(pairs) + len(detached) > MAX_MAP_ENTRIES:
-        raise GrafxConfigurationError(
-            f"The {field} mapping may hold at most {MAX_MAP_ENTRIES} entries.",
-            field=field,
-            value=len(pairs) + len(detached),
-            limit=MAX_MAP_ENTRIES,
-        )
-    for position, raw_pair in enumerate(pairs):
-        pair = _tuple_items(raw_pair, field=f"{field}[{position}]")
-        if len(pair) != 2:
-            raise GrafxConfigurationError(
-                "Every projected path property must be one name/value pair.",
-                field=f"{field}[{position}]",
-                value=len(pair),
-                expected=2,
-            )
-        name = _builtin_text(pair[0], field=f"{field}[{position}].name", empty=False)
-        if len(name) > MAX_NAME_CHARACTERS:
-            raise GrafxConfigurationError(
-                f"A projected path property name may carry at most "
-                f"{MAX_NAME_CHARACTERS} characters.",
-                field=f"{field}[{position}].name",
-                value=len(name),
-                limit=MAX_NAME_CHARACTERS,
-            )
-        if name in detached:
-            raise GrafxConfigurationError(
-                f"A projected path property cannot replace reserved or duplicate key "
-                f"{name!r}.",
-                field=f"{field}[{position}].name",
-                value=name,
-                reason="duplicate",
-            )
-        detached[name] = _query_value_snapshot(
-            pair[1],
-            field=f"{field}.{name}",
-            depth=depth,
-            active=active,
-            max_string_characters=max_string_characters,
-        )
-
-
-def _path_node_snapshot(
-    value: object,
-    *,
-    node_type: type[object],
-    identity_type: type[object],
-    field: str,
-    depth: int,
-    active: set[int],
-    max_string_characters: int,
-) -> dict[Value, Value]:
-    """Rebuild one node of a projected path in Kuzu-compatible key order."""
-    source = _path_exact_value(value, node_type, field=field)
-    detached: dict[Value, Value] = {
-        "_ID": _path_identity_snapshot(
-            _domain_field(source, node_type, "identity"),
-            identity_type,
-            field=f"{field}._ID",
-        ),
-        "_LABEL": _path_label_snapshot(
-            _domain_field(source, node_type, "label"), field=f"{field}._LABEL"
-        ),
-    }
-    _path_properties_snapshot(
-        _domain_field(source, node_type, "properties"),
-        field=f"{field}.properties",
-        depth=depth,
-        active=active,
-        detached=detached,
-        max_string_characters=max_string_characters,
-    )
-    return detached
-
-
-def _path_relationship_snapshot(
-    value: object,
-    *,
-    relationship_type: type[object],
-    identity_type: type[object],
-    field: str,
-    depth: int,
-    active: set[int],
-    max_string_characters: int,
-) -> dict[Value, Value]:
-    """Rebuild one relationship of a projected path in Kuzu-compatible key order."""
-    source = _path_exact_value(value, relationship_type, field=field)
-    detached: dict[Value, Value] = {
-        "_SRC": _path_identity_snapshot(
-            _domain_field(source, relationship_type, "source"),
-            identity_type,
-            field=f"{field}._SRC",
-        ),
-        "_DST": _path_identity_snapshot(
-            _domain_field(source, relationship_type, "target"),
-            identity_type,
-            field=f"{field}._DST",
-        ),
-        "_LABEL": _path_label_snapshot(
-            _domain_field(source, relationship_type, "label"),
-            field=f"{field}._LABEL",
-        ),
-        "_ID": _path_identity_snapshot(
-            _domain_field(source, relationship_type, "identity"),
-            identity_type,
-            field=f"{field}._ID",
-        ),
-    }
-    _path_properties_snapshot(
-        _domain_field(source, relationship_type, "properties"),
-        field=f"{field}.properties",
-        depth=depth,
-        active=active,
-        detached=detached,
-        max_string_characters=max_string_characters,
-    )
-    return detached
-
-
-def _query_path_snapshot(
-    value: object,
-    *,
-    field: str,
-    depth: int,
-    active: set[int],
-    max_string_characters: int,
-) -> dict[Value, Value]:
-    """Detach the engine's nominal one-hop path into maps and immutable sequences."""
-    from okto_grafx.engine.query_engine import (
-        _PathIdentity,
-        _PathNodeValue,
-        _PathRelationshipValue,
-        _PathValue,
-    )
-
-    if depth + 4 > MAX_VALUE_DEPTH:
-        raise GrafxConfigurationError(
-            f"A query value may nest at most {MAX_VALUE_DEPTH} levels deep.",
-            field=field,
-            value=depth + 4,
-            limit=MAX_VALUE_DEPTH,
-        )
-    source = _path_exact_value(value, _PathValue, field=field)
-    marker = id(source)
+def _native_path_snapshot(value: object, *, field: str, depth: int, active: set[int],
+                          max_string_characters: int) -> Value:
+    """Rebuild a result-only path through the same hostile entity admission."""
+    from okto_grafx.domain.query.entity_values import PathValue
+    marker = id(value)
     if marker in active:
-        raise GrafxConfigurationError(
-            "A query value cannot contain a recursive projected path.",
-            field=field,
-            value="cycle",
-        )
+        raise GrafxConfigurationError("A path result cannot contain cycles.", field=field)
     active.add(marker)
     try:
-        raw_nodes = _tuple_items(
-            _domain_field(source, _PathValue, "nodes"), field=f"{field}._NODES"
-        )
-        raw_relationships = _tuple_items(
-            _domain_field(source, _PathValue, "relationships"),
-            field=f"{field}._RELS",
-        )
-        if len(raw_nodes) != 2 or len(raw_relationships) != 1:
-            raise GrafxConfigurationError(
-                "A projected path must contain exactly two nodes and one relationship.",
-                field=field,
-                value={
-                    "nodes": len(raw_nodes),
-                    "relationships": len(raw_relationships),
-                },
-            )
-        nodes = tuple(
-            _path_node_snapshot(
-                raw_node,
-                node_type=_PathNodeValue,
-                identity_type=_PathIdentity,
-                field=f"{field}._NODES[{position}]",
-                depth=depth + 3,
-                active=active,
-                max_string_characters=max_string_characters,
-            )
-            for position, raw_node in enumerate(raw_nodes)
-        )
-        relationships = tuple(
-            _path_relationship_snapshot(
-                raw_relationship,
-                relationship_type=_PathRelationshipValue,
-                identity_type=_PathIdentity,
-                field=f"{field}._RELS[{position}]",
-                depth=depth + 3,
-                active=active,
-                max_string_characters=max_string_characters,
-            )
-            for position, raw_relationship in enumerate(raw_relationships)
-        )
-        if (
-            relationships[0]["_SRC"] != nodes[0]["_ID"]
-            or relationships[0]["_DST"] != nodes[1]["_ID"]
-        ):
-            raise GrafxConfigurationError(
-                "A projected relationship must identify the two nodes surrounding it.",
-                field=field,
-                value="endpoint_mismatch",
-            )
-        return {"_NODES": nodes, "_RELS": relationships}
+        parts = []
+        for name in ("nodes", "relationships"):
+            parts.append(_query_value_snapshot(
+                _domain_field(value, PathValue, name), field=field + "." + name,
+                depth=depth + 1, active=active, max_string_characters=max_string_characters,
+                allow_entities=True))
+        return PathValue(*parts)  # type: ignore[return-value, arg-type]
     finally:
         active.remove(marker)
 
@@ -2178,6 +2013,7 @@ def _query_value_snapshot(
     depth: int,
     active: set[int],
     max_string_characters: int = MAX_STRING_CHARACTERS,
+    allow_entities: bool = False,
 ) -> Value:
     """Copy one query value into an exact, bounded and capability-free value graph."""
     if depth > MAX_VALUE_DEPTH:
@@ -2210,6 +2046,16 @@ def _query_value_snapshot(
         )
     if issubclass(value_type, (bytes, bytearray, memoryview)):
         return _builtin_bytes(value, field=field)
+    from okto_grafx.domain.model.temporal_values import (
+        DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue,
+    )
+    if value_type in (DateValue, LocalTimeValue, TimeValue, LocalDateTimeValue, DateTimeValue, DurationValue):
+        from okto_grafx.domain.model.temporal_codec import encode_temporal_value, decode_temporal_value
+        return decode_temporal_value(encode_temporal_value(value))[0]
+    from okto_grafx.domain.model.decimal_values import DecimalValue
+    if value_type is DecimalValue:
+        from okto_grafx.domain.model.decimal_codec import encode_decimal_value, decode_decimal_value
+        return decode_decimal_value(encode_decimal_value(value))[0]
     if issubclass(value_type, Timestamp):
         source = _domain_value(value, Timestamp, field=field)
         micros = _builtin_int(
@@ -2233,18 +2079,19 @@ def _query_value_snapshot(
     exact_float_sequence = _exact_float_sequence_snapshot(value, depth=depth)
     if exact_float_sequence is not None:
         return exact_float_sequence
-    # This is a result-only marker, not a storable Value. It is recognized nominally and
-    # rebuilt here, outside page access, before a private engine object can reach the caller.
-    from okto_grafx.engine.query_engine import _PathValue
+    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue, PathValue
 
-    if value_type is _PathValue:
-        return _query_path_snapshot(
+    if allow_entities and value_type is PathValue:
+        return _native_path_snapshot(
             value,
             field=field,
             depth=depth,
             active=active,
             max_string_characters=max_string_characters,
         )
+    if allow_entities and value_type in (NodeValue, RelationshipValue):
+        return _query_entity_snapshot(value, field=field, depth=depth, active=active,
+                                      max_string_characters=max_string_characters)
     if isinstance(value, Mapping):
         return _query_mapping_snapshot(
             value,
@@ -2252,6 +2099,7 @@ def _query_value_snapshot(
             depth=depth,
             active=active,
             max_string_characters=max_string_characters,
+            allow_entities=allow_entities,
         )
     if isinstance(value, Sequence):
         return _query_sequence_snapshot(
@@ -2260,6 +2108,7 @@ def _query_value_snapshot(
             depth=depth,
             active=active,
             max_string_characters=max_string_characters,
+            allow_entities=allow_entities,
         )
     observed = _builtin_type_name(value)
     raise GrafxConfigurationError(
@@ -2268,6 +2117,38 @@ def _query_value_snapshot(
         value=observed,
         reason="unsupported_value",
     )
+
+
+def _query_entity_snapshot(value: object, *, field: str, depth: int, active: set[int],
+                           max_string_characters: int) -> Value:
+    """Rebuild nominal entity results; the parameter/AST doors do not admit them."""
+    from okto_grafx.domain.query.entity_identity import EntityIdentity, EntityProvenance
+    from okto_grafx.domain.query.entity_values import NodeValue, RelationshipValue
+
+    def identity(source: object) -> EntityIdentity:
+        """Copy and validate detached entity identity metadata at the public result boundary."""
+        if type(source) is not EntityIdentity:
+            raise GrafxConfigurationError("Entity results require qualified identity metadata.", field=field)
+        return EntityIdentity(*(_domain_field(source, EntityIdentity, name) for name in (
+            "database_uuid", "table_id", "kind", "record_id", "provisional_id")))
+
+    kind = type(value)
+    entity_id = identity(_domain_field(value, kind, "identity"))
+    source = _domain_field(value, kind, "provenance")
+    if type(source) is not EntityProvenance:
+        raise GrafxConfigurationError("Entity results require snapshot provenance.", field=field)
+    provenance = EntityProvenance(*(_domain_field(source, EntityProvenance, name) for name in (
+        "read_lsn", "schema_version", "version_lsn", "pending")))
+    label = _query_value_snapshot(_domain_field(value, kind, "label"), field=field + ".label",
+                                  depth=depth + 1, active=active, max_string_characters=max_string_characters)
+    properties = _query_value_snapshot(_domain_field(value, kind, "properties"), field=field + ".properties",
+                                       depth=depth + 1, active=active, max_string_characters=max_string_characters)
+    if kind is NodeValue:
+        labels = _query_value_snapshot(_domain_field(value, kind, "node_labels"), field=field + ".labels",
+                                      depth=depth + 1, active=active, max_string_characters=max_string_characters)
+        return NodeValue(entity_id, label, properties, provenance, node_labels=labels)  # type: ignore[return-value, arg-type]
+    return RelationshipValue(entity_id, label, identity(_domain_field(value, kind, "source")),
+                              identity(_domain_field(value, kind, "target")), properties, provenance)  # type: ignore[return-value, arg-type]
 
 
 def _exact_float_sequence_snapshot(
@@ -2309,6 +2190,7 @@ def _query_mapping_snapshot(
     depth: int,
     active: set[int],
     max_string_characters: int,
+    allow_entities: bool = False,
 ) -> dict[Value, Value]:
     """Copy one bounded map, rejecting cycles and canonical-key collisions."""
     marker = id(value)
@@ -2337,6 +2219,7 @@ def _query_mapping_snapshot(
                 depth=depth + 1,
                 active=active,
                 max_string_characters=max_string_characters,
+                allow_entities=allow_entities,
             )
             try:
                 duplicate = key in detached
@@ -2366,6 +2249,7 @@ def _query_sequence_snapshot(
     depth: int,
     active: set[int],
     max_string_characters: int,
+    allow_entities: bool = False,
 ) -> tuple[Value, ...]:
     """Copy one bounded sequence without invoking list or tuple subclass overrides."""
     marker = id(value)
@@ -2400,6 +2284,7 @@ def _query_sequence_snapshot(
                     depth=depth + 1,
                     active=active,
                     max_string_characters=max_string_characters,
+                    allow_entities=allow_entities,
                 )
             )
         return tuple(detached)
@@ -2435,9 +2320,15 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
     {
         AggregateRows,
         AllNodesScan,
+        ArgumentRows,
+        ApplyRows,
+        SubqueryRows,
+        RestoreImports,
+        ProcedureRows,
         CreateIndex,
         CreateNodeTable,
         CreateRelationships,
+        CreateSequence,
         CreateRelTable,
         CreateVectorSpace,
         DeleteEntities,
@@ -2460,7 +2351,10 @@ _QUERY_PLAN_NODE_TYPES: frozenset[type[PlanNode]] = frozenset(
         SkipRows,
         SortRows,
         TraverseAnyRelationship,
+        TraverseRelationshipAlternatives,
         TraverseRelationship,
+        CaptureNodePath,
+        ZeroHopRelationship,
         UnionRows,
         UnwindRows,
         VectorSearch,
@@ -2480,8 +2374,14 @@ _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
         MapExpression,
         NullCheck,
         Parameter,
+        PatternPredicate,
+        ExistsSubquery,
+        PatternComprehension,
+        LabelPredicate,
         Property,
         Subscript,
+        ListSlice,
+        ListIteration,
         UnaryOperation,
         Variable,
     }
@@ -2491,14 +2391,28 @@ _QUERY_PLAN_EXPRESSION_TYPES: frozenset[type[Expression]] = frozenset(
 
 _QUERY_PLAN_AUXILIARY_TYPES: frozenset[type[object]] = frozenset(
     {
+        StoredType,
         Aggregation,
+        Query,
+        UnionQuery,
+        MatchClause,
+        WithClause,
+        ReturnClause,
+        UnwindClause,
+        SubqueryClause,
+        ProcedureCall,
         CaseAlternative,
         ColumnDef,
         CreatedNode,
+        CreatedPattern,
         CreatedRelationship,
         MapEntry,
         NamedArgument,
+        PatternPath,
+        NodePattern,
+        RelationshipPattern,
         PropertyAssignment,
+        LabelAssignment,
         ReturnItem,
         SortItem,
         TableDef,
@@ -2832,7 +2746,7 @@ def _query_plan_dataclass_snapshot(
                         expected in (ProduceResults, UnionRows)
                         and declared.name == "columns"
                     )
-                    or (expected is ReturnItem and declared.name == "alias")
+                    or (expected is ReturnItem and declared.name in ("alias", "source_text"))
                     else None
                 ),
             )
@@ -2874,6 +2788,10 @@ def _query_plan_field_snapshot(
         if value is None and type(None) in arguments:
             return None
         choices = tuple(item for item in arguments if item is not type(None))
+        if choices in ((ValueType, SchemaType), (Property, Variable), (Query, UnionQuery),
+                       (PropertyAssignment, LabelAssignment),
+                       (MatchClause, WithClause, UnwindClause, SubqueryClause, ProcedureCall, UpdatingClause)) and type(value) in choices:
+            choices = (type(value),)
         if len(choices) != 1:
             raise GrafxPlanError(
                 "A query plan field has an unsupported union grammar.",
@@ -2913,16 +2831,17 @@ def _query_plan_field_snapshot(
                     value=len(raw_items),
                     limit=MAX_LIST_ELEMENTS,
                 )
-            if len(arguments) != 2 or arguments[1] is not Ellipsis:
+            repeated = len(arguments) == 2 and arguments[1] is Ellipsis
+            if not repeated and (not arguments or len(raw_items) != len(arguments)):
                 raise GrafxPlanError(
-                    "A query plan tuple must declare one repeated item type.",
+                    "A query plan tuple must match its declared item types and arity.",
                     field=field,
                     value="tuple_grammar",
                 )
             return tuple(
                 _query_plan_field_snapshot(
                     item,
-                    annotation=arguments[0],
+                    annotation=arguments[0] if repeated else arguments[position],
                     detached_nodes=detached_nodes,
                     active=active,
                     expression_depth=expression_depth,
@@ -3110,6 +3029,7 @@ def _query_result_snapshot(
                     depth=0,
                     active=active,
                     max_string_characters=max_string_characters,
+                    allow_entities=True,
                 )
                 for column_position, item in enumerate(row_items)
             )
@@ -4062,6 +3982,17 @@ def _catalog_view(store: Any) -> CatalogStoreView:
 def _catalog_view_from(store: Any, catalog: Any) -> CatalogStoreView:
     """Copy one caller-validated catalog value without retaining it or its store."""
     catalog = _domain_value(catalog, Catalog, field="catalog")
+    groups = []
+    for item in _dictionary_values(_domain_field(catalog, Catalog, "_relationship_types"),
+                                   field="catalog.relationship_types"):
+        group = _domain_value(item, RelationshipTypeDef, field="catalog.relationship_type")
+        members = _domain_field(group, RelationshipTypeDef, "table_ids")
+        if type(members) is not tuple:
+            raise GrafxConfigurationError("Relationship members must be an immutable tuple.", field="relationship_members")
+        groups.append(RelationshipTypeDef(
+            _builtin_text(_domain_field(group, RelationshipTypeDef, "name"), field="relationship_type", empty=False),
+            tuple(_builtin_int(key) for key in members),
+        ))
     tables = tuple(
         sorted(
             (
@@ -4089,7 +4020,7 @@ def _catalog_view_from(store: Any, catalog: Any) -> CatalogStoreView:
     return CatalogStoreView(
         _builtin_text(store.file, field="catalog.file", empty=False),
         _builtin_int(store.chunk_capacity),
-        CatalogView(tables, spaces),
+        CatalogView(tables, spaces, tuple(sorted(groups, key=lambda group: group.name))),
     )
 
 
@@ -4471,6 +4402,7 @@ def _vector_index_view(
         _builtin_bool(index.stale),
         _builtin_optional_text(index.stale_reason, field="vector.index.stale_reason"),
         built_through,
+        _builtin_int(definition.table_id, field="vector.index.table_id"),
     )
 
 

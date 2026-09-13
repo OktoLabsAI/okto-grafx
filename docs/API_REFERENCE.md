@@ -1,8 +1,331 @@
 # Public Python API
 
+`okto_grafx.collection_json.collection_json_value()` and
+`collection_from_json_value()` convert exact StoredType collections to/from owned,
+bounded JSON primitives. CSV/JSONL/SQLite reader/importer `types` now accepts
+`tuple[str | StoredType, ...]`; descriptors are copied at admission and the
+existing whole-call staging contract is unchanged. [Representation, limits and example](COLLECTION_JSON.md).
+
+Development `okto_grafx.StoredType` describes typed LIST/MAP/ARRAY/STRUCT columns.
+`ColumnDef.stored_type` owns the tree, with matching underlying LIST/MAP family and
+root nullability. `value_type`, `describe()` and `contains()` expose metadata.
+DDL and existing query/history/copy/transfer APIs preserve it under catalog-v2
+capability `typed_collections_v1`. No execution method or connection knob is added.
+[Syntax, bounds and consumers](specs/TYPED_COLLECTIONS_V1.md),
+[installed type-package qualification](reports/FP6_TYPE_WHEEL_QUALIFICATION.md).
+
+Development `okto_grafx.DecimalValue(coefficient, precision, scale)` is accepted as
+a native parameter/result and typed/ANY property. `ColumnDef` adds trailing
+`decimal_precision`/`decimal_scale` metadata for `ValueType.DECIMAL`; DDL spells it
+`DECIMAL(p,s)`. The native `decimal(value,p,s[,rounding])` query function adds explicit
+conversion; numeric operators/aggregates and exact typed-index seeks use the existing
+execute/query/cursor APIs. Exact assignment, DTO helpers, format admission and the
+remaining index/transport limits are documented in the
+[native decimal contract](specs/DECIMAL_VALUES_V1.md#native-storage-contract-development).
+Existing history, catalog-copy and logical-transfer APIs preserve decimal values
+and column p/s without new parameters. Copy requires matching target declarations;
+logical import refuses noncanonical stored metadata before creating a destination.
+See [durable consumer contracts](specs/DECIMAL_VALUES_V1.md#history-copy-and-logical-transfer-consumption).
+CLI JSON/schema and typed CSV/JSONL/SQLite readers now preserve decimal tags/p/s;
+`types=("DECIMAL",)` declares the native input family. Registered procedures accept
+DECIMAL and NUMBER preserves native decimals alongside INT64/DOUBLE, including
+owned nested values and native query/write callbacks. No new connection option or
+ScalarFunction signature is implied. [Interface contracts](specs/DECIMAL_VALUES_V1.md#json-local-imports-and-procedure-signatures).
+Columnar `types` tuples accept `okto_grafx.arrow.ArrowDecimalType(precision, scale)`
+for exact decimal128 import/export through Arrow, Pandas, Polars and Parquet.
+Matching physical p/s and decimal128-v1 metadata are mandatory; export does not
+rescale native values. Existing limits/savepoints apply with explicit decimal-cell
+workspace charging. [Consumption contract and example](EXTENSIONS_AND_ARROW.md#exact-native-decimals-006-development).
+
+Native `EXISTS { ... }` is consumed through the existing execute/query/cursor APIs
+and returns boolean values. There is no new connection option or nested transaction.
+Public plans now admit the canonical, independently owned `ExistsSubquery` syntax
+and its read-query/UNION bodies. See [examples, scope, errors and resource contracts](specs/EXISTS_SUBQUERIES_V1.md).
+
+The native plan adds `CreateSequence(child, patterns)` and immutable
+`CreatedPattern(nodes, relationships, path_variable)` for consecutive CREATEs.
+`MAX_PIPELINE_CLAUSES=1024` is exported from `okto_grafx.domain.query`;
+`MAX_CLAUSES=64` retains the separate UNION/action limit. Consumers continue using
+`Transaction.execute()`; `result.plan`/EXPLAIN expose independently owned flat
+instruction snapshots. [Contract](specs/WRITE_PATTERN_CONTRACTS_V1.md#large-create-pipelines).
+
+`CreateRelationships` and `MergePattern` plan snapshots add `path_variable` for
+native named written paths. Query consumers continue using `Transaction.execute()`
+and the existing detached `PathValue`; new binding/admission errors have explicit
+reason/phase fields. [Contract](specs/WRITE_PATTERN_CONTRACTS_V1.md).
+
+`RelationshipPattern.both_directions_written` preserves double-arrow spelling;
+undirected `CreatedRelationship.direction` is now admitted by bound-edge MERGE.
+`startNode()`/`endNode()` query expressions return existing `NodeValue` results.
+These add no connection setting, Python execution method or persistent format.
+
+The development `DeleteEntities` plan node now carries `targets: tuple[Expression, ...]`
+instead of variable-name strings. Native DELETE supports selectors yielding
+entities/paths or NULL, through `Transaction.execute()` on a write transaction.
+[Contract, migration detail and tests](specs/DELETE_EXPRESSIONS_V1.md).
+
+`Transaction.execute()` accepts whole-property `SET n = map/entity` and
+`SET n += map/entity`, including conditional MERGE actions and writing subqueries.
+The public plan snapshot admits canonical `Property | Variable` targets and a
+`merge` boolean, without arbitrary union/object admission. No new method or option
+is needed. [Semantics, constraints and evidence](specs/SET_PROPERTY_MAPS_V1.md).
+
+Native unlabeled node results use `NodeValue.label = None`, `labels == ()` and
+JSON `label: null`. `TableDef.flexible_properties` and `TableDef.unlabeled` are
+exact boolean schema metadata (false for ordinary typed tables). Public schema
+and plan snapshots preserve both fields. [Creation, updates and durable contract](architecture/FLEXIBLE_GRAPH_V1.md).
+
+Development-line heterogeneous property columns accept
+`ColumnDef(name, SchemaType.ANY, nullable=True)`, importing `SchemaType` from
+`okto_grafx.domain.model.schema`. `ColumnDef.type` is `ValueType | SchemaType`;
+`SchemaType` is not a concrete value type. The exact-enum public plan/snapshot
+boundary preserves that distinction. Native DDL is `property ANY` after explicit
+catalog-v2 activation. See [usage, durable contract and current restrictions](architecture/HETEROGENEOUS_PROPERTIES_V1.md).
+
 [Documentation index](README.md) · [Integration](INTEGRATION.md) · [Query types](QUERY_LANGUAGE.md)
 
+Typed omitted-upper traversals preserve `RelationshipPattern.upper_bound_omitted`
+and the matching `TraverseRelationship` plan flag. The numeric upper count is the
+fixed 30-hop resource ceiling, not a result-range promise. EXPLAIN retains
+`hops="n.."` and reports `max_traversal_hops=30`. A valid further extension raises
+`GrafxQueryBudgetExceeded` with `field="max_traversal_hops"`, `limit=30`,
+`observed=31`. Explicit ranges retain their requested stopping point. Streaming
+cursor exhaustion is required to establish completeness; closing early or LIMIT
+does not certify unexplored tails. See [query semantics](QUERY_LANGUAGE.md).
+
 ## Entry points and supported imports
+
+`MergePattern.node_match_tables` is an optional tuple of candidate `TableDef`s
+for standalone node MERGE matching. `None` retains the bound-node/relationship
+shape; an empty tuple describes no candidate tables, not permission to create
+an anonymous table. `CreatedNode.table` supplies the explicit creation target,
+if any. The public query entry points are unchanged. Read transactions now
+reject write plans before execution even if no row would be changed. Use
+`Transaction.execute()` on an explicit write transaction for MERGE; see
+[node MERGE semantics](QUERY_LANGUAGE.md#node-merge-matching-and-creation).
+
+`CreatedRelationship.table` may be `None` for a runtime-resolved relationship
+write; `candidate_tables` then carries the closed tuple of eligible physical
+members. With a statically selected table the candidate tuple is empty. Native
+execution resolves exactly one member for the actual endpoint bindings, then
+performs the ordinary catalog, pending/physical identity and OCC checks. This
+metadata does not make caller-supplied detached values writable handles. See
+[polymorphic write contracts](QUERY_LANGUAGE.md#writes-through-polymorphic-bindings).
+
+Semantic `Binding.entity` distinguishes a written relationship range as
+`"relationship list"` (`analysis.ENTITY_RELATIONSHIP_LIST`) from `"relationship"`.
+The dataclass fields are unchanged. WITH may preserve node/edge/path/list kinds
+through proved coalesce/CASE branches or a literal relationship list. Planner
+candidate-table provenance remains internal; returned graph objects use the same
+detached DTOs. Lists cannot be used as single edges or writable handles. See
+[scope and current proof boundaries](COMPOSABLE_QUERIES.md#clause-order-and-scope).
+
+`RelationshipPattern` permits independently bounded `min_hops > max_hops` as
+an empty read interval; this is not a zero-hop traversal. The native planner
+preserves input consumption but emits no traversal for that pattern. Both counts
+remain integers in `0..30`, including in expression-local ASTs. Malformed textual
+ranges (missing `*`, negative bounds) report `GrafxParseError` with
+`reason="invalid_relationship_pattern"`, `field="hops"` and
+`query_phase="planning"`. No new connection setting or stored format is involved.
+
+Bidirectional read arrows are represented by the existing `Direction.UNDIRECTED`;
+the AST description is canonical `--`, not a new enum member. Optional colons in
+relationship-type alternatives normalize to the same type tuple. Native parser
+refusals for a bare property-map parameter report `GrafxParseError` with
+`reason="invalid_parameter_use"`, `field="pattern_properties"`, its name in
+`value` and `query_phase="planning"`. See [arrow/type syntax](QUERY_LANGUAGE.md#read-arrows-and-type-alternatives)
+and [map parameter rules](QUERY_LANGUAGE.md#inline-relationship-property-maps).
+
+`RelationshipPattern.properties` now participates in native read execution,
+using the existing `MapExpression` AST and execute/query/cursor APIs. Maps become
+equality predicates, or a per-edge `all` for a written range. No new DTO, setting
+or callback authority is introduced. See [inline map semantics](QUERY_LANGUAGE.md#inline-relationship-property-maps).
+
+Polymorphic property results may contain different Python scalar types across
+rows; consumers must not infer one column type solely from the first row. Stored
+schema is unchanged. See [dynamic expression contracts](QUERY_LANGUAGE.md#heterogeneous-properties-across-tables).
+Invalid aggregate placement reports `GrafxPlanError` with
+`reason="invalid_aggregation_context"`, a context field such as `predicate` for
+MATCH/WHERE or `expression` for other expression positions, and
+`query_phase="planning"`. Static path-property access reports
+`reason="path_property_type"`, `field="property"`, the property name in `value`,
+and `query_phase="planning"`. These are native raise-site facts, not classifications
+inferred from a test's expected error.
+Native scope refusals additionally report `variable_type_conflict` when one
+binding is reused as a different entity kind, and `variable_already_bound` when
+a path capture attempts to reserve an occupied name. Both carry
+`query_phase="planning"`; `field` is `variable`, or `pattern` for a path-name
+collision within one MATCH clause. The public `named_path_refusal()` two-field
+summary remains unchanged.
+Repeating a relationship variable in a connected read pattern raises
+`GrafxPlanError` with `reason="relationship_uniqueness_violation"`,
+`field="variable"`, its name in `value`, and `query_phase="planning"`.
+This is distinct from legal identity-constrained reuse in a later MATCH.
+
+`LabelPredicate(subject: Expression, labels: tuple[str, ...])`, exported by
+`okto_grafx.domain.query.ast`, represents a native node-label conjunction.
+Execution returns Python `bool` or `None` through the existing execute/cursor
+APIs. Public plan snapshots preserve syntax without live graph authority.
+Wrong subjects raise `GrafxPlanError` with `reason="label_argument_type"` and
+the applicable `query_phase` (`planning` for known types, `execution` for dynamic
+values). See [label semantics and model limits](QUERY_LANGUAGE.md#node-label-predicates).
+
+`PatternPredicate(pattern: PatternPath)` is an immutable syntax expression for
+existential WHERE patterns. Its named entities are incoming references, not new
+bindings. Its detached public plan representation retains syntax only; compiled
+correlated read descriptors and active argument slots remain execution-owned.
+Existing `execute`/cursor APIs return the filtered outer rows, not inner paths.
+See [semantics and limits](QUERY_LANGUAGE.md#existential-pattern-predicates).
+
+`PatternComprehension(pattern: PatternPath, projection: Expression,
+predicate: Expression | None = None)` is immutable native list-query syntax.
+Existing execute/cursor APIs return tuple-valued lists with detached entity/path
+elements; NULL correlations return `None`. Public plan snapshots retain syntax,
+not compiled subplan descriptors or active argument slots. See
+[scope, execution and resource contracts](QUERY_LANGUAGE.md#pattern-comprehensions).
+
+Expression NaN is returned as a Python DOUBLE (`float('nan')`) through existing
+query/result APIs; `math.isnan(value)` distinguishes it from NULL (`None`).
+No signature or connection setting changes. Persisting NaN/infinity through
+CREATE/MERGE/SET or batch imports raises `SchemaMismatchError` (a `GrafxError`)
+and retains the existing statement/whole-batch rollback boundary. Nested stored
+LIST/MAP values are also checked. See the
+[expression/storage contract](QUERY_LANGUAGE.md#nan-expressions-versus-persistent-properties).
+
+Native read patterns referencing absent tables return no match (or OPTIONAL NULL
+extension); they do not create schema. `ZeroHopRelationship` in the detached
+EXPLAIN plan represents a zero-length branch for an absent relationship type,
+with source/target/relationship/path names and `hops="0"`. It is not a schema
+definition or transaction capability. Existing `execute`/cursor signatures apply;
+schema creation invalidates the cached read plan. See
+[absent-table semantics](QUERY_LANGUAGE.md#absent-tables-in-read-patterns).
+
+Native query functions `properties(value)`, `labels(node)` and `type(relationship)`
+return detached maps, singleton label tuples and logical relationship-type strings
+(the physical table name for an ungrouped relationship);
+NULL propagates. They consume query bindings, not external writable DTO handles.
+`properties()` excludes internal endpoints and NULL-valued entity columns, but
+preserves explicit NULLs in input maps. Type errors carry planning phase when
+statically known and execution phase when discovered during invocation. See the
+[entity scalar contract](QUERY_LANGUAGE.md#native-entity-scalar-consumption).
+
+`MATCH p=(n)` publishes the same detached `PathValue` as a zero-hop traversal:
+one native node, an empty relationship tuple and length zero. EXPLAIN exposes
+`CaptureNodePath(source, path)` above the ordinary node access plan. The public
+plan is independently cloned under the closed built-in operator grammar; neither
+the DTO nor that plan retains live transaction authority. See
+[node-path consumption](QUERY_LANGUAGE.md) and [entity ownership](ENTITY_VALUES.md).
+
+The 0.0.6 development result contract now returns `NodeValue`,
+`RelationshipValue` and typed bounded-walk `PathValue` from native `execute`/cursors,
+including nested results.
+Import them with `EntityIdentity` and `EntityProvenance` from `okto_grafx`.
+[Fields, ownership, equality, JSON and migration](ENTITY_VALUES.md) replace the
+former integer/label-map entity assumptions; scalar projections are unchanged.
+Entity UNION/UNION ALL, nested aggregates and returning UNION subqueries retain
+these values. Typed bounded path captures compose with OPTIONAL MATCH, WITH,
+predicates, windows and returning subqueries; path-or-NULL UNION exports preserve
+path-function typing. Zero length and concatenated segments retain the same DTO;
+written range variables return relationship tuples even for `*1..1`.
+Untyped/type-alternative single-hop segments also return native paths. Their
+detached `TraverseAnyRelationship` plan exposes the candidate tables, direction,
+bound-target flag, path name/append flag and written-range list flag. Bounded
+heterogeneous ranges use `TraverseRelationshipAlternatives` with real candidate
+tables, min/max counts, target-table/bound-target information and the same path,
+relationship-list and omitted-upper flags. Explicit bounds render as `n..m`;
+omitted bounds render as `n..` with `max_traversal_hops=30`. See
+[range semantics](QUERY_LANGUAGE.md#heterogeneous-bounded-relationship-ranges).
+Coordinated Pulse migration remains FP-3 work in progress.
+`PathValue(nodes, relationships)` owns immutable component
+tuples; `len(path)` and `path.to_dict()` expose length and tagged JSON. These result
+DTOs remain invalid as query parameters or persistent column values.
+
+Unaliased `QueryResult.columns` preserve the expression's submitted source spelling;
+explicit aliases and logical variable names retain their existing meaning.
+`dictionaries()` uses these names as keys. Prefer `AS` for application-stable
+keys. See [query value and heading contracts](QUERY_LANGUAGE.md#values-and-python-mapping)
+for numeric literal and expression-result postfix rules. No signature or
+configuration change is introduced by this FP-2 checkpoint.
+
+Native query text also supports adjacent comparison chains and `rand()`; the
+[query contract](QUERY_LANGUAGE.md#values-and-python-mapping) specifies NULL,
+evaluation placement, random range and durable-view refusal. Randomness is
+injected internally by assembly, not a new `connect()` setting or public seed API.
+
+The [boolean/error contract](QUERY_LANGUAGE.md#values-and-python-mapping) now
+rejects non-BOOL/non-NULL logical operands rather than silently yielding NULL.
+Known types are checked at planning, bound parameters before execution effects,
+and dynamic values when evaluated. Additive error details expose the proven phase
+for these refusals. Scalar literal projection identity also preserves BOOL/INT64/
+DOUBLE independently in aggregate results. No new public signature or setting is
+introduced; callers relying on non-boolean operands must supply explicit predicates.
+
+Empty string map keys are supported in native expressions, parameter maps and
+result maps; returned list/key collections keep their existing immutable tuple
+representation. Direct `UNWIND range(...)` streams a bounded prefix without a new
+public value type. Materialized range results still have their list cap. Scope
+and invalid-aggregation refusals have additive planning-phase evidence. See the
+[query contract](QUERY_LANGUAGE.md#values-and-python-mapping) for examples,
+per-carrier consumption limits and LIMIT/write behavior.
+
+RANGE operand failures now carry runtime `range_argument_type` /
+`range_argument_bounds` reasons; they occur only if the expression is evaluated.
+The numeric-token ceiling is now 2,048 characters to admit long finite DOUBLE
+spellings; INT64 and non-finite refusal remain unchanged. These are native query
+contracts, not new Python signatures, stored types or connection settings.
+
+Native queries also accept `WITH *` / `WITH *, expression AS alias`, expanded
+against the current named scope before ordinary planning. Python result names
+and value representations remain unchanged. IN operand refusals carry additive
+`membership_operand_type` / `query_phase` evidence, and invalid bound right-hand
+parameters refuse before opening a scan. See [scope and limits](COMPOSABLE_QUERIES.md#clause-order-and-scope).
+
+Standalone polymorphic reads now compose in native queries, including rematched
+aliases and explicitly imported/exported live query bindings. The public detached
+entity representation has **not** changed in this increment. There is no new
+`connect()` option or transaction mode; see [polymorphic composition](COMPOSABLE_QUERIES.md#polymorphic-node-read-composition)
+and [FP-3 working evidence](conformance/FP3_PROGRESS.md).
+
+0.0.6 NHC adds `TextMatchPositions` and `TemporalCompactionReport` at the root.
+`okto_grafx.temporal_diff` exports `diff_graph`, `TemporalDiff`,
+`TemporalSchemaChange`, `TemporalRowChange` and `TemporalPropertyChange`.
+The same diff is exposed through `Database.system_diff` / `Transaction.system_diff`.
+See [system time](SYSTEM_TIME_HISTORY.md) for persistent-index activation, access
+selection, compaction, return fields and errors; [FTS](FULL_TEXT_SEARCH.md) for
+position/slop and analyzer replacement. All signatures/DTO fields are generated
+in the appendix below. These additions do not imply CLI equivalents.
+
+`db.add_nullable_column(table, column)` uses
+`okto_grafx.domain.model.schema.ColumnDef` and native
+`okto_grafx.domain.model.value.ValueType`; see [nullable schema evolution](NULLABLE_COLUMNS.md).
+Its `table` argument, and the optional table filter of `db.maintenance.bloat`
+and `vacuum`, accept a unique name or `("node", name)` / `("rel", name)`.
+Ambiguous bare names refuse before effects. Maintenance table reports expose
+that qualified pair only for overlapping names and always retain `table_id`;
+see [maintenance contracts](OPERATIONS.md#observation-and-maintenance-contracts).
+
+`db.views` exposes durable logical read views. Parameter/definition types are
+`okto_grafx.views.ViewParameter` and `ViewDefinition`; registry preparation is
+explicit. See [logical view usage, bounds and errors](LOGICAL_VIEWS.md).
+
+`okto_grafx.catalog_copy` provides `capture_copy`, `prepare_copy_target`,
+`copy_graph` and frozen `CopyLimits`, `CopyTable`, `CopyPackage`, `CopyReceipt`.
+[Existing-target copy](CATALOG_COPY.md) is one atomic native transaction with an
+indexed durable receipt; its v1 selection/schema/PK restrictions are explicit.
+
+`from okto_grafx import CatalogSession, CatalogPathPolicy, CatalogInfo` provides
+[named single-store transactions](CATALOGS_AND_WORKSPACES.md). Optional resolution
+uses `okto_grafx.workspace.WorkspacePolicy`, `ResolvedWorkspace` and
+`resolve_workspace`. Construction requires explicit `owned` and `policy`;
+permissions default to read-only. No distributed write or automatic receipt-ledger
+preparation is implied; `apply_copy` requires the explicit copy setup above.
+
+0.0.6 adds `okto_grafx.sqlite_import` (`SQLiteImportLimits`, `read_sqlite_rows`,
+`import_sqlite`) for [bounded local SQLite consumption](LOCAL_SQLITE_IMPORT.md),
+and `okto_grafx.html_snapshot` (`HtmlSnapshotLimits`, `render_html_snapshot`) for
+[offline HTML pictures](HTML_SNAPSHOTS.md). `GraphProjection.topological_order`
+returns the frozen `TopologicalOrderResult`; see [algorithms](GRAPH_PROJECTIONS.md).
+All new options are operation-local; no durable-format migration is introduced.
 
 `from okto_grafx.projections import project_graph, ProjectionLimits` exposes
 [read-only snapshot graph pictures, adjacency, degree/WCC/SCC, paths, PageRank and k-core](GRAPH_PROJECTIONS.md).
@@ -75,7 +398,7 @@ integrate an application. Frozen views are observations, not mutable engine door
 | `Query` | Snapshots text/parameters; reusable factory for independent read cursors. Not a serialized or indefinitely cached prepared plan. |
 | `QueryCursor` | Iterator/context manager; batch size 1–65,536, default 256. `fetchone()` returns row or `None`; `fetchmany(size=None)` returns at most that many rows, `()` at EOF. `close()` is idempotent. |
 | `ScanCursorV1` | Opaque, non-serializable, single-use continuation belonging to one read transaction/table/database. Do not construct/copy it or put it in an HTTP token. |
-| `ScanRowV1` / `ScanPageV1` | Record ID and values in declared column order; physical relation endpoint columns lead. Parallel relationship occurrences remain separate. |
+| `ScanRowV1` / `ScanPageV1` | Record ID and values in declared column order; physical relation endpoint columns lead. Parallel relationship occurrences remain separate. `node_labels` preserves explicit complete membership even with a property projection; `()` is an empty set and `None` denotes implicit table membership (or a relationship). See [native labels](specs/NODE_LABELS_V1.md#query-create-merge-and-scan-checkpoint). |
 | `CommitReport` | `csn`, `durable`, `wrote`; may be observable even when commit raises after durability. Follow [outcome handling](OPERATIONS.md#commit-outcomes-and-retries), not automatic retry. |
 | `VectorSearchResult` | `hits`, `regime`, `achieved_k`, `requested_k`, `space`, `filter_cardinality`. `k` is requested, not an unconditional result-count promise. |
 | `VectorHit` | Record ID, score, physical ref and retired flag. ID is not automatically a user PK; ref is not a portable application identifier. |
@@ -100,6 +423,15 @@ typed unsupported/configuration refusal rather than silently emulating a feature
 
 ## Schema, index and diagnostic views
 
+`TableDef.vector_identity_names` is the exact-boolean persisted automatic-vector
+naming policy exposed by detached schema views. Identity naming requires
+`vector_owner_names_v1` (catalog bit 25). See [names, activation and history](specs/VECTOR_OWNER_NAMES_V1.md).
+
+`VectorIndexView` now requires `table_id`, and its inventory supports
+`index(space, table_id=...)`. Public memory/rebuild doors accept `table=TableSelector`;
+ambiguous selection refuses before mutation. See [qualified maintenance](specs/VECTOR_QUALIFIED_MAINTENANCE_V1.md)
+for the unchanged post-rebuild coverage fence and failure contracts.
+
 `catalog` is an immutable schema snapshot; `indexes`/`vectors` expose inventories,
 not mutation hooks. `attached_indexes`, `unindexed_tables` and `stale_indexes`
 describe open-time adoption, not a forever-current certificate. `read_index_status`
@@ -112,7 +444,32 @@ bounded observations or inventories with no mutable storage/lease/WAL capability
 Some full inventories and explicit memory estimates still cost proportional work;
 avoid repeatedly collecting them in every query request.
 
+### Logical relationship group observations
+
+Logical relationship types in the 0.0.6 development line use
+`CREATE REL TABLE GROUP name(FROM A TO B, FROM B TO C, ...)` inside a write
+transaction, after explicit catalog-v2 admission through
+`maintenance.ensure_identity_indexes()` when needed. Physical member/index
+creation and logical metadata share the ordinary statement rollback boundary.
+
+The detached `database.catalog.catalog` observation includes
+`relationship_type_definitions`, `relationship_types()`,
+`relationship_tables(name)` and `relationship_type_name(table_id)`.
+`RelationshipTypeDef(name, table_ids)` has immutable, strictly ordered physical
+member IDs. `tables()`/`table()` still describe physical storage; logical names
+never alias those identities. Held observations remain usable after close and do
+not change when another participant commits DDL. Grouped `RelationshipValue.label`
+and native `type(r)` use the logical name, with distinct physical entity IDs.
+The authored grammar, migration prerequisite, current write limits and refusing
+transfer paths are in
+[relationship groups](QUERY_LANGUAGE.md#relationship-types-spanning-endpoint-tables).
+
 ## Read execution control and orphan cleanup
+
+`Database.search_vectors(..., table=...)` selects one physical table within a
+shared embedding space. Pass a unique name or `("node", name)` / `("rel", name)`;
+omitted ambiguous ownership refuses before retrieval. Hybrid qualifies its named
+node target automatically. See [ownership, errors and current naming limits](specs/VECTOR_PHYSICAL_OWNERS_V1.md).
 
 `Database.execute`, read `Transaction.execute` and `Query.cursor` accept optional
 `timeout_seconds` and a public `CancellationToken`. Defaults preserve uncontrolled
@@ -120,13 +477,39 @@ execution; write transactions refuse the options. `Maintenance.cleanup_indexes`
 provides an independently revalidated dry-run/removal census under explicit
 whole-store quiescence. See [contracts, examples, errors and limits](READ_CONTROL_AND_INDEX_CLEANUP.md).
 
-## Trusted scalar extensions and Arrow interop
+## Trusted scalar/tabular extensions and Arrow interop
 
-Use `from okto_grafx.extensions import ExtensionRegistry, ScalarFunction` and
+Use `from okto_grafx.extensions import ExtensionRegistry, ScalarFunction, TabularProcedure` and
 `connect(..., extensions=registry)` for the explicit per-handle allowlist.
 `registry.call_scalar(name, arguments_tuple)` supports direct invocation; the query
 door is `udf('namespace.name', ...)`. Registration, value budgets, NULL/type/error
 semantics and trust limits are in [Extensions and Arrow](EXTENSIONS_AND_ARROW.md).
+Typed tabular CALL/YIELD, permissions, per-invocation budgets, cleanup and
+subquery composition are specified in [Composable queries](COMPOSABLE_QUERIES.md).
+`ProcedureWriter` from `okto_grafx.extensions` is supplied to explicit `mode="write"`
+callbacks. Its `execute(query, parameters=None) -> None` door performs bounded
+result-free native mutations in the caller's transaction. Registration, authority
+lifetime, limits and errors: [writing procedures](specs/WRITING_PROCEDURES_V1.md).
+Its inherited `query(text, parameters=None) -> ProcedureResult` supports bounded
+native reads and returning writes. Read callbacks opt into a permissioned
+ProcedureReader with `graph_read=True`; defaults remain pure. ProcedureResult
+exposes owned columns/rows, no plan or transaction. `max_query_statements`,
+`max_query_rows` and `max_query_bytes` accumulate across input rows; existing
+cell/output/write budgets remain in force. [Complete contract](specs/PROCEDURE_QUERY_AUTHORITY_V1.md).
+Native child queries now support registered CALL, with `max_call_depth=8` (exact
+int 1..16) inherited as the minimum across ancestors. Query/write/traversal quotas
+do not reset in deeper contexts. `deterministic=False` is the default; True is a
+trusted read-only promise checked against native child effects. Registry metadata,
+not caller-supplied AST flags, controls effect analysis. [Nesting API and upgrade](specs/PROCEDURE_NESTING_EFFECTS_V1.md).
+Procedure input/output names additionally include all six native temporals,
+LIST/MAP/ANY and VECTOR_F32/F64. Exact mappings, mutable ownership, recursive budgets,
+native persistence and remaining entity/type limits are specified in
+[native procedure values](specs/PROCEDURE_NATIVE_VALUES_V1.md); ScalarFunction is unchanged.
+
+`TabularProcedure` also accepts NODE, RELATIONSHIP, PATH, LIST<NODE> and
+LIST<RELATIONSHIP>. Native CALL provides invocation-scoped observations; direct
+invoke or detached entity parameters do not grant native references. Generic
+containers may carry witnessed entities. [Entity API and example](specs/PROCEDURE_ENTITY_SIGNATURES_V1.md).
 `from okto_grafx.arrow import to_arrow_batches` provides optional copied scalar/vector
 batches over a materialized result or caller-owned cursor. The same guide defines
 all type mappings, budget tariffs, snapshot and close obligations.
@@ -174,7 +557,7 @@ Return an immutable-shape snapshot of counters observed so far.
 #### QueryCursor.fetchone
 
 ```python
-fetchone() -> tuple[Value, ...] | None
+fetchone() -> tuple[QueryValue, ...] | None
 ```
 
 Return the next detached row, or `None` after exhaustion.
@@ -182,7 +565,7 @@ Return the next detached row, or `None` after exhaustion.
 #### QueryCursor.fetchmany
 
 ```python
-fetchmany(size: int | None=None) -> tuple[tuple[Value, ...], ...]
+fetchmany(size: int | None=None) -> tuple[tuple[QueryValue, ...], ...]
 ```
 
 Return at most `size` detached rows without materialising the remaining result.
@@ -247,6 +630,30 @@ execute(text: str, parameters: Mapping[str, object] | None=None, *, timeout_seco
 
 Run one statement inside this transaction and return its result.
 
+#### Transaction.system_as_of
+
+```python
+system_as_of(at: CommitId | Timestamp, *, tables: tuple[TableSelector, ...], limits: TemporalLimits=TemporalLimits()) -> TemporalGraph
+```
+
+Read durable system-time rows under this transaction's snapshot, excluding private writes.
+
+#### Transaction.system_diff
+
+```python
+system_diff(before: CommitId, after: CommitId, *, tables: tuple[TableSelector, ...], limits: TemporalLimits=TemporalLimits(), max_changes: int=100000) -> TemporalDiff
+```
+
+Return a bounded same-store historical graph diff under this transaction's snapshot.
+
+#### Transaction.system_versions
+
+```python
+system_versions(table: TableSelector, record_id: int, *, limits: TemporalLimits=TemporalLimits()) -> TemporalVersions
+```
+
+Read one logical row's intervals visible to this snapshot, not later commits.
+
 #### Transaction.commit_history
 
 ```python
@@ -274,7 +681,7 @@ Stage one updating statement for every parameter mapping, atomically as a batch.
 #### Transaction.scan_rows_v1
 
 ```python
-scan_rows_v1(table: str, *, limit: int, cursor: ScanCursorV1 | None=None, columns: tuple[str, ...] | None=None, max_batch_bytes: int | None=None, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> ScanPageV1
+scan_rows_v1(table: str, *, limit: int, kind: str | None=None, cursor: ScanCursorV1 | None=None, columns: tuple[str, ...] | None=None, max_batch_bytes: int | None=None, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> ScanPageV1
 ```
 
 Read one bounded page of physical rows under this transaction's fixed snapshot.
@@ -310,7 +717,7 @@ Return a last-observed status snapshot without claiming global linearizability.
 #### Maintenance.bloat
 
 ```python
-bloat(table: str | None=None) -> BloatReport
+bloat(table: TableSelector | None=None) -> BloatReport
 ```
 
 Return a conservative read-only heap-bloat census.
@@ -326,7 +733,7 @@ Inventory or reclaim unreferenced native generations with every other handle sto
 #### Maintenance.vacuum
 
 ```python
-vacuum(table: str | None=None, *, confirm_quiescent: bool=False, max_versions: int | None=None, index_free_pages: bool=False) -> VacuumReport
+vacuum(table: TableSelector | None=None, *, confirm_quiescent: bool=False, max_versions: int | None=None, index_free_pages: bool=False) -> VacuumReport
 ```
 
 Run explicit foreground MVCC reclamation under the v1 quiescence contract.
@@ -358,7 +765,7 @@ Delegate recovery to :meth:`Database.recover`.
 #### Maintenance.rebuild_vector_index
 
 ```python
-rebuild_vector_index(space: str) -> VectorIndexView
+rebuild_vector_index(space: str, *, table: TableSelector | None=None) -> VectorIndexView
 ```
 
 Delegate the repair to :meth:`Database.rebuild_vector_index`.
@@ -599,6 +1006,14 @@ catalog: CatalogStoreView  # read-only property
 
 Return a complete, linearized schema and catalog-layout snapshot.
 
+#### Database.views
+
+```python
+views: LogicalViews  # read-only property
+```
+
+Return the bounded, persistent read-only logical view API; prepare explicitly.
+
 #### Database.heap
 
 ```python
@@ -722,7 +1137,7 @@ Return per-handle aggregate ANN reservations; disabled accounting reports zero.
 #### Database.vector_memory_usage
 
 ```python
-vector_memory_usage(space: str) -> VectorMemoryUsage
+vector_memory_usage(space: str, *, table: TableSelector | None=None) -> VectorMemoryUsage
 ```
 
 Observe local HNSW cache tariffs without building or proving freshness.
@@ -730,7 +1145,7 @@ Observe local HNSW cache tariffs without building or proving freshness.
 #### Database.search_vectors
 
 ```python
-search_vectors(transaction: Transaction, *, space: str, query: Sequence[float] | VectorValue, k: int, candidate_filter: RecordIdFilter | None=None, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None) -> VectorSearchResult
+search_vectors(transaction: Transaction, *, space: str, query: Sequence[float] | VectorValue, k: int, candidate_filter: RecordIdFilter | None=None, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, table: TableSelector | None=None) -> VectorSearchResult
 ```
 
 Search one owned snapshot with optional cooperative read controls.
@@ -746,15 +1161,23 @@ Fuse text/vector candidate windows with RRF-v1 and optional bounded graph eviden
 #### Database.create_text_index
 
 ```python
-create_text_index(name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None=None, bucket_count: int=64) -> IndexView
+create_text_index(name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None=None, bucket_count: int=64, kind: str | None=None) -> IndexView
 ```
 
 Create a native persisted full-text generation over one to four STRING fields.
 
+#### Database.replace_text_index
+
+```python
+replace_text_index(name: str, *, options: TextIndexOptions) -> IndexView
+```
+
+Atomically replace a text analyzer/options using a fresh complete generation.
+
 #### Database.search_text
 
 ```python
-search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, prefix: bool=False) -> TextSearchResult
+search_text(reader: Transaction | None=None, *, index: str, query: str, k: int=20, filter: RecordIdFilter | None=None, limits: TextSearchLimits | None=None, k1: float=1.2, b: float=0.75, timeout_seconds: float | None=None, cancellation: CancellationToken | None=None, prefix: bool=False, phrase: bool=False, return_positions: bool=False, slop: int=0) -> TextSearchResult
 ```
 
 Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot.
@@ -815,6 +1238,14 @@ verify(scope: str='all') -> VerificationReport
 
 Walk the database and report every finding, precisely located (SPEC-M1 FR-11).
 
+#### Database.add_nullable_column
+
+```python
+add_nullable_column(table: TableSelector, column: ColumnDef) -> TableDef
+```
+
+Atomically append one nullable non-vector column, without rewriting old rows.
+
 #### Database.ensure_identity_indexes
 
 ```python
@@ -822,6 +1253,86 @@ ensure_identity_indexes() -> None
 ```
 
 Persist and activate every exact access path required by endpoint identities.
+
+#### Database.system_as_of
+
+```python
+system_as_of(at: CommitId | Timestamp, *, tables: tuple[TableSelector, ...], limits: TemporalLimits=TemporalLimits()) -> TemporalGraph
+```
+
+Return a bounded historical graph at a qualified commit or ordered timestamp.
+
+#### Database.system_versions
+
+```python
+system_versions(table: TableSelector, record_id: int, *, limits: TemporalLimits=TemporalLimits()) -> TemporalVersions
+```
+
+Return create/update/delete-bounded intervals for one logical row identity.
+
+#### Database.system_diff
+
+```python
+system_diff(before: CommitId, after: CommitId, *, tables: tuple[TableSelector, ...], limits: TemporalLimits=TemporalLimits(), max_changes: int=100000) -> TemporalDiff
+```
+
+Compare retained system-time commits; no valid-time or write effects are introduced.
+
+#### Database.enable_system_history
+
+```python
+enable_system_history(tables: tuple[TableSelector, ...]) -> None
+```
+
+Atomically opt tables into durable system-time history with their current baseline.
+
+#### Database.enable_system_history_index
+
+```python
+enable_system_history_index(*, max_bytes: int=16 * 1024 * 1024) -> bool
+```
+
+Atomically build the optional persistent temporal access path.
+
+#### Database.compact_system_history
+
+```python
+compact_system_history(*, confirm_quiescent: bool=False, max_bytes: int=16 * 1024 * 1024) -> TemporalCompactionReport
+```
+
+Reclaim redacted history payloads and obsolete temporal tree paths offline.
+
+#### Database.pin_system_history
+
+```python
+pin_system_history(name: str, at: CommitId, *, tables: tuple[TableSelector, ...]) -> None
+```
+
+Persist named protection against retention beyond `at` for selected tables.
+
+#### Database.unpin_system_history
+
+```python
+unpin_system_history(name: str) -> None
+```
+
+Explicitly release a durable temporal pin; an absent valid name is a no-op.
+
+#### Database.system_history_pins
+
+```python
+system_history_pins() -> tuple[TemporalPin, ...]
+```
+
+List durable temporal pins in name order under a qualified publication read.
+
+#### Database.prune_system_history
+
+```python
+prune_system_history(before: CommitId, *, tables: tuple[TableSelector, ...], max_bytes: int=16 * 1024 * 1024) -> TemporalPruneReport
+```
+
+Atomically redact payloads of versions closed at/before a new retained horizon.
 
 #### Database.enable_commit_history
 
@@ -858,7 +1369,7 @@ Persist the compatibility fence before emitting compressed WAL page images.
 #### Database.rebuild_vector_index
 
 ```python
-rebuild_vector_index(space: str) -> VectorIndexView
+rebuild_vector_index(space: str, *, table: TableSelector | None=None) -> VectorIndexView
 ```
 
 Re-derive one vector index from the heap, and report it only once it is healthy.
@@ -943,8 +1454,248 @@ close() -> None
 
 Release owned resources under this database's checksum selection (FR-1).
 
+### CatalogSession
+
+Bounded aliases and pinned native transactions. Python permissions are not an OS sandbox.
+
+#### CatalogSession.open
+
+```python
+open(path: str | os.PathLike[str], *, policy: CatalogPathPolicy, read_only: bool=True) -> CatalogSession
+```
+
+Open an existing main store; no creation or workspace lookup. Writable opens may recover.
+
+#### CatalogSession.attach_handle
+
+```python
+attach_handle(database: Database, *, alias: str, owned: bool, read_only: bool=True) -> None
+```
+
+Attach caller-supplied handle; ownership transfers only after successful publication.
+
+#### CatalogSession.attach
+
+```python
+attach(path: str | os.PathLike[str], *, alias: str, read_only: bool=True) -> None
+```
+
+Open an existing local catalog with read-only default; release failed acquisitions.
+
+#### CatalogSession.catalogs
+
+```python
+catalogs() -> tuple[CatalogInfo, ...]
+```
+
+Return bounded sorted alias/permission/ownership inventory; omit private paths.
+
+#### CatalogSession.use
+
+```python
+use(alias: str) -> None
+```
+
+Change the default for future begins only.
+
+#### CatalogSession.begin
+
+```python
+begin(mode: str='read', *, catalog: str | None=None, metadata: CommitMetadata | None=None) -> Transaction
+```
+
+Return a native transaction permanently owned by the selected store, not the session default.
+
+#### CatalogSession.apply_copy
+
+```python
+apply_copy(package: CopyPackage, *, target: str, idempotency_key: str, conflict: str='fail', metadata: CommitMetadata | None=None, limits: CopyLimits | None=None) -> CopyReceipt
+```
+
+Apply a detached package using the target permission/lifetime and a pinned native commit.
+
+#### CatalogSession.detach
+
+```python
+detach(alias: str) -> None
+```
+
+Refuse in-use detach; close owned handles only. main cannot detach.
+
+#### CatalogSession.close
+
+```python
+close() -> None
+```
+
+Refuse active transactions; otherwise close every owned handle, preserving first failure.
+
+### LogicalViews
+
+Database-owned logical view operations; no separately closable resources or caches.
+
+#### LogicalViews.prepare
+
+```python
+prepare() -> None
+```
+
+Create the owned registry in one native transaction; repeat adds no commit.
+
+#### LogicalViews.create
+
+```python
+create(name: str, *, query: str, parameters_schema: tuple[ViewParameter, ...]=(), replace: bool=False) -> ViewDefinition
+```
+
+Validate and atomically create/replace one definition; no automatic OCC retry.
+
+#### LogicalViews.get
+
+```python
+get(name: str, *, snapshot: Transaction | None=None) -> ViewDefinition | None
+```
+
+Inspect one checked definition at a read snapshot; None means no visible name.
+
+#### LogicalViews.list
+
+```python
+list(*, after: str | None=None, limit: int=100, snapshot: Transaction | None=None) -> tuple[ViewDefinition, ...]
+```
+
+Bounded lexicographic introspection; reuse one snapshot across stable pages.
+
+#### LogicalViews.drop
+
+```python
+drop(name: str) -> bool
+```
+
+Atomically remove a definition; absent returns False without a new commit.
+
+#### LogicalViews.execute
+
+```python
+execute(name: str, parameters: Mapping[str, object] | None=None, *, snapshot: Transaction | None=None, timeout_seconds: float | None=None) -> QueryResult
+```
+
+Execute a validated read definition at one native snapshot, never open a writer.
+
+### ProcedureReader
+
+Query the caller's snapshot without commit, store switching or write authority.
+
+#### ProcedureReader.query
+
+```python
+query(query: str, parameters: Mapping[str, object] | None=None) -> ProcedureResult
+```
+
+Return bounded native query results; a refused operation poisons the invocation.
+
+### ProcedureWriter
+
+Execute native graph mutations in the calling statement; never commit independently.
+
+#### ProcedureWriter.execute
+
+```python
+execute(query: str, parameters: Mapping[str, object] | None=None) -> None
+```
+
+Run one result-free native mutation; any refused operation poisons this invocation.
+
+#### ProcedureWriter.schema
+
+```python
+schema(query: str) -> None
+```
+
+Stage authorized native DDL under the caller's schema journal and rollback.
+
 ## Public factory and transfer functions
 
+
+### okto_grafx.collection_json.collection_json_value
+
+```python
+collection_json_value(descriptor: StoredType, value: object, *, max_bytes: int=65536) -> object
+```
+
+Encode a canonical stored collection to owned JSON primitives, at most max_bytes UTF-8.
+
+### okto_grafx.collection_json.collection_from_json_value
+
+```python
+collection_from_json_value(descriptor: StoredType, value: object, *, max_bytes: int=65536) -> tuple[object, ...] | dict[str, object] | None
+```
+
+Decode bounded exact JSON primitives; wrong types, metadata or missing fields refuse.
+
+### okto_grafx.temporal_diff.diff_graph
+
+```python
+diff_graph(reader: Transaction, before: CommitId, after: CommitId, *, tables: tuple[str, ...], limits: TemporalLimits=TemporalLimits(), max_changes: int=100000) -> TemporalDiff
+```
+
+Capture two retained pictures under one owning transaction and return no partial diff.
+
+### okto_grafx.catalog_copy.capture_copy
+
+```python
+capture_copy(source: Transaction, *, tables: tuple[TableSelector, ...], limits: CopyLimits=CopyLimits(), record_ids: dict[TableSelector, tuple[int, ...]] | None=None, history: str='refuse', include_endpoints: bool=False) -> CopyPackage
+```
+
+Capture tables or explicit RID subsets from one native read snapshot.
+
+### okto_grafx.catalog_copy.prepare_copy_target
+
+```python
+prepare_copy_target(database: Database) -> None
+```
+
+Explicitly enable existing provenance capabilities and initialize the ordinary receipt ledger.
+
+### okto_grafx.catalog_copy.copy_graph
+
+```python
+copy_graph(package: CopyPackage, target: Database, *, idempotency_key: str, conflict: str='fail', metadata: CommitMetadata | None=None, limits: CopyLimits=CopyLimits()) -> CopyReceipt
+```
+
+Copy into pre-existing compatible tables with data+receipt in one native durable commit.
+
+### okto_grafx.workspace.resolve_workspace
+
+```python
+resolve_workspace(*, policy: WorkspacePolicy, explicit_store: str | Path | None=None, project_root: str | Path | None=None, cwd: str | Path | None=None, user_store: str | Path | None=None) -> ResolvedWorkspace
+```
+
+Resolve explicit store > project root > bounded marker > opted-in cwd. No mkdir/open.
+
+### okto_grafx.html_snapshot.render_html_snapshot
+
+```python
+render_html_snapshot(graph: GraphProjection, *, catalog: CatalogView | None=None, limits: HtmlSnapshotLimits=HtmlSnapshotLimits(), cancellation: CancellationToken | None=None) -> str
+```
+
+Render detached identities/edges and optional separately captured schema; never write files.
+
+### okto_grafx.sqlite_import.read_sqlite_rows
+
+```python
+read_sqlite_rows(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], query: str, columns: tuple[str, ...], types: tuple[str | StoredType, ...], parameters: tuple=(), limits: SQLiteImportLimits=SQLiteImportLimits(), cancellation: CancellationToken | None=None) -> tuple[dict[str, object], ...]
+```
+
+Read one bounded SELECT; SQL NULL stays None; source closes before return.
+
+### okto_grafx.sqlite_import.import_sqlite
+
+```python
+import_sqlite(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], query: str, columns: tuple[str, ...], types: tuple[str | StoredType, ...], parameters: tuple=(), limits: SQLiteImportLimits=SQLiteImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
+```
+
+Atomically stage the complete bounded selection; caller owns Grafx commit/rollback.
 
 ### okto_grafx.graph_interop.to_networkx
 
@@ -965,7 +1716,7 @@ Export scoped identities/endpoints and optional aligned scalar results in bounde
 ### okto_grafx.polars.to_polars
 
 ```python
-to_polars(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=100000, max_bytes: int=64 * 1024 * 1024) -> PolarsFrame
+to_polars(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=100000, max_bytes: int=64 * 1024 * 1024) -> PolarsFrame
 ```
 
 Materialize an explicitly typed frame and retain its native schema separately.
@@ -973,7 +1724,7 @@ Materialize an explicitly typed frame and retain its native schema separately.
 ### okto_grafx.polars.import_polars
 
 ```python
-import_polars(transaction: Transaction, statement: str, frame: PolarsFrame, *, types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
+import_polars(transaction: Transaction, statement: str, frame: PolarsFrame, *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
 ```
 
 Stage one metadata-bearing eager frame atomically, with caller-owned commit.
@@ -981,7 +1732,7 @@ Stage one metadata-bearing eager frame atomically, with caller-owned commit.
 ### okto_grafx.text_import.read_csv_batches
 
 ```python
-read_csv_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], delimiter: str=',', null_token: str='\\N', limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> Iterator[tuple[dict[str, object], ...]]
+read_csv_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str | StoredType, ...], delimiter: str=',', null_token: str='\\N', limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> Iterator[tuple[dict[str, object], ...]]
 ```
 
 Read header-required UTF-8 CSV with double quotes; close the iterator on early exit.
@@ -989,15 +1740,15 @@ Read header-required UTF-8 CSV with double quotes; close the iterator on early e
 ### okto_grafx.text_import.read_jsonl_batches
 
 ```python
-read_jsonl_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> Iterator[tuple[dict[str, object], ...]]
+read_jsonl_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str | StoredType, ...], limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> Iterator[tuple[dict[str, object], ...]]
 ```
 
-Read one exact scalar object per UTF-8 line; missing and duplicate keys are errors.
+Read one typed row per UTF-8 line; missing and duplicate keys are errors.
 
 ### okto_grafx.text_import.import_csv
 
 ```python
-import_csv(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], delimiter: str=',', null_token: str='\\N', limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
+import_csv(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str | StoredType, ...], delimiter: str=',', null_token: str='\\N', limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
 ```
 
 Atomically stage one complete CSV file; caller owns transaction, commit and retry.
@@ -1005,7 +1756,7 @@ Atomically stage one complete CSV file; caller owns transaction, commit and retr
 ### okto_grafx.text_import.import_jsonl
 
 ```python
-import_jsonl(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str, ...], limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
+import_jsonl(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], columns: tuple[str, ...], types: tuple[str | StoredType, ...], limits: TextImportLimits=TextImportLimits(), cancellation: CancellationToken | None=None) -> ExecuteManyReport
 ```
 
 Atomically stage one complete JSON Lines file with caller-owned commit/retry.
@@ -1013,7 +1764,7 @@ Atomically stage one complete JSON Lines file with caller-owned commit/retry.
 ### okto_grafx.tabular.to_pandas
 
 ```python
-to_pandas(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=100000, max_bytes: int=64 * 1024 * 1024) -> DataFrame
+to_pandas(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=100000, max_bytes: int=64 * 1024 * 1024) -> DataFrame
 ```
 
 Materialize an explicitly typed Arrow-backed frame; never infer dtypes or close a cursor.
@@ -1021,15 +1772,15 @@ Materialize an explicitly typed Arrow-backed frame; never infer dtypes or close 
 ### okto_grafx.tabular.import_pandas
 
 ```python
-import_pandas(transaction: Transaction, statement: str, frame: DataFrame, *, types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
+import_pandas(transaction: Transaction, statement: str, frame: DataFrame, *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
 ```
 
-Stage one Arrow-backed DataFrame atomically; require explicit dtypes and vector metadata.
+Stage an Arrow-backed frame atomically; native parameterized types require metadata.
 
 ### okto_grafx.parquet.read_parquet_batches
 
 ```python
-read_parquet_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024, max_row_group_bytes: int=64 * 1024 * 1024) -> Iterator[RecordBatch]
+read_parquet_batches(path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024, max_row_group_bytes: int=64 * 1024 * 1024) -> Iterator[RecordBatch]
 ```
 
 Read typed batches from one permitted local file; close the iterator on early exit.
@@ -1037,7 +1788,7 @@ Read typed batches from one permitted local file; close the iterator on early ex
 ### okto_grafx.parquet.import_parquet
 
 ```python
-import_parquet(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024, max_row_group_bytes: int=64 * 1024 * 1024) -> ExecuteManyReport
+import_parquet(transaction: Transaction, statement: str, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024, max_row_group_bytes: int=64 * 1024 * 1024) -> ExecuteManyReport
 ```
 
 Stage one complete local Parquet import atomically; never commit or retry for the caller.
@@ -1045,7 +1796,7 @@ Stage one complete local Parquet import atomically; never commit or retry for th
 ### okto_grafx.parquet.write_parquet
 
 ```python
-write_parquet(source: QueryResult | QueryCursor, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024) -> ParquetExportReport
+write_parquet(source: QueryResult | QueryCursor, path: str | os.PathLike[str], *, allowed_root: str | os.PathLike[str], types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096, max_file_bytes: int=256 * 1024 * 1024) -> ParquetExportReport
 ```
 
 Publish a complete new Parquet file atomically without overwrite; caller owns the cursor.
@@ -1053,18 +1804,18 @@ Publish a complete new Parquet file atomically without overwrite; caller owns th
 ### okto_grafx.arrow.import_arrow_batches
 
 ```python
-import_arrow_batches(transaction: Transaction, statement: str, batches: Iterable[RecordBatch], *, types: tuple[str | ArrowVectorType, ...], max_batch_rows: int=65536, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
+import_arrow_batches(transaction: Transaction, statement: str, batches: Iterable[RecordBatch], *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int=65536, max_batch_bytes: int=16 * 1024 * 1024, max_rows: int=1000000, max_batches: int=4096) -> ExecuteManyReport
 ```
 
-Atomically stage typed scalar/vector batches as named parameters, without committing.
+Atomically stage typed scalar/vector/temporal/decimal/collection batches.
 
 ### okto_grafx.arrow.to_arrow_batches
 
 ```python
-to_arrow_batches(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024) -> Iterator[RecordBatch]
+to_arrow_batches(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], batch_rows: int=256, max_batch_bytes: int=16 * 1024 * 1024) -> Iterator[RecordBatch]
 ```
 
-Yield copied typed batches; caller owns cursor lifetime and already-emitted batches.
+Yield copied typed batches; caller owns cursor lifetime and emitted batches.
 
 ### okto_grafx.projections.project_graph
 
@@ -1109,7 +1860,7 @@ Verify and restore into a NEW directory for offline replacement, never a writabl
 ### okto_grafx.transfer.export_graph
 
 ```python
-export_graph(database: Database, destination: str | os.PathLike[str], *, limits: TransferLimits | None=None) -> TransferReport
+export_graph(database: Database, destination: str | os.PathLike[str], *, limits: TransferLimits | None=None, history: str='refuse') -> TransferReport
 ```
 
 Stream all current logical schema/rows/vectors from one fixed reader snapshot.
@@ -1129,6 +1880,344 @@ construct raw engine state. Consume returned instances and documented accessors.
 `Lsn`, `Csn` and record/table IDs are integer aliases, not wall-clock times.
 `RecordRef` is a physical page/slot identity, not your application primary key.
 `Value` is the detached value union described in the query-language reference.
+
+### StoredType fields
+
+Annotation location: `okto_grafx.domain.model.stored_types.StoredType`.
+
+One exact schema type, including nested nullability and parameter metadata.
+
+```python
+kind: str
+nullable: bool
+element: StoredType | None
+length: int | None
+fields: tuple[tuple[str, StoredType], ...]
+precision: int | None
+scale: int | None
+```
+
+#### StoredType.value_type
+
+```python
+value_type: ValueType | None  # read-only property
+```
+
+Return the query/value family; ANY is dynamic, ARRAY/LIST and STRUCT/MAP share tags.
+
+#### StoredType.describe
+
+```python
+describe() -> str
+```
+
+Return canonical native type syntax with explicit nested nullability.
+
+#### StoredType.contains
+
+```python
+contains(kind: str) -> bool
+```
+
+Check a descriptor family, not the values that may later be stored in ANY.
+
+### DecimalValue fields
+
+Annotation location: `okto_grafx.domain.model.decimal_values.DecimalValue`.
+
+Exact coefficient/type snapshot; numeric equality uses numeric_key instead.
+
+```python
+coefficient: int
+precision: int
+scale: int
+```
+
+#### DecimalValue.as_integer_ratio
+
+```python
+as_integer_ratio() -> tuple[int, int]
+```
+
+Return the reduced exact numerator and positive denominator of this decimal.
+
+#### DecimalValue.numeric_key
+
+```python
+numeric_key() -> tuple[int, int]
+```
+
+Canonical finite rational key; equality/hash callers share this proof.
+
+#### DecimalValue.to_string
+
+```python
+to_string() -> str
+```
+
+Format the exact value while preserving its declared fractional scale.
+
+#### DecimalValue.rescale
+
+```python
+rescale(precision: int, scale: int, *, rounding: str='EXACT') -> DecimalValue
+```
+
+Convert to a requested precision and scale using the explicit rounding policy.
+
+### RelationshipTypeDef fields
+
+Annotation location: `okto_grafx.domain.model.relationship_type.RelationshipTypeDef`.
+
+One logical name and its nonempty, canonically ordered physical members.
+
+```python
+name: str
+table_ids: tuple[int, ...]
+```
+
+### TemporalLimits fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalLimits`.
+
+Aggregate encoded-input, event and live/output-row bounds; not an RSS ceiling.
+
+```python
+max_events: int
+max_bytes: int
+max_rows: int
+access_path: str
+```
+
+### TemporalVersion fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalVersion`.
+
+One row lineage interval [system_from, system_to); None is unbounded.
+
+```python
+table: str
+table_id: int
+record_id: int
+values: tuple[object, ...]
+schema_version: int
+system_from: CommitId
+system_to: CommitId | None
+logical_type: str | None
+node_labels: tuple[str, ...] | None
+```
+
+### TemporalGraph fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalGraph`.
+
+Complete bounded historical rows/schemas for a requested closed table set.
+
+```python
+as_of: CommitId
+schemas: tuple[TableDef, ...]
+rows: tuple[TemporalVersion, ...]
+events_scanned: int
+encoded_bytes_scanned: int
+relationship_types: tuple[RelationshipTypeDef, ...]
+```
+
+### TemporalVersions fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalVersions`.
+
+Versions visible to the owning read snapshot, never a claim beyond its boundary.
+
+```python
+read_commit: CommitId
+table: str
+record_id: int
+versions: tuple[TemporalVersion, ...]
+activation: CommitId
+retained_from: CommitId
+```
+
+### TemporalPin fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalPin`.
+
+Durable named retention protection; explicitly released, with no implicit TTL.
+
+```python
+name: str
+at: CommitId
+tables: tuple[TableSelector, ...]
+```
+
+### TemporalCompactionReport fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalCompactionReport`.
+
+Physical reclamation after a durable logical replacement and checkpoint.
+
+```python
+commit: CommitId | None
+physical_bytes_before: int
+physical_bytes_after: int
+physical_bytes_reclaimed: int
+```
+
+### TemporalPruneReport fields
+
+Annotation location: `okto_grafx.domain.temporal.TemporalPruneReport`.
+
+Atomic retention result; payload redaction does not reclaim physical file space.
+
+```python
+before: CommitId
+tables: tuple[TableSelector, ...]
+commit: CommitId | None
+redacted_versions: int
+redacted_bytes: int
+physical_bytes_reclaimed: int
+```
+
+### ViewParameter fields
+
+Annotation location: `okto_grafx.views.ViewParameter`.
+
+An exact native scalar type; all declared arguments are required, even if nullable.
+
+```python
+name: str
+type: ValueType
+nullable: bool
+```
+
+### ViewDefinition fields
+
+Annotation location: `okto_grafx.views.ViewDefinition`.
+
+Detached definition; sorted name/hash pairs retain every physical dependency.
+
+```python
+name: str
+query: str
+parameters_schema: tuple[ViewParameter, ...]
+columns: tuple[str, ...]
+dependencies: tuple[tuple[str, str], ...]
+sha256: str
+```
+
+### CopyLimits fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyLimits`.
+
+Whole-package logical bounds, not process RSS or durable transaction quota overrides.
+
+```python
+max_rows: int
+max_bytes: int
+max_row_bytes: int
+max_tables: int
+```
+
+### CopyTable fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyTable`.
+
+Immutable schema and framed native rows; optional GXL1 membership precedes tuple bytes.
+
+```python
+schema: TableDef
+rows: tuple[tuple[int, bytes], ...]
+logical_type: str | None
+```
+
+### CopyPackage fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyPackage`.
+
+Detached retry input; checksummed, not authenticated or a physical backup.
+
+```python
+source_commit: CommitId
+tables: tuple[CopyTable, ...]
+spaces: tuple[EmbeddingSpaceDef, ...]
+sha256: str
+```
+
+### CopyReceipt fields
+
+Annotation location: `okto_grafx.catalog_copy.CopyReceipt`.
+
+One proven target commit; replayed=True adds no new target effects.
+
+```python
+source_commit: CommitId
+target_commit: CommitId
+request_sha256: str
+rows: int
+replayed: bool
+skipped_rows: int
+```
+
+### CatalogPathPolicy fields
+
+Annotation location: `okto_grafx.catalogs.CatalogPathPolicy`.
+
+Existing allowed roots, no links/UNC, no implicit home expansion or directory creation.
+
+```python
+allowed_roots: tuple[str, ...]
+max_catalogs: int
+max_active_transactions: int
+```
+
+#### CatalogPathPolicy.resolve
+
+```python
+resolve(path: str | os.PathLike[str], *, existing: bool=True) -> str
+```
+
+Validate an explicit path against roots; this never creates or opens a store.
+
+### CatalogInfo fields
+
+Annotation location: `okto_grafx.catalogs.CatalogInfo`.
+
+Detached catalog inventory; store identity is not filesystem authority.
+
+```python
+alias: str
+database_uuid: bytes
+read_only: bool
+owned: bool
+active_transactions: int
+```
+
+### WorkspacePolicy fields
+
+Annotation location: `okto_grafx.workspace.WorkspacePolicy`.
+
+Opt-in discovery within explicit allowed roots, with no environment/home fallback.
+
+```python
+paths: CatalogPathPolicy
+markers: tuple[str, ...]
+max_parent_steps: int
+allow_cwd: bool
+allow_user_store: bool
+project_store_name: str
+```
+
+### ResolvedWorkspace fields
+
+Annotation location: `okto_grafx.workspace.ResolvedWorkspace`.
+
+Explicit absolute paths, not open handles; source records which precedence rule won.
+
+```python
+root: str
+project_store: str
+user_store: str | None
+source: str
+```
 
 ### ProjectionLimits fields
 
@@ -1202,6 +2291,14 @@ weights: tuple[float, ...] | None
 pagerank_preparation: PageRankPreparation | None
 simple_topology: SimpleTopology | None
 ```
+
+#### GraphProjection.topological_order
+
+```python
+topological_order(*, cancellation: CancellationToken | None=None) -> TopologicalOrderResult
+```
+
+Return deterministic Kahn ordering or a typed cycle/blocked result, in O(V+E).
 
 #### GraphProjection.with_pagerank
 
@@ -1307,6 +2404,18 @@ weakly_connected_components(*, cancellation: CancellationToken | None=None) -> t
 
 Return each node's component label (minimum table/record identity), including isolates.
 
+### TopologicalOrderResult fields
+
+Annotation location: `okto_grafx.projection_algorithms.TopologicalOrderResult`.
+
+Typed DAG/cycle result. Blocked includes cycle descendants, not just cycle members.
+
+```python
+order: tuple[ProjectionNode, ...]
+acyclic: bool
+blocked: tuple[ProjectionNode, ...]
+```
+
 ### PageRankPreparation fields
 
 Annotation location: `okto_grafx.projection_algorithms.PageRankPreparation`.
@@ -1410,6 +2519,32 @@ in_edges: tuple[int, ...]
 logical_bytes: int
 ```
 
+### HtmlSnapshotLimits fields
+
+Annotation location: `okto_grafx.html_snapshot.HtmlSnapshotLimits`.
+
+Display limits; source capture uses independent ProjectionLimits.
+
+```python
+max_nodes: int
+max_edges: int
+max_bytes: int
+max_work: int
+```
+
+### SQLiteImportLimits fields
+
+Annotation location: `okto_grafx.sqlite_import.SQLiteImportLimits`.
+
+Logical input bounds, including SQLite VM instructions; not a process RSS promise.
+
+```python
+max_rows: int
+max_bytes: int
+max_field_bytes: int
+max_work: int
+```
+
 ### PolarsFrame fields
 
 Annotation location: `okto_grafx.polars.PolarsFrame`.
@@ -1451,6 +2586,17 @@ batches: int
 bytes: int
 ```
 
+### ArrowDecimalType fields
+
+Annotation location: `okto_grafx.arrow.ArrowDecimalType`.
+
+Exact DECIMAL(p,s) interchange declaration, represented by Arrow decimal128.
+
+```python
+precision: int
+scale: int
+```
+
 ### ArrowVectorType fields
 
 Annotation location: `okto_grafx.arrow.ArrowVectorType`.
@@ -1485,6 +2631,42 @@ invoke(arguments: tuple[object, ...]) -> object
 
 Call with scalar values only; NULL propagates and callback failures are typed.
 
+### TabularProcedure fields
+
+Annotation location: `okto_grafx.domain.query.extensions.TabularProcedure`.
+
+Trusted typed callback with explicit read/write mode and named permissions.
+
+```python
+name: str
+argument_types: tuple[str, ...]
+columns: tuple[tuple[str, str], ...]
+implementation: Callable[..., Iterable[tuple[object, ...]] | None]
+required_permissions: frozenset[str]
+max_rows: int
+max_result_bytes: int
+max_value_bytes: int
+argument_names: tuple[str, ...] | None
+mode: str
+max_write_statements: int
+graph_read: bool
+max_query_statements: int
+max_query_rows: int
+max_query_bytes: int
+max_call_depth: int
+deterministic: bool
+schema_write: bool
+max_schema_statements: int
+```
+
+#### TabularProcedure.invoke
+
+```python
+invoke(arguments: tuple[object, ...], *, writer: ProcedureWriter | None=None, entity_resolver: Callable[[object], object] | None=None, reader: ProcedureReader | None=None) -> Iterator[tuple[object, ...]]
+```
+
+Validate inputs/results and close the callback stream on exhaustion or cancellation.
+
 ### ExtensionRegistry fields
 
 Annotation location: `okto_grafx.domain.query.extensions.ExtensionRegistry`.
@@ -1494,6 +2676,8 @@ Per-handle immutable trusted allowlist; not a sandbox or a plugin loader.
 ```python
 scalars: tuple[ScalarFunction, ...]
 trusted: bool
+procedures: tuple[TabularProcedure, ...]
+procedure_permissions: frozenset[str]
 ```
 
 #### ExtensionRegistry.call_scalar
@@ -1503,6 +2687,17 @@ call_scalar(name: str, arguments: tuple[object, ...]) -> object
 ```
 
 Invoke only an exact registered name; no module/path or builtin resolution.
+
+### ProcedureResult fields
+
+Annotation location: `okto_grafx.domain.query.procedure_writer.ProcedureResult`.
+
+Bounded columns and owned result rows from a transaction-scoped native query.
+
+```python
+columns: tuple[str, ...]
+rows: tuple[tuple[object, ...], ...]
+```
 
 ### VectorTotalMemoryUsage fields
 
@@ -1700,12 +2895,13 @@ batch_rows: int
 
 Annotation location: `okto_grafx.transfer.RecordIdMapping`.
 
-One current logical identity remap, qualified by the stable table name.
+One current logical identity remap, qualified by table name and entity kind.
 
 ```python
 table: str
 source_record_id: int
 target_record_id: int
+kind: str | None
 ```
 
 ### TransferReport fields
@@ -1747,6 +2943,7 @@ stemming: str
 statistics_mode: str
 statistics_history_entries: int
 prefix_max_characters: int
+positions: bool
 ```
 
 #### TextIndexOptions.derivation
@@ -1772,6 +2969,20 @@ max_memory_bytes: int
 max_statistics_wal_records: int
 max_statistics_wal_bytes: int
 max_expanded_terms: int
+max_position_results: int
+max_proximity_work: int
+```
+
+### TextMatchPositions fields
+
+Annotation location: `okto_grafx.domain.index.fulltext.TextMatchPositions`.
+
+Validated zero-based analyzed token ordinals for one field/term, not character offsets.
+
+```python
+field: str
+term: str
+positions: tuple[int, ...]
 ```
 
 ### TextHit fields
@@ -1785,6 +2996,7 @@ record_id: int
 score: float
 matched_fields: tuple[str, ...]
 matched_terms: tuple[str, ...]
+positions: tuple[TextMatchPositions, ...]
 ```
 
 ### TextSearchResult fields
@@ -1803,6 +3015,65 @@ candidates: int
 corpus_documents: int
 statistics_regime: str
 statistics_wal_records: int
+```
+
+### TemporalPropertyChange fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalPropertyChange`.
+
+Absent and NULL are distinct; endpoint slots use names _from/_to from native schema.
+
+```python
+name: str
+before_present: bool
+after_present: bool
+before: object
+after: object
+```
+
+### TemporalRowChange fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalRowChange`.
+
+One node/relationship lineage change; recreate is a separate added identity.
+
+```python
+table: str
+table_kind: str
+record_id: int
+operation: str
+before: TemporalVersion | None
+after: TemporalVersion | None
+properties: tuple[TemporalPropertyChange, ...]
+labels_added: tuple[str, ...]
+labels_removed: tuple[str, ...]
+```
+
+### TemporalSchemaChange fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalSchemaChange`.
+
+Explicit historical schema change, even for tables containing no rows.
+
+```python
+table: str
+before: TableDef | None
+after: TableDef | None
+```
+
+### TemporalDiff fields
+
+Annotation location: `okto_grafx.temporal_diff.TemporalDiff`.
+
+Complete same-store diff; scan counters cover both captured pictures.
+
+```python
+before: CommitId
+after: CommitId
+schemas: tuple[TemporalSchemaChange, ...]
+rows: tuple[TemporalRowChange, ...]
+events_scanned: int
+encoded_bytes_scanned: int
 ```
 
 ### ConnectOptions fields
@@ -1893,6 +3164,7 @@ One detached stored row in table-column order.
 ```python
 record_id: int
 values: tuple[Value, ...]
+node_labels: tuple[str, ...] | None
 ```
 
 ### ScanPageV1 fields
@@ -1925,7 +3197,7 @@ The rows one statement produced, with the plan that produced them.
 
 ```python
 columns: tuple[str, ...]
-rows: tuple[tuple[Value, ...], ...]
+rows: tuple[tuple[QueryValue, ...], ...]
 plan: PlanNode | None
 statistics: Mapping[str, int]
 ```
@@ -1933,7 +3205,7 @@ statistics: Mapping[str, int]
 #### QueryResult.dictionaries
 
 ```python
-dictionaries() -> tuple[dict[str, Value], ...]
+dictionaries() -> tuple[dict[str, QueryValue], ...]
 ```
 
 Return the rows as mappings from column name to value.
@@ -2096,7 +3368,7 @@ Annotation location: `okto_grafx.engine.public_views.TableBloatReport`.
 Conservative heap-bloat census for one table at one recyclable horizon.
 
 ```python
-table: str
+table: TableSelector
 table_id: int
 data_pages: int
 slot_directory_entries: int
@@ -2141,7 +3413,7 @@ Annotation location: `okto_grafx.engine.public_views.TableVacuumReport`.
 Detached physical effects of one quiescent vacuum pass over one table.
 
 ```python
-table: str
+table: TableSelector
 table_id: int
 pages_scanned: int
 eligible_inline_versions: int
@@ -2279,7 +3551,32 @@ Immutable catalog definition snapshot with read-compatible lookup helpers.
 ```python
 table_definitions: tuple[TableDef, ...]
 space_definitions: tuple[EmbeddingSpaceDef, ...]
+relationship_type_definitions: tuple[RelationshipTypeDef, ...]
 ```
+
+#### CatalogView.relationship_types
+
+```python
+relationship_types() -> tuple[RelationshipTypeDef, ...]
+```
+
+Return detached logical groups in name order, without live authority.
+
+#### CatalogView.relationship_tables
+
+```python
+relationship_tables(name: str) -> tuple[TableDef, ...]
+```
+
+Resolve a captured logical type without aliasing physical identities.
+
+#### CatalogView.relationship_type_name
+
+```python
+relationship_type_name(table_id: int) -> str
+```
+
+Return the captured logical type of a real relationship table.
 
 #### CatalogView.tables
 
@@ -2300,10 +3597,10 @@ Return captured embedding spaces in numeric identity order.
 #### CatalogView.has_table
 
 ```python
-has_table(name: str) -> bool
+has_table(name: str, *, kind: str | None=None) -> bool
 ```
 
-Return whether a captured table has `name`.
+Return whether a physical name exists, optionally qualified by kind.
 
 #### CatalogView.has_space
 
@@ -2316,10 +3613,10 @@ Return whether a captured embedding space has `name`.
 #### CatalogView.table
 
 ```python
-table(name: str) -> TableDef
+table(name: str, *, kind: str | None=None) -> TableDef
 ```
 
-Return a captured table by name.
+Return a captured physical table; ambiguous unqualified names refuse.
 
 #### CatalogView.table_by_id
 
@@ -2672,6 +3969,7 @@ ef_search: int
 stale: bool
 stale_reason: str | None
 built_through_lsn: int | None
+table_id: int
 ```
 
 ### VectorEngineView fields
@@ -2713,10 +4011,10 @@ Return captured vector indexes in stable space-name order.
 #### VectorEngineView.index
 
 ```python
-index(space_name: str) -> VectorIndexView
+index(space_name: str, *, table_id: int | None=None) -> VectorIndexView
 ```
 
-Return the captured vector index of one embedding space.
+Select a captured physical owner; an unqualified shared space refuses.
 
 ### IndexCleanupFile fields
 
@@ -3077,10 +4375,21 @@ One column of a table: a name, a stored type, nullability and, for vectors, its 
 
 ```python
 name: str
-type: ValueType
+type: ValueType | SchemaType
 nullable: bool
 vector_space: str | None
+decimal_precision: int | None
+decimal_scale: int | None
+stored_type: StoredType | None
 ```
+
+#### ColumnDef.normalize_value
+
+```python
+normalize_value(value: Value) -> Value
+```
+
+Return an exact typed assignment, never rounding a decimal implicitly.
 
 #### ColumnDef.is_vector
 
@@ -3105,6 +4414,11 @@ primary_key: str | None
 from_table: str | None
 to_table: str | None
 schema_version: int
+schema_layouts: tuple[tuple[int, int], ...]
+flexible_properties: bool
+unlabeled: bool
+vector_identity_names: bool
+extra_node_labels: tuple[str, ...]
 ```
 
 #### TableDef.arity
@@ -3114,6 +4428,22 @@ arity: int  # read-only property
 ```
 
 Return the number of columns a tuple of this table must carry.
+
+#### TableDef.node_label_candidates
+
+```python
+node_label_candidates: tuple[str, ...]  # read-only property
+```
+
+Conservative possible membership, not the actual labels of each row.
+
+#### TableDef.admits_node_labels
+
+```python
+admits_node_labels(labels: tuple[str, ...]) -> bool
+```
+
+Test already validated labels against cached conservative candidates.
 
 #### TableDef.endpoint_columns
 

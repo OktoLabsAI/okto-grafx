@@ -194,7 +194,7 @@ def test_maximum_string_literal_keeps_its_query_derived_result_column() -> None:
 
 
 def test_case_and_subscript_survive_the_detached_public_plan_boundary() -> None:
-    text = "RETURN CASE WHEN true THEN [10, 20][2] ELSE 0 END AS selected"
+    text = "RETURN CASE WHEN true THEN [10, 20][1] ELSE 0 END AS selected"
     with connect(":memory:") as database:
         plan = database.explain(text)
         result = database.execute(text)
@@ -385,8 +385,11 @@ def test_maximum_nonprintable_string_literal_fits_rendered_query_bound(
         result = database.execute(text)
 
     assert type(plan) is ProduceResults
-    assert plan.columns == (rendered,)
-    assert result.columns == (rendered,)
+    # Unaliased headings preserve the submitted spelling, while normalized
+    # rendering still fits its separate expansion budget.
+    assert plan.columns == (text[len("RETURN "):],)
+    assert result.columns == (text[len("RETURN "):],)
+    assert len(rendered) <= MAX_RENDERED_QUERY_CHARACTERS
     assert result.rows == ((literal,),)
 
 
@@ -948,11 +951,15 @@ def test_exact_plan_nodes_are_rebuilt_with_exact_scalar_tuple_and_schema_leaves(
     column = ColumnDef(name=HostileText("id"), type=ValueType.INT64, nullable=False)
     table = TableDef(
         table_id=1,
-        name=HostileText("Person"),
+        name="Person",
         kind=HostileText("node"),
         columns=HostileTuple((column,)),
         primary_key=HostileText("id"),
     )
+    # Current TableDef admission rejects non-exact label names. Inject the
+    # hostile returned leaf *after* construction to exercise the public-plan
+    # copying boundary independently of constructor admission.
+    object.__setattr__(table, "name", HostileText("Person"))
     raw = ProduceResults(
         child=NodeScan(
             child=SingleRow(),

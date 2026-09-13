@@ -123,7 +123,7 @@ def search_hybrid(
             reader._require_batch_idle("search_hybrid")
             check()
             catalog = database._catalog.catalog
-            target = catalog.table(table)
+            target = catalog.table(table, kind="node")
             if target.kind != "node":
                 raise GrafxConfigurationError(
                     "Hybrid target must be a node table.", field="table"
@@ -178,7 +178,7 @@ def search_hybrid(
                 if not owners:
                     errors.append(("vector", "missing_space_binding"))
                     vector_regime = "unavailable"
-                elif len(owners) != 1 or owners[0][0] != target.table_id:
+                elif sum(table_id == target.table_id for table_id, _column in owners) != 1:
                     raise GrafxConfigurationError(
                         "Hybrid vector space must bind once to the target table.",
                         field="space",
@@ -187,6 +187,7 @@ def search_hybrid(
                     result = database._search_vectors_with_control(
                         reader,
                         space=space,
+                        table=("node", target.name),
                         query=wanted_vector,
                         k=selected.candidate_k,
                         candidate_filter=filter,
@@ -271,7 +272,7 @@ def search_hybrid(
                         database, reader, identity, paths, selected, allowed, check, reserve,
                     )
                 for name in selected.graph_relations if paths is None else ():
-                    relation = catalog.table(name)
+                    relation = catalog.table(name, kind="rel")
                     if (
                         relation.kind != "rel"
                         or relation.from_table != table
@@ -285,6 +286,7 @@ def search_hybrid(
                     while True:
                         page = reader.scan_rows_v1(
                             name,
+                            kind="rel",
                             limit=min(128, selected.max_graph_edges - visited + 1),
                             cursor=cursor,
                         )

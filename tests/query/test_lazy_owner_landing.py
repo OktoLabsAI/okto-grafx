@@ -34,7 +34,7 @@ from tests.query.stack import QueryStack, build_query_stack
 class _LandingContext:
     """The minimal weak-referenceable statement authority consumed by a landing view."""
 
-    __slots__ = ("_schema", "snapshot", "staged_rows", "txn", "__weakref__")
+    __slots__ = ("_schema", "snapshot", "staged_rows", "phase_rows", "txn", "__weakref__")
 
     def __init__(
         self,
@@ -49,6 +49,7 @@ class _LandingContext:
         self.snapshot = transaction.snapshot
         self._schema = stack.catalog_store.catalog
         self.staged_rows: list[object] = []
+        self.phase_rows: tuple[object, ...] = ()
 
     def schema(self) -> object:
         """Return the exact catalog picture shared by sibling statement contexts."""

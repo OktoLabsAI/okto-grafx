@@ -1,5 +1,16 @@
 # Application schema migrations
 
+In 0.0.6 development, the migration ledger resolves specifically to the node
+namespace. A same-named relationship neither becomes the ledger nor hides the
+owned node ledger. Node schema, owner marker and checksum validation remain
+mandatory; an unrelated edge cannot authorize a corrupt/missing ledger row.
+Dry-run, per-version atomicity and bounded OCC retry are unchanged. Overlapping
+names retain the catalog-v2 namespace capability and upgrade requirements.
+
+For the separate 0.0.6 typed nullable-column operation, see
+[append-only schema evolution](NULLABLE_COLUMNS.md). The string-based migration
+runner below does not yet accept ALTER statements or typed operations.
+
 [Index](README.md) · [API](API_REFERENCE.md) · [Roadmap](../ROADMAP.md)
 
 The 0.0.5 development API `okto_grafx.migrations` provides a bounded additive

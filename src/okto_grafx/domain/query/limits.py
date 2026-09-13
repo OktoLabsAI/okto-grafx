@@ -23,6 +23,7 @@ from __future__ import annotations
 __all__ = [
     "DEFAULT_MAX_QUERY_VALUE_CHARACTERS",
     "MAX_CLAUSES",
+    "MAX_PIPELINE_CLAUSES",
     "MAX_COLUMN_DEFINITIONS",
     "MAX_EXPRESSION_DEPTH",
     "MAX_LIST_ELEMENTS",
@@ -71,7 +72,7 @@ columns unbounded.  This bound applies only to derived display names; identifier
 string values retain their substantially smaller limits.
 """
 
-MAX_TOKENS: int = 8192
+MAX_TOKENS: int = 32768
 """Tokens one query may produce, so a pathological but short text cannot expand without bound."""
 
 MAX_EXPRESSION_DEPTH: int = 48
@@ -82,7 +83,14 @@ so this leaves two orders of magnitude of headroom. Real Cypher rarely passes fi
 """
 
 MAX_CLAUSES: int = 64
-"""Clauses one query may chain, counting every MATCH, CREATE, MERGE, SET, DELETE and RETURN."""
+"""Maximum UNION branches or conditional SET actions within one MERGE."""
+
+MAX_PIPELINE_CLAUSES: int = 1024
+"""Written clauses in a query pipeline; source size and physical plan depth also bound it.
+
+Consecutive CREATE patterns run as a flat native sequence. Other operator trees
+still obey their independent depth guard, and expression recursion is unchanged.
+"""
 
 MAX_PATTERNS_PER_CLAUSE: int = 32
 """Comma-separated patterns one MATCH, CREATE or MERGE clause may carry."""
@@ -91,23 +99,10 @@ MAX_PATTERN_ELEMENTS: int = 64
 """Nodes and relationships one pattern may chain, so a path cannot be arbitrarily long."""
 
 MAX_TRAVERSAL_HOPS: int = 30
-"""The largest upper bound a variable-length relationship may DECLARE.
+"""Largest declared upper count and resource ceiling for an omitted upper bound.
 
-A traversal is always bounded, because an unbounded walk over a cyclic graph is exactly the
-shape that does not terminate. What a query may write explicitly reaches thirty; what it gets
-when it writes no upper bound at all is :data:`DEFAULT_TRAVERSAL_HOPS`, which is smaller. The
-two numbers answer different questions and are deliberately not the same one.
-"""
-
-DEFAULT_TRAVERSAL_HOPS: int = 20
-"""The upper bound a variable-length relationship takes when it omits one.
-
-Twenty, because that is what the public endpoint already applies: it rewrites ``*`` textually to
-``*..20`` from ``MAX_TRAVERSAL_DEPTH`` before a query reaches any engine -- a range whose own
-lower bound is still omitted, and which therefore means one to twenty. So a caller who omits the
-upper bound has been getting twenty hops all along. Adopting the same number is what makes the omission mean
-one thing rather than two, and it is a canonicalisation rather than a guess -- the accepted form
-is written back as the explicit range it became.
+Omission is preserved in AST/plan. An extendable trail at this ceiling raises a
+query-budget error; it is never silently reported as complete enumeration.
 """
 
 MAX_PROJECTION_ITEMS: int = 256
@@ -131,13 +126,14 @@ MAX_COLUMN_DEFINITIONS: int = 512
 MAX_NAME_CHARACTERS: int = 128
 """Characters one identifier may carry, matching the schema identifier rule of the domain model."""
 
-MAX_NUMBER_CHARACTERS: int = 40
+MAX_NUMBER_CHARACTERS: int = 2048
 """Characters one numeric literal may carry.
 
-The bound is about the conversion, not about taste. CPython refuses to build an integer from a
-very long digit string and raises ``ValueError`` while doing it, and a caller can ask for that in
-a few kilobytes of text; forty characters is more than any real literal and far below the point
-where the conversion becomes expensive at all.
+This admits long finite DOUBLE spellings, including the full decimal expansion of
+binary64 subnormals, while bounding token allocation and conversion work. Decimal
+integers are checked lexically against INT64 magnitude before conversion, so this
+limit does not depend on CPython's process-global integer conversion limit. Query
+text/token limits still apply independently; this is not a configurable budget.
 """
 
 MAX_STRING_CHARACTERS: int = 16384

@@ -786,12 +786,22 @@ def test_vector_adoption_requires_the_complete_embedding_space_definition(
 
 def test_partial_multi_index_statement_releases_its_adopted_observation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Failure after PK adoption must not make an unrelated commit adopt that PK."""
 
     root = tmp_path / "partial-multi-index-unwind"
-    long_space = "s" * 120
+    long_space = "s"
     database = connect(root, **_OPTIONS)
+    vector_type = type(database._vectors)
+    original_attach = vector_type._attach_speculative
+
+    def refuse_vector_after_pk(engine, table, space_name, catalog):
+        if engine is database._vectors and table.name == "Decision":
+            raise GrafxIndexError("Injected vector attachment failure after PK adoption.", field="name")
+        return original_attach(engine, table, space_name, catalog)
+
+    monkeypatch.setattr(vector_type, "_attach_speculative", refuse_vector_after_pk)
     owner = database.begin("write")
     partial = database.begin("write")
     try:
@@ -800,8 +810,9 @@ def test_partial_multi_index_statement_releases_its_adopted_observation(
             f"CREATE VECTOR SPACE {long_space} "
             "{dimension: 2, metric: 'cosine'}"
         )
-        # pk_Decision is equivalent to the owner's first index and is staged first.  The vector
-        # index name then exceeds the identifier budget, forcing statement-level reverse unwind.
+        # pk_Decision is equivalent to the owner's first index and is staged first.
+        # Explicit vector failure preserves this unwind case now that long derived
+        # names have a bounded identity-name representation in catalog v2.
         with pytest.raises(GrafxIndexError):
             partial.execute(
                 "CREATE NODE TABLE Decision("

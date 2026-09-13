@@ -46,10 +46,11 @@ All source execution and graph evidence stay on its snapshot, including old read
 while another participant commits. No read operation builds an index or writes data.
 
 The target is one node table. The FTS index must cover that table. The vector space
-must bind to **exactly one vector column, on that table**: native RecordIds are
-table-qualified, while vector-space results do not carry a table discriminator.
-Multiple bindings are refused rather than post-filtered after top-k. Create separate
-spaces when different tables need independent retrieval. To disable a source, set
+must bind to **exactly one vector column on that target table**. In the 0.0.6
+physical-owner repair, other tables may share the space: retrieval qualifies the
+target before ranking, never post-filters a graph-global top-k. Native record IDs
+remain table-local. See [ownership and remaining naming limits](specs/VECTOR_PHYSICAL_OWNERS_V1.md).
+To disable a source, set
 its weight to zero; pass `index=None` or `space=None` if unused, and `vector=()` for
 lexical-only search. At least one text/vector source must remain enabled.
 

@@ -317,15 +317,15 @@ def test_an_edge_written_the_other_way_round_stores_its_endpoints_in_schema_orde
     assert transaction.row_intents[0].values[:2] == (2, 1)
 
 
-def test_an_edge_to_a_node_the_same_statement_creates_is_refused(stack: QueryStack) -> None:
-    # The identity of a row this statement creates is allocated by the commit, so an edge to it
-    # would name a number nobody has issued. The refusal names the remedy.
+def test_fresh_endpoints_need_an_atomic_staging_collaborator(stack: QueryStack) -> None:
+    # This domain fixture has no statement savepoint protocol. Native transactions
+    # provide it; an incomplete injected collaborator must not issue partial intents.
     failure, transaction = refused(
         stack,
         "MATCH (a:Person) WHERE a.id = 1 CREATE (a)-[:Knows]->(b:Person {id: 9, name: 'New'})",
     )
     assert isinstance(failure, GrafxUnsupportedOperation)
-    assert failure.details["value"] == "b"
+    assert failure.details["operation"] == "relationship_endpoint"
     assert transaction.row_intents == []
 
 

@@ -104,7 +104,6 @@ from okto_grafx.domain.index.header import (
     IndexHeader,
 )
 from okto_grafx.domain.index.layout import IndexLayout
-from okto_grafx.domain.index.keys import bucket_of
 from okto_grafx.domain.index.records import (
     IndexChange,
     IndexOperation,
@@ -829,7 +828,8 @@ class IndexStore:
         storage = self._pool.storage
         header = FileHeader(kind=FileKind.INDEX, page_size=self._pool.page_size)
         index_header = IndexHeader(
-            format_version=4 if self._definition.layout is IndexLayout.SPARSE_HASH else 2,
+            format_version=(5 if self._definition.layout is IndexLayout.POSTING_HASH else
+                            4 if self._definition.layout is IndexLayout.SPARSE_HASH else 2),
             layout=self._definition.layout,
             visibility=self._definition.visibility,
             table_id=self._definition.table_id,
@@ -1989,7 +1989,7 @@ class IndexStore:
             try:
                 moved: bool
                 hot_bucket = hot_buckets.get(
-                    bucket_of(change.key, self._definition.bucket_count)
+                    self._definition.bucket_for(change.key)
                 )
                 if hot_bucket is not None:
                     moved = self._apply_common_replay_hot_change(
@@ -2754,7 +2754,7 @@ class IndexStore:
     def _candidates_unchecked(self, wanted: bytes) -> tuple[IndexEntry, ...]:
         """Walk one already-validated key; the manager surrounds this with its view fence."""
         _pages, found = self._scan_bucket(
-            bucket_of(wanted, self._definition.bucket_count), wanted
+            self._definition.bucket_for(wanted), wanted
         )
         return found
 
@@ -2778,7 +2778,7 @@ class IndexStore:
             return
         buckets: dict[int, list[bytes]] = {}
         for key in keys:
-            buckets.setdefault(bucket_of(key, self._definition.bucket_count), []).append(key)
+            buckets.setdefault(self._definition.bucket_for(key), []).append(key)
         for bucket, wanted in buckets.items():
             if len(wanted) == 1:
                 yield wanted[0], self._candidates_unchecked(wanted[0])
@@ -2808,13 +2808,17 @@ class IndexStore:
                 entries.extend(self._entries_on(page_index))
         return tuple(entries)
 
+    def _entry_images(self, page: Page):
+        """Iterate canonical entry images; physical layouts may decode their own slots."""
+        return page.iter_slot_views()
+
     def _entries_on(self, page_index: PageIndex) -> tuple[IndexEntry, ...]:
         """Return the entries stored on one page, tagged with where each one lives."""
         with self._pool.pinned(self.file, page_index) as page:
             self._require_index_page(page, page_index)
             return tuple(
                 IndexEntry.decode(payload).located_at(page_index, slot)
-                for slot, payload in page.iter_slot_views()
+                for slot, payload in self._entry_images(page)
             )
 
     def _entry_headers(self, *, max_entries: int | None = None) -> tuple[_IndexEntryHeader, ...]:
@@ -2832,7 +2836,7 @@ class IndexStore:
             for page_index in self._bucket_pages(bucket):
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for slot, image in page.iter_slot_views():
+                    for slot, image in self._entry_images(page):
                         (
                             validated,
                             encoded_ref,
@@ -2873,7 +2877,7 @@ class IndexStore:
             for page_index in self._bucket_pages(bucket):
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for _slot, image in page.iter_slot_views():
+                    for _slot, image in self._entry_images(page):
                         _image, _ref, _born_csn, dead_csn, _versioned = (
                             _validated_image(image)
                         )
@@ -2896,7 +2900,7 @@ class IndexStore:
             for page_index in self._bucket_pages(bucket):
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for _slot, image in page.iter_slot_views():
+                    for _slot, image in self._entry_images(page):
                         _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
                             _validated_image(image)
                         )
@@ -2916,7 +2920,7 @@ class IndexStore:
                 refs: list[RecordRef] = []
                 with self._pool.pinned(self.file, page_index) as page:
                     self._require_index_page(page, page_index)
-                    for _slot, image in page.iter_slot_views():
+                    for _slot, image in self._entry_images(page):
                         _image, encoded_ref, _born_csn, _dead_csn, _versioned = (
                             _validated_image(image)
                         )
@@ -2941,8 +2945,8 @@ class IndexStore:
         found: list[IndexEntry] = []
         with self._pool.pinned(self.file, page_index) as page:
             self._require_index_page(page, page_index)
-            for slot in page.live_slots():
-                entry = IndexEntry.decode_if_matches(page.slot_view(slot), key, ref)
+            for slot, raw in self._entry_images(page):
+                entry = IndexEntry.decode_if_matches(raw, key, ref)
                 if entry is not None:
                     found.append(entry.located_at(page_index, slot))
         return tuple(found)
@@ -3100,7 +3104,7 @@ class IndexStore:
 
         counts: dict[int, int] = {}
         for change in staged.changes:
-            bucket = bucket_of(change.key, self._definition.bucket_count)
+            bucket = self._definition.bucket_for(change.key)
             if bucket not in counts and len(counts) >= _COMMON_REPLAY_HOT_BUCKET_LIMIT:
                 return {}
             counts[bucket] = counts.get(bucket, 0) + 1
@@ -3114,7 +3118,7 @@ class IndexStore:
             return {}
         retained_targets = 0
         for change in staged.changes:
-            bucket = bucket_of(change.key, self._definition.bucket_count)
+            bucket = self._definition.bucket_for(change.key)
             targets = targets_by_bucket.get(bucket)
             if targets is None:
                 continue
@@ -3468,7 +3472,7 @@ class IndexStore:
         """Apply against a batch proved empty, returning None when canonical fallback is needed."""
         if not build.valid or change.operation is IndexOperation.RESET:
             return None
-        bucket = bucket_of(change.key, self._definition.bucket_count)
+        bucket = self._definition.bucket_for(change.key)
         identity = (change.key, change.ref)
         located = build.entries.get(identity)
         if change.operation is IndexOperation.INSERT:
@@ -3544,7 +3548,7 @@ class IndexStore:
             if moved and self._metrics.enabled and self._definition.versioned:
                 self._tombstone_backlog_count = 0
             return moved
-        bucket = bucket_of(change.key, self._definition.bucket_count)
+        bucket = self._definition.bucket_for(change.key)
         pages, matches = self._scan_bucket(
             bucket, change.key, change.ref, first_matching_page=True
         )
@@ -3874,7 +3878,10 @@ class IndexStore:
                     if self._key_page_memo is None:
                         from okto_grafx.engine.key_page_memo import KeyPageMemo
                         self._key_page_memo = KeyPageMemo()
-                    for entry in self._key_page_memo.matches(page, key, ref):
+                    selected = (self._posting_matches(page, key, ref)
+                                if self.definition.layout is IndexLayout.POSTING_HASH
+                                else self._key_page_memo.matches(page, key, ref))
+                    for entry in selected:
                         if max_matches is not None and len(matches) >= max_matches:
                             raise GrafxQueryBudgetExceeded(
                                 "Exact candidate capture budget exceeded.",
@@ -3887,7 +3894,7 @@ class IndexStore:
                         # page type/link. Preserve that bounded work and error surface exactly.
                         matching_complete = True
                 elif keys is not None:
-                    for slot, image in page.iter_slot_views():
+                    for slot, image in self._entry_images(page):
                         raw, encoded_ref, born, dead, versioned = _validated_image(image)
                         stored_key = bytes(raw[INDEX_ENTRY_HEADER_SIZE:])
                         if stored_key in keys:
@@ -6976,7 +6983,7 @@ class IndexManager:
                 store,
                 change,
                 lsn_of(record),
-                bucket_of(change.key, store.definition.bucket_count),
+                store.definition.bucket_for(change.key),
             )
             items.append(item)
             if store not in seen:
@@ -8142,6 +8149,9 @@ class IndexManager:
         elif definition.layout is IndexLayout.SPARSE_HASH:
             from okto_grafx.engine.sparse_hash import SparseHashIndex
             index = SparseHashIndex(definition, self._pool, self._metrics)
+        elif definition.layout is IndexLayout.POSTING_HASH:
+            from okto_grafx.engine.posting_hash import PostingHashIndex
+            index = PostingHashIndex(definition, self._pool, self._metrics)
         else:
             index = HashIndex(definition, self._pool, self._metrics)
         from okto_grafx.engine.key_page_memo import KeyPageMemo

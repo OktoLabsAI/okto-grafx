@@ -1,14 +1,4 @@
-"""A named path that is written and never read.
-
-The contract admits `MATCH path = (a:A)-[r:T]->(b:B) ... RETURN a.id`, where the path carries a
-name and nothing in the query refers to it. So the name is decorative: it changes what a query
-may SAY and nothing about what a query DOES. That is the whole claim of this file, and the
-sharpest way to state it is that the plan is identical to the same query without the name.
-
-What keeps a decoration honest is the refusal surface around it. Outside the separately tested
-standalone one-hop path projection, properties, predicates and ordering cannot read the name.
-It must also remain distinct from the node and relationship names beside it.
-"""
+"""Named captures: decorative optimization, composed reads and unsafe AST refusal."""
 
 from __future__ import annotations
 
@@ -18,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import okto_grafx
-from okto_grafx.domain.errors import GrafxParseError, GrafxPlanError
+from okto_grafx.domain.errors import GrafxPlanError
 from okto_grafx.domain.query.analysis import (
     Binding,
     QueryAnalysis,
@@ -135,101 +125,95 @@ def test_the_owner_sees_its_own_edge_and_a_rollback_removes_it(
     assert database.execute(NAMED).rows == (("a1", "canonical"),)
 
 
-# --- expressions outside the standalone path projection remain refused -------------------------
+# --- native path operations and remaining explicit refusals -------------------------------
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length",
-        "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id, path",
-        "MATCH path = (a:A)-[r:R]->(b:B) WHERE path IS NULL RETURN a.id",
-        "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id ORDER BY path",
-        "MATCH path = (a:A)-[r:R]->(b:B) RETURN size(path) AS n",
-        "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id LIMIT path",
-    ],
-)
-def test_every_reference_to_the_name_is_refused_by_the_analysis(query: str) -> None:
-    """It refuses in analyze(), before planning, because there is nothing to plan for it."""
-    with pytest.raises(GrafxPlanError) as raised:
-        analyze(parse(query))
-
-    assert raised.value.details["value"] == "path"
+@pytest.mark.parametrize("query", [
+    "MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length",
+    "MATCH path = (a:A)-[r:R]->(b:B) RETURN size(path) AS n",
+    "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id LIMIT path",
+])
+def test_invalid_path_operations_are_refused_before_execution(database, query):
+    with pytest.raises(GrafxPlanError):
+        database.explain(query)
 
 
-def test_the_refusal_says_the_path_is_unreadable_rather_than_unbound(
-    database: object,
-) -> None:
-    with pytest.raises(GrafxPlanError) as raised:
+def test_path_property_refusal_identifies_the_invalid_operation(database):
+    with pytest.raises(GrafxPlanError, match="no property map") as raised:
         database.execute("MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length")
-
-    assert "written and never read" in str(raised.value)
-    assert raised.value.details == {"field": "variable", "value": "path"}
+    assert raised.value.details["field"] == "property"
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "MATCH a = (a:A)-[r:R]->(b:B) RETURN a.id",
-        "MATCH r = (a:A)-[r:R]->(b:B) RETURN a.id",
-        "MATCH b = (a:A)-[r:R]->(b:B) RETURN a.id",
-    ],
-)
-def test_a_path_name_may_not_be_a_name_something_else_answers_to(query: str) -> None:
-    """Structural, not incidental: the gate compares the names, never the expressions.
+@pytest.mark.parametrize("query,expected", [
+    ("MATCH path = (a:A)-[r:R]->(b:B) WHERE path IS NULL RETURN a.id", ()),
+    ("MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id ORDER BY path", (("a1",),)),
+    ("MATCH path = (a)-[r:R]->(b:B) RETURN a.id", (("a1",),)),
+    ("MATCH path = (a:A)-[r:R]->(b) RETURN a.id", (("a1",),)),
+    ("MATCH path = (a:A)-[r:R]-(b:B) RETURN a.id", (("a1",),)),
+    ("MATCH path = (a:A)-[:R]->(b:B) RETURN a.id", (("a1",),)),
+    ("MATCH path = (a:A {id:'a1'})-[r:R]->(b:B) RETURN a.id", (("a1",),)),
+    ("MATCH path = (a:A)-[r:R]->(b:B), (c:A) RETURN a.id", (("a1",),)),
+    ("MATCH path = (a:A)-[r:R]->(b:B) MATCH (c:A) RETURN a.id", (("a1",),)),
+    ("MATCH path = (a:A)-[r:R]->(b:B) WITH a RETURN a.id", (("a1",),)),
+    ("UNWIND $rows AS x MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id", (("a1",),)),
+    # One MATCH cannot reuse the only relationship across its two patterns.
+    ("MATCH path = (a:A)-[r:R]->(b:B), p2 = (c:A)-[q:R]->(d:B) RETURN a.id", ()),
+])
+def test_composed_decorative_names_keep_exact_results(database, query, expected):
+    assert database.execute(query, {"rows": [1]}).rows == expected
 
-    A rule that noticed the collision only because the name happened to appear in a RETURN
-    would miss `MATCH r = (a:A)-[r:R]->(b:B) RETURN a.id`, where nothing reads r at all.
-    """
-    with pytest.raises(GrafxPlanError) as raised:
+
+@pytest.mark.parametrize("query", [
+    "MATCH a = (a:A)-[r:R]->(b:B) RETURN a.id",
+    "MATCH r = (a:A)-[r:R]->(b:B) RETURN a.id",
+    "MATCH b = (a:A)-[r:R]->(b:B) RETURN a.id",
+])
+def test_a_path_name_may_not_be_a_name_something_else_answers_to(query):
+    with pytest.raises(GrafxPlanError, match="must differ") as raised:
         analyze(parse(query))
-
     assert raised.value.details["field"] == "pattern"
-    assert "not the name of a" in str(raised.value)
 
 
-# --- the one shape, and only it ----------------------------------------------------------------
+@pytest.mark.parametrize("query", [
+    "MATCH path = (a:A)<-[r:R]-(b:B) RETURN a.id",
+    "MATCH path = (a:A)-[r:R]->(b:B)-[q:R]->(c:B) RETURN a.id",
+])
+def test_wrong_endpoint_schema_remains_refused(database, query):
+    with pytest.raises(GrafxPlanError):
+        database.explain(query)
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "MATCH path = (a)-[r:R]->(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R]->(b) RETURN a.id",
-        "MATCH path = (a:A)-[r]->(b:B) RETURN a.id",
-        "MATCH path = (a:A)<-[r:R]-(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R]-(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R*1..2]->(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R*1..1]->(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[:R]->(b:B) RETURN a.id",
-        "MATCH path = (a:A {id: 'a1'})-[r:R]->(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R {layer: 'canonical'}]->(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R]->(b:B)-[q:R]->(c:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R]->(b:B), (c:A) RETURN a.id",
-        "MATCH path = (a:A)-[r:R]->(b:B) MATCH (c:A) RETURN a.id",
-        "MATCH path = (a:A)-[r:R]->(b:B) SET a.id = 'z'",
-        "MATCH path = (a:A)-[r:R]->(b:B) DELETE r",
-        "MATCH path = (a:A)-[r:R]->(b:B) WITH a RETURN a.id",
-        "UNWIND $rows AS x MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id",
-        "MATCH path = (a:A)-[r:R]->(b:B), p2 = (c:A)-[q:R]->(d:B) RETURN a.id",
-    ],
-)
-def test_every_shape_outside_the_frozen_one_is_refused(
-    database: object, query: str
-) -> None:
-    with pytest.raises(GrafxPlanError) as raised:
-        database.execute(query, {"rows": [1]})
-
-    assert raised.value.details["field"] == "pattern"
-    assert "exactly one shape" in str(raised.value)
+def test_named_path_inline_map_filters_instead_of_refusing(database):
+    query = "MATCH path = (a:A)-[r:R {layer:$layer}]->(b:B) RETURN a.id,path"
+    rows = database.execute(query, {"layer":"canonical"}).rows
+    assert len(rows) == 1 and rows[0][0] == "a1"
+    assert rows[0][1].relationships[0].properties["layer"] == "canonical"
+    assert database.execute(query, {"layer":"missing"}).rows == ()
 
 
-def test_a_name_on_a_written_pattern_never_reaches_the_analysis() -> None:
-    """The parser reads `name =` only inside MATCH, so a write cannot carry one at all."""
-    with pytest.raises(GrafxParseError):
-        parse("CREATE p = (a:A)-[:R]->(b:B)")
-    with pytest.raises(GrafxParseError):
-        parse("MERGE p = (a:A)-[:R]->(b:B)")
+def test_decorative_path_name_allows_native_relationship_type_inference(database):
+    query = "MATCH path = (a:A)-[r]->(b:B) RETURN a.id"
+    assert database.execute(query).rows == (("a1",),)
+    assert database.explain(query) is not None
+
+
+@pytest.mark.parametrize("operation,probe,expected", [
+    ("SET a.id = 'z'", "MATCH (a:A) RETURN a.id", (("z",),)),
+    ("DELETE r", "MATCH (a:A)-[r:R]->(b:B) RETURN r.layer", ()),
+])
+def test_named_read_before_write_uses_original_transaction(database, operation, probe, expected):
+    original = database.execute(probe).rows
+    with database.begin("write") as tx:
+        tx.execute("MATCH path=(a:A)-[r:R]->(b:B) " + operation)
+        assert tx.execute(probe).rows == expected
+        assert database.execute(probe).rows == original
+    assert database.execute(probe).rows == expected
+
+
+def test_written_pattern_path_names_reach_the_analysis() -> None:
+    """CREATE and MERGE now preserve named captures; shape support is checked later."""
+    assert parse("CREATE p = (a:A)-[:R]->(b:B)").updating_clauses[0].patterns[0].variable == "p"
+    assert parse("MERGE p = (a:A)").updating_clauses[0].pattern.variable == "p"
 
 
 # --- a tree nobody parsed ------------------------------------------------------------------------
@@ -275,108 +259,39 @@ def _analysis(statement: Query) -> QueryAnalysis:
     )
 
 
-@pytest.mark.parametrize(
-    ("name", "statement"),
-    [
-        (
-            "an incoming hop",
-            Query(
-                match_clauses=(MatchClause(patterns=(_named(Direction.INCOMING),)),),
-                return_clause=_returns_id(),
-            ),
-        ),
-        (
-            "an unlabelled end",
-            Query(
-                match_clauses=(
-                    MatchClause(
-                        patterns=(
-                            _named(
-                                nodes=(
-                                    NodePattern(variable="a"),
-                                    NodePattern(variable="b", labels=("B",)),
-                                )
-                            ),
-                        )
-                    ),
-                ),
-                return_clause=_returns_id(),
-            ),
-        ),
-        (
-            "no RETURN",
-            Query(match_clauses=(MatchClause(patterns=(_named(),)),)),
-        ),
-    ],
-)
-def test_a_supplied_analysis_cannot_vouch_for_a_shape_the_planner_refuses(
-    catalog: object, indexes: tuple, name: str, statement: Query
-) -> None:
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(
-            statement, catalog=catalog, indexes=indexes, analysis=_analysis(statement)
-        )
-
-    assert raised.value.details["field"] == "pattern", name
-
-
-def test_the_analysis_refuses_the_same_trees_on_its_own() -> None:
-    """Both doors, not one: the planner repeats a rule the analysis already applies."""
+@pytest.mark.parametrize("direction", tuple(Direction))
+def test_analysis_accepts_both_directions_and_typed_endpoint_inference(direction):
     statement = Query(
-        match_clauses=(MatchClause(patterns=(_named(Direction.INCOMING),)),),
+        match_clauses=(MatchClause(patterns=(_named(direction),)),),
         return_clause=_returns_id(),
     )
+    assert analyze(statement).binding("path").entity == "path"
 
+
+def test_supplied_analysis_cannot_smuggle_a_missing_return(catalog, indexes):
+    statement = Query(match_clauses=(MatchClause(patterns=(_named(),)),))
     with pytest.raises(GrafxPlanError) as raised:
-        analyze(statement)
-    assert raised.value.details["field"] == "pattern"
+        build_plan(statement, catalog=catalog, indexes=indexes, analysis=_analysis(statement))
+    assert raised.value.details["field"] == "clause"
 
 
-@pytest.mark.parametrize(
-    ("name", "query", "columns"),
-    [
-        (
-            "a projected property",
-            "MATCH path = (a:A)-[r:R]->(b:B) RETURN path.length",
-            ("path.length",),
-        ),
-        (
-            "a read in the predicate",
-            "MATCH path = (a:A)-[r:R]->(b:B) WHERE path IS NULL RETURN a.id",
-            ("a.id",),
-        ),
-        (
-            "a read in the ordering",
-            "MATCH path = (a:A)-[r:R]->(b:B) RETURN a.id ORDER BY path",
-            ("a.id",),
-        ),
-    ],
-)
-def test_a_supplied_analysis_cannot_smuggle_a_read_of_the_name_past_the_planner(
-    catalog: object, indexes: tuple, name: str, query: str, columns: tuple
-) -> None:
-    """The analysis refuses these per site; the planner refuses them again, and must.
-
-    ``build_plan`` takes an analysis from its caller, and an analysis that never looked is an
-    analysis that never refused. Without this the shape gate alone would let a forged analysis
-    project a path -- the shape is legal; what is not legal is reading the name inside it.
-    """
-    statement = parse(query)
-    forged = QueryAnalysis(
-        statement=statement,
-        bindings=(
-            Binding(name="a", entity="node", labels=("A",), created=False),
-            Binding(name="b", entity="node", labels=("B",), created=False),
-            Binding(name="r", entity="relationship", labels=("R",), created=False),
-        ),
-        output_columns=columns,
-    )
-
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(statement, catalog=catalog, indexes=indexes, analysis=forged)
-
-    assert raised.value.details["field"] == "variable", name
-    assert "never read" in str(raised.value), name
+@pytest.mark.parametrize("suffix,refused", [
+    ("RETURN path.length", True),
+    ("WHERE path IS NULL RETURN a.id", False),
+    ("RETURN a.id ORDER BY path", False),
+])
+def test_supplied_analysis_is_recomputed_for_native_paths(catalog, indexes, suffix, refused):
+    # Real catalog labels prevent absent A/R tables from hiding scope/type defects.
+    statement = parse("MATCH path=(a:Person)-[r:Knows]->(b:Person) " + suffix)
+    forged = QueryAnalysis(statement=statement, bindings=(), output_columns=("wrong",))
+    if refused:
+        with pytest.raises(GrafxPlanError) as raised:
+            build_plan(statement, catalog=catalog, indexes=indexes, analysis=forged)
+        assert raised.value.details["field"] == "property"
+    else:
+        planned = build_plan(statement, catalog=catalog, indexes=indexes, analysis=forged)
+        assert planned.analysis.output_columns == ("a.id",)
+        assert planned.analysis.binding("path").entity == "path"
 
 
 @pytest.mark.parametrize("collides", ["a", "r", "b"])
@@ -443,7 +358,7 @@ def test_a_name_the_parser_could_not_have_written_is_refused(
 
     with pytest.raises(GrafxPlanError) as raised:
         analyze(statement)
-    assert raised.value.details["field"] == "pattern", name
+    assert raised.value.details["field"] == ("pattern" if type(variable) is str else "ast"), name
 
 
 class _HostileName(str):
@@ -481,7 +396,7 @@ def test_a_name_that_is_not_a_builtin_string_is_refused_before_it_is_touched() -
 
     with pytest.raises(GrafxPlanError) as raised:
         analyze(statement)
-    assert raised.value.details["field"] == "pattern"
+    assert raised.value.details["field"] == "ast"
 
 
 @pytest.mark.parametrize(
@@ -568,14 +483,10 @@ def test_the_valid_form_still_plans_under_a_supplied_analysis(
     assert "RelationshipScan" in tuple(node.label for node in planned.root.walk())
 
 
-def test_a_named_path_never_becomes_the_typed_endpoint_form(
+def test_a_named_path_infers_both_endpoints_from_its_relationship_type(
     catalog: object, indexes: tuple
 ) -> None:
-    """M-PULSE-2H reads a label-free end from the relationship; a named path is not that form.
-
-    Written out because the two forms are one token apart: without this, `path = (a)-[r:T]->(b)`
-    could take the near end from the schema, which neither batch froze.
-    """
+    """A decorative path shares the typed source/target resolution of its unnamed twin."""
     statement = Query(
         match_clauses=(
             MatchClause(
@@ -597,10 +508,7 @@ def test_a_named_path_never_becomes_the_typed_endpoint_form(
         return_clause=_returns_id(),
     )
 
-    with pytest.raises(GrafxPlanError) as raised:
-        build_plan(statement, catalog=catalog, indexes=indexes)
-    assert raised.value.details["field"] == "pattern"
+    assert build_plan(statement, catalog=catalog, indexes=indexes) is not None
 
-    # The same pattern WITHOUT the name is the 2H form, and it still plans.
     unnamed = parse("MATCH (a)-[r:Knows]->(b) RETURN a.id")
     assert build_plan(unnamed, catalog=catalog, indexes=indexes) is not None

@@ -160,7 +160,7 @@ def test_all_value_types_and_retired_space(tmp_path, monkeypatch, resumable):
             Uuid(b"u" * 16),
             VectorValue((1, 2), space.space_id),
         )
-        _stage_rows(db, table, [(90, values)])
+        _stage_rows(db, table, [(90, values, None)])
         with db.begin() as tx:
             cat = db._catalog.catalog.copy()
             cat.retire_space("Vec")
@@ -201,19 +201,23 @@ def test_unsigned_endpoint_identity_remapping(tmp_path):
         _stage_rows(
             db,
             db._catalog.catalog.table("N"),
-            [(2**63 + 1, ("unsigned",)), (2**63 - 2, ("node",))],
+            [(2**63 + 1, ("unsigned",), None), (2**63 - 2, ("node",), None)],
         )
         # The existing heap endpoint column is signed INT64, unlike node/edge IDs.
         _stage_rows(
             db,
             db._catalog.catalog.table("R"),
-            [(2**63 + 2, (2**63 - 2, 2**63 - 2, "loop"))],
+            [(2**63 + 2, (2**63 - 2, 2**63 - 2, "loop"), None)],
         )
         export_graph(db, tmp_path / "artifact")
     report = import_graph(tmp_path / "artifact", tmp_path / "target")
     assert [
-        (m.source_record_id, m.target_record_id) for m in report.record_id_mapping
-    ] == [(2**63 + 1, 1), (2**63 - 2, 2), (2**63 + 2, 3)]
+        (m.kind, m.table, m.source_record_id, m.target_record_id)
+        for m in report.record_id_mapping
+    ] == [("node", "N", 2**63 + 1, 1), ("node", "N", 2**63 - 2, 2),
+          ("rel", "R", 2**63 + 2, 1)]
+    # Destination allocation follows each table's durable identity floor; IDs
+    # need not be globally unique. Qualified mappings still remap both endpoints.
     with connect(tmp_path / "target") as db:
         assert db.execute(
             "MATCH (a:N)-[r:R]->(b:N) RETURN a.value,r.value,b.value"

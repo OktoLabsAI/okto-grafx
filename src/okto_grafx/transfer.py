@@ -6,6 +6,9 @@ writer lease, old UUID or commit history is transplanted into the target databas
 
 from __future__ import annotations
 
+from okto_grafx.domain.model.stored_types import stored_type_to_json, stored_type_from_json
+from okto_grafx.domain.model.node_labels import decode_node_labels, encode_node_labels, validate_node_labels
+
 import hashlib
 import json
 import os
@@ -24,13 +27,15 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.model.catalog import Catalog
+from okto_grafx.domain.model.relationship_type import RelationshipTypeDef
 from okto_grafx.domain.index.fulltext import (
     TextIndexOptions,
     decode_options,
     is_fulltext,
 )
-from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef
+from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef, SchemaType, encode_tuple
 from okto_grafx.domain.model.value import (
+    TEMPORAL_VALUE_TYPES,
     Value,
     ValueType,
     VectorValue,
@@ -44,7 +49,7 @@ from okto_grafx.domain.query.plan import (
     CreateVectorSpace,
 )
 from okto_grafx.engine.database import Database
-from okto_grafx.engine.query_engine import QueryEngine
+from okto_grafx.engine.query_engine import QueryEngine, _AttachRelationshipType
 
 __all__ = [
     "RecordIdMapping",
@@ -55,6 +60,9 @@ __all__ = [
 ]
 
 _FORMAT = "okto-grafx-logical-1"
+_MODEL_FORMAT = "okto-grafx-logical-2"
+_NAMESPACE_FORMAT = "okto-grafx-logical-3"
+_LABEL_FORMAT = "okto-grafx-logical-4"
 _ROW = struct.Struct("<QI")
 _MANIFEST_BYTES = 4 * 1024 * 1024
 
@@ -96,11 +104,12 @@ class TransferLimits:
 
 @dataclass(frozen=True, slots=True)
 class RecordIdMapping:
-    """One current logical identity remap, qualified by the stable table name."""
+    """One current logical identity remap, qualified by table name and entity kind."""
 
     table: str
     source_record_id: int
     target_record_id: int
+    kind: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,9 +165,20 @@ def _schema(catalog: Catalog) -> dict:
                 type=c.type.name,
                 nullable=c.nullable,
                 vector_space=c.vector_space,
+                **({"decimal_precision": c.decimal_precision,
+                    "decimal_scale": c.decimal_scale} if c.type is ValueType.DECIMAL else {}),
+                **({"stored_type": stored_type_to_json(c.stored_type)} if c.stored_type is not None else {}),
             )
             for c in table.columns
         ]
+        if table.flexible_properties:
+            item.update(flexible_properties=True, unlabeled=table.unlabeled)
+        if table.kind == "node" and catalog.requires_capability("node_labels_v1"):
+            item["extra_node_labels"] = list(table.extra_node_labels)
+        # Logical transfer writes complete decoded current tuples into a fresh
+        # schema; source physical decode layouts are neither needed nor portable.
+        if table.schema_layouts:
+            item["schema_version"] = 1
         tables.append(item)
     spaces = []
     for space in catalog.spaces():
@@ -166,6 +186,7 @@ def _schema(catalog: Catalog) -> dict:
         item["metric"] = space.metric.value
         spaces.append(item)
     indexes = []
+    namespace_overlap = catalog._has_namespace_overlap() or catalog.requires_capability("node_labels_v1")
     for index in catalog.index_definitions():
         if index.automatic:
             continue
@@ -177,7 +198,7 @@ def _schema(catalog: Catalog) -> dict:
                 name=index.name,
                 table=index.table_name,
                 columns=[
-                    catalog.table(index.table_name).columns[p].name
+                    catalog.table_by_id(index.table_id).columns[p].name
                     for p in index.positions
                 ],
                 layout=index.layout.value,
@@ -188,12 +209,24 @@ def _schema(catalog: Catalog) -> dict:
                 else None,
             )
         )
-    return dict(tables=tables, spaces=spaces, indexes=indexes)
+        if namespace_overlap:
+            indexes[-1]["table_kind"] = catalog.table_by_id(index.table_id).kind
+    result = dict(tables=tables, spaces=spaces, indexes=indexes)
+    if catalog.relationship_types():
+        result["relationship_types"] = [
+            dict(name=group.name, members=[catalog.table_by_id(key).name for key in group.table_ids])
+            for group in catalog.relationship_types()
+        ]
+    return result
 
 
 def _tables(schema: dict) -> tuple[tuple[TableDef, ...], tuple[EmbeddingSpaceDef, ...]]:
     """Validate detached logical definitions using the native catalog invariants."""
-    if type(schema) is not dict or set(schema) != {"tables", "spaces", "indexes"}:
+    if type(schema) is not dict or set(schema) not in (
+        {"tables", "spaces", "indexes"}, {"tables", "spaces", "indexes", "relationship_types"},
+    ):
+        raise _refuse("schema_invalid")
+    if any(type(schema[key]) is not list for key in schema):
         raise _refuse("schema_invalid")
     tables = []
     spaces = []
@@ -214,20 +247,41 @@ def _tables(schema: dict) -> tuple[tuple[TableDef, ...], tuple[EmbeddingSpaceDef
         if any(type(c["nullable"]) is not bool for c in raw["columns"]):
             raise _refuse("schema_invalid")
         columns = tuple(
-            ColumnDef(**{**c, "type": ValueType[c["type"]]}) for c in raw["columns"]
+            ColumnDef(**{**c, "type": SchemaType.ANY if c["type"] == "ANY" else ValueType[c["type"]],
+                         **({"stored_type": stored_type_from_json(c["stored_type"])} if "stored_type" in c else {})})
+            for c in raw["columns"]
         )
-        table = TableDef(**{**raw, "columns": columns})
+        labels = {}
+        if "extra_node_labels" in raw:
+            if raw["kind"] != "node" or type(raw["extra_node_labels"]) is not list:
+                raise _refuse("node_label_schema")
+            labels["extra_node_labels"] = validate_node_labels(tuple(raw["extra_node_labels"]))
+        table = TableDef(**{**raw, "columns": columns, **labels})
         # The import compiler currently recreates v1 immutable table definitions.
         if table.schema_version != 1:
             raise _refuse("unsupported_schema_version")
         tables.append(table)
+    if (schema.get("relationship_types") or _physical_overlap(tables)
+            or any("extra_node_labels" in raw for raw in schema["tables"]) or any(
+        c.stored_type is not None or c.type in (SchemaType.ANY, ValueType.DECIMAL) or c.type in TEMPORAL_VALUE_TYPES
+        for table in tables for c in table.columns
+    )):
+        catalog.upgrade_index_catalog(())
     for table in sorted(tables, key=lambda t: t.kind != "node"):
         catalog.add_table(table)
+    for group in schema.get("relationship_types", ()):
+        if (type(group) is not dict or set(group) != {"name", "members"}
+                or type(group["members"]) is not list or not group["members"]
+                or any(type(name) is not str for name in group["members"])):
+            raise _refuse("relationship_type_invalid")
+        catalog.add_relationship_type(RelationshipTypeDef(
+            group["name"], tuple(sorted(catalog.table(name, kind="rel").table_id for name in group["members"])),
+        ))
     for space in spaces:
         if not space.is_active:
             catalog.retire_space(space.name)
     for index in schema["indexes"]:
-        if set(index) != {
+        fields = {
             "name",
             "table",
             "columns",
@@ -235,9 +289,15 @@ def _tables(schema: dict) -> tuple[tuple[TableDef, ...], tuple[EmbeddingSpaceDef
             "bucket_count",
             "expected_cardinality",
             "fulltext",
-        }:
+        }
+        if type(index) is not dict or set(index) not in (fields, fields | {"table_kind"}):
             raise _refuse("schema_invalid")
-        if index["layout"] not in ("hash", "ordered", "sparse_hash"):
+        if "table_kind" in index and index["table_kind"] not in ("node", "rel"):
+            raise _refuse("index_table_kind")
+        indexed = catalog.table(index["table"], kind=index.get("table_kind"))
+        if index["fulltext"] is None and indexed.kind != "node":
+            raise _refuse("index_table_kind")
+        if index["layout"] not in ("hash", "ordered", "sparse_hash", "posting_hash"):
             raise _refuse("unsupported_index_layout")
         if index["fulltext"] is not None:
             TextIndexOptions(
@@ -249,9 +309,20 @@ def _tables(schema: dict) -> tuple[tuple[TableDef, ...], tuple[EmbeddingSpaceDef
     return tuple(tables), tuple(spaces)
 
 
+def _physical_overlap(tables) -> bool:
+    """Cross-kind spelling, never a substitute for full catalog validation."""
+    return bool({t.name for t in tables if t.kind == "node"}
+                & {t.name for t in tables if t.kind == "rel"})
+
+
+def _schema_overlap(tables, groups) -> bool:
+    return _physical_overlap(tables) or bool(
+        {t.name for t in tables if t.kind == "node"} & {g["name"] for g in groups})
+
+
 def _rows(
     storage: LocalStorageDevice, item: dict, table: TableDef, limits: TransferLimits
-) -> Iterator[tuple[int, tuple[Value, ...]]]:
+) -> Iterator[tuple[int, tuple[Value, ...], tuple[str, ...] | None]]:
     """Read one bounded row at a time and verify framing, count and whole-file digest."""
     size = storage.file_size(item["file"])
     if size != item["bytes"] or size > limits.max_bytes:
@@ -274,13 +345,30 @@ def _rows(
         endpoint_bytes = 16 if table.kind == "rel" else 0
         if length < endpoint_bytes:
             raise _refuse("row_truncated")
+        labels = None
+        value_offset = endpoint_bytes
+        if item.get("node_labels", False):
+            if table.kind != "node" or not payload or payload[0] not in (0, 1):
+                raise _refuse("node_label_frame")
+            value_offset = 1
+            if payload[0] == 1:
+                labels, value_offset = decode_node_labels(payload, value_offset)
+                if not table.admits_node_labels(labels):
+                    raise _refuse("node_label_admission")
         values, end = decode_values(
-            payload, len(table.columns) - (2 if endpoint_bytes else 0), endpoint_bytes
+            payload, len(table.columns) - (2 if endpoint_bytes else 0), value_offset
         )
         if endpoint_bytes:
             values = (*struct.unpack_from("<QQ", payload), *values)
         if end != length:
             raise _refuse("row_trailing_bytes")
+        # Value-v1 also transports transient expression values. Stored schema
+        # admission (including finite ANY/bag rules) must pass before import opens
+        # a destination/workspace, not only when a later private batch is staged.
+        if encode_tuple(table, values) != encode_values(values):
+            # This is a stored row, not an assignment that may rescale DECIMAL.
+            # Numerically equal frames with a different declaration must refuse.
+            raise _refuse("row_schema_encoding")
         seen.add(record_id)
         count += 1
         if count > limits.max_rows:
@@ -288,7 +376,7 @@ def _rows(
         offset += _ROW.size + length
         digest.update(header)
         digest.update(payload)
-        yield record_id, values
+        yield record_id, values, labels
     if count != item["rows"] or digest.hexdigest() != item["sha256"]:
         raise _refuse("object_checksum_or_count")
 
@@ -323,7 +411,7 @@ def _manifest(
     }:
         raise _refuse("manifest_fields")
     if (
-        manifest["format"] != _FORMAT
+        manifest["format"] not in (_FORMAT, _MODEL_FORMAT, _NAMESPACE_FORMAT, _LABEL_FORMAT)
         or manifest["value_codec"] != "grafx-value-v1"
         or manifest["history"] != "current-state-only"
     ):
@@ -335,6 +423,23 @@ def _manifest(
     if type(lsn) is not int or not 0 <= lsn < 0xFFFFFFFFFFFFFFFF:
         raise _refuse("snapshot_lsn")
     tables, spaces = _tables(manifest["schema"])
+    labeled = manifest["format"] == _LABEL_FORMAT
+    for raw_table, table in zip(manifest["schema"]["tables"], tables, strict=True):
+        if ("extra_node_labels" in raw_table) != (labeled and table.kind == "node"):
+            raise _refuse("labels_require_format_4")
+    if manifest["format"] not in (_NAMESPACE_FORMAT, _LABEL_FORMAT) and (
+        _schema_overlap(tables, manifest["schema"].get("relationship_types", ()))
+        or any("table_kind" in i for i in manifest["schema"]["indexes"])
+    ):
+        raise _refuse("namespaces_require_format_3")
+    if manifest["format"] in (_NAMESPACE_FORMAT, _LABEL_FORMAT) and any(
+        "table_kind" not in i for i in manifest["schema"]["indexes"]
+    ):
+        raise _refuse("index_table_kind")
+    if manifest["format"] == _FORMAT and (
+        "relationship_types" in manifest["schema"] or any(table.flexible_properties for table in tables)
+    ):
+        raise _refuse("model_requires_format_2")
     if type(manifest["objects"]) is not list or len(manifest["objects"]) != len(tables):
         raise _refuse("object_coverage")
     total = size
@@ -342,14 +447,17 @@ def _manifest(
     for position, (item, table) in enumerate(
         zip(manifest["objects"], tables, strict=True)
     ):
-        if type(item) is not dict or set(item) != {
+        fields = {
             "table_id",
             "file",
             "bytes",
             "rows",
             "sha256",
-        }:
+        }
+        if type(item) is not dict or set(item) != (fields | {"node_labels"} if labeled else fields):
             raise _refuse("object_fields")
+        if labeled and (type(item["node_labels"]) is not bool or item["node_labels"] != (table.kind == "node")):
+            raise _refuse("object_label_model")
         if (
             item["file"] != f"rows/{position:08d}.bin"
             or type(item["table_id"]) is not int
@@ -388,11 +496,17 @@ def _report(
     )
 
 
-def _row_payload(table: TableDef, values: tuple[Value, ...]) -> bytes:
-    """Preserve unsigned relationship identities outside the signed scalar value codec."""
+def _row_payload(table: TableDef, values: tuple[Value, ...], *,
+                 node_labels: tuple[str, ...] | None = None, labels_format: bool = False) -> bytes:
+    """Frame membership explicitly and retain unsigned relationship endpoint identities."""
     if table.kind == "rel":
+        if node_labels is not None:
+            raise _refuse("node_label_frame")
         return struct.pack("<QQ", *values[:2]) + encode_values(values[2:])
-    return encode_values(values)
+    if node_labels is not None and (not labels_format or not table.admits_node_labels(node_labels)):
+        raise _refuse("node_label_admission")
+    prefix = (b"\0" if node_labels is None else b"\1" + encode_node_labels(node_labels)) if labels_format else b""
+    return prefix + encode_values(values)
 
 
 def export_graph(
@@ -400,15 +514,21 @@ def export_graph(
     destination: str | os.PathLike[str],
     *,
     limits: TransferLimits | None = None,
+    history: str = "refuse",
 ) -> TransferReport:
     """Stream all current logical schema/rows/vectors from one fixed reader snapshot.
 
+    Native node labels use format 4. Otherwise overlapping node/relationship namespaces use format 3.
+    flexible models/logical groups use format 2 and ordinary typed ungrouped
+    schemas retain format 1. Model/endpoint authority is preserved.
     Writers keep their normal protocol. Concurrent DDL causes a typed refusal, not
     mixed-schema output. A failed attempt leaves no published artifact; start a new
     attempt rather than resuming an expired reader cursor. Physical history and
     index generations are not exported. Custom active index declarations are.
     """
     budget = _limits(limits)
+    if history not in ("refuse", "current-only") or type(history) is not str:
+        raise GrafxConfigurationError("history must be refuse or current-only.", field="history")
     source = (
         Path(database._storage.root).resolve(strict=True)
         if type(database._storage) is LocalStorageDevice
@@ -423,17 +543,23 @@ def export_graph(
     ):
         staging = Path(temp) / "artifact"
         with database._transactions.page_access_section(fresh_read_view=True):
+            if database._catalog.catalog.system_history_tables() and history != "current-only":
+                raise _refuse("system_history_requires_explicit_current_only")
             schema_before_snapshot = _schema(database._catalog.catalog)
         with LocalStorageDevice(staging) as artifact, database.begin("read") as reader:
             with database._transactions.page_access_section(
                 transaction=reader._context
             ):
                 catalog = database._catalog.catalog.copy()
+                if catalog.system_history_tables() and history != "current-only":
+                    raise _refuse("system_history_requires_explicit_current_only")
                 schema = _schema(catalog)
                 if schema != schema_before_snapshot:
                     raise _refuse("schema_changed")
             manifest = dict(
-                format=_FORMAT,
+                format=(_LABEL_FORMAT if catalog.requires_capability("node_labels_v1") else
+                        _NAMESPACE_FORMAT if catalog._has_namespace_overlap() else
+                        _MODEL_FORMAT if catalog.relationship_types() or any(t.flexible_properties for t in catalog.tables()) else _FORMAT),
                 value_codec="grafx-value-v1",
                 source_uuid=database.identity.database_uuid.hex(),
                 snapshot_lsn=reader.snapshot.read_lsn,
@@ -450,10 +576,11 @@ def export_graph(
                 cursor = None
                 while True:
                     page = reader.scan_rows_v1(
-                        table.name, limit=budget.batch_rows, cursor=cursor
+                        table.name, kind=table.kind, limit=budget.batch_rows, cursor=cursor
                     )
                     for row in page.rows:
-                        payload = _row_payload(table, row.values)
+                        payload = _row_payload(table, row.values, node_labels=row.node_labels,
+                                               labels_format=manifest["format"] == _LABEL_FORMAT)
                         if len(payload) > budget.max_row_bytes:
                             raise _refuse("row_size")
                         framed = _ROW.pack(row.record_id, len(payload)) + payload
@@ -476,6 +603,7 @@ def export_graph(
                         bytes=size,
                         rows=rows,
                         sha256=digest.hexdigest(),
+                        **({"node_labels": table.kind == "node"} if manifest["format"] == _LABEL_FORMAT else {}),
                     )
                 )
             with database._transactions.page_access_section(
@@ -499,8 +627,15 @@ def _install_schema(
     database: Database,
     tables: tuple[TableDef, ...],
     spaces: tuple[EmbeddingSpaceDef, ...],
+    groups: tuple[dict, ...] = (),
+    *, labels_format: bool = False,
 ) -> None:
     """Reuse the native DDL journal, attachment rollback and WAL staging, not save()."""
+    if labels_format or groups or _physical_overlap(tables) or any(
+        c.stored_type is not None or c.type in (SchemaType.ANY, ValueType.DECIMAL) or c.type in TEMPORAL_VALUE_TYPES
+        for table in tables for c in table.columns
+    ):
+        database.maintenance.ensure_identity_indexes()
     engine = database._queries
     if type(engine) is not QueryEngine:
         raise GrafxUnsupportedOperation(
@@ -525,13 +660,20 @@ def _install_schema(
                 )
             for table in sorted(tables, key=lambda t: t.kind != "node"):
                 plan = (
-                    CreateNodeTable(table.name, table.columns, table.primary_key)
+                    CreateNodeTable(table.name, table.columns, table.primary_key,
+                                    flexible_properties=table.flexible_properties, unlabeled=table.unlabeled)
                     if table.kind == "node"
                     else CreateRelTable(
-                        table.name, table.from_table, table.to_table, table.columns
+                        table.name, table.from_table, table.to_table, table.columns,
+                        flexible_properties=table.flexible_properties,
                     )
                 )
                 engine._schema(plan, context, {})
+                if labels_format and table.kind == "node":
+                    target = engine._working_catalog(context).table(table.name, kind="node")
+                    engine._admit_node_labels(context, target.table_id, table.extra_node_labels)
+            for group in groups:
+                engine._schema(_AttachRelationshipType(group["name"], tuple(group["members"])), context, {})
 
 
 def _remap(values: tuple[Value, ...], spaces: dict[int, int]) -> tuple[Value, ...]:
@@ -551,16 +693,16 @@ def _remap(values: tuple[Value, ...], spaces: dict[int, int]) -> tuple[Value, ..
 
 
 def _stage_rows(
-    database: Database, table: TableDef, rows: list[tuple[int, tuple[Value, ...]]]
+    database: Database, table: TableDef, rows: list[tuple[int, tuple[Value, ...], tuple[str, ...] | None]]
 ) -> None:
     """Stage a private import batch through normal row quotas, OCC and commit validation."""
     with database.begin("write") as transaction:
         with database._transactions.page_access_section(
             transaction=transaction._context
         ):
-            for record_id, values in rows:
+            for record_id, values, labels in rows:
                 transaction._context.stage_row_insert(
-                    table, values, record_id=record_id
+                    table, values, record_id=record_id, node_labels=labels
                 )
 
 
@@ -576,13 +718,14 @@ def _import_into(
 ) -> tuple[RecordIdMapping, ...]:
     """Import nodes before edges, then rebuild indexes and restore retired-space state."""
     if not resume or not database._catalog.catalog.tables():
-        _install_schema(database, tables, spaces)
+        _install_schema(database, tables, spaces, tuple(manifest["schema"].get("relationship_types", ())),
+                        labels_format=manifest["format"] == _LABEL_FORMAT)
     target_catalog = database._catalog.catalog
     space_map = {s.space_id: target_catalog.space(s.name).space_id for s in spaces}
-    identities: dict[tuple[str, int], int] = {}
-    expected: dict[tuple[str, int], bytes] = {}
+    identities: dict[tuple[str, str, int], int] = {}
+    expected: dict[tuple[str, str, int], bytes] = {}
     objects = {
-        t.name: item for t, item in zip(tables, manifest["objects"], strict=True)
+        t.table_id: item for t, item in zip(tables, manifest["objects"], strict=True)
     }
     existing = {}
     if resume:
@@ -592,43 +735,40 @@ def _import_into(
             database, storage, manifest, tables, spaces, limits
         )
     for table in sorted(tables, key=lambda t: t.kind != "node"):
-        target_table = target_catalog.table(table.name)
+        target_table = target_catalog.table(table.name, kind=table.kind)
         batch = []
-        prior = existing.get(table.name, ())
+        prior = existing.get((table.kind, table.name), ())
         ordinal = 0
         next_id = 0
-        for record_id, values in _rows(storage, objects[table.name], table, limits):
-            if resume:
-                if ordinal < len(prior):
-                    new_id = prior[ordinal]
-                else:
-                    if not batch:
-                        with database._transactions.page_access_section(
-                            fresh_read_view=True
-                        ):
-                            next_id = database._heap.next_record_id(target_table)
-                    new_id = next_id
-                    next_id += 1
+        for record_id, values, labels in _rows(storage, objects[table.table_id], table, limits):
+            if ordinal < len(prior):
+                new_id = prior[ordinal]
             else:
-                new_id = len(identities) + 1
-            identities[table.name, record_id] = new_id
+                # A prior batch can advance the durable identity floor beyond a
+                # dense integer sequence. Never synthesize IDs below that floor.
+                if not batch:
+                    with database._transactions.page_access_section(fresh_read_view=True):
+                        next_id = database._heap.next_record_id(target_table)
+                new_id = next_id
+                next_id += 1
+            identities[table.kind, table.name, record_id] = new_id
             values = _remap(values, space_map)
             if table.kind == "rel":
                 if any(type(v) is not int for v in values[:2]):
                     raise _refuse("endpoint_invalid")
                 try:
                     values = (
-                        identities[table.from_table, values[0]],
-                        identities[table.to_table, values[1]],
+                        identities["node", table.from_table, values[0]],
+                        identities["node", table.to_table, values[1]],
                         *values[2:],
                     )
                 except KeyError as failure:
                     raise _refuse("endpoint_missing") from failure
-            expected[table.name, new_id] = hashlib.sha256(
-                encode_values(values)
+            expected[table.kind, table.name, new_id] = hashlib.sha256(
+                _row_payload(table, values, node_labels=labels, labels_format=objects[table.table_id].get("node_labels", False))
             ).digest()
             if not resume or ordinal >= len(prior):
-                batch.append((new_id, values))
+                batch.append((new_id, values, labels))
             ordinal += 1
             if len(batch) >= limits.batch_rows:
                 _stage_rows(database, target_table, batch)
@@ -649,6 +789,7 @@ def _import_into(
                 tuple(index["columns"]),
                 options=TextIndexOptions(**settings),
                 bucket_count=index["bucket_count"],
+                kind=index.get("table_kind"),
             )
             continue
         options = (
@@ -685,11 +826,12 @@ def _import_into(
             cursor = None
             while True:
                 page = reader.scan_rows_v1(
-                    table.name, limit=limits.batch_rows, cursor=cursor
+                    table.name, kind=table.kind, limit=limits.batch_rows, cursor=cursor
                 )
                 for row in page.rows:
-                    digest = expected.pop((table.name, row.record_id), None)
-                    if digest != hashlib.sha256(encode_values(row.values)).digest():
+                    digest = expected.pop((table.kind, table.name, row.record_id), None)
+                    if digest != hashlib.sha256(_row_payload(table, row.values, node_labels=row.node_labels,
+                            labels_format=objects[table.table_id].get("node_labels", False))).digest():
                         raise _refuse("import_readback_mismatch")
                 cursor = page.next_cursor
                 if cursor is None:
@@ -697,8 +839,8 @@ def _import_into(
     if expected or database.verify("all").findings:
         raise _refuse("import_verification_failed")
     return tuple(
-        RecordIdMapping(table, source, target)
-        for (table, source), target in identities.items()
+        RecordIdMapping(table, source, target, kind=kind)
+        for (kind, table, source), target in identities.items()
     )
 
 
@@ -711,6 +853,9 @@ def import_graph(
 ) -> TransferReport:
     """Verify a logical artifact and publish a separately writable fresh-UUID database.
 
+    Accepts formats 1-4, validating stored values, node labels, physical kind and logical
+    relationship membership before creation; table/record identities and endpoints
+    are remapped.
     Destination must not exist. Batches commit only inside a private sibling; errors
     never publish a partial graph. Optional resume_directory retains a locked private
     workspace and verifies durable prefixes before continuing the same artifact;
@@ -723,7 +868,10 @@ def import_graph(
     if resume_directory is not None:
         from okto_grafx.transfer_resume import resume_import
 
-        return resume_import(root, destination, resume_directory, budget)
+        try:
+            return resume_import(root, destination, resume_directory, budget)
+        except (KeyError, TypeError, ValueError, OverflowError, struct.error) as failure:
+            raise _refuse("artifact_invalid") from failure
     target = _destination(destination, source=root)
     try:
         with LocalStorageDevice(root, create_root=False) as storage:

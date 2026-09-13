@@ -256,7 +256,7 @@ def test_a_deleted_landing_node_is_not_reached_through_its_edges(database) -> No
     """An edge is followed only when the snapshot sees the node it lands on -- index or scan."""
     _small_graph(database)
     with database.begin("write") as txn:
-        txn.execute("MATCH (b:B) WHERE b.id = 1 DELETE b")
+        txn.execute("MATCH (b:B) WHERE b.id = 1 DETACH DELETE b")
     assert database.execute("MATCH (a:A {id: 2})-[:E]->(b:B) RETURN b.id").rows == ()
     assert sorted(database.execute("MATCH (a:A {id: 1})-[:E]->(b:B) RETURN b.id").rows) == [
         (2,)

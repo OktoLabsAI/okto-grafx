@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import struct
 import threading
 import uuid
@@ -63,7 +64,7 @@ from okto_grafx.domain.errors import (
     GrafxSchemaVersionMismatch,
     GrafxUnsupportedOperation,
 )
-from okto_grafx.domain.index.definition import IndexDefinition
+from okto_grafx.domain.index.definition import IndexDefinition, vector_index_name
 from okto_grafx.domain.index.layout import IndexLayout
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import CATALOG_FORMAT_VERSION
@@ -239,6 +240,15 @@ def new_database_uuid() -> bytes:
     mechanism (G2b, A5): the pure core is handed the bytes and only ever stores and compares them.
     """
     return uuid.uuid4().bytes
+
+
+def _new_query_random_source() -> Callable[[], float]:
+    """Own one pseudorandom stream per handle; not identity/security entropy.
+
+    Construction and seeding belong to the composition root. Query semantics
+    receives only a callable, which focused tests replace with controlled draws.
+    """
+    return random.Random().random
 
 
 def _builtin_type_name(value: object) -> str:
@@ -520,6 +530,11 @@ def assemble_database(
             # from WAL.
             pool.checkpoint()
 
+        from okto_grafx.adapters.temporal_clock import SystemTemporalClock
+        from okto_grafx.adapters.temporal_zoneinfo import ZoneInfoTemporalResolver
+        from okto_grafx.domain.temporal_runtime import TemporalTransactionContext
+        temporal_clock = SystemTemporalClock()
+        temporal_resolver = ZoneInfoTemporalResolver()
         transactions = TransactionManager(
             wal,
             pool,
@@ -529,6 +544,8 @@ def assemble_database(
             clock,
             metrics,
             indexes,
+            temporal_context_factory=lambda: TemporalTransactionContext.begin(
+                temporal_clock, resolver=temporal_resolver),
             partitions_per_table=config.partitions_per_table,
             identity_lease_size=config.identity_lease_size,
             commit_lock_timeout=config.commit_lock_timeout_seconds,
@@ -565,11 +582,16 @@ def assemble_database(
             with transactions.schema_artifact_section():
                 sync_indexes(existing_only=False)
         queries = QueryEngine(
+            temporal_resolver=temporal_resolver,
+            execution_identity=threading.get_ident,
             catalog=catalog,
             heap=heap,
             pool=pool,
             metrics=metrics,
             clock=clock,
+            random_source=_new_query_random_source(),
+            database_uuid=identity.database_uuid,
+            entity_namespace=new_database_uuid(),
             indexes=indexes,
             vectors=vectors,
             page_stager=transactions._stage_page_image,
@@ -763,11 +785,14 @@ def _attach_primary_key_indexes(
             continue
         try:
             from okto_grafx.engine.sparse_hash import SparseHashIndex
+            from okto_grafx.engine.posting_hash import PostingHashIndex
             index = (
                 OrderedIndex(definition, pool, metrics)
                 if definition.layout is IndexLayout.ORDERED
                 else SparseHashIndex(definition, pool, metrics)
                 if definition.layout is IndexLayout.SPARSE_HASH
+                else PostingHashIndex(definition, pool, metrics)
+                if definition.layout is IndexLayout.POSTING_HASH
                 else HashIndex(definition, pool, metrics)
             )
             try:
@@ -864,11 +889,11 @@ def _attach_declared_vector_indexes(
     }
     attached: list[str] = []
     for table in catalog.catalog.tables():
-        for column in table.columns:
+        for position, column in enumerate(table.columns):
             space = column.vector_space
             if space is None:
                 continue
-            name = f"vector_{table.name}_{space}"
+            name = vector_index_name(table, position)
             if name.lower() not in active_names:
                 continue
             file = index_file(name)

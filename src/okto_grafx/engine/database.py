@@ -31,8 +31,11 @@ detail is exactly the defect A47 was written about.
 
 from __future__ import annotations
 
+from okto_grafx.temporal_diff import TemporalDiff
+
 from okto_grafx.domain.index.fulltext import TextIndexOptions, TextSearchLimits, TextSearchResult
 from okto_grafx.domain.query.hybrid import HybridSearchOptions, HybridSearchResult
+from okto_grafx.domain.query.entity_values import QueryValue
 from okto_grafx.engine.hybrid import search_hybrid as _search_hybrid
 from okto_grafx.engine.fulltext import create_text_index as _create_text_index, search_text as _search_text
 from okto_grafx.domain.query.text_procedure import text_call
@@ -43,6 +46,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Self, TypeVar
+from okto_grafx.domain.model.schema import ColumnDef, TableDef
 
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
@@ -60,9 +64,11 @@ from okto_grafx.domain.index.keys import (
 )
 from okto_grafx.domain.index.visibility import IndexVisibility
 from okto_grafx.domain.model.catalog import (
+    Catalog,
     CATALOG_FORMAT_VERSION,
     HEAP_RECLAIM_V1_CAPABILITY,
 )
+from okto_grafx.domain.model.table_selection import TableSelector, table_selector_parts, select_table, public_table_selector
 from okto_grafx.domain.model.value import (
     INT64_MAX,
     INT64_MIN,
@@ -88,6 +94,7 @@ from okto_grafx.domain.ports.metrics import MetricsSink
 from okto_grafx.domain.ports.storage import StorageDevice
 from okto_grafx.domain.ports.vectormath import VectorMath
 from okto_grafx.domain.query.ast import Query as QueryStatement
+from okto_grafx.domain.query.ast import UnionQuery
 from okto_grafx.domain.query.control import CancellationToken, _ReadControl, _read_control
 from okto_grafx.engine.index_distribution import IndexDistribution
 from okto_grafx.engine.key_page_memo import KeyPageCacheUsage
@@ -112,6 +119,7 @@ from okto_grafx.domain.txn.commit_metadata import CommitMetadata, capture_commit
 from okto_grafx.domain.txn.commit_catalog import CommitCatalogEntry
 from okto_grafx.domain.txn.commit_history import CommitHistoryPage
 from okto_grafx.engine.commit_history_reader import observe_commit_catalog
+from okto_grafx.domain.temporal import TemporalCompactionReport, TemporalGraph, TemporalLimits, TemporalPin, TemporalPruneReport, TemporalVersions
 from okto_grafx.engine.commit_catalog_store import CommitCatalogStore
 from okto_grafx.domain.vector.filter import RecordIdFilter
 from okto_grafx.domain.verify.findings import VerificationReport, VerificationFinding, FindingKind, FindingLocation
@@ -196,6 +204,7 @@ from okto_grafx.engine.verifier import VERIFICATION_SCOPES
 _HistoryResult = TypeVar("_HistoryResult")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from okto_grafx.views import LogicalViews
     from okto_grafx.engine.wal_manager import WalManager
 
 __all__ = [
@@ -733,10 +742,17 @@ def _engine_owns_prepared_plan(engine: object, plan: object) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class ScanRowV1:
-    """One detached stored row in table-column order."""
+    """One detached stored row in table-column order.
+
+    ``node_labels`` is the canonical complete native membership when explicit,
+    including an empty tuple. ``None`` means legacy implicit membership (the
+    physical node table name, or no labels for an unlabeled table); relationships
+    always use ``None``. Projection does not remove this version metadata.
+    """
 
     record_id: int
     values: tuple[Value, ...]
+    node_labels: tuple[str, ...] | None = None
 
 
 _SCAN_EXACT_IMMUTABLE_VALUE_TYPES: frozenset[type[object]] = frozenset(
@@ -1024,12 +1040,12 @@ class QueryCursor:
         # copied dictionary rather than exposing the engine's live counter map.
         return QueryResult(statistics=dict(observed)).statistics
 
-    def fetchone(self) -> tuple[Value, ...] | None:
+    def fetchone(self) -> tuple[QueryValue, ...] | None:
         """Return the next detached row, or ``None`` after exhaustion."""
         batch = self.fetchmany(1)
         return None if not batch else batch[0]
 
-    def fetchmany(self, size: int | None = None) -> tuple[tuple[Value, ...], ...]:
+    def fetchmany(self, size: int | None = None) -> tuple[tuple[QueryValue, ...], ...]:
         """Return at most ``size`` detached rows without materialising the remaining result."""
         wanted = self._batch_size if size is None else _query_cursor_batch_size(size)
         if self._closed:
@@ -1068,7 +1084,7 @@ class QueryCursor:
     def __iter__(self) -> QueryCursor:
         return self
 
-    def __next__(self) -> tuple[Value, ...]:
+    def __next__(self) -> tuple[QueryValue, ...]:
         if self._closed:
             raise StopIteration
         self._require_database_open()
@@ -1210,6 +1226,27 @@ class Transaction:
         control = _read_control(self._database._clock, timeout_seconds, cancellation)
         return self._database._run_statement(self._context, text, parameters, control=control)
 
+    def system_as_of(self, at: CommitId | Timestamp, *, tables: tuple[TableSelector, ...],
+                     limits: TemporalLimits = TemporalLimits()) -> TemporalGraph:
+        """Read durable system-time rows under this transaction's snapshot, excluding private writes."""
+        self._require_active()
+        return self._database._read_system_history(self._context, at=at, tables=tables, limits=limits)
+
+    def system_diff(self, before: CommitId, after: CommitId, *, tables: tuple[TableSelector, ...],
+                    limits: TemporalLimits = TemporalLimits(), max_changes: int = 100_000) -> TemporalDiff:
+        """Return a bounded same-store historical graph diff under this transaction's snapshot."""
+        from okto_grafx.temporal_diff import diff_graph
+        self._require_active()
+        return diff_graph(self, before, after, tables=tables, limits=limits, max_changes=max_changes)
+
+    def system_versions(self, table: TableSelector, record_id: int, *,
+                        limits: TemporalLimits = TemporalLimits()) -> TemporalVersions:
+        """Read one logical row's intervals visible to this snapshot, not later commits."""
+        self._require_active()
+        return self._database._read_system_history(self._context,
+            at=CommitId(self._database.identity.database_uuid, self._context.snapshot.read_lsn),
+            tables=(table,), limits=limits, record_id=record_id)
+
     def commit_history(self, *, after: CommitId | None = None, limit: int = 100) -> CommitHistoryPage:
         """Read an ascending bounded history page under this transaction's snapshot."""
         self._require_active()
@@ -1244,6 +1281,7 @@ class Transaction:
         table: str,
         *,
         limit: int,
+        kind: str | None = None,
         cursor: ScanCursorV1 | None = None,
         columns: tuple[str, ...] | None = None,
         max_batch_bytes: int | None = None,
@@ -1269,6 +1307,7 @@ class Transaction:
                 operation="scan_rows_v1",
             )
         table_name = _builtin_text(table, field="table", empty=False)
+        Catalog._validate_table_kind(kind)
         page_limit = _require_positive_integer("limit", limit)
         if columns is not None and (type(columns) is not tuple or len(columns) > 256
                 or any(type(c) is not str or not c for c in columns)
@@ -1290,6 +1329,7 @@ class Transaction:
         return self._database._scan_rows_v1(
             self._context,
             table=table_name,
+            kind=kind,
             limit=page_limit,
             cursor_payload=payload,
             cursor_owner=self._scan_owner,
@@ -1469,7 +1509,7 @@ class Maintenance:
             oldest_reader_age=None,
         )
 
-    def bloat(self, table: str | None = None) -> BloatReport:
+    def bloat(self, table: TableSelector | None = None) -> BloatReport:
         """Return a conservative read-only heap-bloat census."""
         return self._database._bloat(table)
 
@@ -1489,7 +1529,7 @@ class Maintenance:
 
     def vacuum(
         self,
-        table: str | None = None,
+        table: TableSelector | None = None,
         *,
         confirm_quiescent: bool = False,
         max_versions: int | None = None,
@@ -1516,9 +1556,11 @@ class Maintenance:
         """Delegate recovery to :meth:`Database.recover`."""
         return self._database.recover()
 
-    def rebuild_vector_index(self, space: str) -> VectorIndexView:
+    def rebuild_vector_index(
+        self, space: str, *, table: TableSelector | None = None
+    ) -> VectorIndexView:
         """Delegate the repair to :meth:`Database.rebuild_vector_index`."""
-        return self._database.rebuild_vector_index(space)
+        return self._database.rebuild_vector_index(space, table=table)
 
     def ensure_identity_indexes(self) -> None:
         """Delegate explicit persistent identity-index activation to the database."""
@@ -2003,6 +2045,13 @@ class Database:
             self._require_open()
             snapshot, _epoch = self._catalog_snapshot()
             return snapshot
+
+    @property
+    def views(self) -> LogicalViews:
+        """Return the bounded, persistent read-only logical view API; prepare explicitly."""
+        from okto_grafx.views import LogicalViews
+        self._require_open()
+        return LogicalViews(self)
 
     @property
     def heap(self) -> HeapStoreView:
@@ -2548,44 +2597,84 @@ class Database:
             call = text_call(statement, detached_parameters)
             if call is not None:
                 return self._run_text_procedure(context, call, control)
-            with self._transactions.page_access_section(transaction=context):
-                self._require_open()
-                if not context.active:
-                    raise GrafxTransactionStateError(
-                        f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
-                        "another statement.",
-                        txn_id=context.txn_id,
-                        state=context.state.value,
-                    )
-                # Registration and statement execution share the participant section. Close can
-                # therefore neither miss a context that may have acquired a schema journal nor
-                # release storage while the statement is installing one.
-                self._public_contexts.setdefault(context.txn_id, context)
+            # Keep native logical writes reversible until the public result and deadline
+            # have both passed validation. Schema statements have their own catalog/artifact
+            # journal and must not be unwound with a row-only staging snapshot.
+            with self._logical_statement_publication(context, engine, statement):
+                with self._transactions.page_access_section(transaction=context):
+                    self._require_open()
+                    if not context.active:
+                        raise GrafxTransactionStateError(
+                            f"Transaction {context.txn_id} is {context.state.value} and cannot execute "
+                            "another statement.",
+                            txn_id=context.txn_id,
+                            state=context.state.value,
+                        )
+                    # Registration and statement execution share the participant section. Close can
+                    # therefore neither miss a context that may have acquired a schema journal nor
+                    # release storage while the statement is installing one.
+                    self._public_contexts.setdefault(context.txn_id, context)
+                    if control is not None:
+                        control.check()
+                        raw_result = engine.execute(statement, context, detached_parameters, read_control=control)  # type: ignore[attr-defined]
+                        control.check()
+                    else:
+                        raw_result = engine.execute(statement, context, detached_parameters)  # type: ignore[attr-defined]
+                # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
+                # after leaving page access, while _public_operation still translates ordinary host
+                # failures and deliberately lets process-control signals pass unchanged.
+                result = _query_result_view(
+                    raw_result,
+                    max_string_characters=self._max_query_value_characters,
+                    internally_owned_plan=(
+                        type(raw_result) is QueryResult
+                        and _engine_owns_prepared_plan(
+                            engine,
+                            _domain_field(raw_result, QueryResult, "plan"),
+                        )
+                    ),
+                    plan_memo=self._plan_view_memo,
+                    plan_guard_factory=self._plan_guard_factory,
+                )
                 if control is not None:
                     control.check()
-                    raw_result = engine.execute(statement, context, detached_parameters, read_control=control)  # type: ignore[attr-defined]
-                    control.check()
-                else:
-                    raw_result = engine.execute(statement, context, detached_parameters)  # type: ignore[attr-defined]
-            # A collaborator result may itself be a hostile Mapping/Sequence. Rebuild it only
-            # after leaving page access, while _public_operation still translates ordinary host
-            # failures and deliberately lets process-control signals pass unchanged.
-            result = _query_result_view(
-                raw_result,
-                max_string_characters=self._max_query_value_characters,
-                internally_owned_plan=(
-                    type(raw_result) is QueryResult
-                    and _engine_owns_prepared_plan(
-                        engine,
-                        _domain_field(raw_result, QueryResult, "plan"),
-                    )
-                ),
-                plan_memo=self._plan_view_memo,
-                plan_guard_factory=self._plan_guard_factory,
-            )
-            if control is not None:
-                control.check()
-            return result
+                return result
+
+    @contextmanager
+    def _logical_statement_publication(
+        self, context: TransactionContext, engine: object, statement: str,
+    ) -> Iterator[None]:
+        """Hold native row effects through public result canonicalization."""
+        mark = None
+        schema_mark = None
+        if context.mode is TransactionMode.WRITE and type(engine) is QueryEngine:
+            parsed = engine.parse(statement)
+            if isinstance(parsed, (QueryStatement, UnionQuery)) and parsed.writes:
+                with self._transactions.page_access_section(transaction=context):
+                    self._require_open()
+                    mark = context.staging_mark()
+                    schema_mark = engine._schema_statement_mark(context)
+        try:
+            yield
+            if mark is not None:
+                with self._transactions.page_access_section(transaction=context):
+                    self._require_open()
+                    context.settle_staging_mark(mark)
+        except BaseException as failure:
+            if mark is not None and context.active:
+                try:
+                    with self._transactions.page_access_section(transaction=context):
+                        context.discard_since(mark)
+                        engine._restore_schema_statement(context, schema_mark)
+                except BaseException as cleanup_failure:
+                    _note_cleanup_failure(failure, cleanup_failure)
+                    # If statement rollback cannot be proved, no later commit is safe.
+                    try:
+                        if context.active:
+                            self._transactions.rollback(context)
+                    except BaseException as rollback_failure:
+                        _note_cleanup_failure(failure, rollback_failure)
+            raise
 
     def _run_text_procedure(self, context: TransactionContext, call: tuple[object, ...], control: _ReadControl | None) -> QueryResult:
         """Run the closed FTS read procedure, sharing the calling statement's deadline."""
@@ -2655,6 +2744,7 @@ class Database:
                         value=type(statement).__name__,
                     )
                 mark = context.staging_mark()
+                schema_mark = engine._schema_statement_mark(context) if type(engine) is QueryEngine else None
 
             try:
                 if isinstance(parameter_sets, Mapping):
@@ -2763,9 +2853,17 @@ class Database:
                     context.settle_staging_mark(mark)
             except BaseException as failure:
                 try:
-                    context.discard_since(mark)
+                    with self._transactions.page_access_section(transaction=context):
+                        context.discard_since(mark)
+                        if schema_mark is not None:
+                            engine._restore_schema_statement(context, schema_mark)
                 except BaseException as cleanup_failure:
                     _note_cleanup_failure(failure, cleanup_failure)
+                    try:
+                        if context.active:
+                            self._transactions.rollback(context)
+                    except BaseException as rollback_failure:
+                        _note_cleanup_failure(failure, rollback_failure)
                 raise
             return report
 
@@ -2786,6 +2884,7 @@ class Database:
         limit: int,
         cursor_payload: tuple[int, int, _HeapScanPosition, ScanCursorV1] | None,
         cursor_owner: object,
+        kind: str | None = None,
         columns: tuple[str, ...] | None = None,
         max_batch_bytes: int | None = None,
         control: _ReadControl | None = None,
@@ -2811,7 +2910,7 @@ class Database:
                         mode=context.mode.value,
                         operation="scan_rows_v1",
                     )
-                table_def = self._catalog.catalog.table(table)
+                table_def = self._catalog.catalog.table(table, kind=kind)
                 positions = None if columns is None else tuple(table_def.column_index(c) for c in columns)
                 position: _HeapScanPosition | None = None
                 if cursor_payload is not None:
@@ -2878,6 +2977,12 @@ class Database:
                         )
                         for value_position, value in enumerate(raw_values)
                     )
+                node_labels = version.node_labels
+                if node_labels is not None:
+                    from okto_grafx.domain.model.node_labels import validate_node_labels
+                    validate_node_labels(node_labels)
+                    if table_def.kind != "node" or not table_def.admits_node_labels(node_labels):
+                        raise GrafxConfigurationError("Scanned label metadata exceeds its physical table.", field="node_labels")
                 rows.append(
                     ScanRowV1(
                         record_id=_builtin_int(
@@ -2885,6 +2990,7 @@ class Database:
                             field=f"scan.rows[{row_position}].record_id",
                         ),
                         values=detached_values,
+                        node_labels=node_labels,
                     )
                 )
             next_cursor = (
@@ -2915,15 +3021,24 @@ class Database:
                 )
             return observe()
 
-    def vector_memory_usage(self, space: str) -> VectorMemoryUsage:
+    def vector_memory_usage(
+        self, space: str, *, table: TableSelector | None = None
+    ) -> VectorMemoryUsage:
         """Observe local HNSW cache tariffs without building or proving freshness.
 
         The per-picture limit is independent of query memory and is not an RSS or
         aggregate multi-handle ceiling. No persistent state is changed.
         """
         with self._public_operation("vector_memory_usage"):
+            if table is not None:
+                table_selector_parts(table)
             vectors = self._require_component("vectors", self._vectors, "the vector engine (C9)")
-            index = vectors.index(_require_text("space", space))
+            wanted_space = _require_text("space", space)
+            if table is None:
+                index = vectors.index(wanted_space)
+            else:
+                selected = select_table(self.catalog.catalog, table)
+                index = vectors.index(wanted_space, table_id=selected.table_id)
             observe = getattr(index, "memory_usage", None)
             if not callable(observe):
                 raise GrafxUnsupportedOperation(
@@ -2942,6 +3057,7 @@ class Database:
         candidate_filter: RecordIdFilter | None = None,
         timeout_seconds: float | None = None,
         cancellation: CancellationToken | None = None,
+        table: TableSelector | None = None,
     ) -> VectorSearchResult:
         """Search one owned snapshot with optional cooperative read controls.
 
@@ -2952,6 +3068,7 @@ class Database:
         return self._search_vectors_with_control(
             transaction, space=space, query=query, k=k, candidate_filter=candidate_filter,
             control=_read_control(self._clock, timeout_seconds, cancellation),
+            table=table,
         )
 
     def _search_vectors_with_control(
@@ -2964,6 +3081,7 @@ class Database:
         candidate_filter: RecordIdFilter | None = None,
         control: _ReadControl | None = None,
         memory=None,
+        table: TableSelector | None = None,
     ) -> VectorSearchResult:
         """Search vectors under the fixed snapshot of one active transaction.
 
@@ -3011,6 +3129,8 @@ class Database:
             wanted_k = _require_positive_integer("k", k)
             wanted_query = _vector_query_snapshot(query)
             wanted_filter = _record_id_filter_snapshot(candidate_filter)
+            if table is not None:
+                table_selector_parts(table)
             vectors = self._require_component(
                 "vectors", self._vectors, "the vector engine (C9)"
             )
@@ -3019,11 +3139,14 @@ class Database:
                 # use. Checking before it would let a racing rollback withdraw this snapshot's
                 # reader pin in the gap and leave the search below a recyclable horizon.
                 transaction._require_active()
+                selected_table = (None if table is None else
+                                  select_table(self._catalog.catalog, table))
                 dirty_table = next(
                     (
                         table
                         for intent in transaction._context.row_intents
                         if (table := getattr(intent, "table", None)) is not None
+                        and (selected_table is None or table.table_id == selected_table.table_id)
                         and any(
                             getattr(column, "vector_space", None) == wanted_space
                             for column in getattr(table, "columns", ())
@@ -3046,6 +3169,14 @@ class Database:
                 snapshot = _public_snapshot(transaction._context.snapshot)
                 operation = vectors.search
                 extra = {}
+                if selected_table is not None:
+                    operation = getattr(vectors, "search_for_table", None)
+                    if not callable(operation):
+                        raise GrafxUnsupportedOperation(
+                            "The vector engine does not support physical-owner selection.",
+                            operation="search_vectors", field="table",
+                        )
+                    extra["table_id"] = selected_table.table_id
                 if control is not None or memory is not None:
                     if control is not None:
                         control.check()
@@ -3096,21 +3227,45 @@ class Database:
             space=space, vector=vector, k=k, options=options, filter=filter,
             text_limits=text_limits, timeout_seconds=timeout_seconds, cancellation=cancellation)
 
-    def create_text_index(self, name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None = None, bucket_count: int = 64) -> IndexView:
+    def create_text_index(self, name: str, table: str, columns: tuple[str, ...], *, options: TextIndexOptions | None = None, bucket_count: int = 64, kind: str | None = None) -> IndexView:
         """Create a native persisted full-text generation over one to four STRING fields."""
-        return _create_text_index(self, name, table, columns, options=options, bucket_count=bucket_count)
+        return _create_text_index(self, name, table, columns, options=options, bucket_count=bucket_count, kind=kind)
+
+    def replace_text_index(self, name: str, *, options: TextIndexOptions) -> IndexView:
+        """Atomically replace a text analyzer/options using a fresh complete generation.
+
+        The table, fields and sizing stay fixed. Old files are not reinterpreted
+        or deleted; catalog publication is the only switch. Each new search uses
+        the currently published analyzer with its owning data snapshot, while an
+        in-flight certificate must still validate its selected generation.
+        """
+        if type(name) is not str or type(options) is not TextIndexOptions:
+            raise GrafxConfigurationError("Expected an index name and TextIndexOptions.", field="replace_text_index")
+        from okto_grafx.domain.index.fulltext import is_fulltext
+        with self._public_operation("replace_text_index"):
+            self._require_writable("replace text index")
+            with self._transactions.page_access_section(fresh_read_view=True):
+                logical = self._catalog.catalog.index_definition(name)
+                if not is_fulltext(logical.key_derivation) or logical.active_generation() is None:
+                    raise GrafxConfigurationError("Select an active full-text index.", field="name")
+                table = self._catalog.catalog.table_by_id(logical.table_id)
+                columns = tuple(table.columns[position].name for position in logical.positions)
+                buckets = logical.active_generation().bucket_count
+            return _create_text_index(self, logical.name, table.name, columns, options=options,
+                bucket_count=buckets, kind=table.kind, _replace_existing=True)
 
     def search_text(self, reader: Transaction | None = None, *, index: str, query: str, k: int = 20,
                     filter: RecordIdFilter | None = None, limits: TextSearchLimits | None = None,
                     k1: float = 1.2, b: float = 0.75, timeout_seconds: float | None = None,
-                    cancellation: CancellationToken | None = None, prefix: bool = False) -> TextSearchResult:
+                    cancellation: CancellationToken | None = None, prefix: bool = False,
+                    phrase: bool = False, return_positions: bool = False, slop: int = 0) -> TextSearchResult:
         """Read bounded BM25 hits in a caller-owned reader or a fresh autocommit snapshot."""
         if reader is None:
             with self.begin("read") as owned:
-                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
+                return self.search_text(owned, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase, return_positions=return_positions, slop=slop)
         if type(reader) is not Transaction:
             raise GrafxConfigurationError("reader must be a Transaction.", field="reader")
-        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix)
+        return _search_text(self, reader, index=index, query=query, k=k, filter=filter, limits=limits, k1=k1, b=b, timeout_seconds=timeout_seconds, cancellation=cancellation, prefix=prefix, phrase=phrase, return_positions=return_positions, slop=slop)
 
     def create_index(
         self,
@@ -3129,6 +3284,8 @@ class Database:
         both is refused by the same planner used by textual ``CREATE INDEX``. The ordered
         layout is selected explicitly with ``layout='ordered'`` and accepts only a
         TIMESTAMP+STRING key, without hash sizing hints.
+        ``layout='posting_hash'`` deduplicates repeated property keys per page;
+        it remains an exact candidate index with native heap visibility checks.
         """
         with self._public_operation("create_index"):
             self._require_open()
@@ -3405,7 +3562,31 @@ class Database:
                 report = verifier.verify(wanted_scope)  # type: ignore[attr-defined]
                 if wanted_scope != "indexes" and self._catalog.catalog.commit_catalog_activation is not None:
                     report = self._verify_commit_history(report)
+                    if self._catalog.catalog.system_history_tables():
+                        report = self._verify_system_history(report)
                 return _verification_report_view(report, requested_scope=wanted_scope)
+
+    def _verify_system_history(self, report: VerificationReport) -> VerificationReport:
+        """Include complete temporal chain/interval validation and current-row agreement."""
+        try:
+            with self.begin("read") as tx:
+                catalog = self._catalog.catalog
+                tables = tuple(catalog.table_by_id(key) for key, _, _ in catalog.system_history_tables())
+                graph = tx.system_as_of(CommitId(self.identity.database_uuid, tx.snapshot.read_lsn),
+                    tables=tuple((table.kind, table.name) for table in tables), limits=TemporalLimits(access_path="scan"))
+                current = {(table.table_id, version.record_id): (tuple(version.values), version.node_labels)
+                           for table in tables for _, version in self._heap.scan(table, tx._context.snapshot)}
+                historical = {(row.table_id, row.record_id): (row.values, row.node_labels) for row in graph.rows}
+                if current != historical:
+                    raise GrafxCorruptionDetected("Current rows disagree with native history.", field="system_history_current")
+            return replace(report, records_checked=report.records_checked + graph.events_scanned,
+                pages_checked=report.pages_checked + self._storage.page_count("system-history.dat"),
+                files_checked=tuple(dict.fromkeys((*report.files_checked, "system-history.dat"))))
+        except GrafxError:
+            finding = VerificationFinding(kind=FindingKind.CATALOG_UNREADABLE,
+                location=FindingLocation(file="system-history.dat"),
+                detail="Temporal history verification refused; complete lineage/current-state agreement could not be proved.")
+            return replace(report, findings=(*report.findings, finding))
 
     def _verify_commit_history(self, report: VerificationReport) -> VerificationReport:
         """Include logical history in public verification, with no repair side effect."""
@@ -3435,7 +3616,7 @@ class Database:
             del failure
             return replace(report, findings=(*report.findings, finding))
 
-    def _bloat(self, table: str | None = None) -> BloatReport:
+    def _bloat(self, table: TableSelector | None = None) -> BloatReport:
         """Measure heap bloat at the existing recyclable horizon without changing state.
 
         The public door lives on :class:`Maintenance`; this private database operation supplies
@@ -3448,7 +3629,9 @@ class Database:
         """
         with self._public_operation("measure heap bloat"):
             self._require_open()
-            wanted_table = None if table is None else _require_text("table", table)
+            wanted_table = table
+            if wanted_table is not None:
+                table_selector_parts(wanted_table)
             with self._transactions.page_access_section(
                 fresh_read_view=True,
                 allow_writeback=False,
@@ -3457,7 +3640,7 @@ class Database:
                 tables = (
                     catalog.tables()
                     if wanted_table is None
-                    else (catalog.table(wanted_table),)
+                    else (select_table(catalog, wanted_table),)
                 )
                 horizon = self._transactions.observational_recyclable_horizon()
                 samples = tuple(
@@ -3467,7 +3650,7 @@ class Database:
 
             table_reports = tuple(
                 TableBloatReport(
-                    table=_builtin_text(table_def.name, field="table", empty=False),
+                    table=public_table_selector(catalog, table_def),
                     table_id=_builtin_int(sample.table_id, field="table_id"),
                     data_pages=_builtin_int(sample.data_pages, field="data_pages"),
                     slot_directory_entries=_builtin_int(
@@ -3539,7 +3722,7 @@ class Database:
 
     def _vacuum(
         self,
-        table: str | None = None,
+        table: TableSelector | None = None,
         *,
         confirm_quiescent: bool,
         max_versions: int | None,
@@ -3552,7 +3735,9 @@ class Database:
             self._require_writable("vacuum MVCC history")
             if type(index_free_pages) is not bool:
                 raise GrafxConfigurationError("index_free_pages must be a bool.", field="index_free_pages")
-            wanted_table = None if table is None else _require_text("table", table)
+            wanted_table = table
+            if wanted_table is not None:
+                table_selector_parts(wanted_table)
             wanted_limit = (
                 None
                 if max_versions is None
@@ -3576,7 +3761,7 @@ class Database:
                     selected = (
                         source.tables()
                         if wanted_table is None
-                        else (source.table(wanted_table),)
+                        else (select_table(source, wanted_table),)
                     )
                     floor_before = self._heap.reclaim_floor()
                     capability_active = (
@@ -3615,7 +3800,7 @@ class Database:
                     selected = (
                         current.tables()
                         if wanted_table is None
-                        else (current.table(wanted_table),)
+                        else (select_table(current, wanted_table),)
                     )
                     horizon = self._transactions.published_state().last_committed_lsn
 
@@ -3650,11 +3835,7 @@ class Database:
                 tables_by_id = {table_def.table_id: table_def for table_def in selected}
                 table_reports = tuple(
                     TableVacuumReport(
-                        table=_builtin_text(
-                            tables_by_id[item.table_id].name,
-                            field="table",
-                            empty=False,
-                        ),
+                        table=public_table_selector(current, tables_by_id[item.table_id]),
                         table_id=_builtin_int(item.table_id, field="table_id"),
                         pages_scanned=_builtin_int(
                             item.pages_scanned, field="pages_scanned"
@@ -3719,6 +3900,28 @@ class Database:
                     ),
                 )
 
+    def add_nullable_column(self, table: TableSelector, column: ColumnDef) -> TableDef:
+        """Atomically append one nullable non-vector column, without rewriting old rows.
+
+        Requires explicit identity-index activation. Publishes the one-way
+        nullable_columns_v1 capability; incompatible old binaries refuse the store.
+        One dedicated native transaction, no automatic retry or backfill.
+        """
+        from okto_grafx.engine.public_views import _table_definition, _column_definition
+        _kind, name = table_selector_parts(table)
+        if name.startswith("_grafx_") or type(column) is not ColumnDef:
+            raise GrafxConfigurationError("Invalid nullable-column input.", field="column")
+        captured = _column_definition(column)
+        with self._public_operation("add_nullable_column"):
+            self._require_open()
+            self._require_writable("add nullable column")
+            engine = self._require_component("queries", self._queries, "the query engine (C10)")
+            with self.begin("write") as tx:
+                with self._transactions.page_access_section(transaction=tx._context):
+                    self._public_contexts.setdefault(tx.txn_id, tx._context)
+                    updated = engine.add_nullable_column(tx._context, table, captured)
+            return _table_definition(updated)
+
     def ensure_identity_indexes(self) -> None:
         """Persist and activate every exact access path required by endpoint identities.
 
@@ -3749,6 +3952,116 @@ class Database:
 
             self._refresh_index_inventory()
             return None
+
+    def system_as_of(self, at: CommitId | Timestamp, *, tables: tuple[TableSelector, ...],
+                     limits: TemporalLimits = TemporalLimits()) -> TemporalGraph:
+        """Return a bounded historical graph at a qualified commit or ordered timestamp.
+
+        Include both endpoint tables when requesting relationships. Historical
+        identities never resolve through recreated primary keys. History before
+        activation or retention has distinct typed refusal, not an empty graph.
+        """
+        from okto_grafx.engine.system_history_reader import _inputs
+        at = _inputs(self, at, tables, limits, None)
+        with self.begin("read") as transaction:
+            return transaction.system_as_of(at, tables=tables, limits=limits)
+
+    def system_versions(self, table: TableSelector, record_id: int, *,
+                        limits: TemporalLimits = TemporalLimits()) -> TemporalVersions:
+        """Return create/update/delete-bounded intervals for one logical row identity."""
+        from okto_grafx.engine.system_history_reader import _inputs
+        _inputs(self, CommitId(self.identity.database_uuid, 1), (table,), limits, record_id)
+        with self.begin("read") as transaction:
+            return transaction.system_versions(table, record_id, limits=limits)
+
+    def _read_system_history(self, context, *, at, tables, limits, record_id=None):
+        from okto_grafx.engine.system_history_reader import read_system_history
+        with self._public_operation("read system history"):
+              return read_system_history(self, context, at=at, tables=tables, limits=limits, record_id=record_id)
+
+    def system_diff(self, before: CommitId, after: CommitId, *, tables: tuple[TableSelector, ...],
+                    limits: TemporalLimits = TemporalLimits(), max_changes: int = 100_000) -> TemporalDiff:
+        """Compare retained system-time commits; no valid-time or write effects are introduced."""
+        from okto_grafx.temporal_diff import _validate
+        _validate(before, after, limits, max_changes)
+        with self.begin('read') as reader:
+            return reader.system_diff(before, after, tables=tables, limits=limits, max_changes=max_changes)
+
+    def enable_system_history(self, tables: tuple[TableSelector, ...]) -> None:
+        """Atomically opt tables into durable system-time history with their current baseline.
+
+        Requires explicit identity-index and commit-history activation first.
+        Relationship history requires both endpoint tables enabled together or
+        previously. A baseline exceeding native history budgets refuses intact.
+        Activation is one-way; this is not retained MVCC or an automatic migration.
+        """
+        with self._public_operation("enable_system_history"):
+            self._require_writable("enable system history")
+            with self.begin("write") as transaction:
+                self._transactions._history_publication.stage_activation(transaction._context, tables)
+
+    def enable_system_history_index(self, *, max_bytes: int = 16 * 1024 * 1024) -> bool:
+        """Atomically build the optional persistent temporal access path.
+
+        Requires native system history. Activation is one-way and refuses older
+        readers through a required catalog capability. A dedicated bounded build
+        captures all retained events; later commits update immutable search paths.
+        Returns False when already active. No connection default is changed.
+        """
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 2**31:
+            raise GrafxConfigurationError("Invalid index build budget.", field="max_bytes")
+        with self._public_operation("enable_system_history_index"):
+            self._require_writable("enable system history index")
+            with self.begin("write") as transaction:
+                changed = self._transactions._history_publication.stage_index(
+                    transaction._context, max_bytes=max_bytes)
+            return changed
+
+    def compact_system_history(self, *, confirm_quiescent: bool = False,
+                               max_bytes: int = 16 * 1024 * 1024) -> TemporalCompactionReport:
+        """Reclaim redacted history payloads and obsolete temporal tree paths offline.
+
+        Requires no open local transaction and explicit confirmation that other
+        processes are stopped. Retained horizons, pins and row/edge lineage do not
+        change. A native full-image COMMIT and checkpoint precede truncation; a
+        crash may leave an unused tail, never a partly authoritative history.
+        No old WAL, physical backup or filesystem snapshot is securely erased.
+        """
+        from okto_grafx.engine.system_history_operations import compact
+        return compact(self, confirm_quiescent=confirm_quiescent, max_bytes=max_bytes)
+
+    def pin_system_history(self, name: str, at: CommitId, *, tables: tuple[TableSelector, ...]) -> None:
+        """Persist named protection against retention beyond ``at`` for selected tables.
+
+        Pins survive close/crash, have no TTL and require explicit unpinning. They
+        protect logical history only, not physical MVCC/WAL retention. Repeating an
+        identical binding is a no-op; rebinding an existing name refuses.
+        """
+        from okto_grafx.engine.system_history_operations import control
+        control(self, operation="pin system history", name=name, before=at, tables=tables)
+
+    def unpin_system_history(self, name: str) -> None:
+        """Explicitly release a durable temporal pin; an absent valid name is a no-op."""
+        from okto_grafx.engine.system_history_operations import control
+        control(self, operation="unpin system history", name=name)
+
+    def system_history_pins(self) -> tuple[TemporalPin, ...]:
+        """List durable temporal pins in name order under a qualified publication read."""
+        from okto_grafx.engine.system_history_operations import pins
+        return pins(self)
+
+    def prune_system_history(self, before: CommitId, *, tables: tuple[TableSelector, ...],
+                             max_bytes: int = 16 * 1024 * 1024) -> TemporalPruneReport:
+        """Atomically redact payloads of versions closed at/before a new retained horizon.
+
+        Explicit pins prevent incompatible pruning. Current versions, lineage,
+        schema and interval framing remain. The bounded rewrite uses native WAL,
+        OCC and COMMIT; a concurrent publication can require caller retry. This
+        does not shrink files or securely erase old WAL, backups or snapshots.
+        ``max_bytes`` caps captured history-file bytes, not process RSS.
+        """
+        from okto_grafx.engine.system_history_operations import control
+        return control(self, operation="prune system history", before=before, tables=tables, max_bytes=max_bytes)
 
     def enable_commit_history(self) -> None:
         """Activate one-way durable provenance after ensure_identity_indexes().
@@ -3942,7 +4255,9 @@ class Database:
                 )
             return receipt.index(name)
 
-    def rebuild_vector_index(self, space: str) -> VectorIndexView:
+    def rebuild_vector_index(
+        self, space: str, *, table: TableSelector | None = None
+    ) -> VectorIndexView:
         """Re-derive one vector index from the heap, and report it only once it is healthy.
 
         Nothing repairs an index at open, and a stale proximity index is the dangerous
@@ -3965,9 +4280,15 @@ class Database:
         with self._public_operation("rebuild_vector_index"):
             self._require_open()
             self._require_writable("rebuild a vector index")
-            return self._rebuild_vector_index_inside_guard(space)
+            selected_id = None
+            if table is not None:
+                table_selector_parts(table)
+                selected_id = select_table(self.catalog.catalog, table).table_id
+            return self._rebuild_vector_index_inside_guard(space, table_id=selected_id)
 
-    def _rebuild_vector_index_inside_guard(self, space: str) -> VectorIndexView:
+    def _rebuild_vector_index_inside_guard(
+        self, space: str, *, table_id: int | None = None
+    ) -> VectorIndexView:
         """Run the repair with the public facade section already entered.
 
         The guard is taken by the door above and held across everything here, including the
@@ -3980,7 +4301,8 @@ class Database:
         # Resolution by space is the public one, so an unknown space, a name that is not a
         # vector index and a target this database never attached all refuse identically,
         # before a transaction exists to roll back.
-        target = self.vectors.index(space)
+        target = (self.vectors.index(space) if table_id is None else
+                  self.vectors.index(space, table_id=table_id))
         name = target.name
         manager = self._require_component(
             "indexes", self._indexes, "the index manager (C4)"
@@ -3997,6 +4319,11 @@ class Database:
             if callable(active_index)
             else manager.index(name)  # type: ignore[attr-defined]
         )
+        if selected_index.definition.table_id != target.table_id:
+            raise GrafxIndexError(
+                "The selected vector owner changed before rebuild admission.",
+                field="table_id", index=name,
+            )
         claimed = self._transactions.checkpoint_and_claim_index_rebuild(
             selected_index,
             claim_reason,
@@ -4070,7 +4397,9 @@ class Database:
         # recreate a refusal after the fact -- which is what made every earlier version of this
         # door fragile. A failure at any point simply leaves the claim's own mark in place.
         try:
-            prepared = self._prepared_rebuilt_vector_index(space, through, claim_reason)
+            prepared = self._prepared_rebuilt_vector_index(
+                space, through, claim_reason, table_id=table_id
+            )
         except BaseException as unproved:
             self._remember_stale_index(name, unproved)
             raise
@@ -4135,7 +4464,7 @@ class Database:
         raise failure
 
     def _prepared_rebuilt_vector_index(
-        self, space: str, through: int, claim_reason: str
+        self, space: str, through: int, claim_reason: str, *, table_id: int | None = None
     ) -> VectorIndexView:
         """Assemble the answer while the index is still refusing, so nothing follows the clear.
 
@@ -4145,7 +4474,14 @@ class Database:
         only ones this differs from what was read, and they are stated rather than re-read
         because re-reading them would be fallible work after the last mutation.
         """
-        observed = self._vectors_view_now().index(space)
+        view = self._vectors_view_now()
+        observed = (view.index(space) if table_id is None else
+                    view.index(space, table_id=table_id))
+        if table_id is not None and observed.table_id != table_id:
+            raise GrafxIndexError(
+                "The rebuild proof belongs to a different physical vector owner.",
+                field="table_id", index=observed.name,
+            )
         if observed.stale and observed.stale_reason != claim_reason:
             # Stale is expected here -- the claim put it there and the clear has not run. What
             # is NOT expected is stale for some OTHER reason: that means the mark this door is
@@ -4188,6 +4524,7 @@ class Database:
             False,
             None,
             through,
+            observed.table_id,
         )
         built_through = observed.built_through_lsn
         if built_through is None:

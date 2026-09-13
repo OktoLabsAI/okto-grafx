@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import heapq
+import math
 import random
 
 import pytest
@@ -121,13 +122,33 @@ def test_selected_numpy_missing_and_algorithm_limits(monkeypatch):
 
 
 @pytest.mark.parametrize("cost", [-1., float("nan"), float("inf")])
-def test_capture_rejects_invalid_weights_without_losing_reader(cost):
+def test_capture_rejects_invalid_weights_without_losing_reader(cost, monkeypatch):
+    from okto_grafx.domain.model.errors import SchemaMismatchError
+    from okto_grafx.engine.database import Transaction
+
     with connect(":memory:") as db:
         with db.begin() as tx:
             tx.execute("CREATE NODE TABLE N(id INT64,PRIMARY KEY(id))")
             tx.execute("CREATE REL TABLE R(FROM N TO N,cost DOUBLE,label STRING)")
             tx.execute("CREATE (:N {id:1})")
-            tx.execute("MATCH (n:N) CREATE (n)-[:R {cost:$cost}]->(n)", {"cost": cost})
+            if not math.isfinite(cost):
+                with pytest.raises(SchemaMismatchError):
+                    tx.execute("MATCH (n:N) CREATE (n)-[:R {cost:$cost}]->(n)", {"cost": cost})
+                assert tx.execute("MATCH(:N)-[e:R]->(:N) RETURN count(e)").rows == ((0,),)
+            tx.execute("MATCH (n:N) CREATE (n)-[:R {cost:$cost}]->(n)",
+                       {"cost": cost if math.isfinite(cost) else 1.0})
+        original_scan = Transaction.scan_rows_v1
+
+        def faulty_scan(tx, table, **kwargs):
+            page = original_scan(tx, table, **kwargs)
+            if table == "R" and kwargs.get("columns") == ("_from", "_to", "cost"):
+                # Defensive consumer validation remains tested even though native
+                # storage now correctly rejects NaN/Infinity before commit.
+                return replace(page, rows=tuple(replace(row, values=row.values[:2] + (cost,))
+                                                for row in page.rows))
+            return page
+
+        monkeypatch.setattr(Transaction, "scan_rows_v1", faulty_scan)
         with db.begin("read") as reader:
             for column in ("cost", "label", "absent"):
                 with pytest.raises(GrafxConfigurationError):

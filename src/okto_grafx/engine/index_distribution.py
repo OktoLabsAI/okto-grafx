@@ -40,7 +40,7 @@ def index_distribution(database: Database, name: str, *, max_pages: int, max_ent
     with database._public_operation("index_distribution"), database.begin("read") as reader:
         with database._transactions.page_access_section(transaction=reader._context):
             store = database._indexes.active_index(name)
-            if store.definition.layout not in (IndexLayout.HASH, IndexLayout.SPARSE_HASH):
+            if store.definition.layout not in (IndexLayout.HASH, IndexLayout.SPARSE_HASH, IndexLayout.POSTING_HASH):
                 raise GrafxUnsupportedOperation("Distribution describes HASH indexes only.", field="layout")
             pages_work = 0
 

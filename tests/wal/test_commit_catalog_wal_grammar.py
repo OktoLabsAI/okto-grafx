@@ -43,8 +43,8 @@ def test_required_journal_roundtrip_even_when_compression_does_not_win(
 
 
 @pytest.mark.parametrize("flags", range(64))
-def test_write_page_v2_accepts_only_the_three_exact_grammars(flags: int) -> None:
-    assert (v2_record_semantics_error(WalRecordType.WRITE_PAGE, flags) is None) == (flags in {5, 17, 21})
+def test_write_page_v2_accepts_only_the_five_exact_grammars(flags: int) -> None:
+    assert (v2_record_semantics_error(WalRecordType.WRITE_PAGE, flags) is None) == (flags in {5, 17, 21, 33, 37})
 
 
 @pytest.mark.parametrize("file", sorted(COMMIT_CATALOG_PAGE_FILES))

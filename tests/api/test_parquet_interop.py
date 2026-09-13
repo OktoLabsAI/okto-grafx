@@ -61,7 +61,8 @@ def test_input_bounds_bad_types_paths_and_early_close(tmp_path):
 
 
 def test_late_invalid_parquet_value_rolls_back_import_not_prior_staging(tmp_path):
-    table = pa.table({"id": pa.array([1, 99], type=pa.int64()), "f": pa.array([1., float("nan")], from_pandas=False)})
+    # A distinct second ID proves nonfinite admission, not primary-key conflict.
+    table = pa.table({"id": pa.array([1, 2], type=pa.int64()), "f": pa.array([1., float("nan")], from_pandas=False)})
     pq.write_table(table, tmp_path / "bad.parquet", row_group_size=1)
     with connect(":memory:") as db:
         with db.begin() as tx:

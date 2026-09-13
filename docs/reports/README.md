@@ -1,5 +1,18 @@
 # Evidence and report index
 
+- [0.0.6 publication preparation: isolated sanitation rehearsal and remaining approvals](V006_PUBLICATION_PREPARATION.md)
+
+- [Functional parity: final native regression, 22-contract reconciliation and explicit Neo4j deferral](FP_FINAL_NATIVE_QUALIFICATION.md)
+- [Final installed Pulse candidate: package, API, browser and MCP qualification](FP_FINAL_PULSE_QUALIFICATION.md)
+- [Final 0.0.6 native cost observations: exact fixtures, read/write boundaries and limitations](FP_NATIVE_COST_OBSERVATIONS.md)
+- [Bounded pinned Ladybug comparison and dialect differences](FP_BOUNDED_LADYBUG_COMPARISON.md)
+
+- [Pulse / Grafx 0.0.6 integration follow-up](PULSE_V006_INTEGRATION_REGRESSION.md)
+- [0.0.6 query-language round: fixed scope, full regression and consumer migration](V006_QUERY_LANGUAGE_ROUND.md)
+
+- [0.0.6 NHC-1–8: positional search, selected copy, temporal diff/index/compaction and analyzer replacement](V006_NHC_ROUND.md)
+- [0.0.6 native history/catalog/search round: fixed eight-item scope and validation](V006_NATIVE_HISTORY_ROUND.md)
+
 [Documentation index](../README.md) · [Current performance](../PERFORMANCE.md) · [Roadmap](../../ROADMAP.md)
 
 Dated evidence, not active execution queues. Each report retains its original

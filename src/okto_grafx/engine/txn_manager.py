@@ -143,6 +143,7 @@ from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.txn.commit_record import CommitPayload, FileIdMap, PageTouch
 from okto_grafx.domain.txn.commit_state import COMMIT_STATE_FORMAT_VERSION, CommitState
 from okto_grafx.domain.txn.context import (
+    _node_label_payload_bytes,
     CommitReport,
     PendingRowRef,
     RowIntent,
@@ -328,6 +329,7 @@ class _RowWrite:
     born_values: tuple[object, ...] = ()
     ended_values: tuple[object, ...] = ()
     record_id: int | None = None
+    born_node_labels: tuple[str, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -725,8 +727,10 @@ class TransactionManager:
         "_identity_leases",
         "_index_catalog_activation_plans",
         "_commit_catalog_activation_plans",
+        "_temporal_activation_plans",
         "_database_uuid",
         "_journal_attempt",
+        "_history_publication",
         "_maintenance_txns",
         "_commit_metadata",
         "_checksum_scope",
@@ -765,6 +769,7 @@ class TransactionManager:
         "_close_quiesced",
         "_close_complete",
         "_close_finalizing",
+        "_temporal_context_factory",
     )
 
     def __init__(
@@ -799,6 +804,7 @@ class TransactionManager:
         tuple_encoding_proofs: TupleEncodingProofs | None = None,
         process_identity_provider: Callable[[], object] | None = None,
         catalog_changes_are_wal_logged: bool = False,
+        temporal_context_factory: Callable[[], object] | None = None,
     ) -> None:
         """Build a manager over one database.
 
@@ -904,8 +910,12 @@ class TransactionManager:
             TxnId, _IndexCatalogActivationPlan
         ] = {}
         self._commit_catalog_activation_plans: dict[TxnId, tuple[bytes, Csn]] = {}
+        self._temporal_activation_plans: dict[TxnId, dict[tuple[str, PageIndex], bytes]] = {}
+        self._temporal_context_factory = temporal_context_factory
         self._database_uuid = database_uuid
         self._journal_attempt: tuple[int, PreparedCommitCatalogAppend, dict[tuple[str, int], bytes]] | None = None
+        from okto_grafx.engine.system_history_publication import HistoryPublication
+        self._history_publication = HistoryPublication(self)
         self._maintenance_txns: set[int] = set()
         self._commit_metadata: dict[int, bytes] = {}
         self._checksum_scope: Callable[[], AbstractContextManager[object]] = nullcontext
@@ -1186,6 +1196,7 @@ class TransactionManager:
         *,
         operation: str,
         purpose: str,
+        register_maintenance: bool = True,
     ) -> None:
         """Require the untouched write transaction used by one detached catalog build.
 
@@ -1231,7 +1242,8 @@ class TransactionManager:
                 field="activation_transaction",
                 txn_id=txn.txn_id,
             )
-        self._maintenance_txns.add(int(txn.txn_id))
+        if register_maintenance:
+            self._maintenance_txns.add(int(txn.txn_id))
 
     def prepare_identity_index_activation(self, txn: TransactionContext) -> bool:
         """Stage one explicit, atomic catalog-v2 identity-index activation.
@@ -1342,6 +1354,135 @@ class TransactionManager:
                         image,
                     )
                 return True
+
+    def _prepare_temporal_values_activation(self, txn: TransactionContext) -> bool:
+        """Stage the internal metadata fence through normal WAL/OCC publication.
+
+        This dedicated-transaction primitive is separate from automatic first-row
+        admission, which merges the fence with the user's already-staged schema.
+        """
+        from okto_grafx.domain.model.temporal_codec import TEMPORAL_VALUES_CAPABILITY
+
+        operation = "prepare temporal-values activation"
+        self._require_fresh_index_catalog_transaction(
+            txn, operation=operation, purpose="Temporal-value activation", register_maintenance=False)
+        with self._participant_section():
+            self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            with self.schema_artifact_section(sync_if=lambda: True):
+                source = getattr(self._catalog, "catalog", None)
+                if not isinstance(source, Catalog) or source.format_version != CATALOG_FORMAT_VERSION:
+                    raise GrafxUnsupportedOperation(
+                        "Temporal-value activation requires the persistent v2 catalog.",
+                        operation=operation, field="format_version", remedy="maintenance.ensure_identity_indexes")
+                if source.requires_capability(TEMPORAL_VALUES_CAPABILITY):
+                    return False
+                candidate = source.copy()._enable_temporal_values()
+                images = self._catalog.stage(candidate)
+                mark = txn.staging_mark()
+                was_maintenance = int(txn.txn_id) in self._maintenance_txns
+                try:
+                    for page_index, image in images:
+                        self._stage_page_image(txn, self._file_ids.catalog_file, page_index, image)
+                    self._require_not_closed(operation)
+                    self._require_current_active(txn)
+                    self._temporal_activation_plans[txn.txn_id] = dict(txn.page_images)
+                    self._maintenance_txns.add(int(txn.txn_id))
+                    txn.settle_staging_mark(mark)
+                except BaseException:
+                    self._temporal_activation_plans.pop(txn.txn_id, None)
+                    if not was_maintenance:
+                        self._maintenance_txns.discard(int(txn.txn_id))
+                    if txn._staging_marks and txn._staging_marks[-1][0] is mark:
+                        txn.discard_since(mark)
+                    raise
+                return True
+
+    def _prepare_native_row_admission(self, txn: TransactionContext, *, _commit_admitted: bool = False) -> bool:
+        """Merge required native-value fences into the row transaction's effective catalog.
+
+        Run before the first OCC snapshot-interest freeze. These staged catalog
+        pages retain the ORIGINAL snapshot baseline, including after a retry.
+        Ordinary tuple encoding still owns schema and scalar validity checks.
+        The commit-only flag preserves the lifecycle winner already admitted by
+        _commit_with_writing: close waits for that owner instead of cancelling it.
+        """
+        from okto_grafx.domain.temporal_admission import native_value_capabilities
+        from okto_grafx.domain.model.temporal_codec import TEMPORAL_VALUES_CAPABILITY
+        from okto_grafx.domain.model.decimal_codec import DECIMAL_VALUES_CAPABILITY
+        from okto_grafx.engine.catalog_store import read_catalog_page_images
+
+        operation = "prepare native-value row admission"
+        if not _commit_admitted:
+            self._require_not_closed(operation)
+        self._require_owned(txn)
+        self._require_current_active(txn)
+        self._require_writable(operation)
+        if txn.mode is not TransactionMode.WRITE:
+            raise GrafxTransactionStateError("Native-value admission requires a write transaction.", operation=operation)
+        # A durable capability is monotonic. Ordinary subsequent row writers need
+        # neither another walk of nested values nor a schema synchronization lock.
+        # Staged schema must still be inspected: an older snapshot may lack the bit.
+        source = getattr(self._catalog, "catalog", None)
+        if (isinstance(source, Catalog) and source.requires_capability(TEMPORAL_VALUES_CAPABILITY)
+                and source.requires_capability(DECIMAL_VALUES_CAPABILITY)) and not any(
+            file == self._file_ids.catalog_file for file, _ in txn.page_images
+        ):
+            return False
+        required: frozenset[str] = frozenset()
+        for intent in reduce_row_intents(txn.row_intents):
+            if intent.operation is not RowOperation.DELETE:
+                # Pending relationship endpoints are transaction-local identities,
+                # not scalar values. The endpoint planner validates them separately.
+                values = intent.values[2:] if getattr(intent.table, "kind", None) == "rel" else intent.values
+                required = required | native_value_capabilities(values)
+        if not required:
+            return False
+        if isinstance(source, Catalog) and all(source.requires_capability(capability) for capability in required) and not any(
+            file == self._file_ids.catalog_file for file, _ in txn.page_images
+        ):
+            return False
+        if txn.unproved_page_images():
+            raise GrafxConfigurationError(
+                "Native-value admission cannot adopt schema images without exact staging provenance.",
+                field="page_image_provenance", txn_id=txn.txn_id)
+        with self._participant_section(), self.schema_artifact_section(sync_if=lambda: True):
+            if not _commit_admitted:
+                self._require_not_closed(operation)
+            self._require_current_active(txn)
+            self._require_recovery_complete()
+            source = getattr(self._catalog, "catalog", None)
+            images = tuple((index, raw) for (file, index), raw in txn.page_images.items()
+                           if file == self._file_ids.catalog_file)
+            if images:
+                normalized = []
+                for index, raw in images:
+                    page = Page.from_bytes(raw)
+                    page.page_lsn = 1
+                    normalized.append((index, page.to_bytes()))
+                source = read_catalog_page_images(tuple(normalized), page_size=self._pool.page_size, sequence=1)
+            if not isinstance(source, Catalog) or source.format_version != CATALOG_FORMAT_VERSION:
+                raise GrafxUnsupportedOperation(
+                    "Native-value admission requires the persistent v2 catalog.",
+                    operation=operation, field="format_version", remedy="maintenance.ensure_identity_indexes")
+            if all(source.requires_capability(capability) for capability in required):
+                return False
+            candidate = source.copy()._enable_native_value_capabilities(required)
+            candidate_images = self._catalog.stage(candidate)
+            mark = txn.staging_mark()
+            try:
+                for index, raw in candidate_images:
+                    self._stage_page_image(txn, self._file_ids.catalog_file, index, raw)
+                if not _commit_admitted:
+                    self._require_not_closed(operation)
+                self._require_current_active(txn)
+                txn.settle_staging_mark(mark)
+            except BaseException:
+                if txn._staging_marks and txn._staging_marks[-1][0] is mark:
+                    txn.discard_since(mark)
+                raise
+            return True
 
     def prepare_wal_record_v2_activation(self, txn: TransactionContext) -> bool:
         """Stage the durable capability fence before any compressed page record is emitted."""
@@ -1627,6 +1768,8 @@ class TransactionManager:
         expected_cardinality: int | None,
         layout: IndexLayout = IndexLayout.HASH,
         key_derivation: str = COLUMN_KEY_DERIVATION,
+        replace_text: bool = False,
+        table_kind: str | None = None,
     ) -> CatalogIndexDefinition:
         """Seal a full custom exact-index build into one fresh write transaction.
 
@@ -1684,6 +1827,8 @@ class TransactionManager:
                     layout=layout,
                     key_derivation=key_derivation,
                     operation=operation,
+                    replace_text=replace_text,
+                    table_kind=table_kind,
                 )
                 published = self._published_state_in_section().last_committed_lsn
                 activation = self._plan_identity_index_activation(
@@ -1705,7 +1850,10 @@ class TransactionManager:
                     state=IndexGenerationState.ACTIVE,
                 )
                 logical = replace(provisional, generations=(generation,))
-                candidate.add_index_definition(logical)
+                if replace_text:
+                    candidate._replace_text_index_definition(logical)
+                else:
+                    candidate.add_index_definition(logical)
                 custom_runtime = logical.runtime_definition(generation)
                 complete_runtime = (*runtime_definitions, custom_runtime)
                 self._declare_complete_table_reads(txn, {table.table_id: table})
@@ -1997,6 +2145,8 @@ class TransactionManager:
         layout: IndexLayout,
         key_derivation: str,
         operation: str,
+        replace_text: bool = False,
+        table_kind: str | None = None,
     ) -> tuple[TableDef, CatalogIndexDefinition]:
         """Validate one custom definition without changing catalog, txn or nonce state."""
 
@@ -2007,8 +2157,11 @@ class TransactionManager:
                 field="table",
                 value=repr(table_name),
             )
-        table = source.table(table_name)
         from okto_grafx.domain.index.fulltext import is_fulltext
+        source._validate_table_kind(table_kind)
+        if table_kind is None and not is_fulltext(key_derivation) and source.has_table(table_name, kind="node"):
+            table_kind = "node"  # Custom property indexes have an explicit node-only contract.
+        table = source.table(table_name, kind=table_kind)
         if table.kind != "node" and not is_fulltext(key_derivation):
             raise GrafxUnsupportedOperation(
                 f"Custom exact index {name!r} cannot target relationship table "
@@ -2061,7 +2214,15 @@ class TransactionManager:
                     value=provisional.positions,
                     index=provisional.name,
                 )
-        if source.has_index_definition(provisional.name):
+        if type(replace_text) is not bool:
+            raise GrafxConfigurationError("Invalid analyzer replacement flag.", field="replace_text")
+        if replace_text:
+            existing = source.index_definition(provisional.name)
+            if (not is_fulltext(existing.key_derivation) or not is_fulltext(key_derivation)
+                    or existing.table_id != table.table_id or existing.positions != positions
+                    or existing.automatic or existing.layout is not layout):
+                raise GrafxConfigurationError("Replacement must retain the text index table and fields.", field="replace_text")
+        if source.has_index_definition(provisional.name) and not replace_text:
             raise GrafxConfigurationError(
                 f"Catalog index name {provisional.name!r} is already defined without regard "
                 "to case.",
@@ -2072,7 +2233,7 @@ class TransactionManager:
             )
 
         indexes = getattr(manager, "indexes", None)
-        if callable(indexes) and any(
+        if not replace_text and callable(indexes) and any(
             getattr(getattr(index, "definition", None), "registry_key", None)
             == provisional.registry_key
             for index in indexes()
@@ -2445,7 +2606,7 @@ class TransactionManager:
     def _identity_endpoint_tables(catalog: Catalog) -> tuple[TableDef, ...]:
         """Return each node table referenced by a relationship exactly once."""
 
-        by_name = {table.name: table for table in catalog.tables()}
+        by_name = {table.name: table for table in catalog.tables() if table.kind == "node"}
         selected: dict[int, TableDef] = {}
         for relation in catalog.tables():
             if relation.kind != "rel":
@@ -2495,7 +2656,9 @@ class TransactionManager:
                 page_partition(file, page) for file, page in journal_locations
             )
         self._validate_index_catalog_activation_plan(
-            txn, plan, journal_partitions=journal_partitions
+            txn, plan, journal_partitions=journal_partitions | frozenset(
+                page_partition(file, page) for file, page in self._history_publication.images(txn.txn_id, through_lsn + 1)
+            )
         )
         if plan.state == "built":
             return
@@ -2947,6 +3110,21 @@ class TransactionManager:
                 observe(published_lsn)
             if self._index_sync is not None:
                 self._index_sync()
+        committed_catalog = getattr(catalog, "catalog", None)
+        if (type(committed_catalog) is Catalog
+                and "nullable_columns_v1" in committed_catalog.required_capabilities()):
+            for intent in reduced_intents:
+                table = intent.table
+                if committed_catalog.has_table(table.name, kind=table.kind):
+                    current_table = committed_catalog.table(table.name, kind=table.kind)
+                    if (current_table.table_id == table.table_id
+                            and replace(current_table, extra_node_labels=table.extra_node_labels) != table):
+                        raise GrafxSchemaVersionMismatch(
+                            "A staged row was bound before the table schema changed; retry in a new transaction.",
+                            field="schema_version", table=table.name,
+                            stored_schema_version=table.schema_version,
+                            current_schema_version=current_table.schema_version,
+                        )
         if manager is None:
             return
 
@@ -2968,7 +3146,10 @@ class TransactionManager:
                     or not committed_catalog.has_table(table_name)
                 ):
                     continue
-                table = committed_catalog.table(table_name)
+                try:
+                    table = committed_catalog.table_by_id(table_id)
+                except GrafxCorruptionDetected:
+                    continue  # A same-name sibling can still be private to this transaction.
                 if table.table_id == table_id:
                     selected.append(table)
             written_tables = tuple(selected)
@@ -3388,6 +3569,13 @@ class TransactionManager:
                 tuple_encoding_proofs=self._tuple_encoding_proofs,
             )
             self._require_not_closed("begin a transaction")
+            if self._temporal_context_factory is not None:
+                from okto_grafx.domain.temporal_runtime import TemporalTransactionContext
+                temporal = self._temporal_context_factory()
+                if type(temporal) is not TemporalTransactionContext:
+                    raise GrafxConfigurationError("Invalid transaction temporal context.", field="temporal_context")
+                transaction._temporal_context = temporal
+                self._require_not_closed("begin a transaction")
             self._open[transaction.txn_id] = transaction
             if metadata is not None:
                 self._commit_metadata[int(transaction.txn_id)] = metadata
@@ -3620,6 +3808,8 @@ class TransactionManager:
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._open.pop(txn.txn_id, None)
         self._commit_catalog_activation_plans.pop(txn.txn_id, None)
+        self._temporal_activation_plans.pop(txn.txn_id, None)
+        self._history_publication.forget(txn.txn_id)
         self._maintenance_txns.discard(int(txn.txn_id))
         self._commit_metadata.pop(int(txn.txn_id), None)
         if self._journal_attempt is not None and self._journal_attempt[0] == int(txn.txn_id):
@@ -4576,6 +4766,7 @@ class TransactionManager:
                                     txn.txn_id, None
                                 )
                                 self._commit_catalog_activation_plans.pop(txn.txn_id, None)
+                                self._temporal_activation_plans.pop(txn.txn_id, None)
                                 failure = _accumulate_failure(
                                     failure,
                                     self._drain_transaction_descriptor_scope(
@@ -4601,9 +4792,13 @@ class TransactionManager:
                         self._identity_leases.clear()
                         self._index_catalog_activation_plans.clear()
                         self._commit_catalog_activation_plans.clear()
+                        self._temporal_activation_plans.clear()
                         self._maintenance_txns.clear()
                         self._commit_metadata.clear()
                         self._journal_attempt = None
+                        self._history_publication.activations.clear()
+                        self._history_publication.controls.clear()
+                        self._history_publication.attempt = None
                         self._open.clear()
                         for mode_name in self._mode_counts:
                             self._mode_counts[mode_name] = 0
@@ -4731,6 +4926,7 @@ class TransactionManager:
             self._require_writable("commit a write transaction")
             self._require_recovery_complete()
             self._validate_staged_inputs(txn)
+            self._prepare_native_row_admission(txn, _commit_admitted=True)
             self._require_commit_catalog_writer_ready()
             activation_plan = self._index_catalog_activation_plans.get(txn.txn_id)
             if activation_plan is not None:
@@ -4948,6 +5144,7 @@ class TransactionManager:
                                 rows = self._write_rows(txn, identities)
                             materialized_pages = self._declare_page_interest(txn, rows)
                             materialized_pages = materialized_pages | self._prepare_journal(txn, current)
+                            materialized_pages = materialized_pages | self._history_publication.prepare(txn, current, rows)
                             journaled_commit = self._journal_attempt is not None
                             materialized_interest = self._materialized_page_delta(
                                 txn,
@@ -5008,7 +5205,8 @@ class TransactionManager:
                                 if commit_trace is not None:
                                     commit_trace.increment(COMMIT_RETARGETS_TOTAL)
                             self._materialized = None
-                            if not raw_batch_rolls and txn.txn_id not in self._commit_catalog_activation_plans:
+                            if (not raw_batch_rolls and txn.txn_id not in self._commit_catalog_activation_plans
+                                    and txn.txn_id not in self._history_publication.activations):
                                 records = self._compress_page_records(records, images)
                             self._validate_wal_batch_budget(txn, records)
                             if commit_trace is not None and (
@@ -5362,6 +5560,14 @@ class TransactionManager:
         # provenance hook below: a malformed pending identity must not reach any collaborator,
         # and certainly must not be mistaken for a physical RecordRef by the heap.
         self._validate_row_intents(txn)
+        self._history_publication.validate_staged(txn)
+        temporal_activation = self._temporal_activation_plans.get(txn.txn_id)
+        if temporal_activation is not None and (
+            txn.row_intents or txn.pending_records or txn.page_images != temporal_activation
+        ):
+            raise GrafxConfigurationError(
+                "Temporal-value activation requires an unchanged dedicated transaction.",
+                field="temporal_values_activation")
         activation = self._commit_catalog_activation_plans.get(txn.txn_id)
         if activation is not None:
             expected_catalog = Catalog.deserialize(activation[0])
@@ -5384,6 +5590,7 @@ class TransactionManager:
                 pages=list(unproved),
                 txn_id=txn.txn_id,
             )
+        self._validate_native_label_intents(txn)
         for file, _page_index in txn.staged_pages():
             if not is_redoable_page_file(file):
                 raise GrafxConfigurationError(
@@ -5435,6 +5642,10 @@ class TransactionManager:
                     txn_id=txn.txn_id,
                 )
             reference = intent.reference
+            if intent.node_labels is not None:
+                if operation is RowOperation.DELETE:
+                    raise GrafxConfigurationError("DELETE intents cannot carry label replacements.", field="node_labels")
+                _node_label_payload_bytes(intent.table, intent.node_labels)
             if operation is RowOperation.INSERT:
                 if reference is None:
                     continue  # accepted legacy insert; new inserts receive PendingRowRef
@@ -5518,6 +5729,48 @@ class TransactionManager:
         # -- this pass reports a caller's own mistake before the transaction spends anything, and
         # the later one decides against the picture as it is when the commit actually happens.
         self._refuse_reused_identities(txn, self._reserved_record_ids(txn, settled))
+
+    def _validate_native_label_intents(self, txn: TransactionContext) -> Catalog | None:
+        """Prove label replacements against the complete effective schema before writes."""
+        from okto_grafx.domain.model.node_labels import NODE_LABELS_CAPABILITY
+        from okto_grafx.engine.catalog_store import read_catalog_page_images
+
+        if not any(intent.node_labels is not None for intent in txn.row_intents):
+            return None
+        intents = tuple(intent for intent in reduce_row_intents(txn.row_intents)
+                        if intent.node_labels is not None)
+        if not intents:
+            return None
+        if txn.unproved_page_images():
+            raise GrafxConfigurationError("Label schema requires exact staging provenance.", field="page_image_provenance")
+        catalog = getattr(self._catalog, "catalog", None)
+        images = tuple((index, raw) for (file, index), raw in txn.page_images.items()
+                       if file == self._file_ids.catalog_file)
+        if images:
+            normalized = []
+            for index, raw in images:
+                page = Page.from_bytes(raw)
+                page.page_lsn = 1
+                normalized.append((index, page.to_bytes()))
+            catalog = read_catalog_page_images(tuple(normalized), page_size=self._pool.page_size, sequence=1)
+        if type(catalog) is not Catalog or not catalog.requires_capability(NODE_LABELS_CAPABILITY):
+            raise GrafxConfigurationError("Label replacements require journaled native capability admission.", field="node_labels")
+        for intent in intents:
+            try:
+                table = catalog.table_by_id(intent.table.table_id)
+            except GrafxCorruptionDetected as failure:
+                raise GrafxConfigurationError("Label intent names an unknown native table.", field="node_labels") from failure
+            if (table.kind != "node" or table.name != intent.table.name
+                    or not table.admits_node_labels(intent.node_labels)):
+                raise GrafxConfigurationError("Label intent exceeds effective native table authority.", field="node_labels")
+        heap = self._heap
+        if any(getattr(getattr(heap, method, None), "__func__", None) is not canonical
+               for method, canonical in (("insert", _CANONICAL_HEAP_INSERT),
+                   ("insert_reserved", _CANONICAL_HEAP_INSERT_RESERVED),
+                   ("insert_initial_reserved", _CANONICAL_HEAP_INSERT_INITIAL_RESERVED),
+                   ("update", _CANONICAL_HEAP_UPDATE))):
+            raise GrafxUnsupportedOperation("This custom heap cannot certify native label writes.", field="node_labels")
+        return catalog
 
     def _validate_pending_index_records(
         self, txn: TransactionContext, records: Sequence[object]
@@ -5778,6 +6031,7 @@ class TransactionManager:
         journal = self._journal_attempt
         if self._commit_catalog_capable and (journal is None or journal[0] != int(txn.txn_id)):
             raise GrafxTransactionStateError("Journal was not prepared before physical validation.", field="commit_catalog_publication")
+        predicted += len(self._history_publication.images(txn.txn_id, predicted))
         if journal is not None and journal[0] == int(txn.txn_id):
             predicted += journal[1].image_count + len(journal[2])
             journal_images = dict(journal[2])
@@ -5786,6 +6040,8 @@ class TransactionManager:
             staged = sorted(set(staged) | journal_images.keys())
         else:
             journal_images = {}
+        journal_images.update(self._history_publication.images(txn.txn_id, predicted))
+        staged = sorted(set(staged) | journal_images.keys())
         if predicted >= PROVISIONAL_CSN:
             raise GrafxTransactionStateError(
                 "The write-ahead log has exhausted its usable commit-number space; the maximum "
@@ -5794,6 +6050,7 @@ class TransactionManager:
                 value=base,
             )
         self._rebind_commit_catalog_activation(txn, predicted)
+        self._history_publication.rebind_activation(txn, predicted)
         if uses_canonical_index_staging:
             # Count and staging run in this same COMMIT_SECTION against the same immutable
             # catalog authority.  Carry that one-shot observation into the verifier instead of
@@ -5945,10 +6202,12 @@ class TransactionManager:
         )
         self._materialized = None
         rebound_activation = self._rebind_commit_catalog_activation(txn, new_csn)
+        rebound_activation = self._history_publication.rebind_activation(txn, new_csn) or rebound_activation
         journal = self._journal_attempt
         journal_images = (dict(journal[2]) | {(item.file, item.page_index): item.raw
                            for item in journal[1].bind(new_csn).images}
                           if journal is not None and journal[0] == int(txn.txn_id) else {})
+        journal_images.update(self._history_publication.images(txn.txn_id, new_csn))
         for file, page_index, image in images:
             page = reusable.get((file, page_index))
             if (file, page_index) in journal_images:
@@ -6389,9 +6648,11 @@ class TransactionManager:
         provisional = PROVISIONAL_CSN
         written: list[_RowWrite] = []
         try:
-            effective_row_tables = self._write_intents(
-                txn, heap, provisional, written, identities
-            )
+            label_catalog = self._validate_native_label_intents(txn)
+            with (heap._node_label_write_scope(label_catalog) if label_catalog is not None else nullcontext()):
+                effective_row_tables = self._write_intents(
+                    txn, heap, provisional, written, identities
+                )
         except BaseException as failure:
             # The intents already written are abandoned HERE, by the one frame that knows
             # about them. The caller sees only what this method returns, and a refusal on the
@@ -6419,6 +6680,8 @@ class TransactionManager:
         effective_row_tables: set[tuple[int, str]] = set()
         initialized_tables: set[int] = set()
         reserved_extent_proofs: dict[int, object] = {}
+        history_tables = (frozenset(key for key, _, _ in self._catalog.catalog.system_history_tables())
+                          if self._catalog is not None else frozenset())
         for position, intent in enumerate(self._resolved_intents(txn, identities)):
             effective_row_tables.add((intent.table.table_id, intent.table.name))
             if intent.operation is RowOperation.DELETE:
@@ -6436,6 +6699,11 @@ class TransactionManager:
                 continue
             if intent.operation is RowOperation.UPDATE:
                 record_id, ending = self._index_row_at(intent.reference)
+                labels = intent.node_labels
+                if labels is None and intent.table.kind == "node" and intent.table.table_id in history_tables:
+                    # A property-only replacement inherits the actual previous
+                    # membership, not the table name or a stale intent schema.
+                    labels = heap.read_landing(intent.reference).node_labels
                 update = heap.update
                 update_kwargs = (
                     {"_encoding_proof": intent._encoding_proof}
@@ -6448,6 +6716,7 @@ class TransactionManager:
                     intent.values,
                     provisional,
                     **update_kwargs,
+                    **({"node_labels": intent.node_labels} if intent.node_labels is not None else {}),
                 )
                 written.append(
                     _RowWrite(
@@ -6457,6 +6726,7 @@ class TransactionManager:
                         born_values=tuple(intent.values),
                         ended_values=ending,
                         record_id=record_id,
+                        born_node_labels=labels,
                     )
                 )
                 continue
@@ -6483,6 +6753,7 @@ class TransactionManager:
                     provisional,
                     next_record_id=initial_floor,
                     **initial_kwargs,
+                    **({"node_labels": intent.node_labels} if intent.node_labels is not None else {}),
                 )
                 initialized_tables.add(table_id)
             elif initial_floor is not None or position in identities.leased_positions:
@@ -6504,6 +6775,7 @@ class TransactionManager:
                     provisional,
                     extent_proof=extent_proof,
                     **reserved_kwargs,
+                    **({"node_labels": intent.node_labels} if intent.node_labels is not None else {}),
                 )
             else:
                 # The first row of a table has no extent to reserve yet.  Its ordinary insert
@@ -6521,6 +6793,7 @@ class TransactionManager:
                     intent.values,
                     provisional,
                     **insert_kwargs,
+                    **({"node_labels": intent.node_labels} if intent.node_labels is not None else {}),
                 )
             written.append(
                 _RowWrite(
@@ -6529,6 +6802,7 @@ class TransactionManager:
                     table=intent.table,
                     born_values=tuple(intent.values),
                     record_id=record_id,
+                    born_node_labels=intent.node_labels,
                 )
             )
         return frozenset(effective_row_tables)
@@ -6939,6 +7213,7 @@ class TransactionManager:
         epoch = lease.epoch
         try:
             self._prepare_journal(reservation, previous.last_committed_lsn)
+            self._history_publication.prepare(reservation, previous.last_committed_lsn)
             if trace is not None:
                 trace.phase("build_records")
             with self._close_wait_hazard():
@@ -8227,6 +8502,7 @@ class TransactionManager:
         final outcome non-retryable.
         """
         descriptor_failure = self._drain_transaction_descriptor_scope(txn.txn_id)
+        self._history_publication.forget(txn.txn_id)
         self._maintenance_txns.discard(int(txn.txn_id))
         self._commit_metadata.pop(int(txn.txn_id), None)
         if self._journal_attempt is not None and self._journal_attempt[0] == int(txn.txn_id):
@@ -8234,6 +8510,7 @@ class TransactionManager:
         self._open.pop(txn.txn_id, None)
         self._index_catalog_activation_plans.pop(txn.txn_id, None)
         self._commit_catalog_activation_plans.pop(txn.txn_id, None)
+        self._temporal_activation_plans.pop(txn.txn_id, None)
         if self._mode_counts[mode] > 0:
             self._mode_counts[mode] -= 1
         return self._mode_counts[mode], descriptor_failure

@@ -2,14 +2,82 @@
 
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 9, 2026. “Current” means the **latest recorded observation for
+Updated September 13, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
-Current development source is 0.0.5; published baseline is 0.0.4 with CAP-1 recovery work.
-The latest live measurement used
-`0.0.4@fa8f188`, not that later recovery checkpoint. No new live benchmark or
-spec consolidation was performed for this documentation refactor.
+Current development source is 0.0.6; published baseline is 0.0.5.
+The latest isolated installed Pulse/native observations below use the final
+0.0.6 candidate. The latest production spec-consolidation measurement still uses
+`0.0.4@fa8f188`; no production spec was consolidated for these tests.
 
-## Latest real Pulse sample
+## Latest 0.0.6 installed native graph observations
+
+Windows/CPython 3.13.1, NumPy 2.5.3, google-crc32c 1.8.0; exact privately installed
+wheel `d666704a...`. Fresh persistent chains, default 8,192-byte pages, 64 partitions,
+64 MiB buffer and strict descriptor revalidation. Reads: median of four subsequent
+calls after a retained first call, including public autocommit/materialization.
+Writes: median of three transactions, each including begin, 32 updates and durable
+COMMIT; no excluded warm-up write. The full regression ran concurrently.
+
+| Operation | 64 nodes / 63 edges | 1,024 nodes / 1,023 edges |
+| --- | ---: | ---: |
+| Indexed exact lookup | 2.335 ms | 3.248 ms |
+| Sorted first page, 50 exact IDs | 4.394 ms | 43.537 ms |
+| Complete count and exact sum | 3.177 ms | 38.336 ms |
+| Named outgoing trail, 0..3 hops | 6.066 ms | 8.589 ms |
+| Durable transaction updating 32 nodes | 149.304 ms | 992.746 ms |
+
+These are two bounded sizes, not a production-scale or throughput benchmark.
+The scalar UNWIND update retains scan work; indexed map-element driving keys
+already have a faster plan shape. Post-write checkpoints are measured separately,
+not hidden in the commit table. Exact cold-reopen values and zero verification
+findings are required on both stores. [Queries, raw boundary definitions, artifact
+hashes and reproducible tool](reports/FP_NATIVE_COST_OBSERVATIONS.md).
+
+## Latest isolated Pulse 0.3.3 API observations with Grafx 0.0.6
+
+One final qualification request per operation, loopback HTTP, 510 synthetic
+Decisions, one canonical Board Entity and 20 logical edges. Stub embeddings and
+normal background workers; the full native regression was active. These measure
+client-observed API work, **not** browser rendering, pure engine time or percentiles.
+
+| Operation | Latest observed request |
+| --- | ---: |
+| First KG page, 500 of 511 unique nodes | 4.183 s |
+| Cursor continuation, remaining 11 nodes | 228.684 ms |
+| Exact Decision count, 510 | 112.050 ms |
+| Logical relationship count, 20 | 542.285 ms |
+| Runtime Settings identity | 82.068 ms |
+
+Rows, cursor exhaustion and totals were checked independently. Real-browser
+pagination/search/detail also passed, without a measured paint-to-interactive
+latency. [Final paired candidate and exact HTTP receipt](reports/FP_FINAL_PULSE_QUALIFICATION.md).
+
+## Latest 0.0.6 native range-prefix observation
+
+Windows/Python 3.13, September 11, current development source; one in-memory handle,
+five consecutive `db.execute()` calls, timing only execute (first call includes
+planning, later calls reuse the prepared cache). No machine-idle certification.
+
+| Operation | Latest measured median |
+|---|---:|
+| `UNWIND range(1000000,2000000) AS i WITH i LIMIT 3000 RETURN sum(i)` | 14.03 ms |
+
+The exact result is `3004498500`; only 3,000 input values are consumed, with no
+million-element list allocation. Raw samples: 17.821, 14.734, 14.030, 13.156,
+12.785 ms. This is a scalar query observation, not a Pulse/graph-write benchmark
+or a performance gate. Tests in `tests/query/test_fp2_streamed_range.py` verify
+the carrier path, exact LIMIT pulls, budgets, rollback/reopen and cursor cleanup.
+
+## Latest 0.0.6 physical posting evidence
+
+Windows/Python 3.13, September 10: 60 rows repeating one 80-character string,
+512-byte pages and one hash bucket, explicit `posting_hash`: **4 bucket pages**.
+A separate 120-row same-key INSERT batch performs **1 membership chain scan**.
+These are deterministic structural counts, not latency/throughput or a Pulse
+measurement. See [usage and limits](POSTING_HASH.md) and
+`tests/api/test_posting_hash.py`; full results remain O(output + bucket pages).
+
+## Latest production spec-consolidation Pulse sample
 
 Pulse 0.3.3; Grafx 0.0.4 `fa8f188`; Windows, Python 3.13; NumPy 2.5.2 and
 google-crc32c 1.8.0 installed. Eleven Alternative nodes and 22 edges, no vector

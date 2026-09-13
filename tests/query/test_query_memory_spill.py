@@ -42,6 +42,31 @@ def _run(stack: QueryStack, text: str):
     return stack.engine.execute(text, stack.transaction())
 
 
+@pytest.mark.parametrize("query", (
+    "UNWIND $xs AS x RETURN DISTINCT x",
+    "UNWIND $xs AS x RETURN x, count(*) AS n",
+    "UNWIND $xs AS x RETURN count(DISTINCT x)",
+    "UNWIND $xs AS x RETURN x ORDER BY x",
+    "UNWIND $xs AS x RETURN min(x), max(x)",
+))
+def test_numeric_equivalence_is_identical_in_memory_and_spill(query, monkeypatch):
+    values = ([1, 1.0, 0, -0.0, True, False, 9007199254740992, 9007199254740993,
+               9007199254740992.0, {"v": 1}, {"v": 1.0}, [1, None], [1.0, None]] * 10)
+    values.extend(f"unique-{index}" for index in range(120))
+    ordinary = build_query_stack(query_memory_budget_bytes=None)
+    spilled = build_query_stack(query_memory_budget_bytes=4096)
+    expected = ordinary.engine.execute(query, ordinary.transaction(), {"xs": values})
+    opened = []
+    original_open = LocalQuerySpillFactory.open
+    def record_open(factory, budget):
+        opened.append(True)
+        return original_open(factory, budget)
+    monkeypatch.setattr(LocalQuerySpillFactory, "open", record_open)
+    actual = spilled.engine.execute(query, spilled.transaction(), {"xs": values})
+    assert actual.rows == expected.rows
+    assert opened, "The equivalence test must actually exercise external spill."
+
+
 def test_external_sort_matches_the_unbounded_stable_result() -> None:
     ordinary = _filled(budget=None)
     spilled = _filled(budget=2_048)
@@ -71,14 +96,18 @@ def test_spilled_sort_keeps_the_canonical_stable_nan_order() -> None:
         )
     )
     stack.catalog_store.save()
-    for record_id, value in ((1, float("nan")), (2, 0.0), (3, float("nan")), (4, -1.0)):
+    for record_id, value in ((1, 0.0), (2, 0.0), (3, 0.0), (4, -1.0)):
         stack.insert("Measurement", record_id, (record_id, value))
 
     ascending = _run(
-        stack, "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value"
+        stack, "MATCH (m:Measurement) WITH m.id AS id, "
+        "CASE WHEN m.id % 2 = 1 THEN 0.0 / 0.0 ELSE m.value END AS value "
+        "RETURN id, value ORDER BY value"
     )
     descending = _run(
-        stack, "MATCH (m:Measurement) RETURN m.id, m.value ORDER BY m.value DESC"
+        stack, "MATCH (m:Measurement) WITH m.id AS id, "
+        "CASE WHEN m.id % 2 = 1 THEN 0.0 / 0.0 ELSE m.value END AS value "
+        "RETURN id, value ORDER BY value DESC"
     )
 
     assert tuple(row[0] for row in ascending.rows) == (4, 2, 1, 3)
@@ -134,16 +163,16 @@ def test_spilled_grouping_preserves_repeated_and_distinct_nan_identities() -> No
             )
         )
         stack.catalog_store.save()
-        stack.insert("Measurement", 1, (1, float("nan")))
-        stack.insert("Measurement", 2, (2, float("nan")))
-        stack.insert("Measurement", 3, (3, float("nan")))
+        stack.insert("Measurement", 1, (1, 0.0))
+        stack.insert("Measurement", 2, (2, 0.0))
+        stack.insert("Measurement", 3, (3, 0.0))
         groups = _run(
             stack,
-            "MATCH (m:Measurement) RETURN m.value AS value, count(*) AS rows",
+            "MATCH (m:Measurement) RETURN m.value / 0.0 AS value, count(*) AS rows",
         )
         distinct = _run(
             stack,
-            "MATCH (m:Measurement) RETURN count(DISTINCT m.value) AS values",
+            "MATCH (m:Measurement) RETURN count(DISTINCT m.value / 0.0) AS values",
         )
         shared = float("nan")
         parameter_group = stack.engine.execute(
@@ -158,7 +187,7 @@ def test_spilled_grouping_preserves_repeated_and_distinct_nan_identities() -> No
         )
         row_distinct = _run(
             stack,
-            "MATCH (m:Measurement) RETURN DISTINCT m.value AS value",
+            "MATCH (m:Measurement) RETURN DISTINCT m.value / 0.0 AS value",
         )
         parameter_row_distinct = stack.engine.execute(
             "MATCH (m:Measurement) RETURN DISTINCT $value AS value",

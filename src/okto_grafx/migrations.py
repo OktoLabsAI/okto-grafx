@@ -15,6 +15,7 @@ from okto_grafx.domain.errors import (
     GrafxWriteConflict, GrafxPlanError,
 )
 from okto_grafx.domain.model.catalog import Catalog
+from okto_grafx.domain.model.relationship_type import RelationshipTypeDef
 from okto_grafx.domain.model.schema import ColumnDef, EmbeddingSpaceDef, TableDef, is_identifier
 from okto_grafx.domain.model.value import ValueType
 from okto_grafx.domain.query.ast import (
@@ -80,22 +81,22 @@ def _ledger_error(reason: str) -> GrafxLedgerError:
                             operation="migrate_schema", reason=reason)
 
 
-def _catalog(database: Database) -> Catalog:
-    """Build a detached schema-only catalog from the supported observation facade."""
-    view = database.catalog.catalog
-    catalog = Catalog()
-    for space in view.space_definitions:
-        catalog.add_space(space)
-    for table in view.table_definitions:
-        catalog.add_table(table)
-    return catalog
+def _catalog(database: Database, transaction: Transaction) -> Catalog:
+    """Capture complete native schema metadata in the migration's fenced snapshot.
+
+    Rebuilding tables alone loses capability/group/index authority and makes a
+    preview describe a different schema from the one execution will mutate.
+    The copy has private dictionaries and grants no storage/transaction handle.
+    """
+    with database._transactions.page_access_section(transaction=transaction._context):
+        return database._catalog.catalog.copy()
 
 
 def _history(tx: Transaction, catalog: Catalog, ledger: str, owner: str,
              plan: tuple[SchemaMigration, ...]) -> tuple[int, ...]:
-    if not catalog.has_table(ledger):
+    if not catalog.has_table(ledger, kind="node"):
         return ()
-    table = catalog.table(ledger)
+    table = catalog.table(ledger, kind="node")
     if (table.kind != "node" or table.columns != _COLUMNS or table.primary_key != "version"):
         raise _ledger_error("unexpected_ledger_schema")
     rows = tx.execute(
@@ -120,8 +121,17 @@ def _simulate(catalog: Catalog, migrations: tuple[SchemaMigration, ...]) -> None
                 catalog.add_table(TableDef(table_id=catalog.next_table_id(), name=node.name,
                     kind="node", columns=node.columns, primary_key=node.primary_key))
             elif isinstance(node, CreateRelTable):
-                catalog.add_table(TableDef(table_id=catalog.next_table_id(), name=node.name,
-                    kind="rel", columns=node.columns, from_table=node.from_table, to_table=node.to_table))
+                if node.endpoint_pairs:
+                    members = []
+                    for source, target in node.endpoint_pairs:
+                        key = catalog.next_table_id()
+                        catalog.add_table(TableDef(key, f"_gx_rel_{key:08x}", "rel", node.columns,
+                                                   from_table=source, to_table=target))
+                        members.append(key)
+                    catalog.add_relationship_type(RelationshipTypeDef(node.name, tuple(members)))
+                else:
+                    catalog.add_table(TableDef(table_id=catalog.next_table_id(), name=node.name,
+                        kind="rel", columns=node.columns, from_table=node.from_table, to_table=node.to_table))
             elif isinstance(node, CreateVectorSpace):
                 catalog.add_space(EmbeddingSpaceDef(space_id=catalog.next_space_id(), name=node.name,
                     dimension=node.dimension, metric=node.metric, normalized=node.normalized,
@@ -166,7 +176,7 @@ def migrate_schema(database: Database, migrations: tuple[SchemaMigration, ...], 
         for attempt in range(max_attempts):
             try:
                 with database.begin("read" if dry_run else "write") as tx:
-                    catalog = _catalog(database)
+                    catalog = _catalog(database, tx)
                     if database.transactions.published_state().last_committed_lsn != tx.snapshot.read_lsn:
                         raise GrafxWriteConflict("Schema moved after opening the migration snapshot.")
                     seen = _history(tx, catalog, ledger, owner, migrations)
@@ -178,7 +188,7 @@ def migrate_schema(database: Database, migrations: tuple[SchemaMigration, ...], 
                         return MigrationReport(namespace, dry_run,
                             tuple(v for v in seen if v not in applied), tuple(applied),
                             tuple(m.version for m in remaining), tuple(lsns))
-                    if not catalog.has_table(ledger):
+                    if not catalog.has_table(ledger, kind="node"):
                         tx.execute(f"CREATE NODE TABLE {ledger}(version INT64, checksum STRING, PRIMARY KEY(version))")
                         tx.execute(f"CREATE (:{ledger} {{version:0, checksum:$hash}})", {"hash": owner})
                     next_step = remaining[0]

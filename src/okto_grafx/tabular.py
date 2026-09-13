@@ -5,9 +5,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from collections.abc import Iterator
 
-from okto_grafx.arrow import ArrowVectorType, _arrow_type, _metadata, import_arrow_batches, to_arrow_batches
+from okto_grafx.arrow import (
+    ArrowVectorType, ArrowDecimalType, _arrow_type, _metadata, _scalar_arrow_types, _structured,
+    import_arrow_batches, to_arrow_batches,
+)
 from okto_grafx.engine.database import Transaction, QueryCursor, ExecuteManyReport
 from okto_grafx.engine.query_engine import QueryResult
+from okto_grafx.domain.model.stored_types import StoredType
+from okto_grafx._arrow_values import _own_collections
 from okto_grafx.errors import GrafxConfigurationError, GrafxUnsupportedOperation, GrafxQueryBudgetExceeded
 
 if TYPE_CHECKING:
@@ -40,10 +45,9 @@ def _limit(name, value, maximum=2**31):
 
 
 def _schema(names, types, pa):
-    scalar = {"BOOL": pa.bool_(), "INT64": pa.int64(), "DOUBLE": pa.float64(), "STRING": pa.string(),
-              "BYTES": pa.binary(), "TIMESTAMP": pa.timestamp("us", tz="UTC"), "UUID": pa.binary(16)}
+    scalar = _scalar_arrow_types(pa)
     if (type(types) is not tuple or not 1 <= len(types) <= 256 or len(names) != len(types)
-            or any(type(t) is not ArrowVectorType and (type(t) is not str or t not in scalar) for t in types)):
+            or any(type(t) not in (ArrowVectorType, ArrowDecimalType, StoredType) and (type(t) is not str or t not in scalar) for t in types)):
         raise GrafxConfigurationError("Explicit supported types must match all columns.", field="types")
     if any(type(n) is not str or not n or len(n) > 256 for n in names) or len(set(names)) != len(names):
         raise GrafxConfigurationError("Column names must be unique nonempty strings.", field="columns")
@@ -56,17 +60,21 @@ def _match_schema(observed, expected, types):
     for actual, wanted, kind in zip(observed, expected, types):
         metadata = actual.metadata or {}
         required = wanted.metadata or {}
-        bad = (any(metadata.get(k) != v for k, v in required.items()) if type(kind) is ArrowVectorType else
+        bad = (any(metadata.get(k) != v for k, v in required.items()) if _structured(kind) else
                b"grafx.type" in metadata and metadata[b"grafx.type"] != required[b"grafx.type"])
         if actual.type != wanted.type or bad:
             raise GrafxUnsupportedOperation("Tabular field differs from its declared native type.", field="types", column=actual.name)
 
 
 def _charge(batch):
-    return 256 + 256 * batch.num_columns + 80 * batch.num_rows * batch.num_columns + 16 * batch.nbytes
+    pa = _arrow()
+    decimals = sum(pa.types.is_decimal(field.type) for field in batch.schema)
+    return (256 + 256 * batch.num_columns + 80 * batch.num_rows * batch.num_columns
+            + 16 * batch.nbytes + 1024 * batch.num_rows * decimals
+            + 16 * sum(len((field.metadata or {}).get(b"grafx.stored_type", b"")) for field in batch.schema))
 
 
-def to_pandas(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType, ...],
+def to_pandas(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...],
               batch_rows: int = 256, max_batch_bytes: int = 16 * 1024 * 1024,
               max_rows: int = 100_000, max_bytes: int = 64 * 1024 * 1024) -> DataFrame:
     """Materialize an explicitly typed Arrow-backed frame; never infer dtypes or close a cursor."""
@@ -75,6 +83,7 @@ def to_pandas(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVect
     _limit("max_rows", max_rows)
     _limit("max_bytes", max_bytes)
     pa, pd = _arrow(), _pandas()
+    types = _own_collections(types)
     schema = _schema(source.columns, types, pa)
     batches, rows, charge = [], 0, 4096
     if charge > max_bytes:
@@ -91,10 +100,10 @@ def to_pandas(source: QueryResult | QueryCursor, *, types: tuple[str | ArrowVect
 
 
 def import_pandas(transaction: Transaction, statement: str, frame: DataFrame, *,
-                  types: tuple[str | ArrowVectorType, ...], max_batch_rows: int = 256,
+                  types: tuple[str | ArrowVectorType | ArrowDecimalType | StoredType, ...], max_batch_rows: int = 256,
                   max_batch_bytes: int = 16 * 1024 * 1024, max_rows: int = 1_000_000,
                   max_batches: int = 4096) -> ExecuteManyReport:
-    """Stage one Arrow-backed DataFrame atomically; require explicit dtypes and vector metadata."""
+    """Stage an Arrow-backed frame atomically; native parameterized types require metadata."""
     pa, pd = _arrow(), _pandas()
     if type(frame) is not pd.DataFrame:
         raise GrafxConfigurationError("Expected an exact DataFrame.", field="frame")
@@ -102,6 +111,7 @@ def import_pandas(transaction: Transaction, statement: str, frame: DataFrame, *,
     _limit("max_batch_bytes", max_batch_bytes)
     _limit("max_rows", max_rows)
     _limit("max_batches", max_batches)
+    types = _own_collections(types)
     schema = _schema(tuple(frame.columns), types, pa)
     for name, field in zip(frame.columns, schema):
         dtype = frame[name].dtype
@@ -112,8 +122,8 @@ def import_pandas(transaction: Transaction, statement: str, frame: DataFrame, *,
         if type(observed) is not pa.Schema:
             raise GrafxConfigurationError("grafx.arrow_schema must be an Arrow Schema.", field="metadata")
         _match_schema(observed, schema, types)
-    elif any(type(t) is ArrowVectorType for t in types):
-        raise GrafxUnsupportedOperation("Vector DataFrames require grafx.arrow_schema metadata.", field="metadata")
+    elif any(_structured(t) for t in types):
+        raise GrafxUnsupportedOperation("Structured DataFrames require grafx.arrow_schema metadata.", field="metadata")
     if len(frame) > max_rows:
         raise GrafxQueryBudgetExceeded("Pandas import row bound exceeded.", resource="pandas_import")
 
@@ -123,6 +133,7 @@ def import_pandas(transaction: Transaction, statement: str, frame: DataFrame, *,
             segment = frame.iloc[start:start + max_batch_rows]
             arrays = [segment[name].array.__arrow_array__() for name in segment.columns]
             charge = 256 + 256 * len(types) + 80 * len(segment) * len(types) + 16 * sum(a.nbytes for a in arrays)
+            charge += 1024 * len(segment) * sum(type(kind) is ArrowDecimalType for kind in types)
             if charge > max_batch_bytes:
                 raise GrafxQueryBudgetExceeded("Pandas batch bound exceeded.", resource="pandas_import")
             yield pa.RecordBatch.from_arrays([a.combine_chunks() for a in arrays], schema=schema)

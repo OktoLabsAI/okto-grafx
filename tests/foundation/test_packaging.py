@@ -58,7 +58,7 @@ def test_package_discovery_excludes_optional_sibling_wheels(
 
 
 def test_acceleration_is_a_base_runtime_dependency(manifest: dict[str, Any]) -> None:
-    assert manifest["project"]["dependencies"] == ["numpy>=1.24", "google-crc32c>=1.5"]
+    assert manifest["project"]["dependencies"] == ["numpy>=1.24", "google-crc32c>=1.5", "tzdata>=2024.1"]
 
 
 def test_optional_dependencies_are_the_declared_extras(manifest: dict[str, Any]) -> None:
@@ -71,7 +71,7 @@ def test_optional_dependencies_are_the_declared_extras(manifest: dict[str, Any])
         "networkx": ["networkx>=3"],
         "accel": [],
         "bench": ["ladybug==0.16.0", "numpy>=1.24"],
-        "dev": ["pytest>=8", "pytest-timeout", "ruff==0.15.1", "PyYAML>=6"],
+        "dev": ["pytest>=8", "pytest-timeout", "ruff==0.15.1", "PyYAML>=6", "gherkin-official==37.0.0"],
     }
 
 
@@ -164,6 +164,9 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
     # to `from okto_grafx import *`, and it is exported code that no import ever exercises.
     assert okto_grafx.__all__ == [
         "CancellationToken",
+        "CatalogInfo",
+        "CatalogPathPolicy",
+        "CatalogSession",
         "CommitCatalogEntry",
         "CommitHistoryPage",
         "CommitId",
@@ -175,22 +178,44 @@ def test_the_package_imports_from_a_clean_interpreter() -> None:
         "Database",
         "DatabaseConfig",
         "DatabaseIdentity",
+        "DateTimeValue",
+        "DateValue",
+        "DecimalValue",
+        "DurationValue",
+        "EntityIdentity",
+        "EntityProvenance",
         "ExecuteManyReport",
         "HybridHit",
         "HybridSearchOptions",
         "HybridSearchResult",
+        "LocalDateTimeValue",
+        "LocalTimeValue",
         "MetadataLimits",
+        "NodeValue",
+        "PathValue",
         "PortRegistry",
         "Query",
         "QueryCursor",
         "QueryResult",
+        "QueryValue",
+        "RelationshipValue",
         "ScanCursorV1",
         "ScanPageV1",
         "ScanRowV1",
+        "StoredType",
+        "TemporalCompactionReport",
+        "TemporalGraph",
+        "TemporalLimits",
+        "TemporalPin",
+        "TemporalPruneReport",
+        "TemporalVersion",
+        "TemporalVersions",
         "TextHit",
         "TextIndexOptions",
+        "TextMatchPositions",
         "TextSearchLimits",
         "TextSearchResult",
+        "TimeValue",
         "Timestamp",
         "Transaction",
         "VectorValue",
@@ -351,7 +376,9 @@ def test_the_built_wheel_declares_default_acceleration(built_wheel: Path) -> Non
         for line in metadata.splitlines()
         if line.startswith("Requires-Dist:") and "extra ==" not in line
     ]
-    assert set(required) == {"Requires-Dist: numpy>=1.24", "Requires-Dist: google-crc32c>=1.5"}, required
+    assert set(required) == {
+        "Requires-Dist: numpy>=1.24", "Requires-Dist: google-crc32c>=1.5", "Requires-Dist: tzdata>=2024.1",
+    }, required
     assert "Requires-Python: >=3.11" in metadata
 
 

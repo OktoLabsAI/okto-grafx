@@ -188,7 +188,7 @@ def test_seek_is_differentially_equal_to_the_canonical_scan(
     assert accelerated == canonical
 
 
-def test_a_non_list_probe_keeps_the_public_in_refusal_at_the_scan(
+def test_a_non_list_probe_refuses_at_binding_before_seek_or_scan(
     database: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     counts = _doors(monkeypatch)
@@ -197,7 +197,9 @@ def test_a_non_list_probe_keeps_the_public_in_refusal_at_the_scan(
 
     assert "IN looks inside a list" in refused.value.to_dict()["message"]
     assert counts["many"] == 0 and counts["certificates"] == 0
-    assert counts["scans"] == 1
+    assert counts["scans"] == 0
+    assert refused.value.details["query_phase"] == "execution"
+    assert refused.value.details["reason"] == "membership_operand_type"
 
 
 def test_a_probe_the_key_cannot_encode_takes_the_scan_without_a_new_refusal(
@@ -515,7 +517,7 @@ def test_a_table_whose_rows_were_all_deleted_keeps_the_selector(
 ) -> None:
     """Ids once allocated are not the empty proof: the rule and its scan still run."""
     with database.begin("write") as transaction:  # type: ignore[attr-defined]
-        transaction.execute("MATCH (n:A) DELETE n")
+        transaction.execute("MATCH (n:A) DETACH DELETE n")
     counts = _doors(monkeypatch)
     assert database.execute(QUERY, {"ids": ["a1"]}).rows == ()  # type: ignore[attr-defined]
     assert counts["many"] == 1 and counts["scans"] == 0
