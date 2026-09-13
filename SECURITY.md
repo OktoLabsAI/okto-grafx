@@ -5,10 +5,14 @@
 Security fixes are prepared for the latest published Okto Grafx release. When a fix is released,
 users should upgrade to the newest available version. Older versions may not receive backports.
 
-Okto Grafx is pre-alpha (0.0.1) and the on-disk format is not yet stable. An upgrade may require
-rebuilding a database rather than migrating it.
+Okto Grafx is in the 0.0.x development series. Review the release-specific compatibility guide
+and changelog before upgrading; do not assume that a public repository makes every development
+branch a supported release or guarantees on-disk compatibility.
 
 ## Reporting a vulnerability
+
+Public visibility is not authorization to publish operational data or credentials. Repository
+publication and administrator-review requirements are described in [GOVERNANCE.md](GOVERNANCE.md).
 
 Do not open a public GitHub issue for a suspected vulnerability. Send a private report to
 **dev@oktolabs.ai** with:

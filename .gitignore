@@ -14,3 +14,10 @@ htmlcov/
 bench/results/
 .grafx-tmp/
 *.stackdump
+# Local agent/browser evidence and credentials must not enter public history.
+.claude/
+.playwright-mcp/
+.env
+.env.*
+!.env.example
+.release-*-dist/

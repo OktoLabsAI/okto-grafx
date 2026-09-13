@@ -1,7 +1,8 @@
 # Contributing to Okto Grafx
 
-Thank you for helping improve Okto Grafx. Use a focused branch and a pull request for every change;
-the `main` branch is protected.
+Thank you for helping improve Okto Grafx. Use a focused branch and a pull request for every change,
+including administrator changes. [Repository governance](GOVERNANCE.md) specifies the required
+protection and records the activation prerequisite; a CODEOWNERS file alone does not enforce it.
 
 Okto Grafx is a database. A defect here is not a wrong pixel — it is a row that is not there after a
 commit said it was. The conventions below exist because of specific failures this project has
@@ -10,7 +11,8 @@ already paid for, and each one names the failure it prevents.
 ## Prerequisites
 
 - Python 3.11, 3.12, or 3.13
-- No other runtime dependency. The core is pure Python.
+- The Python package installs NumPy, google-crc32c and tzdata by default. Optional integrations
+  declare their own extras; install the development extras for the test suite.
 
 ## Getting set up
 
@@ -148,7 +150,10 @@ pytest tests/smoke -q
    and the numbers you measured — a claim nobody can re-run is worse than no claim, and this project
    has a lesson about that (L31).
 5. Record known gaps in `ROADMAP.md` (historical detail in `docs/archive/ROADMAP_SOURCES.md`) rather than leaving them implied.
-6. Resolve review conversations and wait for the required checks and approvals before merging.
+6. Resolve review conversations, inspect the relevant CI results and obtain an approval from
+   a designated administrator in [.github/CODEOWNERS](.github/CODEOWNERS) before merging.
+   New reviewable commits invalidate stale approvals; the most recent reviewable push must be
+   approved by someone other than its pusher. Do not use administrator bypass or direct pushes.
 
 Never commit a database directory, a WAL, metrics output, a quarantine or ledger file, or private
 data of any kind. Report security vulnerabilities using [SECURITY.md](SECURITY.md), not a public
@@ -159,6 +164,9 @@ issue.
 Okto Grafx is distributed under the Elastic License 2.0 together with the project's SaaS,
 competing-service, internal-use, and attribution addendum. See [LICENSE](LICENSE). By opening a pull
 request you agree that your contribution is licensed under those same terms.
+
+Public source access does not replace this custom license with unmodified ELv2 or an
+OSI-approved license. Third-party code retains its applicable notices and licenses.
 
 Do not add code carrying an incompatible license, and do not remove or alter the Okto Labs or
 Okto Grafx notices: Section III of the addendum requires them to stay intact in the source
