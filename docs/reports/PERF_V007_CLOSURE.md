@@ -142,6 +142,19 @@ The workflow parses and its two checkout revisions/environment paths agree with
 the freezer. Documentation/API checks, Ruff and diff checks pass. Evidence is
 retained under `.grafx-tmp/perf07/merge-main/`; it is not a new full regression.
 
+The previously invalid `v006-compatibility.yml` also needed a block scalar for
+the `--only-binary=:all:` command. Once GitHub could parse it, both Linux and
+Windows upgrade workers failed on missing `tzdata`. The workflow now installs
+the built candidate and its declared runtime dependencies. A fresh Windows /
+Python 3.11.14 environment reproducing that workflow passes all 14 installed
+0.0.5-to-0.0.7 upgrade cells and its 38 selected regression tests (93.97 seconds),
+with zero exits. This is bounded upgrade qualification, not a full installed
+platform qualification. All three workflow files parse locally.
+
+The PR's next D5 POSIX observation at `5e3cb96` still fails durable commit at
+11.42x against 10x; point read, open replay and vector recall meet their targets.
+This remains failed evidence, independently of CI dependency corrections.
+
 ## Round disposition and retained evidence
 
 Implementation is closed for this v0.0.7 round. Delivered platform mechanisms
