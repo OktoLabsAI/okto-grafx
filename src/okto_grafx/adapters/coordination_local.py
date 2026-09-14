@@ -64,6 +64,7 @@ from okto_grafx.domain.errors import (
     GrafxUnsupportedOperation,
 )
 from okto_grafx.domain.ids import Epoch, Lsn
+from okto_grafx.domain.page.checksum import crc32c
 from okto_grafx.domain.ports.clock import Clock
 from okto_grafx.domain.ports.coordination import DeadOwnerReport, Lease, ReaderHandle
 from okto_grafx.domain.ports.metrics import MetricsSink
@@ -822,6 +823,12 @@ class LocalProcessCoordinator:
     thread and the same section name may nest; the lock is taken once and released when the
     outermost block exits. A different thread, a different coordinator instance or a different
     process always contends for real, in both modes.
+
+    One narrow exception to the first mode, and it changes no exclusion:
+    :meth:`_declare_private_section` converts a section whose name carries this instance's own
+    ``owner_id`` digest to the second mode's mechanism. Such a name cannot be produced by any
+    other coordinator instance, so nothing outside this process was ever excluded by its file
+    lock, and the lock file is still created so the control directory looks the same.
     """
 
     def __init__(
@@ -890,6 +897,9 @@ class LocalProcessCoordinator:
 
         self._state_lock = threading.RLock()
         self._sections: dict[tuple[int, str], object] = {}
+        # Sections proved private to THIS instance by _declare_private_section. Empty unless a
+        # caller declares one, so the default shape of every section is unchanged.
+        self._private_section_locks: dict[str, threading.Lock] = {}
         self._descriptor_scopes: dict[tuple[int, str], _ReusableDescriptorScope] = {}
         self._held: Lease | None = None
         self._installed: Lease | None = None
@@ -1496,7 +1506,7 @@ class LocalProcessCoordinator:
         if not isinstance(name, str):
             raise _reject("The section name must be a string.", value=repr(name))
         normalized = _validate_identifier("section name", name.lower())
-        if self._lock_directory is None:
+        if self._lock_directory is None or normalized in self._private_section_locks:
             return None
         return self._reuse_unlocked_section_descriptor(normalized, revalidated=True)
 
@@ -1505,7 +1515,8 @@ class LocalProcessCoordinator:
         self, name: str, *, revalidated: bool = False
     ) -> Iterator[None]:
         """Bound descriptor reuse to one thread and one exact section name."""
-        if self._lock_directory is None:
+        if self._lock_directory is None or name in self._private_section_locks:
+            # Nothing is opened per entry for these sections, so there is no descriptor to park.
             yield
             return
 
@@ -1965,11 +1976,23 @@ class LocalProcessCoordinator:
         """Take the advisory lock of a section, or raise GrafxLeaseTimeout on expiry."""
         if self._lock_directory is None:
             return self._take_local_lock(name, timeout)
+        private = self._private_section_locks.get(name)
+        if private is not None:
+            # A section whose name carries this instance's own owner digest cannot be entered
+            # by any other participant, so its exclusion has nothing to say between processes
+            # and the operating-system lock is pure cost. See _declare_private_section.
+            return self._wait_for_local_lock(private, name, timeout)
         return self._take_file_lock(name, timeout)
 
     def _take_local_lock(self, name: str, timeout: float) -> object:
         """Take the process-wide lock that stands in for a section with no lock directory."""
         lock = _shared_section_lock(self._namespace, f"{self._control}/{name}")
+        return self._wait_for_local_lock(lock, name, timeout)
+
+    def _wait_for_local_lock(
+        self, lock: threading.Lock, name: str, timeout: float
+    ) -> object:
+        """Take an in-process section lock on the injected clock, or raise GrafxLeaseTimeout."""
         deadline = self._clock.monotonic() + timeout
         allowance = self._iteration_budget(timeout)
         iterations = 0
@@ -1987,12 +2010,68 @@ class LocalProcessCoordinator:
                 )
             self._sleep(min(self._poll, deadline - now))
 
-    def _take_file_lock(self, name: str, timeout: float) -> object:
-        """Take the operating-system advisory lock that backs a section between processes."""
+    def _declare_private_section(self, name: str) -> bool:
+        """Serialise one PROVABLY instance-private section in this process instead of on disk.
+
+        The optional, private-performance capability behind W-01. A caller may declare a section
+        private only by naming it with the digest of THIS coordinator's ``owner_id``, and that
+        identity is not a configured string: it always ends in ``_INSTANCE_NONCE_LENGTH`` hex
+        characters of ``uuid4`` minted in :meth:`__init__`, so no other coordinator instance --
+        in this process or any other, with or without the same configured owner name, before or
+        after a reopen -- can produce the digest. The name is therefore unreachable by anything
+        the operating-system lock could have excluded, and what remains to exclude is exactly the
+        THREADS of this instance, which a process lock excludes precisely.
+
+        Refused, so the claim can never be taken on trust:
+
+        * a name that does not carry this instance's digest (the cross-process sections --
+          ``commit``, ``writer.lease``, ``first-open``, ``page0-*`` -- can never satisfy it);
+        * a name whose section is held right now, by any thread, so the mechanism behind a live
+          section can never change underneath its holder.
+
+        The lock FILE is still created, once, exactly where and when the first entry would have
+        created it. Its presence is part of the observable control inventory that forensic and
+        census tooling compares, and a declaration must not change what a directory looks like --
+        only how often this process pays for it. It is never locked again afterwards.
+
+        Returns True when the declaration took effect (including a repeat of one already made).
+        """
+        if not isinstance(name, str):
+            raise _reject("The section name must be a string.", value=repr(name))
+        normalized = _validate_identifier("section name", name.lower())
+        if self._lock_directory is None:
+            # Sections are already process-local here; there is nothing to convert and no lock
+            # file to preserve.
+            return False
+        digest = f"{crc32c(self._owner.encode('utf-8')):08x}"
+        if not normalized.endswith(digest):
+            return False
+        with self._state_lock:
+            existing = self._private_section_locks.get(normalized)
+            if existing is not None:
+                return True
+            if any(key[1] == normalized for key in self._sections):
+                return False
+        path = self._lock_file_path(normalized)
+        deadline = self._clock.monotonic() + self._section_timeout
+        handle = self._open_lock_file(path, normalized, deadline)
+        self._close_file_descriptor(handle)
+        with self._state_lock:
+            if any(key[1] == normalized for key in self._sections):
+                return False
+            self._private_section_locks.setdefault(normalized, threading.Lock())
+        return True
+
+    def _lock_file_path(self, name: str) -> str:
+        """Return the host path of one section's lock file: the ONE native path built here."""
         directory = self._lock_directory
-        path = os.path.join(
+        return os.path.join(
             "" if directory is None else directory, f"{name}{LOCK_FILE_SUFFIX}"
         )
+
+    def _take_file_lock(self, name: str, timeout: float) -> object:
+        """Take the operating-system advisory lock that backs a section between processes."""
+        path = self._lock_file_path(name)
         deadline = self._clock.monotonic() + timeout
         key = (threading.get_ident(), name)
         scope: _ReusableDescriptorScope | None = None
