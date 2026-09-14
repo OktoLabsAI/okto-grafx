@@ -470,10 +470,19 @@ def _instrument_hashes(
 
 
 def _terminate_process_tree(process: subprocess.Popen, root: Any) -> None:
-    """Best-effort whole-tree termination; never leave a timed-out instrument writing."""
+    """Clean up known descendants; refuse when platform termination proof is unavailable."""
     posix_tree_kill_ok = True
     posix_group_gone = False
     windows_tree_kill_ok = True
+    descendants = []
+    if os.name == "nt" and root is not None:
+        try:
+            # taskkill can remove a launcher before its descendants. Retain
+            # psutil's PID/birth-bound objects while the root still exists, so
+            # the fallback can reach them even after that ancestry is lost.
+            descendants.extend(root.children(recursive=True))
+        except Exception:  # noqa: BLE001 - process may have exited
+            pass
     if os.name == "posix":
         try:
             # _spawn(start_new_session=True) makes the child's PID its PGID.  Using
@@ -497,11 +506,12 @@ def _terminate_process_tree(process: subprocess.Popen, root: Any) -> None:
             windows_tree_kill_ok = False
     if root is not None:
         try:
-            for member in reversed(root.children(recursive=True)):
-                try:
-                    member.kill()
-                except Exception:  # noqa: BLE001 - process may have exited
-                    pass
+            descendants.extend(root.children(recursive=True))
+        except Exception:  # noqa: BLE001 - process may have exited
+            pass
+    for member in reversed(descendants):
+        try:
+            member.kill()
         except Exception:  # noqa: BLE001 - process may have exited
             pass
     try:
