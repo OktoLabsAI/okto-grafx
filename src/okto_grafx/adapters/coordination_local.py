@@ -47,6 +47,7 @@ from functools import lru_cache
 from math import isfinite
 from typing import TypeVar
 
+from okto_grafx.adapters.clock_system import SystemClock
 from okto_grafx.adapters.control_record_io import read_control_if_exists
 from okto_grafx.domain.control_record import (
     ControlRecordKind,
@@ -875,6 +876,21 @@ class LocalProcessCoordinator:
                 metrics.register(metric(name))
         self._sleeper: Callable[[float], None] = (
             time.sleep if sleeper is None else sleeper
+        )
+        # Whether a wait for an IN-PROCESS section lock may spend its interval inside the lock
+        # instead of beside it (see _wait_for_local_lock). Only a coordinator that measures AND
+        # spends real time may: the real sleeper is not enough on its own, because a stack can
+        # pair the default sleeper with a test clock, and it is the CLOCK that decides whether a
+        # spent interval is ever seen. SystemClock is the only Clock this package ships and the
+        # one every composition root binds (runtime.bootstrap build_clock, transfer_resume), so
+        # every database parks; every other Clock in this repository is a test double whose
+        # readings are accounted rather than spent, and a coordinator must never spend real time
+        # that its clock cannot see. A caller who binds a foreign clock through the registry
+        # therefore keeps the sampling wait, which is stated here rather than hidden. Nothing
+        # about exclusion, the budget, the iteration allowance or the typed timeout depends on
+        # this flag; only where an interval is spent does.
+        self._parks_on_section_locks: bool = self._sleeper is time.sleep and isinstance(
+            self._clock, SystemClock
         )
         configured = (
             _validate_identifier(
@@ -2058,9 +2074,49 @@ class LocalProcessCoordinator:
     def _wait_for_local_lock(
         self, lock: threading.Lock, name: str, timeout: float
     ) -> object:
-        """Take an in-process section lock on the injected clock, or raise GrafxLeaseTimeout."""
+        """Take an in-process section lock on the injected clock, or raise GrafxLeaseTimeout.
+
+        A waiter that spends its interval INSIDE the lock is woken by the release. A waiter that
+        spends it beside the lock -- sleeping, then sampling with a non-blocking acquire -- is
+        not: it is never enqueued, so nothing tells it the section became free, and the thread
+        that has just released re-takes the section before the sleeper's next sample lands.
+        Under three threads of one participant that is not slow, it is starvation. Measured on
+        the participant section of one database, two reader threads and one writer thread over
+        30 s (HOTFIX-vector-concurrency): the section changed hands 4 times, one thread took it
+        9 804 times and the other two took it 3 and 14 times while each waited 30 s inside a
+        single acquisition. The operating-system lock never showed this, because every one of
+        its attempts pays an ``os.open`` and a platform lock call that release the interpreter
+        lock, which is exactly the gap a sleeping waiter needs: 1 056 hand-offs, 1 074 / 846 /
+        1 638 acquisitions, over the same 30 s and the same work.
+
+        So the wait parks in the lock for one poll interval at a time, and does so on BOTH paths
+        that reach here: the declared private participant section resolved by :meth:`_section`,
+        and the process-wide stand-in :meth:`_take_local_lock` gives a stack with no lock
+        directory at all -- the ``':memory:'``-shaped and root-less compositions. The iteration
+        allowance and the typed timeout are the ones this wait always had, and the interval is
+        still ``min(self._poll, deadline - now)``; only where it is spent has changed.
+
+        That last difference is why the clock decides. On a frozen clock ``now >= deadline`` is
+        never reached, so the wait can only end on the iteration allowance -- and a parked
+        interval costs at least one platform timer tick, 15.885 to 15.99 ms measured on this
+        Windows machine, against 1.55 ms for ``time.sleep(0.001)``. A wait of a thousand
+        allowed iterations that took 1.543 s sampling took 15.949 s parked, which is ten times
+        its own budget in real seconds the clock never saw. ``_parks_on_section_locks`` is
+        therefore true only when the sleeper is real time AND the clock is the shipped
+        :class:`~okto_grafx.adapters.clock_system.SystemClock`; a stack that pairs the default
+        sleeper with a test clock, which ``tests/txn/txn_support.py`` does, keeps the sampling
+        wait. ``tests/txn/test_terminal_close.py`` guards that frozen-clock side: its forced
+        participant timeout has a 10 s ceiling that a parked wait blows through.
+
+        Every composition root binds ``SystemClock`` (``runtime.bootstrap`` ``build_clock``,
+        ``transfer_resume``), so the parking wait is the one every database gets. A caller who
+        binds a foreign clock through the registry gets the sampling wait, stated rather than
+        hidden: its intervals are accounted rather than spent, and a coordinator must never
+        spend real time a clock cannot see.
+        """
         deadline = self._clock.monotonic() + timeout
         allowance = self._iteration_budget(timeout)
+        parks = self._parks_on_section_locks
         iterations = 0
         while True:
             iterations += 1
@@ -2074,7 +2130,12 @@ class LocalProcessCoordinator:
                     timeout_seconds=timeout,
                     owner_id=self._owner,
                 )
-            self._sleep(min(self._poll, deadline - now))
+            interval = min(self._poll, deadline - now)
+            if parks and interval > 0.0:
+                if lock.acquire(timeout=interval):
+                    return lock
+                continue
+            self._sleep(interval)
 
     def _private_section_name(self) -> str:
         """Return the ONE section name this instance may declare private: ``txn-<own digest>``.

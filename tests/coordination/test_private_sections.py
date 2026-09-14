@@ -3,13 +3,16 @@
 ``_declare_private_section`` is the optional, private-performance capability that lets a section
 whose name carries this instance's own ``owner_id`` digest be serialised with a process lock
 instead of an operating-system file lock. The claim it rests on is narrow and is tested here as
-three separate obligations:
+five separate obligations:
 
 * the declaration is REFUSED for every name that is not EXACTLY this instance's participant
   name, so no cross-process section can be downgraded by a caller that merely asks nicely -- and
   not by one that pads a spelling until it ends in the right eight hex characters either;
 * a declared section still serialises the THREADS of its coordinator, which is the entire reason
   the participant section exists (txn_manager ``_participant_section``);
+* a declared section keeps being HANDED OVER, not merely held by one thread at a time: every
+  thread of the coordinator goes on getting it, and a wait for it is BOUNDED, so a waiter that
+  cannot be woken is a failure here rather than a hang somewhere downstream;
 * a declaration and an entry that race are ordered: the mechanism behind a live section never
   changes underneath its holder, which is a fence rather than a check;
 * the control directory keeps the same lock file, because forensic and census tooling compares
@@ -49,6 +52,51 @@ real defect into an intermittent green.
 
 _RACE_TIMEOUT: float = 30.0
 """Ceiling on every wait of the race, so a wedged round fails the suite instead of hanging it."""
+
+_STARVATION_WORKERS: int = 3
+"""Threads of one coordinator in the starvation test: two is a duel, three is a queue."""
+
+_STARVATION_ENTRIES: int = 8
+"""Back-to-back entries per round, the shape one statement of a participant really has."""
+
+_STARVATION_WINDOW: float = 6.0
+"""Seconds of contention. Long enough that a starved thread cannot be called unlucky."""
+
+_STARVATION_SHARE: int = 10
+"""How many times the busiest thread's rounds the quietest one is allowed to be below.
+
+A share rather than a count, so a loaded machine that simply ran less still passes, while the
+defect -- 794 rounds for one thread against none at all for the other two -- cannot come near
+it at any factor.
+"""
+
+_STARVATION_FLOOR: int = 5
+"""Rounds per worker, summed, below which the window proved nothing and the test skips (A75.2).
+
+The floor is on the TOTAL across the workers, never on the smallest of them. Under the defect
+one thread stays busy and turns in hundreds of rounds, so the total clears the floor easily and
+the share assertion still fires; a floor on the minimum would skip exactly the starved shape the
+test exists to catch. The accepted cost is the other direction: a CPU-bound thread inside the
+same interpreter can hold every worker down to rounds like ``[0, 1, 1]`` with the fix and
+``[0, 0, 2]`` without it, and both windows are below the floor and therefore UNMEASURED rather
+than a regression (CONTRACT.md A75.2), which is the right answer for a window in which nothing
+contended.
+"""
+
+_STARVATION_JOIN_SLACK: float = 20.0
+"""Seconds past the contention window that ALL joins share, so no join can outlive the suite.
+
+One deadline for the three joins rather than one timeout each: three sequential 36 s joins can
+add up to 108 s, past the 60 s per-test timeout whose thread method ``os._exit()``s the whole
+session and leaves no report. With a shared deadline the liveness assertion below is what
+reports a wedged thread.
+"""
+
+_BOUND_BUDGET: float = 0.5
+"""Timeout handed to the waiter of the bounded-wait test: small, so an unbounded park is obvious."""
+
+_BOUND_SLACK: float = 5.0
+"""Seconds past that budget the bounded waiter may take before the test calls it unbounded."""
 
 
 def _digest(coordinator: object) -> str:
@@ -242,6 +290,165 @@ def test_a_declared_section_still_serialises_two_threads_of_one_coordinator(
 
     assert overlaps == 0
     assert order == ["enter:a", "exit:a", "enter:b", "exit:b"]
+
+
+@pytest.mark.slow
+def test_no_thread_of_one_coordinator_is_starved_of_a_declared_section(
+    database_root: Path, lock_directory: str
+) -> None:
+    """Every thread of one participant keeps GETTING the section, not only the one that has it.
+
+    THE REGRESSION TEST FOR THE VECTOR-CONCURRENCY HANG. Serialising the threads is not the
+    whole obligation: a wait that cannot see the release serialises them into one. A waiter that
+    spends its interval beside the lock -- asleep, then sampling with a non-blocking acquire --
+    is never enqueued, so nothing wakes it when the section is freed, and the thread that just
+    released re-takes it within microseconds, long before the sleeper's next sample lands. A
+    participant enters this section several times back to back for one statement, so the freed
+    instants are exactly the ones a sleeping waiter is least likely to be looking at, and the
+    thread already running wins every one of them.
+
+    The shape below is that one: a round is a run of back-to-back entries whose body makes real
+    system calls, which is where the interpreter hands over while the section is HELD. Forcing
+    ``_parks_on_section_locks`` False restores exactly the wait ``0e8c13a`` shipped, and over
+    six seconds this test then turns in rounds ``[0, 0, 794]`` with refusals ``[3, 3, 0]``: one
+    thread completed 794 rounds while the other two completed none at all and were refused with
+    the typed timeout three times each. With the parking wait the same window is shared -- 2 600,
+    2 088 and 1 912 section entries across the three threads -- and all of them keep progressing.
+
+    The assertion is a SHARE, so a loaded machine that simply ran less cannot fail it, and the
+    volume floor above it is what stops a window that interleaved nothing from failing on a
+    number that measured nothing (A75.2). The real clock and the default sleeper are used
+    because this is a test about a wait that must really wait and must really be woken.
+    """
+    coordinator = LocalProcessCoordinator(
+        DirectoryStorageDevice(database_root),
+        SystemClock(),
+        owner_id="p1-aaaa",
+        lock_directory=lock_directory,
+    )
+    name = _participant_name(coordinator)
+    assert type(coordinator).__dict__["_declare_private_section"](coordinator, name) is True
+    # The section's own lock file: it exists because the declaration created it, and a stat of
+    # it is the cheapest honest system call this test can make from inside the section.
+    touched = str(Path(lock_directory) / f"{name}{LOCK_FILE_SUFFIX}")
+
+    rounds = [0] * _STARVATION_WORKERS
+    refusals = [0] * _STARVATION_WORKERS
+    escaped: list[str] = []
+    ready = threading.Barrier(_STARVATION_WORKERS)
+    deadline = time.monotonic() + _STARVATION_WINDOW
+
+    def worker(slot: int) -> None:
+        try:
+            ready.wait(timeout=_STARVATION_WINDOW)
+            while time.monotonic() < deadline:
+                try:
+                    for _entry in range(_STARVATION_ENTRIES):
+                        with coordinator.exclusive(name, timeout=2.0):
+                            for _call in range(30):
+                                os.stat(touched)
+                except GrafxLeaseTimeout:
+                    refusals[slot] += 1
+                    continue
+                rounds[slot] += 1
+        except BaseException as failure:  # noqa: BLE001 - reported as a failure below
+            escaped.append(f"{slot}:{type(failure).__name__}: {failure}")
+
+    workers = [
+        threading.Thread(target=worker, args=(slot,), name=f"starve-{slot}", daemon=True)
+        for slot in range(_STARVATION_WORKERS)
+    ]
+    for thread in workers:
+        thread.start()
+    # ONE deadline shared by the three joins: see _STARVATION_JOIN_SLACK. The assertion below,
+    # not a join that outlived the session, is what reports a thread that never came back.
+    join_deadline = deadline + _STARVATION_JOIN_SLACK
+    for thread in workers:
+        thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+    assert [thread.name for thread in workers if thread.is_alive()] == []
+    assert escaped == [], escaped
+
+    evidence = (rounds, refusals)
+    if sum(rounds) < _STARVATION_WORKERS * _STARVATION_FLOOR:
+        pytest.skip(
+            f"machine too loaded to prove anything: {sum(rounds)} rounds in total across the "
+            f"workers ({rounds}) in {_STARVATION_WINDOW} s, below the "
+            f"{_STARVATION_WORKERS * _STARVATION_FLOOR} this test needs to have exercised "
+            "contention at all"
+        )
+    assert min(rounds) * _STARVATION_SHARE >= max(rounds), evidence
+
+
+def test_a_wait_for_a_parked_declared_section_is_bounded_by_its_own_budget(
+    database_root: Path, lock_directory: str
+) -> None:
+    """A waiter that parks IN the section lock still comes back, and still refuses in type.
+
+    The companion of the starvation test and the guard of one term: the ``timeout=`` of the
+    ``lock.acquire`` the parking wait performs. Parking is what makes a release wake a waiter,
+    and an unbounded park would deliver that at the price of the refusal -- the thread would
+    stay inside ``threading.Lock.acquire`` for as long as the holder wanted, never reach the
+    deadline test above it, never raise :class:`GrafxLeaseTimeout`, and hand the caller a hang
+    in place of an error. So the waiter below is given a budget far shorter than the holder's
+    stay and must come back inside it, with the typed refusal the section contract promises.
+
+    What this does NOT guard is the OTHER term of the same line, the ``deadline - now`` in
+    ``min(self._poll, deadline - now)``: a wait that ignored it would overshoot by at most one
+    poll interval, five milliseconds, which no assertion on a loaded machine can see. Only the
+    bound of the acquire is observable from outside, and it is the one that matters, because it
+    is the one whose absence turns a refusal into a wedge.
+
+    A real :class:`SystemClock` and the default sleeper are used, the same construction as the
+    starvation test, because those are exactly the conditions under which the wait parks at all.
+    """
+    coordinator = LocalProcessCoordinator(
+        DirectoryStorageDevice(database_root),
+        SystemClock(),
+        owner_id="p1-aaaa",
+        lock_directory=lock_directory,
+    )
+    name = _participant_name(coordinator)
+    assert type(coordinator).__dict__["_declare_private_section"](coordinator, name) is True
+
+    held = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    refusal: list[BaseException] = []
+
+    def holder() -> None:
+        with coordinator.exclusive(name, timeout=_RACE_TIMEOUT):
+            held.set()
+            release.wait(timeout=_RACE_TIMEOUT)
+
+    def waiter() -> None:
+        try:
+            with coordinator.exclusive(name, timeout=_BOUND_BUDGET):
+                pytest.fail("the section was granted while another thread held it")
+        except BaseException as raised:  # noqa: BLE001 - recorded and asserted below
+            refusal.append(raised)
+        finally:
+            returned.set()
+
+    keeper = threading.Thread(target=holder, name="bound-holder")
+    keeper.start()
+    assert held.wait(timeout=_BOUND_SLACK), "the holder never entered the section"
+    loser = threading.Thread(target=waiter, name="bound-waiter", daemon=True)
+    loser.start()
+    bounded = returned.wait(timeout=_BOUND_BUDGET + _BOUND_SLACK)
+    release.set()
+    join_deadline = time.monotonic() + _BOUND_SLACK
+    for thread in (loser, keeper):
+        thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+
+    assert bounded, (
+        f"the waiter was still inside its {_BOUND_BUDGET} s wait after "
+        f"{_BOUND_BUDGET + _BOUND_SLACK} s: the park is not bounded by the budget"
+    )
+    assert [thread.name for thread in (loser, keeper) if thread.is_alive()] == []
+    assert len(refusal) == 1, refusal
+    assert isinstance(refusal[0], GrafxLeaseTimeout), refusal[0]
+    assert refusal[0].retryable is True
+    assert refusal[0].details["section"] == name
 
 
 def test_a_declared_section_stops_taking_operating_system_locks_but_keeps_its_lock_file(
