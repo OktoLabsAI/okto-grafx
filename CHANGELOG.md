@@ -38,6 +38,8 @@ including the on-disk format.
 
 ### Changed (0.0.7 development)
 
+- Fix the 0.0.6 compatibility workflow's YAML command block so GitHub can start
+  its installed-upgrade matrix; the unquoted `:all:` option prevented parsing.
 - Provision the pinned public Core/Community corpus source inputs in all four
   full-suite CI jobs. Attribute two unavailable historical wheel-receipt audits
   as explicit coverage debt; their assertions remain active with real receipts.

@@ -19,7 +19,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install "build>=1" numpy google-crc32c pytest pytest-timeout
-      - run: python -m pip download --no-deps --only-binary=:all: okto-grafx==0.0.5 -d legacy
+      - run: |
+          python -m pip download --no-deps --only-binary=:all: okto-grafx==0.0.5 -d legacy
       - run: python -m build --wheel --outdir current
       - run: python tools/check_v006_upgrade.py --legacy-wheel legacy/okto_grafx-0.0.5-py3-none-any.whl --current-wheel current/okto_grafx-0.0.7-py3-none-any.whl
       - run: python -m pytest tests/api/test_system_history_native.py tests/api/test_system_history_operations.py tests/api/test_system_time_queries.py tests/api/test_fulltext_positions.py tests/api/test_posting_hash_memo.py --junitxml=v006.xml
