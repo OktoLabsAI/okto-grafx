@@ -22,6 +22,7 @@ CONSUMER_DOCS = (
     "docs/conformance/README.md",
     "docs/specs/FUNCTIONAL_PARITY_PLAN.md",
     "docs/specs/PERFORMANCE_V007_PLAN.md",
+    "docs/reports/PERF_V007_WAVE_A.md",
     "docs/reports/FP_INTEGRATED_REGRESSION_CORRECTIONS.md",
     "docs/TYPE_SUPPORT.md",
     "docs/ENTITY_VALUES.md",
