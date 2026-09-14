@@ -119,4 +119,4 @@ __all__ = [
     "prepare_commit_import",
 ]
 
-__version__: str = "0.0.6"
+__version__: str = "0.0.7"

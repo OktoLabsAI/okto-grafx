@@ -7,7 +7,19 @@ including the on-disk format.
 
 ## [Unreleased]
 
-### Added (0.0.6 development)
+### Changed (0.0.7 development)
+
+- Bumped the package and source version to 0.0.7 on `feature/v0.0.7`, branched from
+  the released 0.0.6 `main` merge. No functional, persistent-format, query-semantics or
+  dependency change; the 0.0.5-legacy wheel compatibility workflow now builds the 0.0.7
+  candidate as its current wheel.
+- Reconciled the release-status prose that still described 0.0.6 as unreleased or 0.0.5 as
+  the published package (feature comparison, compatibility, type/entity contracts, roadmap,
+  governance) with the published 0.0.6 (PyPI, September 13, 2026).
+
+## [0.0.6] - 2026-09-13
+
+### Added
 
 - Authorized eight-item language round (locally validated): fixed openCypher
   TCK 2024.3 inventory; ordered clauses and lexical scopes; correlated typed OPTIONAL
@@ -80,7 +92,7 @@ including the on-disk format.
   logical work/memory bounds and cancellation.
 - Comparative feature-gap register and ordered MP-1–MP-8 minimum-parity roadmap.
 
-### Fixed (0.0.6 development)
+### Fixed
 
 - Full-text verification now detects missing/extra live multi-key coverage and
   duplicate physical postings, including positional chunks.
@@ -94,6 +106,10 @@ including the on-disk format.
   protection payload that also enforces administrators, and a privacy/history publication
   checklist. Retained the existing Elastic License 2.0 + SaaS/Branding Addendum unchanged.
   Preparation does not change GitHub visibility or activate a protection unavailable on the plan.
+
+## [0.0.5] - 2026-09-10
+
+### Changed
 
 - Continuation after `a4dd85a`: opt-in immutable PageRank transition preparation and
   simple topology reuse; bounded deterministic read-only label propagation.

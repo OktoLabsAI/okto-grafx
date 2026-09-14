@@ -1,8 +1,9 @@
 # Documentation index
 
-The consumer guides include source version **0.0.6 development** additions, marked
-with their implementation and acceptance status. They do not assert PyPI
-publication or that the latest source is installed in a particular application.
+The consumer guides include source version **0.0.7 development** additions, marked
+with their implementation and acceptance status; entries marked "0.0.6 development"
+shipped in the published 0.0.6 release. They do not assert that the latest source is
+installed in a particular application.
 
 ## Integrate without reading engine internals
 

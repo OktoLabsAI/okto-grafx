@@ -1,6 +1,6 @@
 # Native flexible graph: implicit labels, unlabeled nodes and relationships
 
-Development on `feature/v0.0.6`; not a release or full schema-free/TCK parity claim.
+Developed on `feature/v0.0.6` and shipped in 0.0.6; not a full schema-free/TCK parity claim.
 This implements unlabeled nodes, implicit single-label creation, dynamic properties
 and automatic undeclared relationship types. Full package qualification remains
 in progress; arbitrary multiple labels are not implemented.

@@ -1,6 +1,6 @@
 # Heterogeneous properties v1
 
-Development contract on `feature/v0.0.6`, not a released compatibility claim.
+Contract developed on `feature/v0.0.6` and shipped in 0.0.6; not a broader compatibility claim.
 This is the storage/query foundation of the authorized flexible graph model,
 **not completion of FP-3/FP-6**. Native unlabeled node creation is now a separate
 implemented layer: [flexible graph contract](FLEXIBLE_GRAPH_V1.md).

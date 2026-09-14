@@ -53,7 +53,7 @@ old-reader/writer scenarios with unchanged files on refusal and verified current
 recovery. See [exact format, wheel hashes and limits](specs/VECTOR_OWNER_NAMES_V1.md).
 This is additional focused evidence, not replacement of the broader gates below.
 
-Source/development validation, **not a published release or Pulse installation**.
+Source/development validation gathered before the 0.0.6 publication, **not a Pulse installation claim**.
 
 The later [independent graph namespaces](specs/GRAPH_NAMESPACES_V1.md) increment
 uses catalog-v2 required bit 24 only when node and relationship names overlap.
@@ -71,7 +71,7 @@ The reproducible command installs both supplied wheels into separate temporary
 targets, invokes isolated interpreters and checks imported package origins:
 
 ```sh
-python tools/check_v006_upgrade.py --legacy-wheel legacy/okto_grafx-0.0.5-py3-none-any.whl --current-wheel current/okto_grafx-0.0.6-py3-none-any.whl
+python tools/check_v006_upgrade.py --legacy-wheel legacy/okto_grafx-0.0.5-py3-none-any.whl --current-wheel current/okto_grafx-0.0.7-py3-none-any.whl
 ```
 
 Install NumPy, google-crc32c and tzdata in the invoking Python environment first. Isolated

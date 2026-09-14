@@ -1,10 +1,11 @@
 # Okto Grafx roadmap
 
-**Single active product backlog — reconciled September 13, 2026.**
-Published/main baseline: `0.0.5`, tag `v0.0.5`, main merge
-`83cc3137bb7e95ad2a1ed9271b1a1134063097a8`. The `feature/v0.0.6` MP-1–MP-8
-checkpoint and the latest authorized native-history/catalog/search follow-up are
-implemented and locally validated, not released. Latest isolated native/Pulse
+**Single active product backlog — reconciled September 13, 2026; baseline updated
+September 14, 2026.** Published/main baseline: `0.0.6`, tag `v0.0.6`, main merge
+`1e01be5ae142eb3aa51cb97e8dff6cdd3741dbba`, published on PyPI on September 13, 2026.
+The `feature/v0.0.6` MP-1–MP-8 checkpoint and the authorized native-history/catalog/search
+follow-up shipped in that release. Development continues on `feature/v0.0.7` with the
+source version bumped to 0.0.7 and no functional change yet. Latest isolated native/Pulse
 observations use 0.0.6; the latest production spec-consolidation sample uses
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
 
@@ -174,7 +175,7 @@ fault-hook mismatches. All are addressed by the final **392-pass** combined
 corrective collection; the original grouped run remains failed, with final
 current-source package regression still required. Exact receipts and limits are
 in the linked node-label contract.
-This is still an in-progress native-label delivery, not a release or upgrade.
+This native-label delivery shipped in the 0.0.6 package; the checkpoint above records its pre-release qualification state, not an upgrade guarantee.
 The corrected query/transaction/procedure group has **1,110 passes**, zero
 failures/errors/skips; [the contract](docs/specs/NODE_LABELS_V1.md#query-label-mutation-checkpoint)
 records original/corrective evidence and the final read-boundary follow-up.
@@ -1077,7 +1078,7 @@ FP-3; it does not complete its public-entity/path/UNION or indexing requirements
 
 ## Authorized query-language compatibility round
 
-Status: **all eight implemented, tested and documented in development; not released**.
+Status: **all eight implemented, tested and documented; released in 0.0.6 on September 13, 2026**.
 The user authorized items 1–8 in order,
 including breaking query semantics with coordinated Pulse migration and no legacy
 mode. The fixed reference, scope, item-by-item acceptance criteria and reproducible
@@ -1291,7 +1292,7 @@ prerequisite, not a new performance gate. No marginal timing target is added.
 
 | ID | Status | Deliverable / exit condition |
 | --- | --- | --- |
-| V006-HISTORY-CATALOG-SEARCH | All eight approved items complete in development | Native temporal publication/query/operations, explicit catalog/workspace CLI, selected copy/skip, positional FTS, posting decode memo and real-wheel matrix. Feature/regression/corrective tests and consumer documentation validated. [Exact evidence and limitations](docs/reports/V006_NATIVE_HISTORY_ROUND.md). Not published or installed in Pulse. |
+| V006-HISTORY-CATALOG-SEARCH | All eight approved items complete; released in 0.0.6 | Native temporal publication/query/operations, explicit catalog/workspace CLI, selected copy/skip, positional FTS, posting decode memo and real-wheel matrix. Feature/regression/corrective tests and consumer documentation validated. [Exact evidence and limitations](docs/reports/V006_NATIVE_HISTORY_ROUND.md). Published in 0.0.6 on September 13, 2026; Pulse installation is not implied. |
 | REL-004 | Published September 8, 2026 | [PR #2](https://github.com/OktoLabsAI/okto-grafx/pull/2) merged; tag `v0.0.4` points to `425362a`. Wheel/sdist built from the tag, Twine validation, 149 package-file parity checks, isolated consumer smoke and public PyPI install smoke passed; remote SHA-256 values matched. [PyPI 0.0.4](https://pypi.org/project/okto-grafx/0.0.4/). GitHub Actions could not start because of account billing; local evidence does not certify the remote/platform matrix. |
 | DOC-1 | Implemented in this documentation refactor | One README entry point, public API/configuration/query/operations references, measured-performance table, one roadmap and a preserved source archive. Links, examples, API/config field coverage and preservation hashes are checked; [validation receipt](docs/reports/DOCUMENTATION_REFACTOR_2026_09_08.md). |
 | CAP-1B | Implemented checkpoint | `6b5163e`: native journal preflight is connected to page application/checkpoint; UUID, activation/COMMIT coverage, target/resident LSN and file extents validated. 2,433 tests / 77.27 s recorded; no new typing diagnostics in the isolated comparison. This is recovery correctness, not a latency benchmark. |

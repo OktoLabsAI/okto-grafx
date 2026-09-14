@@ -77,7 +77,7 @@ HTTP 422 while private. Do not claim that the target protection is active.
 Before changing visibility:
 
 1. Review and merge this governance PR through an administrator review, without
-   bypassing the intended policy. It is separate from the unreleased 0.0.6 branch.
+   bypassing the intended policy. It was merged together with the 0.0.6 release candidate in PR #5 (tag `v0.0.6`).
 2. Resolve the privacy findings in all published branches/tags and relevant PR
    references. The local audit found 48 tracked browser logs/snapshots in a
    development branch, containing Pulse operational content. Deleting them from

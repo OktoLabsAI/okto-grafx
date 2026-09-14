@@ -4,7 +4,7 @@
 
 Updated September 13, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
-Current development source is 0.0.6; published baseline is 0.0.5.
+Current development source is 0.0.7; published baseline is 0.0.6.
 The latest isolated installed Pulse/native observations below use the final
 0.0.6 candidate. The latest production spec-consolidation measurement still uses
 `0.0.4@fa8f188`; no production spec was consolidated for these tests.

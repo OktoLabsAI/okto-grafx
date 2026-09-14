@@ -1,8 +1,8 @@
 # Native type support matrix
 
-This is the consolidated FP-5/FP-6 support/refusal contract for the **0.0.6
-development source**, not a declaration of full Cypher/TCK parity or a published
-release. The tables distinguish native storage, query values, callback signatures
+This is the consolidated FP-5/FP-6 support/refusal contract for **0.0.6** (published on
+PyPI on September 13, 2026), not a declaration of full Cypher/TCK parity. The tables
+distinguish native storage, query values, callback signatures
 and external transport: support in one does not imply support in every other one.
 Existing operation/transaction bounds, explicit permissions and storage capability
 admission remain applicable to every supported cell.

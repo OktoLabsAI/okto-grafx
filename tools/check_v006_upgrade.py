@@ -1,4 +1,4 @@
-"""Verify real installed 0.0.5/0.0.6 wheels, additive upgrades and old-reader refusal.
+"""Verify real installed 0.0.5 legacy and current 0.0.7 wheels, additive upgrades and old-reader refusal.
 
 Both wheels are installed without dependencies into temporary isolated targets;
 no source checkout, production database or global installation is used by workers.
@@ -113,7 +113,7 @@ def main():
                 seed = run(packages[0], path, "seed", profile)
                 assert seed == dict(version="0.0.5", outcome="opened", rows=[[1]]), seed
                 upgraded = run(packages[1], path, "append", profile)
-                assert upgraded == dict(version="0.0.6", outcome="opened", rows=[[1], [2]]), upgraded
+                assert upgraded == dict(version="0.0.7", outcome="opened", rows=[[1], [2]]), upgraded
                 if capability != "default":
                     assert run(packages[1], path, capability, profile)["outcome"] == "opened"
                 before = payloads(path)
