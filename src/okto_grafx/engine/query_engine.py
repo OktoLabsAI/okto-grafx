@@ -1388,6 +1388,17 @@ class _Context:
     # the linear walk is chosen once for that parameter rather than re-examined on every row.
     in_list_memos: dict[str, _InListMemo | None] = field(default_factory=dict)
     in_list_memo_elements: int = 0
+    # The names an expression reads are a constant of the PLAN: the walk that finds them looks at
+    # the expression and never at the row.  ORDER BY asks once per row per key, so the same walk
+    # runs once for every scanned row.  This holds one answer per expression for the life of ONE
+    # statement, keyed by the IDENTITY of the expression object and retaining that object beside
+    # its id (the reason ``pending_tokens`` does the same), so an id can never be recycled onto a
+    # different expression while its answer is held.  Never keyed by value: two structurally equal
+    # expressions belonging to different plans must keep separate answers, and nothing here
+    # outlives the statement, so no container is shared between statements or processes.
+    free_name_memos: dict[int, tuple[Expression, tuple[str, ...]]] = field(
+        default_factory=dict
+    )
 
     def already_ended(self, reference: object) -> bool:
         """Answer whether this exact version has already been told to stop.
@@ -13208,6 +13219,25 @@ def _top_projected_rows(
         yield _Row(bindings=source.bindings, computed=source.computed, columns=columns)
 
 
+def _free_names(expression: Expression, context: _Context) -> tuple[str, ...]:
+    """Return the names one plan expression reads, proving them once per statement.
+
+    :func:`free_variables` walks the whole expression tree, and its answer depends only on that
+    tree: the expressions this is asked about belong to the immutable plan, and every AST node is
+    a frozen dataclass, so the answer cannot change while the statement runs.  The memo lives on
+    the statement's context, is keyed by the identity of the expression, and holds the expression
+    beside its id so that id stays reserved for as long as the answer is.  A refusal is not
+    memoised: an expression whose walk raises raises again on the next row, exactly as before.
+    """
+    memo = context.free_name_memos
+    held = memo.get(id(expression))
+    if held is not None:
+        return held[1]
+    names = free_variables(expression)
+    memo[id(expression)] = (expression, names)
+    return names
+
+
 def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:
     """Return the value one ORDER BY key reads from a row."""
     expression = key.expression
@@ -13222,7 +13252,7 @@ def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:
         # expression was computed from, so re-evaluating it would refuse.
         return columns[expression.name]
     if columns is not None:
-        shadowed = {name for name in free_variables(expression)
+        shadowed = {name for name in _free_names(expression, context)
                     if name in columns and name in row.bindings and columns[name] is not row.bindings[name]}
         if shadowed:
             # Compound sort expressions obey the same alias precedence as a bare
@@ -13230,7 +13260,7 @@ def _sort_value(key: SortItem, row: _Row, context: _Context) -> object:
             # shadowed name, retaining aggregate results computed for the group.
             computed = None if row.computed is None else {
                 item: value for item, value in row.computed.items()
-                if is_aggregate(item) or not shadowed.intersection(free_variables(item))
+                if is_aggregate(item) or not shadowed.intersection(_free_names(item, context))
             }
             row = _Row(bindings={**row.bindings, **{name: columns[name] for name in shadowed}},
                        columns=columns, computed=computed)
