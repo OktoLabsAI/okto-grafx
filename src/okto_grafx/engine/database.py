@@ -367,9 +367,22 @@ class _LogicalStatementPublication:
     strictly adjacent participant section (with its file lock and stat) for every write
     statement. Settling and discarding keep their own sections, because both happen after the
     statement has left page access.
+
+    The question the boundary answers -- does this statement stage rows? -- is asked by
+    :meth:`decide` with no section held, exactly where the context manager asked it before the
+    split. Only :meth:`begin`, two in-memory bookkeeping calls on the context, runs inside the
+    caller's section.
     """
 
-    __slots__ = ("_database", "_context", "_engine", "_statement", "_mark", "_schema_mark")
+    __slots__ = (
+        "_database",
+        "_context",
+        "_engine",
+        "_statement",
+        "_stages",
+        "_mark",
+        "_schema_mark",
+    )
 
     def __init__(
         self, database: Database, context: TransactionContext, engine: object, statement: str
@@ -378,20 +391,37 @@ class _LogicalStatementPublication:
         self._context = context
         self._engine = engine
         self._statement = statement
+        self._stages = False
         self._mark: object | None = None
         self._schema_mark: object | None = None
 
-    def begin(self) -> None:
-        """Open the boundary from inside the caller's page-access section."""
+    def decide(self) -> None:
+        """Answer whether this statement stages rows, holding no section while asking.
+
+        Parsing is the expensive half of the question and none of it touches shared state:
+        ``QueryEngine.parse`` is text in, plan out, behind its own LRU cache. A cache miss
+        still costs hundreds of microseconds to milliseconds, and the participant section
+        serialises the threads of this participant, so the verdict is proved out here and only
+        the marks are taken inside the section. A statement the engine refuses to parse refuses
+        from here, before the boundary exists and before the caller's section is opened, which
+        is where it refused from before this class existed.
+        """
         context = self._context
         engine = self._engine
         if context.mode is not TransactionMode.WRITE or type(engine) is not QueryEngine:
             return
         parsed = engine.parse(self._statement)
-        if not (isinstance(parsed, (QueryStatement, UnionQuery)) and parsed.writes):
+        self._stages = bool(
+            isinstance(parsed, (QueryStatement, UnionQuery)) and parsed.writes
+        )
+
+    def begin(self) -> None:
+        """Open the boundary from inside the caller's page-access section."""
+        if not self._stages:
             return
+        context = self._context
         self._mark = context.staging_mark()
-        self._schema_mark = engine._schema_statement_mark(context)
+        self._schema_mark = self._engine._schema_statement_mark(context)  # type: ignore[attr-defined]
 
     def settle(self) -> None:
         """Publish the statement's staged effects once the public result exists."""
@@ -2680,7 +2710,8 @@ class Database:
                     # mark is still taken before any intent of this statement can stage, and the
                     # recovery latch is held stable across exactly the same window; only the
                     # separate participant section, file lock and stat that the previous adjacent
-                    # access paid for every write statement are gone.
+                    # access paid for every write statement are gone. The parse that decides
+                    # whether there is a mark to take already happened outside every section.
                     publication.begin()
                     # Registration and statement execution share the participant section. Close can
                     # therefore neither miss a context that may have acquired a schema journal nor
@@ -2718,6 +2749,10 @@ class Database:
     ) -> Iterator[_LogicalStatementPublication]:
         """Hold native row effects through public result canonicalization."""
         publication = _LogicalStatementPublication(self, context, engine, statement)
+        # Outside every section, as before this boundary had an object: a refusal here escapes
+        # the same way it always did, and a cold parse is never serialised against the other
+        # threads of this participant.
+        publication.decide()
         try:
             yield publication
             publication.settle()

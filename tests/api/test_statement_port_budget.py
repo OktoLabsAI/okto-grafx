@@ -3,17 +3,24 @@
 Two budgets, both counted at the port and not by reading call sites:
 
 * how many participant page-access sections one public statement opens, and
-* how many times an ORDER BY expression is walked for its free names.
+* how deep the section stack is at the moment the statement is parsed.
 
-Both are per-statement constants. A row-proportional or duplicated count is the defect these
-tests exist to catch, so each assertion names an exact number rather than a bound.
+The first is a per-statement constant, so each assertion names an exact number rather than a
+bound: a row-proportional or duplicated count is the defect these tests exist to catch. The
+second is zero, and must stay zero: parsing is local work behind an LRU cache whose misses cost
+hundreds of microseconds, and the participant section serialises the threads of this
+participant, so a parse performed under it would be a new serialisation nobody asked for.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 
 from okto_grafx import connect
+from okto_grafx.domain.errors import GrafxError
+from okto_grafx.engine.query_engine import QueryEngine
 from okto_grafx.engine.txn_manager import TransactionManager
 
 
@@ -107,79 +114,111 @@ def test_schema_statement_opens_one_page_access_section(tmp_path, count_sections
 
 
 @pytest.fixture
-def count_free_variables(monkeypatch):
-    """Count AST free-name walks at the module the engine reads them from."""
-    import okto_grafx.engine.query_engine as engine_module
+def parse_depth(monkeypatch):
+    """Record the page-access section depth held at every entry into the parser.
 
-    tally = {"n": 0}
-    original = engine_module.free_variables
+    The depth is counted at the manager port, incremented only once the real section has been
+    entered, and the parser is counted at its own port on the engine class. ``execute`` parses
+    the statement itself from inside the section, so the interesting entry is the FIRST one of
+    a statement: that is the boundary's own question about whether the statement stages rows.
+    """
+    state = {"depth": 0, "parses": []}
+    original_section = TransactionManager.page_access_section
 
-    def counted(expression):
-        tally["n"] += 1
-        return original(expression)
+    @contextmanager
+    def tracked(self, *args, **kwargs):
+        with original_section(self, *args, **kwargs):
+            state["depth"] += 1
+            try:
+                yield
+            finally:
+                state["depth"] -= 1
 
-    monkeypatch.setattr(engine_module, "free_variables", counted)
-    return tally
+    monkeypatch.setattr(TransactionManager, "page_access_section", tracked)
+
+    original_parse = QueryEngine.parse
+
+    def counted(self, text, *args, **kwargs):
+        state["parses"].append((state["depth"], text))
+        return original_parse(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(QueryEngine, "parse", counted)
+    return state
 
 
-def test_order_by_walks_its_expression_once_per_statement(
-    tmp_path, count_free_variables
+def test_write_statement_is_parsed_with_no_page_access_section_held(
+    tmp_path, parse_depth
 ):
-    """The names a sort key reads are a plan constant, not a per-row question."""
-    with connect(tmp_path / "sort-budget") as db:
+    """The boundary asks whether a statement writes before it holds anything.
+
+    ``QueryEngine.parse`` is LRU-cached, so a repeated parameterised statement pays microseconds
+    -- but a cache miss costs hundreds of microseconds to milliseconds, and the participant
+    section it would be held under serialises every other thread of this participant. Taking the
+    mark inside the running statement's section must not drag the parse in with it.
+    """
+    with connect(tmp_path / "parse-depth") as db:
         _schema(db)
-        _rows(db, 40)
-        with db.begin("read") as tx:
-            tx.execute("MATCH (n:T) RETURN n.pk, n.v ORDER BY n.v LIMIT 500")
-            count_free_variables["n"] = 0
-            result = tx.execute("MATCH (n:T) RETURN n.pk, n.v ORDER BY n.v LIMIT 500")
-            assert len(result.rows) == 40
-            assert count_free_variables["n"] == 1
+        _rows(db, 4)
+        with db.begin("write") as tx:
+            parse_depth["parses"].clear()
+            tx.execute("CREATE (n:T {pk:$p, v:1, s:'x'}) RETURN n.pk", {"p": 500})
+    assert parse_depth["parses"], "the statement never reached the parser"
+    first_depth, first_text = parse_depth["parses"][0]
+    assert first_text.startswith("CREATE (n:T")
+    assert first_depth == 0, parse_depth["parses"]
 
 
-def test_sort_walk_count_does_not_grow_with_rows(tmp_path, count_free_variables):
-    """Twice the rows, the same number of walks: the memo is keyed by the expression."""
-    walks = {}
-    for size in (20, 80):
-        with connect(tmp_path / f"sort-scale-{size}") as db:
-            _schema(db)
-            _rows(db, size)
-            with db.begin("read") as tx:
-                tx.execute("MATCH (n:T) RETURN n.pk ORDER BY n.v LIMIT 500")
-                count_free_variables["n"] = 0
-                result = tx.execute("MATCH (n:T) RETURN n.pk ORDER BY n.v LIMIT 500")
-                assert len(result.rows) == size
-                walks[size] = count_free_variables["n"]
-    assert walks[20] == walks[80] == 1
-
-
-def test_sort_memo_refuses_an_entry_that_is_not_its_expression():
-    """A reused id must not let one expression answer for another."""
-    from types import SimpleNamespace
-
-    from okto_grafx.domain.query.ast import Property, Variable
-    from okto_grafx.engine.query_engine import _statement_free_variables
-
-    wanted = Property(subject=Variable(name="n"), key="v")
-    impostor = Property(subject=Variable(name="other"), key="v")
-    context = SimpleNamespace(
-        sort_free_variables={id(wanted): (impostor, ("other",))}
-    )
-    assert _statement_free_variables(wanted, context) == ("n",)
-    assert context.sort_free_variables[id(wanted)][0] is wanted
-
-
-def test_alias_shadowing_still_wins_over_the_bound_variable(tmp_path):
-    """The memo answers for an expression, never for a row: shadowing keeps its precedence."""
-    with connect(tmp_path / "shadow") as db:
+def test_relationship_write_statement_is_parsed_with_no_section_held(
+    tmp_path, parse_depth
+):
+    """The Pulse relation shape, whose plan is the more expensive one to build."""
+    with connect(tmp_path / "parse-depth-rel") as db:
         _schema(db)
-        _rows(db, 6)
+        _rows(db, 4)
+        with db.begin("write") as tx:
+            parse_depth["parses"].clear()
+            tx.execute(
+                "MATCH (source:T {pk:$a}), (target:T {pk:$b}) "
+                "CREATE (source)-[r:R {w:1}]->(target) RETURN source.pk",
+                {"a": 1, "b": 2},
+            )
+    assert parse_depth["parses"], "the statement never reached the parser"
+    assert parse_depth["parses"][0][0] == 0, parse_depth["parses"]
+
+
+def test_a_refused_statement_leaves_the_transaction_usable_and_unchanged(tmp_path):
+    """A statement the parser refuses is refused before any section or mark exists.
+
+    Three things have to hold together: the refusal is a typed ``GrafxError``, the participant
+    section it would otherwise have been raised inside is not wedged (the next statement in the
+    SAME transaction succeeds), and nothing of the refused statement is visible afterwards.
+    """
+    with connect(tmp_path / "refused") as db:
+        _schema(db)
+        _rows(db, 4)
+        with db.begin("write") as tx:
+            with pytest.raises(GrafxError):
+                tx.execute("CRATE (n:T {pk:900, v:1, s:'x'})")
+            with pytest.raises(GrafxError):
+                tx.execute("CREATE (n:T {pk:901, v:1, s:'x'")
+            tx.execute("CREATE (n:T {pk:902, v:1, s:'x'}) RETURN n.pk")
         with db.begin("read") as tx:
-            shadowed = tx.execute(
-                "MATCH (n:T) WITH n, n.v AS v RETURN n.pk AS pk, -v AS v ORDER BY v LIMIT 500"
-            )
-            direct = tx.execute(
-                "MATCH (n:T) RETURN n.pk AS pk, -n.v AS v ORDER BY v LIMIT 500"
-            )
-        assert shadowed.rows == direct.rows
-        assert [row[1] for row in shadowed.rows] == sorted(row[1] for row in shadowed.rows)
+            rows = tx.execute("MATCH (n:T) RETURN n.pk ORDER BY n.pk").rows
+    assert [row[0] for row in rows] == [0, 1, 2, 3, 902]
+
+
+def test_a_statement_that_fails_mid_flight_stages_nothing(tmp_path):
+    """The rollback boundary itself: rows staged before the failure never become visible."""
+    with connect(tmp_path / "midflight") as db:
+        _schema(db)
+        _rows(db, 4)
+        with db.begin("write") as tx:
+            with pytest.raises(GrafxError):
+                # 3 already exists, so the statement refuses after staging 800 and 801.
+                tx.execute("UNWIND [800, 801, 3, 802] AS i CREATE (n:T {pk:i, v:1, s:'x'})")
+            inside = tx.execute("MATCH (n:T) RETURN n.pk ORDER BY n.pk").rows
+            assert [row[0] for row in inside] == [0, 1, 2, 3]
+            tx.execute("CREATE (n:T {pk:900, v:1, s:'x'}) RETURN n.pk")
+        with db.begin("read") as tx:
+            rows = tx.execute("MATCH (n:T) RETURN n.pk ORDER BY n.pk").rows
+    assert [row[0] for row in rows] == [0, 1, 2, 3, 900]
