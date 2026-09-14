@@ -7945,6 +7945,12 @@ def _admits_batched_landings(
     WAL records, physical images or write partitions. Its closed read-only
     preflight can use the same bounded snapshot batches; eligibility is tested
     again for each statement, never carried into subsequent staged work.
+
+    Not a quota: an admitted traversal resolves up to 64 landings before the first
+    ``read_control.step()`` of that fan-out, so a deadline or a cancellation is observed at
+    most one 64-wide window late -- the window ``_ReadControl.step`` already amortises the
+    clock over. The property is the batched path's from the start; a vector-free landing
+    table now reaches that same path.
     """
     manager = engine._indexes
     if (
@@ -7983,10 +7989,48 @@ def _admits_batched_landings(
     return blocking
 
 
+def _declares_vector(table: TableDef) -> bool:
+    """Return whether any column of the table stores a vector body."""
+    return any(column.type in VECTOR_VALUE_TYPES for column in table.columns)
+
+
+def _total_landings(engine: QueryEngine, node: TraverseRelationship) -> bool:
+    """Admit the batched port for a landing table that declares no vector column.
+
+    ``_OwnerLandingView.landings_many`` withholds exactly one thing its scalar sibling
+    ``_OwnerLandingView.get`` retains: the vector components of the landing. A target table
+    with no vector column therefore receives, value for value, the row the scalar path
+    decodes -- ``decode_tuple_landing`` differs from ``decode_tuple`` only inside the vector
+    branch of ``_decode_tuple``, and the marker substitution of ``landings_many`` walks the
+    same empty set of vector columns. Identity index, snapshot, ``_stable_view``
+    certificate, duplicate-identity refusal and row order are the ones the scalar path uses.
+
+    ``_closed_vector_free_landings`` declines such a table outright -- with no vector to
+    withhold its proof has nothing to earn -- and BATCH-REL-1 reads that same verdict, so a
+    graph without vector columns never reached the batched port at all. This gate restores
+    only the batching, never the withholding: the canonical heap and index implementations
+    are checked exactly as the vector-free gate checks them, and ``_batched_landing_steps``
+    re-proves the table of the landings it actually resolves before it batches anything.
+    """
+    return (
+        type(engine.heap) is HeapStore
+        and type(engine._indexes) is IndexManager
+        and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
+        and getattr(engine.heap._decode_version, "__func__", None)
+        is _VECTOR_FREE_CANONICAL_DECODE
+        and getattr(engine._indexes.validated_versions, "__func__", None)
+        is _VECTOR_FREE_CANONICAL_VALIDATED
+        and node.target_table is not None
+        and not _declares_vector(node.target_table)
+    )
+
+
 def _batched_landing_steps(
     engine: QueryEngine, context: _Context,
     steps: Iterator[tuple[object, HeapVersion, TableDef, object]],
     view_at: Callable[[TableDef], _OwnerLandingView],
+    *,
+    withhold_vectors: bool,
 ) -> Iterator[tuple[object, HeapVersion, TableDef, object, bool,
                     tuple[RecordRef, HeapVersion] | None]]:
     """Resolve at most 64 detached steps, then emit them in their original order.
@@ -7994,10 +8038,20 @@ def _batched_landing_steps(
     New witnesses are proved in one stable view before any row of the batch is
     available to the blocking consumer. Repeated destinations use the same
     transaction-local, bounded payload memo as scalar landings.
+
+    The batch always withholds vector components. ``withhold_vectors`` is the closed proof
+    that no consumer inspects them; without it, only a landing table that stores none may
+    take this path, and the table proved here is the runtime one these steps actually land
+    on, not the plan's.
     """
     try:
         first = next(steps)
     except StopIteration:
+        return
+    if not withhold_vectors and _declares_vector(first[2]):
+        yield *first, False, None
+        for candidate in steps:
+            yield *candidate, False, None
         return
     # A missing source/edge must not inspect the destination index eagerly.
     index = _endpoint_identity_index(engine, context, first[2])
@@ -8094,7 +8148,13 @@ def _traverse(
         and getattr(engine.heap._decode_version, "__func__", None) is _VECTOR_FREE_CANONICAL_DECODE
         and getattr(engine._indexes.validated_versions, "__func__", None) is _VECTOR_FREE_CANONICAL_VALIDATED
     )
-    batch_landings = type(node) is TraverseRelationship and vector_free and _admits_batched_landings(engine, node, context)
+    # A landing table with no vector column reaches the same batched port without the closed
+    # vector-free proof: there is nothing for the batch to withhold (READ-3).
+    batch_landings = (
+        type(node) is TraverseRelationship
+        and (vector_free or _total_landings(engine, node))
+        and _admits_batched_landings(engine, node, context)
+    )
 
     def view_at(table: TableDef) -> _OwnerLandingView:
         """Reuse one endpoint landing view per table within this operation."""
@@ -8165,7 +8225,8 @@ def _traverse(
                         continue
                     candidates = steps(record_id)
                     resolved = (
-                        _batched_landing_steps(engine, context, iter(candidates), view_at)
+                        _batched_landing_steps(engine, context, iter(candidates), view_at,
+                                               withhold_vectors=vector_free)
                         if batch_landings else
                         ((*candidate, False, None) for candidate in candidates)
                     )
