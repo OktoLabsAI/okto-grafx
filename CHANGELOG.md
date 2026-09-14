@@ -9,6 +9,12 @@ including the on-disk format.
 
 ### Added (0.0.7 development)
 
+- Recorded the [wave-A qualification](docs/reports/PERF_V007_WAVE_A.md), separating
+  the original failed full regression from baseline reproduction, focused tooling
+  corrections, current port counters, independent native workloads and controlled
+  consumer measurements. Grafx platform performance defines the scope; Pulse is
+  one consumer. Conditional traversal/write-staging gains and the residual native
+  scalar-sort cost are recorded without claiming a universal or Pulse speedup.
 - Recorded the [performance v0.0.7 plan](docs/specs/PERFORMANCE_V007_PLAN.md): a
   mandatory baseline that re-measures the stale consumer denominators on current
   source, the ordered read/write packages that stay inside the multi-writer model,
@@ -19,7 +25,7 @@ including the on-disk format.
 - Recorded the [0.0.7 Phase 0 performance baseline](docs/reports/PERF_V007_BASELINE.md):
   HEAD `b0e4f51` against v0.0.5 `83cc313`, arms alternated round by round on a machine
   declared non-quiescent, so only the paired ratios are defended — Pulse logical
-  transfer 0.945 (HEAD 5.5% slower, 3 of 3 rounds, entirely in the two write phases),
+  transfer 0.945 (HEAD approximately 5.8% slower, 3 of 3 rounds, entirely in the two write phases),
   KG page 0.814 and fan-out 0.834, production vector search 0.886 and cold-handle
   `verify('all')` 0.936 with bands containing 1 — together with the finding that the
   production Pulse fan-out statement carries no id list, which re-ranks the read
@@ -32,6 +38,13 @@ including the on-disk format.
   protocol with the actual interpreter instead of a Windows venv launcher, and
   attribute the graph-export test's Arrow/NetworkX skips. Refreshed the lockfile
   against the current manifest; no database runtime behavior changed.
+- Memoized ORDER BY free names within a statement (READ-4), reduced write-statement
+  sections from three to two (FIX-W), admitted vector-free batched endpoint
+  landings with the existing blocking-consumer guard (READ-3), and implemented
+  private participant sections in process (W-01/W-02). The private-wait hotfix
+  parks real-clock waits with a bounded timeout and preserves manual-clock sampling.
+  These mechanisms have overlapping costs; their earlier ceilings are not additive
+  consumer speedups. See the wave-A report for validation and limitations.
 - Bumped the package and source version to 0.0.7 on `feature/v0.0.7`, branched from
   the released 0.0.6 `main` merge. No functional, persistent-format, query-semantics or
   dependency change; the 0.0.5-legacy wheel compatibility workflow now builds the 0.0.7

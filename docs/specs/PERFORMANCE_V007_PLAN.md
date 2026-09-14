@@ -15,14 +15,19 @@ measured-evidence authority. The evidence base is the untracked reader reports u
 `{BACKLOG,WRITE,READ,CKPT,INSTRUMENTS,GUARDRAILS}/REPORT.md`), read at `1e01be5`.
 Every number keeps its report label: **MEDIDO** (measured in that round, with a
 command), **CITADO** (recorded earlier, with `path:line`), **INFERIDO** (derived,
-not measured), **A_MEDIR** (not measured yet). **No item here is GO**, and the
-ordering is a value hypothesis falsifiable by Phase 0.
+not measured), **A_MEDIR** (not measured yet). The initial ordering was a value
+hypothesis falsifiable by Phase 0. Delivery and independent qualification through
+`852b655` are recorded in the [wave-A report](../reports/PERF_V007_WAVE_A.md)
+and the roadmap; the original cost estimates below are not current speedups.
 
 ## 1. Outcome and fixed boundaries
 
-Deliver measured reductions in read and write cost **inside** the existing
-concurrency model, each justified by the fraction of a real consumer denominator
-measured on the v0.0.7 baseline — never by a micro-benchmark alone.
+Deliver measured reductions in Grafx platform read and write cost **inside** the
+existing concurrency model. The operator clarified on September 14 that Pulse
+is one consumer, not the optimization scope. Use representative native workloads
+to establish the platform effect and consumer workloads to validate its practical
+consequences. Keep mechanism counters, native latency and consumer latency
+separate; a micro-benchmark alone never establishes universal or consumer speedup.
 
 **Many concurrent writers and readers across processes is the product premise.**
 No change may weaken OCC and read/write conflict detection, page-0 and descriptor
@@ -135,6 +140,13 @@ Mandatory and first, as specified in §2. Its output re-ranks everything below.
 
 ### 3.2 Wave A — inside the model, no user decision
 
+Delivery checkpoint (September 14): READ-4 and FIX-W merged; READ-6 is NO_CHANGE,
+READ-9 unchanged; READ-3 merged for eligible vector-free/blocking shapes.
+CKPT-2 is rejected after spurious `index_entry_unresolved` findings under
+eviction, CKPT-4 stopped, and W-07 refuted. W-08 remains Q16. The following
+diagnostic costs retain their original measurement scope; see the
+[wave-A report](../reports/PERF_V007_WAVE_A.md) for integration and qualification.
+
 Each package carries an owner, mechanism references, discriminating tests, the A/B
 and the denominator. **The order is provisional until the Phase 0 numbers land.**
 
@@ -186,16 +198,18 @@ and count the predicate identically. Pin (a) a row the `NodeScan` refuses by typ
 still refuses when the seek eliminates it, (b) binding order preserved, (c) the
 `IndexManager.validated_versions*` port counts exactly one per operation, not one
 per landing; mutate by widening `standalone` without the proof and watch (a) go
-red. Effort M. **Phase 0 outcome — ranked last in Wave A.** The production statement
+red. Effort M. **Initial Phase 0 ranking used the Pulse workload.** The production statement
 carries no id list at all: Community `72a2df3` sends
 `MATCH (a:{from})-[r:{rel}]->(b:{to}) WHERE <visibility(a)> AND <visibility(b)>
 RETURN a.id, b.id, r.confidence LIMIT 5000` and applies the page's node ids in Python
 afterwards (`kg_routes.py:606-615` and `:625`, quoted verbatim in
 [the baseline](../reports/PERF_V007_BASELINE.md)), and `IN $` does not occur anywhere
 in that Community tree. NODE-IN-SEEK on an anchored pattern therefore does not serve
-the production shape and has no consumer denominator here, so A2 is delivered — if at
-all — as a planner improvement measured on the anchored shape only, **after every
-other Wave A package**. Recorded separately as consumer feedback outside this
+the production shape and has no Pulse denominator here. The operator's platform
+scope clarification removes “after every other package” as an automatic priority:
+measure representative native anchored queries and retain the refusal proof
+before choosing the implementation priority. Pulse's lack of this query form is
+not evidence against its value to Grafx. Recorded separately as consumer feedback outside this
 repository, not as work in this plan: that fan-out fetches up to 5,000 edges per
 layout and filters the page's ids in Python.
 
@@ -219,8 +233,8 @@ implemented.
 | READ-9 | Value detachment at the public boundary (`_query_value_snapshot`), the public-boundary capability guard | 5,500 calls per query, tottime 5.0%; 2–4% INFERIDO. Low confidence, listed for completeness, admissible only with an explicit design. Effort M |
 
 **A5 — READ-3: engage the grouped endpoint landings that already exist.**
-`_batched_landing_steps` (`query_engine.py:7975`, the BATCH-REL-1 read side) would
-resolve 500 certificates in 8, but `_admits_batched_landings` ends in
+`_batched_landing_steps` (`query_engine.py:7975`, the BATCH-REL-1 read side)
+groups endpoint certificates, but `_admits_batched_landings` ends in
 `return blocking` (`:7973`) and the `vector_free` gate (`:8079`) also applies.
 MEDIDO: adding `ORDER BY b.pk` changes neither the invalidations (500 split, 2,000
 anchored) nor the wall on a table with no vector columns — the batch did not engage
@@ -229,7 +243,11 @@ candidates: `_closed_vector_free_landings`, the canonical `__func__` values of t
 index manager, `_endpoint_identity_index`); that is effort S and the cheapest route
 into the READ-2 cost bag. Then engage the landings through the existing validated
 `validated_versions_many_reusing` port (`index_manager.py:7635`) **without changing
-what is certified**, expecting `ceil(500/64) = 8` invalidations counted at the port.
+what is certified**. Delivered in `a46e0d2`: the frontier is per source, with
+cached destinations excluded. The corrected probe observes `64+64+64+8` for one
+source and 200 distinct destinations; an overlap fixture has 100 batched calls
+versus 131 scalar certificates. A blanket “8 invalidations for 500 rows” is
+incorrect. The streaming LIMIT used by the Pulse fan-out still does not qualify.
 
 **A6 — commit-local repeated work.**
 
@@ -259,6 +277,12 @@ put a v0.0.7 number on them.
 | Batch statements inside one read transaction where the per-transaction envelope dominates (READ-7, COMMITSTATE-1) | `begin("read")` publishes a reader-registration file per transaction | MEDIDO: `with db.begin("read"): pass` costs 3.58 ms against a 3.16 ms point query |
 
 ### 3.3 Wave B — proof-gated, no premise change if the proof holds
+
+W-01/W-02 are now merged in `0e8c13a`, with the private-wait starvation
+correction in `852b655`. The 154-entry observation below precedes FIX-W
+integration; the integrated 50-statement fixture has 104 participant entries.
+Its fresh recheck records zero participant file locks and four other file-lock
+acquisitions on both revisions. The historical 1.226x arm remains a ceiling.
 
 **W-01 / W-02 — the participant section is process-local by construction but is
 implemented as an OS advisory file lock.** The section name is
@@ -300,7 +324,7 @@ ranks them.
 | Q9 | READ-7 | Reuse a reader registration across sequential read transactions of one handle | Envelope 3.58 ms versus a 3.16 ms point query MEDIDO; interacts with the BR-10 `reader_horizon` regression |
 | Q10 | CKPT-1 | Narrow `barrier_files` to actually touched files; requires accepting the fsync induction in writing | 37 `durable_barrier`/fsync for 5 `write_page` MEDIDO; touches durability |
 | — | CKPT-5 | Avoid the second `IndexStore.open()` per index on cold write open | 30 extra `page_count` and 30 extra page-0 reads MEDIDO; both points sit outside `COMMIT_SECTION` |
-| — | COMMITSTATE-1 | Any memo over the publication authority (one commit-state read per statement in autocommit) | ~65% of `_run_statement` cumulative for a point read MEDIDO; caveat: Pulse reads inside explicit read transactions, so the real fraction is A_MEDIR |
+| — | COMMITSTATE-1 | Any memo over the publication authority (one commit-state read per statement in autocommit) | ~65% of `_run_statement` cumulative for a point read MEDIDO; the old harness shares a transaction, but pinned Pulse `72a2df3` calls `database.execute` per fan-out table. The real fraction remains A_MEDIR |
 | Q13/Q15 | Public defaults | `buffer_budget_bytes` 64 → 256 MiB; `identity_lease_size` 64 → 1024 | As in §3.2; opt-in today, default only by decision |
 | Q3 | D-3 / LV-2 | Bucket sizing port (`DEFAULT_BUCKET_COUNT = 64`, 99% empty) | DDL = 10.6% of transfer, 99% of it empty-bucket writes (CITADO); **persisted format** |
 | Q4 | STORAGE-6 | Persisted ordered spine (design B-spine) | x2.54 on top-K when the LIMIT bites (CITADO); **persisted format**; the memo warns the value is asymptotic, not wall-clock at current N |
@@ -309,7 +333,9 @@ ranks them.
 | Q7 | EXEC-5 | An inexact selectivity statistic chooses the scan-versus-seek arm | Fraction 0 today; cliff 1.39–2.36x, up to x3.3 under churn (CITADO) |
 | Q11 | Determinism | The cross-machine determinism contract for `vector_math='numpy'`, which became the default in `4b632c0` without the contract the consensus required | Every vector number before `4b632c0` measured the pure adapter |
 | Q12 | EXEC-MP | Whether the `MappingProxyType` seal covers the query engine's hot dispatch tables or only the storage core | Residual after EXEC-CSE is 0.6% (CITADO); conflicts with `tests/storage_core/test_no_shared_state.py` (AST scan) |
-| Q14 | Measurement environment | `ladybug` bench extra, `psutil`, and copying the levantamento-2 boards into `.grafx-tmp/` | Without them the three D5 multiples stay UNMEASURED and PERF-MEM has no instrument |
+| Q14 | Measurement environment | `ladybug` bench extra, `psutil`, and copying the levantamento-2 boards into `.grafx-tmp/` | Current tests/measurements supply `psutil` and isolated board copies. The Ladybug comparison remains UNMEASURED; this does not authorize a new competitor campaign |
+| Q16 | W-08 | Add `operator.is_` outside the frozen standard-library allowlist | Reported 0.24% of commit; no implementation authorized by this plan |
+| M3 | READ-9 / NodeValue | Change the public value-materialization trust boundary | Bisected to `6b6ff12..69af5db`; a redundant-copy claim does not prove an engine collaborator can be trusted |
 
 ### 3.5 Explicit exclusions and already-delivered work
 
@@ -345,6 +371,12 @@ recovery-floor photo reuse, scoped checkpoint photograph); and C3 plan cloning
 - Each package runs its focused positive, negative and prior-regression cases during
   implementation; grouped regressions run at the end of each wave, not after every
   edit. New WAL, format or rollback risk requires its focused fault tests immediately.
+- After integrating a coordination-section change, run
+  `tests/api/test_vector_concurrency.py` and
+  `tests/api/test_public_boundary_concurrency.py` before the grouped gate.
+  In `coordination_local.py::_wait_for_local_lock`, park only with a real
+  `SystemClock` and real sleeper, keep the wait bounded, and preserve sampling
+  for manual/foreign clocks.
 - **Make every test used as proof fail on purpose before accepting it as a guard.**
 - **Count calls per operation with counters at the port, never by grepping call
   sites.** Do not deflate syscall fractions derived from a profile: cProfile
@@ -354,6 +386,10 @@ recovery-floor photo reuse, scoped checkpoint photograph); and C3 plan cloning
   certificates/syscalls" claim. Install the same CRC the consumer uses before timing
   any path that hashes pages. Treat missing data as unknown, never as zero.
 - **Never run anything heavy while an Amdahl measurement is running.**
+- Preserve the full run's exit status and JUnit independently. Reproduce new
+  failures on the relevant ancestor before attribution. A documented tooling-only
+  exception may permit unchanged-runtime measurements after focused correction;
+  it never turns a failed full run into a passing gate.
 - Do not sum gains of items that attack the same cost; the overlap columns of the
   source synthesis are normative.
 
@@ -383,9 +419,10 @@ GUARDRAILS report §11, whose §12 lists the mandatory test sets per area):
 - Every delivered item adds one line to [`docs/PERFORMANCE.md`](../PERFORMANCE.md)
   naming workload, build, boundaries and limitations, and one
   [`CHANGELOG.md`](../../CHANGELOG.md) entry under the 0.0.7 development headings.
-- **No speedup claim without the measured fraction of a real consumer denominator on
-  the v0.0.7 baseline.** A micro-benchmark ratio is attribution evidence, never a
-  published gain.
+- **Every speedup claim names its measured workload and denominator on the
+  v0.0.7 baseline.** Native API measurements can establish bounded platform gains;
+  consumer measurements establish the corresponding application effect. A
+  micro-benchmark ratio is attribution evidence, not a universal or consumer gain.
 - **No persisted-format change, public default change or capability activation
   without the user's recorded decision**, quoted by its number from §3.4; a one-way
   activation is recorded as one-way.

@@ -104,7 +104,11 @@ batches; the synthetic graph generation (1.19–1.29 s) is outside the denominat
 | 8b 300 one-hop reads | 0.617 (0.572..0.636) | 0.533 (0.469..0.537) | — | 0.871 | MEDIDO |
 | 8c 30 vector searches | 3.248 (3.186..3.249) | 3.184 (3.002..3.317) | — | 0.980 | MEDIDO |
 
-Reading: on this machine, in this shape, the HEAD transfer is **5.5 % slower than v0.0.5**
+Percentage erratum, September 14 wave-A review: the original 5.5% prose used the
+wrong denominator. With v0.0.5/HEAD = 0.945, HEAD's excess latency relative to
+v0.0.5 is `1/0.945 - 1`, approximately 5.8%. The original timings and ratios stand.
+
+Reading: on this machine, in this shape, the HEAD transfer is **approximately 5.8% slower than v0.0.5**
 (3 of 3 rounds below 1, band 0.895–0.973). The whole of that difference and more sits in the two
 write phases — `write_nodes` 0.847 and `write_relations` 0.871, both 3 of 3 rounds below 1 — while
 `checkpoint` moves the other way (1.128, 3 of 3 rounds at or above 1.01) and `certify` is

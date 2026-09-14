@@ -9,7 +9,35 @@ The latest isolated installed Pulse/native observations below use the final
 0.0.6 candidate. The latest production spec-consolidation measurement still uses
 `0.0.4@fa8f188`; no production spec was consolidated for these tests.
 
-## Latest 0.0.7 baseline: HEAD versus v0.0.5 on the same machine
+## 0.0.7 wave A: merged mechanisms and independent qualification
+
+The objective is Grafx platform performance. Native API workloads evaluate
+general mechanisms; Pulse workloads evaluate one consumer's resulting experience.
+Neither a Pulse-specific result nor one native micro-benchmark establishes a
+universal gain.
+
+The [wave-A report](reports/PERF_V007_WAVE_A.md) records development source
+`852b655`, its pre-wave and 0.0.5 comparisons, the original full regression
+(24,780 passed, 2 failed, 41 skipped), reproduction of both failures before wave A,
+and separate focused tooling corrections. The failed full run remains failed.
+READ-4 memoization, FIX-W section fusion, READ-3 vector-free admission and
+W-01/W-02 private participant coordination are delivered mechanisms; their
+individual ceiling measurements must not be added together. The private-wait
+hotfix retains bounded waiting and manual-clock behavior. The fresh 50-statement
+port recheck observes 104 private participant entries, zero participant file
+locks and four other file-lock acquisitions, both before and after that hotfix.
+Consumer timing boundaries and results are recorded separately in the report.
+
+The new native matrix establishes conditional benefits outside Pulse: ordered
+traversals to 200 distinct destinations and to overlapping destinations have paired
+pre-wave/head ratios 3.060/1.592; staging 50 individual node/relationship writes
+has ratios 1.496/1.246. Streaming, bulk-write and commit cases do not show uniform
+gains. These are bounded workload observations, not additive package speedups.
+The current Pulse shape and total transfer do not establish gains beyond the
+same-code variation. A scalar 2,000-row sort still trails v0.0.5; the report records
+a native call-profile diagnostic and the resulting platform priorities.
+
+## Pre-wave 0.0.7 baseline: HEAD versus v0.0.5 on the same machine
 
 September 14, 2026, Phase 0 of the 0.0.7 performance initiative. `b0e4f51`
 (`feature/v0.0.7`, the v0.0.6 tag `1e01be5` plus the version bump) against `83cc313`
@@ -35,7 +63,7 @@ arm was faster.
 | Production vector search, per query | 74.9 ms | 69.6 ms | 0.886, band contains 1 | MEDIDO |
 | `verify('all')`, cold handle, copied board | 0.610 s | 0.571 s | 0.936, band contains 1 | MEDIDO |
 
-Reading: HEAD measures **5.5 % slower on the Pulse logical transfer, 3 of 3 rounds**,
+Reading: HEAD measures **approximately 5.8% slower on the Pulse logical transfer, 3 of 3 rounds**,
 and all of that difference sits in the two write phases while checkpoint moves the
 other way; the vector and `verify('all')` bands contain 1, so no difference is
 established there. No cause is established for any ratio. On HEAD the transfer
