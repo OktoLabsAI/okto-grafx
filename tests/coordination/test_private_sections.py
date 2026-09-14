@@ -5,10 +5,13 @@ whose name carries this instance's own ``owner_id`` digest be serialised with a 
 instead of an operating-system file lock. The claim it rests on is narrow and is tested here as
 three separate obligations:
 
-* the declaration is REFUSED for every name that is not this instance's digest, so no
-  cross-process section can be downgraded by a caller that merely asks nicely;
+* the declaration is REFUSED for every name that is not EXACTLY this instance's participant
+  name, so no cross-process section can be downgraded by a caller that merely asks nicely -- and
+  not by one that pads a spelling until it ends in the right eight hex characters either;
 * a declared section still serialises the THREADS of its coordinator, which is the entire reason
   the participant section exists (txn_manager ``_participant_section``);
+* a declaration and an entry that race are ordered: the mechanism behind a live section never
+  changes underneath its holder, which is a fence rather than a check;
 * the control directory keeps the same lock file, because forensic and census tooling compares
   that inventory and a performance decision must not change what a directory looks like.
 """
@@ -36,11 +39,27 @@ from okto_grafx.domain.page.checksum import crc32c
 PARTICIPANT_PREFIX: str = "txn-"
 """The engine's participant prefix, repeated here so the test does not depend on the engine."""
 
+_RACE_ROUNDS: int = 16
+"""How many times the declaration/entry race is replayed.
+
+The race is staged rather than sampled, so one round already discriminates; the repetition is
+there because a scheduler that parks a thread at the wrong moment must not be able to turn a
+real defect into an intermittent green.
+"""
+
+_RACE_TIMEOUT: float = 30.0
+"""Ceiling on every wait of the race, so a wedged round fails the suite instead of hanging it."""
+
+
+def _digest(coordinator: object) -> str:
+    """Return the eight hex characters of this coordinator's own identity digest."""
+    owner: str = coordinator.owner_id()  # type: ignore[attr-defined]
+    return f"{crc32c(owner.encode('utf-8')):08x}"
+
 
 def _participant_name(coordinator: object) -> str:
     """Return the section name the engine would build for this coordinator."""
-    owner: str = coordinator.owner_id()  # type: ignore[attr-defined]
-    return f"{PARTICIPANT_PREFIX}{crc32c(owner.encode('utf-8')):08x}"
+    return f"{PARTICIPANT_PREFIX}{_digest(coordinator)}"
 
 
 def _count_os_locks(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
@@ -73,22 +92,74 @@ def _count_os_locks(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
 def test_only_this_instances_own_digest_can_be_declared_private(
     make_coordinator: CoordinatorFactory,
 ) -> None:
-    """Every cross-process section name is refused, whoever asks and however it is spelled."""
+    """Every cross-process section name is refused, whoever asks and however it is spelled.
+
+    The refusal list is anchored deliberately. A guard written as ``name.endswith(digest)``
+    passes every case that ends in the right eight hex characters, and ``page0-<digest>`` is
+    exactly that shape (``api/assembly.py`` spells page-0 sections ``page0-<crc32c(file):08x>``),
+    so the cases below are the ones that separate a full-name comparison from a tail comparison.
+    """
     first = make_coordinator(owner_id="p1-aaaa")
     second = make_coordinator(owner_id="p2-bbbb", monotonic_origin=50.0)
     declare = type(first).__dict__["_declare_private_section"]
+    digest = _digest(first)
 
     assert declare(first, _participant_name(first)) is True
     for refused in (
+        # Named cross-process sections, as they are actually spelled.
         "commit",
+        "lease",
         "writer.lease",
         "first-open",
         "page0-1dec8160",
+        # A different instance's participant name, and a digest that belongs to nobody.
         _participant_name(second),
         f"{PARTICIPANT_PREFIX}00000000",
+        # The tail is this instance's digest, the name is not. Every one of these passes an
+        # endswith guard.
+        digest,
+        f"page0-{digest}",
+        f"commit-{digest}",
+        f"writer.lease-{digest}",
+        f"x-{PARTICIPANT_PREFIX}{digest}",
+        f"zzz{digest}",
+        # The digest as a PREFIX, and the right name padded on the right.
+        f"{digest}-{PARTICIPANT_PREFIX.rstrip('-')}",
+        f"{digest}0000",
+        f"{PARTICIPANT_PREFIX}{digest}-1",
+        f"{PARTICIPANT_PREFIX}{digest}0",
+        f"{PARTICIPANT_PREFIX}{digest}.lock",
     ):
         assert declare(first, refused) is False, refused
     assert set(first._private_section_locks) == {_participant_name(first)}
+
+
+def test_the_accepted_name_is_the_one_the_engine_builds(
+    make_coordinator: CoordinatorFactory,
+) -> None:
+    """The adapter's grammar and the engine's participant name are pinned to each other.
+
+    The adapter re-declares the prefix instead of importing the engine, so this test is the fence
+    against drift: if either side changes its spelling, the capability silently stops applying
+    (or, worse, starts applying to something else) and this fails instead.
+    """
+    from okto_grafx.engine.txn_manager import PARTICIPANT_SECTION_PREFIX
+
+    assert coordination_local._PRIVATE_SECTION_PREFIX == PARTICIPANT_SECTION_PREFIX
+    assert PARTICIPANT_PREFIX == PARTICIPANT_SECTION_PREFIX
+
+    coordinator = make_coordinator(owner_id="p1-aaaa")
+    engine_name = (
+        f"{PARTICIPANT_SECTION_PREFIX}"
+        f"{crc32c(coordinator.owner_id().encode('utf-8')):08x}"
+    )
+    assert coordinator._private_section_name() == engine_name
+    declare = type(coordinator).__dict__["_declare_private_section"]
+    assert declare(coordinator, engine_name) is True
+    # The same normalized name spelled in upper case is the same section, and exclusive()
+    # normalizes identically, so it is accepted rather than treated as a foreign name.
+    assert declare(coordinator, engine_name.upper()) is True
+    assert set(coordinator._private_section_locks) == {engine_name}
 
 
 def test_the_same_configured_owner_name_still_yields_two_private_sections(
@@ -238,12 +309,187 @@ def test_a_declared_section_keeps_the_timeout_and_re_entry_contract(
 def test_a_declaration_is_refused_while_the_section_is_held(
     make_coordinator: CoordinatorFactory,
 ) -> None:
-    """The mechanism behind a live section never changes underneath its holder."""
+    """The mechanism behind a live section never changes underneath its holder.
+
+    The sequentially ordered half of the obligation: the holder is already registered when the
+    declaration asks. The racing half -- a holder that is still on its way IN -- is the test
+    below, and only that one discriminates the fence from the check.
+    """
     coordinator = make_coordinator(owner_id="p1-aaaa")
     name = _participant_name(coordinator)
     declare = type(coordinator).__dict__["_declare_private_section"]
     with coordinator.exclusive(name, timeout=1.0):
         assert declare(coordinator, name) is False
+    assert declare(coordinator, name) is True
+
+
+def test_a_declaration_racing_an_entry_never_changes_the_mechanism_in_flight(
+    database_root: Path, lock_directory: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declaration and an entry that overlap are ORDERED, not merely checked.
+
+    THE SECOND DISCRIMINATING TEST FOR W-01, and the one that separates a fence from a
+    time-of-check window. ``_section`` resolves the mechanism of an entry and registers that
+    entry in ``self._sections`` at two different moments. Between them the entry is in flight:
+    it is committed to the operating-system lock and it is invisible to anything that only reads
+    ``self._sections``. A declaration that installs the process lock inside that window leaves a
+    section whose holder is excluding on the FILE while every later thread excludes on a fresh,
+    unheld process lock -- so two threads are inside at once.
+
+    The window is the shipped code's; the test only decides WHEN it is entered instead of
+    sampling it, by stalling the holder inside ``_open_lock_file`` (the first thing the entry
+    does after it stops being able to see the declaration). Both threads meet at a barrier first
+    and the round is repeated, because a scheduler that happened to order them the other way
+    would otherwise turn a real defect into a flake.
+
+    Pre-fix this fails on the first round: the declaration returns True, the intruder reports
+    INSIDE, and ``overlaps`` is 1.
+    """
+    real_open = LocalProcessCoordinator._open_lock_file
+    stage: dict[str, object] = {"section": None, "holder": None}
+
+    def staged_open(
+        self: LocalProcessCoordinator, path: str, section: str, deadline: float
+    ) -> int:
+        if section == stage["section"] and threading.get_ident() == stage["holder"]:
+            entry_in_flight: threading.Event = stage["in_flight"]  # type: ignore[assignment]
+            decided: threading.Event = stage["decided"]  # type: ignore[assignment]
+            entry_in_flight.set()
+            decided.wait(timeout=_RACE_TIMEOUT)
+        return real_open(self, path, section, deadline)
+
+    monkeypatch.setattr(LocalProcessCoordinator, "_open_lock_file", staged_open)
+
+    for attempt in range(_RACE_ROUNDS):
+        coordinator = LocalProcessCoordinator(
+            DirectoryStorageDevice(database_root),
+            SystemClock(),
+            owner_id=f"race{attempt:03d}",
+            lock_directory=lock_directory,
+            poll_interval=0.001,
+            sleeper=time.sleep,
+        )
+        name = _participant_name(coordinator)
+        declare = type(coordinator).__dict__["_declare_private_section"]
+
+        stage["section"] = name
+        stage["holder"] = None
+        stage["in_flight"] = in_flight = threading.Event()
+        stage["decided"] = decided = threading.Event()
+
+        gate = threading.Barrier(2, timeout=_RACE_TIMEOUT)
+        entered = threading.Event()
+        may_release = threading.Event()
+        guard = threading.Lock()
+        declared: list[object] = []
+        intruder_saw: list[str] = []
+        inside = 0
+        overlaps = 0
+        failures: list[BaseException] = []
+
+        def holder() -> None:
+            nonlocal inside, overlaps
+            try:
+                stage["holder"] = threading.get_ident()
+                gate.wait()
+                with coordinator.exclusive(name, timeout=_RACE_TIMEOUT):
+                    with guard:
+                        inside += 1
+                        if inside > 1:
+                            overlaps += 1
+                    entered.set()
+                    may_release.wait(timeout=_RACE_TIMEOUT)
+                    with guard:
+                        inside -= 1
+            except BaseException as raised:  # noqa: BLE001 - asserted after the join
+                failures.append(raised)
+                entered.set()
+
+        def declarer() -> None:
+            try:
+                gate.wait()
+                assert in_flight.wait(timeout=_RACE_TIMEOUT)
+                declared.append(declare(coordinator, name))
+            except BaseException as raised:  # noqa: BLE001 - asserted after the join
+                failures.append(raised)
+            finally:
+                decided.set()
+
+        def intruder() -> None:
+            nonlocal inside, overlaps
+            try:
+                with coordinator.exclusive(name, timeout=0.1):
+                    with guard:
+                        inside += 1
+                        if inside > 1:
+                            overlaps += 1
+                        intruder_saw.append("INSIDE")
+                        inside -= 1
+            except GrafxLeaseTimeout:
+                intruder_saw.append("GrafxLeaseTimeout")
+
+        threads = [
+            threading.Thread(target=holder, name="holder"),
+            threading.Thread(target=declarer, name="declarer"),
+        ]
+        for thread in threads:
+            thread.start()
+        assert entered.wait(timeout=_RACE_TIMEOUT), attempt
+        third = threading.Thread(target=intruder, name="intruder")
+        third.start()
+        third.join(timeout=_RACE_TIMEOUT)
+        may_release.set()
+        for thread in (*threads, third):
+            thread.join(timeout=_RACE_TIMEOUT)
+
+        assert failures == [], attempt
+        # The harm first, because that is what the invariant is FOR: nobody joins the holder
+        # inside the section, whatever the declaration did.
+        assert overlaps == 0, attempt
+        assert intruder_saw == ["GrafxLeaseTimeout"], (attempt, intruder_saw)
+        assert inside == 0, attempt
+        # Then the mechanism that prevents it: the declaration is refused while an entry is in
+        # flight, exactly as it is refused while one is held.
+        assert declared == [False], (attempt, declared)
+        # Once nothing is live the mechanism may change, and does.
+        assert declare(coordinator, name) is True, attempt
+        assert set(coordinator._private_section_locks) == {name}, attempt
+
+
+def test_an_entry_that_fails_leaves_nothing_pending_behind(
+    make_coordinator: CoordinatorFactory,
+) -> None:
+    """The fence must not wedge its own door.
+
+    A declaration is refused while a name is PENDING, so an entry that ends in a timeout, a
+    device failure or a host interrupt has to stop being pending on the way out. If it did not,
+    one lost race would make the capability permanently undeclarable for the life of the
+    coordinator -- silently, because the declaration just answers False.
+    """
+    coordinator = make_coordinator(owner_id="p1-aaaa", poll_interval=0.001)
+    name = _participant_name(coordinator)
+    declare = type(coordinator).__dict__["_declare_private_section"]
+    failure: list[BaseException] = []
+
+    def loser() -> None:
+        try:
+            with coordinator.exclusive(name, timeout=0.05):
+                pytest.fail("the section was granted twice at once")
+        except BaseException as raised:  # noqa: BLE001 - recorded and asserted below
+            failure.append(raised)
+
+    # The section is NOT declared here, so the loser fails inside the file-lock path.
+    with coordinator.exclusive(name, timeout=1.0):
+        thread = threading.Thread(target=loser)
+        thread.start()
+        thread.join(timeout=30.0)
+        assert coordinator._pending_sections == {}
+
+    assert len(failure) == 1
+    assert isinstance(failure[0], GrafxLeaseTimeout)
+    assert coordinator._pending_sections == {}
+    assert coordinator._sections == {}
+    # And the door still opens.
     assert declare(coordinator, name) is True
 
 

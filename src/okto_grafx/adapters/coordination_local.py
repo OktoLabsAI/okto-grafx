@@ -159,6 +159,21 @@ READER_FORMAT_VERSION: int = 1
 LEASE_SECTION: str = "writer.lease"
 """Name of the section that serialises every read-modify-write of the lease file."""
 
+_PRIVATE_SECTION_PREFIX: str = "txn-"
+"""Prefix of the ONE section-name grammar :meth:`_declare_private_section` may accept.
+
+The whole accepted language is ``_PRIVATE_SECTION_PREFIX`` followed by the eight lowercase hex
+characters of ``crc32c(owner_id)`` for THIS instance, and the guard compares the full string, not
+a suffix: a name that merely ends in the digest -- ``page0-<digest>``, ``commit-<digest>``, the
+bare digest -- is a different section and is refused.
+
+The spelling repeats ``okto_grafx.engine.txn_manager.PARTICIPANT_SECTION_PREFIX`` on purpose
+rather than importing it. The adapter answers a port and must not depend on the engine that
+happens to be its only caller today; ``tests/coordination/test_private_sections.py`` pins the two
+constants against each other, so a drift is a failing test rather than a guard that silently
+stops matching -- or, worse, silently matches more.
+"""
+
 LEASE_WAIT_METRIC: str = "oktografx_lease_wait_seconds"
 """Metric this adapter observes on every acquisition attempt (CONTRACT.md section 9)."""
 
@@ -898,8 +913,14 @@ class LocalProcessCoordinator:
         self._state_lock = threading.RLock()
         self._sections: dict[tuple[int, str], object] = {}
         # Sections proved private to THIS instance by _declare_private_section. Empty unless a
-        # caller declares one, so the default shape of every section is unchanged.
+        # caller declares one, so the default shape of every section is unchanged. Written only
+        # under _state_lock, and only by a declaration that saw the name neither held nor
+        # pending, which is what makes the mechanism of a live section immutable.
         self._private_section_locks: dict[str, threading.Lock] = {}
+        # Sections whose mechanism has been resolved by _section but whose entry has not yet
+        # reached self._sections: the window a declaration must not slip through. Counted
+        # rather than flagged because several threads may be entering one name at once.
+        self._pending_sections: dict[str, int] = {}
         self._descriptor_scopes: dict[tuple[int, str], _ReusableDescriptorScope] = {}
         self._held: Lease | None = None
         self._installed: Lease | None = None
@@ -1552,25 +1573,62 @@ class LocalProcessCoordinator:
 
     @contextmanager
     def _section(self, name: str, timeout: float) -> Iterator[None]:
-        """Take the named section, counting re-entry from the same thread of this coordinator."""
+        """Take the named section, counting re-entry from the same thread of this coordinator.
+
+        Lock order, and the reason there is one: ``_state_lock`` is the innermost lock of this
+        adapter and is never held across a file operation or an advisory lock. What it does hold
+        across is the pair of decisions that must not be separated -- WHICH mechanism this entry
+        will use, and the record that an entry is in flight. A declaration
+        (:meth:`_declare_private_section`) refuses a name that is held OR pending under that same
+        lock, so an entry carries the mechanism it resolved here all the way to its release and
+        the mechanism behind a live section can never change underneath its holder.
+        """
         budget = _require_non_negative("timeout", timeout)
         key = (threading.get_ident(), name)
+        private: threading.Lock | None = None
         with self._state_lock:
             reentered = key in self._sections
+            if not reentered:
+                private = self._private_section_locks.get(name)
+                self._pending_sections[name] = self._pending_sections.get(name, 0) + 1
         if reentered:
             # The frame that took the lock is the frame that releases it, so a nested frame has
             # nothing to do on the way in or on the way out.
             yield
             return
-        handle = self._take_lock(name, budget)
+        try:
+            handle = self._take_lock(name, budget, private=private)
+        except BaseException:
+            # A timeout, a device failure or a host interrupt on the way in ends the entry, so
+            # the name stops being pending and a declaration may proceed again.
+            with self._state_lock:
+                self._forget_pending_section(name)
+            raise
         with self._state_lock:
             self._sections[key] = handle
+            # Held and pending are dropped in that order, under one acquisition, so the name is
+            # never briefly neither.
+            self._forget_pending_section(name)
         try:
             yield
         finally:
             with self._state_lock:
                 self._sections.pop(key, None)
             self._drop_lock(handle)
+
+    def _forget_pending_section(self, name: str) -> None:
+        """Drop one in-flight entry of a section. Callers must already hold ``_state_lock``."""
+        remaining = self._pending_sections.get(name, 0) - 1
+        if remaining > 0:
+            self._pending_sections[name] = remaining
+        else:
+            self._pending_sections.pop(name, None)
+
+    def _section_is_live(self, name: str) -> bool:
+        """Answer whether a section is held or being entered. Callers must hold ``_state_lock``."""
+        if name in self._pending_sections:
+            return True
+        return any(key[1] == name for key in self._sections)
 
     # --- internals: lease state ------------------------------------------------------------------
 
@@ -1972,11 +2030,19 @@ class LocalProcessCoordinator:
             ) from failure
         return lock_directory
 
-    def _take_lock(self, name: str, timeout: float) -> object:
-        """Take the advisory lock of a section, or raise GrafxLeaseTimeout on expiry."""
+    def _take_lock(
+        self, name: str, timeout: float, *, private: threading.Lock | None = None
+    ) -> object:
+        """Take the advisory lock of a section, or raise GrafxLeaseTimeout on expiry.
+
+        ``private`` is the mechanism :meth:`_section` resolved under ``_state_lock``. It is
+        handed down rather than looked up here on purpose: a lookup at this point would read
+        ``_private_section_locks`` outside the lock that guards it and could observe a
+        declaration that landed after the entry began. Omitting it asks for the operating-system
+        lock, which is what every section did before the capability existed.
+        """
         if self._lock_directory is None:
             return self._take_local_lock(name, timeout)
-        private = self._private_section_locks.get(name)
         if private is not None:
             # A section whose name carries this instance's own owner digest cannot be entered
             # by any other participant, so its exclusion has nothing to say between processes
@@ -2010,29 +2076,54 @@ class LocalProcessCoordinator:
                 )
             self._sleep(min(self._poll, deadline - now))
 
+    def _private_section_name(self) -> str:
+        """Return the ONE section name this instance may declare private: ``txn-<own digest>``.
+
+        Derived here, from this coordinator's own identity, so a caller can only ever confirm a
+        name the adapter already computed -- never widen it.
+        """
+        return f"{_PRIVATE_SECTION_PREFIX}{crc32c(self._owner.encode('utf-8')):08x}"
+
     def _declare_private_section(self, name: str) -> bool:
         """Serialise one PROVABLY instance-private section in this process instead of on disk.
 
         The optional, private-performance capability behind W-01. A caller may declare a section
-        private only by naming it with the digest of THIS coordinator's ``owner_id``, and that
-        identity is not a configured string: it always ends in ``_INSTANCE_NONCE_LENGTH`` hex
-        characters of ``uuid4`` minted in :meth:`__init__`, so no other coordinator instance --
-        in this process or any other, with or without the same configured owner name, before or
-        after a reopen -- can produce the digest. The name is therefore unreachable by anything
-        the operating-system lock could have excluded, and what remains to exclude is exactly the
+        private only by naming it EXACTLY :meth:`_private_section_name`, the digest of THIS
+        coordinator's ``owner_id`` under the one accepted prefix. That identity is not a
+        configured string: it always ends in ``_INSTANCE_NONCE_LENGTH`` hex characters of
+        ``uuid4`` minted in :meth:`__init__`, so no other coordinator instance -- in this process
+        or any other, with or without the same configured owner name, before or after a reopen --
+        can produce the digest. The name is therefore unreachable by anything the
+        operating-system lock could have excluded, and what remains to exclude is exactly the
         THREADS of this instance, which a process lock excludes precisely.
 
         Refused, so the claim can never be taken on trust:
 
-        * a name that does not carry this instance's digest (the cross-process sections --
-          ``commit``, ``writer.lease``, ``first-open``, ``page0-*`` -- can never satisfy it);
-        * a name whose section is held right now, by any thread, so the mechanism behind a live
-          section can never change underneath its holder.
+        * anything but the exact name. The comparison is against the whole string and not
+          against its tail, because a tail would also admit ``page0-<digest>`` -- page-0 sections
+          are spelled with an eight-hex digest too -- as well as ``commit-<digest>``,
+          ``writer.lease-<digest>`` and the bare digest. ``commit``, ``writer.lease``,
+          ``first-open``, a page-0 name and another instance's participant name are all outside
+          the accepted language, whoever asks and however the caller pads the spelling;
+        * a name whose section is held right now by any thread, OR is being entered right now by
+          any thread. The second half is what makes this a fence rather than a check:
+          :meth:`_section` resolves the mechanism and records the entry as pending under one
+          acquisition of ``_state_lock``, and both halves are read here under that same lock, so
+          there is no instant at which an entry is invisible and a declaration could install a
+          second mechanism for a section a holder is already inside.
+
+        Lock order: the lock file is opened OUTSIDE ``_state_lock``, which is never held across a
+        file operation or an advisory lock; the decision to install is then re-taken under
+        ``_state_lock`` alone, so a name that became live during the open is still refused.
 
         The lock FILE is still created, once, exactly where and when the first entry would have
         created it. Its presence is part of the observable control inventory that forensic and
         census tooling compares, and a declaration must not change what a directory looks like --
-        only how often this process pays for it. It is never locked again afterwards.
+        only how often this process pays for it. It is never locked again afterwards, and the
+        one consequence of that is recorded honestly: a declared section's lock file is no longer
+        re-created by the next statement if something outside the database removes it under a
+        live handle. Exclusion is unaffected -- the process lock does not live in the file -- and
+        the next open re-creates it, but the file has stopped healing itself per entry.
 
         Returns True when the declaration took effect (including a repeat of one already made).
         """
@@ -2043,23 +2134,23 @@ class LocalProcessCoordinator:
             # Sections are already process-local here; there is nothing to convert and no lock
             # file to preserve.
             return False
-        digest = f"{crc32c(self._owner.encode('utf-8')):08x}"
-        if not normalized.endswith(digest):
+        if normalized != self._private_section_name():
             return False
         with self._state_lock:
-            existing = self._private_section_locks.get(normalized)
-            if existing is not None:
+            if normalized in self._private_section_locks:
                 return True
-            if any(key[1] == normalized for key in self._sections):
+            if self._section_is_live(normalized):
                 return False
         path = self._lock_file_path(normalized)
         deadline = self._clock.monotonic() + self._section_timeout
         handle = self._open_lock_file(path, normalized, deadline)
         self._close_file_descriptor(handle)
         with self._state_lock:
-            if any(key[1] == normalized for key in self._sections):
+            if normalized in self._private_section_locks:
+                return True
+            if self._section_is_live(normalized):
                 return False
-            self._private_section_locks.setdefault(normalized, threading.Lock())
+            self._private_section_locks[normalized] = threading.Lock()
         return True
 
     def _lock_file_path(self, name: str) -> str:
