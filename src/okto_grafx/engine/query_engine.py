@@ -7945,6 +7945,12 @@ def _admits_batched_landings(
     WAL records, physical images or write partitions. Its closed read-only
     preflight can use the same bounded snapshot batches; eligibility is tested
     again for each statement, never carried into subsequent staged work.
+
+    Not a quota: an admitted traversal resolves up to 64 landings before the first
+    ``read_control.step()`` of that fan-out, so a deadline or a cancellation is observed at
+    most one 64-wide window late -- the window ``_ReadControl.step`` already amortises the
+    clock over. The property is the batched path's from the start; a vector-free landing
+    table now reaches that same path.
     """
     manager = engine._indexes
     if (
