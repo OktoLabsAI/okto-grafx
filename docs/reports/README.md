@@ -1,5 +1,7 @@
 # Evidence and report index
 
+- [v0.0.7 performance baseline (Phase 0): HEAD versus v0.0.5 paired ratios, on a machine declared non-quiescent](PERF_V007_BASELINE.md)
+
 - [0.0.6 publication preparation: isolated sanitation rehearsal and remaining approvals](V006_PUBLICATION_PREPARATION.md)
 
 - [Functional parity: final native regression, 22-contract reconciliation and explicit Neo4j deferral](FP_FINAL_NATIVE_QUALIFICATION.md)

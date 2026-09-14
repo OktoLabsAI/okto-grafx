@@ -7,6 +7,24 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Added (0.0.7 development)
+
+- Recorded the [performance v0.0.7 plan](docs/specs/PERFORMANCE_V007_PLAN.md): a
+  mandatory baseline that re-measures the stale consumer denominators on current
+  source, the ordered read/write packages that stay inside the multi-writer model,
+  a proof-gated item, the user decision queue for persisted-format, public-default
+  and capability-activation questions, and the guardrails and measurement rules
+  every delivery must follow. This is a plan only — no engine, format, default or
+  measured result changed, and no speedup is claimed.
+- Recorded the [0.0.7 Phase 0 performance baseline](docs/reports/PERF_V007_BASELINE.md):
+  HEAD `b0e4f51` against v0.0.5 `83cc313`, arms alternated round by round on a machine
+  declared non-quiescent, so only the paired ratios are defended — Pulse logical
+  transfer 0.945 (HEAD 5.5% slower, 3 of 3 rounds, entirely in the two write phases),
+  KG page 0.814 and fan-out 0.834, production vector search 0.886 and cold-handle
+  `verify('all')` 0.936 with bands containing 1 — together with the finding that the
+  production Pulse fan-out statement carries no id list, which re-ranks the read
+  planner item. Evidence only: no engine, format, default or public behaviour changed.
+
 ### Changed (0.0.7 development)
 
 - Bumped the package and source version to 0.0.7 on `feature/v0.0.7`, branched from

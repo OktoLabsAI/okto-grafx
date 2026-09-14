@@ -1757,7 +1757,10 @@ No additional marginal performance threshold is introduced by this requirement.
 
 This is a finite residual queue, not a requirement to rediscover every historic
 micro-optimization. [Measurements](docs/PERFORMANCE.md) distinguish component,
-native API, HTTP/MCP and UI boundaries.
+native API, HTTP/MCP and UI boundaries. The 0.0.7 initiative that re-measures these
+denominators on current source and orders the next bounded actions is the
+[performance v0.0.7 plan](docs/specs/PERFORMANCE_V007_PLAN.md); no item in it is
+approved work until its baseline exists.
 
 | Priority / ID | Status / next bounded action | Success evidence |
 | --- | --- | --- |
@@ -1774,6 +1777,49 @@ Completed Wave 0–3, OIX-0–3, source-reference seeks, query-expression reuse,
 vector-free relationship landings, grouped endpoint/count checks, bucket batching,
 recovery-floor reuse and telemetry sampling stay completed within their recorded
 scope. Negative experiments are not silently put back into this queue.
+
+## Next iteration assessment: feature/v0.0.7
+
+Assessment opened September 14, 2026 at the operator's request. Local branch
+`feature/v0.0.7` starts at the released main merge `1e01be5` (v0.0.6). This section
+orders one performance initiative against existing evidence; it is not a new
+independent plan, a delivery commitment or a claimed speedup. The full document is
+the [performance v0.0.7 plan](docs/specs/PERFORMANCE_V007_PLAN.md), which also holds
+the fixed boundaries, the guardrail list and the user decision queue.
+
+Every recorded consumer denominator is stale. The 0.0.6 line (`83cc313..1e01be5`,
+19 commits) contains no performance commit, while transfer 58.49 s, KG page
+0.866–0.96 s, fan-out 0.76–0.85 s and vector search 112–137 ms were all measured on
+`17f1f76`/`acf63c8`/`a726744`, roughly 50 functional-parity commits behind HEAD, and
+that parity work added planner/executor surface with no regression measurement.
+Nothing below is GO until the Phase 0 baseline re-measures those numbers on current
+source. Phase 0 was executed on September 14, 2026
+([baseline](docs/reports/PERF_V007_BASELINE.md)) on a machine declared non-quiescent,
+so only its paired alternated ratios are defended: the Pulse logical transfer is
+0.945 (HEAD 5.5% slower than v0.0.5, 3 of 3 rounds, entirely in the two write phases)
+and the KG page 0.814, both MEDIDO; the ranking below is updated from that outcome.
+Effort is relative; potential impact is a hypothesis, not a measured gain.
+Labels follow the source reports: MEDIDO, CITADO, INFERIDO, A_MEDIR.
+
+| Order / IDs | Concrete opportunity and evidence | Effort / potential impact | Bounded first action and stop condition |
+| --- | --- | --- | --- |
+| 0 / Phase 0 baseline | Nine sequential steps on a quiescent machine: Pulse transfer Amdahl on HEAD plus a 256 MiB arm, the same Amdahl at `83cc313`, KG page/fan-out A/B, vector A/B with `vector_math=numpy`, cold-handle `verify('all')` A/B, three native micros and an optional checkpoint replay bench. | Medium / none by itself; it is the precondition for every claim | Preserve the existing harnesses and boards first; run detached with partial JSON per round; publish `docs/reports/PERF_V007_BASELINE.md` with commands, HEAD, machine and medians. Stop if the machine is not quiescent; never run anything heavy while an Amdahl runs. |
+| 0.5 / A0, PARITY-REG | The 19 functional-parity commits `83cc313..1e01be5` added planner/executor surface (polymorphic hops, heterogeneous paths, entity scalars, UNION up to 64 branches, subqueries, procedures) with no regression measurement, and the baseline measures node `execute` 0.847, relationship `execute` 0.871, KG page 0.814 and fan-out 0.834 as paired alternated ratios (MEDIDO). | Medium to large / high on write execute and KG read | cProfile diff of the same on-disk workloads between the two arms (call counts and cumtime per function), then a bisect across the 19 commits with paired alternated arms on the cheapest reproducing proxy; fix only inefficiencies — an added pass, copy, dispatch chain or repeated revalidation — inside the model, with discriminating tests proved by mutation. Stop if the cost is a correctness requirement of parity: it then goes to the decision queue with its number instead of being optimized. |
+| 1 / A1, CKPT-2 | `verify('all')` reads and CRC-checks each index page twice: 3,870 device reads for 1,950 pages, 48% of one call's device reads (MEDIDO); certify was 14.22 s of the 58.49 s transfer (CITADO). | Medium / high on verification cost | Call-local reuse of images already decoded and CRC-checked. `verify` keeps reading from the device with an independent structural oracle; dedupe only within one call. Stop if a damaged image stops producing exactly one finding per call. |
+| 2 / A2, READ-1 | NODE-IN-SEEK does not apply to the anchor of a pattern with a relationship (`planner.py:2967` marks `standalone=False`, `:3074` requires it): 3.74x with identical rows, 2,556 versus 10,072 syscalls (MEDIDO). | Medium / high if the Pulse fan-out has the anchored form | Re-ranked **last in Wave A** by the baseline: the production Pulse statement carries no id list at all (it fetches up to 5,000 edges per layout and filters the page's ids in Python), so an anchored seek has no consumer denominator and this stays a planner improvement measured on the anchored shape only. Replicate the existing refusal proof; stop if either route stops counting the predicate identically. |
+| 3 / A3, CKPT-4, CKPT-3 | `IndexStore.open` counts the same file's pages twice (20% of `page_count` in cold open, MEDIDO); recovery takes a complete watermark photograph the checkpoint already narrows (3 full logical heap scans per cold open, MEDIDO). | Small each / moderate on cold open | Reuse the header's `present` as `page_count`, asserted by a port counter. CKPT-3 only after a design check that narrowing does not reintroduce the OPEN-1 circularity; if it does, it becomes a user decision, not an implementation. |
+| 4 / A4, READ-4, READ-6, READ-9 | Pure-Python per-row work: `free_variables` recomputed per row (2–4% of wall, MEDIDO), full decode of every scanned row under a retained LIMIT (ceiling ~21% of the page profile, INFERIDO), value detachment at the public boundary (2–4%, INFERIDO). | Small to medium / moderate on the KG page | Memoize the plan-constant set first. READ-6 requires the decode-versus-page-pin cut measured before any change; READ-9 requires an explicit design. Stop if a row that becomes invisible between passes can appear in a result. |
+| 5 / A5, READ-3, BATCH-REL-1 | Grouped endpoint landings exist (`query_engine.py:7975`) but do not engage in a typed fan-out even with a blocking consumer (MEDIDO). | Small diagnosis, medium delivery / moderate | Diagnose which gate refuses, then engage through the existing `validated_versions_many_reusing` port without changing what is certified; expect 8 invalidations for 500 rows, counted at the port. Stop if certification coverage changes. |
+| 6 / A6, W-08, W-07 | Commit-local repeated work: element-wise revalidation of the 384-d vector per statement (1.5–3% of the commit, INFERIDO) and identical key lookups inside one commit (55 index page reads for 4 distinct keys, MEDIDO). | Small to medium / moderate on write | Memo scoped to the commit and discarded at its boundary, following the existing memo rules. Preserve the hostile-callback copy at the public boundary. Stop if any memo replaces the index's freshness authority. |
+| 7 / A7, LV-3, VECTOR-7, C6 | Small items: `active_indexes_for` resolved twice per row (0.66% of transfer), linear column scan per vector candidate (1.9% of the vector query), `_retarget_commit_batch` on 10 of 12 node commits (~1.5% of transfer), all CITADO. | Small / low | Admit only if a measured fraction of at least 1% of their own denominator survives on the v0.0.7 baseline; otherwise record the measurement and drop the item rather than carrying it forward. |
+| 8 / Wave B, W-01, W-02 | The participant section is process-local by construction (`txn_manager.py:976-979`) but uses an OS advisory file lock taken 154 times per 50-row commit; 18.4% of the commit wall, A/B ceiling 1.226x (MEDIDO). | Medium / moderate on write, conditional on proof | Requires a written proof that the section identity is unique per process and that no cross-process semantics depend on the file lock, plus a two-process discriminating test. If the proof fails, it becomes a user decision and is not implemented. |
+| — / Decision queue: Q1 CONCUR-2, Q2 D-8, READ-2, Q8 READ-5, Q9 READ-7, Q10 CKPT-1, CKPT-5, COMMITSTATE-1, Q13/Q15 defaults, Q3 D-3, Q4 STORAGE-6, Q5 WAL v2 default, Q6 EXEC-1, Q7 EXEC-5, Q11 numpy determinism, Q12 dispatch seal, Q14 measurement environment | Each would change a certificate protocol, a correctness proof, a durability induction, a persisted format, a public default or a capability activation. Evidence and fractions are recorded per item in the plan. | Large / from none to the largest single lever numbered so far | User decisions only. Present the number, the mechanism and the price; never implement speculatively, never behind a preview flag, and never as a side effect of an accepted item. |
+
+Consumer-side guidance needs no engine change and no decision: `buffer_budget_bytes`
+256 MiB and `identity_lease_size` at least the batch size are public `connect()`
+options for Pulse-shaped loads, publishable once the baseline puts a current number
+on them. Excluded candidates and already-delivered work are listed in the plan and
+are not silently returned to this queue.
 
 ## Next iteration assessment: feature/v0.0.5
 

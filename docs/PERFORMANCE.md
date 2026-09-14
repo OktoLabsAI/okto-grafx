@@ -2,12 +2,56 @@
 
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 13, 2026. “Current” means the **latest recorded observation for
+Updated September 14, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
 Current development source is 0.0.7; published baseline is 0.0.6.
 The latest isolated installed Pulse/native observations below use the final
 0.0.6 candidate. The latest production spec-consolidation measurement still uses
 `0.0.4@fa8f188`; no production spec was consolidated for these tests.
+
+## Latest 0.0.7 baseline: HEAD versus v0.0.5 on the same machine
+
+September 14, 2026, Phase 0 of the 0.0.7 performance initiative. `b0e4f51`
+(`feature/v0.0.7`, the v0.0.6 tag `1e01be5` plus the version bump) against `83cc313`
+(v0.0.5), arms alternated round by round in one window. Windows 11, Intel i7-11800H,
+16 logical cores, CPython 3.11.14, native `google-crc32c`; `buffer_budget_bytes`
+64 MiB, `codec` and `vector_math` `numpy` — the defaults in **both** arms. Medians of
+three measured rounds, round 0 discarded. **The machine was not quiescent**: a live
+Pulse server and a concurrent agent runtime held 1.4–3.1 of the 16 cores throughout,
+so absolute walls are inflated by an unknown, time-varying amount and **only the
+paired ratios are defended**. Ratios are v0.0.5 wall ÷ HEAD wall; below 1 the v0.0.5
+arm was faster.
+
+| Workload / phase | HEAD | v0.0.5 | Paired ratio | Label |
+| --- | ---: | ---: | --- | --- |
+| Pulse logical transfer, phases 1–6 | 70.19 s | 66.31 s | 0.945, 3 of 3 rounds below 1 | MEDIDO |
+| — `write_nodes` | 14.90 s | 12.51 s | 0.847 | MEDIDO |
+| — `write_relations` | 27.22 s | 23.95 s | 0.871 | MEDIDO |
+| — `checkpoint` | 5.26 s | 5.93 s | 1.128 | MEDIDO |
+| — `certify` | 15.11 s | 15.78 s | 1.044 | MEDIDO |
+| — DDL `begin_candidate` | 5.96 s | 6.19 s | 0.977 | MEDIDO |
+| KG page, 500 rows, exact Pulse statement | 0.551 s | 0.441 s | 0.814 | MEDIDO |
+| KG fan-out, 69 layouts, older harness form | 2.069 s | 1.861 s | 0.834 | MEDIDO |
+| Production vector search, per query | 74.9 ms | 69.6 ms | 0.886, band contains 1 | MEDIDO |
+| `verify('all')`, cold handle, copied board | 0.610 s | 0.571 s | 0.936, band contains 1 | MEDIDO |
+
+Reading: HEAD measures **5.5 % slower on the Pulse logical transfer, 3 of 3 rounds**,
+and all of that difference sits in the two write phases while checkpoint moves the
+other way; the vector and `verify('all')` bands contain 1, so no difference is
+established there. No cause is established for any ratio. On HEAD the transfer
+composes as relationship `execute` 29.9 %, node `execute` 10.3 %, node `commit`
+8.9 %, relationship `commit` 8.3 %, `verify("all")` 7.9 %, `checkpoint` 7.5 %, DDL
+`execute` 7.3 %, cold `connect_ro` 4.5 %, the Pulse `_prepare` 3.2 % and the Core
+fingerprint 2.6 %. The baseline also settles a statement question: the production
+Pulse fan-out sends `MATCH (a:{from})-[r:{rel}]->(b:{to}) WHERE <visibility> RETURN
+a.id, b.id, r.confidence LIMIT 5000` with **no id list**, filtering the page's ids in
+Python afterwards. Not measured: the 256 MiB `buffer_budget_bytes` arm (the Amdahl
+instrument takes no connect options) and the checkpoint bucket-floor replay (its
+bench is stale against 0.0.6+). Native micros on HEAD in the same session: DML commit
+23.82 ms with commit history off, 30.69 ms on; projected ordered page 28.56 ms
+against a 33.52 ms full-decode oracle.
+[Commands, provenance, per-operation composition and every limitation](reports/PERF_V007_BASELINE.md)
+· [the initiative that ordered it](specs/PERFORMANCE_V007_PLAN.md).
 
 ## Latest 0.0.6 installed native graph observations
 

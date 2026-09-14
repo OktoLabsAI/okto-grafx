@@ -109,6 +109,7 @@ and immutable instruction snapshots without per-pattern operator recursion.
 | How can I inspect a graph offline without a server? | [HTML snapshots](HTML_SNAPSHOTS.md) |
 | How can JavaScript/TypeScript consume the CLI safely? | [Subprocess recipe](../examples/cli-consumer/README.md) |
 | What has actually been measured? | [Performance](PERFORMANCE.md) |
+| Which performance work is planned for 0.0.7 and under which rules? | [Performance v0.0.7 plan — baseline first, nothing approved yet](specs/PERFORMANCE_V007_PLAN.md) |
 | How does Grafx compare with Ladybug and Neo4j? | [Feature comparison and trade-offs](FEATURE_COMPARISON.md) |
 | What is missing or planned? | [Roadmap](../ROADMAP.md) |
 
