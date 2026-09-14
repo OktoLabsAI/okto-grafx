@@ -18962,6 +18962,19 @@ def _sort_key(value: object) -> tuple[int, object]:
     """
     if value is None:
         return (12, 0)
+    # Exact scalar values cannot carry a collection/entity payload. Keep their
+    # existing ranks and numeric tie/NaN keys without probing the Mapping ABC
+    # and every other kind for each scalar key. Subclasses retain the general
+    # door below: a numeric/string subclass may also be a Mapping.
+    value_type = type(value)
+    if value_type is int:
+        return (7, (0, value))
+    if value_type is float:
+        return (7, (1, 0.0)) if isnan(value) else (7, (0, value))
+    if value_type is str:
+        return (5, value)
+    if value_type is bool:
+        return (6, int(value))
     if isinstance(value, Mapping):
         return (0, tuple((key, _sort_key(item)) for key, item in sorted(value.items())))
     if isinstance(value, RowBinding):
