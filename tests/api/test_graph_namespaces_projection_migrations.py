@@ -114,6 +114,8 @@ def test_homonymous_edge_cannot_validate_a_corrupt_node_migration_ledger(tmp_pat
 
 
 @pytest.mark.parametrize("codec", ["pure", "numpy"])
+@pytest.mark.optional_dependency("pyarrow")
+@pytest.mark.optional_dependency("networkx")
 def test_detached_graph_exports_preserve_same_named_node_and_relationship(tmp_path, codec):
     pytest.importorskip("pyarrow")
     pytest.importorskip("networkx")

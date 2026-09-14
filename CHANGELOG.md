@@ -27,6 +27,11 @@ including the on-disk format.
 
 ### Changed (0.0.7 development)
 
+- Made the tooling regression reproducible in development environments: declare
+  `psutil` for the memory/identity probes, exercise the direct-interpreter profiling
+  protocol with the actual interpreter instead of a Windows venv launcher, and
+  attribute the graph-export test's Arrow/NetworkX skips. Refreshed the lockfile
+  against the current manifest; no database runtime behavior changed.
 - Bumped the package and source version to 0.0.7 on `feature/v0.0.7`, branched from
   the released 0.0.6 `main` merge. No functional, persistent-format, query-semantics or
   dependency change; the 0.0.5-legacy wheel compatibility workflow now builds the 0.0.7

@@ -226,8 +226,15 @@ def test_os_counters_are_deltas_from_pre_go_and_new_children_start_at_zero() -> 
 
 
 def test_synthetic_profile_uses_spawned_direct_child_and_ready_go_order(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # A uv-created Windows venv executable is a launcher: its Python process is
+    # a grandchild. The production preflight deliberately refuses that shape.
+    # Exercise the successful protocol with the actual interpreter, retaining
+    # the PID, parent and executable checks instead of weakening their proof.
+    direct_python = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
+    _require_direct_interpreter((direct_python,))
+    monkeypatch.setattr(sys, "executable", direct_python)
     target_script = tmp_path / "target.py"
     target_script.write_text(
         """
