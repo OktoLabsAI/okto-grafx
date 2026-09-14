@@ -153,8 +153,10 @@ def test_committed_batch_survives_cold_reopen_and_verifies_clean(
 
 
 def test_durable_batch_reuses_one_descriptor_but_locks_each_page_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, undeclared_participant_section: None
 ) -> None:
+    # The subject here is the operating-system lock file of the participant section, so this runs
+    # on a coordinator that declined W-01. Its declared sibling is the next test.
     root = tmp_path / "descriptor-count"
     with connect(root) as database:
         _install_schema(database)
@@ -207,6 +209,71 @@ def test_durable_batch_reuses_one_descriptor_but_locks_each_page_access(
         assert acquired == 5
         assert released == 5
         assert coordinator._descriptor_scopes == {}
+        transaction.rollback()
+
+
+def test_durable_batch_on_a_declared_participant_section_takes_no_file_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same batch on the DEFAULT composition: no open, no advisory lock, same lock file.
+
+    The declared sibling of the test above. The participant section still serialises the threads
+    of this database; what disappears is the operating-system round trip per page access.
+    """
+    root = tmp_path / "declared-descriptor-count"
+    with connect(root) as database:
+        _install_schema(database)
+        coordinator = database._transactions._coordinator
+        participant = database._transactions._participant_section_name
+        assert participant in coordinator._private_section_locks
+        participant_suffix = f"{participant}.lock"
+        real_open = os.open
+        real_acquire = coordination_local._acquire_os_lock
+        real_release = coordination_local._release_os_lock
+        opened: list[str] = []
+        participant_descriptors: set[int] = set()
+        acquired = 0
+        released = 0
+
+        def counted_open(path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if str(path).endswith(participant_suffix):
+                opened.append(str(path))
+                participant_descriptors.add(descriptor)
+            return descriptor
+
+        def counted_acquire(descriptor: int) -> None:
+            nonlocal acquired
+            if descriptor in participant_descriptors:
+                acquired += 1
+            real_acquire(descriptor)
+
+        def counted_release(descriptor: int) -> None:
+            nonlocal released
+            if descriptor in participant_descriptors:
+                released += 1
+            real_release(descriptor)
+
+        transaction = database.begin("write")
+        with monkeypatch.context() as patch:
+            patch.setattr(coordination_local.os, "open", counted_open)
+            patch.setattr(coordination_local, "_acquire_os_lock", counted_acquire)
+            patch.setattr(coordination_local, "_release_os_lock", counted_release)
+            report = transaction.executemany(
+                _INSERT,
+                (
+                    {"id": 1, "name": "one"},
+                    {"id": 2, "name": "two"},
+                    {"id": 3, "name": "three"},
+                ),
+            )
+
+        assert report.statements == 3
+        assert opened == []
+        assert acquired == 0
+        assert released == 0
+        assert coordinator._descriptor_scopes == {}
+        assert (root / "control" / participant_suffix).is_file()
         transaction.rollback()
 
 
