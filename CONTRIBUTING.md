@@ -35,6 +35,15 @@ The full Pulse corpus check also needs local checkouts with HEAD exactly at Comm
 `PULSE_CORE_BASELINE` to those repositories if the documented sibling names are
 not present. The freezer verifies HEAD and reads pinned Git objects; do not replace these references
 with current source or skip the corpus to produce a green full regression.
+CI checks out these public repositories at the exact revisions on every full-suite
+leg; no Pulse application installation is needed.
+
+Two optional audits read retained historical wheel receipts from
+`.grafx-tmp/fp5-wheel-qualification/run-{4,5}/report.json`. Clean environments
+attribute their absence as pending coverage debt (`CI-WHEEL-RECEIPTS` in
+[ROADMAP.md](ROADMAP.md)), rather than claiming those audits ran. Supplying the
+real receipts executes all their assertions. Neither outcome certifies a fresh
+installed wheel of the current candidate.
 
 ```bash
 pytest tests/query -q

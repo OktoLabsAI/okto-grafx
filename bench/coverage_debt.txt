@@ -11,8 +11,17 @@
 # An entry that DID run is reported as stale so this file can be pruned; that is a note, never a
 # failure. An entry that never ran and is NOT listed here fails the check by name.
 #
-# Empty on purpose, and MEASURED rather than assumed. On 2026-08-20 the whole suite was run on
+# Historically empty, and MEASURED rather than assumed. On 2026-08-20 the whole suite was run on
 # both families of the D9 matrix -- Windows 11 / CPython 3.13.1 and Linux / CPython 3.12.13 --
 # and the check read 6756 reported nodes, every one of them observed to execute on at least
 # one family. 35 nodes ran on one family only and are listed as declared partial coverage
 # (TR-8), which is not debt: they ran.
+
+# CI-WHEEL-RECEIPTS (ROADMAP.md), recorded 2026-09-14: these two tests audit retained
+# historical v0.0.6 receipts under ignored .grafx-tmp, unavailable on clean runners.
+# A clean worktree reproduces both skips; the qualified local v0.0.7 regression
+# executed both with the real receipts. This debt is not fresh wheel qualification.
+# Keep assertions active when receipts exist; remove these entries after CI can
+# provision verified receipts and the cross-family report observes their execution.
+tests.tools.test_qualify_temporal_wheels::test_actual_wheel_receipt_retains_all_seeded_values[run-4]
+tests.tools.test_qualify_temporal_wheels::test_actual_wheel_receipt_retains_all_seeded_values[run-5]

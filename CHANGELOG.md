@@ -38,6 +38,11 @@ including the on-disk format.
 
 ### Changed (0.0.7 development)
 
+- Provision the pinned public Core/Community corpus source inputs in all four
+  full-suite CI jobs. Attribute two unavailable historical wheel-receipt audits
+  as explicit coverage debt; their assertions remain active with real receipts.
+  See `CI-WHEEL-RECEIPTS` in the roadmap. This does not change Grafx runtime or
+  claim that the remote suite has completed.
 - Dispatch exact built-in scalar ordering keys before general-kind probes.
   Mixed-kind ranks, NaNs, numeric ties and Mapping-subclass precedence stay
   intact. Native public-query comparisons support bounded scalar-sort gains;

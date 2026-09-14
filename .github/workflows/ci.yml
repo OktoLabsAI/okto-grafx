@@ -115,6 +115,9 @@ jobs:
   suite:
     name: suite (${{ matrix.family }} / ${{ matrix.profile }})
     runs-on: ${{ matrix.os }}
+    env:
+      PULSE_COMMUNITY_BASELINE: ${{ github.workspace }}/.grafx-tmp/ci-corpus/community
+      PULSE_CORE_BASELINE: ${{ github.workspace }}/.grafx-tmp/ci-corpus/core
     # Generous, but bounded: an unbounded job that hangs reports nothing at all, and a hang must
     # always become a red result rather than a wait (A42/A88).
     timeout-minutes: 90
@@ -147,6 +150,26 @@ jobs:
           # A depth-1 checkout contains the integration tree but not those historical objects,
           # which would turn an honest provenance gate into a CI-only rev-parse failure.
           fetch-depth: 0
+
+      # Public source inputs for tools/pulse_query_corpus.py, not runtime dependencies.
+      # Keep exact HEADs and their history: the inventory re-derives pinned Git objects.
+      - name: Check out the pinned Community corpus baseline
+        uses: actions/checkout@v4
+        with:
+          repository: OktoLabsAI/okto-pulse
+          ref: befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595
+          path: .grafx-tmp/ci-corpus/community
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the pinned Core corpus baseline
+        uses: actions/checkout@v4
+        with:
+          repository: OktoLabsAI/okto-pulse-core
+          ref: f602c7cc2f6a9f5ef446d4c991309196bd4667c7
+          path: .grafx-tmp/ci-corpus/core
+          fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:

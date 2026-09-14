@@ -15,6 +15,21 @@ operational hardening and developer experience**. It replaces the execution
 authority of the former evolution/agent/performance/round plans. It does not
 reopen completed work, authorize production data changes or imply release approval.
 
+## CI prerequisite correction (CI-WHEEL-RECEIPTS)
+
+The v0.0.7 PR exposed absent inputs on clean runners: full-suite collection
+requires the pinned public Core/Community corpus checkouts, now provisioned by
+the workflow. Two historical v0.0.6 wheel-receipt audits also require ignored
+local files. Their absence is explicitly attributed with `pending` and exactly
+two entries in `bench/coverage_debt.txt`; all assertions still execute when real
+receipts exist. Both ran in the complete local v0.0.7 regression. Remote absence
+does not count as execution or fresh installed-wheel qualification.
+
+Open C13 tooling debt: provide verified historical receipt inputs to CI (or
+replace this historical audit with a separately specified fresh qualification),
+then remove the two debt entries once actual matrix execution is observed.
+This is CI portability work, not another performance mechanism for this round.
+
 ## Current functional-parity acceptance
 
 The [final complete native regression](docs/reports/FP_FINAL_NATIVE_QUALIFICATION.md)

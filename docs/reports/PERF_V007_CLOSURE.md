@@ -113,6 +113,35 @@ invocations each pass their single test (2.95, 2.81 and 2.91 seconds in pytest).
 These checks run after the latency campaign. The full regression above includes
 the smoke test as well; none of these focused results replaces its verdict.
 
+### Remote CI follow-up
+
+PR #6's initial remote full-suite jobs stopped at collection because the runners
+did not have the pinned Community/Core corpus sources. The workflow now provisions
+both public checkouts at the freezer's exact revisions, retaining Git history.
+Two historical wheel-receipt audits also reproduced unattributed skips in a clean
+worktree. Their absence is now explicitly attributed and listed as exactly two
+coverage-debt entries; their assertions remain active when real receipts exist.
+[CI-WHEEL-RECEIPTS](../../ROADMAP.md#ci-prerequisite-correction-ci-wheel-receipts)
+records that remaining tooling debt. This does not change the runtime, the local
+24,808-pass result, or the performance estimate, and does not claim remote
+execution of the two historical audits.
+
+The initial push run also exceeded the D5 durable-commit ceiling (10.32x on
+Windows and 20.79x on POSIX, against 10x), while both PR D5 jobs passed on the
+same head. Those failed observations are retained. The ceiling, durability and
+coordination policy are unchanged; a successful repetition does not erase them.
+Remote full-suite completion and independent code-owner approval remain separate
+requirements from the local regression evidence above.
+
+Focused validation of this CI correction: 268 passes, two attributed historical
+receipt skips and two attributed pyarrow skips, zero failures/errors and both
+pytest exits zero. This covers the corpus, packaging, leg verdict, cross-family
+coverage, skip attribution and documentation regressions. With real receipts
+present both audits pass; an altered recovered-value receipt fails its assertion.
+The workflow parses and its two checkout revisions/environment paths agree with
+the freezer. Documentation/API checks, Ruff and diff checks pass. Evidence is
+retained under `.grafx-tmp/perf07/merge-main/`; it is not a new full regression.
+
 ## Round disposition and retained evidence
 
 Implementation is closed for this v0.0.7 round. Delivered platform mechanisms
