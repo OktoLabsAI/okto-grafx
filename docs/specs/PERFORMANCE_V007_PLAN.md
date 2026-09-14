@@ -1,5 +1,10 @@
 # Performance v0.0.7: read and write paths inside the multi-writer model
 
+Implementation round closed September 14, 2026 at the operator's request.
+The [closing report](../reports/PERF_V007_CLOSURE.md) records the final
+direct comparison and regression. Undelivered proposals below remain
+historical assessment or future roadmap decisions, not additional v0.0.7 work.
+
 [Roadmap and delivery status](../../ROADMAP.md#next-iteration-assessment-featurev007) ·
 [Measured evidence](../PERFORMANCE.md) ·
 [Reproduction rules](../PERFORMANCE.md#how-to-reproduce-and-compare-responsibly) ·
@@ -19,6 +24,10 @@ not measured), **A_MEDIR** (not measured yet). The initial ordering was a value
 hypothesis falsifiable by Phase 0. Delivery and independent qualification through
 `852b655` are recorded in the [wave-A report](../reports/PERF_V007_WAVE_A.md)
 and the roadmap; the original cost estimates below are not current speedups.
+The subsequent [native scalar-sort report](../reports/PERF_V007_SCALAR_SORT.md)
+records exact scalar dispatch, separate latency controls and a new full
+regression. It implements a bounded platform lead from wave A; residual
+metadata work remains subject to fresh evidence in the existing roadmap.
 
 ## 1. Outcome and fixed boundaries
 

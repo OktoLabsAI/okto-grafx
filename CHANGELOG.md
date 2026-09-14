@@ -9,6 +9,11 @@ including the on-disk format.
 
 ### Added (0.0.7 development)
 
+- Closed the implementation round with a [direct v0.0.6 comparison](docs/reports/PERF_V007_CLOSURE.md):
+  19.7% estimated lower latency for a predefined eleven-scenario native
+  basket, with all workloads and same-code controls retained. This is a
+  synthetic workload estimate, not a universal or Pulse gain. Full regression
+  passes (24,808 tests, 41 attributed skips, zero failures/errors).
 - Recorded the [wave-A qualification](docs/reports/PERF_V007_WAVE_A.md), separating
   the original failed full regression from baseline reproduction, focused tooling
   corrections, current port counters, independent native workloads and controlled
@@ -33,6 +38,18 @@ including the on-disk format.
 
 ### Changed (0.0.7 development)
 
+- Dispatch exact built-in scalar ordering keys before general-kind probes.
+  Mixed-kind ranks, NaNs, numeric ties and Mapping-subclass precedence stay
+  intact. Native public-query comparisons support bounded scalar-sort gains;
+  [measurements and complete regression](docs/reports/PERF_V007_SCALAR_SORT.md)
+  retain same-code controls and do not claim universal or Pulse acceleration.
+- Synchronized the packaging regression's exact development-extra list with
+  the previously declared `psutil>=5.9` dependency. The stale assertion was
+  independently reproduced before the scalar-sort change.
+- Retain known Windows descendants before terminating a timed-out performance
+  process tree, so fallback cleanup can still reach them after launcher loss.
+  Unproven termination continues to refuse the measurement. Regression tests
+  exercise real descendants, lost ancestry and strict refusal.
 - Made the tooling regression reproducible in development environments: declare
   `psutil` for the memory/identity probes, exercise the direct-interpreter profiling
   protocol with the actual interpreter instead of a Windows venv launcher, and

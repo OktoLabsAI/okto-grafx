@@ -4,8 +4,9 @@
 September 14, 2026.** Published/main baseline: `0.0.6`, tag `v0.0.6`, main merge
 `1e01be5ae142eb3aa51cb97e8dff6cdd3741dbba`, published on PyPI on September 13, 2026.
 The `feature/v0.0.6` MP-1–MP-8 checkpoint and the authorized native-history/catalog/search
-follow-up shipped in that release. Development continues on `feature/v0.0.7` with the
-source version bumped to 0.0.7 and no functional change yet. Latest isolated native/Pulse
+follow-up shipped in that release. The performance round on `feature/v0.0.7` is closed
+with source version 0.0.7, wave-A mechanisms and native scalar-sort dispatch. Latest
+development observations use the named 0.0.7 builds; installed native/Pulse
 observations use 0.0.6; the latest production spec-consolidation sample uses
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
 
@@ -1780,6 +1781,16 @@ scope. Negative experiments are not silently put back into this queue.
 
 ## Next iteration assessment: feature/v0.0.7
 
+**Round closed September 14, 2026 at the operator's request.** Runtime
+`a504417` completes wave A and exact scalar dispatch. The
+[closing report](docs/reports/PERF_V007_CLOSURE.md) records the direct
+v0.0.6 comparison: 19.7% estimated lower latency for its fixed native
+basket, plus 24,808 full-regression passes and 41 attributed skips
+(zero failures/errors, exit 0). The basket is not a universal or Pulse gain.
+Open opportunities and owner decisions below are retained for a future
+iteration, not further implementation in this round. This development
+closure does not assert package publication or installed-wheel qualification.
+
 Assessment opened September 14, 2026 at the operator's request. Local branch
 `feature/v0.0.7` starts at the released main merge `1e01be5` (v0.0.6). This section
 orders one performance initiative against existing evidence; it is not a new
@@ -1806,9 +1817,10 @@ Wave-A delivery through `852b655` is now recorded in the
 FIX-W, READ-3 and W-01/W-02 are merged, including the bounded private-wait hotfix.
 READ-6 is NO_CHANGE; READ-9/M3 remains a trust-boundary decision. CKPT-2 is rejected
 after eviction-related false findings; CKPT-4 is stopped; W-07 was refuted.
-The full regression has 24,780 passes, two failures reproduced on pre-wave source,
-and 41 skips. Focused tooling corrections pass separately; this is not a green
-full gate or release qualification. The table's cost figures below are historical
+Wave A's original full regression had 24,780 passes, two failures reproduced on
+pre-wave source and 41 skips. Its focused tooling corrections were separate evidence;
+that run was not a green full gate. The new passing regression is recorded above.
+The table's cost figures below are historical
 attribution and ceilings; current paired consumer results belong to the report.
 
 The operator clarified the scope: improve Grafx as a platform, with Pulse
@@ -1825,10 +1837,23 @@ platform lead is residual scalar ORDER BY dispatch/metadata cost, supported by
 the native 2,000-row profile. Preserve mixed-kind ordering, alias precedence and
 entity checks; the scalar profile does not justify M3's public trust-boundary change.
 
+The bounded dispatch lead is implemented in `0919c06`: exact built-in scalar
+keys avoid general-kind probes and retain the original subclass path. The
+[native scalar-sort report](docs/reports/PERF_V007_SCALAR_SORT.md) records
+independent-process noise, three within-process paired repetitions, 510 focused
+passes, ten detected mutations and a new full gate (24,808 passes, 41
+attributed skips, zero failures/errors, exit 0). The top-50/2,000-row pooled
+ratio is 1.082; this is bounded native evidence, not a Pulse or universal gain.
+Reproducing this local gate requires the pinned consumer corpus and retained
+historical wheel receipts named in the report; a clean checkout alone does
+not supply those inputs or establish new installed-wheel qualification.
+In a future iteration, re-profile residual alias metadata before implementation. READ-1
+continues to require representative native evidence and its refusal proof.
+
 | Order / IDs | Concrete opportunity and evidence | Effort / potential impact | Bounded first action and stop condition |
 | --- | --- | --- | --- |
 | 0 / Phase 0 baseline | Nine sequential steps on a quiescent machine: Pulse transfer Amdahl on HEAD plus a 256 MiB arm, the same Amdahl at `83cc313`, KG page/fan-out A/B, vector A/B with `vector_math=numpy`, cold-handle `verify('all')` A/B, three native micros and an optional checkpoint replay bench. | Medium / none by itself; it is the precondition for every claim | Preserve the existing harnesses and boards first; run detached with partial JSON per round; publish `docs/reports/PERF_V007_BASELINE.md` with commands, HEAD, machine and medians. Stop if the machine is not quiescent; never run anything heavy while an Amdahl runs. |
-| 0.5 / A0, PARITY-REG | M1 attributed to added statement sections and corrected by FIX-W; M2's repeated free-name analysis corrected by READ-4; M3 remains a public-value decision. | Delivered fixes; residual native scalar sort remains | The new 2,000-row native profile identifies sort dispatch/alias metadata as bounded leads while public scalar snapshot calls/cost stay essentially unchanged. Preserve parity semantics and refusal rules; do not attribute every residual to M3 or the latest merge. |
+| 0.5 / A0, PARITY-REG | M1 attributed to added statement sections and corrected by FIX-W; M2's repeated free-name analysis corrected by READ-4; M3 remains a public-value decision. | Delivered fixes and exact scalar dispatch; residual metadata open | `0919c06` removes scalar general-kind probes; the new report records paired native gains and full qualification. Re-profile alias metadata separately. Preserve parity semantics and refusal rules; public scalar snapshot cost did not justify M3. |
 | 1 / A1, CKPT-2 | Historical duplicated-read cost motivated call-local reuse in verification. | Rejected | Eviction produced spurious `index_entry_unresolved` findings. Preserve the independent verifier; no consumer saving is delivered by this rejected branch. |
 | 2 / A2, READ-1 | NODE-IN-SEEK does not apply to the relationship anchor; the earlier anchored-query rewrite measured 3.74x with identical rows and fewer certificates. | Open; priority requires representative native evidence | The original last-place ranking depended on Pulse's lack of an ID-list predicate. Platform scope removes that as a reason to defer. Measure native anchored-query workloads and preserve the refusal proof before prioritizing an implementation; no universal or Pulse gain follows from the old proxy. |
 | 3 / A3, CKPT-4, CKPT-3 | Historical cold-open page-count and recovery-photograph costs remain attribution evidence. | CKPT-4 stopped; CKPT-3 conditional | Do not reopen CKPT-4 without new discriminating evidence. CKPT-3 still requires a design check against OPEN-1 circularity; no delivered saving is claimed. |

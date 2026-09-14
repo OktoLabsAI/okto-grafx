@@ -9,6 +9,34 @@ The latest isolated installed Pulse/native observations below use the final
 0.0.6 candidate. The latest production spec-consolidation measurement still uses
 `0.0.4@fa8f188`; no production spec was consolidated for these tests.
 
+## 0.0.7 performance round closure
+
+The [closing comparison](reports/PERF_V007_CLOSURE.md) estimates **19.7%
+lower latency in a fixed eleven-scenario native basket** for final runtime
+`a504417` versus released v0.0.6 source `1e01be5`. Six balanced blocks include
+an identical-code control (median control/final ratio 0.996).
+The basket has explicit synthetic weights and includes every native scenario
+from wave A. It is not a universal or Pulse percentage. Earlier incremental
+gains are not added to this direct comparison. Implementation is closed for
+this round; individual results, full regression and limits are in the report.
+
+## 0.0.7 native scalar sort dispatch
+
+The [scalar-sort report](reports/PERF_V007_SCALAR_SORT.md) measures `0919c06`
+against `7d52f8a`. Exact built-in scalar keys avoid general-kind probes while
+retaining mixed-kind ordering and the subclass fallback. Three processes
+alternating the old/new helper in one public-query runtime favor the change
+for top-50 of 2,000 integer rows (pooled ratio 1.082, about 7.6% lower latency
+in this sample). Other scalar-key cases also favor the change, with workload
+and same-code variation recorded individually. The independent-process
+comparison was noisier; it is retained rather than presented as a precise
+gain. This does not establish a universal or Pulse speedup.
+
+The new complete regression has 24,808 passes, 41 attributed skips,
+zero failures/errors and exit 0. Focused tests and ten detected mutations
+separately qualify the mechanism. Alias metadata and the public-value trust
+boundary remain separate from this implementation.
+
 ## 0.0.7 wave A: merged mechanisms and independent qualification
 
 The objective is Grafx platform performance. Native API workloads evaluate
