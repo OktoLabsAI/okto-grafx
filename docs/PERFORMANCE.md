@@ -500,6 +500,14 @@ durability/recovery, concurrency violations and unexplained operation timeouts.
 Run focused tests during implementation, then proportional grouped regressions;
 do not repeatedly spend hours proving marginal latency changes.
 
+CI selects `--informational-ceilings` in `python -m bench.harness.gate` to apply
+this policy. Valid timing overflows retain their values and an explicit
+`informational_ceilings_exceeded` status. Missing or malformed measurements and
+recall below the frozen floor still fail. The default CLI mode retains strict
+D5 comparison for historical reproduction; CI does not use that mode as a
+release gate. Numerical ceilings, raw measurements and the recall target are
+unchanged.
+
 Grafx does not currently claim Ladybug parity, constant-time general traversal,
 linear CPU/GIL scaling or an RSS bound equal to `buffer_budget_bytes`. Historical
 cross-platform comparisons remain [historical](reports/PERFORMANCE_HISTORY.md).

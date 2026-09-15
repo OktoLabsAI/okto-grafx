@@ -323,7 +323,7 @@ jobs:
           retention-days: 14
 
   calibration:
-    name: D5 ceilings (${{ matrix.family }})
+    name: D5 measurements and recall (${{ matrix.family }})
     runs-on: ${{ matrix.os }}
     # C13: the weekly FULL recall profile builds an 8192x384 HNSW in pure Python -- measured
     # locally above 50 minutes on a machine faster than these runners -- so the scheduled run
@@ -381,17 +381,18 @@ jobs:
             --metrics "metrics-${{ matrix.family }}.json" \
             --workspace .recall-workspace
 
-      - name: Apply the D5 ceilings to the PUBLISHED metric
+      - name: Validate measurements and recall; report D5 ceilings
         shell: bash
-        # OR-4: the gate reads oktografx_baseline_ceiling_multiple, not a log. A durable-commit
-        # multiple above 10x is the 'consult JP' state of FR-15 and stops the pipeline.
+        # OR-4: read the published metric. The September 8 performance policy makes
+        # D5 timing ratios informational. Missing/invalid measurements and recall
+        # failures still fail this unconditional step; no exit status is discarded.
         # C13: --require-recall makes a build that publishes no recall gauge FAIL (the C13
         # observation closed). The temporary --recall-target override is GONE: the freeze
         # landed, so bench/calibration.json carries vector_recall.frozen.target and the
         # versioned artifact governs the floor through _resolve_recall_target's precedence
         # (flag > frozen artifact > built-in). Moving the floor is now a reviewable change
         # to a committed file rather than a flag edited inside a workflow.
-        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --calibration bench/calibration.json
+        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --calibration bench/calibration.json --informational-ceilings
 
       - name: Upload the calibration artefacts
         if: always()

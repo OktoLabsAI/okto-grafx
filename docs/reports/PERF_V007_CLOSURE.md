@@ -155,6 +155,34 @@ The PR's next D5 POSIX observation at `5e3cb96` still fails durable commit at
 11.42x against 10x; point read, open replay and vector recall meet their targets.
 This remains failed evidence, independently of CI dependency corrections.
 
+### Correcting the stale CI timing policy
+
+The subsequent inspection found a policy mismatch: the performance guide and
+roadmap have treated D5 timings as informational since `8380da3a` (September 8),
+and the v0.0.7 plan repeats that decision, but the workflow still used the original
+strict M1 comparator. CI now explicitly selects `--informational-ceilings`.
+Valid overflows retain their values and an `informational_ceilings_exceeded`
+status. Missing or invalid evidence, recall below the frozen floor, and the
+unconditional/fatal execution guards remain blocking. Negative or duplicate D5
+samples are now rejected in either mode. The default CLI preserves strict
+comparison for historical reproduction.
+
+No numeric ceiling, recall floor, raw artifact or database runtime was changed.
+Original failed job receipts remain failed. Applying the policy to the exact
+downloaded `5912a6f` metrics retains POSIX durable commit 19.89x and Windows
+12.56x against 10x, with recall 0.9953 against 0.9; both now receive the explicit
+informational status. Their metric-file hashes stay unchanged. This is a CI
+policy correction, not an additional performance gain.
+
+Focused gate, recall and workflow-freeze regression: 198 passes. The 20 new
+policy cases fail before implementation. Deliberately removing the timing policy,
+hiding a low recall behind a timing overflow, or enabling informational behavior
+implicitly each fails the strengthened tests. Evidence is retained under
+`.grafx-tmp/perf07/ci-policy/`.
+The complete bench group plus consumer/public-adapter documentation regressions
+passes 473 tests with three attributed optional-dependency skips in 36.02 seconds,
+exit zero. Documentation/API checks, changed-file Ruff and diff checks pass.
+
 ## Round disposition and retained evidence
 
 Implementation is closed for this v0.0.7 round. Delivered platform mechanisms

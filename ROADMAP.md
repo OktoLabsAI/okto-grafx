@@ -17,6 +17,14 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## CI prerequisite correction (CI-WHEEL-RECEIPTS)
 
+The CI timing policy is now aligned with the September 8 performance policy:
+valid D5 timing overflows are explicitly informational, while missing/invalid
+measurements and recall failures remain fatal. The old strict comparator remains
+available for historical reproduction. No ceiling, recall floor, runtime or
+durability rule changes. Negative or duplicate D5 samples are rejected in both
+modes. This closes the stale numeric-release-gate wiring; it does not claim that
+the measured D5 ratios improved or met their historical ceilings.
+
 The v0.0.7 PR exposed absent inputs on clean runners: full-suite collection
 requires the pinned public Core/Community corpus checkouts, now provisioned by
 the workflow. Two historical v0.0.6 wheel-receipt audits also require ignored

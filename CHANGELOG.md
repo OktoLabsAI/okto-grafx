@@ -38,6 +38,12 @@ including the on-disk format.
 
 ### Changed (0.0.7 development)
 
+- Align CI with the existing informational performance policy: retain exceeded
+  D5 timing ratios in the report without blocking release on their magnitude.
+  Missing/invalid measurements and the frozen vector-recall floor still fail;
+  negative or duplicate D5 samples now refuse in both timing policies. The
+  historical strict CLI comparison remains available. Runtime, ceilings and
+  durability guarantees are unchanged.
 - Fix the 0.0.6 compatibility workflow's YAML command block so GitHub can start
   its installed-upgrade matrix; the unquoted `:all:` option prevented parsing.
   Install the built candidate's declared runtime dependencies so isolated
