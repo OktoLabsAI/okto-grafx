@@ -47,13 +47,23 @@ def _counting_syscalls() -> Iterator[Counter[str]]:
         "fstat": os.fstat,
         "realpath": os.path.realpath,
     }
+    realpath_depth = 0
 
     def _counting(name: str):  # type: ignore[no-untyped-def]
         original = originals[name]
 
         def call(*args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal realpath_depth
             counts[name] += 1
-            return original(*args, **kwargs)
+            if name == "lstat" and realpath_depth:
+                counts["realpath_lstat"] += 1
+            if name == "realpath":
+                realpath_depth += 1
+            try:
+                return original(*args, **kwargs)
+            finally:
+                if name == "realpath":
+                    realpath_depth -= 1
 
         return call
 
@@ -120,8 +130,10 @@ def test_a_directory_prefix_does_not_enumerate_its_siblings(
     # One scandir: the ``wal`` directory itself. Neither the root nor ``index/`` is opened.
     # Mutant m1 -- a walk that starts at the root and filters -- opens five directories here.
     assert counts["scandir"] == 1, dict(counts)
-    # Root identity, the ``wal`` segment, and whatever the platform's junction probe adds.
-    assert counts["lstat"] <= 4, dict(counts)
+    # Bound the adapter's inspections. POSIX realpath itself calls lstat for each
+    # absolute-path component, whose count depends on the runner's checkout depth.
+    # Those calls are still recorded; the separate realpath bound pins containment work.
+    assert counts["lstat"] - counts["realpath_lstat"] <= 4, dict(counts)
 
 
 def test_a_file_prefix_scans_only_the_parent_directory(

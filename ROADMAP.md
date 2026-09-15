@@ -1,10 +1,12 @@
 # Okto Grafx roadmap
 
-**Single active product backlog — reconciled September 13, 2026.**
-Published/main baseline: `0.0.5`, tag `v0.0.5`, main merge
-`83cc3137bb7e95ad2a1ed9271b1a1134063097a8`. The `feature/v0.0.6` MP-1–MP-8
-checkpoint and the latest authorized native-history/catalog/search follow-up are
-implemented and locally validated, not released. Latest isolated native/Pulse
+**Single active product backlog — reconciled September 13, 2026; baseline updated
+September 14, 2026.** Published/main baseline: `0.0.6`, tag `v0.0.6`, main merge
+`1e01be5ae142eb3aa51cb97e8dff6cdd3741dbba`, published on PyPI on September 13, 2026.
+The `feature/v0.0.6` MP-1–MP-8 checkpoint and the authorized native-history/catalog/search
+follow-up shipped in that release. The performance round on `feature/v0.0.7` is closed
+with source version 0.0.7, wave-A mechanisms and native scalar-sort dispatch. Latest
+development observations use the named 0.0.7 builds; installed native/Pulse
 observations use 0.0.6; the latest production spec-consolidation sample uses
 `0.0.4@fa8f188`. See [performance](docs/PERFORMANCE.md).
 
@@ -12,6 +14,41 @@ This roadmap includes **new capabilities, corrective work, known limitations,
 operational hardening and developer experience**. It replaces the execution
 authority of the former evolution/agent/performance/round plans. It does not
 reopen completed work, authorize production data changes or imply release approval.
+
+## CI prerequisite correction (CI-WHEEL-RECEIPTS)
+
+The maintainer requested a 20-minute limit per automatic CI job. The full
+Windows/POSIX × bare/extras matrix and its dependent coverage report are now
+manual-only. Full recall is an explicit manual input; automatic recall stays on
+smoke with a 20-minute timeout. This scheduling change does not certify the omitted
+matrix. The interrupted Windows runs are canceled evidence, not passing regression.
+
+POSIX exposed stale first-barrier directory counts, platform-dependent realpath
+accounting, a planted skip with the wrong active family condition, four missing
+platform markers and inline measurement code incorrectly probed as a filename.
+The corrections preserve root-parent durability and provenance hashes; genuine
+I/O errors still fail. No database runtime changes or new performance gains apply.
+
+The CI timing policy is now aligned with the September 8 performance policy:
+valid D5 timing overflows are explicitly informational, while missing/invalid
+measurements and recall failures remain fatal. The old strict comparator remains
+available for historical reproduction. No ceiling, recall floor, runtime or
+durability rule changes. Negative or duplicate D5 samples are rejected in both
+modes. This closes the stale numeric-release-gate wiring; it does not claim that
+the measured D5 ratios improved or met their historical ceilings.
+
+The v0.0.7 PR exposed absent inputs on clean runners: full-suite collection
+requires the pinned public Core/Community corpus checkouts, now provisioned by
+the workflow. Two historical v0.0.6 wheel-receipt audits also require ignored
+local files. Their absence is explicitly attributed with `pending` and exactly
+two entries in `bench/coverage_debt.txt`; all assertions still execute when real
+receipts exist. Both ran in the complete local v0.0.7 regression. Remote absence
+does not count as execution or fresh installed-wheel qualification.
+
+Open C13 tooling debt: provide verified historical receipt inputs to CI (or
+replace this historical audit with a separately specified fresh qualification),
+then remove the two debt entries once actual matrix execution is observed.
+This is CI portability work, not another performance mechanism for this round.
 
 ## Current functional-parity acceptance
 
@@ -174,7 +211,7 @@ fault-hook mismatches. All are addressed by the final **392-pass** combined
 corrective collection; the original grouped run remains failed, with final
 current-source package regression still required. Exact receipts and limits are
 in the linked node-label contract.
-This is still an in-progress native-label delivery, not a release or upgrade.
+This native-label delivery shipped in the 0.0.6 package; the checkpoint above records its pre-release qualification state, not an upgrade guarantee.
 The corrected query/transaction/procedure group has **1,110 passes**, zero
 failures/errors/skips; [the contract](docs/specs/NODE_LABELS_V1.md#query-label-mutation-checkpoint)
 records original/corrective evidence and the final read-boundary follow-up.
@@ -1077,7 +1114,7 @@ FP-3; it does not complete its public-entity/path/UNION or indexing requirements
 
 ## Authorized query-language compatibility round
 
-Status: **all eight implemented, tested and documented in development; not released**.
+Status: **all eight implemented, tested and documented; released in 0.0.6 on September 13, 2026**.
 The user authorized items 1–8 in order,
 including breaking query semantics with coordinated Pulse migration and no legacy
 mode. The fixed reference, scope, item-by-item acceptance criteria and reproducible
@@ -1291,7 +1328,7 @@ prerequisite, not a new performance gate. No marginal timing target is added.
 
 | ID | Status | Deliverable / exit condition |
 | --- | --- | --- |
-| V006-HISTORY-CATALOG-SEARCH | All eight approved items complete in development | Native temporal publication/query/operations, explicit catalog/workspace CLI, selected copy/skip, positional FTS, posting decode memo and real-wheel matrix. Feature/regression/corrective tests and consumer documentation validated. [Exact evidence and limitations](docs/reports/V006_NATIVE_HISTORY_ROUND.md). Not published or installed in Pulse. |
+| V006-HISTORY-CATALOG-SEARCH | All eight approved items complete; released in 0.0.6 | Native temporal publication/query/operations, explicit catalog/workspace CLI, selected copy/skip, positional FTS, posting decode memo and real-wheel matrix. Feature/regression/corrective tests and consumer documentation validated. [Exact evidence and limitations](docs/reports/V006_NATIVE_HISTORY_ROUND.md). Published in 0.0.6 on September 13, 2026; Pulse installation is not implied. |
 | REL-004 | Published September 8, 2026 | [PR #2](https://github.com/OktoLabsAI/okto-grafx/pull/2) merged; tag `v0.0.4` points to `425362a`. Wheel/sdist built from the tag, Twine validation, 149 package-file parity checks, isolated consumer smoke and public PyPI install smoke passed; remote SHA-256 values matched. [PyPI 0.0.4](https://pypi.org/project/okto-grafx/0.0.4/). GitHub Actions could not start because of account billing; local evidence does not certify the remote/platform matrix. |
 | DOC-1 | Implemented in this documentation refactor | One README entry point, public API/configuration/query/operations references, measured-performance table, one roadmap and a preserved source archive. Links, examples, API/config field coverage and preservation hashes are checked; [validation receipt](docs/reports/DOCUMENTATION_REFACTOR_2026_09_08.md). |
 | CAP-1B | Implemented checkpoint | `6b5163e`: native journal preflight is connected to page application/checkpoint; UUID, activation/COMMIT coverage, target/resident LSN and file extents validated. 2,433 tests / 77.27 s recorded; no new typing diagnostics in the isolated comparison. This is recovery correctness, not a latency benchmark. |
@@ -1756,7 +1793,10 @@ No additional marginal performance threshold is introduced by this requirement.
 
 This is a finite residual queue, not a requirement to rediscover every historic
 micro-optimization. [Measurements](docs/PERFORMANCE.md) distinguish component,
-native API, HTTP/MCP and UI boundaries.
+native API, HTTP/MCP and UI boundaries. The 0.0.7 initiative that re-measures these
+denominators on current source and orders the next bounded actions is the
+[performance v0.0.7 plan](docs/specs/PERFORMANCE_V007_PLAN.md); no item in it is
+approved work until its baseline exists.
 
 | Priority / ID | Status / next bounded action | Success evidence |
 | --- | --- | --- |
@@ -1773,6 +1813,97 @@ Completed Wave 0–3, OIX-0–3, source-reference seeks, query-expression reuse,
 vector-free relationship landings, grouped endpoint/count checks, bucket batching,
 recovery-floor reuse and telemetry sampling stay completed within their recorded
 scope. Negative experiments are not silently put back into this queue.
+
+## Next iteration assessment: feature/v0.0.7
+
+**Round closed September 14, 2026 at the operator's request.** Runtime
+`a504417` completes wave A and exact scalar dispatch. The
+[closing report](docs/reports/PERF_V007_CLOSURE.md) records the direct
+v0.0.6 comparison: 19.7% estimated lower latency for its fixed native
+basket, plus 24,808 full-regression passes and 41 attributed skips
+(zero failures/errors, exit 0). The basket is not a universal or Pulse gain.
+Open opportunities and owner decisions below are retained for a future
+iteration, not further implementation in this round. This development
+closure does not assert package publication or installed-wheel qualification.
+
+Assessment opened September 14, 2026 at the operator's request. Local branch
+`feature/v0.0.7` starts at the released main merge `1e01be5` (v0.0.6). This section
+orders one performance initiative against existing evidence; it is not a new
+independent plan, a delivery commitment or a claimed speedup. The full document is
+the [performance v0.0.7 plan](docs/specs/PERFORMANCE_V007_PLAN.md), which also holds
+the fixed boundaries, the guardrail list and the user decision queue.
+
+Every recorded consumer denominator is stale. The 0.0.6 line (`83cc313..1e01be5`,
+19 commits) contains no performance commit, while transfer 58.49 s, KG page
+0.866–0.96 s, fan-out 0.76–0.85 s and vector search 112–137 ms were all measured on
+`17f1f76`/`acf63c8`/`a726744`, roughly 50 functional-parity commits behind HEAD, and
+that parity work added planner/executor surface with no regression measurement.
+Nothing below is GO until the Phase 0 baseline re-measures those numbers on current
+source. Phase 0 was executed on September 14, 2026
+([baseline](docs/reports/PERF_V007_BASELINE.md)) on a machine declared non-quiescent,
+so only its paired alternated ratios are defended: the Pulse logical transfer is
+0.945 (HEAD approximately 5.8% slower than v0.0.5, 3 of 3 rounds, entirely in the two write phases)
+and the KG page 0.814, both MEDIDO; the ranking below is updated from that outcome.
+Effort is relative; potential impact is a hypothesis, not a measured gain.
+Labels follow the source reports: MEDIDO, CITADO, INFERIDO, A_MEDIR.
+
+Wave-A delivery through `852b655` is now recorded in the
+[independent qualification report](docs/reports/PERF_V007_WAVE_A.md). READ-4,
+FIX-W, READ-3 and W-01/W-02 are merged, including the bounded private-wait hotfix.
+READ-6 is NO_CHANGE; READ-9/M3 remains a trust-boundary decision. CKPT-2 is rejected
+after eviction-related false findings; CKPT-4 is stopped; W-07 was refuted.
+Wave A's original full regression had 24,780 passes, two failures reproduced on
+pre-wave source and 41 skips. Its focused tooling corrections were separate evidence;
+that run was not a green full gate. The new passing regression is recorded above.
+The table's cost figures below are historical
+attribution and ceilings; current paired consumer results belong to the report.
+
+The operator clarified the scope: improve Grafx as a platform, with Pulse
+benefiting as one consumer. The report adds independent native write, lookup,
+ordering and traversal workloads. A missing Pulse gain does not exclude a
+general platform mechanism; claims still require a measured, named workload
+and must distinguish general evidence from conditional admission.
+
+Wave-A measurement closure: 16 transfer, 32 KG and 16 accepted native comparison
+invocations preserve their expected results. Native ordered traversal and
+per-statement write staging show conditional gains; current Pulse and transfer
+totals do not establish gains beyond the same-code variation. The next bounded
+platform lead is residual scalar ORDER BY dispatch/metadata cost, supported by
+the native 2,000-row profile. Preserve mixed-kind ordering, alias precedence and
+entity checks; the scalar profile does not justify M3's public trust-boundary change.
+
+The bounded dispatch lead is implemented in `0919c06`: exact built-in scalar
+keys avoid general-kind probes and retain the original subclass path. The
+[native scalar-sort report](docs/reports/PERF_V007_SCALAR_SORT.md) records
+independent-process noise, three within-process paired repetitions, 510 focused
+passes, ten detected mutations and a new full gate (24,808 passes, 41
+attributed skips, zero failures/errors, exit 0). The top-50/2,000-row pooled
+ratio is 1.082; this is bounded native evidence, not a Pulse or universal gain.
+Reproducing this local gate requires the pinned consumer corpus and retained
+historical wheel receipts named in the report; a clean checkout alone does
+not supply those inputs or establish new installed-wheel qualification.
+In a future iteration, re-profile residual alias metadata before implementation. READ-1
+continues to require representative native evidence and its refusal proof.
+
+| Order / IDs | Concrete opportunity and evidence | Effort / potential impact | Bounded first action and stop condition |
+| --- | --- | --- | --- |
+| 0 / Phase 0 baseline | Nine sequential steps on a quiescent machine: Pulse transfer Amdahl on HEAD plus a 256 MiB arm, the same Amdahl at `83cc313`, KG page/fan-out A/B, vector A/B with `vector_math=numpy`, cold-handle `verify('all')` A/B, three native micros and an optional checkpoint replay bench. | Medium / none by itself; it is the precondition for every claim | Preserve the existing harnesses and boards first; run detached with partial JSON per round; publish `docs/reports/PERF_V007_BASELINE.md` with commands, HEAD, machine and medians. Stop if the machine is not quiescent; never run anything heavy while an Amdahl runs. |
+| 0.5 / A0, PARITY-REG | M1 attributed to added statement sections and corrected by FIX-W; M2's repeated free-name analysis corrected by READ-4; M3 remains a public-value decision. | Delivered fixes and exact scalar dispatch; residual metadata open | `0919c06` removes scalar general-kind probes; the new report records paired native gains and full qualification. Re-profile alias metadata separately. Preserve parity semantics and refusal rules; public scalar snapshot cost did not justify M3. |
+| 1 / A1, CKPT-2 | Historical duplicated-read cost motivated call-local reuse in verification. | Rejected | Eviction produced spurious `index_entry_unresolved` findings. Preserve the independent verifier; no consumer saving is delivered by this rejected branch. |
+| 2 / A2, READ-1 | NODE-IN-SEEK does not apply to the relationship anchor; the earlier anchored-query rewrite measured 3.74x with identical rows and fewer certificates. | Open; priority requires representative native evidence | The original last-place ranking depended on Pulse's lack of an ID-list predicate. Platform scope removes that as a reason to defer. Measure native anchored-query workloads and preserve the refusal proof before prioritizing an implementation; no universal or Pulse gain follows from the old proxy. |
+| 3 / A3, CKPT-4, CKPT-3 | Historical cold-open page-count and recovery-photograph costs remain attribution evidence. | CKPT-4 stopped; CKPT-3 conditional | Do not reopen CKPT-4 without new discriminating evidence. CKPT-3 still requires a design check against OPEN-1 circularity; no delivered saving is claimed. |
+| 4 / A4, READ-4, READ-6, READ-9 | READ-4 statement-local free-name memo merged in `4ac516b`. The original 2–4% estimate is attribution, not a current consumer gain. | READ-6 measured NO_CHANGE; READ-9 open | Keep READ-6 unchanged. READ-9/M3 requires an explicit trust-boundary design and decision. Consumer comparison and limitations are in the wave-A report. |
+| 5 / A5, READ-3, BATCH-REL-1 | Vector-free endpoint batching merged in `a46e0d2`, retaining canonical-port and blocking-consumer guards. | Delivered on eligible shapes | Count the frontier per source and uncached destination: `64+64+64+8` for 200 distinct destinations, not eight invalidations per 500 result rows. Current Pulse streaming LIMIT does not qualify; do not attribute its fan-out timing to READ-3. |
+| 6 / A6, W-08, W-07 | W-07 refuted by its measurement; W-08's proposed `operator.is_` change is outside the frozen allowlist. | W-07 closed; W-08 decision Q16 | Preserve the hostile-callback copy and freshness authority. The reported W-08 fraction is 0.24% of commit; no implementation follows from the earlier 1.5–3% estimate. |
+| 7 / A7, LV-3, VECTOR-7, C6 | Small items: `active_indexes_for` resolved twice per row (0.66% of transfer), linear column scan per vector candidate (1.9% of the vector query), `_retarget_commit_batch` on 10 of 12 node commits (~1.5% of transfer), all CITADO. | Small / low | Admit only if a measured fraction of at least 1% of their own denominator survives on the v0.0.7 baseline; otherwise record the measurement and drop the item rather than carrying it forward. |
+| 8 / Wave B, W-01, W-02 | Private participant sections merged in `0e8c13a`; starvation correction merged in `852b655`. | Delivered; bounded real-clock wait and manual-clock sampling retained | Fresh 50-statement recheck: 104 participant entries, zero participant file locks, four other file-lock acquisitions. The old 154-entry shape precedes FIX-W integration; 1.226x remains a historical ceiling, not a delivered consumer speedup. |
+| — / Decision queue: Q1 CONCUR-2, Q2 D-8, READ-2, Q8 READ-5, Q9 READ-7, Q10 CKPT-1, CKPT-5, COMMITSTATE-1, Q13/Q15 defaults, Q3 D-3, Q4 STORAGE-6, Q5 WAL v2 default, Q6 EXEC-1, Q7 EXEC-5, Q11 numpy determinism, Q12 dispatch seal, Q14 measurement environment | Each would change a certificate protocol, a correctness proof, a durability induction, a persisted format, a public default or a capability activation. Evidence and fractions are recorded per item in the plan. | Large / from none to the largest single lever numbered so far | User decisions only. Present the number, the mechanism and the price; never implement speculatively, never behind a preview flag, and never as a side effect of an accepted item. |
+
+Consumer-side guidance needs no engine change and no decision: `buffer_budget_bytes`
+256 MiB and `identity_lease_size` at least the batch size are public `connect()`
+options for Pulse-shaped loads, publishable once the baseline puts a current number
+on them. Excluded candidates and already-delivered work are listed in the plan and
+are not silently returned to this queue.
 
 ## Next iteration assessment: feature/v0.0.5
 

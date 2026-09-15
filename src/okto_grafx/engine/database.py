@@ -356,6 +356,102 @@ def _note_cleanup_failure(primary: BaseException, cleanup: BaseException) -> Non
         return
 
 
+class _LogicalStatementPublication:
+    """One statement's rollback boundary over native logical writes.
+
+    The boundary is the same one the enclosing ``_logical_statement_publication`` context
+    manager used to open by itself: a staging mark taken before the statement runs, settled
+    once the public result has been rebuilt, discarded if anything between the two fails.
+    Splitting the opening out of ``__enter__`` lets the caller take the mark inside the
+    page-access section it already holds for the statement, instead of paying a second,
+    strictly adjacent participant section (with its file lock and stat) for every write
+    statement. Settling and discarding keep their own sections, because both happen after the
+    statement has left page access.
+
+    The question the boundary answers -- does this statement stage rows? -- is asked by
+    :meth:`decide` with no section held, exactly where the context manager asked it before the
+    split. Only :meth:`begin`, two in-memory bookkeeping calls on the context, runs inside the
+    caller's section.
+    """
+
+    __slots__ = (
+        "_database",
+        "_context",
+        "_engine",
+        "_statement",
+        "_stages",
+        "_mark",
+        "_schema_mark",
+    )
+
+    def __init__(
+        self, database: Database, context: TransactionContext, engine: object, statement: str
+    ) -> None:
+        self._database = database
+        self._context = context
+        self._engine = engine
+        self._statement = statement
+        self._stages = False
+        self._mark: object | None = None
+        self._schema_mark: object | None = None
+
+    def decide(self) -> None:
+        """Answer whether this statement stages rows, holding no section while asking.
+
+        Parsing is the expensive half of the question and none of it touches shared state:
+        ``QueryEngine.parse`` is text in, plan out, behind its own LRU cache. A cache miss
+        still costs hundreds of microseconds to milliseconds, and the participant section
+        serialises the threads of this participant, so the verdict is proved out here and only
+        the marks are taken inside the section. A statement the engine refuses to parse refuses
+        from here, before the boundary exists and before the caller's section is opened, which
+        is where it refused from before this class existed.
+        """
+        context = self._context
+        engine = self._engine
+        if context.mode is not TransactionMode.WRITE or type(engine) is not QueryEngine:
+            return
+        parsed = engine.parse(self._statement)
+        self._stages = bool(
+            isinstance(parsed, (QueryStatement, UnionQuery)) and parsed.writes
+        )
+
+    def begin(self) -> None:
+        """Open the boundary from inside the caller's page-access section."""
+        if not self._stages:
+            return
+        context = self._context
+        self._mark = context.staging_mark()
+        self._schema_mark = self._engine._schema_statement_mark(context)  # type: ignore[attr-defined]
+
+    def settle(self) -> None:
+        """Publish the statement's staged effects once the public result exists."""
+        mark = self._mark
+        if mark is None:
+            return
+        with self._database._transactions.page_access_section(transaction=self._context):
+            self._database._require_open()
+            self._context.settle_staging_mark(mark)
+
+    def unwind(self, failure: BaseException) -> None:
+        """Roll the statement back, and refuse every later commit if that cannot be proved."""
+        mark = self._mark
+        context = self._context
+        if mark is None or not context.active:
+            return
+        try:
+            with self._database._transactions.page_access_section(transaction=context):
+                context.discard_since(mark)
+                self._engine._restore_schema_statement(context, self._schema_mark)  # type: ignore[attr-defined]
+        except BaseException as cleanup_failure:
+            _note_cleanup_failure(failure, cleanup_failure)
+            # If statement rollback cannot be proved, no later commit is safe.
+            try:
+                if context.active:
+                    self._database._transactions.rollback(context)
+            except BaseException as rollback_failure:
+                _note_cleanup_failure(failure, rollback_failure)
+
+
 def _note_batch_index(failure: GrafxError, batch_index: int) -> None:
     """Add bounded batch context without letting hostile diagnostics replace the failure."""
     try:
@@ -2600,7 +2696,7 @@ class Database:
             # Keep native logical writes reversible until the public result and deadline
             # have both passed validation. Schema statements have their own catalog/artifact
             # journal and must not be unwound with a row-only staging snapshot.
-            with self._logical_statement_publication(context, engine, statement):
+            with self._logical_statement_publication(context, engine, statement) as publication:
                 with self._transactions.page_access_section(transaction=context):
                     self._require_open()
                     if not context.active:
@@ -2610,6 +2706,13 @@ class Database:
                             txn_id=context.txn_id,
                             state=context.state.value,
                         )
+                    # Opening the statement mark shares the section that runs the statement. The
+                    # mark is still taken before any intent of this statement can stage, and the
+                    # recovery latch is held stable across exactly the same window; only the
+                    # separate participant section, file lock and stat that the previous adjacent
+                    # access paid for every write statement are gone. The parse that decides
+                    # whether there is a mark to take already happened outside every section.
+                    publication.begin()
                     # Registration and statement execution share the participant section. Close can
                     # therefore neither miss a context that may have acquired a schema journal nor
                     # release storage while the statement is installing one.
@@ -2643,37 +2746,18 @@ class Database:
     @contextmanager
     def _logical_statement_publication(
         self, context: TransactionContext, engine: object, statement: str,
-    ) -> Iterator[None]:
+    ) -> Iterator[_LogicalStatementPublication]:
         """Hold native row effects through public result canonicalization."""
-        mark = None
-        schema_mark = None
-        if context.mode is TransactionMode.WRITE and type(engine) is QueryEngine:
-            parsed = engine.parse(statement)
-            if isinstance(parsed, (QueryStatement, UnionQuery)) and parsed.writes:
-                with self._transactions.page_access_section(transaction=context):
-                    self._require_open()
-                    mark = context.staging_mark()
-                    schema_mark = engine._schema_statement_mark(context)
+        publication = _LogicalStatementPublication(self, context, engine, statement)
+        # Outside every section, as before this boundary had an object: a refusal here escapes
+        # the same way it always did, and a cold parse is never serialised against the other
+        # threads of this participant.
+        publication.decide()
         try:
-            yield
-            if mark is not None:
-                with self._transactions.page_access_section(transaction=context):
-                    self._require_open()
-                    context.settle_staging_mark(mark)
+            yield publication
+            publication.settle()
         except BaseException as failure:
-            if mark is not None and context.active:
-                try:
-                    with self._transactions.page_access_section(transaction=context):
-                        context.discard_since(mark)
-                        engine._restore_schema_statement(context, schema_mark)
-                except BaseException as cleanup_failure:
-                    _note_cleanup_failure(failure, cleanup_failure)
-                    # If statement rollback cannot be proved, no later commit is safe.
-                    try:
-                        if context.active:
-                            self._transactions.rollback(context)
-                    except BaseException as rollback_failure:
-                        _note_cleanup_failure(failure, rollback_failure)
+            publication.unwind(failure)
             raise
 
     def _run_text_procedure(self, context: TransactionContext, call: tuple[object, ...], control: _ReadControl | None) -> QueryResult:

@@ -344,20 +344,20 @@ def test_a_special_namespace_entry_is_refused_without_opening_or_mutating_it(
         fifo.unlink()
 
 
-def _record_barrier(device: LocalStorageDevice, file: str | None) -> tuple[set[int], int]:
-    """Run one barrier and return which file inodes and how many directories it flushed.
+def _record_barrier(device: LocalStorageDevice, file: str | None) -> tuple[set[int], list[int]]:
+    """Run one barrier and return the file inodes and ordered directory inodes it flushed.
 
     Each descriptor is classified while it is still open, because a small cache closes the one
     it just flushed before the barrier returns.
     """
     files: set[int] = set()
-    directories = [0]
+    directories: list[int] = []
     real_fsync = os.fsync
 
     def _recording_fsync(descriptor: int) -> None:
         information = os.fstat(descriptor)
         if stat.S_ISDIR(information.st_mode):
-            directories[0] += 1
+            directories.append(information.st_ino)
         else:
             files.add(information.st_ino)
         real_fsync(descriptor)
@@ -368,7 +368,7 @@ def _record_barrier(device: LocalStorageDevice, file: str | None) -> tuple[set[i
         device.durable_barrier(file)
     finally:
         storage_local.os.fsync = original
-    return files, directories[0]
+    return files, directories
 
 
 def test_a_barrier_without_a_name_flushes_every_open_file(local_device: LocalStorageDevice) -> None:
@@ -383,9 +383,11 @@ def test_a_barrier_without_a_name_flushes_every_open_file(local_device: LocalSto
     }
     files, directories = _record_barrier(local_device, None)
     assert files == expected
-    # The cost is decided by the code, not by the data: POSIX also flushes the directory of
-    # each file plus the device root, and Windows has no directory handle to flush at all.
-    assert directories == (0 if IS_WINDOWS else 2)
+    # The fixture creates the database root too, so its parent owes publication.
+    # POSIX must flush child before parent, exactly once; Windows has no directory fsync.
+    assert directories == ([] if IS_WINDOWS else [
+        os.stat(path).st_ino for path in (root / "wal", root, root.parent)
+    ])
 
 
 def test_a_barrier_that_the_platform_refuses_is_a_typed_failure(local_device: LocalStorageDevice) -> None:
@@ -649,8 +651,11 @@ def test_a_barrier_flushes_the_one_file_it_names_and_its_directories(
     segment_inode = os.stat(Path(local_device.root) / "wal" / "000000000001.wal").st_ino
     files, directories = _record_barrier(local_device, SEGMENT)
     assert files == {segment_inode}
-    # POSIX flushes the directory that holds the file and the device root; Windows neither.
-    assert directories == (0 if IS_WINDOWS else 2)
+    # A named barrier also publishes the newly created root through its parent.
+    root = Path(local_device.root)
+    assert directories == ([] if IS_WINDOWS else [
+        os.stat(path).st_ino for path in (root / "wal", root, root.parent)
+    ])
     # The other file was never named, so the barrier did not touch it.
     assert os.stat(Path(local_device.root) / "heap.dat").st_ino not in files
 

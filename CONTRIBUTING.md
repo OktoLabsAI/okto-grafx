@@ -35,6 +35,23 @@ The full Pulse corpus check also needs local checkouts with HEAD exactly at Comm
 `PULSE_CORE_BASELINE` to those repositories if the documented sibling names are
 not present. The freezer verifies HEAD and reads pinned Git objects; do not replace these references
 with current source or skip the corpus to produce a green full regression.
+CI checks out these public repositories at the exact revisions on every full-suite
+leg; no Pulse application installation is needed.
+
+Automatic CI has a 20-minute budget per job. The full four-leg regression matrix
+exceeds that budget and runs only through **Actions > ci > Run workflow** on the
+chosen branch. Its cross-family coverage check runs on the same manual invocation,
+including after a failed suite leg. Select `recall_profile=full` there for the long
+recall calibration; the default, push/PR and weekly runs use `smoke`. Lint, installed
+consumer checks, compatibility and smoke recall remain automatic. A skipped manual
+matrix is not a completed regression and does not replace release qualification.
+
+Two optional audits read retained historical wheel receipts from
+`.grafx-tmp/fp5-wheel-qualification/run-{4,5}/report.json`. Clean environments
+attribute their absence as pending coverage debt (`CI-WHEEL-RECEIPTS` in
+[ROADMAP.md](ROADMAP.md)), rather than claiming those audits ran. Supplying the
+real receipts executes all their assertions. Neither outcome certifies a fresh
+installed wheel of the current candidate.
 
 ```bash
 pytest tests/query -q

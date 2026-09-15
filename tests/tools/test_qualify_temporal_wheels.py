@@ -72,9 +72,15 @@ def test_snapshot_includes_control_wal_and_new_or_removed_files(tmp_path):
     assert changed == {"control/commit.state", "wal/log.0", "unexpected.dat"}
 
 
+@pytest.mark.pending
 @pytest.mark.parametrize("run", ["run-4", "run-5"])
 def test_actual_wheel_receipt_retains_all_seeded_values(run):
-    """Audit the retained integration receipt when present; normal unit runs need no artifacts."""
+    """Audit historical receipts when present; CI absence is explicit coverage debt.
+
+    ROADMAP's CI-WHEEL-RECEIPTS item tracks provisioning these retained inputs.
+    The pending marker attributes absence only; it does not bypass any assertion
+    when a receipt is available or claim a fresh installed-wheel qualification.
+    """
     from pathlib import Path
     import json
     from okto_grafx.domain.model.temporal_interchange import temporal_json_value

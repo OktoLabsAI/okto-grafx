@@ -56,7 +56,7 @@ See [native creation and durable semantics](architecture/FLEXIBLE_GRAPH_V1.md).
 [API reference](API_REFERENCE.md) · [FP-3 evidence](conformance/FP3_PROGRESS.md) ·
 [Roadmap](../ROADMAP.md#functional-parity-expansion-plan)
 
-This page documents the **0.0.6 development API**, not a published release or
+This page documents the **0.0.6 API** (published on PyPI on September 13, 2026), not
 full Cypher conformance. Native `execute` and cursors return `NodeValue`
 for typed and polymorphic nodes and `RelationshipValue` for relationships, also
 inside lists/maps. Both types, `EntityIdentity` and `EntityProvenance`, are exported

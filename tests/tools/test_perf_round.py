@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -908,6 +909,34 @@ def test_a_series_refuses_unbound_copies_stale_outputs_and_missing_timeouts(
         )
 
 
+@pytest.mark.parametrize("error_number", [errno.ENAMETOOLONG, errno.EACCES, errno.EIO])
+def test_inline_instrument_hashing_distinguishes_non_paths_from_io_failures(
+    monkeypatch: pytest.MonkeyPatch, error_number: int
+) -> None:
+    """POSIX rejects long argv literals as paths; genuine I/O failures remain fatal."""
+    payload = "print('" + "literal" * 200 + "')"
+    real_is_file = Path.is_file
+
+    def inspect(path: Path) -> bool:
+        if str(path) == payload:
+            raise OSError(error_number, "planted stat failure")
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", inspect)
+    template = [sys.executable, "-c", payload]
+    if error_number != errno.ENAMETOOLONG:
+        with pytest.raises(OSError) as raised:
+            baseline_runs._instrument_hashes(template, [])
+        assert raised.value.errno == error_number
+    else:
+        hashes = baseline_runs._instrument_hashes(template, [])
+        inline = [item for item in hashes if item.get("inline")]
+        assert len(inline) == 1
+        assert inline[0]["sha256"] == receipt.sha256_text(payload)
+        assert inline[0]["bound_instrument"] is True
+        assert any(item["command_executable"] and item["sha256"] for item in hashes)
+
+
 def test_a_series_requires_the_actual_instrument_to_be_hashed(tmp_path: Path) -> None:
     with pytest.raises(baseline_runs.RunRefused, match="direct .py script"):
         baseline_runs.run_series(
@@ -1060,23 +1089,115 @@ def test_a_timed_out_or_broken_run_is_an_error_not_a_sample(tmp_path: Path) -> N
 def test_timeout_terminates_descendants_before_they_can_write_late_output(
     tmp_path: Path,
 ) -> None:
+    import psutil
+
     sentinel = tmp_path / "late.txt"
+    ready = tmp_path / "ready.txt"
+    release = tmp_path / "release.txt"
     grandchild = (
-        "import pathlib,sys,time; time.sleep(1.5); "
-        "pathlib.Path(sys.argv[1]).write_text('late')"
+        "import os,pathlib,sys,time\n"
+        "ready,release,sentinel=map(pathlib.Path,sys.argv[1:])\n"
+        "temporary=ready.with_suffix('.tmp')\n"
+        "temporary.write_text(str(os.getpid()))\n"
+        "temporary.replace(ready)\n"
+        "while not release.exists(): time.sleep(0.01)\n"
+        "sentinel.write_text('late')\n"
     )
     parent = (
         "import subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, {str(sentinel)!r}]); "
-        "time.sleep(30)"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, "
+        f"{str(ready)!r}, {str(release)!r}, {str(sentinel)!r}]); "
+        "time.sleep(60)"
     )
     run_home = tmp_path / "isolated-home"
     run_home.mkdir()
     process = baseline_runs._spawn([sys.executable, "-c", parent], run_home)
-    watched = baseline_runs._watch(process, poll_seconds=0.05, timeout_seconds=0.3)
-    assert watched["timed_out"] is True
-    time.sleep(1.7)
-    assert not sentinel.exists()
+    root = psutil.Process(process.pid)
+    members = [root]
+    try:
+        deadline = time.monotonic() + 10.0
+        while not ready.exists() and time.monotonic() < deadline:
+            assert process.poll() is None
+            time.sleep(0.01)
+        assert ready.exists(), "the descendant must exist before the timeout is exercised"
+        members.extend(root.children(recursive=True))
+        assert int(ready.read_text()) in {member.pid for member in members}
+        try:
+            watched = baseline_runs._watch(process, poll_seconds=0.05, timeout_seconds=0.3)
+        except baseline_runs.RunRefused as failure:
+            # Windows can lose launcher ancestry during taskkill. A refused
+            # sample stays refused; the known descendants must still be dead.
+            assert os.name == "nt"
+            assert str(failure) == (
+                f"Windows could not prove termination of timed-out process tree {process.pid}"
+            )
+        else:
+            assert watched["timed_out"] is True
+        process.wait(timeout=5)
+        _gone, alive = psutil.wait_procs(members, timeout=5)
+        assert not alive, "a timed-out descendant can still write into its isolated home"
+        # Authorize the potential write only AFTER cleanup. A fixed short sleep
+        # could expire while monitoring/taskkill was still running on a busy host.
+        release.write_text("go")
+        assert not sentinel.exists()
+    finally:
+        # Independent cleanup also contains intentionally broken termination
+        # variants used to prove that this test detects surviving descendants.
+        try:
+            members.extend(root.children(recursive=True))
+        except psutil.NoSuchProcess:
+            pass
+        for member in reversed(members):
+            try:
+                member.kill()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(members, timeout=5)
+        process.wait(timeout=5)
+
+
+def test_windows_timeout_keeps_descendants_after_root_loss_and_still_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-change helper loses this child after taskkill removes its parent."""
+    root_present = True
+    killed = []
+
+    class Child:
+        def kill(self) -> None:
+            killed.append("child")
+
+    child = Child()
+
+    class Root:
+        def children(self, *, recursive: bool):
+            assert recursive
+            if not root_present:
+                raise ProcessLookupError("launcher has already exited")
+            return [child]
+
+    class Process:
+        pid = 4242
+
+        def kill(self) -> None:
+            killed.append("root")
+
+        def wait(self, timeout: float) -> int:
+            assert timeout == 10
+            return 1
+
+    def taskkill(argv, **kwargs):
+        nonlocal root_present
+        assert argv == ["taskkill", "/PID", "4242", "/T", "/F"]
+        root_present = False
+        return subprocess.CompletedProcess(argv, 1)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(baseline_runs.os, "name", "nt")
+        patch.setattr(baseline_runs.subprocess, "run", taskkill)
+        with pytest.raises(baseline_runs.RunRefused, match="Windows could not prove"):
+            baseline_runs._terminate_process_tree(Process(), Root())
+    assert killed == ["child", "root"]
 
 
 def test_posix_timeout_targets_the_known_process_group_and_proves_it_gone(

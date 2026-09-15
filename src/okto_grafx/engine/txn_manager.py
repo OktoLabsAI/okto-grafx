@@ -977,6 +977,18 @@ class TransactionManager:
             f"{PARTICIPANT_SECTION_PREFIX}"
             f"{crc32c(coordinator.owner_id().encode('utf-8')):08x}"
         )
+        # W-01. The name above is the digest of THIS coordinator's identity, so the section it
+        # names excludes only the threads of this participant (see _participant_section). A
+        # coordinator that offers the private capability may therefore serialise it with its own
+        # process mechanism instead of an operating-system lock, and the engine -- which owns no
+        # mechanism (G2) and may not import threading -- only says which name qualifies. The
+        # concrete class dictionary is the discovery door for the same reason the descriptor
+        # capability uses it: inheriting the adapter must not silently inherit this. The
+        # coordinator re-derives the digest from its own owner id and refuses any other name, so
+        # the claim is proved there rather than trusted from here.
+        declare = type(coordinator).__dict__.get("_declare_private_section")
+        if callable(declare):
+            declare(coordinator, self._participant_section_name)
         self._next_txn_id: TxnId = 1
         self._open: dict[TxnId, TransactionContext] = {}
         # Long-lived descriptor reuse is owned by the same manager that owns transaction
@@ -8355,7 +8367,13 @@ class TransactionManager:
         The mutex is the coordinator's own section rather than a lock built here, because the
         engine owns no mechanism (G2) and may not import threading. The name carries a digest of
         this participant's identity, so the section is participant-local: another PROCESS never
-        waits on it, which is what keeps the processes half of FR-3 concurrent.
+        waits on it, which is what keeps the processes half of FR-3 concurrent. Because that is
+        true by construction and not by convention, ``__init__`` offers the name to the
+        coordinator's optional ``_declare_private_section`` capability, which serialises it in
+        this process rather than through the file system after re-deriving the digest itself.
+        Every cross-process section -- commit, the lease, first-open, page-0 -- keeps the
+        operating-system lock unchanged, and so does this one under any coordinator that does
+        not declare the capability.
 
         It is re-entrant from the same thread, so a door that takes it may call another that
         does. Lock order is participant -> lease -> commit on every path, and nothing anywhere

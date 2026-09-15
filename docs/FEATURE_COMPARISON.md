@@ -9,7 +9,7 @@ include CREATE/MERGE, SET/REMOVE, exact membership, stable identities, history,
 copy and transfer/resume. The [installed label-format matrix](reports/FP_NODE_LABEL_WHEEL_QUALIFICATION.md)
 passes 36 native scenarios and 36 transfer worker checks.
 
-This is development evidence, not a released version, full TCK conformance or
+This is evidence from the 0.0.6 development line, since released as 0.0.6; it is not full TCK conformance or
 proof of matching every Ladybug/Neo4j feature. The [final repository regression](reports/FP_FINAL_NATIVE_QUALIFICATION.md)
 passes 25,077 tests with 19 attributed skips; all 20 mapped native supplemental
 contracts pass. [Final installed Pulse qualification](reports/FP_FINAL_PULSE_QUALIFICATION.md)
@@ -273,14 +273,14 @@ and [expanded scope](specs/FUNCTIONAL_PARITY_PLAN.md#authorized-model-expansion-
 Reviewed September 10, 2026. This is a capability and integration comparison,
 not a benchmark, migration guarantee or product certification.
 
-The cross-product tables describe **validated 0.0.6 development source**, including
-the completed NHC-1–8 round. They do **not** describe the published 0.0.5 package.
-Section 5 identifies the development additions; release availability must be
-checked separately. Local feature/regression/documentation acceptance is recorded
+The cross-product tables describe **validated 0.0.6 source**, including the completed
+NHC-1–8 round, published as 0.0.6 on September 13, 2026. They do **not** describe the
+earlier 0.0.5 package. Section 5 identifies the 0.0.6 additions; installed versions must
+be checked separately. Local feature/regression/documentation acceptance is recorded
 in the [delivery evidence](reports/V006_NHC_ROUND.md), not inferred from feature names.
 
-The query-language rows additionally identify the **locally validated, unreleased**
-language round. Its [acceptance evidence](reports/V006_QUERY_LANGUAGE_ROUND.md),
+The query-language rows additionally identify the **language round shipped in 0.0.6**
+(locally validated before publication). Its [acceptance evidence](reports/V006_QUERY_LANGUAGE_ROUND.md),
 [separate contract](CYPHER_COMPATIBILITY.md) and
 remaining reference divergences supersede the older two-branch query description;
 they do not retroactively change the NHC checkpoint's test evidence.
@@ -350,8 +350,8 @@ trail beyond the 30-hop resource ceiling, instead of silently truncating at 20.
 Untyped alternatives remain incomplete; this is not complete path-language parity.
 Node-only named patterns also publish zero-edge native paths without requiring a
 relationship schema; aliases, optional nulls, UNION and aggregates preserve their
-qualified identities. This development increment is not a published release or
-new competitor execution result.
+qualified identities. This increment shipped in 0.0.6; it is not a new competitor
+execution result.
 
 Native `properties()`, `labels()` and `type()` expose property maps, the current
 node-label set and relationship type, including NULL, polymorphic/UNION/path
@@ -361,8 +361,8 @@ vendor-specific extensions and final integrated consumer qualification remain di
 
 | Product | Baseline and evidence |
 | --- | --- |
-| Okto Grafx | Published **0.0.5**, tag `v0.0.5`, merge `83cc313`. Local consumer contracts and implementation are the authority. [Publication receipt](reports/PYPI_0_0_5_PUBLICATION.md). |
-| Okto Grafx development (comparison baseline) | **0.0.6**, `feature/v0.0.6`, including completed NHC-1–8, reviewed September 10, 2026. Local acceptance, not a published package or remote CI claim. [Changelog](../CHANGELOG.md), [NHC evidence](reports/V006_NHC_ROUND.md). |
+| Okto Grafx | Published **0.0.6**, tag `v0.0.6`, merge `1e01be5`, PyPI September 13, 2026. Local consumer contracts and implementation are the authority. The latest publication receipt in this repository covers [0.0.5](reports/PYPI_0_0_5_PUBLICATION.md). |
+| Okto Grafx comparison baseline | **0.0.6** as developed on `feature/v0.0.6`, including completed NHC-1–8, reviewed September 10, 2026 and since published as 0.0.6. Local acceptance, not a remote CI claim. [Changelog](../CHANGELOG.md), [NHC evidence](reports/V006_NHC_ROUND.md). |
 | Ladybug | **0.20.3** release, plus official rolling documentation accessed on the review date. Source was inspected where the concurrency documentation leaves an important ambiguity. This is not the older Ladybug 0.16.0 used in some Grafx benchmarks. [Release](https://github.com/LadybugDB/ladybug/releases/tag/v0.20.3). |
 | Neo4j | Current self-managed documentation accessed on the review date, distinguishing **Community (CE)**, **Enterprise (EE)** and separately installed libraries. Not an installed-version conformance test. Rolling documentation may describe features newer than a particular deployed release. [Edition guide](https://neo4j.com/docs/operations-manual/current/introduction/). |
 
@@ -475,7 +475,7 @@ redistribution, embedding or hosted deployment.
 
 ## 5. Current Grafx development: implemented deltas and practical value
 
-Every row below is **0.0.6 development**, not the published 0.0.5 package.
+Every row below describes **0.0.6** (published September 13, 2026), not the earlier 0.0.5 package.
 NHC-1–8 have completed local acceptance: 269 affected tests and 2,774 final
 corrective tests passed, plus all 14 real-wheel compatibility cells. The initial
 full run recorded 16,929 passes and nine failures; every failure was corrected
@@ -589,6 +589,12 @@ changes. In particular, revalidate Ladybug's documented versus enabled multiwrit
 semantics, Neo4j edition-dependent features and any claimed new temporal/cluster
 capabilities. Linked rolling documentation is evidence accessed on the review
 date, not a frozen promise about future releases.
+
+### September 14, 2026 refresh record
+
+- Reconciled release status after the 0.0.6 publication (tag `v0.0.6`, PyPI
+  September 13, 2026): the comparison baseline is the published 0.0.6, and the
+  development source is now 0.0.7 with no comparison-relevant additions yet.
 
 ### September 10, 2026 refresh record
 

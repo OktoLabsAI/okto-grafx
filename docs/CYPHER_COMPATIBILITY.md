@@ -429,8 +429,9 @@ restores a removed backend to bypass failures.
 
 Community's dependency is pinned to `okto-grafx[accel]==0.0.6`: do not install the
 changed owner-reference queries with an older Grafx runtime. This is a coordinated
-source/dependency update, not a global Pulse installation or a PyPI publication.
-Until release, integration builds must resolve the locally built 0.0.6 wheel.
+source/dependency update, not a global Pulse installation. Grafx 0.0.6 was published on
+PyPI on September 13, 2026, so integration builds can resolve the published wheel;
+locally built 0.0.6 wheels were only required before that.
 
 Validated policies in this development round:
 

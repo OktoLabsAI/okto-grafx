@@ -86,6 +86,7 @@ EXPECTED_GATE_ARGV: tuple[str, ...] = (
     "--require-recall",
     "--calibration",
     "bench/calibration.json",
+    "--informational-ceilings",
 )
 
 EXPECTED_GATE_MATRIX: dict[str, list[dict[str, str]]] = {
@@ -96,15 +97,28 @@ EXPECTED_GATE_MATRIX: dict[str, list[dict[str, str]]] = {
 }
 
 EXPECTED_CALIBRATION_JOB_SHA256: str = (
-    "be5907510ee635287282e62b3e4c8e1d0fe7eb72c7f508de02f426e9b1491dcc"
+    "40ae443f62bdb4afa39497c5fd2ac946cc981fea9f75ed9edb18b28d2460e87c"
 )
-"""Canonical execution fingerprint of the whole calibration job, excluding YAML comments."""
+"""Canonical job fingerprint; D5 is informational under the September 8 policy.
+
+Recall, measurement validation and unconditional/fatal execution stay governed.
+The maintainer's 20-minute automatic-job budget makes full recall manual-only.
+"""
 
 EXPECTED_WORKFLOW_TRIGGERS: dict[str, object] = {
     "push": None,
     "pull_request": None,
     "schedule": [{"cron": "0 6 * * 1"}],
-    "workflow_dispatch": None,
+    "workflow_dispatch": {
+        "inputs": {
+            "recall_profile": {
+                "description": "Recall workload (full exceeds 20 minutes; manual only)",
+                "type": "choice",
+                "default": "smoke",
+                "options": ["smoke", "full"],
+            }
+        }
+    },
 }
 
 EXPECTED_WORKFLOW_NON_TRIGGER_KEYS: frozenset[object] = frozenset(
@@ -517,7 +531,7 @@ def _gate_command(workflow_text: str | None = None) -> list[str]:
     )
     triggers = document[trigger_keys[0]]
     assert triggers == EXPECTED_WORKFLOW_TRIGGERS, (
-        "the calibration gate must run for push, pull request, weekly full recall and manual "
+        "the calibration gate must run for push, pull request, weekly smoke recall and manual "
         f"dispatch; found {triggers!r}"
     )
     job_controls = sorted(FORBIDDEN_GATE_JOB_CONTROLS.intersection(job))
@@ -1543,7 +1557,7 @@ def test_a_conditional_decoy_cannot_capture_the_check_for_a_weaker_real_gate() -
         " --require-recall",
         " --recall-target 0.10",
     )
-    governed_step = "      - name: Apply the D5 ceilings to the PUBLISHED metric"
+    governed_step = "      - name: Validate measurements and recall; report D5 ceilings"
     assert workflow.count(governed_step) == 1
     mutated = workflow.replace(real_line, weaker)
     mutated = mutated.replace(governed_step, f"{decoy}\n\n{governed_step}")
@@ -1554,7 +1568,7 @@ def test_a_conditional_decoy_cannot_capture_the_check_for_a_weaker_real_gate() -
 def test_a_prior_step_cannot_mutate_a_load_bearing_input_behind_an_exact_gate() -> None:
     """The final step is insufficient authority when an earlier step can rewrite its input."""
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    governed_step = "      - name: Apply the D5 ceilings to the PUBLISHED metric"
+    governed_step = "      - name: Validate measurements and recall; report D5 ceilings"
     assert workflow.count(governed_step) == 1
     mutator = "\n".join(
         (

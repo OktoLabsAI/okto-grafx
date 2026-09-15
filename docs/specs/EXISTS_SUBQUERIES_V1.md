@@ -1,6 +1,6 @@
 # Native EXISTS subqueries
 
-Implemented on `feature/v0.0.6`; development source, not a released wheel or a
+Implemented on `feature/v0.0.6` and shipped in the 0.0.6 release; not a
 complete FP-4/Cypher-parity claim. This closes the existential-subquery family
 without rewriting upstream fixtures or relaxing the storage/transaction model.
 

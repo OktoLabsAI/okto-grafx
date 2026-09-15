@@ -1,7 +1,8 @@
 # Okto Grafx continuous integration (component C13).
 #
 # SPEC-M1 TR-8 and decision D9: Windows and POSIX are equal citizens, so the whole bench runs on
-# both families and the aggregate is green only when BOTH are. SPEC-VEC TR-6 and VTS-9 add the
+# both families and the aggregate is green only when BOTH are. The full matrix is manual-only:
+# its jobs exceed the maintainer's 20-minute automatic CI budget. SPEC-VEC TR-6 and VTS-9 add the
 # second axis: the suite must also run WITHOUT the optional extras (base acceleration remains
 # installed), so four jobs -- two families
 # times two installation profiles.
@@ -39,8 +40,14 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "0 6 * * 1"  # weekly full-profile recall calibration (C13)
+    - cron: "0 6 * * 1"  # weekly smoke-profile recall calibration (C13)
   workflow_dispatch:
+    inputs:
+      recall_profile:
+        description: "Recall workload (full exceeds 20 minutes; manual only)"
+        type: choice
+        default: smoke
+        options: [smoke, full]
 
 permissions:
   contents: read
@@ -114,7 +121,12 @@ jobs:
 
   suite:
     name: suite (${{ matrix.family }} / ${{ matrix.profile }})
+    # Explicit maintainer policy: long jobs stay available through Run workflow.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
+    env:
+      PULSE_COMMUNITY_BASELINE: ${{ github.workspace }}/.grafx-tmp/ci-corpus/community
+      PULSE_CORE_BASELINE: ${{ github.workspace }}/.grafx-tmp/ci-corpus/core
     # Generous, but bounded: an unbounded job that hangs reports nothing at all, and a hang must
     # always become a red result rather than a wait (A42/A88).
     timeout-minutes: 90
@@ -147,6 +159,26 @@ jobs:
           # A depth-1 checkout contains the integration tree but not those historical objects,
           # which would turn an honest provenance gate into a CI-only rev-parse failure.
           fetch-depth: 0
+
+      # Public source inputs for tools/pulse_query_corpus.py, not runtime dependencies.
+      # Keep exact HEADs and their history: the inventory re-derives pinned Git objects.
+      - name: Check out the pinned Community corpus baseline
+        uses: actions/checkout@v4
+        with:
+          repository: OktoLabsAI/okto-pulse
+          ref: befaf1e4f9da9d0cff7cfc0f4aee177ef0a3e595
+          path: .grafx-tmp/ci-corpus/community
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the pinned Core corpus baseline
+        uses: actions/checkout@v4
+        with:
+          repository: OktoLabsAI/okto-pulse-core
+          ref: f602c7cc2f6a9f5ef446d4c991309196bd4667c7
+          path: .grafx-tmp/ci-corpus/core
+          fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -268,7 +300,7 @@ jobs:
     needs: suite
     # `always()`: the check must run even when a suite job failed. A red suite and a test that
     # ran nowhere are different defects and both must be reported.
-    if: always()
+    if: always() && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -300,13 +332,11 @@ jobs:
           retention-days: 14
 
   calibration:
-    name: D5 ceilings (${{ matrix.family }})
+    name: D5 measurements and recall (${{ matrix.family }})
     runs-on: ${{ matrix.os }}
-    # C13: the weekly FULL recall profile builds an 8192x384 HNSW in pure Python -- measured
-    # locally above 50 minutes on a machine faster than these runners -- so the scheduled run
-    # gets 180 minutes while pushes and pull requests (smoke profile) keep the original 60.
-    # The worker's own internal timeout stays the inner safety net either way.
-    timeout-minutes: ${{ github.event_name == 'schedule' && 180 || 60 }}
+    # Full recall exceeds 50 minutes and now requires an explicit manual selection.
+    # Automatic jobs use smoke and are bounded by the maintainer's 20-minute budget.
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.recall_profile == 'full' && 180 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -347,9 +377,9 @@ jobs:
         # a broken vector stage. Appends are ordered: section into the calibration document
         # first, the gauge into the metrics document LAST (an interrupted run leaves
         # section-without-gauge, which --require-recall below reads as UNMEASURED).
-        # Pushes run the smoke profile; the weekly schedule runs the full numpy oracle.
+        # Automatic events use smoke; full recall is available only through Run workflow.
         env:
-          RECALL_PROFILE: ${{ github.event_name == 'schedule' && 'full' || 'smoke' }}
+          RECALL_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.recall_profile == 'full' && 'full' || 'smoke' }}
         run: |
           python -m bench.harness.recall_wiring \
             --profile "$RECALL_PROFILE" \
@@ -358,17 +388,18 @@ jobs:
             --metrics "metrics-${{ matrix.family }}.json" \
             --workspace .recall-workspace
 
-      - name: Apply the D5 ceilings to the PUBLISHED metric
+      - name: Validate measurements and recall; report D5 ceilings
         shell: bash
-        # OR-4: the gate reads oktografx_baseline_ceiling_multiple, not a log. A durable-commit
-        # multiple above 10x is the 'consult JP' state of FR-15 and stops the pipeline.
+        # OR-4: read the published metric. The September 8 performance policy makes
+        # D5 timing ratios informational. Missing/invalid measurements and recall
+        # failures still fail this unconditional step; no exit status is discarded.
         # C13: --require-recall makes a build that publishes no recall gauge FAIL (the C13
         # observation closed). The temporary --recall-target override is GONE: the freeze
         # landed, so bench/calibration.json carries vector_recall.frozen.target and the
         # versioned artifact governs the floor through _resolve_recall_target's precedence
         # (flag > frozen artifact > built-in). Moving the floor is now a reviewable change
         # to a committed file rather than a flag edited inside a workflow.
-        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --calibration bench/calibration.json
+        run: python -m bench.harness.gate --metrics metrics-${{ matrix.family }}.json --require-recall --calibration bench/calibration.json --informational-ceilings
 
       - name: Upload the calibration artefacts
         if: always()

@@ -2,12 +2,112 @@
 
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 13, 2026. “Current” means the **latest recorded observation for
+Updated September 14, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
-Current development source is 0.0.6; published baseline is 0.0.5.
+Current development source is 0.0.7; published baseline is 0.0.6.
 The latest isolated installed Pulse/native observations below use the final
 0.0.6 candidate. The latest production spec-consolidation measurement still uses
 `0.0.4@fa8f188`; no production spec was consolidated for these tests.
+
+## 0.0.7 performance round closure
+
+The [closing comparison](reports/PERF_V007_CLOSURE.md) estimates **19.7%
+lower latency in a fixed eleven-scenario native basket** for final runtime
+`a504417` versus released v0.0.6 source `1e01be5`. Six balanced blocks include
+an identical-code control (median control/final ratio 0.996).
+The basket has explicit synthetic weights and includes every native scenario
+from wave A. It is not a universal or Pulse percentage. Earlier incremental
+gains are not added to this direct comparison. Implementation is closed for
+this round; individual results, full regression and limits are in the report.
+
+## 0.0.7 native scalar sort dispatch
+
+The [scalar-sort report](reports/PERF_V007_SCALAR_SORT.md) measures `0919c06`
+against `7d52f8a`. Exact built-in scalar keys avoid general-kind probes while
+retaining mixed-kind ordering and the subclass fallback. Three processes
+alternating the old/new helper in one public-query runtime favor the change
+for top-50 of 2,000 integer rows (pooled ratio 1.082, about 7.6% lower latency
+in this sample). Other scalar-key cases also favor the change, with workload
+and same-code variation recorded individually. The independent-process
+comparison was noisier; it is retained rather than presented as a precise
+gain. This does not establish a universal or Pulse speedup.
+
+The new complete regression has 24,808 passes, 41 attributed skips,
+zero failures/errors and exit 0. Focused tests and ten detected mutations
+separately qualify the mechanism. Alias metadata and the public-value trust
+boundary remain separate from this implementation.
+
+## 0.0.7 wave A: merged mechanisms and independent qualification
+
+The objective is Grafx platform performance. Native API workloads evaluate
+general mechanisms; Pulse workloads evaluate one consumer's resulting experience.
+Neither a Pulse-specific result nor one native micro-benchmark establishes a
+universal gain.
+
+The [wave-A report](reports/PERF_V007_WAVE_A.md) records development source
+`852b655`, its pre-wave and 0.0.5 comparisons, the original full regression
+(24,780 passed, 2 failed, 41 skipped), reproduction of both failures before wave A,
+and separate focused tooling corrections. The failed full run remains failed.
+READ-4 memoization, FIX-W section fusion, READ-3 vector-free admission and
+W-01/W-02 private participant coordination are delivered mechanisms; their
+individual ceiling measurements must not be added together. The private-wait
+hotfix retains bounded waiting and manual-clock behavior. The fresh 50-statement
+port recheck observes 104 private participant entries, zero participant file
+locks and four other file-lock acquisitions, both before and after that hotfix.
+Consumer timing boundaries and results are recorded separately in the report.
+
+The new native matrix establishes conditional benefits outside Pulse: ordered
+traversals to 200 distinct destinations and to overlapping destinations have paired
+pre-wave/head ratios 3.060/1.592; staging 50 individual node/relationship writes
+has ratios 1.496/1.246. Streaming, bulk-write and commit cases do not show uniform
+gains. These are bounded workload observations, not additive package speedups.
+The current Pulse shape and total transfer do not establish gains beyond the
+same-code variation. A scalar 2,000-row sort still trails v0.0.5; the report records
+a native call-profile diagnostic and the resulting platform priorities.
+
+## Pre-wave 0.0.7 baseline: HEAD versus v0.0.5 on the same machine
+
+September 14, 2026, Phase 0 of the 0.0.7 performance initiative. `b0e4f51`
+(`feature/v0.0.7`, the v0.0.6 tag `1e01be5` plus the version bump) against `83cc313`
+(v0.0.5), arms alternated round by round in one window. Windows 11, Intel i7-11800H,
+16 logical cores, CPython 3.11.14, native `google-crc32c`; `buffer_budget_bytes`
+64 MiB, `codec` and `vector_math` `numpy` — the defaults in **both** arms. Medians of
+three measured rounds, round 0 discarded. **The machine was not quiescent**: a live
+Pulse server and a concurrent agent runtime held 1.4–3.1 of the 16 cores throughout,
+so absolute walls are inflated by an unknown, time-varying amount and **only the
+paired ratios are defended**. Ratios are v0.0.5 wall ÷ HEAD wall; below 1 the v0.0.5
+arm was faster.
+
+| Workload / phase | HEAD | v0.0.5 | Paired ratio | Label |
+| --- | ---: | ---: | --- | --- |
+| Pulse logical transfer, phases 1–6 | 70.19 s | 66.31 s | 0.945, 3 of 3 rounds below 1 | MEDIDO |
+| — `write_nodes` | 14.90 s | 12.51 s | 0.847 | MEDIDO |
+| — `write_relations` | 27.22 s | 23.95 s | 0.871 | MEDIDO |
+| — `checkpoint` | 5.26 s | 5.93 s | 1.128 | MEDIDO |
+| — `certify` | 15.11 s | 15.78 s | 1.044 | MEDIDO |
+| — DDL `begin_candidate` | 5.96 s | 6.19 s | 0.977 | MEDIDO |
+| KG page, 500 rows, exact Pulse statement | 0.551 s | 0.441 s | 0.814 | MEDIDO |
+| KG fan-out, 69 layouts, older harness form | 2.069 s | 1.861 s | 0.834 | MEDIDO |
+| Production vector search, per query | 74.9 ms | 69.6 ms | 0.886, band contains 1 | MEDIDO |
+| `verify('all')`, cold handle, copied board | 0.610 s | 0.571 s | 0.936, band contains 1 | MEDIDO |
+
+Reading: HEAD measures **approximately 5.8% slower on the Pulse logical transfer, 3 of 3 rounds**,
+and all of that difference sits in the two write phases while checkpoint moves the
+other way; the vector and `verify('all')` bands contain 1, so no difference is
+established there. No cause is established for any ratio. On HEAD the transfer
+composes as relationship `execute` 29.9 %, node `execute` 10.3 %, node `commit`
+8.9 %, relationship `commit` 8.3 %, `verify("all")` 7.9 %, `checkpoint` 7.5 %, DDL
+`execute` 7.3 %, cold `connect_ro` 4.5 %, the Pulse `_prepare` 3.2 % and the Core
+fingerprint 2.6 %. The baseline also settles a statement question: the production
+Pulse fan-out sends `MATCH (a:{from})-[r:{rel}]->(b:{to}) WHERE <visibility> RETURN
+a.id, b.id, r.confidence LIMIT 5000` with **no id list**, filtering the page's ids in
+Python afterwards. Not measured: the 256 MiB `buffer_budget_bytes` arm (the Amdahl
+instrument takes no connect options) and the checkpoint bucket-floor replay (its
+bench is stale against 0.0.6+). Native micros on HEAD in the same session: DML commit
+23.82 ms with commit history off, 30.69 ms on; projected ordered page 28.56 ms
+against a 33.52 ms full-decode oracle.
+[Commands, provenance, per-operation composition and every limitation](reports/PERF_V007_BASELINE.md)
+· [the initiative that ordered it](specs/PERFORMANCE_V007_PLAN.md).
 
 ## Latest 0.0.6 installed native graph observations
 
@@ -399,6 +499,14 @@ gates. Quality gates still reject corruption, semantic divergence, broken
 durability/recovery, concurrency violations and unexplained operation timeouts.
 Run focused tests during implementation, then proportional grouped regressions;
 do not repeatedly spend hours proving marginal latency changes.
+
+CI selects `--informational-ceilings` in `python -m bench.harness.gate` to apply
+this policy. Valid timing overflows retain their values and an explicit
+`informational_ceilings_exceeded` status. Missing or malformed measurements and
+recall below the frozen floor still fail. The default CLI mode retains strict
+D5 comparison for historical reproduction; CI does not use that mode as a
+release gate. Numerical ceilings, raw measurements and the recall target are
+unchanged.
 
 Grafx does not currently claim Ladybug parity, constant-time general traversal,
 linear CPU/GIL scaling or an RSS bound equal to `buffer_budget_bytes`. Historical

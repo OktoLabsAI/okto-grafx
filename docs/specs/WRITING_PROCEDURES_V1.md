@@ -1,6 +1,6 @@
 # Transaction-scoped writing procedures — FP-7 development
 
-Status: bounded native implementation on `feature/v0.0.6`, not a release or full
+Status: bounded native implementation on `feature/v0.0.6`, shipped in 0.0.6; not full
 FP-7 completion. This extends [CALL invocation](PROCEDURE_INVOCATION_V1.md) and
 [numeric signatures](PROCEDURE_NUMERIC_SIGNATURES_V1.md). No persisted layout,
 capability bit, recovery rule or independent-reader/writer policy changes.

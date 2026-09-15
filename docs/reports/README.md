@@ -1,5 +1,11 @@
 # Evidence and report index
 
+- [v0.0.7 round closure: direct v0.0.6 comparison and fixed native basket](PERF_V007_CLOSURE.md)
+- [v0.0.7 native scalar sort: exact-type dispatch, paired controls and full regression](PERF_V007_SCALAR_SORT.md)
+- [v0.0.7 performance wave A: independent regression, native platform workloads and consumer measurements](PERF_V007_WAVE_A.md)
+
+- [v0.0.7 performance baseline (Phase 0): HEAD versus v0.0.5 paired ratios, on a machine declared non-quiescent](PERF_V007_BASELINE.md)
+
 - [0.0.6 publication preparation: isolated sanitation rehearsal and remaining approvals](V006_PUBLICATION_PREPARATION.md)
 
 - [Functional parity: final native regression, 22-contract reconciliation and explicit Neo4j deferral](FP_FINAL_NATIVE_QUALIFICATION.md)

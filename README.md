@@ -5,8 +5,9 @@ snapshot isolation, WAL-backed durability, verification and fail-closed recovery
 No database server is required. The base installation includes NumPy and native CRC-32C;
 engine/domain mechanisms remain isolated behind ports.
 
-**Source version: 0.0.6, pre-alpha — in development.** Latest published release: 0.0.5. See the
-[publication receipt](docs/reports/PYPI_0_0_5_PUBLICATION.md). API and persistent-format compatibility
+**Source version: 0.0.7, pre-alpha — in development.** Latest published release: 0.0.6 (PyPI and
+tag `v0.0.6`, September 13, 2026); the latest publication receipt in this repository still covers
+[0.0.5](docs/reports/PYPI_0_0_5_PUBLICATION.md). API and persistent-format compatibility
 must be checked before upgrading; see [operations](docs/OPERATIONS.md).
 
 Development procedures now support [explicit native schema authority](docs/specs/PROCEDURE_SCHEMA_AUTHORITY_V1.md),

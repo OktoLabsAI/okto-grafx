@@ -1,4 +1,4 @@
-"""The CI ceiling gate: it reads the published METRIC, never a log (SPEC-M1 AC-14, OR-4).
+"""Validate published measurements and recall, with an explicit D5 timing policy.
 
 ``calibrate.py`` measures and publishes; this reads what was published and decides. The split is
 the requirement, not a preference: OR-4 says the gate reads
@@ -6,7 +6,12 @@ the requirement, not a preference: OR-4 says the gate reads
 dashboard would show, and a harness that printed a friendly log while publishing something else
 would be caught here.
 
-Four things it decides:
+The default retains the historical strict D5 comparison. CI explicitly selects
+``--informational-ceilings`` under docs/PERFORMANCE.md's September 8 policy:
+exceeded timing ceilings remain visible but do not block release. Missing or
+invalid evidence and a failed recall floor still fail under either policy.
+
+The strict comparison decides:
 
 * each of the three D5 multiples is within its ceiling;
 * a durable-commit multiple above 10x is not merely a failure but the ``consult_jp`` state FR-15
@@ -17,8 +22,9 @@ Four things it decides:
   or above the frozen recall target. The vector calibration itself belongs to the vector engine's
   wave; until it publishes, the ratio is absent and the gate says so rather than inventing one.
 
-Exit codes: ``0`` every required ceiling met, ``1`` a ceiling missed or the pipeline stopped,
-``2`` UNMEASURED.
+Exit codes: ``0`` valid evidence meeting the selected policy, ``1`` a blocking
+ceiling/recall failure, ``2`` UNMEASURED. Informational overflow has its own status;
+it is never reported as a ceiling that was met.
 """
 
 from __future__ import annotations
@@ -47,6 +53,9 @@ RECALL_METRIC: str = "oktografx_vector_recall_ratio"
 
 DEFAULT_RECALL_TARGET: float = 0.90
 """The recall target this build calibrates against until the vector wave freezes its own."""
+
+STATUS_INFORMATIONAL: str = "informational_ceilings_exceeded"
+"""D5 timings exceed historical ceilings under the explicit informational policy."""
 
 
 def _as_finite_float(value: object) -> float | None:
@@ -233,7 +242,7 @@ class GateResult:
     """What the gate concluded about one published metrics document."""
 
     status: str
-    """``ceilings_met``, ``ceiling_exceeded``, ``consult_jp`` or ``unmeasured``."""
+    """Measured, exceeded, informational overflow, consult-JP, or unmeasured status."""
 
     lines: tuple[str, ...]
     """One line per ceiling, in reading order."""
@@ -241,7 +250,7 @@ class GateResult:
     @property
     def exit_code(self) -> int:
         """Return the process exit code this result deserves."""
-        if self.status == STATUS_MET:
+        if self.status in (STATUS_MET, STATUS_INFORMATIONAL):
             return 0
         if self.status == STATUS_UNMEASURED:
             return 2
@@ -369,11 +378,27 @@ def _collect_multiples(
         name = entry.get("name")
         samples = entry.get("samples")
         if not _is_a(samples, list):
+            if name == METRIC_NAME:
+                return {}, {}, "D5 samples are not a list: UNMEASURED"
             # samples can arrive as null, a number, anything: iterating a non-list raises
             # TypeError through the never-raise promise. A non-list is simply not samples,
             # so the entry contributes nothing and a required ceiling reads UNMEASURED.
             continue
         for sample in samples:
+            if name == METRIC_NAME:
+                if not _is_a(sample, Mapping):
+                    return {}, {}, "D5 sample is not a mapping: UNMEASURED"
+                labels = sample.get("labels")
+                if not _is_a(labels, Mapping) or not _is_a(labels.get("ceiling"), str):
+                    return {}, {}, "D5 sample has no ceiling label: UNMEASURED"
+                ceiling = labels["ceiling"]
+                coerced = _as_finite_float(sample.get("value"))
+                if coerced is None or coerced < 0:
+                    return {}, {}, "D5 sample is not a nonnegative finite multiple: UNMEASURED"
+                if ceiling in multiples:
+                    return {}, {}, f"D5 ceiling {ceiling} was published more than once: UNMEASURED"
+                multiples[ceiling] = coerced
+                continue
             if not _is_a(sample, Mapping) or "value" not in sample:
                 continue
             # The guarded coercion is load-bearing here too: float(10**400) raises
@@ -384,12 +409,7 @@ def _collect_multiples(
             coerced = _as_finite_float(sample["value"])
             if coerced is None:
                 continue
-            labels = sample.get("labels", {})
-            if name == METRIC_NAME and _is_a(labels, Mapping):
-                ceiling = labels.get("ceiling")
-                if _is_a(ceiling, str):
-                    multiples[ceiling] = coerced
-            elif _is_a(name, str):
+            if _is_a(name, str):
                 gauges[name] = coerced
     return multiples, gauges, ""
 
@@ -397,8 +417,8 @@ def _collect_multiples(
 def _recall_measurement(document: str) -> tuple[str, object]:
     """The ONE recall measurement, or the exact reason there is none.
 
-    ``read_multiples`` collapses same-name entries last-wins and coerces through ``float``,
-    which suits the legacy gauges and is WRONG for a required floor: the gate reads any
+    ``read_multiples`` collects legacy non-D5 gauges last-wins and coerces through ``float``,
+    which is WRONG for a required floor: the gate reads any
     metrics file, not only wiring output, so the gauge can arrive twice, or as ``true``,
     ``NaN``, ``Infinity``, or an out-of-range ratio -- and none of those is a measurement.
     The result is a three-state verdict, because ABSENT and MALFORMED are different facts:
@@ -507,13 +527,22 @@ def check(
     required: Sequence[str] = tuple(CEILINGS),
     recall_target: float = DEFAULT_RECALL_TARGET,
     require_recall: bool = False,
+    informational_ceilings: bool = False,
 ) -> GateResult:
     """Apply the D5 ceilings, and the recall floor when it is published.
 
     ``recall_target`` is validated HERE as well as at the CLI boundary: a direct caller
     passing bool/NaN/Inf or a value outside (0, 1] gets UNMEASURED, never an exception and
     never a verdict computed against nonsense.
+
+    ``informational_ceilings`` changes only the consequence of valid D5 timing
+    overflows. It never changes measurement validation or the recall floor.
     """
+    if type(informational_ceilings) is not bool:
+        return GateResult(
+            status=STATUS_UNMEASURED,
+            lines=("UNMEASURED -- informational_ceilings must be an explicit boolean",),
+        )
     coerced_target = _as_finite_float(recall_target)
     if coerced_target is None or not 0.0 < coerced_target <= 1.0:
         return GateResult(
@@ -549,6 +578,11 @@ def check(
             lines.append(f"{ceiling}: {measured:.2f}x of {limit:g}x -- met")
             continue
         lines.append(f"{ceiling}: {measured:.2f}x of {limit:g}x -- EXCEEDED")
+        if informational_ceilings:
+            lines.append("D5 timing is informational under docs/PERFORMANCE.md's performance policy.")
+            if status == STATUS_MET:
+                status = STATUS_INFORMATIONAL
+            continue
         if ceiling == "durable_commit":
             lines.append(
                 "durable commit is above 10x, so FR-15 puts the pipeline in the 'consult JP' "
@@ -593,7 +627,7 @@ def check(
                 f"vector_recall: {measured:.4f} BELOW the {recall_target:g} "
                 "target -- EXCEEDED"
             )
-            if status == STATUS_MET:
+            if status in (STATUS_MET, STATUS_INFORMATIONAL):
                 status = STATUS_EXCEEDED
     return GateResult(status=status, lines=tuple(lines))
 
@@ -669,7 +703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Read a published metrics document and apply the ceilings; no exception escapes."""
     parser = argparse.ArgumentParser(
         prog="python -m bench.harness.gate",
-        description="Fail the build when a D5 ceiling is exceeded, reading the published metric.",
+        description="Validate published measurements and recall under the selected D5 timing policy.",
     )
     parser.add_argument(
         "--metrics", required=True, help="the published metrics JSON document"
@@ -698,6 +732,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--require-recall",
         action="store_true",
         help="fail when the vector recall ratio has not been published",
+    )
+    parser.add_argument(
+        "--informational-ceilings",
+        action="store_true",
+        help="report valid D5 timing overflows without failing; invalid evidence and recall still fail",
     )
     arguments = parser.parse_args(argv)
     try:
@@ -731,6 +770,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             required=tuple(arguments.require) or tuple(CEILINGS),
             recall_target=recall_target,
             require_recall=arguments.require_recall,
+            informational_ceilings=arguments.informational_ceilings,
         )
     except Exception as error:  # noqa: BLE001 - a crash here must read as UNMEASURED, never as 1
         # The docstring above promises that no exception escapes, and a promise the code does not

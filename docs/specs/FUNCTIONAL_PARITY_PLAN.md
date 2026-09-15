@@ -801,7 +801,7 @@ Check paths/signatures/examples with the documentation validator and executable 
 
 Update `FEATURE_COMPARISON.md` when capabilities actually pass, not at plan approval.
 Update ROADMAP package status and link immutable acceptance reports/artifact hashes.
-Do not promote the current 0.0.6 development source to a published release in prose.
+Do not promote the current development source (0.0.7) to a published release in prose; 0.0.6 was published on September 13, 2026.
 Release/branch allocation is intentionally not decided by this plan.
 
 Permitted final claim: **functional parity for the published local-first profile,

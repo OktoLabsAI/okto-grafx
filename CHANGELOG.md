@@ -7,7 +7,97 @@ including the on-disk format.
 
 ## [Unreleased]
 
-### Added (0.0.6 development)
+### CI portability and execution policy
+
+- Move the full Windows/POSIX regression matrix and its coverage report to manual
+  execution under the maintainer's 20-minute automatic-job budget. Full recall is
+  also manual; smoke recall, lint, consumer and compatibility checks stay automatic.
+- Fix POSIX measurement provenance for long inline Python arguments, retaining
+  payload hashes and failing on actual I/O errors. Correct platform skip attribution
+  and storage-test expectations for parent-directory durability and realpath costs.
+  These changes do not alter the database runtime or add a performance-gain claim.
+
+### Added (0.0.7 development)
+
+- Closed the implementation round with a [direct v0.0.6 comparison](docs/reports/PERF_V007_CLOSURE.md):
+  19.7% estimated lower latency for a predefined eleven-scenario native
+  basket, with all workloads and same-code controls retained. This is a
+  synthetic workload estimate, not a universal or Pulse gain. Full regression
+  passes (24,808 tests, 41 attributed skips, zero failures/errors).
+- Recorded the [wave-A qualification](docs/reports/PERF_V007_WAVE_A.md), separating
+  the original failed full regression from baseline reproduction, focused tooling
+  corrections, current port counters, independent native workloads and controlled
+  consumer measurements. Grafx platform performance defines the scope; Pulse is
+  one consumer. Conditional traversal/write-staging gains and the residual native
+  scalar-sort cost are recorded without claiming a universal or Pulse speedup.
+- Recorded the [performance v0.0.7 plan](docs/specs/PERFORMANCE_V007_PLAN.md): a
+  mandatory baseline that re-measures the stale consumer denominators on current
+  source, the ordered read/write packages that stay inside the multi-writer model,
+  a proof-gated item, the user decision queue for persisted-format, public-default
+  and capability-activation questions, and the guardrails and measurement rules
+  every delivery must follow. This is a plan only — no engine, format, default or
+  measured result changed, and no speedup is claimed.
+- Recorded the [0.0.7 Phase 0 performance baseline](docs/reports/PERF_V007_BASELINE.md):
+  HEAD `b0e4f51` against v0.0.5 `83cc313`, arms alternated round by round on a machine
+  declared non-quiescent, so only the paired ratios are defended — Pulse logical
+  transfer 0.945 (HEAD approximately 5.8% slower, 3 of 3 rounds, entirely in the two write phases),
+  KG page 0.814 and fan-out 0.834, production vector search 0.886 and cold-handle
+  `verify('all')` 0.936 with bands containing 1 — together with the finding that the
+  production Pulse fan-out statement carries no id list, which re-ranks the read
+  planner item. Evidence only: no engine, format, default or public behaviour changed.
+
+### Changed (0.0.7 development)
+
+- Align CI with the existing informational performance policy: retain exceeded
+  D5 timing ratios in the report without blocking release on their magnitude.
+  Missing/invalid measurements and the frozen vector-recall floor still fail;
+  negative or duplicate D5 samples now refuse in both timing policies. The
+  historical strict CLI comparison remains available. Runtime, ceilings and
+  durability guarantees are unchanged.
+- Fix the 0.0.6 compatibility workflow's YAML command block so GitHub can start
+  its installed-upgrade matrix; the unquoted `:all:` option prevented parsing.
+  Install the built candidate's declared runtime dependencies so isolated
+  upgrade workers can import `tzdata` as required by the temporal adapter.
+- Provision the pinned public Core/Community corpus source inputs in all four
+  full-suite CI jobs. Attribute two unavailable historical wheel-receipt audits
+  as explicit coverage debt; their assertions remain active with real receipts.
+  See `CI-WHEEL-RECEIPTS` in the roadmap. This does not change Grafx runtime or
+  claim that the remote suite has completed.
+- Dispatch exact built-in scalar ordering keys before general-kind probes.
+  Mixed-kind ranks, NaNs, numeric ties and Mapping-subclass precedence stay
+  intact. Native public-query comparisons support bounded scalar-sort gains;
+  [measurements and complete regression](docs/reports/PERF_V007_SCALAR_SORT.md)
+  retain same-code controls and do not claim universal or Pulse acceleration.
+- Synchronized the packaging regression's exact development-extra list with
+  the previously declared `psutil>=5.9` dependency. The stale assertion was
+  independently reproduced before the scalar-sort change.
+- Retain known Windows descendants before terminating a timed-out performance
+  process tree, so fallback cleanup can still reach them after launcher loss.
+  Unproven termination continues to refuse the measurement. Regression tests
+  exercise real descendants, lost ancestry and strict refusal.
+- Made the tooling regression reproducible in development environments: declare
+  `psutil` for the memory/identity probes, exercise the direct-interpreter profiling
+  protocol with the actual interpreter instead of a Windows venv launcher, and
+  attribute the graph-export test's Arrow/NetworkX skips. Refreshed the lockfile
+  against the current manifest; no database runtime behavior changed.
+- Memoized ORDER BY free names within a statement (READ-4), reduced write-statement
+  sections from three to two (FIX-W), admitted vector-free batched endpoint
+  landings with the existing blocking-consumer guard (READ-3), and implemented
+  private participant sections in process (W-01/W-02). The private-wait hotfix
+  parks real-clock waits with a bounded timeout and preserves manual-clock sampling.
+  These mechanisms have overlapping costs; their earlier ceilings are not additive
+  consumer speedups. See the wave-A report for validation and limitations.
+- Bumped the package and source version to 0.0.7 on `feature/v0.0.7`, branched from
+  the released 0.0.6 `main` merge. No functional, persistent-format, query-semantics or
+  dependency change; the 0.0.5-legacy wheel compatibility workflow now builds the 0.0.7
+  candidate as its current wheel.
+- Reconciled the release-status prose that still described 0.0.6 as unreleased or 0.0.5 as
+  the published package (feature comparison, compatibility, type/entity contracts, roadmap,
+  governance) with the published 0.0.6 (PyPI, September 13, 2026).
+
+## [0.0.6] - 2026-09-13
+
+### Added
 
 - Authorized eight-item language round (locally validated): fixed openCypher
   TCK 2024.3 inventory; ordered clauses and lexical scopes; correlated typed OPTIONAL
@@ -80,7 +170,7 @@ including the on-disk format.
   logical work/memory bounds and cancellation.
 - Comparative feature-gap register and ordered MP-1–MP-8 minimum-parity roadmap.
 
-### Fixed (0.0.6 development)
+### Fixed
 
 - Full-text verification now detects missing/extra live multi-key coverage and
   duplicate physical postings, including positional chunks.
@@ -94,6 +184,10 @@ including the on-disk format.
   protection payload that also enforces administrators, and a privacy/history publication
   checklist. Retained the existing Elastic License 2.0 + SaaS/Branding Addendum unchanged.
   Preparation does not change GitHub visibility or activate a protection unavailable on the plan.
+
+## [0.0.5] - 2026-09-10
+
+### Changed
 
 - Continuation after `a4dd85a`: opt-in immutable PageRank transition preparation and
   simple topology reuse; bounded deterministic read-only label propagation.

@@ -44,5 +44,5 @@ def test_refuses_creation_and_missing_paths(cli, tmp_path):
 
 def test_text_and_version(cli, database_path):
     assert "Person" in cli("schema", database_path).out
-    assert __version__ == "0.0.6"
-    assert "0.0.6" in cli("--version").out
+    assert __version__ == "0.0.7"
+    assert "0.0.7" in cli("--version").out

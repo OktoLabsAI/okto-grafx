@@ -1,4 +1,22 @@
-"""Unlocked participant descriptor reuse across repeated transaction statements."""
+"""Unlocked participant descriptor reuse across repeated transaction statements.
+
+TXN-1 -- parking one proved-unlocked descriptor of the participant lock file for the lifetime of
+a transaction -- exists to avoid re-opening that file per statement. W-01 went one step further
+for the DEFAULT composition: the participant section name carries this coordinator instance's own
+``owner_id`` digest, so no other participant can ever contend for it, and the concrete coordinator
+now serialises it in this process and opens no descriptor per entry at all. There is then nothing
+left for TXN-1 to park there.
+
+Both contracts are alive and both are tested here:
+
+* every test that is ABOUT the descriptor scope runs on the ``undeclared_participant_section``
+  fixture (``tests/api/conftest.py``), which makes the coordinator decline the private-section
+  declaration exactly as a custom or older coordinator would. The counts below are therefore still the real counts of the
+  path that opens and locks the file, unchanged from before W-01.
+* :func:`test_the_declared_participant_section_opens_and_locks_nothing_per_statement` and its
+  siblings assert what the default composition does instead: zero opens, zero advisory locks and
+  no scope at all for the same workload.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +44,7 @@ def _seed(database: object) -> None:
 
 
 def test_repeated_execute_reuses_only_the_unlocked_participant_descriptor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, undeclared_participant_section: None
 ) -> None:
     root = tmp_path / "repeated-execute-descriptor"
     with connect(root, checkpoint_interval_records=10_000) as database:
@@ -83,7 +101,7 @@ def test_repeated_execute_reuses_only_the_unlocked_participant_descriptor(
 
 
 def test_autocommit_reuses_one_descriptor_but_takes_every_real_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, undeclared_participant_section: None
 ) -> None:
     root = tmp_path / "autocommit-descriptor"
     with connect(root, checkpoint_interval_records=10_000) as database:
@@ -133,7 +151,7 @@ def test_autocommit_reuses_one_descriptor_but_takes_every_real_lock(
 
 
 def test_bounded_transaction_scope_revalidates_one_descriptor_for_its_whole_lifetime(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, undeclared_participant_section: None
 ) -> None:
     root = tmp_path / "bounded-transaction-descriptor"
     with connect(root, checkpoint_interval_records=10_000) as database:
@@ -266,7 +284,7 @@ def test_autocommit_rolls_back_a_commit_failure_that_left_the_context_active(
 
 
 def test_idle_transaction_descriptor_never_excludes_another_thread(
-    tmp_path: Path,
+    tmp_path: Path, undeclared_participant_section: None
 ) -> None:
     root = tmp_path / "idle-descriptor-interleaving"
     with connect(root, checkpoint_interval_records=10_000) as database:
@@ -295,7 +313,7 @@ def test_idle_transaction_descriptor_never_excludes_another_thread(
 
 
 def test_database_close_drains_an_idle_transaction_descriptor(
-    tmp_path: Path,
+    tmp_path: Path, undeclared_participant_section: None
 ) -> None:
     root = tmp_path / "close-idle-descriptor"
     database = connect(root, checkpoint_interval_records=10_000)
@@ -315,7 +333,7 @@ def test_database_close_drains_an_idle_transaction_descriptor(
 
 
 def test_occ_refusal_keeps_the_scope_until_retry_retires_the_predecessor(
-    tmp_path: Path,
+    tmp_path: Path, undeclared_participant_section: None
 ) -> None:
     root = tmp_path / "descriptor-occ-retry"
     with connect(root, checkpoint_interval_records=10_000) as database:
@@ -343,7 +361,7 @@ def test_occ_refusal_keeps_the_scope_until_retry_retires_the_predecessor(
 
 
 def test_thread_hop_uses_cold_handles_and_still_drains_the_original_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, undeclared_participant_section: None
 ) -> None:
     root = tmp_path / "descriptor-thread-hop"
     with connect(root, checkpoint_interval_records=10_000) as database:
@@ -384,6 +402,132 @@ def test_thread_hop_uses_cold_handles_and_still_drains_the_original_scope(
         assert worker_opens == 3
         assert database._transactions._transaction_descriptor_scopes == {}
         assert database._transactions._coordinator._descriptor_scopes == {}
+
+
+def test_the_declared_participant_section_opens_and_locks_nothing_per_statement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """W-01, default composition: the same workload costs zero opens and zero advisory locks.
+
+    Compare with ``test_repeated_execute_reuses_only_the_unlocked_participant_descriptor``, which
+    is the identical workload on a coordinator that declined the declaration and still pays 3
+    opens and 6 lock/unlock pairs on the participant file.
+    """
+    root = tmp_path / "declared-participant-section"
+    with connect(root, checkpoint_interval_records=10_000) as database:
+        _seed(database)
+        coordinator = database._transactions._coordinator
+        participant = database._transactions._participant_section_name
+        assert participant in coordinator._private_section_locks
+        participant_suffix = f"{participant}.lock"
+        real_open = os.open
+        real_acquire = coordination_local._acquire_os_lock
+        real_release = coordination_local._release_os_lock
+        participant_descriptors: set[int] = set()
+        opened = 0
+        acquired = 0
+        released = 0
+
+        def counted_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal opened
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if str(path).endswith(participant_suffix):
+                opened += 1
+                participant_descriptors.add(descriptor)
+            return descriptor
+
+        def counted_acquire(descriptor: int) -> None:
+            nonlocal acquired
+            if descriptor in participant_descriptors:
+                acquired += 1
+            real_acquire(descriptor)
+
+        def counted_release(descriptor: int) -> None:
+            nonlocal released
+            if descriptor in participant_descriptors:
+                released += 1
+            real_release(descriptor)
+
+        transaction = database.begin("read")
+        with monkeypatch.context() as patch:
+            patch.setattr(coordination_local.os, "open", counted_open)
+            patch.setattr(coordination_local, "_acquire_os_lock", counted_acquire)
+            patch.setattr(coordination_local, "_release_os_lock", counted_release)
+            for _ in range(4):
+                assert transaction.execute(_SEEK, {"id": 1}).rows == ((1,),)
+            transaction.commit()
+
+        assert opened == 0
+        assert acquired == 0
+        assert released == 0
+        # Nothing is opened per entry, so TXN-1 has nothing to park and installs no scope.
+        assert database._transactions._transaction_descriptor_scopes == {}
+        assert coordinator._descriptor_scopes == {}
+        # The lock file itself is still there: the control inventory is unchanged.
+        assert (root / "control" / participant_suffix).is_file()
+
+
+def test_the_declared_participant_section_still_serialises_two_threads_of_one_database(
+    tmp_path: Path,
+) -> None:
+    """The section a real database declares still excludes a second thread of that database."""
+    root = tmp_path / "declared-participant-threads"
+    with connect(root, checkpoint_interval_records=10_000) as database:
+        _seed(database)
+        coordinator = database._transactions._coordinator
+        participant = database._transactions._participant_section_name
+        assert participant in coordinator._private_section_locks
+
+        admitted: list[str] = []
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with coordinator.exclusive(participant, timeout=30.0):
+                admitted.append("holder")
+                holding.set()
+                release.wait(timeout=30.0)
+
+        def contend() -> None:
+            with coordinator.exclusive(participant, timeout=30.0):
+                admitted.append("contender")
+
+        holder = threading.Thread(target=hold, name="participant-holder")
+        holder.start()
+        assert holding.wait(timeout=30.0)
+        contender = threading.Thread(target=contend, name="participant-contender")
+        contender.start()
+        contender.join(timeout=0.2)
+        assert contender.is_alive() is True
+        assert admitted == ["holder"]
+        release.set()
+        holder.join(timeout=30.0)
+        contender.join(timeout=30.0)
+        assert admitted == ["holder", "contender"]
+
+
+def test_two_databases_in_one_process_never_share_a_participant_section(
+    tmp_path: Path,
+) -> None:
+    """Two handles over one directory get two names, so neither can wait on the other's."""
+    root = tmp_path / "two-handles-one-directory"
+    with connect(root, checkpoint_interval_records=10_000) as first:
+        _seed(first)
+        with connect(root, checkpoint_interval_records=10_000) as second:
+            first_name = first._transactions._participant_section_name
+            second_name = second._transactions._participant_section_name
+            assert first_name != second_name
+            assert (
+                first._transactions._coordinator.owner_id()
+                != second._transactions._coordinator.owner_id()
+            )
+            with first._transactions._coordinator.exclusive(first_name, timeout=1.0):
+                # The other handle's own section is untouched, and so is its work.
+                with second._transactions._coordinator.exclusive(
+                    second_name, timeout=0.2
+                ):
+                    pass
+                assert second.execute(_SEEK, {"id": 1}).rows == ((1,),)
 
 
 def test_memory_transactions_keep_the_descriptor_optimization_absent() -> None:

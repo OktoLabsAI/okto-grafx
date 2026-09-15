@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "okto-grafx"
-version = "0.0.6"
+version = "0.0.7"
 description = "Okto Grafx - embedded graph database for Python: multi-process safe, verifiable on disk, recoverable by construction"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -77,6 +77,7 @@ bench = [
 dev = [
     "pytest>=8",
     "pytest-timeout",
+    "psutil>=5.9",
     "ruff==0.15.1",
     "PyYAML>=6",
     "gherkin-official==37.0.0",
