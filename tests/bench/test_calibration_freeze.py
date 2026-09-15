@@ -97,18 +97,28 @@ EXPECTED_GATE_MATRIX: dict[str, list[dict[str, str]]] = {
 }
 
 EXPECTED_CALIBRATION_JOB_SHA256: str = (
-    "b0163421cd0ae8ffe283df37ddaed550791ebe20647e9785746a1d9f0eefce26"
+    "40ae443f62bdb4afa39497c5fd2ac946cc981fea9f75ed9edb18b28d2460e87c"
 )
 """Canonical job fingerprint; D5 is informational under the September 8 policy.
 
 Recall, measurement validation and unconditional/fatal execution stay governed.
+The maintainer's 20-minute automatic-job budget makes full recall manual-only.
 """
 
 EXPECTED_WORKFLOW_TRIGGERS: dict[str, object] = {
     "push": None,
     "pull_request": None,
     "schedule": [{"cron": "0 6 * * 1"}],
-    "workflow_dispatch": None,
+    "workflow_dispatch": {
+        "inputs": {
+            "recall_profile": {
+                "description": "Recall workload (full exceeds 20 minutes; manual only)",
+                "type": "choice",
+                "default": "smoke",
+                "options": ["smoke", "full"],
+            }
+        }
+    },
 }
 
 EXPECTED_WORKFLOW_NON_TRIGGER_KEYS: frozenset[object] = frozenset(
@@ -521,7 +531,7 @@ def _gate_command(workflow_text: str | None = None) -> list[str]:
     )
     triggers = document[trigger_keys[0]]
     assert triggers == EXPECTED_WORKFLOW_TRIGGERS, (
-        "the calibration gate must run for push, pull request, weekly full recall and manual "
+        "the calibration gate must run for push, pull request, weekly smoke recall and manual "
         f"dispatch; found {triggers!r}"
     )
     job_controls = sorted(FORBIDDEN_GATE_JOB_CONTROLS.intersection(job))

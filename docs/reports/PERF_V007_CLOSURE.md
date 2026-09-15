@@ -183,6 +183,39 @@ The complete bench group plus consumer/public-adapter documentation regressions
 passes 473 tests with three attributed optional-dependency skips in 36.02 seconds,
 exit zero. Documentation/API checks, changed-file Ruff and diff checks pass.
 
+### POSIX portability and the automatic CI budget
+
+At `2ed8a9e`, remote POSIX extras completed with 25,194 passes, nine failures and
+28 skips in 1,785.28 seconds; bare completed with 24,811 passes, nine failures
+and 51 skips in 2,094.05 seconds. Both also reported four unattributed Windows-only
+workspace skips. These are failed receipts, not qualifying full regressions.
+The slowest individual extras test took 13.257 seconds; the job's accumulated work
+exceeded 20 minutes.
+
+The same nine failures and four unattributed skips reproduced in an isolated
+Linux/Python 3.13.14 environment. The fixes retain the necessary root-parent fsync,
+count POSIX realpath's internal lstat calls separately from adapter inspections,
+make the planted platform condition true on the executing family, mark the
+Windows-only workspace cases, and treat ENAMETOOLONG from an argv literal as a
+non-file while preserving the inline payload hash. Other I/O errors remain fatal.
+No files under `src/` change.
+
+Linux validation passes 281 focused portability tests with 19 attributed platform
+skips (112.71 seconds) and 479 bench/documentation tests without skips (22.53
+seconds), both exits zero. A new planted ENAMETOOLONG case fails before the fix;
+EACCES/EIO controls remain fatal. Mutations dropping root-parent publication and
+enumerating sibling directories are both rejected by the corrected tests.
+The matching Windows/Python 3.11.14 portability, bench and documentation selection
+passes 761 tests with 15 attributed platform/optional-dependency skips in 233.56
+seconds, exit zero. Documentation/API validation, Ruff and diff checks pass.
+
+The maintainer explicitly requested jobs exceeding 20 minutes to run manually.
+The complete four-leg suite and dependent coverage report now require workflow
+dispatch. Full recall also requires explicit manual selection; automatic recall
+uses smoke with a 20-minute job timeout. Remaining Windows runs on `2ed8a9e` were
+canceled, not counted as passes. Fast automatic checks do not certify the omitted
+full matrix. Local correction evidence is under `.grafx-tmp/perf07/posix-ci/`.
+
 ## Round disposition and retained evidence
 
 Implementation is closed for this v0.0.7 round. Delivered platform mechanisms

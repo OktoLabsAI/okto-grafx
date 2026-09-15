@@ -7,6 +7,16 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### CI portability and execution policy
+
+- Move the full Windows/POSIX regression matrix and its coverage report to manual
+  execution under the maintainer's 20-minute automatic-job budget. Full recall is
+  also manual; smoke recall, lint, consumer and compatibility checks stay automatic.
+- Fix POSIX measurement provenance for long inline Python arguments, retaining
+  payload hashes and failing on actual I/O errors. Correct platform skip attribution
+  and storage-test expectations for parent-directory durability and realpath costs.
+  These changes do not alter the database runtime or add a performance-gain claim.
+
 ### Added (0.0.7 development)
 
 - Closed the implementation round with a [direct v0.0.6 comparison](docs/reports/PERF_V007_CLOSURE.md):

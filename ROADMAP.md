@@ -17,6 +17,18 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## CI prerequisite correction (CI-WHEEL-RECEIPTS)
 
+The maintainer requested a 20-minute limit per automatic CI job. The full
+Windows/POSIX × bare/extras matrix and its dependent coverage report are now
+manual-only. Full recall is an explicit manual input; automatic recall stays on
+smoke with a 20-minute timeout. This scheduling change does not certify the omitted
+matrix. The interrupted Windows runs are canceled evidence, not passing regression.
+
+POSIX exposed stale first-barrier directory counts, platform-dependent realpath
+accounting, a planted skip with the wrong active family condition, four missing
+platform markers and inline measurement code incorrectly probed as a filename.
+The corrections preserve root-parent durability and provenance hashes; genuine
+I/O errors still fail. No database runtime changes or new performance gains apply.
+
 The CI timing policy is now aligned with the September 8 performance policy:
 valid D5 timing overflows are explicitly informational, while missing/invalid
 measurements and recall failures remain fatal. The old strict comparator remains

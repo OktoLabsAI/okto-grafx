@@ -53,6 +53,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -293,8 +294,15 @@ def render_argv(template: Sequence[str], **values: str) -> list[str]:
 
 def _resolved_file_token(index: int, token: str) -> Path | None:
     candidate = Path(token)
-    if candidate.is_file():
-        return candidate.resolve()
+    try:
+        if candidate.is_file():
+            return candidate.resolve()
+    except OSError as failure:
+        # argv can contain inline Python or other long literals. POSIX stat raises
+        # ENAMETOOLONG for those non-path tokens; their payload hash is recorded
+        # separately. Other I/O failures must still refuse incomplete provenance.
+        if failure.errno != errno.ENAMETOOLONG:
+            raise
     if index == 0:
         executable = shutil.which(token)
         if executable:

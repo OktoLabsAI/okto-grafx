@@ -165,6 +165,7 @@ def test_symlink_or_junction_refused(tree):
             link.unlink()
 
 
+@pytest.mark.platform_specific
 @pytest.mark.skipif(os.name != "nt", reason="Windows path alias contract")
 @pytest.mark.parametrize("suffix", [".. /outside", "name.", "name ", "file:stream"])
 def test_windows_namespace_aliases_refused(tree, suffix):

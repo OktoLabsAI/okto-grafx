@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -906,6 +907,34 @@ def test_a_series_refuses_unbound_copies_stale_outputs_and_missing_timeouts(
             declared_copy=None,
             **common,
         )
+
+
+@pytest.mark.parametrize("error_number", [errno.ENAMETOOLONG, errno.EACCES, errno.EIO])
+def test_inline_instrument_hashing_distinguishes_non_paths_from_io_failures(
+    monkeypatch: pytest.MonkeyPatch, error_number: int
+) -> None:
+    """POSIX rejects long argv literals as paths; genuine I/O failures remain fatal."""
+    payload = "print('" + "literal" * 200 + "')"
+    real_is_file = Path.is_file
+
+    def inspect(path: Path) -> bool:
+        if str(path) == payload:
+            raise OSError(error_number, "planted stat failure")
+        return real_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", inspect)
+    template = [sys.executable, "-c", payload]
+    if error_number != errno.ENAMETOOLONG:
+        with pytest.raises(OSError) as raised:
+            baseline_runs._instrument_hashes(template, [])
+        assert raised.value.errno == error_number
+    else:
+        hashes = baseline_runs._instrument_hashes(template, [])
+        inline = [item for item in hashes if item.get("inline")]
+        assert len(inline) == 1
+        assert inline[0]["sha256"] == receipt.sha256_text(payload)
+        assert inline[0]["bound_instrument"] is True
+        assert any(item["command_executable"] and item["sha256"] for item in hashes)
 
 
 def test_a_series_requires_the_actual_instrument_to_be_hashed(tmp_path: Path) -> None:

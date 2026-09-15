@@ -268,7 +268,7 @@ def test_a_source_visible_platform_marker_attributes_the_skip(tmp_path: Path) ->
     module = _skipping_module(
         "posix only",
         decorators=(
-            '@pytest.mark.skipif(sys.platform == "win32", reason="windows only")\n'
+            f'@pytest.mark.skipif({_running_family_condition(holds=True)}, reason="this family")\n'
             "@pytest.mark.platform_specific\n"
         ),
     )
