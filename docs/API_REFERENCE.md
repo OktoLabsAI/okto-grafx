@@ -3514,7 +3514,7 @@ Return the participant identity captured with this view.
 
 Annotation location: `okto_grafx.engine.public_views.BufferPoolView`.
 
-Captured buffer-pool capacity and residency counters.
+Captured buffer-pool capacity, residency and pressure counters.
 
 ```python
 page_size: int
@@ -3524,6 +3524,11 @@ used_bytes_value: int
 db_label: str
 retained_bytes_estimate_value: int
 retained_bytes_estimator: str
+hits: int
+misses: int
+evictions: int
+dirty_evictions: int
+load_waits: int
 ```
 
 #### BufferPoolView.used_bytes

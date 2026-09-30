@@ -7,6 +7,12 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Added (0.0.8 development)
+
+- `db.pool` (`BufferPoolView`) reports monotonic, per-handle `hits`, `misses`, `evictions`,
+  `dirty_evictions` and `load_waits` counters so pool pressure can be read directly (issue #13).
+  No behaviour change.
+
 ### Fixed (0.0.8 development)
 
 - Concurrent statements of one handle no longer raise a spurious `GrafxPlanError` ("malformed

@@ -505,7 +505,15 @@ class CoordinatorView:
 
 @dataclass(frozen=True, slots=True)
 class BufferPoolView:
-    """Captured buffer-pool capacity and residency counters."""
+    """Captured buffer-pool capacity, residency and pressure counters.
+
+    ``hits``, ``misses``, ``evictions``, ``dirty_evictions`` and ``load_waits`` are monotonic
+    since this handle opened and private to it (never shared with another process or handle), so
+    a consumer takes deltas between two views. ``hits``: page pins served from a resident frame.
+    ``misses``: pins that started a device load. ``evictions``: clean frames dropped for
+    capacity. ``dirty_evictions``: modified frames written back and dropped for capacity.
+    ``load_waits``: pins that waited on another thread's load of the same page.
+    """
 
     page_size: int
     budget_bytes: int
@@ -514,6 +522,11 @@ class BufferPoolView:
     db_label: str
     retained_bytes_estimate_value: int
     retained_bytes_estimator: str
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    dirty_evictions: int = 0
+    load_waits: int = 0
 
     def used_bytes(self) -> int:
         """Return the resident byte count captured with this view."""
@@ -3973,6 +3986,7 @@ def _coordinator_view(coordinator: Any) -> CoordinatorView:
 
 def _pool_view(pool: Any) -> BufferPoolView:
     """Snapshot buffer-pool counters and limits without pinning or evicting a page."""
+    hits, misses, evictions, dirty_evictions, load_waits = pool.counters()
     return BufferPoolView(
         _builtin_int(pool.page_size),
         _builtin_int(pool.budget_bytes),
@@ -3985,6 +3999,11 @@ def _pool_view(pool: Any) -> BufferPoolView:
             field="pool.retained_bytes_estimator",
             empty=False,
         ),
+        _builtin_int(hits),
+        _builtin_int(misses),
+        _builtin_int(evictions),
+        _builtin_int(dirty_evictions),
+        _builtin_int(load_waits),
     )
 
 
