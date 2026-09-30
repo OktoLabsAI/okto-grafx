@@ -5,7 +5,7 @@ import pytest
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
 from okto_grafx.domain.index.keys import bucket_of
-from okto_grafx.engine.index_manager import HashIndex, INDEX_READ_RETRY_BUDGET, IndexStore
+from okto_grafx.engine.index_manager import HashIndex, INDEX_VIEW_RETRY_BUDGET, IndexStore
 
 from .conftest import SnapshotDouble, TEST_BUCKET_COUNT
 from .test_validated_versions_many import _keys, _populated, _scalar, BORN
@@ -56,7 +56,7 @@ def test_native_grouped_read_retries_entire_view_without_partial_answers(monkeyp
         with pytest.raises(GrafxIndexError) as error:
             database.manager.validated_versions_many(database.exact, keys, SnapshotDouble(BORN))
         assert error.value.details["field"] == "index_view_changed"
-        assert len(attempts) == INDEX_READ_RETRY_BUDGET + 1
+        assert len(attempts) == INDEX_VIEW_RETRY_BUDGET + 1
     else:
         assert database.manager.validated_versions_many(
             database.exact, keys, SnapshotDouble(BORN)) == expected

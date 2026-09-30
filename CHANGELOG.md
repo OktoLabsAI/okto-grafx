@@ -16,6 +16,11 @@ including the on-disk format.
   the whole hit-and-refresh and the whole insert-and-evict; it is never held across plan
   compilation or any engine call. A manually assembled engine without a guard keeps its previous
   behaviour.
+- An index read now re-reads its view up to `INDEX_VIEW_RETRY_BUDGET` (8) times, instead of 2,
+  before raising the retryable `GrafxIndexError` (`index_view_changed`) under foreign-commit
+  churn (issue #12). A result is still returned only when the page-0 certificates before and after
+  the read are equal, and the error is unchanged when the budget is exhausted. The engine cannot
+  sleep (G2), so the attempts are not spaced by a backoff.
 - `checkpoint()` no longer fails with `GrafxDurabilityBarrierFailed` ("File 'wal/...wal' does not
   exist on this device") when another process recycled a WAL segment this handle only had cached
   for reading (issue #11). A global barrier now skips and uncaches such a clean WAL segment; a

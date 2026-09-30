@@ -159,6 +159,7 @@ __all__ = [
     "INDEX_DIRECTORY",
     "INDEX_FLAG_STALE",
     "INDEX_READ_RETRY_BUDGET",
+    "INDEX_VIEW_RETRY_BUDGET",
     "INDEX_METRICS",
     "RECONCILIATION_TOTAL",
     "TOMBSTONE_BACKLOG",
@@ -187,7 +188,22 @@ restart that never asks the question again.
 """
 
 INDEX_READ_RETRY_BUDGET: int = 2
-"""Fresh exact-index views retried after a concurrent header transition before refusing."""
+"""Retries of one page-0 compare-and-swap, and of an exact-index view that was unavailable."""
+
+INDEX_VIEW_RETRY_BUDGET: int = 8
+"""Fresh exact-index views retried after another participant published page 0 mid-read.
+
+A read is attempted ``INDEX_VIEW_RETRY_BUDGET + 1`` times before it raises the retryable
+GrafxIndexError ``index_view_changed``. Issue #12: with a budget of 2 (three attempts) six reader
+handles against a process committing about thirty times a second surfaced that error about twice
+in 7,300 lookups. Every attempt that fails ends right after the foreign publication that failed
+it, so the next attempt starts in the quiet gap before the next commit and is very likely to
+hold; eight retries make the error need nine such publications inside one read.
+
+This layer owns no clock and never sleeps (G2, ``tests/test_import_boundary.py``), so there is no
+backoff between attempts: what spaces them is the cost of the read itself. The bound is also the
+ceiling on wasted work, since every attempt repeats the full traversal.
+"""
 
 _DETACHED_GENERATION_NONCE_ATTEMPTS: int = 64
 """Bounded provider draws used to find one unowned physical-generation name."""
@@ -2696,7 +2712,7 @@ class IndexStore:
         operation: Callable[[_IndexReadCertificate], _ReadResult],
     ) -> _ReadResult:
         """Run one materialising read wholly inside a durable page-0 generation."""
-        for attempt in range(INDEX_READ_RETRY_BUDGET + 1):
+        for attempt in range(INDEX_VIEW_RETRY_BUDGET + 1):
             try:
                 certificate = self.begin_exact_read(required_lsn)
             except GrafxIndexError as failure:
@@ -2725,7 +2741,7 @@ class IndexStore:
             field="index_view_changed",
             index=self.name,
             file=self.file,
-            attempts=INDEX_READ_RETRY_BUDGET + 1,
+            attempts=INDEX_VIEW_RETRY_BUDGET + 1,
             retryable=True,
         )
 

@@ -8,7 +8,7 @@ from okto_grafx.domain.index.definition import RECORD_ID_KEY_DERIVATION
 from okto_grafx.domain.index.keys import record_id_key
 from okto_grafx.engine import query_engine as qe
 from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.engine.index_manager import HashIndex, IndexManager, IndexStore, INDEX_READ_RETRY_BUDGET
+from okto_grafx.engine.index_manager import HashIndex, IndexManager, IndexStore, INDEX_VIEW_RETRY_BUDGET
 from okto_grafx.errors import GrafxCorruptionDetected, GrafxError, GrafxIndexError
 from . import test_vector_free_traversal as fixture
 
@@ -171,7 +171,7 @@ def test_batch_certificate_transition_retries_all_or_refuses(graph, monkeypatch,
             with pytest.raises(GrafxIndexError) as error:
                 graph._indexes.validated_identity_landings_many(index, keys, reader._context.snapshot)
             assert error.value.details['field'] == 'index_view_changed'
-            assert len(calls) == INDEX_READ_RETRY_BUDGET + 1
+            assert len(calls) == INDEX_VIEW_RETRY_BUDGET + 1
         else:
             assert graph._indexes.validated_identity_landings_many(
                 index, keys, reader._context.snapshot) == expected

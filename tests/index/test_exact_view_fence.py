@@ -16,7 +16,7 @@ from okto_grafx.domain.txn.snapshot import Snapshot
 from okto_grafx.engine.buffer_pool import BufferPool
 from okto_grafx.engine.index_manager import (
     INDEX_FLAG_STALE,
-    INDEX_READ_RETRY_BUDGET,
+    INDEX_VIEW_RETRY_BUDGET,
     HashIndex,
     IndexStore,
 )
@@ -467,7 +467,7 @@ def test_repeated_certificate_changes_fail_closed_after_the_bounded_budget(
 
     assert refused.value.details["field"] == "index_view_changed"
     assert refused.value.retryable is True
-    assert calls == INDEX_READ_RETRY_BUDGET + 1
+    assert calls == INDEX_VIEW_RETRY_BUDGET + 1
 
 
 def test_a_snapshot_beyond_the_durable_build_position_is_refused_explicitly() -> None:

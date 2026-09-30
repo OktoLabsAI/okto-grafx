@@ -2,7 +2,7 @@
 import pytest
 
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError, GrafxUnsupportedOperation
-from okto_grafx.engine.index_manager import INDEX_READ_RETRY_BUDGET
+from okto_grafx.engine.index_manager import INDEX_VIEW_RETRY_BUDGET
 from .conftest import build_database, cold_view
 
 
@@ -55,9 +55,9 @@ def test_repeated_failed_generation_changes_keep_existing_retry_bound():
     with pytest.raises(GrafxIndexError) as caught:
         reader.exact._stable_view(0, read)
     assert caught.value.details['field'] == 'index_view_changed'
-    assert caught.value.details['attempts'] == INDEX_READ_RETRY_BUDGET + 1
+    assert caught.value.details['attempts'] == INDEX_VIEW_RETRY_BUDGET + 1
     assert caught.value.retryable
-    assert len(calls) == INDEX_READ_RETRY_BUDGET + 1
+    assert len(calls) == INDEX_VIEW_RETRY_BUDGET + 1
 
 
 @pytest.mark.parametrize('failure', [RuntimeError('host'), KeyboardInterrupt(), SystemExit(1)])
