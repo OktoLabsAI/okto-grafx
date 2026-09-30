@@ -33,6 +33,20 @@ including the on-disk format.
   missing file this handle still owes a flush for, a file the barrier names, and any non-WAL file
   still fail it.
 
+### Known (0.0.8 development)
+
+- The public `Database.catalog`, `indexes` and `vectors` properties (and the catalog-read path in
+  the catalog snapshot helper) read catalog pages outside the per-handle participant section, by
+  design. A concurrent thread that rebases its read view inside the section can doom a catalog
+  page that such a read has pinned, so the last unpin bumps the buffer pool's drop epoch while
+  another thread holds the section. The effect is benign: derived memos are content-keyed, heap
+  consumers revalidate the epoch on every use and `apply_page_image` reads it before and after.
+  No change is made for this release.
+- Crash tests that kill a process with SIGKILL leave the operating system page cache intact, so
+  they cannot detect a missing `fsync`; power-loss testing is out of scope for this release.
+- On macOS, physical backups and logical transfer still fail with "no supported atomic no-replace
+  directory publication" (issue #9).
+
 ### CI portability and execution policy
 
 - Move the full Windows/POSIX regression matrix and its coverage report to manual
