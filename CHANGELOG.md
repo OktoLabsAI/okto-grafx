@@ -7,6 +7,16 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Fixed (0.0.8 development)
+
+- Concurrent statements of one handle no longer raise a spurious `GrafxPlanError` ("malformed
+  plan field (KeyError)", issue #10). The owned-plan recipe LRU is mutated while result views are
+  built, after page access has been released, so one thread's eviction could remove the entry
+  another thread had just read and was about to refresh. The composition's plan guard now covers
+  the whole hit-and-refresh and the whole insert-and-evict; it is never held across plan
+  compilation or any engine call. A manually assembled engine without a guard keeps its previous
+  behaviour.
+
 ### CI portability and execution policy
 
 - Move the full Windows/POSIX regression matrix and its coverage report to manual
