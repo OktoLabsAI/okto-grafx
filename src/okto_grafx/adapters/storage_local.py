@@ -1515,7 +1515,15 @@ class LocalStorageDevice:
                 # conservative and mirrors what fsync(parent) already does for sibling names.
                 directories = tuple(self._dirty_directories)
                 for name in names:
-                    descriptor = self._descriptor(name, "read")
+                    try:
+                        descriptor = self._descriptor(name, "read")
+                    except GrafxCorruptionDetected as failure:
+                        if self._is_recycled_clean_segment(name, file, failure):
+                            # Issue #11: another participant recycled this WAL segment. The
+                            # descriptor was only cached for reading and this device owes it
+                            # nothing; _descriptor already closed and uncached it.
+                            continue
+                        raise
                     try:
                         os.fsync(descriptor)
                     except OSError as failure:
@@ -1583,6 +1591,25 @@ class LocalStorageDevice:
         self.close()
 
     # --- internals ----------------------------------------------------------------------
+
+    def _is_recycled_clean_segment(
+        self, name: str, requested: object, failure: GrafxCorruptionDetected
+    ) -> bool:
+        """Return True when a global barrier may skip a vanished file instead of failing.
+
+        Only a WAL segment qualifies, because segment recycling by another participant is the one
+        legitimate way a file this handle merely read can disappear. The barrier must have named
+        no file (an explicit name is always honoured), the name must not be owed a flush by this
+        device (a dirty file that vanished is lost data), and the failure must be the plain
+        missing-file refusal of that very name rather than any other corruption finding.
+        """
+        return (
+            requested is None
+            and name not in self._dirty
+            and failure.details.get("reason") == "missing_file"
+            and failure.details.get("file") == name
+            and parse_segment_number("wal", name) is not None
+        )
 
     def _barrier_targets(self, file: object) -> tuple[str, ...]:
         """Return the names one barrier has to flush: the one it names, or everything unflushed."""

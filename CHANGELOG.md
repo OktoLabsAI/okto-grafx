@@ -16,6 +16,11 @@ including the on-disk format.
   the whole hit-and-refresh and the whole insert-and-evict; it is never held across plan
   compilation or any engine call. A manually assembled engine without a guard keeps its previous
   behaviour.
+- `checkpoint()` no longer fails with `GrafxDurabilityBarrierFailed` ("File 'wal/...wal' does not
+  exist on this device") when another process recycled a WAL segment this handle only had cached
+  for reading (issue #11). A global barrier now skips and uncaches such a clean WAL segment; a
+  missing file this handle still owes a flush for, a file the barrier names, and any non-WAL file
+  still fail it.
 
 ### CI portability and execution policy
 
