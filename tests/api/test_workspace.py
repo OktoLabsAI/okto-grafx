@@ -174,6 +174,29 @@ def test_windows_namespace_aliases_refused(tree, suffix):
         policy.paths.resolve(str(root) + "/" + suffix, existing=False)
 
 
+@pytest.mark.platform_specific
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path spelling contract")
+@pytest.mark.parametrize("suffix", [".. /outside", "name.", "name ", "file:stream"])
+def test_posix_keeps_the_spellings_windows_refuses_as_aliases(tree, suffix):
+    """The POSIX counterpart of the Windows alias refusals (CONTRACT.md G4).
+
+    ``catalogs._absolute`` refuses trailing-dot/space parts and ``:`` (alternate data stream)
+    only when ``os.name == "nt"``. On POSIX these are ordinary file names: the path must resolve
+    inside the root with its spelling untouched, must not be read as ``..`` or as a stream, and
+    a directory that really carries the name must be found by an ``existing=True`` resolution.
+    """
+    root, _, _, policy = tree
+    spelled = str(root) + "/" + suffix
+    resolved = policy.paths.resolve(spelled, existing=False)
+    assert resolved == os.path.abspath(spelled)
+    assert resolved.startswith(str(root) + os.sep)
+    assert resolved.endswith(suffix), "the trailing dot, space or colon must not be normalized away"
+    real = Path(resolved)
+    real.mkdir(parents=True)
+    assert real.is_dir() and real.parent.name != ".."
+    assert policy.paths.resolve(spelled, existing=True) == resolved
+
+
 def test_path_flag_and_null_refused(tree):
     root, _, _, policy = tree
     with pytest.raises(GrafxConfigurationError):
