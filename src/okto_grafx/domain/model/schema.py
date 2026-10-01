@@ -14,7 +14,7 @@ reader detect that the bytes were written under a different schema before it dec
 from __future__ import annotations
 
 import struct
-from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from enum import IntEnum
@@ -71,6 +71,7 @@ __all__ = [
     "is_identifier",
     "encode_tuple",
     "decode_tuple",
+    "decode_tuples",
 ]
 
 MAX_IDENTIFIER_LENGTH: int = 128
@@ -1384,3 +1385,45 @@ def _decode_tuple_fast(
         materialize_vectors=materialize_vectors,
         preserve_positions=preserve_positions,
     )
+
+
+def decode_tuples(
+    table: TableDef,
+    payloads: Iterable[bytes],
+    *,
+    materialized_positions: frozenset[int] | None = None,
+    materialize_vectors: bool = True,
+    preserve_positions: bool = False,
+) -> Iterator[tuple[Value, ...]]:
+    """Decode a stream of payloads of one table, hoisting the plan out of the per-row work.
+
+    The stream is consumed lazily and strictly one payload per row yielded: nothing is read ahead,
+    so a payload that the per-row decoder refuses raises exactly when ``decode_tuple`` would raise
+    for it, after every earlier row was yielded and before any later payload is requested. Rows,
+    values and refusals are those of ``decode_tuple`` (``materialized_positions`` and
+    ``preserve_positions`` select the projection form, ``materialize_vectors=False`` the landing
+    form).
+    """
+    plan = table._fast_decode_plan
+    column_count = len(table.columns)
+    mat = (
+        None
+        if materialized_positions is None
+        else tuple(position in materialized_positions for position in range(column_count))
+    )
+    for buf in payloads:
+        row = None
+        if plan is not None and type(buf) is bytes:
+            try:
+                row = _fast_row(plan, buf, mat, column_count, materialize_vectors, preserve_positions)
+            except Exception:  # noqa: BLE001 - any anomaly is the oracle's to classify
+                row = None
+        if row is None:
+            row = _decode_tuple(
+                table,
+                buf,
+                materialized_positions=materialized_positions,
+                materialize_vectors=materialize_vectors,
+                preserve_positions=preserve_positions,
+            )
+        yield row
