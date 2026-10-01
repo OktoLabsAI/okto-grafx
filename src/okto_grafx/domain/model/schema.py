@@ -39,6 +39,8 @@ from okto_grafx.domain.model.value import (
     Timestamp,
     Uuid,
     VectorValue,
+    _F64,
+    _I64,
     _U32,
     _append_encoded_value,
     _decode_expected_value_body,
@@ -1203,54 +1205,72 @@ _FIXED_RUN_FORMATS: dict[ValueType, str] = {
     ValueType.DOUBLE: "d",
     ValueType.BOOL: "B",
 }
-_TAG_STRING = int(ValueType.STRING)
 _TAG_NULL = int(ValueType.NULL)
+# column kinds the row loop reads inline instead of through the expected-body decoder
+_KIND_GENERIC, _KIND_STRING, _KIND_INT64, _KIND_DOUBLE, _KIND_BOOL = range(5)
 
 
 def _compile_fast_decode_plan(
     columns: tuple["ColumnDef", ...],
 ) -> tuple[tuple[object, ...], ...] | None:
-    """Compile the planned-decoder steps for these columns, or None when the oracle must decode."""
-    steps: list[tuple[object, ...]] = []
-    run: list[tuple[int, "ColumnDef"]] = []
+    """Compile the planned-decoder steps for these columns, or None when the oracle must decode.
 
-    def flush() -> None:
-        if not run:
-            return
-        start = run[0][0]
-        fmt = "<" + "".join("B" + _FIXED_RUN_FORMATS[column.type] for _, column in run)  # type: ignore[index]
-        tags = tuple(int(column.type) for _, column in run)
-        bools = tuple(
-            index for index, (_, column) in enumerate(run) if column.type is ValueType.BOOL
-        )
-        packer = struct.Struct(fmt)
-        steps.append((_PLAN_RUN, packer, packer.size, tags, start, len(run), bools))
-        run.clear()
-
-    for position, column in enumerate(columns):
+    Every column gets a COLUMN step. Two or more consecutive fixed-width columns (INT64, DOUBLE,
+    BOOL, nullable or not) are additionally preceded by a speculative RUN step that reads the whole
+    run with one struct call and one tag comparison; when the run holds no null, no retagged column
+    and no bad BOOL the loop jumps over that run's COLUMN steps, otherwise it simply falls into them
+    and the per-column path (which handles a null, and declines everything else) decides.
+    """
+    kinds = {
+        ValueType.STRING: _KIND_STRING,
+        ValueType.INT64: _KIND_INT64,
+        ValueType.DOUBLE: _KIND_DOUBLE,
+        ValueType.BOOL: _KIND_BOOL,
+    }
+    for column in columns:
         if (
             column.stored_type is not None
             or column.type is ValueType.DECIMAL
             or column.type is SchemaType.ANY
         ):
             return None
-        if column.type in _FIXED_RUN_FORMATS and not column.nullable:
-            run.append((position, column))
-            continue
-        flush()
-        expected_type = column.type
-        steps.append(
-            (
-                _PLAN_COLUMN,
-                position,
-                int(expected_type),
-                expected_type,
-                column.nullable,
-                expected_type in VECTOR_VALUE_TYPES,
-                expected_type is ValueType.STRING,
+    steps: list[tuple[object, ...]] = []
+    position = 0
+    while position < len(columns):
+        end = position
+        while end < len(columns) and columns[end].type in _FIXED_RUN_FORMATS:
+            end += 1
+        if end - position >= 2:
+            run = columns[position:end]
+            packer = struct.Struct("<" + "".join("B" + _FIXED_RUN_FORMATS[c.type] for c in run))  # type: ignore[index]
+            bools = tuple(i for i, c in enumerate(run) if c.type is ValueType.BOOL)
+            steps.append(
+                (
+                    _PLAN_RUN,
+                    packer,
+                    packer.size,
+                    tuple(int(c.type) for c in run),
+                    position,
+                    len(run),
+                    bools,
+                    len(steps) + 1 + len(run),
+                )
             )
-        )
-    flush()
+        stop = max(end, position + 1)
+        for index in range(position, stop):
+            column = columns[index]
+            steps.append(
+                (
+                    _PLAN_COLUMN,
+                    index,
+                    int(column.type),
+                    column.type,
+                    column.nullable,
+                    column.type in VECTOR_VALUE_TYPES,
+                    kinds.get(column.type, _KIND_GENERIC),  # type: ignore[call-overload]
+                )
+            )
+        position = stop
     return tuple(steps)
 
 
@@ -1270,44 +1290,50 @@ def _fast_row(
     )
     size = len(buf)
     offset = 0
-    for step in plan:
+    index = 0
+    steps = len(plan)
+    while index < steps:
+        step = plan[index]
         if step[0] == _PLAN_RUN:
-            _, packer, run_size, tags, start, count, bools = step  # type: ignore[misc]
-            if offset + run_size > size:
-                return None
-            raw = packer.unpack_from(buf, offset)  # type: ignore[attr-defined]
-            if raw[::2] != tags:
-                return None
-            offset += run_size  # type: ignore[operator]
-            found = raw[1::2]
-            if bools:
-                found = list(found)  # type: ignore[assignment]
-                for index in bools:  # type: ignore[attr-defined]
-                    flag = found[index]
-                    if flag > 1:
-                        return None
-                    found[index] = flag == 1
-            if mat is None:
-                if preserve:
-                    values[start : start + count] = found  # type: ignore[operator]
-                else:
-                    values.extend(found)
-            else:
-                for index, found_value in enumerate(found):
-                    position = start + index  # type: ignore[operator]
-                    if mat[position]:
-                        if preserve:
-                            values[position] = found_value
+            _, packer, run_size, tags, start, count, bools, after = step  # type: ignore[misc]
+            index += 1
+            if offset + run_size <= size:
+                raw = packer.unpack_from(buf, offset)  # type: ignore[attr-defined]
+                if raw[::2] == tags:
+                    found = raw[1::2]
+                    if bools:
+                        found = list(found)  # type: ignore[assignment]
+                        for flag_index in bools:  # type: ignore[attr-defined]
+                            flag = found[flag_index]
+                            if flag > 1:
+                                found = None  # type: ignore[assignment]
+                                break
+                            found[flag_index] = flag == 1
+                    if found is not None:
+                        offset += run_size  # type: ignore[operator]
+                        if mat is None:
+                            if preserve:
+                                values[start : start + count] = found  # type: ignore[operator]
+                            else:
+                                values.extend(found)
                         else:
-                            values.append(found_value)
+                            for run_index, found_value in enumerate(found):
+                                position = start + run_index  # type: ignore[operator]
+                                if mat[position]:
+                                    if preserve:
+                                        values[position] = found_value
+                                    else:
+                                        values.append(found_value)
+                        index = after  # type: ignore[assignment]
             continue
-        _, position, expected_tag, expected_type, nullable, is_vector, is_string = step  # type: ignore[misc]
+        index += 1
+        _, position, expected_tag, expected_type, nullable, is_vector, kind = step  # type: ignore[misc]
         keep = mat is None or mat[position]
         if offset >= size:
             return None
         tag = buf[offset]
         if tag == expected_tag:
-            if is_string:
+            if kind == _KIND_STRING:
                 start_at = offset + 1
                 body_at = start_at + 4
                 if body_at > size:
@@ -1329,6 +1355,19 @@ def _fast_row(
                             return None
                     value = None
                 offset = following
+            elif kind == _KIND_INT64 or kind == _KIND_DOUBLE:
+                if offset + 9 > size:
+                    return None
+                value = (_I64 if kind == _KIND_INT64 else _F64).unpack_from(buf, offset + 1)[0]
+                offset += 9
+            elif kind == _KIND_BOOL:
+                if offset + 2 > size:
+                    return None
+                raw_flag = buf[offset + 1]
+                if raw_flag > 1:
+                    return None
+                value = raw_flag == 1
+                offset += 2
             elif is_vector and (not keep or not materialize_vectors):
                 value, offset = _decode_vector_mode(  # type: ignore[assignment]
                     buf, offset + 1, expected_type, materialize=False  # type: ignore[arg-type]
