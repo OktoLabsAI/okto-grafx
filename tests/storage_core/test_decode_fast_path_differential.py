@@ -203,6 +203,9 @@ def _canon(value: object) -> object:
         return ("dict", tuple((_canon(k), _canon(v)) for k, v in value.items()))
     if schema_module._is_unmaterialized_column(value):
         return ("unmaterialized",)
+    if isinstance(value, VectorValue):
+        width = "<f" if value.dtype == "float32" else "<d"
+        return ("vector", tuple(struct.pack(width, c) for c in value.values), value.space_ref, value.dtype)
     return (type(value).__name__, repr(value))
 
 
@@ -462,3 +465,36 @@ def test_the_batch_decoder_reads_one_payload_per_row_and_never_ahead() -> None:
     assert pulled == [0]
     next(stream)
     assert pulled == [0, 1]
+
+
+def test_vector_components_decode_bit_for_bit_including_nan_payloads_and_negative_zero() -> None:
+    """The decoder does not re-judge components (SPEC-VEC BR-5): every bit pattern survives."""
+    table = _tables()["Wide"]
+    rnd = random.Random(SEED + 31)
+    patterns = (
+        0x7FC00000, 0x7FC00001, 0xFFC12345, 0x7F800001, 0x7F800000, 0xFF800000,  # NaNs and infinities
+        0x80000000, 0x00000000, 0x00000001, 0x007FFFFF, 0x3F800000, 0xBF800000,  # -0.0, 0.0, subnormals, +-1
+    )
+    checked = 0
+    for row in _rows(table, rnd, 40):
+        if row[-2] is None:  # the embedding column is the second to last
+            continue
+        segments = _payload_segments(table, row)
+        assert segments is not None
+        start = sum(len(segment) for segment in segments[:-2])
+        body = start + 1 + 8  # tag, dimension, space reference
+        dimension = len(row[-2].values)  # type: ignore[union-attr]
+        payload = bytearray(encode_tuple(table, row))  # type: ignore[arg-type]
+        for component in range(dimension):
+            payload[body + 4 * component : body + 4 * component + 4] = struct.pack("<I", rnd.choice(patterns))
+        for form, oracle, candidate in _forms(table, rnd):
+            want = _outcome(lambda: oracle(bytes(payload)))
+            got = _outcome(lambda: candidate(bytes(payload)))
+            assert got == want, form
+            checked += 1
+        decoded = decode_tuple(table, bytes(payload))
+        reference = struct.unpack_from("<%df" % dimension, bytes(payload), body)  # the C reference
+        assert [struct.pack("<d", c) for c in decoded[-2].values] == [  # type: ignore[union-attr]
+            struct.pack("<d", c) for c in reference
+        ]
+    assert checked > 200
