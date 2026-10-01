@@ -167,8 +167,12 @@ def test_planned_string_body_is_inlined_without_changing_other_scalar_dispatch(
 
     monkeypatch.setattr(schema_module, "_decode_expected_value_body", observe_dispatch)
 
-    assert decode_tuple(table, payload) == (7, "Ada", 3.5)
+    # The per-row oracle keeps its planned dispatch: the string body is inline, the other
+    # scalars go through the expected-body decoder. The public decoder is the planned fast path
+    # (fixed-width runs read with one struct call) and must return the same row.
+    assert schema_module._decode_tuple(table, payload, materialized_positions=None) == (7, "Ada", 3.5)
     assert observed == [ValueType.INT64, ValueType.DOUBLE]
+    assert decode_tuple(table, payload) == (7, "Ada", 3.5)
 
 
 def test_a_relationship_table_needs_both_endpoints() -> None:
@@ -517,7 +521,10 @@ def test_relationship_endpoint_projection_validates_every_type_without_retaining
     monkeypatch.setattr(schema_module, "_decode_expected_value_body", counted)
 
     assert decode_relationship_endpoints(table, payload) == (11, 22)
-    assert calls == [ValueType.INT64, ValueType.INT64]
+    # The two endpoint INT64 columns may be read by the planned fixed-width run or by the
+    # expected-body decoder; what this pins is that no other column is ever materialised.
+    assert len(calls) <= 2
+    assert all(kind is ValueType.INT64 for kind in calls)
 
 
 def _relationship_with_property(kind: ValueType, *, nullable: bool = False) -> TableDef:

@@ -21,6 +21,7 @@ from okto_grafx.domain.model.schema import (
     ColumnDef,
     TableDef,
     _decode_tuple,
+    _decode_tuple_fast,
     _decode_tuple_projection,
     decode_relationship_endpoints,
     decode_tuple,
@@ -305,6 +306,21 @@ def _forms(table: TableDef, rnd: random.Random):
         lambda buf: _decode_tuple(table, buf, materialized_positions=None, materialize_vectors=False),
         lambda buf: decode_tuple_landing(table, buf),
     )
+    for materialize_vectors in (True, False):
+        for preserve in (False, True):
+            for positions in (None, *_position_sets(table, rnd)):
+                if positions is None and preserve:
+                    continue
+                yield (
+                    "universal[mp=%s,vec=%s,keep=%s]" % (
+                        None if positions is None else sorted(positions), materialize_vectors, preserve),
+                    lambda buf, p=positions, v=materialize_vectors, k=preserve: _decode_tuple(
+                        table, buf, materialized_positions=p, materialize_vectors=v, preserve_positions=k
+                    ),
+                    lambda buf, p=positions, v=materialize_vectors, k=preserve: _decode_tuple_fast(
+                        table, buf, materialized_positions=p, materialize_vectors=v, preserve_positions=k
+                    ),
+                )
     for positions in _position_sets(table, rnd):
         yield (
             "projection%s" % sorted(positions),
@@ -357,3 +373,27 @@ def test_hostile_payloads_are_refused_exactly_as_the_oracle_refuses_them(name: s
                 refusals += want[0] == "error"
     assert cases >= 2_000
     assert refusals >= 500, "the corpus must exercise the refusal paths, not only valid rows"
+
+
+@pytest.mark.parametrize("name", sorted(_tables()))
+def test_the_planned_path_really_accepts_valid_rows(name: str) -> None:
+    """The differential tests would pass vacuously if every row fell back to the oracle."""
+    table = _tables()[name]
+    plan = table._fast_decode_plan
+    if name == "Open":  # an ANY column: the oracle decodes every row of this table
+        assert plan is None
+        return
+    assert plan is not None
+    rnd = random.Random(SEED + 99)
+    column_count = len(table.columns)
+    for row in _rows(table, rnd, 100):
+        payload = encode_tuple(table, row)  # type: ignore[arg-type]
+        for mat in (None, tuple(position % 2 == 0 for position in range(column_count))):
+            for preserve in (False, True):
+                if mat is None and preserve:
+                    continue
+                for vectors in (True, False):
+                    assert (
+                        schema_module._fast_row(plan, payload, mat, column_count, vectors, preserve)
+                        is not None
+                    ), (name, row, mat, preserve, vectors)
