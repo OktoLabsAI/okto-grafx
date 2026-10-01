@@ -69,7 +69,6 @@ from okto_grafx.domain.model.schema import (
     decode_relationship_endpoints,
     decode_tuple,
     decode_tuple_landing,
-    decode_tuples,
     _decode_tuple_projection,
     encode_tuple,
 )
@@ -2333,29 +2332,13 @@ class HeapStore:
 
         # Decoding can follow overflow chains, so it happens only after every data-page pin above
         # has been released. ``selected`` contains at most ``limit`` payloads.
-        # The payloads feed one planned batch decoder (the plan and the projection are hoisted
-        # out of the per-row work).  The feed is lazy and strictly one payload per row, so the
-        # order of the read-control check, the header/overflow validation and the decode of each
-        # row, and therefore which refusal surfaces first, is that of decoding them one by one.
-        pending: list[tuple[RecordRef, RecordHeader, tuple[str, ...] | None]] = []
-
-        def payloads() -> Iterator[bytes]:
-            for ref, header, content in selected:
-                if check is not None:
-                    check()
-                payload, node_labels = self._validated_payload(table, header, content)
-                pending.append((ref, header, node_labels))
-                yield payload
-
         rows = []
-        for values in decode_tuples(
-            table,
-            payloads(),
-            materialized_positions=materialized_positions,
-            preserve_positions=materialized_positions is not None,
-        ):
-            ref, header, node_labels = pending[len(rows)]
-            rows.append((ref, self._version_from_values(table, header, values, node_labels)))
+        for ref, header, content in selected:
+            if check is not None:
+                check()
+            rows.append((ref, self._decode_version_with_header(table, header, content)
+                         if materialized_positions is None else self._decode_version_with_header(
+                             table, header, content, materialized_positions=materialized_positions)))
         if check is not None:
             check()
         return tuple(rows), next_position
@@ -3540,10 +3523,11 @@ class HeapStore:
     ) -> HeapVersion:
         """Decode a version whose header the page walk has already validated."""
         payload, node_labels = self._validated_payload(table, header, content)
-        return self._version_from_values(
-            table,
-            header,
-            (
+        version = HeapVersion(
+            record_id=header.record_id,
+            xmin=header.xmin,
+            xmax=header.xmax,
+            values=(
                 decode_tuple_landing(table, payload)
                 if landing
                 else (
@@ -3552,22 +3536,6 @@ class HeapStore:
                     else decode_tuple(table, payload)
                 )
             ),
-            node_labels,
-        )
-
-    @staticmethod
-    def _version_from_values(
-        table: TableDef,
-        header: RecordHeader,
-        values: tuple[Value, ...],
-        node_labels: tuple[str, ...] | None,
-    ) -> HeapVersion:
-        """Wrap the decoded tuple of a validated record header as a version."""
-        version = HeapVersion(
-            record_id=header.record_id,
-            xmin=header.xmin,
-            xmax=header.xmax,
-            values=values,
             prev=header.previous,
             schema_version=header.schema_version,
             deleted=bool(header.flags & RECORD_FLAG_DELETED),

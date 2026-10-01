@@ -1200,11 +1200,13 @@ def _decode_tuple(
 
 _PLAN_RUN = 0
 _PLAN_COLUMN = 1
-_FIXED_RUN_FORMATS: dict[ValueType, str] = {
-    ValueType.INT64: "q",
-    ValueType.DOUBLE: "d",
-    ValueType.BOOL: "B",
-}
+_FIXED_RUN_FORMATS: Mapping[ValueType, str] = MappingProxyType(
+    {
+        ValueType.INT64: "q",
+        ValueType.DOUBLE: "d",
+        ValueType.BOOL: "B",
+    }
+)
 _TAG_NULL = int(ValueType.NULL)
 # column kinds the row loop reads inline instead of through the expected-body decoder
 _KIND_GENERIC, _KIND_STRING, _KIND_INT64, _KIND_DOUBLE, _KIND_BOOL = range(5)
