@@ -206,12 +206,13 @@ def engine_layer(rounds: int, dim: int, nodes: int, edges: int, switch_interval:
                     " count INT64, emb VECTOR(emb), PRIMARY KEY(id))"
                 )
                 tx.execute("CREATE REL TABLE Edge(FROM Node TO Node, weight DOUBLE, kind STRING, seen INT64)")
+            space_ref = db.catalog.catalog.space("emb").space_id
             with db.begin() as tx:
                 for i in range(nodes):
                     tx.execute(
                         "CREATE (:Node {id:$i,label:$l,name:$n,body:$b,weight:$w,count:$c,emb:$e})",
                         {"i": i, "l": text(rnd, 4, 12), "n": text(rnd, 8, 40), "b": text(rnd, 80, 200),
-                         "w": rnd.random(), "c": rnd.randrange(100), "e": [rnd.random() for _ in range(dim)]},
+                         "w": rnd.random(), "c": rnd.randrange(100), "e": VectorValue(tuple(rnd.random() for _ in range(dim)), space_ref)},
                     )
             with db.begin() as tx:
                 for _ in range(edges):
