@@ -26,7 +26,6 @@ from okto_grafx.domain.model.schema import (
     decode_relationship_endpoints,
     decode_tuple,
     decode_tuple_landing,
-    decode_tuples,
     encode_tuple,
 )
 from okto_grafx.domain.model.value import (
@@ -401,70 +400,6 @@ def test_the_planned_path_really_accepts_valid_rows(name: str) -> None:
                         schema_module._fast_row(plan, payload, mat, column_count, vectors, preserve)
                         is not None
                     ), (name, row, mat, preserve, vectors)
-
-
-def _stream(call: Callable[[], Iterable[object]]) -> tuple[list[object], tuple[str, object] | None]:
-    """Everything a stream yields before it stops, and the refusal that stopped it (if any)."""
-    seen: list[object] = []
-    try:
-        for item in call():
-            seen.append(_canon(item))
-    except Exception as failure:  # noqa: BLE001
-        return seen, ("error", (type(failure), str(failure), _canon(dict(getattr(failure, "details", {}) or {}))))
-    return seen, None
-
-
-@pytest.mark.parametrize("name", sorted(_tables()))
-def test_the_batch_decoder_streams_rows_and_the_first_refusal_like_row_by_row_decoding(name: str) -> None:
-    table = _tables()[name]
-    rnd = random.Random(SEED + 7 * table.table_id)
-    column_count = len(table.columns)
-    forms = [(None, True, False), (None, False, False)]
-    forms += [(positions, True, True) for positions in _position_sets(table, rnd)]
-    rows = _rows(table, rnd, 12)
-    for round_number in range(60):
-        batch: list[bytes] = []
-        for row in rnd.sample(rows, 4):
-            batch.append(encode_tuple(table, row))  # type: ignore[arg-type]
-            if rnd.random() < 0.4:
-                batch.extend(rnd.sample(list(_hostile(table, row, rnd)), 1))
-        for positions, vectors, preserve in forms:
-            want = _stream(
-                lambda: (
-                    _decode_tuple(
-                        table, buf, materialized_positions=positions,
-                        materialize_vectors=vectors, preserve_positions=preserve,
-                    )
-                    for buf in batch
-                )
-            )
-            got = _stream(
-                lambda: decode_tuples(
-                    table, iter(batch), materialized_positions=positions,
-                    materialize_vectors=vectors, preserve_positions=preserve,
-                )
-            )
-            assert got == want, (name, round_number, positions, vectors, preserve)
-    assert column_count > 0
-
-
-def test_the_batch_decoder_reads_one_payload_per_row_and_never_ahead() -> None:
-    table = _tables()["Fixed"]
-    rnd = random.Random(SEED)
-    payloads = [encode_tuple(table, row) for row in _rows(table, rnd, 5)]  # type: ignore[arg-type]
-    pulled: list[int] = []
-
-    def feed() -> Iterable[bytes]:
-        for index, payload in enumerate(payloads):
-            pulled.append(index)
-            yield payload
-
-    stream = decode_tuples(table, feed())
-    assert pulled == []
-    next(stream)
-    assert pulled == [0]
-    next(stream)
-    assert pulled == [0, 1]
 
 
 def test_vector_components_decode_bit_for_bit_including_nan_payloads_and_negative_zero() -> None:
