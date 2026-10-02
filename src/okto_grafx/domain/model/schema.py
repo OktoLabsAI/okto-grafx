@@ -1233,7 +1233,10 @@ def _compile_fast_decode_plan(
             column.stored_type is not None
             or column.type is ValueType.DECIMAL
             or column.type is SchemaType.ANY
+            or column.type is ValueType.NULL
         ):
+            # A NULL-typed column is not a planned shape: the oracle checks nullability for every NULL
+            # tag, so a `nullable=False` NULL column must be refused by the oracle, not decoded here.
             return None
     steps: list[tuple[object, ...]] = []
     position = 0

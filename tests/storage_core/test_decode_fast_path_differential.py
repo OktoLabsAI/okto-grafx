@@ -433,3 +433,52 @@ def test_vector_components_decode_bit_for_bit_including_nan_payloads_and_negativ
             struct.pack("<d", c) for c in reference
         ]
     assert checked > 200
+
+
+def _null_typed_tables() -> dict[str, TableDef]:
+    """Tables whose schema contains a NULL-typed column (not reachable from Cypher DDL, but
+    accepted by ColumnDef/TableDef): the oracle checks nullability for every NULL tag."""
+    return {
+        "null_required": _node(
+            90, "NullRequired", (ColumnDef("x", ValueType.NULL, nullable=False),)
+        ),
+        "null_optional": _node(
+            91, "NullOptional", (ColumnDef("x", ValueType.NULL, nullable=True),)
+        ),
+        "null_between_ints": _node(
+            92,
+            "NullBetweenInts",
+            (
+                ColumnDef("a", ValueType.INT64, nullable=False),
+                ColumnDef("x", ValueType.NULL, nullable=False),
+                ColumnDef("b", ValueType.INT64, nullable=False),
+                ColumnDef("c", ValueType.INT64, nullable=False),
+            ),
+        ),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_null_typed_tables()))
+def test_null_typed_columns_are_decoded_and_refused_exactly_as_the_oracle_does(name: str) -> None:
+    """A NULL-typed `nullable=False` column was accepted by the planned path (tag == expected tag was
+    handled before the nullability check) while the oracle refuses it; such schemas go to the oracle."""
+    table = _null_typed_tables()[name]
+    assert table._fast_decode_plan is None
+    null = encode_value(None)
+    int_body = encode_value(7)
+    payloads = [b"", null, null + null, null[:-1] or b"\xff", int_body, b"\xff", null + b"\x00"]
+    if name == "null_between_ints":
+        payloads += [int_body + null + int_body + int_body, int_body + int_body + int_body + int_body]
+    rnd = random.Random(SEED + table.table_id)
+    saw_refusal = False
+    for payload in payloads:
+        for form, oracle, candidate in _forms(table, rnd):
+            want = _outcome(lambda: oracle(payload))
+            got = _outcome(lambda: candidate(payload))
+            assert got == want, (name, form, payload)
+            saw_refusal = saw_refusal or want[0] == "error"
+    assert saw_refusal
+    if name == "null_required":  # the exact case from the review: b"\x00" must be refused in every form
+        for form, oracle, candidate in _forms(table, rnd):
+            assert _outcome(lambda: candidate(null))[0] == "error", form
+
