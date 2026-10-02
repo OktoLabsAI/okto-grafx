@@ -47,6 +47,41 @@ including the on-disk format.
 - On macOS, physical backups and logical transfer still fail with "no supported atomic no-replace
   directory publication" (issue #9).
 
+### Changed (0.0.9 development)
+
+- Row decoding compiles one plan per table. Runs of consecutive fixed-width columns are read with one
+  `struct.unpack_from` and one tag compare, strings take an inline path (an ASCII fast path for columns
+  that are skipped, no intermediate `bytes` copy), and nullable fixed-width columns ride the same runs
+  speculatively. Any anomaly (a mismatched tag, a compound value, corruption, a short buffer) reruns the
+  previous decoder on the whole payload, so values, refusals, messages and fields are unchanged.
+  Measured on edge rows with scalar columns about 2.9x faster, on string-heavy node rows about 1.3x, on
+  rows carrying a 4096-float embedding decoded in full about 1.0x (the vector build dominates and was
+  already a single C call); through a real database a scan returning properties moves 0.9x-1.2x. Scan
+  CPU per scan falls 4-10%. The wait for the GIL while a scan runs in the same process is unchanged.
+
+### Added (0.0.9 development)
+
+- `tools/measure_row_decode.py` compares the old and new row decoders in one process with alternating
+  rounds and a GIL-wake sampler.
+
+### Tests (0.0.9 development)
+
+- A differential harness holds the planned row decoder to the per-row decoder (the oracle) on valid and
+  hostile payloads in the full, landing, projection and relationship-endpoint forms, and a pin test
+  requires bit-for-bit identical vector components (NaN payloads, -0.0, subnormals).
+- `tests/api/test_workspace.py` gains the POSIX-family counterpart of its Windows alias-refusal test, so
+  `tests/test_platform_parity.py` (CONTRACT.md G4) passes on a whole-suite run. The gap existed in 0.0.8.
+
+### Known (0.0.9 development)
+
+- Physical backup, transfer and export fail on macOS (`GrafxUnsupportedOperation`: no atomic no-replace
+  directory publication), because `_promote` uses `renameat2`, a Linux call (issue #9). They are
+  validated on Linux and Windows only. The macOS test suite therefore has known failures in
+  `tests/api` (transfer, backup, resume) and `tests/foundation/test_packaging.py` (no `pip` in the
+  environment); the same ids fail on 0.0.8.
+- The Linux whole suite at 0.0.9 passes (24836 passed, 51 skipped, `tests/corpus` excluded because it
+  needs an external baseline checkout). The 0.0.8 Linux validation was per-directory.
+
 ### CI portability and execution policy
 
 - Move the full Windows/POSIX regression matrix and its coverage report to manual
