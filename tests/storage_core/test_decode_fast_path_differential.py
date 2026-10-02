@@ -455,6 +455,24 @@ def _null_typed_tables() -> dict[str, TableDef]:
                 ColumnDef("c", ValueType.INT64, nullable=False),
             ),
         ),
+        # relationship tables: the endpoint form decodes only the two endpoints but must still refuse a
+        # NULL in a required property (review of the pull request)
+        "null_rel_required": TableDef(
+            table_id=93,
+            name="NullRelRequired",
+            kind="rel",
+            columns=(ColumnDef("x", ValueType.NULL, nullable=False),),
+            from_table="Wide",
+            to_table="Wide",
+        ),
+        "null_rel_optional": TableDef(
+            table_id=94,
+            name="NullRelOptional",
+            kind="rel",
+            columns=(ColumnDef("x", ValueType.NULL, nullable=True),),
+            from_table="Wide",
+            to_table="Wide",
+        ),
     }
 
 
@@ -467,6 +485,9 @@ def test_null_typed_columns_are_decoded_and_refused_exactly_as_the_oracle_does(n
     null = encode_value(None)
     int_body = encode_value(7)
     payloads = [b"", null, null + null, null[:-1] or b"\xff", int_body, b"\xff", null + b"\x00"]
+    if table.kind == "rel":  # two INT64 endpoints come first, then the properties
+        endpoints = encode_value(11) + encode_value(12)
+        payloads += [endpoints + tail for tail in (b"", null, null + null, int_body, b"\xff")]
     if name == "null_between_ints":
         payloads += [int_body + null + int_body + int_body, int_body + int_body + int_body + int_body]
     rnd = random.Random(SEED + table.table_id)
@@ -481,4 +502,9 @@ def test_null_typed_columns_are_decoded_and_refused_exactly_as_the_oracle_does(n
     if name == "null_required":  # the exact case from the review: b"\x00" must be refused in every form
         for form, oracle, candidate in _forms(table, rnd):
             assert _outcome(lambda: candidate(null))[0] == "error", form
+    if name == "null_rel_required":  # endpoints present, required property NULL: refused in EVERY form, endpoints too
+        forms = list(_forms(table, rnd))
+        assert any(form == "endpoints" for form, _o, _c in forms)
+        for form, oracle, candidate in forms:
+            assert _outcome(lambda: candidate(endpoints + null))[0] == "error", form
 
