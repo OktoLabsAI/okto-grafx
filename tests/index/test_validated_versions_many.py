@@ -17,7 +17,7 @@ import pytest
 from okto_grafx.domain.errors import GrafxCorruptionDetected, GrafxIndexError
 from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import (
-    INDEX_READ_RETRY_BUDGET,
+    INDEX_VIEW_RETRY_BUDGET,
     HashIndex,
     IndexManager,
     IndexStore,
@@ -190,8 +190,8 @@ def test_a_transition_on_every_attempt_refuses_the_batch_without_a_prefix(
 
     assert refused.value.details["field"] == "index_view_changed"
     assert refused.value.retryable is True
-    assert counter.begins == INDEX_READ_RETRY_BUDGET + 1
-    assert counter.probes == len(keys) * (INDEX_READ_RETRY_BUDGET + 1)
+    assert counter.begins == INDEX_VIEW_RETRY_BUDGET + 1
+    assert counter.probes == len(keys) * (INDEX_VIEW_RETRY_BUDGET + 1)
 
 
 def test_a_proximity_index_is_refused_before_any_view_opens(

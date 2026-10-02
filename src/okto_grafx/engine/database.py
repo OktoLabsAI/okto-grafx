@@ -41,7 +41,6 @@ from okto_grafx.engine.fulltext import create_text_index as _create_text_index, 
 from okto_grafx.domain.query.text_procedure import text_call
 
 import struct
-from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -138,6 +137,7 @@ from okto_grafx.engine.public_views import (
     ComponentView,
     CoordinatorView,
     HeapStoreView,
+    _OwnedPlanMemo,
     IndexView,
     IndexRegistryView,
     LedgerView,
@@ -1850,13 +1850,16 @@ class Database:
             tuple[bytes, int, dict[int, object], dict[int, object], CatalogStoreView]
             | None
         ) = None
-        # This cache lives behind the injected facade transition rather than owning a lock.
+        # Guarded by the composition's plan guard (see below); a bare handle keeps a no-op one.
         # Strong source identity prevents id reuse; bounded entries contain only immutable plan
         # values and their already validated, capability-free templates.
-        self._plan_view_memo: OrderedDict[
-            int, tuple[PlanNode, PlanNode]
-        ] = OrderedDict()
+        self._plan_view_memo: _OwnedPlanMemo = _OwnedPlanMemo()
         self._plan_guard_factory = plan_guard_factory
+        if plan_guard_factory is not None:
+            # #10: result views are built outside page access, so concurrent statements of one
+            # handle reach this LRU together; the composition's guard serialises its short
+            # sections.
+            self._plan_view_memo.guard = plan_guard_factory()
         self._checksum_scope: Callable[[], AbstractContextManager[object]] = nullcontext
         self._heap: HeapStore = heap
         self._wal: WalManager = wal

@@ -7,6 +7,81 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### Added (0.0.8 development)
+
+- `db.pool` (`BufferPoolView`) reports monotonic, per-handle `hits`, `misses`, `evictions`,
+  `dirty_evictions` and `load_waits` counters so pool pressure can be read directly (issue #13).
+  No behaviour change.
+
+### Fixed (0.0.8 development)
+
+- Concurrent statements of one handle no longer raise a spurious `GrafxPlanError` ("malformed
+  plan field (KeyError)", issue #10). The owned-plan recipe LRU is mutated while result views are
+  built, after page access has been released, so one thread's eviction could remove the entry
+  another thread had just read and was about to refresh. The composition's plan guard now covers
+  the whole hit-and-refresh and the whole insert-and-evict; it is never held across plan
+  compilation or any engine call. A manually assembled engine without a guard keeps its previous
+  behaviour.
+- An index read now re-reads its view up to `INDEX_VIEW_RETRY_BUDGET` (8) times, instead of 2,
+  before raising the retryable `GrafxIndexError` (`index_view_changed`) under foreign-commit
+  churn (issue #12). A result is still returned only when the page-0 certificates before and after
+  the read are equal, and the error is unchanged when the budget is exhausted. The engine cannot
+  sleep (G2), so the attempts are not spaced by a backoff.
+- `checkpoint()` no longer fails with `GrafxDurabilityBarrierFailed` ("File 'wal/...wal' does not
+  exist on this device") when another process recycled a WAL segment this handle only had cached
+  for reading (issue #11). A global barrier now skips and uncaches such a clean WAL segment; a
+  missing file this handle still owes a flush for, a file the barrier names, and any non-WAL file
+  still fail it.
+
+### Known (0.0.8 development)
+
+- The public `Database.catalog`, `indexes` and `vectors` properties (and the catalog-read path in
+  the catalog snapshot helper) read catalog pages outside the per-handle participant section, by
+  design. A concurrent thread that rebases its read view inside the section can doom a catalog
+  page that such a read has pinned, so the last unpin bumps the buffer pool's drop epoch while
+  another thread holds the section. The effect is benign: derived memos are content-keyed, heap
+  consumers revalidate the epoch on every use and `apply_page_image` reads it before and after.
+  No change is made for this release.
+- Crash tests that kill a process with SIGKILL leave the operating system page cache intact, so
+  they cannot detect a missing `fsync`; power-loss testing is out of scope for this release.
+- On macOS, physical backups and logical transfer still fail with "no supported atomic no-replace
+  directory publication" (issue #9).
+
+### Changed (0.0.9 development)
+
+- Row decoding compiles one plan per table. Runs of consecutive fixed-width columns are read with one
+  `struct.unpack_from` and one tag compare, strings take an inline path (an ASCII fast path for columns
+  that are skipped, no intermediate `bytes` copy), and nullable fixed-width columns ride the same runs
+  speculatively. Any anomaly (a mismatched tag, a compound value, corruption, a short buffer) reruns the
+  previous decoder on the whole payload, so values, refusals, messages and fields are unchanged.
+  Measured on edge rows with scalar columns about 2.9x faster, on string-heavy node rows about 1.3x, on
+  rows carrying a 4096-float embedding decoded in full about 1.0x (the vector build dominates and was
+  already a single C call); through a real database a scan returning properties moves 0.9x-1.2x. Scan
+  CPU per scan falls 4-10%. The wait for the GIL while a scan runs in the same process is unchanged.
+
+### Added (0.0.9 development)
+
+- `tools/measure_row_decode.py` compares the old and new row decoders in one process with alternating
+  rounds and a GIL-wake sampler.
+
+### Tests (0.0.9 development)
+
+- A differential harness holds the planned row decoder to the per-row decoder (the oracle) on valid and
+  hostile payloads in the full, landing, projection and relationship-endpoint forms, and a pin test
+  requires bit-for-bit identical vector components (NaN payloads, -0.0, subnormals).
+- `tests/api/test_workspace.py` gains the POSIX-family counterpart of its Windows alias-refusal test, so
+  `tests/test_platform_parity.py` (CONTRACT.md G4) passes on a whole-suite run. The gap existed in 0.0.8.
+
+### Known (0.0.9 development)
+
+- Physical backup, transfer and export fail on macOS (`GrafxUnsupportedOperation`: no atomic no-replace
+  directory publication), because `_promote` uses `renameat2`, a Linux call (issue #9). They are
+  validated on Linux and Windows only. The macOS test suite therefore has known failures in
+  `tests/api` (transfer, backup, resume) and `tests/foundation/test_packaging.py` (no `pip` in the
+  environment); the same ids fail on 0.0.8.
+- The Linux whole suite at 0.0.9 passes (24836 passed, 51 skipped, `tests/corpus` excluded because it
+  needs an external baseline checkout). The 0.0.8 Linux validation was per-directory.
+
 ### CI portability and execution policy
 
 - Move the full Windows/POSIX regression matrix and its coverage report to manual

@@ -432,6 +432,20 @@ custom provider registration and runtime configuration errors are unchanged.
 | `index_key_cache_bytes` | `1048576` | Integer 0..2^31; retained logical bytes per index. Zero disables retention. Reduce for large index/handle counts. |
 | `read_only` | `False` | No replay/repair; requires checkpoint-complete state and may refuse after a newer acknowledged commit. Distinct from `db.execute()`'s read transaction |
 
+### Reading pool pressure
+
+`db.pool` also carries `hits`, `misses`, `evictions`, `dirty_evictions` and `load_waits`.
+They are monotonic since the handle opened and private to it (not shared with other handles or
+processes), so take two views and subtract. A `hit` is a page pin served from a resident frame,
+a `miss` is a pin that started a device load, `evictions` are clean frames dropped for capacity,
+`dirty_evictions` are modified frames written back and dropped for capacity, and `load_waits`
+counts pins that waited on another thread's load of the same page. Explicit discards and
+flushes are not evictions. A pool that is too small for its working set shows a high `misses`
+and `evictions` rate relative to `hits` (and any sustained `dirty_evictions` means writes are
+paying page write-back on the read path); when `used_bytes` sits at `budget_bytes` and the miss
+ratio `misses / (hits + misses)` stays high over a steady workload, raise `buffer_budget_bytes`
+and compare the deltas again. A full pool with a low miss ratio is healthy.
+
 ## Types, ranges and persistence
 
 There is no new setting for range streaming: the native generated-list ceiling

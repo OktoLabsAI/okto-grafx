@@ -295,3 +295,61 @@ def test_explain_still_returns_an_eager_independent_tree(
     assert type(_stored_plan(result)) is _OwnedPlanDoor
     assert result.plan == first
     assert spy.runs == 3
+
+
+def test_recipe_lru_hit_survives_a_concurrent_eviction_of_its_key() -> None:
+    """#10: result views are built outside page access, so two statements of one handle reach
+    the recipe LRU together.  Statement A hits the LRU-oldest key and is held between the
+    ``get`` and the ``move_to_end``; statement B then inserts a new recipe past the cap, which
+    evicts A's key.  Unguarded, A's ``move_to_end`` raises KeyError (a GrafxPlanError); the
+    composition's guard makes B wait until A has finished its whole hit."""
+    import threading
+    from collections import OrderedDict
+    from contextlib import nullcontext
+
+    cap = public_views._OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES
+    entered = threading.Event()
+    b_done = threading.Event()
+    armed: list[int] = []
+
+    class Probe(OrderedDict):
+        def get(self, key, default=None):  # type: ignore[no-untyped-def]
+            found = super().get(key, default)
+            if armed and key == armed[0] and found is not None:
+                armed.clear()
+                entered.set()
+                # Unguarded, B finishes its eviction while A waits here; guarded, B is blocked
+                # on the guard, so this bounded wait times out and A proceeds.
+                b_done.wait(timeout=2)
+            return found
+
+    failures: list[BaseException] = []
+
+    def run(text: str, done: threading.Event | None = None) -> None:
+        try:
+            database.execute(text).plan
+        except BaseException as failure:  # noqa: BLE001 - asserted below
+            failures.append(failure)
+        finally:
+            if done is not None:
+                done.set()
+
+    with connect(":memory:") as database:
+        for number in range(cap):
+            database.execute(f"RETURN {number} AS v{number}")
+        assert len(database._plan_view_memo) == cap
+        probe = Probe(database._plan_view_memo)
+        probe.guard = getattr(database._plan_view_memo, "guard", nullcontext())  # type: ignore[attr-defined]
+        database._plan_view_memo = probe
+        armed.append(next(iter(probe)))  # the LRU-oldest key: the next eviction victim
+
+        thread_a = threading.Thread(target=run, args=("RETURN 0 AS v0",))
+        thread_a.start()
+        assert entered.wait(timeout=30), "statement A never hit the recipe LRU"
+        thread_b = threading.Thread(target=run, args=(f"RETURN {cap} AS v{cap}", b_done))
+        thread_b.start()
+        thread_a.join(timeout=30)
+        thread_b.join(timeout=30)
+        assert not thread_a.is_alive() and not thread_b.is_alive()
+        assert len(probe) <= cap
+    assert failures == []

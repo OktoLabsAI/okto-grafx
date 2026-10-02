@@ -92,9 +92,12 @@ raise an exception **after the commit is durable**.
 | Successful writing report with `durable=True` | Acknowledged durable write; do not repeat it |
 | Exception details `committed=True`, `durable=True`, `recovery_required=True` | Already committed; stop using the failed handle for ordinary work, arrange bounded recovery/reopen, verify outcome; do not replay the mutation |
 | `GrafxWriteConflict` before durable commit | Roll back/retire that transaction and retry the whole logical operation from a fresh snapshot with bounded backoff |
+| Retryable `GrafxIndexError` with `details["field"] == "index_view_changed"` (an index read saw another participant publish the index header during every attempt) | No result was returned and none is wrong. The engine already re-read the view `INDEX_VIEW_RETRY_BUDGET` (8) times, without sleeping because the engine owns no clock; retry the read, with a short backoff if commits are sustained |
 | Lease/storage/buffer retryable refusal | Address contention/resource cause; inspect durable outcome first, then bounded fresh operation where safe |
 | Durability-barrier failure, process kill or transport timeout without an observed outcome | Do not infer rollback or success; reconcile with durable state/application idempotency before resubmitting |
 | Corruption, incompatible format, unsupported operation or budget error | Do not blind-retry; correct the cause or follow recovery/operator procedure |
+
+Callers should retry every refusal with `retryable=True` with a short, bounded backoff; the engine owns no clock and never sleeps, so it cannot do that for them.
 
 Use supported imports `from okto_grafx.errors import GrafxError, GrafxWriteConflict`.
 Read `code`, `retryable`, `details` and the transaction's `report`; do not match

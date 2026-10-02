@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
@@ -505,7 +505,15 @@ class CoordinatorView:
 
 @dataclass(frozen=True, slots=True)
 class BufferPoolView:
-    """Captured buffer-pool capacity and residency counters."""
+    """Captured buffer-pool capacity, residency and pressure counters.
+
+    ``hits``, ``misses``, ``evictions``, ``dirty_evictions`` and ``load_waits`` are monotonic
+    since this handle opened and private to it (never shared with another process or handle), so
+    a consumer takes deltas between two views. ``hits``: page pins served from a resident frame.
+    ``misses``: pins that started a device load. ``evictions``: clean frames dropped for
+    capacity. ``dirty_evictions``: modified frames written back and dropped for capacity.
+    ``load_waits``: pins that waited on another thread's load of the same page.
+    """
 
     page_size: int
     budget_bytes: int
@@ -514,6 +522,11 @@ class BufferPoolView:
     db_label: str
     retained_bytes_estimate_value: int
     retained_bytes_estimator: str
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    dirty_evictions: int = 0
+    load_waits: int = 0
 
     def used_bytes(self) -> int:
         """Return the resident byte count captured with this view."""
@@ -2427,6 +2440,17 @@ _OwnedPlanFieldClone = Callable[[], object]
 _OwnedPlanViewMemo = OrderedDict[int, tuple[PlanNode, _OwnedPlanClone]]
 
 
+class _OwnedPlanMemo(OrderedDict):
+    """The handle's compiled-plan recipe LRU, with the guard its composition injects (#10).
+
+    Result views are built after leaving page access, so statements of one handle that run at
+    the same time reach this LRU together; an unguarded get/move/evict could raise ``KeyError``.
+    A plain ``OrderedDict`` (tests, manual composition) keeps the no-op guard.
+    """
+
+    guard: AbstractContextManager[object] = nullcontext()
+
+
 def _query_plan_view(
     value: object,
     *,
@@ -2470,19 +2494,22 @@ def _query_owned_plan_recipe(
 ) -> _OwnedPlanClone:
     """Return the compiled clone recipe of one proven internal immutable root, compiling once."""
     marker = id(value)
-    cached = memo.get(marker)
-    if cached is not None and cached[0] is value:
-        memo.move_to_end(marker)
-        return cached[1]
+    guard = getattr(memo, "guard", None) or nullcontext()
+    with guard:
+        cached = memo.get(marker)
+        if cached is not None and cached[0] is value:
+            memo.move_to_end(marker)
+            return cached[1]
     # Compile only this already validated, capability-free graph.  The resulting clone recipe
     # captures immutable leaves and its own copy of a mutable literal, never any caller's result.
     # Every later caller therefore avoids repeating dataclass reflection and validation while
     # still receiving an entirely independent tree from each run of the recipe.
     clone = _query_owned_plan_clone_factory(_query_plan_rebuild(value))
-    memo[marker] = (value, clone)
-    memo.move_to_end(marker)
-    if len(memo) > _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES:
-        memo.popitem(last=False)
+    with guard:
+        memo[marker] = (value, clone)
+        memo.move_to_end(marker)
+        while len(memo) > _OWNED_PLAN_VIEW_CACHE_MAX_ENTRIES:
+            memo.popitem(last=False)
     return clone
 
 
@@ -3959,6 +3986,7 @@ def _coordinator_view(coordinator: Any) -> CoordinatorView:
 
 def _pool_view(pool: Any) -> BufferPoolView:
     """Snapshot buffer-pool counters and limits without pinning or evicting a page."""
+    hits, misses, evictions, dirty_evictions, load_waits = pool.counters()
     return BufferPoolView(
         _builtin_int(pool.page_size),
         _builtin_int(pool.budget_bytes),
@@ -3971,6 +3999,11 @@ def _pool_view(pool: Any) -> BufferPoolView:
             field="pool.retained_bytes_estimator",
             empty=False,
         ),
+        _builtin_int(hits),
+        _builtin_int(misses),
+        _builtin_int(evictions),
+        _builtin_int(dirty_evictions),
+        _builtin_int(load_waits),
     )
 
 

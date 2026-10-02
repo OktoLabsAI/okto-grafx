@@ -8,7 +8,7 @@ from okto_grafx.domain.index import RECORD_ID_KEY_DERIVATION
 from okto_grafx.domain.index.keys import record_id_key
 from okto_grafx.engine import query_engine as qe
 from okto_grafx.engine.heap_store import HeapStore
-from okto_grafx.engine.index_manager import HashIndex, IndexStore, INDEX_READ_RETRY_BUDGET
+from okto_grafx.engine.index_manager import HashIndex, IndexStore, INDEX_VIEW_RETRY_BUDGET
 from okto_grafx.errors import GrafxCorruptionDetected, GrafxError, GrafxIndexError
 
 from . import test_vector_free_traversal as vector_fixture
@@ -100,7 +100,7 @@ def test_whole_batch_retries_or_refuses_without_returning_a_prefix(graph, monkey
             with pytest.raises(GrafxIndexError) as exc:
                 graph._indexes.validated_identity_counts_many(index, keys, snapshot)
             assert exc.value.details["field"] == "index_view_changed"
-            assert len(calls) == INDEX_READ_RETRY_BUDGET + 1
+            assert len(calls) == INDEX_VIEW_RETRY_BUDGET + 1
         else:
             assert graph._indexes.validated_identity_counts_many(index, keys, snapshot) == expected
             assert len(calls) == 2

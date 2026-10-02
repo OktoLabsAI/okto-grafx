@@ -561,6 +561,11 @@ class BufferPool:
         "_condition",
         "_loads",
         "_evictions",
+        "_hits",
+        "_misses",
+        "_clean_evictions",
+        "_dirty_evictions",
+        "_load_waits",
         "_flight_state_epoch",
         "_page_write_section",
         "_page_sequence_fence",
@@ -620,6 +625,13 @@ class BufferPool:
         self._condition: BufferPoolGuard | None = _condition_capability(selected_guard)
         self._loads: dict[tuple[str, PageIndex], _PageLoad] = {}
         self._evictions: dict[tuple[str, PageIndex], _PageEviction] = {}
+        # Monotonic since open and private to this handle; every increment happens while the
+        # guard is held, so a concurrent reader of counters() never loses or tears a count.
+        self._hits: int = 0
+        self._misses: int = 0
+        self._clean_evictions: int = 0
+        self._dirty_evictions: int = 0
+        self._load_waits: int = 0
         self._flight_state_epoch: int = 0
         self._page_write_section: Callable[
             [str, PageIndex], AbstractContextManager[object]
@@ -816,6 +828,25 @@ class BufferPool:
     def used_bytes(self) -> int:
         """Return the bytes currently resident in this pool."""
         return len(self._frames) * self._page_size
+
+    @_guarded
+    def counters(self) -> tuple[int, int, int, int, int]:
+        """Return ``(hits, misses, evictions, dirty_evictions, load_waits)`` since this pool opened.
+
+        Monotonic and process-local to this handle. A hit is a ``pin`` served from a resident
+        frame; a miss is a ``pin`` that started a device load (a retried load counts again);
+        ``evictions`` are clean frames dropped for capacity and ``dirty_evictions`` are frames
+        written back and dropped for capacity. ``load_waits`` counts pins that blocked on another
+        thread's load of the same page. Explicit discards, invalidation and flushes are not
+        evictions.
+        """
+        return (
+            self._hits,
+            self._misses,
+            self._clean_evictions,
+            self._dirty_evictions,
+            self._load_waits,
+        )
 
     @_guarded
     def retained_bytes_estimate(self) -> int:
@@ -1144,8 +1175,10 @@ class BufferPool:
                 self._add_dirty_candidate(key)
             self._frames.move_to_end(key)
             frame.pins += 1
+            self._hits += 1
             return frame.page
         self._make_room(file, page_index)
+        self._misses += 1
         page = self._read_page(file, page_index)
         frame = _Frame(page)
         self._add_dirty_candidate(key)
@@ -1177,6 +1210,7 @@ class BufferPool:
                         self._add_dirty_candidate(key)
                     self._frames.move_to_end(key)
                     frame.pins += 1
+                    self._hits += 1
                     return frame.page
 
                 existing_load = self._loads.get(key)
@@ -1184,6 +1218,7 @@ class BufferPool:
                     self._refuse_own_flight(
                         owner, existing_load.owner, file, page_index, operation="load"
                     )
+                    self._load_waits += 1
                     condition.wait_for(
                         lambda: self._loads.get(key) is not existing_load
                     )
@@ -1205,6 +1240,7 @@ class BufferPool:
                 if self._occupied_slots() < self.capacity_pages:
                     load = _PageLoad(owner, self._load_epoch(file))
                     self._loads[key] = load
+                    self._misses += 1
                 else:
                     victim = self._find_victim()
                     if victim is None:
@@ -1258,6 +1294,8 @@ class BufferPool:
                             # Clean eviction and target reservation are one atomic replacement;
                             # no competitor can steal the slot this caller just made.
                             load = prepared_load
+                            self._clean_evictions += 1
+                        self._misses += 1
 
             if budget_failure is not None:
                 if self._metrics_active():
@@ -2675,6 +2713,7 @@ class BufferPool:
             raise
 
         with self._guard:
+            self._dirty_evictions += 1
             if self._evictions.get(key) is eviction:
                 try:
                     self._remember_write_back(file, page_index, key=key)
@@ -2753,6 +2792,9 @@ class BufferPool:
             frame = self._frames[victim]
             if frame.page.dirty:
                 self._write_back(name, victim_index, frame.page)
+                self._dirty_evictions += 1
+            else:
+                self._clean_evictions += 1
             del self._frames[victim]
             self._refresh_dirty_candidate(victim)
 

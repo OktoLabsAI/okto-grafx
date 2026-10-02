@@ -13,6 +13,7 @@ reader detect that the bytes were written under a different schema before it dec
 
 from __future__ import annotations
 
+import struct
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -38,6 +39,8 @@ from okto_grafx.domain.model.value import (
     Timestamp,
     Uuid,
     VectorValue,
+    _F64,
+    _I64,
     _U32,
     _append_encoded_value,
     _decode_expected_value_body,
@@ -236,11 +239,12 @@ class ColumnDef:
 class _TableDefColumnCache:
     """Reserve non-domain slots for immutable, derived column plans."""
 
-    __slots__ = ("_automatic_index_projection", "_column_positions", "_decode_plan", "_typed_assignments",
+    __slots__ = ("_automatic_index_projection", "_column_positions", "_decode_plan", "_fast_decode_plan", "_typed_assignments",
                  "_node_label_candidates", "_node_label_candidate_set")
     _automatic_index_projection: object | None
     _column_positions: Mapping[str, int]
     _decode_plan: tuple[tuple[int, ValueType | SchemaType, bool, ColumnDef], ...]
+    _fast_decode_plan: tuple[tuple[object, ...], ...] | None
     _typed_assignments: tuple[tuple[int, ColumnDef], ...]
     _node_label_candidates: tuple[str, ...]
     _node_label_candidate_set: frozenset[str]
@@ -339,6 +343,7 @@ class TableDef(_TableDefColumnCache):
                 for column in self.columns
             ),
         )
+        object.__setattr__(self, "_fast_decode_plan", _compile_fast_decode_plan(self.columns))
         reserved_positions = {
             position
             for position, column in enumerate(self.columns)
@@ -934,7 +939,7 @@ def decode_tuple(table: TableDef, buf: bytes) -> tuple[Value, ...]:
     Trailing bytes are corruption, not a mismatch: a payload that decodes into the declared
     number of values and then continues did not come from this encoder.
     """
-    return _decode_tuple(table, buf, materialized_positions=None)
+    return _decode_tuple_fast(table, buf, materialized_positions=None)
 
 
 def decode_tuple_landing(table: TableDef, buf: bytes) -> tuple[Value, ...]:
@@ -948,7 +953,7 @@ def decode_tuple_landing(table: TableDef, buf: bytes) -> tuple[Value, ...]:
     to type, encode or publish it is refused by ``value_type_of`` (RELSEEK-M4).  Every scalar
     column is decoded and judged exactly as ``decode_tuple`` does.
     """
-    return _decode_tuple(
+    return _decode_tuple_fast(
         table, buf, materialized_positions=None, materialize_vectors=False
     )
 
@@ -980,7 +985,7 @@ def _decode_tuple_projection(
     value still passes the canonical non-materialising parser, including UTF-8, recursive MAP
     key, vector-boundary and trailing-payload validation.
     """
-    return _decode_tuple(
+    return _decode_tuple_fast(
         table,
         buf,
         materialized_positions=materialized_positions,
@@ -1005,7 +1010,7 @@ def decode_relationship_endpoints(
             table=table.name,
             table_id=table.table_id,
         )
-    values = _decode_tuple(
+    values = _decode_tuple_fast(
         table,
         buf,
         materialized_positions=frozenset(range(ENDPOINT_COLUMN_COUNT)),
@@ -1178,3 +1183,249 @@ def _decode_tuple(
             length=len(buf),
         )
     return tuple(values)
+
+
+# ---- planned row decoding ---------------------------------------------------------------------
+#
+# ``_decode_tuple`` above is the canonical per-row decoder and stays the single oracle for every
+# refusal.  The planned decoder below is an acceleration of the ACCEPT path only: it walks a plan
+# compiled once per table (runs of fixed-width columns read with one struct call and one tag
+# comparison; strings and the remaining scalar kinds dispatched without the per-column
+# branch chain) and returns the row only when every byte is clean.  On ANY anomaly (a short or
+# retagged column, a bad BOOL, invalid UTF-8, a null in a non-nullable column, trailing bytes, a
+# helper that raises) it discards its partial work and runs the oracle on the whole payload from
+# the first byte, so a refusal is the oracle's by construction, never a re-implementation of it.
+# Tables with a DECIMAL, ANY or typed-collection column take the oracle for every row.
+
+_PLAN_RUN = 0
+_PLAN_COLUMN = 1
+_FIXED_RUN_FORMATS: Mapping[ValueType, str] = MappingProxyType(
+    {
+        ValueType.INT64: "q",
+        ValueType.DOUBLE: "d",
+        ValueType.BOOL: "B",
+    }
+)
+_TAG_NULL = int(ValueType.NULL)
+# column kinds the row loop reads inline instead of through the expected-body decoder
+_KIND_GENERIC, _KIND_STRING, _KIND_INT64, _KIND_DOUBLE, _KIND_BOOL = range(5)
+
+
+def _compile_fast_decode_plan(
+    columns: tuple["ColumnDef", ...],
+) -> tuple[tuple[object, ...], ...] | None:
+    """Compile the planned-decoder steps for these columns, or None when the oracle must decode.
+
+    Every column gets a COLUMN step. Two or more consecutive fixed-width columns (INT64, DOUBLE,
+    BOOL, nullable or not) are additionally preceded by a speculative RUN step that reads the whole
+    run with one struct call and one tag comparison; when the run holds no null, no retagged column
+    and no bad BOOL the loop jumps over that run's COLUMN steps, otherwise it simply falls into them
+    and the per-column path (which handles a null, and declines everything else) decides.
+    """
+    kinds = {
+        ValueType.STRING: _KIND_STRING,
+        ValueType.INT64: _KIND_INT64,
+        ValueType.DOUBLE: _KIND_DOUBLE,
+        ValueType.BOOL: _KIND_BOOL,
+    }
+    for column in columns:
+        if (
+            column.stored_type is not None
+            or column.type is ValueType.DECIMAL
+            or column.type is SchemaType.ANY
+            or column.type is ValueType.NULL
+        ):
+            # A NULL-typed column is not a planned shape: the oracle checks nullability for every NULL
+            # tag, so a `nullable=False` NULL column must be refused by the oracle, not decoded here.
+            return None
+    steps: list[tuple[object, ...]] = []
+    position = 0
+    while position < len(columns):
+        end = position
+        while end < len(columns) and columns[end].type in _FIXED_RUN_FORMATS:
+            end += 1
+        if end - position >= 2:
+            run = columns[position:end]
+            packer = struct.Struct("<" + "".join("B" + _FIXED_RUN_FORMATS[c.type] for c in run))  # type: ignore[index]
+            bools = tuple(i for i, c in enumerate(run) if c.type is ValueType.BOOL)
+            steps.append(
+                (
+                    _PLAN_RUN,
+                    packer,
+                    packer.size,
+                    tuple(int(c.type) for c in run),
+                    position,
+                    len(run),
+                    bools,
+                    len(steps) + 1 + len(run),
+                )
+            )
+        stop = max(end, position + 1)
+        for index in range(position, stop):
+            column = columns[index]
+            steps.append(
+                (
+                    _PLAN_COLUMN,
+                    index,
+                    int(column.type),
+                    column.type,
+                    column.nullable,
+                    column.type in VECTOR_VALUE_TYPES,
+                    kinds.get(column.type, _KIND_GENERIC),  # type: ignore[call-overload]
+                )
+            )
+        position = stop
+    return tuple(steps)
+
+
+def _fast_row(
+    plan: tuple[tuple[object, ...], ...],
+    buf: bytes,
+    mat: tuple[bool, ...] | None,
+    column_count: int,
+    materialize_vectors: bool,
+    preserve: bool,
+) -> tuple[Value, ...] | None:
+    """Decode one payload along the plan; None means "not provably clean, ask the oracle"."""
+    values: list[Value] = (
+        [_UNMATERIALIZED_COLUMN] * column_count  # type: ignore[list-item]
+        if preserve
+        else []
+    )
+    size = len(buf)
+    offset = 0
+    index = 0
+    steps = len(plan)
+    while index < steps:
+        step = plan[index]
+        if step[0] == _PLAN_RUN:
+            _, packer, run_size, tags, start, count, bools, after = step  # type: ignore[misc]
+            index += 1
+            if offset + run_size <= size:
+                raw = packer.unpack_from(buf, offset)  # type: ignore[attr-defined]
+                if raw[::2] == tags:
+                    found = raw[1::2]
+                    if bools:
+                        found = list(found)  # type: ignore[assignment]
+                        for flag_index in bools:  # type: ignore[attr-defined]
+                            flag = found[flag_index]
+                            if flag > 1:
+                                found = None  # type: ignore[assignment]
+                                break
+                            found[flag_index] = flag == 1
+                    if found is not None:
+                        offset += run_size  # type: ignore[operator]
+                        if mat is None:
+                            if preserve:
+                                values[start : start + count] = found  # type: ignore[operator]
+                            else:
+                                values.extend(found)
+                        else:
+                            for run_index, found_value in enumerate(found):
+                                position = start + run_index  # type: ignore[operator]
+                                if mat[position]:
+                                    if preserve:
+                                        values[position] = found_value
+                                    else:
+                                        values.append(found_value)
+                        index = after  # type: ignore[assignment]
+            continue
+        index += 1
+        _, position, expected_tag, expected_type, nullable, is_vector, kind = step  # type: ignore[misc]
+        keep = mat is None or mat[position]
+        if offset >= size:
+            return None
+        tag = buf[offset]
+        if tag == expected_tag:
+            if kind == _KIND_STRING:
+                start_at = offset + 1
+                body_at = start_at + 4
+                if body_at > size:
+                    return None
+                following = body_at + _U32.unpack_from(buf, start_at)[0]
+                if following > size:
+                    return None
+                piece = buf[body_at:following]
+                if keep:
+                    try:
+                        value = piece.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return None
+                else:
+                    if not piece.isascii():
+                        try:
+                            piece.decode("utf-8")
+                        except UnicodeDecodeError:
+                            return None
+                    value = None
+                offset = following
+            elif kind == _KIND_INT64 or kind == _KIND_DOUBLE:
+                if offset + 9 > size:
+                    return None
+                value = (_I64 if kind == _KIND_INT64 else _F64).unpack_from(buf, offset + 1)[0]
+                offset += 9
+            elif kind == _KIND_BOOL:
+                if offset + 2 > size:
+                    return None
+                raw_flag = buf[offset + 1]
+                if raw_flag > 1:
+                    return None
+                value = raw_flag == 1
+                offset += 2
+            elif is_vector and (not keep or not materialize_vectors):
+                value, offset = _decode_vector_mode(  # type: ignore[assignment]
+                    buf, offset + 1, expected_type, materialize=False  # type: ignore[arg-type]
+                )
+            elif keep:
+                value, offset = _decode_expected_value_body(
+                    buf, offset + 1, expected_type  # type: ignore[arg-type]
+                )
+            else:
+                offset = _validate_value(buf, offset)
+                value = None
+        elif tag == _TAG_NULL and nullable:
+            value = None
+            offset += 1
+        else:
+            return None
+        if keep:
+            if preserve:
+                values[position] = value  # type: ignore[index]
+            else:
+                values.append(value)  # type: ignore[arg-type]
+    if offset != size:
+        return None
+    return tuple(values)
+
+
+def _decode_tuple_fast(
+    table: TableDef,
+    buf: bytes,
+    *,
+    materialized_positions: frozenset[int] | None,
+    materialize_vectors: bool = True,
+    preserve_positions: bool = False,
+) -> tuple[Value, ...]:
+    """Planned decode of one payload: the same result and the same refusals as ``_decode_tuple``."""
+    plan = table._fast_decode_plan
+    if plan is not None and type(buf) is bytes:
+        column_count = len(table.columns)
+        mat = (
+            None
+            if materialized_positions is None
+            else tuple(position in materialized_positions for position in range(column_count))
+        )
+        try:
+            row = _fast_row(plan, buf, mat, column_count, materialize_vectors, preserve_positions)
+        except Exception:  # noqa: BLE001 - any anomaly is the oracle's to classify
+            row = None
+        if row is not None:
+            return row
+    return _decode_tuple(
+        table,
+        buf,
+        materialized_positions=materialized_positions,
+        materialize_vectors=materialize_vectors,
+        preserve_positions=preserve_positions,
+    )
+
