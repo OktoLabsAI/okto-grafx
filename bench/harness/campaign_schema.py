@@ -354,6 +354,9 @@ def _validate(data):
             validate_batch_selection(scenarios.values())
         except ValueError as exc:
             raise CampaignError(str(exc)) from exc
+    fixed_read_qualification = (data["intent"] == "qualification" and data["mode"] == "optimization"
+                                and any(s.name.startswith(("rf02-", "rf03-")) or s.family == "pagination"
+                                        for s in scenarios.values()))
     rf05_qualification = (data["intent"] == "qualification" and data["mode"] == "optimization"
                           and any(s.family == "pagination" for s in scenarios.values()))
     if rf06_split:
@@ -546,6 +549,13 @@ def _validate(data):
                     raise CampaignError(str(exc)) from exc
             _fields(memory, ("logical_memory_peak_bytes", "baseline_retained_bytes", "coverage", "unavailable_reason"), "memory")
             _integer(memory["baseline_retained_bytes"], "baseline_retained_bytes")
+            if fixed_read_qualification:
+                _integer(memory["logical_memory_peak_bytes"], "qualified read logical peak")
+                _require(sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes
+                         and memory["coverage"] == LOGICAL_COVERAGE
+                         and memory["unavailable_reason"] is None
+                         and memory["logical_memory_peak_bytes"] <= scenario.query_memory_budget_bytes,
+                         "RF02/RF03/RF05 logical observation missing or exceeds the declared budget")
             if scenario.family in read_lifecycle_qualification.FAMILIES and data["intent"] == "qualification":
                 expected_coverage = (SEQUENCE_LOGICAL_COVERAGE if scenario.family in
                                      {"read_autocommit", "read_shared"} else LOGICAL_COVERAGE)

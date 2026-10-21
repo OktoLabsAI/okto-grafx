@@ -8,7 +8,8 @@ import pytest
 from bench.harness.campaign_fixtures import Scenario, oracle
 from bench.harness.campaign import run_campaign
 from bench.harness.campaign_schema import (CampaignError, validate_campaign,
-                                           validate_fixed_optimization_matrix, compare_campaign)
+                                           validate_fixed_optimization_matrix, compare_campaign,
+                                           LOGICAL_COVERAGE)
 from bench.harness.campaign_worker import sample_record
 from bench.harness.connected_qualification import matrix as rf03_matrix
 from bench.harness.pagination_qualification import matrix as rf05_matrix
@@ -107,7 +108,7 @@ def rf05_campaign():
                 elapsed_ns=80 if ordered and case == "first" else 100,
                 cpu_ns=10, prepare_ns=2,
                 memory={"logical_memory_peak_bytes": 100, "baseline_retained_bytes": 0,
-                        "coverage": "instrumented budgets", "unavailable_reason": None},
+                        "coverage": LOGICAL_COVERAGE, "unavailable_reason": None},
                 rss_peak_bytes=100,
                 selected_plan=["OrderedNodeMerge"] if ordered else ["Scan"],
             )
@@ -129,4 +130,17 @@ def test_rf05_report_exposes_actual_ordered_work_and_rejects_missing_counter():
     candidate = next(run for run in data["runs"] if run["arm"] == "B")
     candidate["samples"][0]["statistics"].pop("ordered_candidates_examined")
     with pytest.raises(CampaignError, match="RF05 candidate lacks"):
+        compare_campaign(data)
+
+
+@pytest.mark.parametrize("change", [
+    lambda sample: sample["memory"].update(logical_memory_peak_bytes=4097),
+    lambda sample: sample["memory"].update(coverage="instrumented budgets"),
+    lambda sample: sample["memory"].update(logical_memory_peak_bytes=None),
+    lambda sample: sample.update(memory_budget_bytes=8192),
+])
+def test_rf05_qualification_rejects_missing_or_overbudget_memory(change):
+    data = rf05_campaign()
+    change(data["runs"][0]["samples"][0])
+    with pytest.raises(CampaignError, match="qualified read logical peak|RF02/RF03/RF05 logical"):
         compare_campaign(data)
