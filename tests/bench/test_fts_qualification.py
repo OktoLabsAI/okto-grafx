@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import pytest
 
+from bench.harness.campaign_schema import CampaignError, compare_campaign, validate_campaign
 from bench.harness.campaign_fixtures import Scenario, matrix
 from bench.harness.fts_qualification import apply_updates, apply_write_case, build_fixture, corpus_documents, oracle, rows, statistics
-from bench.harness.campaign_worker import measure_statement
+from bench.harness.campaign_worker import measure_statement, sample_record, unavailable_memory
 from okto_grafx import connect
 
 
@@ -47,6 +48,54 @@ def test_write_cost_slices_require_durable_acks_and_reopen_exactly(
     with connect(path, read_only=True) as read_only:
         assert rows(read_only, scenario)[0] == oracle(scenario)
         assert not read_only.verify("all").findings
+
+
+def test_write_cost_report_rejects_missing_ack_or_reopen_proof():
+    from tests.bench.test_campaign_schema import campaign
+
+    scenario = Scenario("fts-durable-insert", "fts_matrix", nodes=256,
+                        edges_per_node=0, fts_statistics_mode="durable",
+                        fts_history=8, cache="reopen", fts_write_case="insert")
+    data = campaign()
+    data["mode"] = "recipe"
+    data["scenarios"] = [scenario.to_dict()]
+    for run in data["runs"]:
+        run["samples"] = []
+        for index in range(25):
+            sample = sample_record(
+                scenario.to_dict(), index, oracle(scenario),
+                {"postings_visited": 256, "candidates": 256,
+                 "corpus_documents": 257, "statistics_wal_records": 0,
+                 "statistics_from_durable_summary": 1},
+                elapsed_ns=100, cpu_ns=10, prepare_ns=2,
+                memory=unavailable_memory("native_fts_memory_not_covered_by_query_budget_observer"),
+                rss_peak_bytes=100,
+                rss_scope="process_lifetime_peak_working_set_bytes")
+            sample["fts_source"] = {"statistics_regime": "durable_summary",
+                                    "statistics_mode": "durable", "history_entries": 8,
+                                    "hits": sample["rows"]}
+            sample["fts_setup"] = {"elapsed_ns": 100, "disk_allocated_bytes": 100,
+                                   "wal_allocated_bytes": 0,
+                                   "scope": "seed_insert_index_creation_checkpoint_and_close"}
+            sample["fts_maintenance"] = {"elapsed_ns": 10, "durable_acks": 1,
+                                         "commit_ns": [5], "disk_allocated_delta_bytes": 1,
+                                         "wal_allocated_delta_bytes": 1,
+                                         "scope": "separate_durable_units_before_cold_reopen",
+                                         "write_case": "insert", "writer_origin": "same_handle",
+                                         "read_only_reopen_verified": True}
+            run["samples"].append(sample)
+    validate_campaign(data)
+    tradeoff = compare_campaign(data)["comparisons"][0]["fts_tradeoff"]
+    assert tradeoff["write_case"] == "insert"
+    assert tradeoff["by_arm"]["A"]["write_commit_ack_ns"]["median_ns"] == 5
+    for key, bad in (("durable_acks", 0), ("read_only_reopen_verified", False),
+                     ("writer_origin", "second_handle")):
+        data["runs"][0]["samples"][0]["fts_maintenance"][key] = bad
+        with pytest.raises(CampaignError):
+            validate_campaign(data)
+        data["runs"][0]["samples"][0]["fts_maintenance"][key] = (
+            1 if key == "durable_acks" else True if key == "read_only_reopen_verified"
+            else "same_handle")
 
 
 def test_ranked_fts_oracle_and_source_are_real_for_wal_and_durable(tmp_path):

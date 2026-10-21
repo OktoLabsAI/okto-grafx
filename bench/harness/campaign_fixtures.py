@@ -96,6 +96,8 @@ class Scenario:
             raise ValueError("capacity config applies only to RF12 recipes")
         if self.family == fts_qualification.FAMILY:
             fts_qualification.validate(self)
+        elif self.fts_write_case != "none":
+            raise ValueError("FTS write case only applies to RF11 recipes")
         if self.family == uniqueness_qualification.FAMILY:
             uniqueness_qualification.validate(self)
 

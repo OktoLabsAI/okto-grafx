@@ -483,7 +483,7 @@ def _validate(data):
                          and source["history_entries"] == scenario.fts_history
                          and source["hits"] == sample["rows"]
                          and source["statistics_regime"] == fts_qualification.expected_source(scenario)
-                         and sample["statistics"].get("corpus_documents") == scenario.nodes
+                         and sample["statistics"].get("corpus_documents") == fts_qualification.corpus_documents(scenario)
                          and sample["statistics"].get("statistics_from_" + source["statistics_regime"]) == 1,
                          "FTS source or corpus evidence differs from scenario")
                 _require((sample["statistics"].get("statistics_wal_records", 0) > 0)
@@ -493,13 +493,15 @@ def _validate(data):
                 _integer(setup["elapsed_ns"], "FTS setup elapsed", 1)
                 _integer(setup["disk_allocated_bytes"], "FTS setup disk", 1)
                 _integer(setup["wal_allocated_bytes"], "FTS setup WAL")
-                if scenario.fts_updates:
+                if scenario.fts_updates or scenario.fts_write_case != "none":
                     maintenance = sample.get("fts_maintenance")
                     _fields(maintenance, ("elapsed_ns", "durable_acks", "commit_ns", "disk_allocated_delta_bytes",
                                           "wal_allocated_delta_bytes", "scope"), "FTS maintenance")
-                    _integer(maintenance["elapsed_ns"], "FTS update elapsed", 1)
-                    _require(maintenance["durable_acks"] == scenario.fts_updates,
-                             "FTS update ACK count differs from recipe")
+                    _integer(maintenance["elapsed_ns"], "FTS maintenance elapsed", 1)
+                    expected_acks = scenario.fts_updates or (
+                        4 if scenario.fts_write_case == "external_mixed" else 1)
+                    _require(maintenance["durable_acks"] == expected_acks,
+                             "FTS durable ACK count differs from recipe")
                     _require(isinstance(maintenance["commit_ns"], list)
                              and len(maintenance["commit_ns"]) == maintenance["durable_acks"],
                              "FTS durable commit durations missing")
@@ -510,6 +512,14 @@ def _validate(data):
                     _require(type(maintenance["disk_allocated_delta_bytes"]) is int
                              and type(maintenance["wal_allocated_delta_bytes"]) is int,
                              "FTS allocated byte deltas must be signed integers")
+                    if scenario.fts_write_case != "none":
+                        _require(maintenance.get("write_case") == scenario.fts_write_case
+                                 and maintenance.get("writer_origin") == (
+                                     "second_handle" if scenario.fts_write_case == "external_mixed"
+                                     else "same_handle")
+                                 and maintenance["scope"] == "separate_durable_units_before_cold_reopen"
+                                 and maintenance.get("read_only_reopen_verified") is True,
+                                 "FTS write-cost source or read-only reopen proof missing")
                 else:
                     _require("fts_maintenance" not in sample, "non-retained FTS sample has maintenance")
             for key in ("elapsed_ns", "cpu_ns", "prepare_ns", "consume_all_ns", "rss_peak_bytes"):
@@ -1012,6 +1022,7 @@ def compare_campaign(data):
             if scenario.family == "fts_matrix":
                 comparisons[-1]["fts_tradeoff"] = {
                     "expected_source": fts_qualification.expected_source(scenario),
+                    "write_case": scenario.fts_write_case,
                     "logical_memory": "unavailable; native search is outside the Cypher query-budget observer",
                     "wal_bytes_scope": "allocated WAL file bytes, not logical bytes appended or fsync count",
                     "setup_scope": "seed insert, index creation, checkpoint and close; not isolated index maintenance",
@@ -1034,6 +1045,18 @@ def compare_campaign(data):
                         "update_wal_allocated_delta_bytes": _distribution([
                             s["fts_maintenance"]["wal_allocated_delta_bytes"] for s in rows], "bytes")
                         if scenario.fts_updates else None,
+                        "write_commit_ack_ns": _distribution([duration for s in rows
+                                                               for duration in s["fts_maintenance"]["commit_ns"]])
+                        if scenario.fts_write_case != "none" else None,
+                        "write_elapsed_ns": _distribution([s["fts_maintenance"]["elapsed_ns"]
+                                                           for s in rows])
+                        if scenario.fts_write_case != "none" else None,
+                        "write_disk_allocated_delta_bytes": _distribution([
+                            s["fts_maintenance"]["disk_allocated_delta_bytes"] for s in rows], "bytes")
+                        if scenario.fts_write_case != "none" else None,
+                        "write_wal_allocated_delta_bytes": _distribution([
+                            s["fts_maintenance"]["wal_allocated_delta_bytes"] for s in rows], "bytes")
+                        if scenario.fts_write_case != "none" else None,
                     } for arm, rows in samples.items()},
                 }
             noisy |= any(d["coefficient_of_variation"] > .10 for d in distributions.values())
