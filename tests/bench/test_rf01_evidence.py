@@ -28,6 +28,54 @@ qe = import_module("okto_grafx.engine.query_engine")
 IndexManager = import_module("okto_grafx.engine.index_manager").IndexManager
 
 
+class _CompatibilitySink:
+    """Exercise the real active adapter, with failures at recording boundaries."""
+
+    enabled = True
+
+    def __init__(self, inject=False):
+        self.inner = import_module("okto_grafx.adapters.metrics_openmetrics").OpenMetricsSink()
+        self.inject = inject
+        self.armed = False
+        self.calls = []
+        self.failures = []
+        self.adapter_errors = []
+
+    def register(self, descriptor):
+        self.inner.register(descriptor)
+
+    def _record(self, door, name, value, labels):
+        self.calls.append((door, name))
+        # First validate against the genuine frozen-catalog adapter. Its errors
+        # must not be mistaken for the deliberately injected host exception.
+        try:
+            getattr(self.inner, door)(name, value, labels)
+        except BaseException as exc:
+            self.adapter_errors.append(type(exc).__name__)
+            raise
+        if self.armed and self.inject and (
+            name.startswith("oktografx_query_")
+            or (door == "set_gauge" and name == "oktografx_active_transactions" and value == 0)
+        ):
+            self.failures.append((door, name))
+            raise RuntimeError("RF01 injected recording failure")
+
+    def increment(self, name, value=1.0, labels=None):
+        self._record("increment", name, value, labels)
+
+    def observe(self, name, value, labels=None):
+        self._record("observe", name, value, labels)
+
+    def set_gauge(self, name, value, labels=None):
+        self._record("set_gauge", name, value, labels)
+
+    def time(self, name, labels=None):
+        return self.inner.time(name, labels)
+
+    def snapshot(self):
+        return self.inner.snapshot()
+
+
 def _synthetic_campaign():
     """Arithmetic/schema fixture; never a measurement of this machine or revision."""
     scenario = fixtures.Scenario(name="constant", family="constant", nodes=4).to_dict()
@@ -133,6 +181,18 @@ class RF01Evidence(unittest.TestCase):
 
     def test_compatibility_functional(self):
         """Functional-only entry: overhead qualification remains pending."""
+        # Identical operations through the supported composition boundary. This
+        # is semantic evidence for ts_16741f1a, never timing qualification.
+        catalog = import_module("okto_grafx.engine.metrics_catalog")
+        catalog_before = catalog.METRIC_CATALOG
+        with TemporaryDirectory(prefix="grafx-rf01-sink-matrix-") as directory:
+            outcomes = {}
+            for mode in ("noop", "active", "injected"):
+                with self.subTest(metrics=mode):
+                    outcomes[mode] = self._metrics_compatibility_case(Path(directory) / mode, mode)
+            self.assertEqual(outcomes["active"], outcomes["noop"])
+            self.assertEqual(outcomes["injected"], outcomes["noop"])
+        self.assertEqual(catalog.METRIC_CATALOG, catalog_before)
         scenario = fixtures.Scenario(name="cursor", family="node_scan", nodes=8, cursor_batch_size=1)
         with TemporaryDirectory(prefix="grafx-rf01-functional-") as root:
             with grafx.connect(Path(root) / "read") as db:
@@ -164,6 +224,79 @@ class RF01Evidence(unittest.TestCase):
         report = schema.compare_campaign(pending)
         self.assertEqual(report["decision"], "inconclusive", "Overhead must remain pending")
         self.assertNotEqual(report["decision"], "passed")
+
+    def _metrics_compatibility_case(self, path, mode):
+        sink = None if mode == "noop" else _CompatibilitySink(inject=mode == "injected")
+        kwargs = {}
+        if sink is not None:
+            bootstrap = import_module("okto_grafx.runtime.bootstrap")
+            registry = bootstrap.build_default_registry(grafx.DatabaseConfig(path=str(path)))
+            registry.bind("metrics", sink)
+            kwargs["registry"] = registry
+        outcome = {"reads": [], "errors": []}
+        with grafx.connect(path, **kwargs) as db:
+            with db.begin("write") as tx:
+                tx.execute("CREATE NODE TABLE N(id INT64,value INT64,PRIMARY KEY(id))")
+                tx.execute("CREATE REL TABLE E(FROM N TO N)")
+                tx.execute("UNWIND [1,2,3] AS i CREATE (:N {id:i,value:i})")
+                tx.execute("MATCH (a:N {id:1}),(b:N {id:2}) CREATE (a)-[:E]->(b)")
+                tx.execute("MATCH (a:N {id:1}),(b:N {id:3}) CREATE (a)-[:E]->(b)")
+            if sink is not None:
+                sink.armed = True
+            for query, parameters in (
+                ("MATCH (n:N {id:$id}) RETURN n.id,n.value", {"id": 2}),
+                ("MATCH (a:N)-[:E]->(b:N) RETURN a.id,b.id ORDER BY a.id,b.id", {}),
+                ("UNWIND [1,1,3] AS i MATCH (n:N {id:i}) RETURN n.id ORDER BY n.id", {}),
+            ):
+                result = db.execute(query, parameters)
+                outcome["reads"].append((result.rows, dict(result.statistics)))
+            self.assertEqual(outcome["reads"][0][0], ((2, 2),))
+            self.assertEqual(outcome["reads"][1][0], ((1, 2), (1, 3)))
+            self.assertEqual(outcome["reads"][2][0], ((1,), (1,), (3,)))
+            self.assertEqual(outcome["reads"][1][1]["edge_scans"], 1)
+            self.assertEqual(outcome["reads"][1][1]["physical_edge_versions_examined"], 2)
+            with self.assertRaises(grafx.errors.GrafxError) as read_error:
+                db.execute("MATCH (n:N) RETURN 1 / $zero", {"zero": 0})
+            outcome["errors"].append((type(read_error.exception).__name__, read_error.exception.code))
+            with self.assertRaises(grafx.errors.GrafxError) as write_error:
+                with db.begin("write") as tx:
+                    tx.execute("UNWIND [10,10] AS i CREATE (:N {id:i,value:10})")
+            outcome["errors"].append((type(write_error.exception).__name__, write_error.exception.code))
+            self.assertEqual(db.execute("MATCH (n:N {id:10}) RETURN n.id").rows, ())
+            token = grafx.CancellationToken()
+            with db.query("MATCH (n:N) RETURN n.id ORDER BY n.id").cursor(batch_size=1, cancellation=token) as cursor:
+                self.assertEqual(next(cursor), (1,))
+                token.cancel()
+                with self.assertRaises(grafx.errors.GrafxQueryCancelled) as cancelled:
+                    next(cursor)
+                self.assertTrue(cursor.closed)
+                outcome["cancelled"] = (cancelled.exception.code, dict(cursor.statistics))
+            self.assertEqual(db.transactions.open_transactions, 0)
+            before_commit_failures = len(sink.failures) if sink else 0
+            with db.begin("write") as tx:
+                result = tx.execute("CREATE (:N {id:4,value:40}) RETURN 4")
+                outcome["write"] = (result.rows, dict(result.statistics))
+            # The application received successful commit ACK despite recording
+            # exceptions. Recovery below independently checks durable visibility.
+            self.assertEqual(db.transactions.open_transactions, 0)
+            if sink is not None:
+                self.assertTrue(sink.calls)
+                self.assertEqual(sink.adapter_errors, [])
+                self.assertLessEqual({name for _, name in sink.calls},
+                                     import_module("okto_grafx.engine.metrics_catalog").metric_names())
+                if mode == "injected":
+                    self.assertGreater(len(sink.failures), before_commit_failures)
+                    self.assertTrue(any(name.startswith("oktografx_query_") for _, name in sink.failures))
+                    self.assertIn(("set_gauge", "oktografx_active_transactions"),
+                                  sink.failures[before_commit_failures:])
+                else:
+                    self.assertEqual(sink.failures, [])
+            self.assertIsNone(db._queries._statement_work.current_statistics())
+        with grafx.connect(path) as reopened:
+            outcome["durable"] = reopened.execute("MATCH (n:N) RETURN n.id,n.value ORDER BY n.id").rows
+            self.assertEqual(outcome["durable"], ((1, 1), (2, 2), (3, 3), (4, 40)))
+            self.assertFalse(reopened.verify("all").findings)
+        return outcome
 
     def test_campaign_validation(self):
         """Synthetic malformed evidence fails closed before ratio publication."""
