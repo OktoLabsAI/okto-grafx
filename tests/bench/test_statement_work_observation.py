@@ -1,10 +1,12 @@
 """RF01 exact-read physical work, isolated from result multiplicity and quotas."""
 
+import asyncio
 from okto_grafx import connect
 from contextvars import copy_context
 
 import pytest
 
+from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import HashIndex
 from okto_grafx.engine.statement_work import StatementWorkScope
 from okto_grafx.runtime.scoped_value import ContextLocalValue
@@ -153,6 +155,55 @@ def test_identity_batches_separate_physical_candidates_from_repeated_outputs(gra
     assert stats["landing_candidates"] == 2
     assert stats["index_probe_keys"] == 3
     assert stats["physical_node_versions_examined"] == 2
+
+
+@pytest.mark.parametrize("method,expected", [
+    ("validated_identity_landings", 1),
+    ("validated_identity_landings_many", 2),
+    ("validated_identity_counts_many", 2),
+])
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_identity_candidate_count_survives_mid_validation_failure(
+    graph, monkeypatch, method, expected, failure,
+):
+    """A failed or cancelled certificate still reports every attempted landing."""
+    index = next(index for index in graph._indexes.active_indexes()
+                 if index.definition.table_name == "B"
+                 and index.definition.key_derivation == RECORD_ID_KEY_DERIVATION)
+    scope = graph._queries._statement_work
+    keys = tuple(record_id_key(i) for i in (1, 2))
+    original = HeapStore.read_landing
+    reads = []
+
+    def interrupted(heap, ref):
+        reads.append(ref)
+        if len(reads) == expected:
+            raise failure("interrupted landing")
+        return original(heap, ref)
+
+    stats = {}
+    with graph.begin("read") as reader, scope.bind(stats), monkeypatch.context() as patch:
+        patch.setattr(HeapStore, "read_landing", interrupted)
+        args = (index, keys[0], reader._context.snapshot) if expected == 1 else (
+            index, keys, reader._context.snapshot)
+        with pytest.raises(failure, match="interrupted landing"):
+            getattr(graph._indexes, method)(*args)
+    assert len(reads) == expected
+    assert stats["landing_candidates"] == expected
+    assert stats.get("physical_node_versions_examined", 0) == expected - 1
+
+
+def test_scalar_identity_landing_counts_exact_candidate_work(graph):
+    index = next(index for index in graph._indexes.active_indexes()
+                 if index.definition.table_name == "B"
+                 and index.definition.key_derivation == RECORD_ID_KEY_DERIVATION)
+    scope = graph._queries._statement_work
+    stats = {}
+    with graph.begin("read") as reader, scope.bind(stats):
+        answer = graph._indexes.validated_identity_landings(
+            index, record_id_key(1), reader._context.snapshot)
+    assert len(answer) == 1
+    assert stats["landing_candidates"] == 1
 
 
 def test_interleaved_cursors_restore_binding_and_keep_statistics_separate(graph):

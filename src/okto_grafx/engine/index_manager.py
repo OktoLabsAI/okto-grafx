@@ -7550,24 +7550,29 @@ class IndexManager:
             add_work(statistics, "landing_batches")
             self._prepare_heap_view(index.file, certificate)
             answers: dict[bytes, int] = {}
-            for wanted, candidates in index._candidate_groups_unchecked(distinct):
-                count = 0
-                for entry in candidates:
-                    add_work(statistics, "landing_candidates")
-                    version = self._heap.read_landing(entry.ref)
-                    if version.table_id != definition.table_id:
-                        raise GrafxCorruptionDetected(
-                            f"Index {definition.name!r} points at a row of table "
-                            f"{version.table_id} and covers table {definition.table_id}.",
-                            file=index.file, page=entry.page, slot=entry.slot,
-                            index=definition.name, field="table_id",
-                        )
-                    if not snapshot.visible(version.xmin, version.xmax):
-                        continue
-                    if definition.entry_key_for_record(version.record_id, version.values) != entry.key:
-                        continue
-                    count += 1
-                answers[wanted] = count
+            examined = 0
+            try:
+                for wanted, candidates in index._candidate_groups_unchecked(distinct):
+                    count = 0
+                    for entry in candidates:
+                        examined += 1
+                        version = self._heap.read_landing(entry.ref)
+                        if version.table_id != definition.table_id:
+                            raise GrafxCorruptionDetected(
+                                f"Index {definition.name!r} points at a row of table "
+                                f"{version.table_id} and covers table {definition.table_id}.",
+                                file=index.file, page=entry.page, slot=entry.slot,
+                                index=definition.name, field="table_id",
+                            )
+                        if not snapshot.visible(version.xmin, version.xmax):
+                            continue
+                        if definition.entry_key_for_record(version.record_id, version.values) != entry.key:
+                            continue
+                        count += 1
+                    answers[wanted] = count
+            finally:
+                if examined:
+                    add_work(statistics, "landing_candidates", examined)
             return tuple(answers[wanted] for wanted in wanted_by_position)
 
         return index._stable_view(read_lsn, confirm)
@@ -7752,31 +7757,36 @@ class IndexManager:
         if identity and distinct:
             add_work(statistics, "landing_batches")
         answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
-        for wanted, candidates in index._candidate_groups_unchecked(distinct):
-            accepted: list[tuple[RecordRef, HeapVersion]] = []
-            for entry in candidates:
-                if identity:
-                    add_work(statistics, "landing_candidates")
-                version = read(entry.ref)
-                if version.table_id != definition.table_id:
-                    raise GrafxCorruptionDetected(
-                        f"Index {definition.name!r} points at a row of table "
-                        f"{version.table_id} and covers table {definition.table_id}.",
-                        file=index.file,
-                        page=entry.page,
-                        slot=entry.slot,
-                        index=definition.name,
-                        field="table_id",
-                    )
-                if not snapshot.visible(version.xmin, version.xmax):
-                    continue
-                if (
-                    definition.entry_key_for_record(version.record_id, version.values)
-                    != entry.key
-                ):
-                    continue
-                accepted.append((entry.ref, version))
-            answers[wanted] = tuple(accepted)
+        examined = 0
+        try:
+            for wanted, candidates in index._candidate_groups_unchecked(distinct):
+                accepted: list[tuple[RecordRef, HeapVersion]] = []
+                for entry in candidates:
+                    if identity:
+                        examined += 1
+                    version = read(entry.ref)
+                    if version.table_id != definition.table_id:
+                        raise GrafxCorruptionDetected(
+                            f"Index {definition.name!r} points at a row of table "
+                            f"{version.table_id} and covers table {definition.table_id}.",
+                            file=index.file,
+                            page=entry.page,
+                            slot=entry.slot,
+                            index=definition.name,
+                            field="table_id",
+                        )
+                    if not snapshot.visible(version.xmin, version.xmax):
+                        continue
+                    if (
+                        definition.entry_key_for_record(version.record_id, version.values)
+                        != entry.key
+                    ):
+                        continue
+                    accepted.append((entry.ref, version))
+                answers[wanted] = tuple(accepted)
+        finally:
+            if examined:
+                add_work(statistics, "landing_candidates", examined)
         return tuple(answers[wanted] for wanted in wanted_by_position)
 
     def _validated_items(
@@ -7815,28 +7825,33 @@ class IndexManager:
             statistics = None if scope is None else scope.current_statistics()
             self._prepare_heap_view(index.file, certificate)
             confirmed: list[_ReadResult] = []
-            for entry in index._candidates_unchecked(wanted):
-                if identity:
-                    add_work(statistics, "landing_candidates")
-                version = read(entry.ref)
-                if version.table_id != definition.table_id:
-                    raise GrafxCorruptionDetected(
-                        f"Index {definition.name!r} points at a row of table "
-                        f"{version.table_id} and covers table {definition.table_id}.",
-                        file=index.file,
-                        page=entry.page,
-                        slot=entry.slot,
-                        index=definition.name,
-                        field="table_id",
-                    )
-                if not snapshot.visible(version.xmin, version.xmax):
-                    continue
-                if (
-                    definition.entry_key_for_record(version.record_id, version.values)
-                    != entry.key
-                ):
-                    continue
-                confirmed.append(project(entry.ref, version))
+            examined = 0
+            try:
+                for entry in index._candidates_unchecked(wanted):
+                    if identity:
+                        examined += 1
+                    version = read(entry.ref)
+                    if version.table_id != definition.table_id:
+                        raise GrafxCorruptionDetected(
+                            f"Index {definition.name!r} points at a row of table "
+                            f"{version.table_id} and covers table {definition.table_id}.",
+                            file=index.file,
+                            page=entry.page,
+                            slot=entry.slot,
+                            index=definition.name,
+                            field="table_id",
+                        )
+                    if not snapshot.visible(version.xmin, version.xmax):
+                        continue
+                    if (
+                        definition.entry_key_for_record(version.record_id, version.values)
+                        != entry.key
+                    ):
+                        continue
+                    confirmed.append(project(entry.ref, version))
+            finally:
+                if examined:
+                    add_work(statistics, "landing_candidates", examined)
             return tuple(confirmed)
 
         return index._stable_view(read_lsn, confirm)
