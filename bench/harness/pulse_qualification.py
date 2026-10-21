@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 
 BASELINE = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
 
@@ -102,6 +103,49 @@ def verify_snapshot(snapshot, tracked):
 
 
 def run(snapshot):
+    """Supervise *all* qualification phases below the native 120-second cap.
+
+    Inventories, filesystem hashing and final receipts run in the owned child,
+    so they cannot outlive the 105-second deadline. Timeout leaves an explicit
+    failed supervisor receipt and any partial child artifacts, never a pass.
+    """
+    from bench.harness.campaign import execute_worker
+    started = time.monotonic()
+    snapshot = canonical_path(snapshot)
+    base = canonical_path(Path(os.environ["LOCALAPPDATA"]) / "Okto" / "Grafx")
+    audit = base / "runs" / ("supervisor-" + uuid.uuid4().hex)
+    audit.mkdir(parents=True, exist_ok=False)
+    result = audit / "result.json"
+    launcher = ("import json,pathlib,sys;sys.path.insert(0,sys.argv[1]);"
+                "from bench.harness.pulse_qualification import _run;"
+                "r=_run(pathlib.Path(sys.argv[1]));"
+                "pathlib.Path(sys.argv[2]).write_text(json.dumps(r),encoding='utf-8')")
+    command = [sys.executable, "-I", "-c", launcher, str(snapshot), str(result)]
+    receipt = {"decision": "failed", "command": command, "timeout_seconds": 105}
+    try:
+        remaining = 105 - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("supervisor setup exhausted deadline")
+        with (audit / "supervisor.log").open("x", encoding="utf-8") as log:
+            code = execute_worker(command, log, remaining)
+        if code:
+            raise RuntimeError(f"qualification child exited {code}; see {audit}")
+        child = json.loads(result.read_text(encoding="utf-8"))
+        if child.get("decision") != "passed":
+            raise RuntimeError("qualification child did not pass")
+        if time.monotonic() - started >= 110:
+            raise TimeoutError("qualification exceeded supervisor deadline")
+        receipt["decision"] = "passed"
+        return child
+    except BaseException as failure:
+        receipt["failure"] = f"{type(failure).__name__}: {failure}"
+        raise
+    finally:
+        receipt["elapsed_seconds"] = time.monotonic() - started
+        (audit / "supervisor-receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+
+def _run(snapshot):
     """Run calibration plus six real workers, or fail with preserved artifacts.
 
     A 90-second execution deadline reserves room below the native 120-second
@@ -141,8 +185,7 @@ def run(snapshot):
     try:
         # Isolated interpreter imports the actual runner snapshot's harness;
         # each worker independently attests the requested checkout import.
-        launcher = ("import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
-                    "runpy.run_module('bench.harness.campaign',run_name='__main__')")
+        launcher = campaign_schema.CALIBRATION_LAUNCHER
         common = [str(python), "-I", "-c", launcher, str(snapshot)]
         calibration = output / "calibration.json"
         commands = [common + ["calibrate", "--output", str(calibration)],
@@ -160,6 +203,10 @@ def run(snapshot):
                 code = execute_worker(command, log, remaining)
             if code:
                 raise RuntimeError(f"qualification phase {index} exited {code}; artifacts preserved")
+            if index == 0:
+                actual = campaign_schema.load_json(calibration.read_text(encoding="utf-8"))
+                if actual["procedure"]["command"] != command:
+                    raise ValueError("calibration interpreter argv differs from launched command")
         from bench.harness.campaign_schema import compare_campaign, load_json
         raw = load_json((output / "campaign" / "campaign.json").read_text(encoding="utf-8"))
         report = compare_campaign(raw)

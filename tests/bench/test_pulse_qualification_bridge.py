@@ -85,7 +85,8 @@ def test_inventory_checks_real_git_revision_and_dirty_files(tmp_path):
         inventory(tmp_path, revision)
 
 
-def test_worker_failure_preserves_receipt_and_logs_without_claiming_qualification(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", ["exit", "provenance"])
+def test_worker_failure_preserves_receipt_and_logs_without_claiming_qualification(tmp_path, monkeypatch, failure):
     from bench.harness import pulse_qualification as bridge
 
     # Fault injection tests the bridge's failure boundary only. No timing sample
@@ -107,14 +108,48 @@ def test_worker_failure_preserves_receipt_and_logs_without_claiming_qualificatio
     def failed(command, log, timeout):
         assert 0 < timeout <= 90
         log.write("injected child failure; no calibration executed")
+        if failure == "provenance":
+            Path(command[-1]).write_text(json.dumps({"procedure": {"command": ["invented"]}}))
+            return 0
         return 9
 
     monkeypatch.setattr("bench.harness.campaign.execute_worker", failed)
-    with pytest.raises(RuntimeError, match="phase 0 exited 9"):
-        bridge.run(root)
+    error, match = (RuntimeError, "phase 0 exited 9") if failure == "exit" else (ValueError, "interpreter argv differs")
+    with pytest.raises(error, match=match):
+        bridge._run(root)
     receipt = json.loads((output / "runner-receipt.json").read_text(encoding="utf-8"))
     assert receipt["decision"] == "failed"
     assert receipt["artifact_sha256"]["phase-0.log"] == hashlib.sha256(
         (output / "phase-0.log").read_bytes()
     ).hexdigest()
     assert not (output / "campaign").exists()
+
+
+def test_supervisor_bounds_whole_child_and_preserves_timeout_receipt(tmp_path, monkeypatch):
+    import subprocess
+    from bench.harness import pulse_qualification as bridge
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    def timeout(command, log, seconds):
+        assert 0 < seconds <= 105
+        assert "_run" in command[3]
+        log.write("injected timeout during final inventory; no campaign executed")
+        raise subprocess.TimeoutExpired(command, seconds)
+    monkeypatch.setattr("bench.harness.campaign.execute_worker", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        bridge.run(Path(__file__).resolve().parents[2])
+    receipts = list(tmp_path.rglob("supervisor-receipt.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt["decision"] == "failed"
+    assert "TimeoutExpired" in receipt["failure"]
+    assert not list(tmp_path.rglob("result.json"))
+
+
+def test_supervisor_rejects_child_failure(tmp_path, monkeypatch):
+    from bench.harness import pulse_qualification as bridge
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr("bench.harness.campaign.execute_worker", lambda *args: 7)
+    with pytest.raises(RuntimeError, match="child exited 7"):
+        bridge.run(Path(__file__).resolve().parents[2])
+    receipt = json.loads(next(tmp_path.rglob("supervisor-receipt.json")).read_text())
+    assert receipt["decision"] == "failed"

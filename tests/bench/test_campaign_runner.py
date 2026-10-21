@@ -7,6 +7,16 @@ from bench.harness.campaign import process_schedule, reserve_output
 from bench.harness.campaign_schema import CampaignError
 
 
+def test_calibration_records_actual_interpreter_argv(monkeypatch, tmp_path):
+    import bench.harness.campaign as runner
+    actual = ["python", "-I", "-c", "launcher", "snapshot", "calibrate", "--output", str(tmp_path / "receipt")]
+    monkeypatch.setattr(runner.sys, "orig_argv", actual)
+    captured = []
+    monkeypatch.setattr(runner, "calibrate_executor", lambda output, command: captured.append(command) or {})
+    assert runner.main(["calibrate", "--output", str(tmp_path / "receipt")]) == 0
+    assert captured == [actual]
+
+
 def test_process_order_is_three_independent_pairs():
     assert process_schedule() == [(0, "A", "AB"), (0, "B", "AB"),
                                   (1, "B", "BA"), (1, "A", "BA"),
@@ -120,10 +130,14 @@ def test_invalid_selection_raises_campaign_error(tmp_path, targets, scenarios):
         run_campaign(args)
 
 
-def test_real_calibration_command_produces_bound_receipt(tmp_path, capsys):
+def test_real_calibration_command_produces_bound_receipt(tmp_path, capsys, monkeypatch):
     import hashlib
     import bench.harness.campaign as runner
     output = tmp_path / "calibration.json"
+    # Embedded API invocation must expose its real interpreter argv, not invent
+    # a CLI launch. This fixture supplies the argv of the supported CLI producer.
+    monkeypatch.setattr(runner.sys, "orig_argv", [runner.sys.executable, "-m", "bench.harness.campaign",
+                                               "calibrate", "--output", str(output)])
     assert runner.main(["calibrate", "--output", str(output)]) == 0
     receipt = json.loads(output.read_text())
     assert len(receipt["elapsed_ns"]) == 20

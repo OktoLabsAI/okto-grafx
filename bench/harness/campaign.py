@@ -103,8 +103,9 @@ def execute_worker(command, log, timeout):
                 except psutil.NoSuchProcess:
                     pass
             process.kill()
-            process.wait()
-            psutil.wait_procs(descendants, timeout=5)
+            cleanup_deadline = time.monotonic() + 5
+            process.wait(timeout=5)
+            psutil.wait_procs(descendants, timeout=max(0, cleanup_deadline - time.monotonic()))
             raise
 
 
@@ -167,7 +168,7 @@ def run_campaign(args):
     data = {"schema_version": "grafx-campaign/v1", "intent": args.intent, "mode": args.mode,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "calibrated_executor": args.calibrated_executor,
-            "command": [sys.executable, "-m", "bench.harness.campaign", *sys.argv[1:]],
+            "command": list(sys.orig_argv),
             "protocol": {"pairs": 3, "warmups": 5, "retained": 20, "orders": ["AB", "BA", "AB"],
                          "attempt": 2 if previous else 1, "previous_campaign_sha256": previous,
                          "max_cpu_percent": args.max_cpu_percent},
@@ -247,7 +248,7 @@ def main(argv=None):
         if args.action == "list":
             result = [scenario.to_dict() for scenario in matrix()]
         elif args.action == "calibrate":
-            command = [sys.executable, "-m", "bench.harness.campaign", *(sys.argv[1:] if argv is None else argv)]
+            command = list(sys.orig_argv)
             result = calibrate_executor(args.output, command)
         elif args.action == "run":
             result = run_campaign(args)

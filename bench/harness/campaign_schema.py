@@ -21,6 +21,18 @@ HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
 HISTORICAL_TREE = "c2795181cda21041998cd13959afc8de303802bb"
 HISTORICAL_QUERY_SHA256 = "8056d0625cf4764c3a160bb676b6cefdc71d680f7f52bba44b626a28e0fa7ad8"
 LOGICAL_COVERAGE = "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1"
+CALIBRATION_LAUNCHER = ("import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
+                        "runpy.run_module('bench.harness.campaign',run_name='__main__')")
+
+
+def calibration_command_valid(command):
+    """Recognize the real interpreter argv, including the isolated bridge."""
+    if not isinstance(command, list) or not all(isinstance(x, str) for x in command):
+        return False
+    if command[1:4] == ["-m", "bench.harness.campaign", "calibrate"]:
+        return True
+    return (len(command) == 8 and command[1:4] == ["-I", "-c", CALIBRATION_LAUNCHER]
+            and Path(command[4]).is_absolute() and command[5:7] == ["calibrate", "--output"])
 
 
 def validate_candidate_memory(run, budgets):
@@ -191,7 +203,7 @@ def calibration_matches(data):
              and procedure["source_sha256"] == sources["campaign.py"]
              and procedure.get("source_files") == sources
              and procedure.get("control") == {"algorithm": "sha256", "payload_bytes": 65536, "iterations_per_sample": 128}
-             and procedure["command"][1:4] == ["-m", "bench.harness.campaign", "calibrate"],
+             and calibration_command_valid(procedure["command"]),
              "calibration procedure provenance does not match this executable harness")
     _fields(receipt, ("environment", "warmup_ns", "producer_process_id", "clock"), "calibration receipt")
     _require(canonical_hash(receipt["environment"]) == receipt["environment_hash"], "calibration environment hash mismatch")
