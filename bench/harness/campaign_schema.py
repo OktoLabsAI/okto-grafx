@@ -115,6 +115,8 @@ class CampaignError(ValueError):
 
 
 def _typed(value):
+    if type(value).__name__ == "Timestamp" and type(value).__module__ == "okto_grafx.domain.model.value":
+        return ["timestamp_micros", str(value.micros)]
     if value is None:
         return ["null"]
     if type(value) is bool:

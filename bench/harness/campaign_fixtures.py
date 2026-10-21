@@ -32,9 +32,10 @@ class Scenario:
     role: str = "control"
     work_counter: str | None = None
     query_memory_budget_bytes: int | None = None
+    pagination_case: str | None = None
 
     def __post_init__(self):
-        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts"}:
+        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination"}:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
             raise ValueError("invalid fixture dimensions")
@@ -50,6 +51,11 @@ class Scenario:
             raise ValueError("cursor requires a Cypher read")
         if self.query_memory_budget_bytes is not None and self.query_memory_budget_bytes < 1:
             raise ValueError("logical memory budget must be positive")
+        if self.family == "pagination":
+            from bench.harness.pagination_qualification import validate
+            validate(self)
+        elif self.pagination_case is not None:
+            raise ValueError("pagination case only applies to RF05 pagination")
 
     def to_dict(self):
         return asdict(self)
@@ -89,6 +95,9 @@ def live_data(scenario: Scenario):
 
 
 def oracle(scenario: Scenario):
+    if scenario.family == "pagination":
+        from bench.harness.pagination_qualification import oracle as page_oracle
+        return page_oracle(scenario)
     nodes, edges = live_data(scenario)
     ids = {n["id"] for n in nodes}
     if scenario.family == "constant":
@@ -111,6 +120,9 @@ def oracle(scenario: Scenario):
 
 def query_for(scenario: Scenario):
     family = scenario.family
+    if family == "pagination":
+        from bench.harness.pagination_qualification import query_for as page_query
+        return page_query(scenario)
     if family == "constant":
         return "RETURN 1 AS value", {}
     if family == "keys":
@@ -138,6 +150,9 @@ def query_for(scenario: Scenario):
 
 
 def contract(scenario: Scenario):
+    if scenario.family == "pagination":
+        from bench.harness.pagination_qualification import contract as page_contract
+        return page_contract(scenario)
     value = {"result": "typed ordered rows preserving multiplicity", "snapshot": "before churn" if scenario.reader == "retained" else "fixture after churn",
             "transaction": "one atomic transaction per writer" if scenario.family == "write" else "single read snapshot",
             "durability": "default synchronous ACK", "errors": "success required; any exception invalidates run",
@@ -152,6 +167,9 @@ def contract(scenario: Scenario):
 
 
 def build_fixture(db, scenario: Scenario, *, apply_updates=True):
+    if scenario.family == "pagination":
+        from bench.harness.pagination_qualification import build_fixture as build_page_fixture
+        return build_page_fixture(db, scenario)
     nodes, edges = fixture_data(scenario)
     with db.begin("write") as tx:
         tx.execute("CREATE NODE TABLE N(id INT64,value INT64,payload STRING,body STRING,PRIMARY KEY(id))")
@@ -216,4 +234,6 @@ def matrix():
             for history in (1, 8):
                 result.append(Scenario(f"fts-{term}-{cache}-h{history}", "fts", term=term,
                                        cache=cache, fts_history=history))
+    from bench.harness.pagination_qualification import matrix as page_matrix
+    result.extend(page_matrix(Scenario))
     return result
