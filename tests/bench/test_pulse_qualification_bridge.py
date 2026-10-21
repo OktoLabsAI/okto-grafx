@@ -272,7 +272,8 @@ def test_supervisor_bounds_whole_child_and_preserves_timeout_receipt(tmp_path, m
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
     def timeout(command, log, seconds):
         assert 0 < seconds <= 105
-        assert "_run" in command[3]
+        assert command[1:4] == ["-E", "-P", "-B"]
+        assert "_run" in command[5]
         log.write("injected timeout during final inventory; no campaign executed")
         raise subprocess.TimeoutExpired(command, seconds)
     monkeypatch.setattr("bench.harness.campaign.execute_worker", timeout)

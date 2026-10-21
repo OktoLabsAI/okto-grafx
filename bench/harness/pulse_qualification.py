@@ -194,7 +194,8 @@ def run(snapshot):
                 "from bench.harness.pulse_qualification import _run;"
                 "r=_run(pathlib.Path(sys.argv[1]));"
                 "pathlib.Path(sys.argv[2]).write_text(json.dumps(r),encoding='utf-8')")
-    command = [sys.executable, "-I", "-c", launcher, str(snapshot), str(result)]
+    from bench.harness.campaign_schema import RUNNER_PYTHON_FLAGS
+    command = [sys.executable, *RUNNER_PYTHON_FLAGS, "-c", launcher, str(snapshot), str(result)]
     receipt = {"decision": "failed", "command": command, "timeout_seconds": 105}
     try:
         remaining = 105 - (time.monotonic() - started)
@@ -263,10 +264,10 @@ def _run(snapshot):
                "decision": "incomplete", "commands": [], "controls": manifest["controls"],
                "not_applicable": manifest["not_applicable"]}
     try:
-        # Isolated interpreter imports the actual runner snapshot's harness;
+        # Pulse-compatible safe flags import the actual snapshot's harness;
         # each worker independently attests the requested checkout import.
         launcher = campaign_schema.CALIBRATION_LAUNCHER
-        common = [str(python), "-I", "-c", launcher, str(snapshot)]
+        common = [str(python), *campaign_schema.RUNNER_PYTHON_FLAGS, "-c", launcher, str(snapshot)]
         calibration = output / "calibration.json"
         commands = [common + ["calibrate", "--output", str(calibration)],
                     common + ["run", "--historical-noop", "--mode", "noop", "--intent", "qualification",

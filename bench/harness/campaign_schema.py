@@ -21,6 +21,9 @@ HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
 HISTORICAL_TREE = "c2795181cda21041998cd13959afc8de303802bb"
 HISTORICAL_QUERY_SHA256 = "8056d0625cf4764c3a160bb676b6cefdc71d680f7f52bba44b626a28e0fa7ad8"
 LOGICAL_COVERAGE = "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1"
+# Match the authenticated Pulse interpreter: ignore PYTHON* overrides and
+# unsafe cwd/script prepend, preserve declared user-site dependencies, no pyc.
+RUNNER_PYTHON_FLAGS = ("-E", "-P", "-B")
 CALIBRATION_LAUNCHER = ("import runpy,sys;sys.path.insert(0,sys.argv.pop(1));"
                         "runpy.run_module('bench.harness.campaign',run_name='__main__')")
 
@@ -31,8 +34,9 @@ def calibration_command_valid(command):
         return False
     if command[1:4] == ["-m", "bench.harness.campaign", "calibrate"]:
         return True
-    return (len(command) == 8 and command[1:4] == ["-I", "-c", CALIBRATION_LAUNCHER]
-            and Path(command[4]).is_absolute() and command[5:7] == ["calibrate", "--output"])
+    return (len(command) == 10 and command[1:4] == list(RUNNER_PYTHON_FLAGS)
+            and command[4:6] == ["-c", CALIBRATION_LAUNCHER]
+            and Path(command[6]).is_absolute() and command[7:9] == ["calibrate", "--output"])
 
 
 def validate_candidate_memory(run, budgets):

@@ -72,9 +72,9 @@ def test_complete_campaign_and_descriptive_report():
 
 def test_calibration_accepts_exact_isolated_launcher_but_rejects_other_code(tmp_path):
     from bench.harness.campaign_schema import CALIBRATION_LAUNCHER, calibration_command_valid
-    command = ["python", "-I", "-c", CALIBRATION_LAUNCHER, str(tmp_path), "calibrate", "--output", "receipt"]
+    command = ["python", "-E", "-P", "-B", "-c", CALIBRATION_LAUNCHER, str(tmp_path), "calibrate", "--output", "receipt"]
     assert calibration_command_valid(command)
-    command[3] += ";print('unregistered code')"
+    command[5] += ";print('unregistered code')"
     assert not calibration_command_valid(command)
 
 

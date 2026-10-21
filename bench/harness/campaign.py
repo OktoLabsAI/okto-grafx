@@ -19,7 +19,7 @@ import time
 
 from bench.harness.campaign_fixtures import matrix
 from bench.harness.campaign_schema import CampaignError, canonical_hash, compare_campaign, load_json, validate_campaign
-from bench.harness.campaign_schema import HISTORICAL_SCOPE, HISTORICAL_REVISION
+from bench.harness.campaign_schema import HISTORICAL_SCOPE, HISTORICAL_REVISION, RUNNER_PYTHON_FLAGS
 
 
 def process_schedule():
@@ -194,7 +194,7 @@ def run_campaign(args):
         request_path = output / f"request-{pair}-{arm}.json"
         raw_path = output / f"raw-{pair}-{arm}.json"
         _write(request_path, request)
-        command = [sys.executable, "-I", str(worker), "--request", str(request_path), "--output", str(raw_path)]
+        command = [sys.executable, *RUNNER_PYTHON_FLAGS, str(worker), "--request", str(request_path), "--output", str(raw_path)]
         try:
             with (output / f"worker-{pair}-{arm}.log").open("w", encoding="utf-8") as log:
                 returncode = execute_worker(command, log, getattr(args, "worker_timeout", 3600))

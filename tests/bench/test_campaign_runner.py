@@ -9,7 +9,7 @@ from bench.harness.campaign_schema import CampaignError
 
 def test_calibration_records_actual_interpreter_argv(monkeypatch, tmp_path):
     import bench.harness.campaign as runner
-    actual = ["python", "-I", "-c", "launcher", "snapshot", "calibrate", "--output", str(tmp_path / "receipt")]
+    actual = ["python", "-E", "-P", "-B", "-c", "launcher", "snapshot", "calibrate", "--output", str(tmp_path / "receipt")]
     monkeypatch.setattr(runner.sys, "orig_argv", actual)
     captured = []
     monkeypatch.setattr(runner, "calibrate_executor", lambda output, command: captured.append(command) or {})
@@ -70,8 +70,8 @@ def test_worker_failure_stops_without_fabricating_missing_pairs(tmp_path, monkey
     assert len(calls) == 1
     assert json.loads((args.output / "report.json").read_text())["decision"] == "invalid"
     assert json.loads((args.output / "campaign.json").read_text())["runs"] == []
-    assert Path(calls[0][2]).name == "campaign_worker.py"
-    assert calls[0][1] == "-I"
+    assert Path(calls[0][4]).name == "campaign_worker.py"
+    assert calls[0][1:4] == ["-E", "-P", "-B"]
 
 
 def test_runner_preserves_six_complete_process_outputs(tmp_path, monkeypatch):
