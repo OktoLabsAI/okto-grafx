@@ -272,6 +272,8 @@ def _validate(data):
     _require(isinstance(data["scenarios"], list) and bool(data["scenarios"]), "no scenarios")
     for value in data["scenarios"]:
         scenario = Scenario.from_dict(value)
+        if scenario.family == "capacity":
+            _require(data["mode"] == "recipe", "RF12 capacity is a local recipe, not a universal optimization")
         _require(scenario.name not in scenarios, "duplicate scenario")
         scenarios[scenario.name] = scenario
         if historical:
@@ -381,6 +383,12 @@ def _validate(data):
             else:
                 _require(sample["commit_ns"] is None, "read cannot claim durable commit timing")
             memory = sample["memory"]
+            if scenario.family == "capacity":
+                from bench.harness.capacity_qualification import validate_sample
+                try:
+                    validate_sample(sample, scenario)
+                except ValueError as exc:
+                    raise CampaignError(str(exc)) from exc
             _fields(memory, ("logical_memory_peak_bytes", "baseline_retained_bytes", "coverage", "unavailable_reason"), "memory")
             _integer(memory["baseline_retained_bytes"], "baseline_retained_bytes")
             if historical:

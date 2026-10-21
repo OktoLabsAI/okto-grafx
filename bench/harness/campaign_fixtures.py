@@ -42,6 +42,10 @@ class Scenario:
     partial_progress: bool = False
     quota_field: str | None = None
     quota_limit: int | None = None
+    capacity_case: str | None = None
+    buffer_budget_bytes: int = 64 << 20
+    checkpoint_interval_records: int = 512
+    identity_lease_size: int = 64
 
     def __post_init__(self):
         from bench.harness.quota_qualification import validate as validate_quota
@@ -52,7 +56,7 @@ class Scenario:
             raise ValueError("partial progress must be explicitly accepted")
         if (self.write_shape == "chunks" and self.chunk_rows < 1) or (self.write_shape != "chunks" and self.chunk_rows != 0):
             raise ValueError("chunk size applies only to chunks")
-        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination"} | connected_qualification.FAMILIES | read_lifecycle_qualification.FAMILIES:
+        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination", "capacity"} | connected_qualification.FAMILIES | read_lifecycle_qualification.FAMILIES:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
             raise ValueError("invalid fixture dimensions")
@@ -77,6 +81,12 @@ class Scenario:
             connected_qualification.validate(self)
         if self.family in read_lifecycle_qualification.FAMILIES:
             read_lifecycle_qualification.validate(self)
+        if self.family == "capacity":
+            from bench.harness.capacity_qualification import validate
+            validate(self)
+        elif (self.capacity_case is not None or self.buffer_budget_bytes != 64 << 20
+              or self.checkpoint_interval_records != 512 or self.identity_lease_size != 64):
+            raise ValueError("capacity config applies only to RF12 recipes")
 
     def to_dict(self):
         return asdict(self)
@@ -118,6 +128,9 @@ def live_data(scenario: Scenario):
 def oracle(scenario: Scenario):
     if scenario.family in read_lifecycle_qualification.FAMILIES:
         return read_lifecycle_qualification.oracle(scenario)
+    if scenario.family == "capacity":
+        from bench.harness.capacity_qualification import oracle as capacity_oracle
+        return capacity_oracle(scenario)
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import oracle as page_oracle
         return page_oracle(scenario)
@@ -146,6 +159,9 @@ def oracle(scenario: Scenario):
 def query_for(scenario: Scenario):
     if scenario.family in read_lifecycle_qualification.FAMILIES:
         return read_lifecycle_qualification.query_for(scenario)
+    if scenario.family == "capacity":
+        from bench.harness.capacity_qualification import query_for as capacity_query
+        return capacity_query(scenario)
     if scenario.family in connected_qualification.FAMILIES:
         return connected_qualification.query_for(scenario)
     family = scenario.family
@@ -181,6 +197,9 @@ def query_for(scenario: Scenario):
 
 
 def contract(scenario: Scenario):
+    if scenario.family == "capacity":
+        from bench.harness.capacity_qualification import contract as capacity_contract
+        return capacity_contract(scenario)
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import contract as page_contract
         return page_contract(scenario)
@@ -212,6 +231,9 @@ def contract(scenario: Scenario):
 
 
 def build_fixture(db, scenario: Scenario, *, apply_updates=True):
+    if scenario.family == "capacity":
+        from bench.harness.capacity_qualification import build_fixture as capacity_fixture
+        return capacity_fixture(db, scenario)
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import build_fixture as build_page_fixture
         return build_page_fixture(db, scenario)
@@ -298,6 +320,8 @@ def matrix():
                                        cache=cache, fts_history=history))
     from bench.harness.pagination_qualification import matrix as page_matrix
     result.extend(page_matrix(Scenario))
+    from bench.harness.capacity_qualification import matrix as capacity_matrix
+    result.extend(capacity_matrix(Scenario))
     from bench.harness.rf02_qualification import matrix as scalar_matrix
     from bench.harness.quota_qualification import matrix as quota_matrix
     return (result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix()

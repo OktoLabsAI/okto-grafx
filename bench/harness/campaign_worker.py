@@ -523,11 +523,14 @@ def run_worker(request, output):
         for spec in request["scenarios"]:
             scenario = Scenario.from_dict(spec)
             options = {"query_memory_budget_bytes": scenario.query_memory_budget_bytes}
+            if scenario.family == "capacity":
+                from bench.harness.capacity_qualification import connect_options
+                options.update(connect_options(scenario))
             from bench.harness.quota_qualification import connection_options
             measured_options = {**options, **connection_options(scenario)}
             with tempfile.TemporaryDirectory(prefix="fixture-", dir=output.parent) as directory:
                 root = Path(directory) / "db"
-                independent = scenario.family == "write" or scenario.reader == "retained"
+                independent = scenario.family in ("write", "capacity") or scenario.reader == "retained"
                 if not independent:
                     with okto_grafx.connect(root, **options) as db:
                         build_fixture(db, scenario)
@@ -543,7 +546,7 @@ def run_worker(request, output):
                             continue_sample = False
                         else:
                             continue_sample = True
-                        if scenario.cache == "warm" and scenario.family != "write":
+                        if scenario.cache == "warm" and scenario.family not in ("write", "capacity"):
                             query, params = query_for(scenario)
                             if scenario.family in read_lifecycle_qualification.FAMILIES:
                                 read_lifecycle_qualification.execute(db, scenario)
@@ -553,7 +556,10 @@ def run_worker(request, output):
                                 db.execute(query, params)
                         before, wal_before = _sizes(sample_root)
                         if continue_sample:
-                            if scenario.reader == "retained":
+                            if scenario.family == "capacity":
+                                from bench.harness.capacity_qualification import measure
+                                sample = measure(db, scenario, index, measure_statement)
+                            elif scenario.reader == "retained":
                                 with db.begin("read") as reader:
                                     reader.execute("MATCH (n:N) RETURN count(n)")
                                     apply_churn(db, scenario)
