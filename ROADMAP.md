@@ -17,6 +17,12 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## Grafx performance RF01–RF12 (October 21, 2026)
 
+RF10 N1 adds [explicit reading recipes](docs/PERFORMANCE.md#rf10-reading-recipes-choose-the-snapshot-contract)
+and deterministic snapshot/ownership/cleanup tests. It preserves the existing
+participant lifetime and distinguishes fixed snapshots from fresh independent
+transactions. Fixture measurement, authenticated verification and full RF10
+qualification remain pending; no performance gain or Spec completion is claimed.
+
 The Okto Pulse `okto-grafx` board holds twelve specifications and
 58 tasks. Native Spec dependencies are explicit: RF01 precedes
 RF02, RF03, RF05, RF06 and RF08–RF12; RF03 precedes RF04, which consequently

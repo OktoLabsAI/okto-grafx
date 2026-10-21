@@ -1,5 +1,79 @@
 # Current performance and measurement boundaries
 
+## RF10 reading recipes: choose the snapshot contract
+
+| Application need | Recipe | Visibility and lifetime |
+| --- | --- | --- |
+| Several reads compose one business result | `with db.begin("read") as tx`, then `tx.execute(...)` | One fixed snapshot; later commits are not refreshed between statements. |
+| Independent operations need a newly published view | Separate `db.execute(...)` calls | Each new transaction selects its own view; the group is not one atomic read. |
+| Large incremental result | `with db.query(...).cursor(...) as rows` | Cursor owns its snapshot until exhaustion or close. Close before waiting for network/user input. |
+| Stable keyset export | Pages inside one explicit read transaction | Stable membership at that snapshot; history is retained for the entire export. |
+| Independent keyset pages | New read transaction for each page | Concurrent changes can affect membership; pages do not form one snapshot. |
+
+### Sixteen primary-key reads
+
+Given an existing `Item(id INT64, value INT64, PRIMARY KEY(id))` table and an
+open `db`, these recipes explicitly choose their consistency contract:
+
+```python
+query = "MATCH (n:Item {id: $id}) RETURN n.value"
+keys = range(16)
+with db.begin("read") as tx:
+    related = [tx.execute(query, {"id": key}).rows for key in keys]
+
+independent = [db.execute(query, {"id": key}).rows for key in keys]
+```
+
+The first group uses one snapshot and transaction boundary; the second opens
+sixteen independent transactions. An external writer between related reads is
+visible only after a new transaction starts. Equality on an unchanged fixture
+does not make the concurrent semantics interchangeable. Grouping can amortize
+transaction work when shared consistency is required; no universal speedup is
+promised. Deterministic tests count successful opens and settlements (1 versus
+16). RF10's separate measurement card owns latency/campaign evidence.
+
+### Keyset pages and ownership
+
+Use a unique, stable ordering key. For the same table:
+
+```python
+page_query = (
+    "MATCH (n:Item) WHERE n.id > $after "
+    "RETURN n.id ORDER BY n.id LIMIT 4"
+)
+all_ids = []
+with db.begin("read") as tx:
+    after = -1  # This fixture uses nonnegative IDs.
+    while page := tx.execute(page_query, {"after": after}).rows:
+        all_ids.extend(row[0] for row in page)
+        after = page[-1][0]
+```
+
+For independent pages, omit the outer transaction and call `db.execute` inside
+the loop. A concurrent delete can remove an unseen row; an insert ahead of the
+continuation can add one. Changing sort keys can skip or repeat business entities.
+A single snapshot avoids these cross-page changes but holds history longer.
+This recipe does not prove an indexed seek plan or the RF05 optimization.
+`db.query(...).cursor()` owns its own snapshot; do not transfer it into another TX.
+
+```python
+materialized = db.execute("MATCH (n:Item) RETURN n.id")
+with db.query("MATCH (n:Item) RETURN n.id").cursor(batch_size=1) as rows:
+    first = rows.fetchone()  # The block closes even after partial consumption.
+# Explicit rows.close() is also supported and idempotent.
+```
+
+Materialized rows remain detached after their transaction and handle close.
+Keep the handle open while consuming a cursor. Consumer exceptions and query
+cancellation leave through the context manager; cleanup preserves the primary
+error even when cleanup itself fails. See
+[snapshot diagnosis](OPERATIONS.md#read-snapshot-lifetime-and-diagnosis).
+
+Executable coverage: [RF10 recipes](../tests/api/test_read_snapshot_recipes.py),
+[cursor lifecycle](../tests/query/test_query_cursor.py), and
+[reader registration](../tests/txn/test_reader_lifecycle.py). These establish
+consistency and cleanup, not temporal qualification.
+
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
 Updated October 21, 2026. “Current” means the **latest recorded observation for

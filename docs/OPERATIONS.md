@@ -346,3 +346,47 @@ benefit heaps with no eligible overflow pages. Physical backup preserves allocat
 metadata; logical transfer uses a fresh heap. See [format and failure boundaries](specs/HEAP_FREE_PAGE_INDEX.md).
 
 ---
+
+## Read snapshot lifetime and diagnosis
+
+Choose transaction scope by consistency requirements using the
+[RF10 reading recipes](PERFORMANCE.md#rf10-reading-recipes-choose-the-snapshot-contract).
+Close owned cursors on partial consumption, errors and cancellation; prefer a
+context manager. Materialized query rows no longer own an active snapshot.
+Do not hold a cursor or read transaction across network/user waits merely to
+reuse it for an unrelated request.
+
+`db.transactions.open_transactions` reports active transactions on this handle,
+including a cursor-owned read transaction. Record its value before opening and
+after closing an owned operation; unrelated legitimate transactions can remain.
+It is not a global reader count. The manager's standing participant registration
+can survive individual transactions and belongs to the handle. Zero active
+transactions therefore does not require zero physical pins. `db.close()` releases
+that handle's participant; it cannot release another handle's ownership.
+
+```python
+before = db.transactions.open_transactions
+with db.query("RETURN 1").cursor(batch_size=1) as rows:
+    row = rows.fetchone()
+after = db.transactions.open_transactions
+status = db.maintenance.status()
+# Compare before/after in an exclusively owned handle, not during concurrent use.
+```
+
+`status.wal_bytes` and `status.checkpoint_lag_lsn` are last-observed diagnostics,
+not a globally atomic view. `status.oldest_reader_age` is currently unavailable
+(`None`); never display it as zero. For an operator-requested, potentially costly
+read-only census, `db.maintenance.bloat()` reports `recyclable_horizon_lsn` and
+ended-version retention. It does not authorize reclamation.
+
+Track the age of application-owned operations with a monotonic clock and an
+explicit application warning threshold. Warn and identify the owner when that
+threshold is exceeded; do not kill a legitimate reader, infer abandonment from
+TTL, or advance a horizon artificially. No new timeout, vacuum policy, automatic
+reader termination or default is introduced by this recipe. RF12 owns the
+separate retention/maintenance measurements.
+
+When a consumer raises or cancellation is reported, preserve that primary
+exception while the context manager attempts cleanup. Secondary cleanup failures
+can be attached as exception notes. Do not replace the primary failure with a
+generic cleanup error or silently claim successful cleanup if close itself fails.

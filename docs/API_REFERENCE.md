@@ -1,5 +1,23 @@
 # Public Python API
 
+## Reading recipe ownership
+
+Use `with db.begin("read") as tx` for related `tx.execute` calls that require one
+fixed snapshot. A later writer is visible only in a new transaction. Independent
+`db.execute` calls each open and settle their own read transaction and return
+detached materialized rows, usable after the handle closes.
+
+`db.query(text, parameters).cursor(batch_size=...)` owns a separate read
+transaction. Use its context manager or explicit idempotent `close()` on partial
+consumption; keep the database open while consuming it. It cannot be reassigned
+to an existing transaction. Exceptions and cooperative cancellation trigger
+cleanup without replacing the primary error. A standing participant pin may
+remain until handle close even when `db.transactions.open_transactions == 0`.
+
+See [16-key and keyset examples](PERFORMANCE.md#rf10-reading-recipes-choose-the-snapshot-contract)
+and [lifetime diagnosis](OPERATIONS.md#read-snapshot-lifetime-and-diagnosis).
+These recipes preserve existing API signatures and snapshot/cleanup contracts.
+
 `okto_grafx.collection_json.collection_json_value()` and
 `collection_from_json_value()` convert exact StoredType collections to/from owned,
 bounded JSON primitives. CSV/JSONL/SQLite reader/importer `types` now accepts

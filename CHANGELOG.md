@@ -7,6 +7,14 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### RF10 explicit read lifecycle recipes
+
+- Document shared versus independent read snapshots, 16-key groups, keyset
+  pages, detached results and partial cursor cleanup. Add deterministic tests
+  for external publication, transaction counts, participant release and primary
+  error preservation. No engine/default change or temporal gain is claimed;
+  RF10 fixture and campaign qualification remain separate work.
+
 ### RF07 streaming protection
 
 - Add executable LIMIT 0/1, partial-close, filter/DISTINCT, corruption/duplicate,
