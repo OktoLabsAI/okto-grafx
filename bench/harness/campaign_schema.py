@@ -94,7 +94,7 @@ def validate_candidate_memory(run, budgets):
                 _require(operator["peak_bytes"] <= limit, "operator exceeded memory budget")
 
 
-def _historical_run(run, scenarios):
+def _historical_run(run, scenarios, unbudgeted=False, proof_budget=None):
     _fields(run, ("source_tree", "engine_source_hashes", "logical_observer_available"), "historical source evidence")
     _require(bool(re.fullmatch("[0-9a-f]{40}", run["source_tree"])), "invalid source tree")
     hashes = run["engine_source_hashes"]
@@ -107,7 +107,7 @@ def _historical_run(run, scenarios):
     else:
         _require(run["revision"] != HISTORICAL_REVISION and run["logical_observer_available"] is True,
                  "candidate logical observer unavailable")
-        validate_candidate_memory(run, {s.query_memory_budget_bytes for s in scenarios.values()})
+        validate_candidate_memory(run, {proof_budget} if unbudgeted else {s.query_memory_budget_bytes for s in scenarios.values()})
 
 
 class CampaignError(ValueError):
@@ -241,6 +241,15 @@ def _validate(data):
     scope = data.get("qualification_scope")
     _require(scope in (None, HISTORICAL_SCOPE), "unknown qualification scope")
     historical = scope == HISTORICAL_SCOPE
+    regime = data.get("memory_regime", "budgeted")
+    _require(regime in ("budgeted", "unbudgeted_landing"), "unknown memory regime")
+    unbudgeted = regime == "unbudgeted_landing"
+    proof_budget = data.get("candidate_memory_budget_bytes")
+    if unbudgeted:
+        _require(historical, "unbudgeted landing is only a historical noop exception")
+        _integer(proof_budget, "separate candidate memory budget", 1)
+    else:
+        _require(proof_budget is None, "separate memory budget only applies to unbudgeted landing")
     if historical:
         _require(data["mode"] == "noop", "historical exception is only RF01 total noop overhead")
     _require(type(data["calibrated_executor"]) is bool, "calibrated_executor must be boolean")
@@ -264,8 +273,12 @@ def _validate(data):
         _require(scenario.name not in scenarios, "duplicate scenario")
         scenarios[scenario.name] = scenario
         if historical:
-            _require(type(scenario.query_memory_budget_bytes) is int and scenario.query_memory_budget_bytes > 0,
-                     "historical candidate requires explicit logical budget in both arms")
+            if unbudgeted:
+                _require(scenario.family == "landing" and scenario.query_memory_budget_bytes is None,
+                         "unbudgeted landing requires landing family and no temporal quota in either arm")
+            else:
+                _require(type(scenario.query_memory_budget_bytes) is int and scenario.query_memory_budget_bytes > 0,
+                         "historical candidate requires explicit logical budget in both arms")
             _require(scenario.family not in ("fts", "write") and scenario.writers == 1 and scenario.reader == "short",
                      "historical profile currently covers single-statement read controls only")
         query, params = query_for(scenario)
@@ -299,7 +312,10 @@ def _validate(data):
         revisions[arm].add(run["revision"])
         _require(run["source_clean"] is True, "dirty source cannot establish revision")
         if historical:
-            _historical_run(run, scenarios)
+            if unbudgeted:
+                _require(run.get("memory_regime") == regime and run.get("candidate_memory_budget_bytes") == proof_budget,
+                         "worker memory regime/proof budget differs from campaign")
+            _historical_run(run, scenarios, unbudgeted, proof_budget)
         _require(bool(run["source_root"]) and bool(run["package_file"]), "missing import provenance")
         env = run["environment"]
         _fields(env, ("python", "dependencies", "os", "cpu", "cpu_count", "ram_bytes", "disk", "gc_enabled"), "environment")
@@ -368,11 +384,18 @@ def _validate(data):
                     _require(memory["logical_memory_peak_bytes"] is None
                              and memory["unavailable_reason"] == "revision_has_no_logical_memory_observer"
                              and memory["coverage"] == "unavailable", "historical memory must remain explicitly unavailable, never zero")
+                elif unbudgeted:
+                    _require(memory["logical_memory_peak_bytes"] is None and memory["coverage"] == "unavailable"
+                             and memory["unavailable_reason"] == "query_memory_budget_disabled",
+                             "unbudgeted candidate memory must remain null with disabled-budget reason")
+                    _require(sample["statistics"].get("landing_batches", 0) > 0
+                             and sample["statistics"].get("landing_candidates", 0) > 0,
+                             "unbudgeted landing must demonstrate actual candidate batches and candidates")
                 else:
                     _require(memory["logical_memory_peak_bytes"] is not None and memory["coverage"] == LOGICAL_COVERAGE,
                              "candidate memory must have real covered peak")
             if memory["logical_memory_peak_bytes"] is None:
-                _require((historical and arm == "A") or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
+                _require((historical and (arm == "A" or unbudgeted)) or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
             else:
                 _integer(memory["logical_memory_peak_bytes"], "logical_memory_peak_bytes")
                 _require(memory["logical_memory_peak_bytes"] >= memory["baseline_retained_bytes"], "memory peak below baseline")
@@ -446,6 +469,8 @@ def compare_campaign(data):
         decision = "tradeoff_reported"
     return {"schema_version": "grafx-campaign-report/v1", "campaign_hash": canonical_hash(data),
             "qualification_scope": data.get("qualification_scope", "comparable_observer"),
+            "memory_regime": data.get("memory_regime", "budgeted"),
+            "retry_scope": "single_campaign_only",
             "comparative_logical_memory": data.get("qualification_scope") != HISTORICAL_SCOPE and data["intent"] == "qualification",
             "candidate_memory_verified": data.get("qualification_scope") == HISTORICAL_SCOPE,
             "decision": decision, "comparisons": comparisons, "overall": totals,

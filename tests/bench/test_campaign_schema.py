@@ -236,6 +236,49 @@ def test_historical_null_is_a_narrow_temporal_exception():
     assert report["candidate_memory_verified"] is True
 
 
+def unbudgeted_landing_campaign():
+    from bench.harness.campaign_fixtures import matrix, oracle
+    from bench.harness.campaign_worker import sample_record
+    data = historical_campaign()
+    data.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=4096)
+    scenario = next(s for s in matrix() if s.name == "landing-control")
+    data["scenarios"] = [scenario.to_dict()]
+    for run in data["runs"]:
+        run.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=4096)
+        memory = {"logical_memory_peak_bytes": None, "baseline_retained_bytes": 0,
+                  "coverage": "unavailable", "unavailable_reason": "revision_has_no_logical_memory_observer"
+                  if run["arm"] == "A" else "query_memory_budget_disabled"}
+        run["samples"] = [sample_record(scenario.to_dict(), i, oracle(scenario),
+            {"landing_batches": 1, "landing_candidates": 64}, elapsed_ns=100, cpu_ns=10, prepare_ns=2,
+            memory=memory.copy(), rss_peak_bytes=100, rss_scope="process_lifetime_peak_working_set_bytes") for i in range(25)]
+    return data
+
+
+def test_unbudgeted_landing_keeps_missing_memory_and_separate_proof():
+    report = compare_campaign(unbudgeted_landing_campaign())
+    assert report["decision"] == "passed"
+    assert report["memory_regime"] == "unbudgeted_landing"
+    assert report["retry_scope"] == "single_campaign_only"
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d.update(candidate_memory_budget_bytes=None),
+    lambda d: d.update(candidate_memory_budget_bytes=0),
+    lambda d: d.update(memory_regime="unknown"),
+    lambda d: d.pop("qualification_scope"),
+    lambda d: d["runs"][1].update(candidate_memory_budget_bytes=8192),
+    lambda d: d["runs"][1]["samples"][0]["memory"].update(logical_memory_peak_bytes=0),
+    lambda d: d["runs"][1]["samples"][0]["memory"].update(unavailable_reason="revision_has_no_logical_memory_observer"),
+    lambda d: d["runs"][1]["samples"][0]["statistics"].update(landing_batches=0),
+    lambda d: d["runs"][1].pop("candidate_memory_evidence"),
+])
+def test_unbudgeted_landing_fails_closed(change):
+    data = unbudgeted_landing_campaign()
+    change(data)
+    with pytest.raises(CampaignError):
+        compare_campaign(data)
+
+
 @pytest.mark.parametrize("change", [
     lambda d: d.pop("qualification_scope"),
     lambda d: d.update(mode="recipe"),

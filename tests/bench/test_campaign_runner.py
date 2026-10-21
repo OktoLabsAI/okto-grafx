@@ -23,6 +23,36 @@ def test_process_order_is_three_independent_pairs():
                                   (2, "A", "AB"), (2, "B", "AB")]
 
 
+@pytest.mark.parametrize("temporal_budget,proof_budget,scenario,valid", [
+    (None, 4096, "landing-control", True),
+    (4096, 4096, "landing-control", False),
+    (None, None, "landing-control", False),
+    (None, 0, "landing-control", False),
+    (None, 4096, "constant", False),
+])
+def test_unbudgeted_landing_cli_preserves_two_memory_regimes(tmp_path, monkeypatch, temporal_budget, proof_budget, scenario, valid):
+    import bench.harness.campaign as runner
+    from bench.harness.campaign_schema import HISTORICAL_REVISION
+    revisions = iter([HISTORICAL_REVISION, "b" * 40])
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *a, **k: next(revisions))
+    requests = []
+    def fail(command, log, timeout):
+        requests.append(json.loads(Path(command[command.index("--request") + 1]).read_text()))
+        return 7
+    monkeypatch.setattr(runner, "execute_worker", fail)
+    args = Namespace(output=tmp_path / "out", baseline=tmp_path, candidate=tmp_path,
+                     scenario=[scenario], memory_budget=temporal_budget, candidate_memory_budget=proof_budget,
+                     target=[], previous=None, mode="noop", intent="qualification", calibrated_executor=False,
+                     max_cpu_percent=20, historical_unbudgeted_landing=True)
+    with pytest.raises(CampaignError):
+        runner.run_campaign(args)
+    assert len(requests) == int(valid)
+    if valid:
+        assert requests[0]["memory_regime"] == "unbudgeted_landing"
+        assert requests[0]["candidate_memory_budget_bytes"] == 4096
+        assert requests[0]["scenarios"][0]["query_memory_budget_bytes"] is None
+
+
 @pytest.mark.parametrize("valid_baseline", [False, True])
 def test_historical_cli_enforces_identity_and_propagates_scope(tmp_path, monkeypatch, valid_baseline):
     import bench.harness.campaign as runner

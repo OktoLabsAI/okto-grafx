@@ -363,6 +363,14 @@ def run_worker(request, output):
                               "disk": {"root": str(output.parent.anchor), "free_bytes": shutil.disk_usage(output.parent).free}},
               "cpu_before_percent": psutil.cpu_percent(interval=.2), "samples": []}
     historical = request.get("qualification_scope") == HISTORICAL_SCOPE
+    unbudgeted = request.get("memory_regime") == "unbudgeted_landing"
+    if unbudgeted:
+        proof_budget = request.get("candidate_memory_budget_bytes")
+        if not historical or type(proof_budget) is not int or proof_budget <= 0:
+            raise CampaignError("unbudgeted worker requires historical scope and positive separate proof budget")
+        if any(Scenario.from_dict(spec).family != "landing" or Scenario.from_dict(spec).query_memory_budget_bytes is not None for spec in request["scenarios"]):
+            raise CampaignError("unbudgeted worker requires landing without temporal quota")
+        report.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=proof_budget)
     if historical:
         report.update(source_identity(source, revision))
     output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
@@ -418,7 +426,7 @@ def run_worker(request, output):
         report["cpu_after_percent"] = psutil.cpu_percent(interval=.2)
         if historical and request["arm"] == "B":
             with tempfile.TemporaryDirectory(prefix="memory-evidence-", dir=output.parent) as directory:
-                budgets = {Scenario.from_dict(spec).query_memory_budget_bytes for spec in request["scenarios"]}
+                budgets = {proof_budget} if unbudgeted else {Scenario.from_dict(spec).query_memory_budget_bytes for spec in request["scenarios"]}
                 report["candidate_memory_evidence"] = collect_candidate_memory(report, budgets, directory)
         if _git(source, "rev-parse", "HEAD") != revision or _git(source, "status", "--porcelain"):
             raise CampaignError("source changed during worker execution")

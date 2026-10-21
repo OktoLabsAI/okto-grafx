@@ -142,11 +142,20 @@ def run_campaign(args):
     sources = {"A": args.baseline.resolve(), "B": args.candidate.resolve()}
     revisions = {arm: subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
                  for arm, root in sources.items()}
-    historical = getattr(args, "historical_noop", False)
+    unbudgeted = getattr(args, "historical_unbudgeted_landing", False)
+    proof_budget = getattr(args, "candidate_memory_budget", None)
+    historical = getattr(args, "historical_noop", False) or unbudgeted
+    if unbudgeted:
+        if args.memory_budget is not None or type(proof_budget) is not int or proof_budget <= 0:
+            raise CampaignError("unbudgeted landing requires no temporal quota and a positive separate candidate memory budget")
+        if any(s["family"] != "landing" or s["query_memory_budget_bytes"] is not None for s in selected):
+            raise CampaignError("unbudgeted landing only supports landing scenarios without temporal quota")
+    elif proof_budget is not None:
+        raise CampaignError("separate candidate memory budget only applies to unbudgeted landing")
     if historical:
         if args.mode != "noop" or revisions["A"] != HISTORICAL_REVISION or revisions["B"] == HISTORICAL_REVISION:
             raise CampaignError("historical noop requires the exact original baseline and a distinct candidate")
-        if args.memory_budget is None or args.max_cpu_percent > 20:
+        if (args.memory_budget is None and not unbudgeted) or args.max_cpu_percent > 20:
             raise CampaignError("historical noop requires explicit candidate budget and CPU ceiling <=20%")
         if any(s["family"] in ("fts", "write") or s["writers"] != 1 or s["reader"] != "short" for s in selected):
             raise CampaignError("historical profile currently supports single-statement read controls only")
@@ -163,6 +172,8 @@ def run_campaign(args):
             raise CampaignError("rerun must preserve revisions and registered noise policy")
         if previous_data.get("qualification_scope") != (HISTORICAL_SCOPE if historical else None):
             raise CampaignError("rerun cannot change historical/comparable-observer scope")
+        if previous_data.get("memory_regime", "budgeted") != ("unbudgeted_landing" if unbudgeted else "budgeted") or previous_data.get("candidate_memory_budget_bytes") != proof_budget:
+            raise CampaignError("rerun must preserve memory regime and separate proof budget")
         if historical and compare_campaign(previous_data)["decision"] != "inconclusive":
             raise CampaignError("historical retry is allowed only after a complete inconclusive campaign")
     data = {"schema_version": "grafx-campaign/v1", "intent": args.intent, "mode": args.mode,
@@ -178,6 +189,8 @@ def run_campaign(args):
                                for path in Path(__file__).parent.glob("campaign*.py")}}
     if historical:
         data["qualification_scope"] = HISTORICAL_SCOPE
+    if unbudgeted:
+        data.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=proof_budget)
     calibration_path = getattr(args, "calibration", None)
     if calibration_path is not None:
         raw = calibration_path.read_text(encoding="utf-8")
@@ -191,6 +204,8 @@ def run_campaign(args):
                    "pair": pair, "run_order": order, "scenarios": selected}
         if historical:
             request["qualification_scope"] = HISTORICAL_SCOPE
+        if unbudgeted:
+            request.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=proof_budget)
         request_path = output / f"request-{pair}-{arm}.json"
         raw_path = output / f"raw-{pair}-{arm}.json"
         _write(request_path, request)
@@ -235,6 +250,10 @@ def main(argv=None):
     run.add_argument("--intent", choices=("exploratory", "qualification"), default="exploratory")
     run.add_argument("--historical-noop", action="store_true",
                      help="RF01 edition 3: exact original baseline, candidate memory proof, no comparative memory claim")
+    run.add_argument("--historical-unbudgeted-landing", action="store_true",
+                     help="historical landing without temporal quota; separate candidate memory proof required")
+    run.add_argument("--candidate-memory-budget", type=int,
+                     help="positive budget for separate untimed candidate proof in unbudgeted landing regime")
     run.add_argument("--calibrated-executor", action="store_true")
     run.add_argument("--calibration", type=Path, help="hashed executor control receipt; a boolean alone cannot qualify")
     run.add_argument("--worker-timeout", type=float, default=3600)
