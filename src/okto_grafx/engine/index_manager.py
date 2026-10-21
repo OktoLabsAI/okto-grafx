@@ -7805,14 +7805,14 @@ class IndexManager:
             )
         read = self._heap.read_landing if landing else self._heap.read
         wanted = index._require_key(key)
+        identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
 
         def confirm(
             certificate: _IndexReadCertificate,
         ) -> tuple[_ReadResult, ...]:
             """Validate candidates against heap frames bound to this index generation."""
-            scope = self._statement_work
+            scope = self._statement_work if identity else None
             statistics = None if scope is None else scope.current_statistics()
-            identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
             self._prepare_heap_view(index.file, certificate)
             confirmed: list[_ReadResult] = []
             for entry in index._candidates_unchecked(wanted):

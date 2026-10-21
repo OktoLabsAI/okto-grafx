@@ -79,6 +79,36 @@ def test_certificate_retry_counts_discarded_work_without_fallback(monkeypatch):
                      "index_probe_keys": 4, "physical_node_versions_examined": 4}
 
 
+@pytest.mark.parametrize("visible", [True, False])
+def test_column_seek_needs_no_landing_observation_even_after_retry(monkeypatch, visible):
+    database, refs, scope = _observed_index()
+
+    class NoLandingObservation:
+        def current_statistics(self):
+            raise AssertionError("Column validation must not request landing observation")
+
+    # Store/heap retain their real scope: only the manager's identity-landing
+    # observer is unavailable. Physical work still has to be measured exactly.
+    database.manager._statement_work = NoLandingObservation()
+    finish = HashIndex.finish_exact_read
+    attempts = []
+
+    def changed_once(store, certificate, lsn):
+        accepted = finish(store, certificate, lsn)
+        attempts.append(1)
+        return accepted and len(attempts) > 1
+
+    monkeypatch.setattr(HashIndex, "finish_exact_read", changed_once)
+    stats = {}
+    with scope.bind(stats):
+        answer = database.manager.validated_versions(
+            database.exact, _keys(database, 2)[0], SnapshotDouble(BORN if visible else BORN - 1)
+        )
+    assert tuple(ref for ref, _ in answer) == ((refs[1],) if visible else ())
+    assert stats == {"certificate_attempts": 2, "certificate_retries": 1,
+                     "index_probe_keys": 2, "physical_node_versions_examined": 2}
+
+
 def test_cached_groups_keep_certificate_but_skip_probes_and_heap_reads():
     database, _, scope = _observed_index()
     keys = _keys(database, 2)
