@@ -2,6 +2,9 @@
 
 These four methods establish functional contracts. Synthetic campaign records
 exercise validation only; passing them is NOT temporal overhead qualification.
+Native fixtures explicitly use pure codec/vector adapters in every metrics mode and reopen,
+so the Pulse Python runner does not require NumPy. Production defaults remain
+unchanged; this wrapper does not qualify the NumPy codec's performance.
 """
 import copy
 import hashlib
@@ -147,7 +150,7 @@ class RF01Evidence(unittest.TestCase):
         query = "MATCH (n:A) WHERE n.id IN $ids RETURN n.id, n.v"
         def reasons(result):
             return {k: v for k, v in result.statistics.items() if k.startswith("fallback_reason_")}
-        with TemporaryDirectory(prefix="grafx-rf01-fallback-") as root, grafx.connect(Path(root) / "db") as db:
+        with TemporaryDirectory(prefix="grafx-rf01-fallback-") as root, grafx.connect(Path(root) / "db", codec="pure", vector_math="pure") as db:
             with db.begin("write") as tx:
                 tx.execute("CREATE NODE TABLE A(id STRING, v INT64, PRIMARY KEY(id))")
                 for number in range(1, 6):
@@ -195,7 +198,7 @@ class RF01Evidence(unittest.TestCase):
         self.assertEqual(catalog.METRIC_CATALOG, catalog_before)
         scenario = fixtures.Scenario(name="cursor", family="node_scan", nodes=8, cursor_batch_size=1)
         with TemporaryDirectory(prefix="grafx-rf01-functional-") as root:
-            with grafx.connect(Path(root) / "read") as db:
+            with grafx.connect(Path(root) / "read", codec="pure", vector_math="pure") as db:
                 fixtures.build_fixture(db, scenario)
                 sample = worker.measure_statement(db, scenario, 0)
                 self.assertEqual(sample["result_hash"], sample["expected_result_hash"])
@@ -210,12 +213,12 @@ class RF01Evidence(unittest.TestCase):
                     self.assertTrue(cursor.closed)
                 self.assertEqual(db.transactions.open_transactions, 0)
             write = fixtures.Scenario(name="write", family="write", nodes=4, write_rows=2)
-            with grafx.connect(Path(root) / "write") as db:
+            with grafx.connect(Path(root) / "write", codec="pure", vector_math="pure") as db:
                 fixtures.build_fixture(db, write)
                 sample = worker.measure_statement(db, write, 0)
                 self.assertEqual(sample["result_hash"], sample["expected_result_hash"])
                 self.assertIsNotNone(sample["commit_ns"])
-            with grafx.connect(Path(root) / "write") as db:
+            with grafx.connect(Path(root) / "write", codec="pure", vector_math="pure") as db:
                 self.assertEqual(db.execute("MATCH (n:W) RETURN n.id,n.payload ORDER BY n.id").rows, fixtures.oracle(write))
         # Even complete modeled timings cannot qualify without executor proof.
         # Real query success above supplies functionality, never overhead proof.
@@ -227,10 +230,10 @@ class RF01Evidence(unittest.TestCase):
 
     def _metrics_compatibility_case(self, path, mode):
         sink = None if mode == "noop" else _CompatibilitySink(inject=mode == "injected")
-        kwargs = {}
+        kwargs = {"codec": "pure", "vector_math": "pure"}
         if sink is not None:
             bootstrap = import_module("okto_grafx.runtime.bootstrap")
-            registry = bootstrap.build_default_registry(grafx.DatabaseConfig(path=str(path)))
+            registry = bootstrap.build_default_registry(grafx.DatabaseConfig(path=str(path), codec="pure", vector_math="pure"))
             registry.bind("metrics", sink)
             kwargs["registry"] = registry
         outcome = {"reads": [], "errors": []}
@@ -292,7 +295,7 @@ class RF01Evidence(unittest.TestCase):
                 else:
                     self.assertEqual(sink.failures, [])
             self.assertIsNone(db._queries._statement_work.current_statistics())
-        with grafx.connect(path) as reopened:
+        with grafx.connect(path, codec="pure", vector_math="pure") as reopened:
             outcome["durable"] = reopened.execute("MATCH (n:N) RETURN n.id,n.value ORDER BY n.id").rows
             self.assertEqual(outcome["durable"], ((1, 1), (2, 2), (3, 3), (4, 40)))
             self.assertFalse(reopened.verify("all").findings)
