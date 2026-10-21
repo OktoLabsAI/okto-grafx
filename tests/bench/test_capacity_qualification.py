@@ -98,6 +98,29 @@ def test_equal_work_external_transaction_batches_have_durable_ack_and_reopen(tmp
             capacity.validate_sample(damaged, scenario)
 
 
+def test_qualified_capacity_recipe_rejects_logical_peak_over_quota(tmp_path):
+    scenario = replace(next(s for s in capacity.matrix(Scenario) if s.capacity_case == "external"
+                            and s.capacity_batch_size == 0), nodes=4, write_rows=4)
+    with connect(tmp_path / "quota", codec="pure", vector_math="pure",
+                 **capacity.connect_options(scenario)) as db:
+        capacity.build_fixture(db, scenario)
+        sample = capacity.measure(db, scenario, 5, measure_statement)
+    from bench.harness.campaign_schema import CampaignError, compare_campaign
+    from tests.bench.test_campaign_schema import campaign
+    data = campaign()
+    data.update(mode="recipe", intent="qualification", scenarios=[scenario.to_dict()])
+    for run in data["runs"]:
+        run["samples"] = []
+        for index in range(25):
+            repeated = deepcopy(sample)
+            repeated.update(index=index, kind="warmup" if index < 5 else "retained")
+            run["samples"].append(repeated)
+    assert compare_campaign(data)["decision"] == "tradeoff_reported"
+    data["runs"][0]["samples"][0]["memory"]["logical_memory_peak_bytes"] = (1 << 20) + 1
+    with pytest.raises(CampaignError, match="RF12 qualified recipe requires a covered logical peak"):
+        compare_campaign(data)
+
+
 @pytest.mark.parametrize("case", ["retained", "released", "external"])
 def test_real_capacity_recipe_keeps_snapshot_and_diagnostic_contract(tmp_path, case):
     scenario = capacity.matrix(Scenario)[0]

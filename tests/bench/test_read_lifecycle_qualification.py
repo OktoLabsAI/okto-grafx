@@ -100,6 +100,7 @@ def test_qualified_read_recipe_accepts_first_row_and_bound_ownership_proof():
     lambda d: d["runs"][0]["samples"][0]["statistics"].update(diagnostic_handle_close_complete=0),
     lambda d: d["runs"][0]["samples"][0]["statistics"].pop("diagnostic_partial_owned_transactions"),
     lambda d: d["runs"][0]["samples"][0]["memory"].update(coverage="single_statement_only"),
+    lambda d: d["runs"][0]["samples"][0]["memory"].update(logical_memory_peak_bytes=(1 << 20) + 1),
     lambda d: d["runs"][0]["samples"][0].update(memory_budget_bytes=None),
 ])
 def test_qualified_read_recipe_rejects_missing_or_misattributed_evidence(tamper):

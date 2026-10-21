@@ -562,9 +562,18 @@ def _validate(data):
                 _require(scenario.query_memory_budget_bytes is not None
                          and sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes
                          and memory["logical_memory_peak_bytes"] is not None
+                          and memory["logical_memory_peak_bytes"] <= scenario.query_memory_budget_bytes
                          and memory["coverage"] == expected_coverage
                          and memory["unavailable_reason"] is None,
-                         "RF10 qualified recipe requires its covered logical-memory observer")
+                          "RF10 qualified recipe requires a covered logical peak within its budget")
+            if scenario.family == "capacity" and data["intent"] == "qualification":
+                _require(scenario.query_memory_budget_bytes is not None
+                         and sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes
+                         and memory["logical_memory_peak_bytes"] is not None
+                         and memory["logical_memory_peak_bytes"] <= scenario.query_memory_budget_bytes
+                         and memory["coverage"] == LOGICAL_COVERAGE
+                         and memory["unavailable_reason"] is None,
+                         "RF12 qualified recipe requires a covered logical peak within its budget")
             if rf06_split:
                 _integer(sample["statistics"].get("certificate_attempts"), "RF06 certificate attempts", 1)
                 _integer(sample["statistics"].get("landing_candidates"), "RF06 landing candidates", 1)
