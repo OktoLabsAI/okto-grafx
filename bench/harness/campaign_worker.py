@@ -229,7 +229,8 @@ def source_identity(source, revision):
         if Path(module.__file__).resolve() != expected:
             raise CampaignError("logical observer import provenance mismatch")
         blob = subprocess.check_output(["git", "-C", str(source), "show", f"{revision}:{relative}"])
-        if expected.read_bytes().replace(b"\r\n", b"\n") != blob.replace(b"\r\n", b"\n"):
+        crlf, lf = bytes((13, 10)), bytes((10,))
+        if expected.read_bytes().replace(crlf, lf) != blob.replace(crlf, lf):
             raise CampaignError("logical observer source differs from committed blob")
         hashes[relative] = hashlib.sha256(blob).hexdigest()
     return {"source_tree": _git(source, "rev-parse", f"{revision}^{{tree}}"),
