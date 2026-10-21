@@ -4725,16 +4725,34 @@ class _Planner:
 
         predicate: Expression | None = None
         scan = pipeline
-        if isinstance(scan, FilterRows):
-            predicate = scan.predicate
+        while isinstance(scan, FilterRows):
+            if predicate is not None and not isinstance(scan.predicate, LabelPredicate):
+                # Separate WHERE stages drop NULL before the outer stage runs;
+                # combining arbitrary stages with AND would evaluate its RHS.
+                # A membership test on this concrete node source is two-valued.
+                return None
+            # Preserve every membership/WHERE predicate. Inner filters run first;
+            # totality below is required before a bounded ordered read is legal.
+            predicate = (scan.predicate if predicate is None else
+                         BinaryOperation("AND", scan.predicate, predicate))
             scan = scan.child
         if (
-            not isinstance(scan, AllNodesScan)
+            not isinstance(scan, (AllNodesScan, NodeScan))
             or not isinstance(scan.child, SingleRow)
             or scan.variable != first_subject.name
-            or not scan.tables
         ):
             return None
+        tables = (scan.table,) if isinstance(scan, NodeScan) else scan.tables
+        if not tables:
+            return None
+        pending = [] if predicate is None else [predicate]
+        while pending:
+            expression = pending.pop()
+            # RF05 adds only unambiguous label ownership. Existing unlabeled
+            # polymorphic merges keep their original eligibility and fallback.
+            if isinstance(expression, LabelPredicate) and len(tables) != 1:
+                return None
+            pending.extend(expression.children())
         if predicate is not None and not self._ordered_filter_is_total(
             predicate, scan.variable
         ):
@@ -4749,7 +4767,7 @@ class _Planner:
         string_column = second.expression.key
         ordered_tables: list[TableDef] = []
         index_names: list[str] = []
-        for table in scan.tables:
+        for table in tables:
             timestamp_definition = self._column_of(table, timestamp_column)
             string_definition = self._column_of(table, string_column)
             if timestamp_definition is None or string_definition is None:
@@ -4865,6 +4883,10 @@ class _Planner:
     def _ordered_filter_is_total(expression: Expression, variable: str) -> bool:
         """Admit only the scalar predicate subset that cannot hide a late refusal."""
 
+        if isinstance(expression, LabelPredicate):
+            # The selected source supplies a real node binding. Membership is
+            # evaluated from its MVCC version, never inferred from the table name.
+            return isinstance(expression.subject, Variable) and expression.subject.name == variable
         if isinstance(expression, NullCheck):
             return _Planner._ordered_filter_operand(expression.operand, variable)
         if isinstance(expression, UnaryOperation):

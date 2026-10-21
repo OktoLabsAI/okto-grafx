@@ -7,6 +7,13 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### RF05 ordered pages with label membership
+
+- Admit a single label-selected node owner to the existing ordered page path,
+  preserving membership before LIMIT and canonical fallbacks. Add exact-sequence,
+  bounded-candidate, snapshot and refusal tests. See
+  [eligibility and limits](docs/RF05_PAGINATION.md); no temporal gain is claimed.
+
 ### RF10 explicit read lifecycle recipes
 
 - Document shared versus independent read snapshots, 16-key groups, keyset
