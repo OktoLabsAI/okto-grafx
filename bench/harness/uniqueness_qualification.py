@@ -99,6 +99,8 @@ def validate_sample(sample, scenario, *, arm):
             raise ValueError("RF08 certified work differs from target")
     memory = sample.get("memory", {})
     if scenario.query_memory_budget_bytes is None:
+        if "quota_retention" in evidence:
+            raise ValueError("RF08 unbudgeted sample cannot claim quota retention")
         if (memory.get("logical_memory_peak_bytes") is not None
                 or memory.get("coverage") != "unavailable"
                 or memory.get("unavailable_reason") != "query_memory_budget_disabled"):
@@ -107,3 +109,16 @@ def validate_sample(sample, scenario, *, arm):
           or memory.get("coverage") == "unavailable"
           or memory.get("unavailable_reason") is not None):
         raise ValueError("RF08 quota control requires a measured logical peak")
+    else:
+        retention = evidence.get("quota_retention")
+        if not isinstance(retention, dict):
+            raise ValueError("RF08 quota control lacks retention proof")
+        before = retention.get("retained_before_bytes")
+        after = retention.get("retained_after_bytes")
+        if type(before) is not int or before < 0 or type(after) is not int or after != before:
+            raise ValueError("RF08 quota control retained logical memory after close")
+        if retention.get("open_transactions_after") != 0:
+            raise ValueError("RF08 quota control left an open transaction")
+        if (memory["baseline_retained_bytes"] != before
+                or memory["logical_memory_peak_bytes"] > scenario.query_memory_budget_bytes):
+            raise ValueError("RF08 quota control logical peak exceeds budget or baseline differs")

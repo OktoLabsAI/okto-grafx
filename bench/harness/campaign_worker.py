@@ -440,6 +440,7 @@ def measure_unique_create(db, scenario, index):
     plan = [type(node).__name__ for node in db.explain(query).walk()]
     prepare_ns = time.perf_counter_ns() - prepare_start
     observe = getattr(db._queries, "_observe_logical_memory", None)
+    retained_before = None
     if scenario.query_memory_budget_bytes is None:
         # Enabling the observer here adds tariffs to the timed path yet cannot
         # return a valid logical peak without a quota. Report the null honestly.
@@ -447,6 +448,8 @@ def measure_unique_create(db, scenario, index):
     else:
         if observe is None:
             raise CampaignError("RF08 quota control requires a logical-memory observer")
+        retained_before = (db._queries._owner_budget._used_bytes
+                           + db._queries._endpoint_budget._used_bytes)
         memory_scope = observe()
     with memory_scope as observation:
         tx = db.begin("write")
@@ -481,6 +484,13 @@ def measure_unique_create(db, scenario, index):
         "ack": {"csn": int(ack.csn), "durable": ack.durable, "wrote": ack.wrote},
         "reopened": False,
     }
+    if retained_before is not None:
+        sample["unique_create"]["quota_retention"] = {
+            "retained_before_bytes": retained_before,
+            "retained_after_bytes": (db._queries._owner_budget._used_bytes
+                                     + db._queries._endpoint_budget._used_bytes),
+            "open_transactions_after": db.transactions.open_transactions,
+        }
     return sample
 
 

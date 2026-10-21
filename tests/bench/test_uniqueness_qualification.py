@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from bench.harness import campaign_fixtures, campaign_worker, uniqueness_qualification as rf08
+from bench.harness import campaign_fixtures, campaign_schema, campaign_worker, uniqueness_qualification as rf08
 from okto_grafx import connect
 from okto_grafx.engine import query_engine as qe
 
@@ -44,6 +44,12 @@ def test_target_and_scalar_oracle_share_rows_but_not_certificate_work(tmp_path):
     assert candidate["memory"]["logical_memory_peak_bytes"] is None
     assert candidate["memory"]["unavailable_reason"] == "query_memory_budget_disabled"
     assert guarded["memory"]["logical_memory_peak_bytes"] is not None
+    assert guarded["memory"]["logical_memory_peak_bytes"] <= rf08.QUOTA_BYTES
+    assert guarded["unique_create"]["quota_retention"] == {
+        "retained_before_bytes": guarded["memory"]["baseline_retained_bytes"],
+        "retained_after_bytes": guarded["memory"]["baseline_retained_bytes"],
+        "open_transactions_after": 0,
+    }
     rf08.validate_sample(candidate, target, arm="B")
     rf08.validate_sample(baseline, target, arm="A")
     rf08.validate_sample(guarded, quota, arm="B")
@@ -73,6 +79,36 @@ def test_metadata_tampering_cannot_claim_missing_ack_or_logical_peak(tmp_path):
     sample["memory"]["logical_memory_peak_bytes"] = 0
     with pytest.raises(ValueError, match="cannot claim logical memory"):
         rf08.validate_sample(sample, target, arm="B")
+
+
+def test_quota_control_rejects_retention_and_overbudget_peak(tmp_path):
+    quota = rf08.matrix(campaign_fixtures.Scenario)[2]
+    sample = _sample(tmp_path, quota)
+    sample["unique_create"]["quota_retention"]["retained_after_bytes"] += 1
+    with pytest.raises(ValueError, match="retained logical memory"):
+        rf08.validate_sample(sample, quota, arm="B")
+    sample["unique_create"]["quota_retention"]["retained_after_bytes"] -= 1
+    sample["memory"]["logical_memory_peak_bytes"] = rf08.QUOTA_BYTES + 1
+    with pytest.raises(ValueError, match="exceeds budget"):
+        rf08.validate_sample(sample, quota, arm="B")
+
+
+def test_qualification_requires_the_complete_rf08_matrix():
+    target, one, quota = rf08.matrix(campaign_fixtures.Scenario)
+    data = {
+        "schema_version": "grafx-campaign/v1", "mode": "optimization",
+        "intent": "qualification", "calibrated_executor": False,
+        "command": ["python", "-m", "bench.harness.campaign"],
+        "protocol": {"pairs": 3, "warmups": 5, "retained": 20,
+                     "orders": ["AB", "BA", "AB"], "attempt": 1,
+                     "previous_campaign_sha256": None, "max_cpu_percent": 20},
+        "scenarios": [target.to_dict(), one.to_dict()], "runs": [],
+    }
+    with pytest.raises(campaign_schema.CampaignError, match="exact 128/1/128-quota"):
+        campaign_schema.validate_campaign(data)
+    data["scenarios"].append(quota.to_dict())
+    with pytest.raises(campaign_schema.CampaignError, match="six independent process runs"):
+        campaign_schema.validate_campaign(data)
 
 
 def test_failed_duplicate_has_no_ack_or_persisted_prefix(tmp_path):

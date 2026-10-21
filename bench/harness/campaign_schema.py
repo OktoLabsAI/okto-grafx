@@ -286,8 +286,6 @@ def _validate(data):
         if scenario.family == "unique_create":
             _require(data["mode"] == "optimization" and not historical,
                      "RF08 CREATE requires its own optimization matrix")
-            _require(data["intent"] == "exploratory",
-                     "unbudgeted RF08 batch lacks logical peak; temporal run is diagnostic until formal criterion revision")
         if historical:
             if unbudgeted:
                 _require(scenario.family == "landing" and scenario.query_memory_budget_bytes is None,
@@ -304,6 +302,13 @@ def _validate(data):
                                       "contract_hash": canonical_hash(contract(scenario)),
                                       "expected_result_hash": canonical_hash(expected_rows),
                                       "result_hash": canonical_hash(expected_rows), "rows": len(expected_rows)}
+    rf08_qualification = (data["intent"] == "qualification"
+                          and any(s.family == "unique_create" for s in scenarios.values()))
+    if rf08_qualification:
+        from bench.harness.uniqueness_qualification import matrix as rf08_matrix
+        expected = {scenario.name: scenario.to_dict() for scenario in rf08_matrix(Scenario)}
+        _require({name: scenario.to_dict() for name, scenario in scenarios.items()} == expected,
+                 "RF08 qualification requires the exact 128/1/128-quota scenario matrix")
     fts_recipe = data["mode"] == "recipe" and all(s.family == "fts_matrix" for s in scenarios.values())
     if data["intent"] == "qualification" and any(s.family == "fts_matrix" for s in scenarios.values()):
         _require(fts_recipe, "qualified native FTS recipes cannot mix memory coverage with other families")
@@ -432,6 +437,20 @@ def _validate(data):
                         raise CampaignError(str(exc)) from exc
                     _require(sample["unique_create"]["reopened"] is True,
                              "RF08 read-only reopen and verify proof missing")
+                    if rf08_qualification:
+                        _require(sample["rss_peak_bytes"] > 0 and sample["rss_scope"] in (
+                            "process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"),
+                            "RF08 qualification requires real process RSS in both arms")
+                        _require(sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes,
+                                 "RF08 observed memory budget differs from scenario")
+                        if scenario.query_memory_budget_bytes is None:
+                            _require(sample["memory"]["logical_memory_peak_bytes"] is None
+                                     and sample["memory"]["coverage"] == "unavailable"
+                                     and sample["memory"]["unavailable_reason"] == "query_memory_budget_disabled",
+                                     "RF08 unbudgeted diagnostic must report null logical peak")
+                        else:
+                            _require(sample["memory"]["coverage"] == LOGICAL_COVERAGE,
+                                     "RF08 quota control requires covered logical peak")
                 else:
                     validate_write_sample(sample, scenario, qualification=data["intent"] == "qualification")
                 if data["intent"] == "qualification" and scenario.family == "write" and scenario.writers > 1:
@@ -477,7 +496,8 @@ def _validate(data):
                                           memory["unavailable_reason"] == "native_fts_memory_not_covered_by_query_budget_observer" and
                                           sample["rss_peak_bytes"] > 0 and sample["rss_scope"] in (
                                               "process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"))
-                _require((scenario.family == "write" and scenario.writers > 1) or (historical and (arm == "A" or unbudgeted)) or native_fts_unavailable or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
+                rf08_unbudgeted = rf08_qualification and scenario.family == "unique_create" and scenario.query_memory_budget_bytes is None
+                _require((scenario.family == "write" and scenario.writers > 1) or (historical and (arm == "A" or unbudgeted)) or native_fts_unavailable or rf08_unbudgeted or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
             else:
                 _integer(memory["logical_memory_peak_bytes"], "logical_memory_peak_bytes")
                 _require(memory["logical_memory_peak_bytes"] >= memory["baseline_retained_bytes"], "memory peak below baseline")
@@ -706,7 +726,9 @@ def compare_campaign(data):
                 comparisons[-1]["unique_create_diagnostic"] = {
                     "atomic_unit": "one transaction; one durable ACK",
                     "memory_limit": "unbudgeted batch has no logical peak; budgeted scalar control is separate",
-                    "comparison_limit": "exploratory until RF08 temporal and memory criteria are formally aligned",
+                    "comparison_limit": ("qualified batch timing is unbudgeted; quota control proves scalar memory only"
+                                         if data["intent"] == "qualification" else
+                                         "exploratory RF08 diagnostic"),
                     "by_arm": {arm: {
                         "batch_groups": _distribution([s["statistics"].get("pk_uniqueness_batches", 0)
                                                        for s in rows], "count"),
