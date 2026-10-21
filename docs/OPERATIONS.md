@@ -104,7 +104,9 @@ nonretryable. Custom trusted adapters may propagate their own exceptions.
 Conservative conflict-only application recipe. `operation(txn)` must recompute
 business decisions from that attempt's snapshot, not replay previously calculated
 values. It must not send external messages or perform host side effects. This is
-application code, not a new Grafx API. The budget bounds attempts, not elapsed time.
+application code, not a new Grafx API. A fixed `statement, parameters` pair also
+remains usable for operations that do not require business recomputation. The
+budget bounds attempts, not elapsed time.
 `pause` permits an application-owned backoff/deadline policy outside the transaction.
 
 <!-- rf09-conflict-recipe -->
@@ -114,7 +116,10 @@ import random
 import time
 from okto_grafx.errors import GrafxWriteConflict
 
-def write_with_conflict_retry(db, operation, attempts=3, pause=time.sleep):
+def write_with_conflict_retry(db, operation, parameters=None, attempts=3, pause=time.sleep):
+    if parameters is not None:
+        statement = operation
+        operation = lambda txn: txn.execute(statement, parameters)
     if attempts < 1:
         raise ValueError("attempts must be positive")
     for attempt in range(attempts):
