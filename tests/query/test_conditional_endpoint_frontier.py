@@ -17,6 +17,22 @@ def test_selective_conditional_frontier_uses_endpoint_lookups(database):
     assert result.statistics.get("edge_scans", 0) == 0
 
 
+def test_sixteen_in_starts_cross_with_without_edge_census(database):
+    with database.begin("write") as tx:
+        tx.execute(
+            "UNWIND $ids AS id CREATE (:A {id:id,v:1})",
+            {"ids": [f"a{i}" for i in range(6, 17)]},
+        )
+    query = (
+        "MATCH (a:A) WHERE a.id IN $ids WITH a "
+        "MATCH (a)-[r:R]->(b:B) RETURN a.id,b.id"
+    )
+    result = database.execute(query, {"ids": [f"a{i}" for i in range(1, 17)]})
+    assert result.rows == (("a1", "b1"),)
+    assert result.statistics.get("edge_lookups") == 16
+    assert result.statistics.get("edge_scans", 0) == 0
+
+
 def test_conditional_frontier_matches_grouped_scan_on_fallback(database, monkeypatch):
     fast = database.execute(QUERY, {"ids": ["a1", "a2"]})
     with monkeypatch.context() as patch:
