@@ -12,7 +12,9 @@ import time
 import uuid
 
 BASELINE = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
-MINIMUM_CONTROLS = frozenset({"constant", "reader-short-churn0", "edges-n1024-uniform-x1"})
+MINIMUM_CONTROLS = frozenset({"constant", "reader-short-churn0", "edges-n1024-uniform-x1",
+                              "pk-seek-control", "landing-control"})
+LANDING_CONTROL = "landing-control"
 PHYSICAL_COVERAGE = (
     "physical_node_versions_examined", "physical_edge_versions_examined",
     "index_probe_keys", "certificate_attempts", "landing_candidates", "landing_batches",
@@ -52,10 +54,57 @@ def validate_controls(manifest):
                     raise ValueError("unknown or duplicate scenario")
                 destination.append(name)
     if not MINIMUM_CONTROLS <= set(selected):
-        raise ValueError("minimum statement, cursor and edge controls required")
+        raise ValueError("minimum statement, cursor, edge, seek and landing controls required")
     if set(selected) & set(excluded) or set(selected) | set(excluded) != catalog:
         raise ValueError("selected and omitted scenarios must partition the catalog")
     return selected
+
+
+def partition_controls(selected):
+    """Landing has no query quota; every other selected control keeps one."""
+    if selected.count(LANDING_CONTROL) != 1:
+        raise ValueError("exactly one landing control required")
+    return [name for name in selected if name != LANDING_CONTROL], [LANDING_CONTROL]
+
+
+def _positive_budget(value, label):
+    if type(value) is not int or not 1 <= value <= 64 * 1024 * 1024:
+        raise ValueError(f"{label} must be a positive bounded integer")
+    return value
+
+
+def _deadline(value):
+    # The host profile is separately registered by a local operator. This cap
+    # only narrows that authority; the manifest cannot enlarge a Pulse profile.
+    if type(value) is not int or not 120 <= value <= 1800:
+        raise ValueError("qualification deadline must be 120..1800 seconds")
+    return value
+
+
+def load_operational_manifest(base):
+    from bench.harness.campaign_schema import load_json
+
+    path = canonical_path(base / "rf01-qualification.json")
+    payload = path.read_bytes()
+    manifest = load_json(payload.decode("utf-8"))
+    expected = {"schema_version", "candidate_root", "baseline_root", "python",
+                "candidate_revision", "output", "controls", "not_applicable",
+                "budgeted_memory_budget_bytes", "candidate_memory_proof_budget_bytes",
+                "timeout_seconds", "attempt", "previous_aggregate"}
+    if not isinstance(manifest, dict) or set(manifest) != expected:
+        raise ValueError("unknown or missing operational manifest field")
+    if manifest["schema_version"] != "grafx-pulse-qualification/v3":
+        raise ValueError("unsupported operational manifest")
+    selected = validate_controls(manifest)
+    budgeted, landing = partition_controls(selected)
+    _positive_budget(manifest["budgeted_memory_budget_bytes"], "budgeted query quota")
+    _positive_budget(manifest["candidate_memory_proof_budget_bytes"], "candidate proof quota")
+    _deadline(manifest["timeout_seconds"])
+    if type(manifest["attempt"]) is not int or manifest["attempt"] not in (1, 2):
+        raise ValueError("only one complete repeat is allowed")
+    if (manifest["attempt"] == 1) != (manifest["previous_aggregate"] is None):
+        raise ValueError("second attempt requires the first aggregate")
+    return payload, manifest, budgeted, landing
 
 
 def control_observations(raw):
@@ -80,12 +129,7 @@ def control_observations(raw):
                 counts[name] += value
                 observed[name] += value
     return {"counters": counts, "by_scenario": by_scenario,
-            "uncovered_instrumentation": [name for name, count in counts.items()
-                                          if count == 0 and name not in SEPARATE_LANDING_COVERAGE],
-            "separate_evidence_required": list(SEPARATE_LANDING_COVERAGE),
-            "separation_reason": "The historical campaign requires an explicit memory budget; "
-                                 "the existing executor guard disables batched landings with that budget. "
-                                 "Landing qualification requires a separately reviewed method; it is not N/A."}
+            "uncovered_instrumentation": [name for name, count in counts.items() if count == 0]}
 
 
 def canonical_path(value):
@@ -176,29 +220,122 @@ def verify_snapshot(snapshot, tracked):
             raise ValueError("runner snapshot differs from candidate: " + name)
 
 
-def run(snapshot):
-    """Supervise *all* qualification phases below the native 120-second cap.
+def inspect_component(root, regime, names, manifest):
+    """Recompute one complete component and bind it to the aggregate inputs."""
+    from bench.harness.campaign_schema import compare_campaign, load_json
 
-    Inventories, filesystem hashing and final receipts run in the owned child,
-    so they cannot outlive the 105-second deadline. Timeout leaves an explicit
-    failed supervisor receipt and any partial child artifacts, never a pass.
+    raw = load_json((root / "campaign.json").read_text(encoding="utf-8"))
+    stored = load_json((root / "report.json").read_text(encoding="utf-8"))
+    report = compare_campaign(raw)
+    if stored != report:
+        raise ValueError(f"{regime} retained report differs from raw campaign")
+    if (raw["intent"] != "qualification" or raw["mode"] != "noop"
+            or [scenario["name"] for scenario in raw["scenarios"]] != names):
+        raise ValueError(f"{regime} controls differ from operational selection")
+    unbudgeted = regime == "landing"
+    if (raw.get("memory_regime", "budgeted") != ("unbudgeted_landing" if unbudgeted else "budgeted")
+            or raw.get("candidate_memory_budget_bytes") != (manifest["candidate_memory_proof_budget_bytes"] if unbudgeted else None)):
+        raise ValueError(f"{regime} memory regime differs from protocol")
+    expected_budget = None if unbudgeted else manifest["budgeted_memory_budget_bytes"]
+    if any(scenario["query_memory_budget_bytes"] != expected_budget for scenario in raw["scenarios"]):
+        raise ValueError(f"{regime} temporal memory quota differs from protocol")
+    if ({run["revision"] for run in raw["runs"] if run["arm"] == "A"} != {BASELINE}
+            or {run["revision"] for run in raw["runs"] if run["arm"] == "B"} != {manifest["candidate_revision"]}):
+        raise ValueError(f"{regime} source revisions differ from protocol")
+    for run in raw["runs"]:
+        expected_root = manifest["baseline_root"] if run["arm"] == "A" else manifest["candidate_root"]
+        if run["source_root"] != expected_root:
+            raise ValueError(f"{regime} source root differs from protocol")
+    observed = control_observations(raw)
+    required = SEPARATE_LANDING_COVERAGE if unbudgeted else tuple(
+        name for name in PHYSICAL_COVERAGE if name not in SEPARATE_LANDING_COVERAGE)
+    uncovered = [name for name in required if observed["counters"][name] == 0]
+    if uncovered:
+        raise ValueError(f"{regime} lacks observed physical work: " + ", ".join(uncovered))
+    return report, observed
+
+
+def verify_previous_aggregate(manifest, base, output):
+    """An entire completed inconclusive pair permits one entire repeat."""
+    if manifest["attempt"] == 1:
+        return None
+    from bench.harness.campaign_schema import load_json
+
+    path = canonical_path(manifest["previous_aggregate"])
+    if path.name != "runner-receipt.json" or path.parent == output:
+        raise ValueError("previous aggregate receipt path invalid")
+    path.parent.relative_to(base / "runs")
+    payload = path.read_bytes()
+    previous = load_json(payload.decode("utf-8"))
+    matching = ("candidate_revision", "baseline_revision", "controls", "not_applicable",
+                "budgeted_memory_budget_bytes", "candidate_memory_proof_budget_bytes")
+    expected = dict(manifest, baseline_revision=BASELINE)
+    if (previous.get("attempt") != 1 or previous.get("decision") != "inconclusive"
+            or any(previous.get(key) != expected[key] for key in matching)):
+        raise ValueError("previous aggregate is not the same complete inconclusive protocol")
+    artifacts = previous.get("artifact_sha256")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise ValueError("previous aggregate artifact inventory absent")
+    required = {"operational-manifest.json", "calibration.json",
+                "budgeted/campaign.json", "landing/campaign.json",
+                "budgeted/report.json", "landing/report.json"}
+    if not required <= set(artifacts):
+        raise ValueError("previous aggregate is incomplete")
+    checked = set()
+    for name, digest in artifacts.items():
+        if (not isinstance(name, str) or not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise ValueError("invalid prior artifact inventory")
+        artifact = _tracked_path(path.parent, name, checked)
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != digest:
+            raise ValueError("previous aggregate artifact changed: " + name)
+    prior_manifest = load_json((path.parent / "operational-manifest.json").read_text(encoding="utf-8"))
+    if (hashlib.sha256((path.parent / "operational-manifest.json").read_bytes()).hexdigest() != previous.get("manifest_sha256")
+            or prior_manifest.get("schema_version") != "grafx-pulse-qualification/v3"
+            or prior_manifest.get("output") != str(path.parent)
+            or prior_manifest.get("attempt") != 1 or prior_manifest.get("previous_aggregate") is not None
+            or any(prior_manifest.get(key) != manifest[key] for key in
+                   ("candidate_root", "baseline_root", "python", "candidate_revision", "controls",
+                    "not_applicable", "budgeted_memory_budget_bytes", "candidate_memory_proof_budget_bytes"))):
+        raise ValueError("previous operational manifest changed")
+    budgeted, landing = partition_controls(validate_controls(manifest))
+    decisions = [inspect_component(path.parent / part, part, names, manifest)[0]["decision"]
+                 for part, names in (("budgeted", budgeted), ("landing", landing))]
+    if set(decisions) - {"passed", "inconclusive"} or "inconclusive" not in decisions:
+        raise ValueError("previous aggregate is not a complete inconclusive pair")
+    if previous.get("temporal_decisions") != dict(zip(("budgeted", "landing"), decisions)):
+        raise ValueError("previous aggregate decisions differ from retained raw campaigns")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def run(snapshot):
+    """Supervise the complete protocol under a locally authorized profile.
+
+    The manifest deadline only narrows the registered native runner deadline.
+    Timeout leaves an explicit failed receipt and any partial child artifacts.
     """
     from bench.harness.campaign import execute_worker
     started = time.monotonic()
     snapshot = canonical_path(snapshot)
     base = canonical_path(Path(os.environ["LOCALAPPDATA"]) / "Okto" / "Grafx")
+    manifest_bytes, manifest, _, _ = load_operational_manifest(base)
+    deadline = manifest["timeout_seconds"]
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
     audit = base / "runs" / ("supervisor-" + uuid.uuid4().hex)
     audit.mkdir(parents=True, exist_ok=False)
     result = audit / "result.json"
     launcher = ("import json,pathlib,sys;sys.path.insert(0,sys.argv[1]);"
                 "from bench.harness.pulse_qualification import _run;"
-                "r=_run(pathlib.Path(sys.argv[1]));"
-                "pathlib.Path(sys.argv[2]).write_text(json.dumps(r),encoding='utf-8')")
+                 "r=_run(pathlib.Path(sys.argv[1]),sys.argv[3]);"
+                 "pathlib.Path(sys.argv[2]).write_text(json.dumps(r),encoding='utf-8')")
     from bench.harness.campaign_schema import RUNNER_PYTHON_FLAGS
-    command = [sys.executable, *RUNNER_PYTHON_FLAGS, "-c", launcher, str(snapshot), str(result)]
-    receipt = {"decision": "failed", "command": command, "timeout_seconds": 105}
+    command = [sys.executable, *RUNNER_PYTHON_FLAGS, "-c", launcher,
+               str(snapshot), str(result), manifest_hash]
+    receipt = {"decision": "failed", "command": command,
+               "timeout_seconds": deadline, "manifest_sha256": manifest_hash,
+               "aggregate_attempt": manifest["attempt"]}
     try:
-        remaining = 105 - (time.monotonic() - started)
+        remaining = deadline - (time.monotonic() - started)
         if remaining <= 0:
             raise TimeoutError("supervisor setup exhausted deadline")
         with (audit / "supervisor.log").open("x", encoding="utf-8") as log:
@@ -206,9 +343,11 @@ def run(snapshot):
         if code:
             raise RuntimeError(f"qualification child exited {code}; see {audit}")
         child = json.loads(result.read_text(encoding="utf-8"))
+        receipt["aggregate_decision"] = child.get("decision")
+        receipt["aggregate_receipt"] = str(canonical_path(manifest["output"]) / "runner-receipt.json")
         if child.get("decision") != "passed":
             raise RuntimeError("qualification child did not pass")
-        if time.monotonic() - started >= 110:
+        if time.monotonic() - started >= deadline:
             raise TimeoutError("qualification exceeded supervisor deadline")
         receipt["decision"] = "passed"
         return child
@@ -220,13 +359,8 @@ def run(snapshot):
         (audit / "supervisor-receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
 
 
-def _run(snapshot):
-    """Run calibration plus six real workers, or fail with preserved artifacts.
-
-    A 90-second execution deadline reserves room below the native 120-second
-    cap for process-tree cleanup and provenance checks. It is not a claim that
-    any host can complete the campaign within that cap.
-    """
+def _run(snapshot, expected_manifest_sha256=None):
+    """Run calibration and both complete historical campaigns or fail closed."""
     from bench.harness.campaign import execute_worker
     from bench.harness import campaign, campaign_schema
 
@@ -236,15 +370,10 @@ def _run(snapshot):
 
     started = time.monotonic()
     base = canonical_path(Path(os.environ["LOCALAPPDATA"]) / "Okto" / "Grafx")
-    manifest_path = canonical_path(base / "rf01-qualification.json")
-    manifest_bytes = manifest_path.read_bytes()
-    manifest = campaign_schema.load_json(manifest_bytes.decode("utf-8"))
-    if manifest.get("schema_version") != "grafx-pulse-qualification/v2":
-        raise ValueError("unsupported operational manifest")
-    if set(manifest) != {"schema_version", "candidate_root", "baseline_root", "python",
-                         "candidate_revision", "output", "controls", "not_applicable"}:
-        raise ValueError("unknown or missing operational manifest field")
-    selected = validate_controls(manifest)
+    manifest_bytes, manifest, budgeted, landing = load_operational_manifest(base)
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    if expected_manifest_sha256 is not None and manifest_hash != expected_manifest_sha256:
+        raise ValueError("operational manifest changed after supervision began")
     candidate = canonical_path(manifest["candidate_root"])
     baseline = canonical_path(manifest["baseline_root"])
     python = canonical_path(manifest["python"])
@@ -258,55 +387,74 @@ def _run(snapshot):
     verify_snapshot(snapshot, before)
     output = canonical_path(manifest["output"])
     output.relative_to(base / "runs")
+    previous_hash = verify_previous_aggregate(manifest, base, output)
     output.mkdir(parents=True, exist_ok=False)
-    receipt = {"manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    (output / "operational-manifest.json").write_bytes(manifest_bytes)
+    receipt = {"manifest_sha256": manifest_hash,
                "candidate_revision": revision, "baseline_revision": BASELINE,
                "decision": "incomplete", "commands": [], "controls": manifest["controls"],
-               "not_applicable": manifest["not_applicable"]}
+                "not_applicable": manifest["not_applicable"], "attempt": manifest["attempt"],
+                "previous_aggregate_sha256": previous_hash,
+                "budgeted_memory_budget_bytes": manifest["budgeted_memory_budget_bytes"],
+                "candidate_memory_proof_budget_bytes": manifest["candidate_memory_proof_budget_bytes"],
+                "temporal_decisions": {}}
     try:
         # Pulse-compatible safe flags import the actual snapshot's harness;
         # each worker independently attests the requested checkout import.
         launcher = campaign_schema.CALIBRATION_LAUNCHER
         common = [str(python), *campaign_schema.RUNNER_PYTHON_FLAGS, "-c", launcher, str(snapshot)]
         calibration = output / "calibration.json"
+        common_run = ["--mode", "noop", "--intent", "qualification",
+                      "--baseline", str(baseline), "--candidate", str(candidate),
+                      "--max-cpu-percent", "20", "--calibrated-executor",
+                      "--calibration", str(calibration)]
         commands = [common + ["calibrate", "--output", str(calibration)],
-                    common + ["run", "--historical-noop", "--mode", "noop", "--intent", "qualification",
-                              "--baseline", str(baseline), "--candidate", str(candidate),
-                              "--memory-budget", "4096", "--max-cpu-percent", "20",
-                              *[part for name in selected for part in ("--scenario", name)],
-                              "--calibrated-executor",
-                              "--calibration", str(calibration), "--output", str(output / "campaign")]]
+                    common + ["run", "--historical-noop", *common_run,
+                              "--memory-budget", str(manifest["budgeted_memory_budget_bytes"]),
+                              *[part for name in budgeted for part in ("--scenario", name)],
+                              "--output", str(output / "budgeted")],
+                    common + ["run", "--historical-unbudgeted-landing", *common_run,
+                              "--candidate-memory-budget", str(manifest["candidate_memory_proof_budget_bytes"]),
+                              *[part for name in landing for part in ("--scenario", name)],
+                              "--output", str(output / "landing")]]
         for index, command in enumerate(commands):
-            remaining = 90 - (time.monotonic() - started)
+            remaining = manifest["timeout_seconds"] - (time.monotonic() - started) - 5
             if remaining <= 0:
                 raise TimeoutError("qualification deadline exhausted")
             receipt["commands"].append(command)
             with (output / f"phase-{index}.log").open("x", encoding="utf-8") as log:
                 code = execute_worker(command, log, remaining)
             if code:
-                raise RuntimeError(f"qualification phase {index} exited {code}; artifacts preserved")
+                # The campaign CLI returns 2 for an intact but inconclusive
+                # comparison as well as for invalid/failing campaigns. Only a
+                # complete, recomputed inconclusive result may proceed to the
+                # other campaign and the aggregate decision.
+                if index == 0 or code != 2:
+                    raise RuntimeError(f"qualification phase {index} exited {code}; artifacts preserved")
+                regime = "budgeted" if index == 1 else "landing"
+                phase_output = output / regime
+                try:
+                    expected = budgeted if regime == "budgeted" else landing
+                    recomputed, _ = inspect_component(phase_output, regime, expected, manifest)
+                except (OSError, ValueError, KeyError) as exc:
+                    raise RuntimeError(f"qualification phase {index} has no complete inconclusive campaign") from exc
+                if recomputed["decision"] != "inconclusive":
+                    raise RuntimeError(f"qualification phase {index} exited {code}; artifacts preserved")
             if index == 0:
                 actual = campaign_schema.load_json(calibration.read_text(encoding="utf-8"))
                 if actual["procedure"]["command"] != command:
                     raise ValueError("calibration interpreter argv differs from launched command")
-        from bench.harness.campaign_schema import compare_campaign, load_json
-        raw = load_json((output / "campaign" / "campaign.json").read_text(encoding="utf-8"))
-        report = compare_campaign(raw)
-        receipt["temporal_decision"] = report.get("decision")
-        if [scenario["name"] for scenario in raw["scenarios"]] != selected:
-            raise ValueError("campaign controls differ from operational selection")
-        receipt["physical_coverage"] = control_observations(raw)
-        if receipt["physical_coverage"]["uncovered_instrumentation"]:
-            raise ValueError("uncovered physical instrumentation: " + ", ".join(
-                receipt["physical_coverage"]["uncovered_instrumentation"]))
-        if report.get("decision") != "passed":
-            raise RuntimeError("campaign did not qualify")
-        # A passing budgeted comparison cannot exercise batched landings, whose
-        # existing eligibility guard rejects a configured query memory budget.
-        # Preserve the measured temporal verdict without granting full RF01
-        # qualification until the separate verification method is resolved.
-        receipt["decision"] = "incomplete"
-        receipt["qualification_pending"] = receipt["physical_coverage"]["separate_evidence_required"]
+        for regime, expected in (("budgeted", budgeted), ("landing", landing)):
+            report, observed = inspect_component(output / regime, regime, expected, manifest)
+            receipt.setdefault("physical_coverage", {})[regime] = observed
+            receipt["temporal_decisions"][regime] = report["decision"]
+        decisions = set(receipt["temporal_decisions"].values())
+        if decisions <= {"passed"}:
+            receipt["decision"] = "passed"
+        elif decisions <= {"passed", "inconclusive"}:
+            receipt["decision"] = "inconclusive"
+        else:
+            receipt["decision"] = "failed"
     except BaseException as failure:
         receipt["decision"] = "failed"
         receipt["failure"] = f"{type(failure).__name__}: {failure}"

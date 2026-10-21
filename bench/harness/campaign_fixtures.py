@@ -145,9 +145,8 @@ def contract(scenario: Scenario):
     if scenario.family == "landing":
         value["regime_prerequisites"] = "identity indexes provisioned; blocking consumer; query memory budget disabled in both arms"
         value["qualification_limit"] = (
-            "diagnostic control only under current historical-noop memory contract: "
-            "any configured query memory budget selects memory_guard and does not exercise batched landing; "
-            "without that budget candidate logical-memory observation is unavailable"
+            "historical temporal landing qualification requires no query quota in either arm; "
+            "candidate logical-memory peak and retention require a separate positive-quota proof"
         )
     return value
 

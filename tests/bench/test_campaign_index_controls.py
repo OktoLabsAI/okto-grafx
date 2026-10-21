@@ -40,4 +40,4 @@ def test_catalog_explicitly_names_certified_controls():
     catalog = {spec.name: spec for spec in matrix()}
     assert catalog["pk-seek-control"].family == "pk_seek"
     assert catalog["landing-control"].family == "landing"
-    assert "diagnostic control only" in contract(catalog["landing-control"])["qualification_limit"]
+    assert "separate positive-quota proof" in contract(catalog["landing-control"])["qualification_limit"]
