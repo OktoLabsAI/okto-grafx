@@ -8160,6 +8160,11 @@ def _admits_batched_landings(
     if (engine._max_intermediate_rows is not None
             or engine._max_traversal_expansions is not None
             or engine._max_traversal_paths is not None):
+        # A clean writer may run a read-only preflight, but its shared quota
+        # owner can also accumulate work before publication. Keep that
+        # transaction on the scalar path when a row/traversal limit is set.
+        if context.txn.mode is TransactionMode.WRITE:
+            return decline("ineligible_shape")
         from okto_grafx.domain.query.scopes import _owned_nodes
         # Expression subplans can spend the same owner's quotas between outer
         # emissions. Their expansion has no proved one-candidate upper bound.
