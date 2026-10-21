@@ -71,6 +71,27 @@ def contract(scenario):
             scenario.pagination_case in ("membership", "dynamic_membership") else 0}
 
 
+def validate_qualification_sample(sample, scenario, *, arm):
+    """Require observed ordered work for the candidate, not just an EXPLAIN arm."""
+    if sample.get("first_row_ns") is not None or sample.get("consume_all_ns") != sample.get("elapsed_ns"):
+        raise ValueError("RF05 materialized page cannot claim a first-row or partial-consume boundary")
+    if arm != "B":
+        return
+    stats = sample["statistics"]
+    case = scenario.pagination_case
+    ordered = case in ("first", "membership", "dynamic_membership", "keyset")
+    expected_candidates = scenario.page + (16 if case in ("membership", "dynamic_membership") else 0)
+    if ordered:
+        if ("OrderedNodeMerge" not in sample["selected_plan"]
+                or stats.get("ordered_candidates_examined") != expected_candidates
+                or stats.get("ordered_merge_rows") != scenario.page):
+            raise ValueError("RF05 candidate lacks the bounded ordered execution evidence")
+        if case == "first" and stats.get("physical_node_versions_examined", scenario.nodes) >= scenario.nodes:
+            raise ValueError("RF05 first page did not reduce physical node work")
+    elif stats.get("ordered_merge_rows", 0) != 0:
+        raise ValueError("RF05 fallback control unexpectedly used ordered merge")
+
+
 def build_fixture(db, scenario):
     from okto_grafx.domain.model.value import Timestamp
 

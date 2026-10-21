@@ -1,8 +1,10 @@
 """RF05 campaign fixture keeps exact order and observes bounded/fallback work."""
 
 import pytest
+from copy import deepcopy
 
 from bench.harness.campaign_fixtures import Scenario, build_fixture, contract, matrix, oracle, query_for
+from bench.harness.pagination_qualification import validate_qualification_sample
 from bench.harness.campaign_worker import measure_statement
 from bench.harness.campaign_schema import canonical_hash
 from okto_grafx import connect
@@ -24,6 +26,7 @@ def test_rf05_case_has_independent_oracle_and_runtime_regime(tmp_path, case):
         assert sample["contract_hash"]
         assert sample["first_row_ns"] is None  # db.execute materializes the page.
         assert sample["consume_all_ns"] == sample["elapsed_ns"]
+        validate_qualification_sample(sample, scenario, arm="B")
         if case in ("first", "membership", "dynamic_membership", "keyset"):
             assert result.statistics.get("ordered_candidates_examined") == (
                 32 if case in ("membership", "dynamic_membership") else 16
@@ -35,6 +38,17 @@ def test_rf05_case_has_independent_oracle_and_runtime_regime(tmp_path, case):
                     "physical_node_versions_examined"]
         else:
             assert result.statistics.get("ordered_merge_rows", 0) == 0
+        false_work = deepcopy(sample)
+        if case in ("first", "membership", "dynamic_membership", "keyset"):
+            false_work["statistics"]["ordered_candidates_examined"] += 1
+        else:
+            false_work["statistics"]["ordered_merge_rows"] = 1
+        with pytest.raises(ValueError, match="RF05"):
+            validate_qualification_sample(false_work, scenario, arm="B")
+        false_first_row = deepcopy(sample)
+        false_first_row["first_row_ns"] = 1
+        with pytest.raises(ValueError, match="first-row"):
+            validate_qualification_sample(false_first_row, scenario, arm="B")
 
 
 def test_rf05_catalog_is_explicit_and_rejects_wrong_dimensions():

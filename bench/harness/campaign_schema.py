@@ -354,6 +354,8 @@ def _validate(data):
             validate_batch_selection(scenarios.values())
         except ValueError as exc:
             raise CampaignError(str(exc)) from exc
+    rf05_qualification = (data["intent"] == "qualification" and data["mode"] == "optimization"
+                          and any(s.family == "pagination" for s in scenarios.values()))
     if rf06_split:
         expected = [item.to_dict() for item in quota_qualification.qualification_matrix(Scenario)]
         _require(data["scenarios"] == expected,
@@ -439,6 +441,12 @@ def _validate(data):
             _require(isinstance(sample["statistics"], dict), "statistics missing")
             for key, value in sample["statistics"].items():
                 _integer(value, f"counter {key}")
+            if rf05_qualification:
+                from bench.harness.pagination_qualification import validate_qualification_sample
+                try:
+                    validate_qualification_sample(sample, scenario, arm=arm)
+                except ValueError as exc:
+                    raise CampaignError(str(exc)) from exc
             if scenario.rf04_case is not None:
                 try:
                     rf04_qualification.validate_sample(sample, scenario)
@@ -821,6 +829,8 @@ def matched_write_loads(scenarios, comparisons):
 def compare_campaign(data):
     validate_campaign(data)
     rf06_split = data.get("memory_regime") == quota_qualification.SPLIT_MEMORY_REGIME
+    rf05_qualification = (data["intent"] == "qualification" and data["mode"] == "optimization"
+                          and any(spec["family"] == "pagination" for spec in data["scenarios"]))
     comparisons, totals = [], []
     calibrated = calibration_matches(data)
     noisy = not calibrated or any(
@@ -892,6 +902,21 @@ def compare_campaign(data):
                         "logical_memory_peak_bytes": _distribution([
                             s["memory"]["logical_memory_peak_bytes"] for s in rows], "bytes")
                         if scenario.role == "control" else None,
+                    } for arm, rows in samples.items()},
+                }
+            if rf05_qualification:
+                comparisons[-1]["rf05_access"] = {
+                    "case": scenario.pagination_case,
+                    "plan_scope": "EXPLAIN may include alternatives; counters reflect execution",
+                    "time_scope": "complete materialized page; no first-row latency",
+                    "by_arm": {arm: {
+                        "ordered_plan_samples": sum("OrderedNodeMerge" in s["selected_plan"] for s in rows),
+                        "ordered_candidates_examined": _distribution([
+                            s["statistics"].get("ordered_candidates_examined", 0) for s in rows], "count"),
+                        "ordered_merge_rows": _distribution([
+                            s["statistics"].get("ordered_merge_rows", 0) for s in rows], "count"),
+                        "physical_node_versions_examined": _distribution([
+                            s["statistics"].get("physical_node_versions_examined", 0) for s in rows], "count"),
                     } for arm, rows in samples.items()},
                 }
             if scenario.family == "write":

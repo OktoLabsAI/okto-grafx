@@ -1036,6 +1036,11 @@ and 1.10 p95, calibrated executor, real CPU/RSS and raw hashes as in RF01.
 The worker uses the materializing `db.execute` API: `elapsed_ns` and
 `consume_all_ns` cover the complete page, while `first_row_ns` is `null`.
 This campaign makes no first-row latency claim.
+The qualified candidate must report `OrderedNodeMerge` in the plan and actual
+ordered counters: 16 examined candidates and 16 returned rows for the first
+page, 32 examined for the two membership controls, and no ordered merge for
+`skip` or `no_index`. The report retains these counts by arm and pair; the plan
+alone never substitutes for executed work.
 
 RF06 uses `--rf06-split-memory` and the **exact** six-case matrix returned by
 `quota_qualification.qualification_matrix(Scenario)`, in its declared order.

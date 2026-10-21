@@ -1,13 +1,15 @@
 """Qualified RF02/RF03/RF05 claims require every declared target and control."""
 from argparse import Namespace
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
 
-from bench.harness.campaign_fixtures import Scenario
+from bench.harness.campaign_fixtures import Scenario, oracle
 from bench.harness.campaign import run_campaign
 from bench.harness.campaign_schema import (CampaignError, validate_campaign,
-                                           validate_fixed_optimization_matrix)
+                                           validate_fixed_optimization_matrix, compare_campaign)
+from bench.harness.campaign_worker import sample_record
 from bench.harness.connected_qualification import matrix as rf03_matrix
 from bench.harness.pagination_qualification import matrix as rf05_matrix
 from bench.harness.rf02_qualification import matrix as rf02_matrix
@@ -82,3 +84,49 @@ def test_exploratory_slice_and_rf04_isolation_keep_their_own_scope():
     from bench.harness.rf04_qualification import phase_scenarios
     selected = [item.to_dict() for item in phase_scenarios("rf03", Scenario, budget=4096)]
     validate_fixed_optimization_matrix(selected, mode="optimization", intent="qualification")
+
+
+def rf05_campaign():
+    from tests.bench.test_campaign_schema import campaign
+
+    data = campaign()
+    data.update(mode="optimization", scenarios=fixed_matrix("RF05"))
+    for run in data["runs"]:
+        arm = run["arm"]
+        run["samples"] = []
+        for spec in data["scenarios"]:
+            scenario = Scenario.from_dict(spec)
+            case = scenario.pagination_case
+            ordered = arm == "B" and case in ("first", "membership", "dynamic_membership", "keyset")
+            stats = {"physical_node_versions_examined": 16 if ordered else scenario.nodes}
+            if ordered:
+                stats.update(ordered_candidates_examined=32 if case in ("membership", "dynamic_membership") else 16,
+                             ordered_merge_rows=16)
+            template = sample_record(
+                spec, 0, oracle(scenario), stats,
+                elapsed_ns=80 if ordered and case == "first" else 100,
+                cpu_ns=10, prepare_ns=2,
+                memory={"logical_memory_peak_bytes": 100, "baseline_retained_bytes": 0,
+                        "coverage": "instrumented budgets", "unavailable_reason": None},
+                rss_peak_bytes=100,
+                selected_plan=["OrderedNodeMerge"] if ordered else ["Scan"],
+            )
+            for index in range(25):
+                sample = deepcopy(template)
+                sample["index"] = index
+                sample["kind"] = "warmup" if index < 5 else "retained"
+                run["samples"].append(sample)
+    return data
+
+
+def test_rf05_report_exposes_actual_ordered_work_and_rejects_missing_counter():
+    data = rf05_campaign()
+    report = compare_campaign(data)
+    assert report["decision"] == "passed"
+    target = report["comparisons"][0]
+    assert target["rf05_access"]["by_arm"]["B"]["ordered_candidates_examined"]["median_count"] == 16
+    assert target["rf05_access"]["by_arm"]["A"]["ordered_merge_rows"]["median_count"] == 0
+    candidate = next(run for run in data["runs"] if run["arm"] == "B")
+    candidate["samples"][0]["statistics"].pop("ordered_candidates_examined")
+    with pytest.raises(CampaignError, match="RF05 candidate lacks"):
+        compare_campaign(data)
