@@ -179,8 +179,9 @@ def run_campaign(args):
         # scenario model so an unchanged campaign remains eligible for its one retry.
         if ([Scenario.from_dict(item) for item in previous_data["scenarios"]]
                 != [Scenario.from_dict(item) for item in selected]
-                or previous_data["mode"] != args.mode):
-            raise CampaignError("rerun must preserve scenarios and comparison mode")
+                or previous_data["mode"] != args.mode
+                or previous_data.get("intent") != args.intent):
+            raise CampaignError("rerun must preserve scenarios, comparison mode and intent")
         previous_revisions = {run["arm"]: run["revision"] for run in previous_data["runs"]}
         if previous_revisions != revisions or previous_data["protocol"]["max_cpu_percent"] != args.max_cpu_percent:
             raise CampaignError("rerun must preserve revisions and registered noise policy")

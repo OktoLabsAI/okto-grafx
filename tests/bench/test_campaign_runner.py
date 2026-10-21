@@ -168,7 +168,7 @@ def test_qualification_retry_refuses_conclusive_previous_campaign(tmp_path, monk
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps({
         "protocol": {"attempt": 1, "max_cpu_percent": 20},
-        "scenarios": [scenario.to_dict()], "mode": "optimization",
+        "scenarios": [scenario.to_dict()], "mode": "optimization", "intent": "qualification",
         "runs": [{"arm": arm, "revision": "a" * 40} for arm in ("A", "B")],
     }), encoding="utf-8")
     monkeypatch.setattr(runner.subprocess, "check_output", lambda *a, **k: "a" * 40)
@@ -189,7 +189,7 @@ def test_inconclusive_retry_accepts_json_roundtrip_of_composite_keys(tmp_path, m
     previous = tmp_path / "previous.json"
     previous.write_text(json.dumps({
         "protocol": {"attempt": 1, "max_cpu_percent": 20},
-        "scenarios": [scenario.to_dict()], "mode": "optimization",
+        "scenarios": [scenario.to_dict()], "mode": "optimization", "intent": "qualification",
         "runs": [{"arm": arm, "revision": "a" * 40} for arm in ("A", "B")],
     }), encoding="utf-8")
     assert json.loads(previous.read_text(encoding="utf-8"))["scenarios"][0]["keys"] == [1, 2, 1]
@@ -208,6 +208,29 @@ def test_inconclusive_retry_accepts_json_roundtrip_of_composite_keys(tmp_path, m
     with pytest.raises(WorkerReached):
         runner.run_campaign(args)
     assert (args.output / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("prior_intent", ["exploratory", None])
+def test_qualification_retry_refuses_changed_or_missing_intent(tmp_path, monkeypatch, prior_intent):
+    import bench.harness.campaign as runner
+
+    scenario = next(item for item in runner.matrix() if item.name == "constant")
+    previous_data = {
+        "protocol": {"attempt": 1, "max_cpu_percent": 20},
+        "scenarios": [scenario.to_dict()], "mode": "optimization",
+        "runs": [{"arm": arm, "revision": "a" * 40} for arm in ("A", "B")],
+    }
+    if prior_intent is not None:
+        previous_data["intent"] = prior_intent
+    previous = tmp_path / "previous.json"
+    previous.write_text(json.dumps(previous_data), encoding="utf-8")
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *a, **k: "a" * 40)
+    args = Namespace(output=tmp_path / "out", baseline=tmp_path, candidate=tmp_path,
+                     scenario=[scenario.name], memory_budget=None, target=[], previous=previous,
+                     mode="optimization", intent="qualification", max_cpu_percent=20)
+    with pytest.raises(CampaignError, match="comparison mode and intent"):
+        runner.run_campaign(args)
+    assert not (args.output / "manifest.json").exists()
 
 
 def test_real_calibration_command_produces_bound_receipt(tmp_path, capsys, monkeypatch):
