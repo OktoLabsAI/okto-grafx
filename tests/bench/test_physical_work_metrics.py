@@ -75,7 +75,7 @@ def test_unconsumed_landing_decisions_do_not_report_fallback(graph, suffix):
 
 @pytest.mark.parametrize("option,reason", [
     (None, "streaming_guard"),
-    ("_max_intermediate_rows", "quota_frontier"),
+    ("_max_intermediate_rows", "streaming_guard"),
     ("_query_memory_budget_bytes", "memory_guard"),
 ])
 def test_landing_fallback_records_first_effective_guard(graph, monkeypatch, option, reason):

@@ -143,7 +143,7 @@ def test_operational_quotas_preserve_scalar_admission_and_refusal(graph, monkeyp
             return error.to_dict()
 
     candidate = outcome()
-    assert calls == []
+    assert calls == ([] if option == "_query_memory_budget_bytes" else [3])
     monkeypatch.setattr(qe, "_admits_batched_landings", lambda *_: False)
     assert candidate == outcome()
 

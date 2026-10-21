@@ -8114,8 +8114,8 @@ def _admits_batched_landings(
 ) -> bool:
     """Admit bounded prefetch only when the closed consumer must read every hop.
 
-    A streaming LIMIT must never inspect a later endpoint. Nor may batching move
-    a configured quota's refusal across validation. Those shapes, staged owner writes
+    A streaming LIMIT must never inspect a later endpoint. Quota windows must not
+    move a configured refusal across validation. Streaming shapes, staged owner writes
     and specialized scalar witnesses retain the original per-row access path.
     An exact native WRITE context with ``wrote == False`` has no row intents,
     WAL records, physical images or write partitions. Its closed read-only
@@ -8139,12 +8139,17 @@ def _admits_batched_landings(
     if (context.txn.mode is not TransactionMode.READ
             and (context.txn.mode is not TransactionMode.WRITE or context.txn.wrote)):
         return decline("owner_overlay")
+    if engine._query_memory_budget_bytes is not None:
+        return decline("memory_guard")
     if (engine._max_intermediate_rows is not None
             or engine._max_traversal_expansions is not None
             or engine._max_traversal_paths is not None):
-        return decline("quota_frontier")
-    if engine._query_memory_budget_bytes is not None:
-        return decline("memory_guard")
+        from okto_grafx.domain.query.scopes import _owned_nodes
+        # Expression subplans can spend the same owner's quotas between outer
+        # emissions. Their expansion has no proved one-candidate upper bound.
+        if any(isinstance(part, (PatternComprehension, PatternPredicate, ExistsSubquery))
+               for part in _owned_nodes(context.analysis.statement)):
+            return decline("ineligible_shape")
     if (node.min_hops != 1 or node.max_hops != 1 or node.target_bound
         or node.path_variable is not None or node.target_table is None
         or node.direction is Direction.UNDIRECTED):
@@ -8217,12 +8222,43 @@ def _total_landings(
     return True
 
 
+def _landing_quota_window(engine: QueryEngine, node: TraverseRelationship,
+                          context: _Context) -> int:
+    """Bound speculative work; charging remains at the scalar admission points.
+
+    The caller proves one directed hop and a unary closed consumer chain. Each
+    candidate can emit at most one row/path per operator. Invisible and repeated
+    destinations do not justify a larger window: their costs are known only after
+    resolution. Counters are monotone and are re-read after each completed group.
+    """
+    window = 64
+    owner = context.statement_owner()
+    for limit, used in ((engine._max_traversal_expansions, owner.traversal_expansions),
+                        (engine._max_traversal_paths, owner.traversal_paths)):
+        if limit is not None:
+            window = min(window, max(0, limit - used))
+    limit = engine._max_intermediate_rows
+    if limit is not None:
+        consumer = context.result_node
+        while True:
+            if consumer is not context.result_node:
+                window = min(window, max(0, limit - context.intermediate_rows.get(id(consumer), 0)))
+            if consumer is node:
+                break
+            if type(consumer) not in (AggregateRows, SortRows, ProjectRows, FilterRows,
+                                      DistinctRows, LimitRows, SkipRows):
+                return 0
+            consumer = consumer.child
+    return window
+
+
 def _batched_landing_steps(
     engine: QueryEngine, context: _Context,
     steps: Iterator[tuple[object, HeapVersion, TableDef, object]],
     view_at: Callable[[TableDef], _OwnerLandingView],
     *,
     withhold_vectors: bool,
+    node: TraverseRelationship,
 ) -> Iterator[tuple[object, HeapVersion, TableDef, object, bool,
                     tuple[RecordRef, HeapVersion] | None]]:
     """Resolve at most 64 detached steps, then emit them in their original order.
@@ -8236,6 +8272,15 @@ def _batched_landing_steps(
     take this path, and the table proved here is the runtime one these steps actually land
     on, not the plan's.
     """
+    window = _landing_quota_window(engine, node, context)
+    if window <= 1:
+        recorded = False
+        for candidate in steps:
+            if not recorded:
+                _record_fallback(context, "quota_frontier")
+                recorded = True
+            yield *candidate, False, None
+        return
     try:
         first = next(steps)
     except StopIteration:
@@ -8266,7 +8311,7 @@ def _batched_landing_steps(
         return
     frontier = [first]
     while True:
-        for _ in range(64 - len(frontier)):
+        for _ in range(window - len(frontier)):
             try:
                 frontier.append(next(steps))
             except StopIteration:
@@ -8280,6 +8325,15 @@ def _batched_landing_steps(
             yield ref, edge, table, identity, True, landing
         frontier = []
         landings = ()
+        window = _landing_quota_window(engine, node, context)
+        if window <= 1:
+            recorded = False
+            for candidate in steps:
+                if not recorded:
+                    _record_fallback(context, "quota_frontier")
+                    recorded = True
+                yield *candidate, False, None
+            return
 
 
 def _traverse(
@@ -8424,7 +8478,7 @@ def _traverse(
                     candidates = steps(record_id)
                     resolved = (
                         _batched_landing_steps(engine, context, iter(candidates), view_at,
-                                               withhold_vectors=vector_free)
+                                               withhold_vectors=vector_free, node=node)
                         if batch_landings else
                         ((*candidate, False, None) for candidate in candidates)
                     )
