@@ -1,4 +1,5 @@
 """RF04 four-arm recipe: fixed controls and real endpoint access evidence."""
+from copy import deepcopy
 from dataclasses import replace
 
 import okto_grafx
@@ -6,8 +7,9 @@ import pytest
 
 from bench.harness.campaign_fixtures import Scenario, build_fixture, matrix, oracle, query_for
 from bench.harness.rf04_qualification import access, interaction_report, matrix as rf04_matrix, phase_scenarios
-from bench.harness.campaign_schema import CampaignError
-from bench.harness.campaign_worker import measure_statement
+from bench.harness.campaign_schema import CampaignError, LOGICAL_COVERAGE, validate_campaign
+from bench.harness.campaign_worker import measure_statement, sample_record
+from tests.bench.test_campaign_schema import campaign
 
 
 def test_four_phase_matrix_uses_fixed_equal_query_profiles_and_oracles():
@@ -118,3 +120,50 @@ def test_interaction_binds_four_distinct_revisions_and_checks_actual_fan_limit(m
     campaigns["combined"]["runs"][0]["revision"] = revisions["rf04"]
     with pytest.raises(CampaignError, match="revision changed"):
         interaction_report(campaigns)
+
+
+def _qualified_rf04_campaign():
+    data = campaign()
+    scenarios = [replace(s, query_memory_budget_bytes=1 << 20) for s in rf04_matrix(Scenario)
+                 if s.name in {"rf04-with-target", "rf04-with-fallback"}]
+    data.update(mode="optimization", scenarios=[s.to_dict() for s in scenarios])
+    templates = {}
+    for scenario in scenarios:
+        stats = {"physical_node_versions_examined": 16,
+                 "physical_edge_versions_examined": 16 if scenario.rf04_case == "target" else 2032,
+                 "edge_lookups": 16 if scenario.rf04_case == "target" else 0,
+                 "edge_scans": 0 if scenario.rf04_case == "target" else 1}
+        if scenario.rf04_case == "fallback":
+            stats["fallback_reason_nonselective_probe_set"] = 1
+        sample = sample_record(scenario.to_dict(), 0, oracle(scenario), stats,
+                               elapsed_ns=100, cpu_ns=10, prepare_ns=2,
+                               memory={"logical_memory_peak_bytes": 100,
+                                       "baseline_retained_bytes": 0,
+                                       "coverage": LOGICAL_COVERAGE,
+                                       "unavailable_reason": None},
+                               rss_peak_bytes=100, selected_plan=["NodeMultiKeySeek"])
+        sample["rf04_access"] = access(sample)
+        templates[scenario.name] = sample
+    for run in data["runs"]:
+        run["samples"] = []
+        for scenario in scenarios:
+            for index in range(25):
+                sample = deepcopy(templates[scenario.name])
+                sample.update(index=index, kind="warmup" if index < 5 else "retained")
+                run["samples"].append(sample)
+    return data
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda d: d["runs"][0]["samples"][0].update(memory_budget_bytes=None),
+    lambda d: d["runs"][0]["samples"][0].update(memory_budget_bytes=2 << 20),
+    lambda d: d["runs"][0]["samples"][0]["memory"].update(coverage="other observer"),
+    lambda d: d["runs"][0]["samples"][0]["memory"].update(logical_memory_peak_bytes=(1 << 20) + 1),
+    lambda d: d["runs"][0]["samples"][0]["memory"].update(unavailable_reason="missing"),
+])
+def test_rf04_qualification_rejects_missing_or_over_budget_memory(tamper):
+    data = _qualified_rf04_campaign()
+    validate_campaign(data)
+    tamper(data)
+    with pytest.raises(CampaignError, match="RF04 logical observation"):
+        validate_campaign(data)

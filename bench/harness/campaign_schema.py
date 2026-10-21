@@ -215,6 +215,24 @@ def validate_fixed_optimization_matrix(selected, *, mode, intent):
     _require(selected == expected, f"{label} qualification requires its exact target/control matrix")
 
 
+def validate_read_lifecycle_matrix(selected, *, mode, intent):
+    """Require every RF10 snapshot/cache recipe with one observed budget."""
+    if intent != "qualification":
+        return
+    scenarios = [Scenario.from_dict(value) for value in selected]
+    if not any(item.family in read_lifecycle_qualification.FAMILIES for item in scenarios):
+        return
+    _require(mode == "recipe", "RF10 qualification requires recipe mode")
+    budgets = {item.query_memory_budget_bytes for item in scenarios}
+    _require(len(budgets) == 1 and type(next(iter(budgets))) is int
+             and next(iter(budgets)) > 0,
+             "RF10 qualification requires one positive logical memory budget")
+    budget = next(iter(budgets))
+    expected = [replace(item, query_memory_budget_bytes=budget).to_dict()
+                for item in read_lifecycle_qualification.matrix()]
+    _require(selected == expected, "RF10 qualification requires all eight snapshot/cache slices")
+
+
 def validate_campaign(data):
     """Validate completeness, metadata, independent oracles and contracts."""
     try:
@@ -348,6 +366,7 @@ def _validate(data):
                                       "expected_result_hash": canonical_hash(expected_rows),
                                       "result_hash": canonical_hash(expected_rows), "rows": len(expected_rows)}
     validate_fixed_optimization_matrix(data["scenarios"], mode=data["mode"], intent=data["intent"])
+    validate_read_lifecycle_matrix(data["scenarios"], mode=data["mode"], intent=data["intent"])
     if data["intent"] == "qualification" and any(s.family == "capacity" for s in scenarios.values()):
         from bench.harness.capacity_qualification import validate_batch_selection
         try:
@@ -359,6 +378,8 @@ def _validate(data):
                                         for s in scenarios.values()))
     rf05_qualification = (data["intent"] == "qualification" and data["mode"] == "optimization"
                           and any(s.family == "pagination" for s in scenarios.values()))
+    rf04_qualified = (data["intent"] == "qualification" and data["mode"] == "optimization"
+                      and any(s.rf04_case is not None for s in scenarios.values()))
     if rf06_split:
         expected = [item.to_dict() for item in quota_qualification.qualification_matrix(Scenario)]
         _require(data["scenarios"] == expected,
@@ -556,6 +577,15 @@ def _validate(data):
                          and memory["unavailable_reason"] is None
                          and memory["logical_memory_peak_bytes"] <= scenario.query_memory_budget_bytes,
                          "RF02/RF03/RF05 logical observation missing or exceeds the declared budget")
+            if rf04_qualified and scenario.rf04_case is not None:
+                _require(type(scenario.query_memory_budget_bytes) is int
+                         and scenario.query_memory_budget_bytes > 0
+                         and sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes
+                         and memory["coverage"] == LOGICAL_COVERAGE
+                         and memory["unavailable_reason"] is None
+                         and type(memory["logical_memory_peak_bytes"]) is int
+                         and memory["logical_memory_peak_bytes"] <= scenario.query_memory_budget_bytes,
+                         "RF04 logical observation missing, mismatched or exceeds the declared budget")
             if scenario.family in read_lifecycle_qualification.FAMILIES and data["intent"] == "qualification":
                 expected_coverage = (SEQUENCE_LOGICAL_COVERAGE if scenario.family in
                                      {"read_autocommit", "read_shared"} else LOGICAL_COVERAGE)
