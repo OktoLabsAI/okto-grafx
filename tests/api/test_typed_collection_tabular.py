@@ -11,10 +11,15 @@ from okto_grafx.domain.model.stored_types import encode_stored_type
 from okto_grafx.domain.model.value import encode_value
 from okto_grafx.errors import GrafxError, GrafxQueryBudgetExceeded
 from tests.api.test_collection_json import SCALARS
-from tests.api.test_decimal_tabular import artifact, consume, ROUTES
+from tests.api.test_decimal_tabular import artifact, consume
 
 pytestmark = pytest.mark.optional_dependency("pyarrow")
 pa = pytest.importorskip("pyarrow")
+ROUTES = (
+    "arrow", "pandas",
+    pytest.param("polars", marks=pytest.mark.optional_dependency("polars")),
+    "parquet",
+)
 LEAVES = tuple((kind, value) for kind, value, _ in SCALARS)
 RECORD = StoredType("STRUCT", fields=tuple((f"v{i}", kind) for i, (kind, _) in enumerate(LEAVES)))
 RECORD_VALUE = {f"v{i}": value for i, (_, value) in enumerate(LEAVES)}
@@ -295,6 +300,7 @@ def test_nested_cursor_snapshot_survives_independent_commit_and_output_mutation(
 
 
 @pytest.mark.parametrize("fault", ("numeric_width", "decimal_scale", "null_entry", "null_key", "array_length"))
+@pytest.mark.optional_dependency("polars")
 def test_polars_only_normalizes_documented_layout_differences(tmp_path, fault):
     pl = pytest.importorskip("polars")
     from okto_grafx.polars import PolarsFrame, import_polars

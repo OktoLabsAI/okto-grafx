@@ -573,6 +573,84 @@ def _source_markers(path: str, test_name: str) -> dict[str, tuple[str, ...]]:
     return found
 
 
+def _source_parameter_markers(
+    path: str, test_name: str, item: pytest.Item
+) -> dict[str, tuple[str, ...]]:
+    """Read literal pytest.param markers only for the matching live parameter value.
+
+    A marker on another case in the same parametrized function cannot pay for this case,
+    even if a collection hook adds that marker to the live item later.
+    """
+    callspec = getattr(item, "callspec", None)
+    tree = _parse(path)
+    if callspec is None or tree is None:
+        return {}
+    assignments = {
+        target.id: statement.value
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    found: dict[str, tuple[str, ...]] = {}
+    for function in tree.body:
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) or function.name != test_name:
+            continue
+        for decorator in function.decorator_list:
+            if not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Attribute):
+                continue
+            owner = decorator.func.value
+            if not (
+                decorator.func.attr == "parametrize"
+                and isinstance(owner, ast.Attribute)
+                and owner.attr == "mark"
+                and isinstance(owner.value, ast.Name)
+                and owner.value.id == "pytest"
+                and len(decorator.args) >= 2
+            ):
+                continue
+            argument, cases = decorator.args[:2]
+            if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str):
+                continue
+            names = [name.strip() for name in argument.value.split(",")]
+            if len(names) != 1 or names[0] not in callspec.params:
+                continue
+            if isinstance(cases, ast.Name):
+                cases = assignments.get(cases.id, cases)
+            if not isinstance(cases, (ast.Tuple, ast.List)):
+                continue
+            matching: list[ast.expr] = []
+            actual = callspec.params[names[0]]
+            for case in cases.elts:
+                is_param = (
+                    isinstance(case, ast.Call)
+                    and isinstance(case.func, ast.Attribute)
+                    and case.func.attr == "param"
+                    and isinstance(case.func.value, ast.Name)
+                    and case.func.value.id == "pytest"
+                    and case.args
+                )
+                value = case.args[0] if is_param else case
+                if (
+                    isinstance(value, ast.Constant)
+                    and type(value.value) is type(actual)
+                    and value.value == actual
+                ):
+                    matching.append(case)
+            if len(matching) != 1:
+                continue
+            case = matching[0]
+            if not isinstance(case, ast.Call):
+                continue
+            for keyword in case.keywords:
+                if keyword.arg != "marks":
+                    continue
+                marks = keyword.value.elts if isinstance(keyword.value, (ast.Tuple, ast.List)) else [keyword.value]
+                for mark in marks:
+                    found.update(_marker_of(mark))
+    return found
+
+
 PYTEST_BUILTIN_MARKERS: frozenset[str] = frozenset(
     {"skip", "skipif", "parametrize", "usefixtures", "filterwarnings", "tryfirst", "trylast"}
 )
@@ -1049,7 +1127,8 @@ def _attribution(item: pytest.Item | None) -> str | None:
         return None
     path = str(getattr(item, "path", "") or getattr(item, "fspath", ""))
     name = getattr(item, "originalname", None) or item.name.split("[")[0]
-    written = _source_markers(path, name)
+    written = dict(_source_markers(path, name))
+    written.update(_source_parameter_markers(path, name, item))
     registered = _registered_markers(item.config)
     live = {marker.name for marker in item.iter_markers()}
     claimed = set(written) & ATTRIBUTING_MARKERS & registered & live

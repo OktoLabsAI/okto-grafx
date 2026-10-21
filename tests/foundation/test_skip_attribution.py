@@ -620,6 +620,71 @@ def test_a_declared_absent_optional_dependency_attributes(tmp_path: Path) -> Non
     assert code == 0, output
 
 
+@pytest.mark.parametrize("inline", [False, True])
+def test_a_parameter_marker_attributes_only_its_live_case(
+    tmp_path: Path, inline: bool
+) -> None:
+    cases = (
+        '["arrow", pytest.param("polars", marks=pytest.mark.optional_dependency("grafx_absent_probe"))]'
+    )
+    declaration = "" if inline else f"ROUTES = {cases}\n\n"
+    argument = cases if inline else "ROUTES"
+    module = (
+        HEADER
+        + declaration
+        + f'@pytest.mark.parametrize("route", {argument})\n'
+        + "def test_planted(route) -> None:\n"
+        + '    if route == "polars":\n'
+        + '        pytest.importorskip("grafx_absent_probe")\n'
+        + '    assert route == "arrow"\n'
+    )
+    code, output = _plant(tmp_path, module=module)
+    assert code == 0, output
+
+
+def test_a_parameter_marker_cannot_pay_for_another_case(tmp_path: Path) -> None:
+    module = (
+        HEADER
+        + '@pytest.mark.parametrize("route", ["arrow", '
+        'pytest.param("polars", marks=pytest.mark.optional_dependency("grafx_absent_probe"))])\n'
+        + "def test_planted(route) -> None:\n"
+        + '    if route == "arrow":\n'
+        + '        pytest.skip("undeclared skip on Arrow")\n'
+    )
+    nested_conftest = (
+        "\n\ndef pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        '        if getattr(item, "callspec", None) and item.callspec.params.get("route") == "arrow":\n'
+        '            item.add_marker(pytest.mark.optional_dependency("grafx_absent_probe"))\n'
+    )
+    code, output = _plant(tmp_path, nested_module=module, nested_conftest=nested_conftest)
+    assert code == 1, output
+    assert "skipped test(s) carry neither" in output
+
+
+def test_duplicate_parameter_value_does_not_borrow_a_marker(tmp_path: Path) -> None:
+    module = (
+        HEADER
+        + '@pytest.mark.parametrize("route", ['
+        'pytest.param("polars", marks=pytest.mark.optional_dependency("grafx_absent_probe")), '
+        '"polars"])\n'
+        + "def test_planted(route) -> None:\n"
+        + '    if not hasattr(pytest, "_skip_first"):\n'
+        + '        pytest._skip_first = True\n'
+        + '        pytest.importorskip("grafx_absent_probe")\n'
+        + '    pytest.skip("second duplicate is unmarked")\n'
+    )
+    nested_conftest = (
+        "\n\ndef pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        '        if getattr(item, "callspec", None) and item.callspec.indices.get("route") == 1:\n'
+        '            item.add_marker(pytest.mark.optional_dependency("grafx_absent_probe"))\n'
+    )
+    code, output = _plant(tmp_path, nested_module=module, nested_conftest=nested_conftest)
+    assert code == 1, output
+    assert "skipped test(s) carry neither" in output
+
+
 def test_a_declared_dependency_that_is_present_does_not_attribute(tmp_path: Path) -> None:
     # Declaring "json" and then skipping is a lie the gate can check: json is right there.
     module = (
