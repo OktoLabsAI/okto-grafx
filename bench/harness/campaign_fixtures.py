@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import random
 
-from bench.harness import connected_qualification, fts_qualification, read_lifecycle_qualification, uniqueness_qualification
+from bench.harness import connected_qualification, fts_qualification, read_lifecycle_qualification, rf04_qualification, uniqueness_qualification
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,7 @@ class Scenario:
     identity_lease_size: int = 64
     fts_statistics_mode: str = "durable"
     fts_updates: int = 0
+    rf04_case: str | None = None
 
     def __post_init__(self):
         from bench.harness.quota_qualification import validate as validate_quota
@@ -81,6 +82,7 @@ class Scenario:
             raise ValueError("pagination case only applies to RF05 pagination")
         if self.family in connected_qualification.FAMILIES:
             connected_qualification.validate(self)
+        rf04_qualification.validate(self)
         if self.family in read_lifecycle_qualification.FAMILIES:
             read_lifecycle_qualification.validate(self)
         if self.family == "capacity":
@@ -227,6 +229,8 @@ def contract(scenario: Scenario):
             "fts_projection": "sorted record IDs only; scores/ranking out of scope" if scenario.family == "fts" else None}
     if scenario.family in connected_qualification.FAMILIES:
         value.update(connected_qualification.contract(scenario))
+    if scenario.rf04_case is not None:
+        value.update(rf04_qualification.contract(scenario))
     if scenario.family == "write":
         value.update(write_shape=scenario.write_shape, partial_progress=scenario.partial_progress,
                      chunk_rows=scenario.chunk_rows,
@@ -348,6 +352,6 @@ def matrix():
     result.extend(capacity_matrix(Scenario))
     from bench.harness.rf02_qualification import matrix as scalar_matrix
     from bench.harness.quota_qualification import matrix as quota_matrix
-    return (result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix()
+    return (result + scalar_matrix() + connected_qualification.matrix() + rf04_qualification.matrix(Scenario) + ingestion_matrix()
             + read_lifecycle_qualification.matrix() + quota_matrix(Scenario)
             + fts_qualification.matrix(Scenario) + uniqueness_qualification.matrix(Scenario))

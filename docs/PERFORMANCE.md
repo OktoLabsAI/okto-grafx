@@ -760,6 +760,54 @@ and rigs. Do not run production-copy or long concurrency harnesses blindly from
 a documentation example. Detailed [reports](reports/README.md) preserve their
 commands/conditions; artifact paths outside the repository may be unavailable.
 
+## RF04 endpoint qualification with RF03 interaction
+
+The RF04 recipe uses the existing connected N/B/E fixture: 1,024 starts, 128
+destinations and 1,151 weighted edges. The selective target has 16 distinct
+keys. A second fixture puts at least 80% of edges on 1% of starts; controls
+exercise 65 starts (the fan-limit is 64) and 1,024 probes against 16 starts
+(actual nonselective node-scan fallback). The oracle derives every ordered row
+and parallel-edge occurrence from fixture input, independently of Grafx.
+
+Four **clean, committed** source revisions are needed on one RF01-instrumented
+foundation: base, RF03 only, RF04 only, and both. The source isolation is a
+separate code-diff/receipt claim; the campaign report checks revision lineage
+and never infers patch content from commit hashes. Run four calibrated,
+three-pair A/B campaigns with a common positive logical-memory budget:
+
+| Campaign | A -> B | Query profile | Target physical counter |
+| --- | --- | --- | --- |
+| `rf03` | base -> RF03 only | Original connected `IN` | Node versions examined |
+| `rf04` | base -> RF04 only | `IN` + `WITH` + connected traversal | Edge versions examined |
+| `incremental` | RF03 only -> both | Original connected `IN` | Edge versions examined |
+| `combined` | base -> both | Original connected `IN` | Edge versions examined |
+
+Select all four named cases of the profile in each campaign:
+`rf04-{original|with}-{target|fan_limit|hub|fallback}`. Use
+`python -m bench.harness.campaign run --mode optimization --intent qualification`
+with `--scenario` repeated for each case, `--baseline`, `--candidate`,
+`--output`, `--calibrated-executor`, `--calibration`, `--memory-budget` and the
+same `--max-cpu-percent` on all runs. For `rf03`, override only the target with
+`--target rf04-original-target:physical_node_versions_examined`; the other
+targets already select physical edge work. Join the four `campaign.json` files
+with `python -m bench.harness.campaign rf04-report --rf03 FILE --rf04 FILE
+--incremental FILE --combined FILE --output NEW_FILE`.
+
+The join rejects a missing control, changed fixture/query/budget, changed
+executor environment or CPU policy, incomplete A/B, missing physical counters,
+semantic divergence, and incorrect source-arm lineage. RF04 candidate targets
+must plan the conditional seek and actually issue 16 endpoint lookups with no
+global edge scan. `EXPLAIN` may include an unexecuted NodeScan alternative;
+runtime `edge_scans`, `edge_lookups`, fallback reasons and physical version
+counters decide which path ran. Each sample retains process CPU time, host CPU
+observations, logical peak with its observer coverage, and process-lifetime RSS
+peak. RSS is not a query allocation. The report includes raw campaign hashes,
+per-pair distributions and controls; qualification requires the target's
+physical work to fall, target median ratio <=0.90 in every pair, and each
+control's median <=1.05 and p95 <=1.10. Noise makes a result inconclusive, with
+at most one complete rerun under the existing campaign protocol. No effects
+from separate phases are added together as a speedup.
+
 ## RF07 streaming landing demand
 
 Open streaming traversals retain scalar destination validation. A known `LIMIT`

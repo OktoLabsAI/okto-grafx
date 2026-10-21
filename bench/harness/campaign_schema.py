@@ -15,7 +15,7 @@ import re
 import statistics
 
 from bench.harness.campaign_fixtures import Scenario, contract, oracle, query_for
-from bench.harness import fts_qualification
+from bench.harness import fts_qualification, rf04_qualification
 
 HISTORICAL_SCOPE = "rf01_historical_total_overhead"
 HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
@@ -381,6 +381,11 @@ def _validate(data):
             _require(isinstance(sample["statistics"], dict), "statistics missing")
             for key, value in sample["statistics"].items():
                 _integer(value, f"counter {key}")
+            if scenario.rf04_case is not None:
+                try:
+                    rf04_qualification.validate_sample(sample, scenario)
+                except ValueError as exc:
+                    raise CampaignError(str(exc)) from exc
             if scenario.family == "fts_matrix":
                 source = sample.get("fts_source")
                 _fields(source, ("statistics_regime", "statistics_mode", "history_entries", "hits"), "FTS source")
@@ -720,6 +725,26 @@ def compare_campaign(data):
                                 "median_ratio": med, "p95_ratio": tail, "median_limit": limit,
                                 "p95_limit": tail_limit, "physical_work_reduced": work_reduced,
                                 "thresholds_met": med <= limit and (tail_limit is None or tail <= tail_limit) and work_reduced is not False})
+            if scenario.rf04_case is not None:
+                comparisons[-1]["rf04_tradeoff"] = {
+                    "case": scenario.rf04_case,
+                    "plan_scope": "EXPLAIN may include unexecuted alternatives; regimes come from runtime counters",
+                    "rss_scope": "process-lifetime peak, not query-attributable allocation",
+                    "by_arm": {arm: {
+                        "edge_regimes": {regime: sum(s["rf04_access"]["edge_regime"] == regime for s in rows)
+                                         for regime in ("endpoint", "grouped", "endpoint_then_grouped", "no_edge_access")},
+                        "conditional_seek_in_plan": sum(s["rf04_access"]["conditional_seek_in_plan"] for s in rows),
+                        "physical_node_versions_examined": _distribution([
+                            s["statistics"]["physical_node_versions_examined"] for s in rows], "count"),
+                        "physical_edge_versions_examined": _distribution([
+                            s["statistics"]["physical_edge_versions_examined"] for s in rows], "count"),
+                        "edge_lookups": _distribution([s["statistics"].get("edge_lookups", 0) for s in rows], "count"),
+                        "edge_scans": _distribution([s["statistics"].get("edge_scans", 0) for s in rows], "count"),
+                        "logical_memory_peak_bytes": _distribution([
+                            s["memory"]["logical_memory_peak_bytes"] for s in rows], "bytes")
+                        if all(type(s["memory"]["logical_memory_peak_bytes"]) is int for s in rows) else None,
+                    } for arm, rows in samples.items()},
+                }
             if scenario.family == "write":
                 comparisons[-1]["write_tradeoff"] = write_tradeoff(samples, scenario)
             if scenario.family == "unique_create":

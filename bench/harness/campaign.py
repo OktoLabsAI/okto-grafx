@@ -241,6 +241,10 @@ def main(argv=None):
     commands.add_parser("calibrate", help="execute the fixed local CPU control procedure").add_argument("--output", type=Path, required=True)
     for name in ("validate", "compare"):
         commands.add_parser(name).add_argument("raw", type=Path)
+    interaction = commands.add_parser("rf04-report", help="join four independently validated RF03/RF04 campaigns")
+    for phase in ("rf03", "rf04", "incremental", "combined"):
+        interaction.add_argument("--" + phase, type=Path, required=True)
+    interaction.add_argument("--output", type=Path, required=True)
     run = commands.add_parser("run")
     run.add_argument("--baseline", type=Path, required=True)
     run.add_argument("--candidate", type=Path, required=True)
@@ -271,6 +275,13 @@ def main(argv=None):
             result = calibrate_executor(args.output, command)
         elif args.action == "run":
             result = run_campaign(args)
+        elif args.action == "rf04-report":
+            from bench.harness.rf04_qualification import interaction_report
+            campaigns = {phase: load_json(getattr(args, phase).read_text(encoding="utf-8"))
+                         for phase in ("rf03", "rf04", "incremental", "combined")}
+            result = interaction_report(campaigns)
+            with args.output.open("x", encoding="utf-8") as stream:
+                json.dump(result, stream, indent=2, allow_nan=False)
         else:
             data = load_json(args.raw.read_text(encoding="utf-8"))
             if args.action == "validate":

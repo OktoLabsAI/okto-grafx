@@ -33,7 +33,7 @@ from bench.harness.campaign_fixtures import Scenario, apply_churn, build_fixture
 from bench.harness import read_lifecycle_qualification
 from bench.harness.campaign_schema import CampaignError, canonical_hash, load_json
 from bench.harness.campaign_schema import HISTORICAL_SCOPE, validate_candidate_memory
-from bench.harness import fts_qualification, uniqueness_qualification
+from bench.harness import fts_qualification, rf04_qualification, uniqueness_qualification
 
 
 def unavailable_memory(reason):
@@ -192,6 +192,8 @@ def measure_statement(db, scenario, index, *, reader=None):
     sample = sample_record(scenario.to_dict(), index, rows, stats, elapsed_ns=elapsed, cpu_ns=cpu,
                          prepare_ns=prepare_ns, memory=memory, rss_peak_bytes=peak,
                          first_row_ns=first, commit_ns=commit, selected_plan=plan, rss_scope=scope)
+    if scenario.rf04_case is not None:
+        sample["rf04_access"] = rf04_qualification.access(sample)
     if native_fts:
         sample["fts_source"] = {"statistics_regime": result.statistics_regime,
                                 "statistics_mode": scenario.fts_statistics_mode,
