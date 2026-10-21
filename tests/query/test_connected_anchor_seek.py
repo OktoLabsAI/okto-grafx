@@ -19,10 +19,10 @@ def test_connected_anchor_uses_existing_multi_key_door(database):
     assert len(seeks(database, QUERY)) == 1
     result = database.execute(QUERY, {"ids": ["a1", "a1", "missing"]})
     assert result.rows == (("a1", "b1"),)
-    # Two anchor keys plus one destination identity lookup.
-    assert result.statistics.get("index_probe_keys") == 3
-    # This front does not promise endpoint lookup or elimination of edge scans.
-    assert result.statistics.get("edge_scans") == 1
+    # Two anchor keys, one endpoint lookup, and one destination identity lookup.
+    assert result.statistics.get("index_probe_keys") == 4
+    assert result.statistics.get("edge_lookups") == 1
+    assert result.statistics.get("edge_scans", 0) == 0
 
 
 @pytest.mark.parametrize(
@@ -149,8 +149,9 @@ def test_exact_connected_fixture_reduces_anchor_scan_only(tmp_path, monkeypatch)
         ]
         assert sorted(fast.rows) == sorted(expected)
         assert fast.statistics.get("rows_seeked") == 8
-        assert fast.statistics.get("edge_scans") == 1
-        assert fast.statistics.get("physical_edge_versions_examined") == 1151
+        assert fast.statistics.get("edge_lookups") == 8
+        assert fast.statistics.get("edge_scans", 0) == 0
+        assert fast.statistics.get("physical_edge_versions_examined", 1152) < 1151
         monkeypatch.setattr(IndexManager, "validated_versions_many", None)
         scan = db.execute(QUERY, {"ids": ids})
         assert fast.rows == scan.rows

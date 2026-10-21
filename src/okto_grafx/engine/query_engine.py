@@ -8079,7 +8079,11 @@ def _frontier_is_bounded(root: PlanNode, variable: str) -> bool:
     for planned in root.walk():
         if getattr(planned, "variable", None) != variable:
             continue
-        if isinstance(planned, IndexSeek):
+        # The scan beneath a conditional multi-key seek is an alternative access path,
+        # not the producer selected for a valid, bounded key list.  The endpoint hybrid
+        # retains its own fan limit and grouped-scan fallback if this seek falls back or
+        # yields a wider frontier than expected.
+        if isinstance(planned, (IndexSeek, NodeMultiKeySeek)):
             return True
         if isinstance(planned, (NodeScan, AllNodesScan)):
             return False
