@@ -435,6 +435,27 @@ def test_collect_ignore_cannot_remove_a_module(tmp_path: Path) -> None:
     assert "vanished" in output
 
 
+def test_xdist_collection_reaches_controller_without_weakening_disappearance_gate(
+    tmp_path: Path,
+) -> None:
+    xdist = ("-p", "xdist.plugin", "-n", "2")
+    passing = HEADER + "def test_planted() -> None:\n    assert True\n"
+    code, output = _plant(tmp_path / "present", module=passing, extra_arguments=xdist)
+    assert code == 0, output
+    assert "vanished from collection" not in output
+
+    ignored = tmp_path / "ignored"
+    code, output = _plant(
+        ignored,
+        module=passing,
+        conftest_extra='\n\ncollect_ignore = ["test_planted.py"]\n',
+        extra_arguments=xdist,
+    )
+    assert code != 0, output
+    assert "test_planted.py" in output
+    assert "vanished from collection" in output
+
+
 def test_an_ignore_collect_hook_cannot_remove_a_module(tmp_path: Path) -> None:
     conftest_extra = (
         "\n\ndef pytest_ignore_collect(collection_path, config):\n"

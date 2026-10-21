@@ -1278,6 +1278,21 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             _COLLECTED_FILES.add(str(pathlib.Path(path).resolve()))
 
 
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_node_collection_finished(node: object, ids: list[str]) -> None:
+    """Mirror each worker's collected modules in the xdist controller.
+
+    The controller receives test reports, but never runs collection_modifyitems.
+    Its disappearance check still needs the workers' actual collection inventory.
+    Workers retain their own skip and silent-item attribution checks.
+    """
+    rootpath = pathlib.Path(str(node.config.rootpath))
+    for nodeid in ids:
+        path = nodeid.split("::", 1)[0]
+        if path.endswith(".py"):
+            _COLLECTED_FILES.add(str((rootpath / path).resolve()))
+
+
 def pytest_itemcollected(item: pytest.Item) -> None:
     """Record every item at the moment pytest collects it (A69, D2).
 

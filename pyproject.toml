@@ -76,6 +76,7 @@ bench = [
 ]
 dev = [
     "pytest>=8",
+    "pytest-xdist>=3.6",
     "pytest-timeout",
     "psutil>=5.9",
     "ruff==0.15.1",
