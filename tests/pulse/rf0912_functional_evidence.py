@@ -11,7 +11,9 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
+from xml.etree import ElementTree
 
 
 __test__ = False
@@ -85,6 +87,43 @@ _SELECTORS = {
 }
 
 
+def _verify_junit(path: Path, selectors: tuple[str, ...]) -> None:
+    """Reject an incomplete or mis-scoped pytest run even when it exits zero."""
+    root = ElementTree.parse(path).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    if not suites or root.tag not in {"testsuite", "testsuites"}:
+        raise ValueError("JUnit document has no test suite")
+    totals = {key: 0 for key in ("tests", "errors", "failures", "skipped")}
+    for suite in suites:
+        for key in totals:
+            try:
+                value = int(suite.attrib[key])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"JUnit suite lacks integer {key}") from exc
+            if value < 0:
+                raise ValueError(f"JUnit suite has negative {key}")
+            totals[key] += value
+    cases = root.findall(".//testcase")
+    if totals["tests"] == 0 or totals["tests"] != len(cases):
+        raise ValueError("JUnit case count is empty or inconsistent")
+    if any(totals[key] for key in ("errors", "failures", "skipped")):
+        raise ValueError("JUnit suite contains errors, failures or skips")
+    expected = {(path.removesuffix(".py").replace("/", "."), name)
+                for path, name in (selector.split("::", 1) for selector in selectors)}
+    observed = set()
+    for case in cases:
+        if any(case.find(tag) is not None for tag in ("error", "failure", "skipped")):
+            raise ValueError("JUnit case contains error, failure or skip")
+        classname = case.attrib.get("classname", "")
+        name = case.attrib.get("name", "").split("[", 1)[0]
+        identity = (classname, name)
+        if identity not in expected:
+            raise ValueError(f"JUnit case outside closed selector set: {classname}.{name}")
+        observed.add(identity)
+    if observed != expected:
+        raise ValueError("JUnit selector coverage incomplete")
+
+
 class RF0912FunctionalEvidence(unittest.TestCase):
     """Exact, inspectable delegation to pre-existing pytest functions."""
 
@@ -92,37 +131,46 @@ class RF0912FunctionalEvidence(unittest.TestCase):
 
     def _check(self, key: str) -> None:
         selectors = _SELECTORS[key]
-        command = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "--maxfail=1",
-            "--tb=short",
-            "-p",
-            "no:cacheprovider",
-            *selectors,
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=_ROOT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=_TIMEOUT_SECONDS,
-                check=False,
+        with tempfile.TemporaryDirectory(prefix="grafx-functional-") as temp:
+            junit = Path(temp) / "junit.xml"
+            command = [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-o",
+                "addopts=",
+                "--maxfail=1",
+                "--tb=short",
+                "-p",
+                "no:cacheprovider",
+                f"--junitxml={junit}",
+                *selectors,
+            ]
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=_ROOT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.fail(f"Functional selector set {key} timed out after {_TIMEOUT_SECONDS}s: {exc}")
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"Functional selector set {key} failed (exit {completed.returncode}):\n"
+                f"{completed.stdout[-8000:]}",
             )
-        except subprocess.TimeoutExpired as exc:
-            self.fail(f"Functional selector set {key} timed out after {_TIMEOUT_SECONDS}s: {exc}")
-        self.assertEqual(
-            completed.returncode,
-            0,
-            f"Functional selector set {key} failed (exit {completed.returncode}):\n"
-            f"{completed.stdout[-8000:]}",
-        )
+            try:
+                _verify_junit(junit, selectors)
+            except (OSError, ElementTree.ParseError, ValueError) as exc:
+                self.fail(f"Functional selector set {key} has invalid JUnit evidence: {exc}")
 
     def test_rf09_main(self):
         self._check("rf09_main")
