@@ -7,6 +7,7 @@ descriptive engineering evidence, not a production percentile/SLA estimate.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import math
@@ -176,6 +177,44 @@ def _integer(value, name, minimum=0):
     _require(type(value) is int and value >= minimum, f"{name}: invalid integer")
 
 
+def validate_fixed_optimization_matrix(selected, *, mode, intent):
+    """Close RF02/RF03/RF05 qualification before a worker is launched.
+
+    Other optimization campaigns, including RF04's four isolated source arms,
+    retain their own matrices and validation rules.
+    """
+    if mode != "optimization" or intent != "qualification":
+        return
+    scenarios = [Scenario.from_dict(value) for value in selected]
+    rf02 = any(item.name.startswith("rf02-") for item in scenarios)
+    rf03 = any(item.name.startswith("rf03-") for item in scenarios)
+    rf05 = any(item.family == "pagination" for item in scenarios)
+    if not (rf02 or rf03 or rf05):
+        return
+    _require(sum((rf02, rf03, rf05)) == 1, "RF02/RF03/RF05 qualification matrices cannot be mixed")
+    budgets = {item.query_memory_budget_bytes for item in scenarios}
+    _require(len(budgets) == 1 and type(next(iter(budgets))) is int
+             and next(iter(budgets)) > 0,
+             "RF02/RF03/RF05 qualification requires one positive logical memory budget")
+    budget = next(iter(budgets))
+    if rf02:
+        from bench.harness.rf02_qualification import matrix
+        expected = matrix()
+        label = "RF02"
+    elif rf03:
+        from bench.harness.connected_qualification import matrix
+        expected = matrix()
+        label = "RF03"
+    else:
+        from bench.harness.pagination_qualification import matrix
+        expected = matrix(Scenario)
+        expected[0] = replace(expected[0], role="target",
+                              work_counter="physical_node_versions_examined")
+        label = "RF05"
+    expected = [replace(item, query_memory_budget_bytes=budget).to_dict() for item in expected]
+    _require(selected == expected, f"{label} qualification requires its exact target/control matrix")
+
+
 def validate_campaign(data):
     """Validate completeness, metadata, independent oracles and contracts."""
     try:
@@ -308,6 +347,7 @@ def _validate(data):
                                       "contract_hash": canonical_hash(contract(scenario)),
                                       "expected_result_hash": canonical_hash(expected_rows),
                                       "result_hash": canonical_hash(expected_rows), "rows": len(expected_rows)}
+    validate_fixed_optimization_matrix(data["scenarios"], mode=data["mode"], intent=data["intent"])
     if rf06_split:
         expected = [item.to_dict() for item in quota_qualification.qualification_matrix(Scenario)]
         _require(data["scenarios"] == expected,

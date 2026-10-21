@@ -22,6 +22,8 @@ def test_rf05_case_has_independent_oracle_and_runtime_regime(tmp_path, case):
         sample = measure_statement(db, scenario, 5)
         assert sample["result_hash"] == sample["expected_result_hash"]
         assert sample["contract_hash"]
+        assert sample["first_row_ns"] is None  # db.execute materializes the page.
+        assert sample["consume_all_ns"] == sample["elapsed_ns"]
         if case in ("first", "membership", "dynamic_membership", "keyset"):
             assert result.statistics.get("ordered_candidates_examined") == (
                 32 if case in ("membership", "dynamic_membership") else 16

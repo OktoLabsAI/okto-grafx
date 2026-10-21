@@ -18,7 +18,8 @@ import sys
 import time
 
 from bench.harness.campaign_fixtures import Scenario, matrix
-from bench.harness.campaign_schema import CampaignError, canonical_hash, compare_campaign, load_json, validate_campaign
+from bench.harness.campaign_schema import (CampaignError, canonical_hash, compare_campaign,
+                                           load_json, validate_campaign, validate_fixed_optimization_matrix)
 from bench.harness.campaign_schema import HISTORICAL_SCOPE, HISTORICAL_REVISION, RUNNER_PYTHON_FLAGS
 
 
@@ -139,6 +140,7 @@ def run_campaign(args):
         if name in targets:
             scenario = dataclasses.replace(scenario, role="target", work_counter=targets[name])
         selected.append(scenario.to_dict())
+    validate_fixed_optimization_matrix(selected, mode=args.mode, intent=args.intent)
     sources = {"A": args.baseline.resolve(), "B": args.candidate.resolve()}
     revisions = {arm: subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
                  for arm, root in sources.items()}

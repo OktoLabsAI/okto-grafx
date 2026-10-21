@@ -1026,6 +1026,9 @@ including timestamp ties and keyset boundary. The first page must show bounded
 must not be credited as index wins. The optimization threshold is a median
 candidate/base ratio at most 0.90 per pair, with controls at most 1.05 median
 and 1.10 p95, calibrated executor, real CPU/RSS and raw hashes as in RF01.
+The worker uses the materializing `db.execute` API: `elapsed_ns` and
+`consume_all_ns` cover the complete page, while `first_row_ns` is `null`.
+This campaign makes no first-row latency claim.
 
 RF06 uses `--rf06-split-memory` and the **exact** six-case matrix returned by
 `quota_qualification.qualification_matrix(Scenario)`, in its declared order.
