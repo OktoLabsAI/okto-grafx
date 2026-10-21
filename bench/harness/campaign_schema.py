@@ -15,6 +15,7 @@ import re
 import statistics
 
 from bench.harness.campaign_fixtures import Scenario, contract, oracle, query_for
+from bench.harness import fts_qualification
 
 HISTORICAL_SCOPE = "rf01_historical_total_overhead"
 HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
@@ -276,6 +277,9 @@ def _validate(data):
             _require(data["mode"] == "recipe", "RF12 capacity is a local recipe, not a universal optimization")
         _require(scenario.name not in scenarios, "duplicate scenario")
         scenarios[scenario.name] = scenario
+        if scenario.family == "fts_matrix":
+            _require(data["mode"] == "recipe" and not historical,
+                     "ranked FTS matrix requires a non-historical recipe comparison")
         if historical:
             if unbudgeted:
                 _require(scenario.family == "landing" and scenario.query_memory_budget_bytes is None,
@@ -292,6 +296,9 @@ def _validate(data):
                                       "contract_hash": canonical_hash(contract(scenario)),
                                       "expected_result_hash": canonical_hash(expected_rows),
                                       "result_hash": canonical_hash(expected_rows), "rows": len(expected_rows)}
+    fts_recipe = data["mode"] == "recipe" and all(s.family == "fts_matrix" for s in scenarios.values())
+    if data["intent"] == "qualification" and any(s.family == "fts_matrix" for s in scenarios.values()):
+        _require(fts_recipe, "qualified native FTS recipes cannot mix memory coverage with other families")
     if data["mode"] == "optimization":
         _require(any(s.role == "target" and s.work_counter for s in scenarios.values()), "optimization needs target physical-work counter")
         _require(any(s.role == "control" for s in scenarios.values()), "optimization needs controls")
@@ -361,6 +368,42 @@ def _validate(data):
             _require(isinstance(sample["statistics"], dict), "statistics missing")
             for key, value in sample["statistics"].items():
                 _integer(value, f"counter {key}")
+            if scenario.family == "fts_matrix":
+                source = sample.get("fts_source")
+                _fields(source, ("statistics_regime", "statistics_mode", "history_entries", "hits"), "FTS source")
+                _require(source["statistics_mode"] == scenario.fts_statistics_mode
+                         and source["history_entries"] == scenario.fts_history
+                         and source["hits"] == sample["rows"]
+                         and source["statistics_regime"] == fts_qualification.expected_source(scenario)
+                         and sample["statistics"].get("corpus_documents") == scenario.nodes
+                         and sample["statistics"].get("statistics_from_" + source["statistics_regime"]) == 1,
+                         "FTS source or corpus evidence differs from scenario")
+                _require((sample["statistics"].get("statistics_wal_records", 0) > 0)
+                         == (scenario.fts_updates == 1), "FTS WAL-delta proof invalid")
+                setup = sample.get("fts_setup")
+                _fields(setup, ("elapsed_ns", "disk_allocated_bytes", "wal_allocated_bytes", "scope"), "FTS fixture setup")
+                _integer(setup["elapsed_ns"], "FTS setup elapsed", 1)
+                _integer(setup["disk_allocated_bytes"], "FTS setup disk", 1)
+                _integer(setup["wal_allocated_bytes"], "FTS setup WAL")
+                if scenario.fts_updates:
+                    maintenance = sample.get("fts_maintenance")
+                    _fields(maintenance, ("elapsed_ns", "durable_acks", "commit_ns", "disk_allocated_delta_bytes",
+                                          "wal_allocated_delta_bytes", "scope"), "FTS maintenance")
+                    _integer(maintenance["elapsed_ns"], "FTS update elapsed", 1)
+                    _require(maintenance["durable_acks"] == scenario.fts_updates,
+                             "FTS update ACK count differs from recipe")
+                    _require(isinstance(maintenance["commit_ns"], list)
+                             and len(maintenance["commit_ns"]) == maintenance["durable_acks"],
+                             "FTS durable commit durations missing")
+                    for duration in maintenance["commit_ns"]:
+                        _integer(duration, "FTS commit ACK duration", 1)
+                    _require(sum(maintenance["commit_ns"]) <= maintenance["elapsed_ns"],
+                             "FTS commit ACK durations exceed update interval")
+                    _require(type(maintenance["disk_allocated_delta_bytes"]) is int
+                             and type(maintenance["wal_allocated_delta_bytes"]) is int,
+                             "FTS allocated byte deltas must be signed integers")
+                else:
+                    _require("fts_maintenance" not in sample, "non-retained FTS sample has maintenance")
             for key in ("elapsed_ns", "cpu_ns", "prepare_ns", "consume_all_ns", "rss_peak_bytes"):
                 _integer(sample[key], key)
             _require(sample["elapsed_ns"] > 0, "zero elapsed time")
@@ -412,7 +455,12 @@ def _validate(data):
                     _require(memory["logical_memory_peak_bytes"] is not None and memory["coverage"] == LOGICAL_COVERAGE,
                              "candidate memory must have real covered peak")
             if memory["logical_memory_peak_bytes"] is None:
-                _require((scenario.family == "write" and scenario.writers > 1) or (historical and (arm == "A" or unbudgeted)) or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
+                native_fts_unavailable = (fts_recipe and scenario.family == "fts_matrix" and
+                                          memory["coverage"] == "unavailable" and
+                                          memory["unavailable_reason"] == "native_fts_memory_not_covered_by_query_budget_observer" and
+                                          sample["rss_peak_bytes"] > 0 and sample["rss_scope"] in (
+                                              "process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"))
+                _require((scenario.family == "write" and scenario.writers > 1) or (historical and (arm == "A" or unbudgeted)) or native_fts_unavailable or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
             else:
                 _integer(memory["logical_memory_peak_bytes"], "logical_memory_peak_bytes")
                 _require(memory["logical_memory_peak_bytes"] >= memory["baseline_retained_bytes"], "memory peak below baseline")
@@ -546,6 +594,33 @@ def compare_campaign(data):
                                      for field in ("commits", "durable_acks", "business_rows", "rows_per_second", "durable_acks_per_second")}
                                for arm, rows in samples.items()},
                 }
+            if scenario.family == "fts_matrix":
+                comparisons[-1]["fts_tradeoff"] = {
+                    "expected_source": fts_qualification.expected_source(scenario),
+                    "logical_memory": "unavailable; native search is outside the Cypher query-budget observer",
+                    "wal_bytes_scope": "allocated WAL file bytes, not logical bytes appended or fsync count",
+                    "setup_scope": "seed insert, index creation, checkpoint and close; not isolated index maintenance",
+                    "by_arm": {arm: {
+                        "source_counts": {source: sum(s["fts_source"]["statistics_regime"] == source for s in rows)
+                                          for source in ("snapshot_cache", "wal_delta", "durable_summary", "full_census")},
+                        "postings_visited": _distribution([s["statistics"]["postings_visited"] for s in rows], "count"),
+                        "statistics_wal_records": _distribution([s["statistics"]["statistics_wal_records"] for s in rows], "count"),
+                        "setup_elapsed_ns": _distribution([s["fts_setup"]["elapsed_ns"] for s in rows]),
+                        "setup_disk_allocated_bytes": _distribution([s["fts_setup"]["disk_allocated_bytes"] for s in rows], "bytes"),
+                        "setup_wal_allocated_bytes": _distribution([s["fts_setup"]["wal_allocated_bytes"] for s in rows], "bytes"),
+                        "update_elapsed_ns": _distribution([s["fts_maintenance"]["elapsed_ns"] for s in rows])
+                        if scenario.fts_updates else None,
+                        "update_commit_ack_ns": _distribution([duration for s in rows
+                                                                for duration in s["fts_maintenance"]["commit_ns"]])
+                        if scenario.fts_updates else None,
+                        "update_disk_allocated_delta_bytes": _distribution([
+                            s["fts_maintenance"]["disk_allocated_delta_bytes"] for s in rows], "bytes")
+                        if scenario.fts_updates else None,
+                        "update_wal_allocated_delta_bytes": _distribution([
+                            s["fts_maintenance"]["wal_allocated_delta_bytes"] for s in rows], "bytes")
+                        if scenario.fts_updates else None,
+                    } for arm, rows in samples.items()},
+                }
             noisy |= any(d["coefficient_of_variation"] > .10 for d in distributions.values())
         totals.append({"scenario_id": scenario.name, "all_retained": {arm: _distribution(values) for arm, values in all_values.items()}})
     decision = "passed" if all(c["thresholds_met"] for c in comparisons) else "failed"
@@ -559,7 +634,7 @@ def compare_campaign(data):
             "qualification_scope": data.get("qualification_scope", "comparable_observer"),
             "memory_regime": data.get("memory_regime", "budgeted"),
             "retry_scope": "single_campaign_only",
-            "comparative_logical_memory": data.get("qualification_scope") != HISTORICAL_SCOPE and data["intent"] == "qualification",
+             "comparative_logical_memory": data.get("qualification_scope") != HISTORICAL_SCOPE and data["intent"] == "qualification" and not all(Scenario.from_dict(s).family == "fts_matrix" for s in data["scenarios"]),
             "candidate_memory_verified": data.get("qualification_scope") == HISTORICAL_SCOPE,
             "decision": decision, "comparisons": comparisons, "overall": totals,
             "calibration_valid": calibrated,

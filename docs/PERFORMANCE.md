@@ -879,6 +879,28 @@ rather than masquerade as a fallback. Keep timing in the calibrated campaign;
 the deterministic CI oracles in `test_fulltext_durable.py` and
 `test_fulltext_history.py` establish semantics and recovery, not a speedup.
 
+The maintained `fts-matrix-*` slices in `bench/harness/fts_qualification.py`
+separate a newly opened handle from a primed handle, a WAL delta after one
+committed update, and a reader pinned across four commits. The input-derived
+oracle checks every returned ID, exact BM25 score, tie order and corpus size.
+The campaign requires the expected `full_census`, `snapshot_cache`,
+`wal_delta` or `durable_summary` source for each slice; merely recording a
+source does not count as proving summary coverage. The native FTS path has no
+Cypher query-budget logical-memory observation: its peak remains null with an
+explicit reason, while process RSS is reported separately. This limits a
+recipe comparison to a workload tradeoff, not a comparative logical-memory
+claim.
+
+The raw samples keep setup duration and allocated database/WAL file sizes.
+For update slices they keep each durable commit ACK duration, total update
+duration and signed allocated-byte deltas outside search timing. Allocated WAL
+file growth is not logical bytes appended or a count of fsync operations;
+setup includes seed insertion, index creation and checkpoint, so it cannot
+isolate index-maintenance cost by itself. The OS file cache is uncontrolled
+even when the process-local statistics cache is freshly opened. Run only
+selected slices with the campaign's `recipe` mode and calibrated three-pair
+protocol; these synthetic results do not change the `wal` default.
+
 ## RF01 historical total-overhead qualification
 
 RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`

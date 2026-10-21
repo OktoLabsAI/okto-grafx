@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import random
 
-from bench.harness import connected_qualification, read_lifecycle_qualification
+from bench.harness import connected_qualification, fts_qualification, read_lifecycle_qualification
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,8 @@ class Scenario:
     buffer_budget_bytes: int = 64 << 20
     checkpoint_interval_records: int = 512
     identity_lease_size: int = 64
+    fts_statistics_mode: str = "durable"
+    fts_updates: int = 0
 
     def __post_init__(self):
         from bench.harness.quota_qualification import validate as validate_quota
@@ -56,7 +58,7 @@ class Scenario:
             raise ValueError("partial progress must be explicitly accepted")
         if (self.write_shape == "chunks" and self.chunk_rows < 1) or (self.write_shape != "chunks" and self.chunk_rows != 0):
             raise ValueError("chunk size applies only to chunks")
-        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination", "capacity"} | connected_qualification.FAMILIES | read_lifecycle_qualification.FAMILIES:
+        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination", "capacity", fts_qualification.FAMILY} | connected_qualification.FAMILIES | read_lifecycle_qualification.FAMILIES:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
             raise ValueError("invalid fixture dimensions")
@@ -87,6 +89,8 @@ class Scenario:
         elif (self.capacity_case is not None or self.buffer_budget_bytes != 64 << 20
               or self.checkpoint_interval_records != 512 or self.identity_lease_size != 64):
             raise ValueError("capacity config applies only to RF12 recipes")
+        if self.family == fts_qualification.FAMILY:
+            fts_qualification.validate(self)
 
     def to_dict(self):
         return asdict(self)
@@ -131,6 +135,8 @@ def oracle(scenario: Scenario):
     if scenario.family == "capacity":
         from bench.harness.capacity_qualification import oracle as capacity_oracle
         return capacity_oracle(scenario)
+    if scenario.family == fts_qualification.FAMILY:
+        return fts_qualification.oracle(scenario)
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import oracle as page_oracle
         return page_oracle(scenario)
@@ -162,6 +168,8 @@ def query_for(scenario: Scenario):
     if scenario.family == "capacity":
         from bench.harness.capacity_qualification import query_for as capacity_query
         return capacity_query(scenario)
+    if scenario.family == fts_qualification.FAMILY:
+        return fts_qualification.query_for(scenario)
     if scenario.family in connected_qualification.FAMILIES:
         return connected_qualification.query_for(scenario)
     family = scenario.family
@@ -200,6 +208,8 @@ def contract(scenario: Scenario):
     if scenario.family == "capacity":
         from bench.harness.capacity_qualification import contract as capacity_contract
         return capacity_contract(scenario)
+    if scenario.family == fts_qualification.FAMILY:
+        return fts_qualification.contract(scenario)
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import contract as page_contract
         return page_contract(scenario)
@@ -234,6 +244,8 @@ def build_fixture(db, scenario: Scenario, *, apply_updates=True):
     if scenario.family == "capacity":
         from bench.harness.capacity_qualification import build_fixture as capacity_fixture
         return capacity_fixture(db, scenario)
+    if scenario.family == fts_qualification.FAMILY:
+        return fts_qualification.build_fixture(db, scenario)
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import build_fixture as build_page_fixture
         return build_page_fixture(db, scenario)
@@ -264,6 +276,8 @@ def build_fixture(db, scenario: Scenario, *, apply_updates=True):
 
 
 def apply_churn(db, scenario):
+    if scenario.family == fts_qualification.FAMILY:
+        return fts_qualification.apply_updates(db, scenario)
     for i in range(scenario.nodes * scenario.churn_percent // 100):
         with db.begin("write") as tx:
             if i % 2:
@@ -325,4 +339,5 @@ def matrix():
     from bench.harness.rf02_qualification import matrix as scalar_matrix
     from bench.harness.quota_qualification import matrix as quota_matrix
     return (result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix()
-            + read_lifecycle_qualification.matrix() + quota_matrix(Scenario))
+            + read_lifecycle_qualification.matrix() + quota_matrix(Scenario)
+            + fts_qualification.matrix(Scenario))

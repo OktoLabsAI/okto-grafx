@@ -33,6 +33,7 @@ from bench.harness.campaign_fixtures import Scenario, apply_churn, build_fixture
 from bench.harness import read_lifecycle_qualification
 from bench.harness.campaign_schema import CampaignError, canonical_hash, load_json
 from bench.harness.campaign_schema import HISTORICAL_SCOPE, validate_candidate_memory
+from bench.harness import fts_qualification
 
 
 def unavailable_memory(reason):
@@ -101,6 +102,8 @@ def measure_statement(db, scenario, index, *, reader=None):
     begin = time.perf_counter_ns()
     if scenario.family == "fts":
         plan = ["native_search_text_membership"]
+    elif scenario.family == fts_qualification.FAMILY:
+        plan = ["native_search_text_ranked"]
     else:
         plan = [type(node).__name__ for node in db.explain(query).walk()]
     prepare_ns = time.perf_counter_ns() - begin
@@ -112,7 +115,8 @@ def measure_statement(db, scenario, index, *, reader=None):
     unbudgeted_landing = scenario.family == "landing" and scenario.query_memory_budget_bytes is None
     if unbudgeted_landing and getattr(db._queries, "_memory_observation", None) is not None:
         raise CampaignError("unbudgeted landing requires no preexisting logical observation")
-    memory_scope = observe() if observe is not None and not unbudgeted_landing else nullcontext(None)
+    native_fts = scenario.family == fts_qualification.FAMILY
+    memory_scope = observe() if observe is not None and not (unbudgeted_landing or native_fts) else nullcontext(None)
     first = commit = None
     stats = {}
     with memory_scope as observation:
@@ -124,6 +128,8 @@ def measure_statement(db, scenario, index, *, reader=None):
             rows, result, first = read_lifecycle_qualification.execute(db, scenario, start)
         elif scenario.family == "fts":
             rows, result = _fts_rows(db, scenario)
+        elif native_fts:
+            rows, result = fts_qualification.rows(db, scenario, reader=reader)
         elif scenario.family == "write":
             tx = db.begin("write")
             try:
@@ -160,7 +166,16 @@ def measure_statement(db, scenario, index, *, reader=None):
         # samples describe effective coverage, not that implementation label.
         # Preserve the null peak, reason and measured baseline verbatim.
         memory = dict(memory, coverage="unavailable")
-    if scenario.family == "fts":
+    if native_fts:
+        memory = unavailable_memory("native_fts_memory_not_covered_by_query_budget_observer")
+        stats = fts_qualification.statistics(result)
+        if result.corpus_documents != scenario.nodes:
+            raise CampaignError("FTS corpus count differs from fixture")
+        if result.statistics_regime != fts_qualification.expected_source(scenario):
+            raise CampaignError("FTS statistics source does not cover the declared recipe")
+        if (result.statistics_wal_records > 0) != (scenario.fts_updates == 1):
+            raise CampaignError("FTS WAL delta evidence differs from declared recipe")
+    elif scenario.family == "fts":
         memory = unavailable_memory("native_fts_memory_not_covered_by_query_budget_observer")
         stats = {"postings_visited": result.postings_visited}
     else:
@@ -172,9 +187,15 @@ def measure_statement(db, scenario, index, *, reader=None):
     if scenario.family == "write":
         rows = db.execute("MATCH (n:W) RETURN n.id,n.payload ORDER BY n.id").rows
     peak, scope = rss_peak()
-    return sample_record(scenario.to_dict(), index, rows, stats, elapsed_ns=elapsed, cpu_ns=cpu,
+    sample = sample_record(scenario.to_dict(), index, rows, stats, elapsed_ns=elapsed, cpu_ns=cpu,
                          prepare_ns=prepare_ns, memory=memory, rss_peak_bytes=peak,
                          first_row_ns=first, commit_ns=commit, selected_plan=plan, rss_scope=scope)
+    if native_fts:
+        sample["fts_source"] = {"statistics_regime": result.statistics_regime,
+                                "statistics_mode": scenario.fts_statistics_mode,
+                                "history_entries": scenario.fts_history,
+                                "hits": len(rows)}
+    return sample
 
 
 def _sizes(root):
@@ -530,14 +551,34 @@ def run_worker(request, output):
             measured_options = {**options, **connection_options(scenario)}
             with tempfile.TemporaryDirectory(prefix="fixture-", dir=output.parent) as directory:
                 root = Path(directory) / "db"
-                independent = scenario.family in ("write", "capacity") or scenario.reader == "retained"
+                independent = scenario.family in ("write", "capacity") or scenario.reader == "retained" or (
+                    scenario.family == fts_qualification.FAMILY and scenario.fts_updates > 0)
+                shared_fts_setup = None
                 if not independent:
+                    setup_start = time.perf_counter_ns()
                     with okto_grafx.connect(root, **options) as db:
                         build_fixture(db, scenario)
+                    if scenario.family == fts_qualification.FAMILY:
+                        setup_bytes, setup_wal = _sizes(root)
+                        shared_fts_setup = {"elapsed_ns": time.perf_counter_ns() - setup_start,
+                                            "disk_allocated_bytes": setup_bytes,
+                                            "wal_allocated_bytes": setup_wal,
+                                            "scope": "seed_insert_index_creation_checkpoint_and_close"}
                 for index in range(25):
                     sample_root = root if not independent else Path(directory) / f"independent-{index}"
+                    sample_fts_setup = None
+                    if independent and scenario.family == fts_qualification.FAMILY:
+                        setup_start = time.perf_counter_ns()
+                        with okto_grafx.connect(sample_root, **options) as setup_db:
+                            build_fixture(setup_db, scenario)
+                        setup_bytes, setup_wal = _sizes(sample_root)
+                        sample_fts_setup = {"elapsed_ns": time.perf_counter_ns() - setup_start,
+                                            "disk_allocated_bytes": setup_bytes,
+                                            "wal_allocated_bytes": setup_wal,
+                                            "scope": "seed_insert_index_creation_checkpoint_and_close"}
                     with okto_grafx.connect(sample_root, **measured_options) as db:
-                        if independent:
+                        fts_setup = sample_fts_setup or shared_fts_setup
+                        if independent and scenario.family != fts_qualification.FAMILY:
                             build_fixture(db, scenario, apply_updates=scenario.reader != "retained")
                         report["metrics_sink"] = type(db._queries._metrics.sink.inner).__name__
                         if db._queries._metrics.enabled:
@@ -552,9 +593,23 @@ def run_worker(request, output):
                                 read_lifecycle_qualification.execute(db, scenario)
                             elif scenario.family == "fts":
                                 _fts_rows(db, scenario)
+                            elif scenario.family == fts_qualification.FAMILY:
+                                fts_qualification.rows(db, scenario)
                             else:
                                 db.execute(query, params)
                         before, wal_before = _sizes(sample_root)
+                        fts_update = None
+                        if scenario.family == fts_qualification.FAMILY and scenario.fts_updates == 1:
+                            update_start = time.perf_counter_ns()
+                            commit_times = fts_qualification.apply_updates(db, scenario)
+                            update_elapsed = time.perf_counter_ns() - update_start
+                            updated, updated_wal = _sizes(sample_root)
+                            fts_update = {"elapsed_ns": update_elapsed, "durable_acks": len(commit_times),
+                                          "commit_ns": list(commit_times),
+                                          "disk_allocated_delta_bytes": updated - before,
+                                          "wal_allocated_delta_bytes": updated_wal - wal_before,
+                                          "scope": "one_update_transaction_after_cached_seed"}
+                            before, wal_before = updated, updated_wal
                         if continue_sample:
                             if scenario.family == "capacity":
                                 from bench.harness.capacity_qualification import measure
@@ -562,10 +617,25 @@ def run_worker(request, output):
                             elif scenario.reader == "retained":
                                 with db.begin("read") as reader:
                                     reader.execute("MATCH (n:N) RETURN count(n)")
-                                    apply_churn(db, scenario)
+                                    update_start = time.perf_counter_ns()
+                                    commit_times = apply_churn(db, scenario)
+                                    if scenario.family == fts_qualification.FAMILY:
+                                        update_elapsed = time.perf_counter_ns() - update_start
+                                        updated, updated_wal = _sizes(sample_root)
+                                        fts_update = {"elapsed_ns": update_elapsed,
+                                                      "durable_acks": len(commit_times),
+                                                      "commit_ns": list(commit_times),
+                                                      "disk_allocated_delta_bytes": updated - before,
+                                                      "wal_allocated_delta_bytes": updated_wal - wal_before,
+                                                      "scope": "four_separate_update_transactions_after_reader_pin"}
+                                    before, wal_before = _sizes(sample_root)
                                     sample = measure_statement(db, scenario, index, reader=reader)
                             else:
                                 sample = measure_statement(db, scenario, index)
+                            if scenario.family == fts_qualification.FAMILY:
+                                sample["fts_setup"] = fts_setup
+                                if fts_update is not None:
+                                    sample["fts_maintenance"] = fts_update
                     if scenario.family in read_lifecycle_qualification.FAMILIES:
                         sample["statistics"]["diagnostic_handle_close_complete"] = int(db.close_complete)
                         if not db.close_complete:
