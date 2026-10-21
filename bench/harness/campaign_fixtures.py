@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import random
 
+from bench.harness import connected_qualification
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -33,9 +35,11 @@ class Scenario:
     work_counter: str | None = None
     query_memory_budget_bytes: int | None = None
     pagination_case: str | None = None
+    destination_nodes: int = 128
+    parallel_edges: int = 127
 
     def __post_init__(self):
-        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination"}:
+        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination"} | connected_qualification.FAMILIES:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
             raise ValueError("invalid fixture dimensions")
@@ -56,6 +60,8 @@ class Scenario:
             validate(self)
         elif self.pagination_case is not None:
             raise ValueError("pagination case only applies to RF05 pagination")
+        if self.family in connected_qualification.FAMILIES:
+            connected_qualification.validate(self)
 
     def to_dict(self):
         return asdict(self)
@@ -98,6 +104,8 @@ def oracle(scenario: Scenario):
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import oracle as page_oracle
         return page_oracle(scenario)
+    if scenario.family in connected_qualification.FAMILIES:
+        return connected_qualification.oracle(scenario)
     nodes, edges = live_data(scenario)
     ids = {n["id"] for n in nodes}
     if scenario.family == "constant":
@@ -119,6 +127,8 @@ def oracle(scenario: Scenario):
 
 
 def query_for(scenario: Scenario):
+    if scenario.family in connected_qualification.FAMILIES:
+        return connected_qualification.query_for(scenario)
     family = scenario.family
     if family == "pagination":
         from bench.harness.pagination_qualification import query_for as page_query
@@ -157,6 +167,8 @@ def contract(scenario: Scenario):
             "transaction": "one atomic transaction per writer" if scenario.family == "write" else "single read snapshot",
             "durability": "default synchronous ACK", "errors": "success required; any exception invalidates run",
             "fts_projection": "sorted record IDs only; scores/ranking out of scope" if scenario.family == "fts" else None}
+    if scenario.family in connected_qualification.FAMILIES:
+        value.update(connected_qualification.contract(scenario))
     if scenario.family == "landing":
         value["regime_prerequisites"] = "identity indexes provisioned; blocking consumer; query memory budget disabled in both arms"
         value["qualification_limit"] = (
@@ -170,6 +182,8 @@ def build_fixture(db, scenario: Scenario, *, apply_updates=True):
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import build_fixture as build_page_fixture
         return build_page_fixture(db, scenario)
+    if scenario.family in connected_qualification.FAMILIES:
+        return connected_qualification.build_fixture(db, scenario, apply_updates=apply_updates)
     nodes, edges = fixture_data(scenario)
     with db.begin("write") as tx:
         tx.execute("CREATE NODE TABLE N(id INT64,value INT64,payload STRING,body STRING,PRIMARY KEY(id))")
@@ -236,4 +250,5 @@ def matrix():
                                        cache=cache, fts_history=history))
     from bench.harness.pagination_qualification import matrix as page_matrix
     result.extend(page_matrix(Scenario))
-    return result
+    from bench.harness.rf02_qualification import matrix as scalar_matrix
+    return result + scalar_matrix() + connected_qualification.matrix()
