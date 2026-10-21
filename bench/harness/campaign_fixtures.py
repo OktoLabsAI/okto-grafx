@@ -34,7 +34,7 @@ class Scenario:
     query_memory_budget_bytes: int | None = None
 
     def __post_init__(self):
-        if self.family not in {"constant", "keys", "node_scan", "edge_scan", "page", "fanout", "write", "fts"}:
+        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts"}:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
             raise ValueError("invalid fixture dimensions")
@@ -74,7 +74,7 @@ def fixture_data(scenario: Scenario):
         if scenario.distribution == "hub" and i < (count * 80 + 99) // 100:
             source = i % hubs
         edges.append((source, rng.randrange(scenario.nodes)))
-    if scenario.family == "fanout":
+    if scenario.family in ("fanout", "landing"):
         edges = [(0, i % scenario.nodes) for i in range(scenario.fanout)]
     return nodes, edges
 
@@ -93,12 +93,12 @@ def oracle(scenario: Scenario):
     ids = {n["id"] for n in nodes}
     if scenario.family == "constant":
         return ((1,),)
-    if scenario.family == "keys":
+    if scenario.family in ("keys", "pk_seek"):
         return tuple((i,) for i in sorted(scenario.keys) if i in ids)
     if scenario.family in ("node_scan", "page"):
         rows = tuple((i,) for i in sorted(ids))
         return rows[:scenario.page] if scenario.family == "page" else rows
-    if scenario.family in ("edge_scan", "fanout"):
+    if scenario.family in ("edge_scan", "fanout", "landing"):
         return tuple(sorted(edges))
     if scenario.family == "write":
         return tuple((i, "x" * scenario.payload_bytes)
@@ -115,6 +115,15 @@ def query_for(scenario: Scenario):
         return "RETURN 1 AS value", {}
     if family == "keys":
         return "UNWIND $keys AS k MATCH (n:N {id:k}) RETURN n.id ORDER BY n.id", {"keys": list(scenario.keys)}
+    if family == "pk_seek":
+        # Map-property bindings are already eligible in the historical baseline;
+        # scalar UNWIND is deliberately retained separately as the RF02 workload.
+        return "UNWIND $keys AS k MATCH (n:N {id:k.id}) RETURN n.id ORDER BY n.id", {
+            "keys": [{"id": key} for key in scenario.keys]}
+    if family == "landing":
+        # A bounded indexed anchor plus a blocking consumer admits native batched
+        # landing. This is not a streaming/LIMIT control.
+        return "MATCH (a:N {id:0})-[:E]->(b:N) RETURN a.id,b.id ORDER BY a.id,b.id", {}
     if family == "page":
         return "MATCH (n:N) RETURN n.id ORDER BY n.id LIMIT $page", {"page": scenario.page}
     if family == "node_scan":
@@ -129,10 +138,18 @@ def query_for(scenario: Scenario):
 
 
 def contract(scenario: Scenario):
-    return {"result": "typed ordered rows preserving multiplicity", "snapshot": "before churn" if scenario.reader == "retained" else "fixture after churn",
+    value = {"result": "typed ordered rows preserving multiplicity", "snapshot": "before churn" if scenario.reader == "retained" else "fixture after churn",
             "transaction": "one atomic transaction per writer" if scenario.family == "write" else "single read snapshot",
             "durability": "default synchronous ACK", "errors": "success required; any exception invalidates run",
             "fts_projection": "sorted record IDs only; scores/ranking out of scope" if scenario.family == "fts" else None}
+    if scenario.family == "landing":
+        value["regime_prerequisites"] = "identity indexes provisioned; blocking consumer; query memory budget disabled in both arms"
+        value["qualification_limit"] = (
+            "diagnostic control only under current historical-noop memory contract: "
+            "any configured query memory budget selects memory_guard and does not exercise batched landing; "
+            "without that budget candidate logical-memory observation is unavailable"
+        )
+    return value
 
 
 def build_fixture(db, scenario: Scenario, *, apply_updates=True):
@@ -153,6 +170,10 @@ def build_fixture(db, scenario: Scenario, *, apply_updates=True):
             statistics_mode="durable", statistics_history_entries=scenario.fts_history))
     if apply_updates:
         apply_churn(db, scenario)
+    if scenario.family == "landing":
+        # Identity indexes are optional maintenance artifacts, not implied by a
+        # primary-key index. Provision identically in both arms before timing.
+        db.ensure_identity_indexes()
     db.checkpoint()
 
 
@@ -167,7 +188,10 @@ def apply_churn(db, scenario):
 
 def matrix():
     """Named relevant slices; use CLI list to select, never implicitly run all."""
-    result = [Scenario("constant", "constant")]
+    result = [Scenario("constant", "constant"),
+              Scenario("pk-seek-control", "pk_seek", nodes=128, edges_per_node=0,
+                       keys=(1, 7, 7, 31, 999)),
+              Scenario("landing-control", "landing", nodes=128, edges_per_node=0, fanout=64)]
     for n in (1024, 16384):
         for count in (0, 1, 8, 16, 64, n // 2):
             result.append(Scenario(f"keys-n{n}-k{count}", "keys", nodes=n, keys=tuple(range(count))))
