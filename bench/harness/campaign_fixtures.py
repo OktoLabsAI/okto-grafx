@@ -37,8 +37,17 @@ class Scenario:
     pagination_case: str | None = None
     destination_nodes: int = 128
     parallel_edges: int = 127
+    write_shape: str = "unwind"
+    chunk_rows: int = 0
+    partial_progress: bool = False
 
     def __post_init__(self):
+        if self.write_shape not in ("unwind", "statements", "executemany", "chunks", "transactions"):
+            raise ValueError("unsupported write shape")
+        if self.write_shape in ("chunks", "transactions") and not self.partial_progress:
+            raise ValueError("partial progress must be explicitly accepted")
+        if (self.write_shape == "chunks" and self.chunk_rows < 1) or (self.write_shape != "chunks" and self.chunk_rows != 0):
+            raise ValueError("chunk size applies only to chunks")
         if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination"} | connected_qualification.FAMILIES:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
@@ -153,6 +162,8 @@ def query_for(scenario: Scenario):
     if family in ("edge_scan", "fanout"):
         return "MATCH (a:N)-[:E]->(b:N) RETURN a.id,b.id ORDER BY a.id,b.id", {}
     if family == "write":
+        if scenario.write_shape in ("statements", "executemany", "transactions"):
+            return "CREATE (:W {id:$id,payload:$payload})", {"recipe_rows": scenario.write_rows, "payload_bytes": scenario.payload_bytes}
         return "UNWIND $rows AS r CREATE (:W {id:r.id,payload:r.payload})", {
             "rows": [{"id": i, "payload": "x" * scenario.payload_bytes}
                      for i in range(scenario.write_rows * scenario.writers)]}
@@ -169,6 +180,13 @@ def contract(scenario: Scenario):
             "fts_projection": "sorted record IDs only; scores/ranking out of scope" if scenario.family == "fts" else None}
     if scenario.family in connected_qualification.FAMILIES:
         value.update(connected_qualification.contract(scenario))
+    if scenario.family == "write":
+        value.update(write_shape=scenario.write_shape, partial_progress=scenario.partial_progress,
+                     chunk_rows=scenario.chunk_rows,
+                     transaction=("one transaction per row" if scenario.write_shape == "transactions" else
+                                  "one transaction per explicit chunk" if scenario.write_shape == "chunks" else
+                                  "one atomic transaction per writer"),
+                     comparison="different ACK counts/atomic units are tradeoffs, never equivalent contracts")
     if scenario.family == "landing":
         value["regime_prerequisites"] = "identity indexes provisioned; blocking consumer; query memory budget disabled in both arms"
         value["qualification_limit"] = (
@@ -217,6 +235,21 @@ def apply_churn(db, scenario):
                 tx.execute("MATCH (n:N {id:$id}) SET n.value=$value", {"id": i, "value": -2 * i})
 
 
+def ingestion_matrix():
+    """RF09 representative slices; no implicit full Cartesian campaign."""
+    result = []
+    dimensions = ((1, 64, 1), (32, 64, 1), (128, 4096, 1), (512, 4096, 1),
+                  (32, 64, 2), (32, 64, 4))
+    for shape in ("unwind", "statements", "executemany", "chunks", "transactions"):
+        for rows, size, writers in dimensions:
+            result.append(Scenario(f"ingestion-{shape}-r{rows}-b{size}-w{writers}", "write",
+                                   nodes=1, edges_per_node=0, write_rows=rows,
+                                   payload_bytes=size, writers=writers, write_shape=shape,
+                                   chunk_rows=32 if shape == "chunks" else 0,
+                                   partial_progress=shape in ("chunks", "transactions")))
+    return result
+
+
 def matrix():
     """Named relevant slices; use CLI list to select, never implicitly run all."""
     result = [Scenario("constant", "constant"),
@@ -251,4 +284,4 @@ def matrix():
     from bench.harness.pagination_qualification import matrix as page_matrix
     result.extend(page_matrix(Scenario))
     from bench.harness.rf02_qualification import matrix as scalar_matrix
-    return result + scalar_matrix() + connected_qualification.matrix()
+    return result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix()

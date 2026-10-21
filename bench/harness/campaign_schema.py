@@ -371,6 +371,13 @@ def _validate(data):
             if scenario.family == "write":
                 _integer(sample["commit_ns"], "commit_ns")
                 _require(sample["commit_ns"] <= sample["elapsed_ns"], "ACK boundary exceeds total")
+                validate_write_sample(sample, scenario, qualification=data["intent"] == "qualification")
+                if data["intent"] == "qualification" and scenario.writers > 1:
+                    key = name + ":writer_memory"
+                    coverage = [w["memory"]["coverage"] for w in sample["writers"]]
+                    _require(key not in sample_contracts or sample_contracts[key] == coverage,
+                             "writer memory measurement changed between samples/arms")
+                    sample_contracts[key] = coverage
             else:
                 _require(sample["commit_ns"] is None, "read cannot claim durable commit timing")
             memory = sample["memory"]
@@ -397,7 +404,7 @@ def _validate(data):
                     _require(memory["logical_memory_peak_bytes"] is not None and memory["coverage"] == LOGICAL_COVERAGE,
                              "candidate memory must have real covered peak")
             if memory["logical_memory_peak_bytes"] is None:
-                _require((historical and (arm == "A" or unbudgeted)) or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
+                _require((scenario.family == "write" and scenario.writers > 1) or (historical and (arm == "A" or unbudgeted)) or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
             else:
                 _integer(memory["logical_memory_peak_bytes"], "logical_memory_peak_bytes")
                 _require(memory["logical_memory_peak_bytes"] >= memory["baseline_retained_bytes"], "memory peak below baseline")
@@ -420,6 +427,59 @@ def _distribution(values, unit="ns"):
             f"stdev_{unit}": statistics.stdev(values) if len(values) > 1 else 0,
             "coefficient_of_variation": statistics.stdev(values) / statistics.mean(values)
             if len(values) > 1 and statistics.mean(values) != 0 else 0}
+
+
+def validate_write_sample(sample, scenario, *, qualification):
+    """Validate returned durable reports and each process's real logical peak."""
+    write = sample.get("write", {})
+    from bench.harness.campaign_fixtures import contract
+    _require(sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes, "write memory budget differs from scenario")
+    _require(write.get("atomic_unit") == contract(scenario)["transaction"] and
+             write.get("throughput_boundary") == "sample elapsed interval through all returned durable ACKs",
+             "write timing/atomicity boundary invalid")
+    count = (scenario.write_rows if scenario.write_shape == "transactions" else
+             math.ceil(scenario.write_rows / scenario.chunk_rows) if scenario.write_shape == "chunks" else 1)
+    expected = count * scenario.writers
+    reports = write.get("commit_reports", [])
+    _require(len(reports) == expected and write.get("commits") == expected
+             and write.get("durable_acks") == expected, "write commits/ACKs inconsistent")
+    for report in reports:
+        _integer(report.get("csn"), "commit csn", 1)
+        _require(report.get("durable") is True and report.get("wrote") is True, "write ACK not durable")
+    _require(len({r["csn"] for r in reports}) == expected, "duplicate commit report")
+    _require(write.get("business_rows") == scenario.write_rows * scenario.writers, "write business rows inconsistent")
+    _require(write.get("shape") == scenario.write_shape and write.get("partial_progress") is scenario.partial_progress,
+             "write atomicity differs from scenario")
+    _require(write.get("rows_per_second") == scenario.write_rows * scenario.writers * 1e9 / sample["elapsed_ns"]
+             and write.get("durable_acks_per_second") == expected * 1e9 / sample["elapsed_ns"], "write throughput inconsistent")
+    memories = [sample["memory"]]
+    if scenario.writers > 1:
+        writers = sample.get("writers", [])
+        _require(len(writers) == scenario.writers and {w.get("writer") for w in writers} == set(range(scenario.writers)),
+                 "missing or duplicate writer proof")
+        _require(len({w.get("process_id") for w in writers}) == scenario.writers, "writers must be independent processes")
+        for writer in writers:
+            _require(writer.get("memory_budget_bytes") == scenario.query_memory_budget_bytes, "writer memory budget differs from scenario")
+            _integer(writer.get("process_id"), "writer process ID", 1)
+            _require(len(writer.get("commit_reports", [])) == count, "writer ACK count differs from atomic units")
+            for key in ("elapsed_ns", "cpu_ns", "commit_ns"):
+                _integer(writer.get(key), "writer " + key)
+            _require(writer["elapsed_ns"] > 0 and writer["commit_ns"] <= writer["elapsed_ns"], "writer ACK boundary invalid")
+        _require([r for w in writers for r in w.get("commit_reports", [])] == reports, "writer reports differ from aggregate")
+        _require(sample["memory"]["logical_memory_peak_bytes"] is None and sample["memory"]["unavailable_reason"] ==
+                 "concurrent_process_peaks_reported_per_writer_not_aggregated", "concurrent memory cannot aggregate independent peaks")
+        memories = [w["memory"] for w in writers]
+    for memory in memories:
+        peak = memory.get("logical_memory_peak_bytes")
+        if peak is None:
+            _require(not qualification and bool(memory.get("unavailable_reason")), "writer memory unavailable: cannot qualify")
+            continue
+        _integer(peak, "writer memory peak")
+        _integer(memory.get("baseline_retained_bytes"), "writer memory baseline")
+        _require(peak >= memory["baseline_retained_bytes"] and memory.get("unavailable_reason") is None, "writer memory invalid")
+        if qualification:
+            _require(scenario.query_memory_budget_bytes is not None and memory.get("coverage") in (
+                LOGICAL_COVERAGE, "simultaneous_sequence_query_budget_and_handle_owner_endpoint_tariffs_v1"), "writer memory coverage invalid")
 
 
 def compare_campaign(data):
@@ -460,6 +520,16 @@ def compare_campaign(data):
                                 "median_ratio": med, "p95_ratio": tail, "median_limit": limit,
                                 "p95_limit": tail_limit, "physical_work_reduced": work_reduced,
                                 "thresholds_met": med <= limit and (tail_limit is None or tail <= tail_limit) and work_reduced is not False})
+            if scenario.family == "write":
+                comparisons[-1]["write_tradeoff"] = {
+                    "atomic_unit": samples["A"][0]["write"]["atomic_unit"],
+                    "partial_progress": scenario.partial_progress,
+                    "comparison_limit": "ACK counts and atomic units remain explicit; different shapes are not equivalent contracts",
+                    "by_arm": {arm: {field: _distribution([s["write"][field] for s in rows],
+                                                         "per_second" if field.endswith("per_second") else "count")
+                                     for field in ("commits", "durable_acks", "business_rows", "rows_per_second", "durable_acks_per_second")}
+                               for arm, rows in samples.items()},
+                }
             noisy |= any(d["coefficient_of_variation"] > .10 for d in distributions.values())
         totals.append({"scenario_id": scenario.name, "all_retained": {arm: _distribution(values) for arm, values in all_values.items()}})
     decision = "passed" if all(c["thresholds_met"] for c in comparisons) else "failed"

@@ -16,14 +16,16 @@ __all__ = ["LogicalMemoryBudget"]
 class _LogicalMemoryObservation:
     """Peak of simultaneous admitted tariffs; no allocator or RSS claim.
 
-    Internal opt-in observations are single-execution intervals. Closing revokes
+    Internal opt-in observations are single-execution intervals by default; the
+    explicit sequence mode keeps the same live ledger across owned statements.
+    Closing revokes
     updates from budgets that outlive the interval. Tokens identify budgets, not
     operators: a spill workspace sharing a budget must not count it twice.
     """
 
-    __slots__ = ("_values", "current", "_peak", "_baseline", "_active", "_reason", "_statement", "_cursors")
+    __slots__ = ("_values", "current", "_peak", "_baseline", "_active", "_reason", "_statement", "_cursors", "_sequence")
 
-    def __init__(self) -> None:
+    def __init__(self, *, sequence: bool = False) -> None:
         self._values: dict[object, int] = {}
         self.current = 0
         self._peak = 0
@@ -32,6 +34,7 @@ class _LogicalMemoryObservation:
         self._reason: str | None = None
         self._statement: object | None = None
         self._cursors = 0
+        self._sequence = sequence
 
     def update(self, token: object, retained: int) -> None:
         if not self._active:
@@ -56,7 +59,7 @@ class _LogicalMemoryObservation:
     def claim(self, statement: object) -> None:
         if self._statement is None:
             self._statement = statement
-        elif self._statement is not statement:
+        elif self._statement is not statement and not self._sequence:
             self.invalidate("multiple_statements_in_interval")
 
     def close(self) -> None:
@@ -72,7 +75,8 @@ class _LogicalMemoryObservation:
         return {
             "logical_memory_peak_bytes": self._peak if self._reason is None else None,
             "baseline_retained_bytes": self._baseline,
-            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "coverage": ("simultaneous_sequence_query_budget_and_handle_owner_endpoint_tariffs_v1"
+                         if self._sequence else "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1"),
             "unavailable_reason": self._reason,
         }
 

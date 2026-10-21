@@ -90,6 +90,8 @@ def _fts_rows(db, scenario):
 def measure_statement(db, scenario, index, *, reader=None):
     if db._queries._query_memory_budget_bytes != scenario.query_memory_budget_bytes:
         raise CampaignError("runtime logical memory budget differs from scenario")
+    if scenario.family == "write":
+        return measure_single_write(db, scenario, index)
     query, params = query_for(scenario)
     begin = time.perf_counter_ns()
     if scenario.family == "fts":
@@ -272,35 +274,93 @@ def collect_candidate_memory(run, budgets, directory):
     return evidence
 
 
+def execute_write_recipe(db, scenario, records):
+    """Use existing APIs; collect only returned ACKs, never replay a failed commit."""
+    query = query_for(scenario)[0]
+    width = (1 if scenario.write_shape == "transactions" else
+             scenario.chunk_rows if scenario.write_shape == "chunks" else len(records))
+    stats, reports, commit_ns = {}, [], 0
+    for offset in range(0, len(records), max(1, width)):
+        group = records[offset:offset + width]
+        tx = db.begin("write")
+        try:
+            if scenario.write_shape == "executemany":
+                results = (tx.executemany(query, iter(group)),)
+            elif scenario.write_shape in ("statements", "transactions"):
+                results = (tx.execute(query, record) for record in group)
+            else:
+                results = (tx.execute(query, {"rows": group}),)
+            for result in results:
+                for key, value in result.statistics.items():
+                    stats[key] = stats.get(key, 0) + value
+            ack_start = time.perf_counter_ns()
+            report = tx.commit()
+            commit_ns += time.perf_counter_ns() - ack_start
+            reports.append({"csn": int(report.csn), "durable": report.durable, "wrote": report.wrote})
+            if report.durable is not True or report.wrote is not True:
+                raise CampaignError("write returned no durable ACK; campaign invalid, no replay")
+        finally:
+            # A commit refusal may leave the transaction active. Confirmed and
+            # uncertain outcomes never receive replay from this measurement.
+            if tx.active:
+                tx.rollback()
+    return stats, reports, commit_ns
+
+
+def _measure_writer(db, scenario, records):
+    sequence = getattr(db._queries, "_observe_logical_memory_sequence", None)
+    observe = sequence or (getattr(db._queries, "_observe_logical_memory", None)
+                           if scenario.write_shape == "unwind" else None)
+    with (observe() if observe else nullcontext(None)) as observation:
+        cpu_start, start = time.process_time_ns(), time.perf_counter_ns()
+        stats, reports, commit_ns = execute_write_recipe(db, scenario, records)
+        elapsed, cpu = time.perf_counter_ns() - start, time.process_time_ns() - cpu_start
+    memory = observation.result() if observation else unavailable_memory("revision_has_no_sequence_memory_observer")
+    peak, rss_scope = rss_peak()
+    return {"elapsed_ns": elapsed, "cpu_ns": cpu, "commit_ns": commit_ns,
+            "memory_budget_bytes": scenario.query_memory_budget_bytes,
+            "statistics": stats, "commit_reports": reports, "memory": memory,
+            "rss_peak_bytes": peak, "rss_scope": rss_scope}
+
+
+def write_summary(scenario, reports, elapsed):
+    return {"shape": scenario.write_shape, "partial_progress": scenario.partial_progress,
+            "atomic_unit": contract(scenario)["transaction"],
+            "business_rows": scenario.write_rows * scenario.writers,
+            "commits": len(reports), "durable_acks": sum(r["durable"] is True for r in reports),
+            "commit_reports": reports,
+            "rows_per_second": scenario.write_rows * scenario.writers * 1e9 / elapsed,
+            "durable_acks_per_second": sum(r["durable"] is True for r in reports) * 1e9 / elapsed,
+            "throughput_boundary": "sample elapsed interval through all returned durable ACKs"}
+
+
+def measure_single_write(db, scenario, index):
+    prepare = time.perf_counter_ns()
+    plan = [type(n).__name__ for n in db.explain(query_for(scenario)[0]).walk()]
+    prepare = time.perf_counter_ns() - prepare
+    records = [{"id": i, "payload": "x" * scenario.payload_bytes} for i in range(scenario.write_rows)]
+    measured = _measure_writer(db, scenario, records)
+    rows = db.execute("MATCH (n:W) RETURN n.id,n.payload ORDER BY n.id").rows
+    sample = sample_record(scenario.to_dict(), index, rows, measured["statistics"],
+                           elapsed_ns=measured["elapsed_ns"], cpu_ns=measured["cpu_ns"],
+                           prepare_ns=prepare, memory=measured["memory"],
+                           rss_peak_bytes=measured["rss_peak_bytes"], rss_scope=measured["rss_scope"],
+                           commit_ns=measured["commit_ns"], selected_plan=plan)
+    sample["write"] = write_summary(scenario, measured["commit_reports"], measured["elapsed_ns"])
+    return sample
+
+
 def _writer_child(root, spec, number, barrier, queue):
     """Spawn target with disjoint keys; any conflict/error remains a failed run."""
     import okto_grafx
     scenario = Scenario.from_dict(spec)
     try:
         with okto_grafx.connect(root, query_memory_budget_bytes=scenario.query_memory_budget_bytes) as db:
-            observe = getattr(db._queries, "_observe_logical_memory", None)
-            scope = observe() if observe else nullcontext(None)
             records = [{"id": number * scenario.write_rows + i, "payload": "x" * scenario.payload_bytes}
                        for i in range(scenario.write_rows)]
             barrier.wait(timeout=60)
-            with scope as observation:
-                cpu_start, start = time.process_time_ns(), time.perf_counter_ns()
-                tx = db.begin("write")
-                try:
-                    result = tx.execute(query_for(scenario)[0], {"rows": records})
-                    ack_start = time.perf_counter_ns()
-                    tx.commit()
-                    ack_end = time.perf_counter_ns()
-                except BaseException:
-                    tx.rollback()
-                    raise
-                elapsed = time.perf_counter_ns() - start
-                cpu = time.process_time_ns() - cpu_start
-            peak, rss_scope = rss_peak()
-            queue.put({"writer": number, "process_id": os.getpid(), "elapsed_ns": elapsed,
-                       "commit_ns": ack_end-ack_start, "cpu_ns": cpu,
-                       "statistics": dict(result.statistics), "rss_peak_bytes": peak, "rss_scope": rss_scope,
-                       "memory": observation.result() if observation else unavailable_memory("revision_has_no_logical_memory_observer")})
+            measured = _measure_writer(db, scenario, records)
+            queue.put(dict(measured, writer=number, process_id=os.getpid()))
     except BaseException as exc:
         queue.put({"writer": number, "error": type(exc).__name__, "message": str(exc)})
         try:
@@ -348,12 +408,13 @@ def measure_concurrent_write(root, scenario, index):
                            cpu_ns=sum(w["cpu_ns"] for w in writers), prepare_ns=release-start,
                            memory=unavailable_memory("concurrent_process_peaks_reported_per_writer_not_aggregated"),
                            rss_peak_bytes=peak, rss_scope=rss_scope,
-                           commit_ns=max(w["commit_ns"] for w in writers), selected_plan=["concurrent_native_UNWIND_writers"])
+                           commit_ns=max(w["commit_ns"] for w in writers), selected_plan=["concurrent_native_" + scenario.write_shape])
     sample.update(writers=sorted(writers, key=lambda w: w["writer"]),
                   prepare_boundary="spawn_open_and_barrier_ready_not_query_compile",
                   commit_boundary="maximum individual durable commit duration; individual ACKs in writers",
                   cpu_scope="sum of writer CPU times; not coordinator CPU",
                   elapsed_boundary="barrier release to all writer results; includes result IPC")
+    sample["write"] = write_summary(scenario, [r for w in sample["writers"] for r in w["commit_reports"]], elapsed)
     return sample
 
 

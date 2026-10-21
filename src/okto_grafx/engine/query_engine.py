@@ -3887,7 +3887,7 @@ class QueryEngine:
         return plan
 
     @contextmanager
-    def _observe_logical_memory(self) -> Iterator[_LogicalMemoryObservation]:
+    def _observe_logical_memory(self, *, _sequence: bool = False) -> Iterator[_LogicalMemoryObservation]:
         """Observe one exclusive execution interval, including existing handle tariffs.
 
         This harness-only door does not measure Python allocations, result rows,
@@ -3897,7 +3897,7 @@ class QueryEngine:
         own a private handle with no execution already running at entry; this
         opt-in observer does not add an always-on registry to ordinary queries.
         """
-        observation = _LogicalMemoryObservation()
+        observation = _LogicalMemoryObservation(sequence=_sequence)
         identity = self._execution_identity
         owner = None if identity is None else identity()
         with self._endpoint_guard:
@@ -3923,6 +3923,17 @@ class QueryEngine:
                 self._memory_observation_owner = None
                 self._owner_budget._observation_engine = None
                 self._endpoint_budget._observation_engine = None
+
+    def _observe_logical_memory_sequence(self):
+        """Private, exclusive same-owner sequence, including executemany.
+
+        Keep one live tariff ledger across statements and commit/rollback. Its
+        peak is simultaneous retained logical tariffs, never a sum of peaks.
+        The caller must own a private idle handle, as for the single-statement
+        observer. Foreign identities, overlapping scopes, escaped cursors and
+        missing quotas remain unavailable. No allocator or total TX-memory claim.
+        """
+        return self._observe_logical_memory(_sequence=True)
 
     def _memory_observation_current(self) -> _LogicalMemoryObservation | None:
         """Resolve identity outside budget guards; foreign execution invalidates proof."""
