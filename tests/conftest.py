@@ -470,6 +470,7 @@ _UNATTRIBUTED: list[tuple[str, str]] = []
 _REASONS: dict[str, str] = {}
 _COLLECTED_FILES: set[str] = set()
 _ITEMS_BY_ID: dict[str, pytest.Item] = {}
+_PENDING_XDIST_SKIPS: dict[object, set[str]] = {}
 _VANISHED: list[str] = []
 _ERRORED_FILES: set[str] = set()
 _COLLECTED_IDS: dict[str, pytest.Item] = {}
@@ -1322,10 +1323,22 @@ def pytest_runtest_protocol(item: pytest.Item) -> None:
     _ITEMS_BY_ID[item.nodeid] = item
 
 
+def _defer_xdist_skip(report: pytest.TestReport) -> bool:
+    """Wait for the worker's source-checked verdict when this report came from xdist."""
+    node = getattr(report, "node", None)
+    if node is None:
+        return False
+    _PENDING_XDIST_SKIPS.setdefault(node, set()).add(report.nodeid)
+    return True
+
+
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     """Record every skipped test, and note that this node produced a report at all (A69)."""
     _REPORTED_IDS.add(report.nodeid)
     if hasattr(report, "wasxfail"):
+        if _defer_xdist_skip(report):
+            _REASONS.setdefault(report.nodeid, "x-failed without a source-visible marker")
+            return
         # An x-fail is the same invariant as a skip: the marker must be visible in the source,
         # so a collection-time add_marker(xfail) cannot suppress a failure. Enforcing it for
         # skip and not for xfail was two paths for one rule.
@@ -1337,7 +1350,29 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if not report.skipped:
         return
     _REASONS.setdefault(report.nodeid, _skip_reason(report))
+    if _defer_xdist_skip(report):
+        return
     _record_skip(report.nodeid, _ITEMS_BY_ID.get(report.nodeid))
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: object, error: object | None) -> None:
+    """Accept only skip verdicts the worker checked against its real pytest item."""
+    pending = _PENDING_XDIST_SKIPS.pop(node, set())
+    if not pending:
+        return
+    output = getattr(node, "workeroutput", None)
+    verdicts = (
+        output.get("g4_attributed_skips")
+        if error is None and isinstance(output, dict)
+        else None
+    )
+    for nodeid in pending:
+        verdict = verdicts.get(nodeid) if isinstance(verdicts, dict) else None
+        if isinstance(verdict, str) and verdict:
+            _ATTRIBUTED[nodeid] = verdict
+        else:
+            _record_skip(nodeid, None)
 
 
 def pytest_collectreport(report: pytest.CollectReport) -> None:
@@ -1407,6 +1442,11 @@ def _reconcile(session: pytest.Session) -> list[str]:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Fail the session when a skip or a disappearance could not be attributed."""
+    # A crashed worker has no source-checked verdict. Its reports cannot earn attribution.
+    for pending in _PENDING_XDIST_SKIPS.values():
+        for nodeid in pending:
+            _record_skip(nodeid, None)
+    _PENDING_XDIST_SKIPS.clear()
     for nodeid in _reconcile(session):
         entry = (nodeid, "collected but never reported")
         if entry not in _UNATTRIBUTED:
@@ -1418,5 +1458,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             if _declared_absent(module):
                 continue
             _VANISHED.append(str(module))
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if isinstance(workeroutput, dict):
+        workeroutput["g4_attributed_skips"] = dict(_ATTRIBUTED)
     if (_UNATTRIBUTED or _VANISHED) and exitstatus == 0:
         session.exitstatus = 1

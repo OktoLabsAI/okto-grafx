@@ -456,6 +456,38 @@ def test_xdist_collection_reaches_controller_without_weakening_disappearance_gat
     assert "vanished from collection" in output
 
 
+def test_xdist_skip_attribution_requires_a_source_visible_marker(tmp_path: Path) -> None:
+    xdist = ("-p", "xdist.plugin", "-n", "2")
+    marked = (
+        HEADER
+        + "@pytest.mark.pending\n"
+        + "def test_planted() -> None:\n    pytest.skip('declared debt')\n"
+    )
+    code, output = _plant(tmp_path / "marked", module=marked, extra_arguments=xdist)
+    assert code == 0, output
+    assert "unattributed skips" not in output
+
+    unmarked = _skipping_module("declared debt")
+    code, output = _plant(tmp_path / "unmarked", module=unmarked, extra_arguments=xdist)
+    assert code == 1, output
+    assert "test_planted.py::test_planted" in output
+    assert "unattributed skips" in output
+
+    # Even a genuinely marked skip must fail if its worker verdict never reaches the controller.
+    code, output = _plant(
+        tmp_path / "missing_verdict",
+        module=marked,
+        extra_arguments=xdist,
+        mutation=(
+            'workeroutput["g4_attributed_skips"] = dict(_ATTRIBUTED)',
+            'workeroutput["g4_attributed_skips"] = {}',
+        ),
+    )
+    assert code == 1, output
+    assert "test_planted.py::test_planted" in output
+    assert "unattributed skips" in output
+
+
 def test_an_ignore_collect_hook_cannot_remove_a_module(tmp_path: Path) -> None:
     conftest_extra = (
         "\n\ndef pytest_ignore_collect(collection_path, config):\n"
