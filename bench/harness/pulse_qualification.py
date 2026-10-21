@@ -226,6 +226,23 @@ def inspect_component(root, regime, names, manifest):
 
     raw = load_json((root / "campaign.json").read_text(encoding="utf-8"))
     stored = load_json((root / "report.json").read_text(encoding="utf-8"))
+    # Retry belongs to the closed aggregate. Both components are freshly run
+    # with attempt 1 even when their enclosing aggregate is attempt 2.
+    protocol = raw.get("protocol")
+    if (not isinstance(protocol, dict) or type(protocol.get("attempt")) is not int
+            or protocol["attempt"] != 1 or protocol.get("previous_campaign_sha256", "missing") is not None):
+        raise ValueError(f"{regime} component attempt must be fresh within its aggregate")
+    # Resolve against this component's own aggregate, including when checking
+    # a prior aggregate for permission to repeat. Text normalization matches
+    # campaign.run's embedded receipt on Windows; outer hashes bind raw bytes.
+    calibration_path = canonical_path((root.parent / "calibration.json").resolve())
+    calibration_raw = calibration_path.read_text(encoding="utf-8")
+    calibration = raw.get("calibration")
+    if (not isinstance(calibration, dict)
+            or calibration.get("path") != str(calibration_path)
+            or calibration.get("raw_json") != calibration_raw
+            or calibration.get("sha256") != hashlib.sha256(calibration_raw.encode()).hexdigest()):
+        raise ValueError(f"{regime} component differs from its aggregate calibration")
     report = compare_campaign(raw)
     if stored != report:
         raise ValueError(f"{regime} retained report differs from raw campaign")

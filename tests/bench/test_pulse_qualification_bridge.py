@@ -68,7 +68,12 @@ def test_v3_manifest_rejects_unsafe_regime_and_retry_configuration(tmp_path, fie
 def transport_raw(manifest, part, decision):
     from bench.harness import pulse_qualification as bridge
     names = [r["scenario"] for r in manifest["controls"] if (r["scenario"] == "landing-control") == (part == "landing")]
+    calibration_path = Path(manifest["output"]) / "calibration.json"
+    calibration_raw = calibration_path.read_text(encoding="utf-8")
     return {"intent": "qualification", "mode": "noop", "transport_test_decision": decision,
+            "protocol": {"attempt": 1, "previous_campaign_sha256": None},
+            "calibration": {"path": str(calibration_path.resolve()), "raw_json": calibration_raw,
+                            "sha256": hashlib.sha256(calibration_raw.encode()).hexdigest()},
             "memory_regime": "unbudgeted_landing" if part == "landing" else "budgeted",
             "candidate_memory_budget_bytes": manifest["candidate_memory_proof_budget_bytes"] if part == "landing" else None,
             "scenarios": [{"name": n, "query_memory_budget_bytes": None if part == "landing" else manifest["budgeted_memory_budget_bytes"]} for n in names],
@@ -108,6 +113,30 @@ def test_retry_accepts_only_complete_inconclusive_pair(tmp_path, monkeypatch, de
     current, path, _ = previous_pair_fixture(tmp_path, monkeypatch, decisions)
     digest = verify_previous_aggregate(current, tmp_path, Path(current["output"]))
     assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("fault", ["individual_retry", "previous_link", "different_calibration", "different_path"])
+def test_retry_rejects_rehashed_component_outside_aggregate_protocol(tmp_path, monkeypatch, fault):
+    from bench.harness.pulse_qualification import verify_previous_aggregate
+    current, path, receipt = previous_pair_fixture(tmp_path, monkeypatch)
+    component = path.parent / "landing" / "campaign.json"
+    raw = json.loads(component.read_text())
+    if fault == "individual_retry":
+        raw["protocol"].update(attempt=2, previous_campaign_sha256="a" * 64)
+    elif fault == "previous_link":
+        raw["protocol"]["previous_campaign_sha256"] = "a" * 64
+    elif fault == "different_calibration":
+        replacement = '{"producer":"a different otherwise independent calibration"}'
+        raw["calibration"].update(raw_json=replacement, sha256=hashlib.sha256(replacement.encode()).hexdigest())
+    else:
+        raw["calibration"]["path"] = str(path.parent / "other-calibration.json")
+    component.write_text(json.dumps(raw))
+    # Rehash the changed raw artifact: refusal must come from protocol binding,
+    # not merely detecting a stale envelope digest.
+    receipt["artifact_sha256"]["landing/campaign.json"] = hashlib.sha256(component.read_bytes()).hexdigest()
+    path.write_text(json.dumps(receipt))
+    with pytest.raises(ValueError, match="component attempt|aggregate calibration"):
+        verify_previous_aggregate(current, tmp_path, Path(current["output"]))
 
 
 @pytest.mark.parametrize("fault", ["passed_pair", "failed_part", "missing_part", "changed_artifact",
