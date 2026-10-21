@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import time
 
 BASELINE = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
@@ -75,6 +76,8 @@ def run(snapshot):
     candidate = canonical_path(manifest["candidate_root"])
     baseline = canonical_path(manifest["baseline_root"])
     python = canonical_path(manifest["python"])
+    if python != canonical_path(sys.executable):
+        raise ValueError("operational interpreter differs from authenticated runner")
     revision = manifest["candidate_revision"]
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
         raise ValueError("exact candidate SHA required")
