@@ -178,7 +178,7 @@ def _integer(value, name, minimum=0):
 
 
 def validate_fixed_optimization_matrix(selected, *, mode, intent):
-    """Close RF02/RF03/RF05 qualification before a worker is launched.
+    """Close RF02/RF03/RF05/RF08 qualification before a worker is launched.
 
     Other optimization campaigns, including RF04's four isolated source arms,
     retain their own matrices and validation rules.
@@ -189,9 +189,18 @@ def validate_fixed_optimization_matrix(selected, *, mode, intent):
     rf02 = any(item.name.startswith("rf02-") for item in scenarios)
     rf03 = any(item.name.startswith("rf03-") for item in scenarios)
     rf05 = any(item.family == "pagination" for item in scenarios)
-    if not (rf02 or rf03 or rf05):
+    rf08 = any(item.family == "unique_create" for item in scenarios)
+    if not (rf02 or rf03 or rf05 or rf08):
         return
-    _require(sum((rf02, rf03, rf05)) == 1, "RF02/RF03/RF05 qualification matrices cannot be mixed")
+    _require(sum((rf02, rf03, rf05, rf08)) == 1,
+             "RF02/RF03/RF05/RF08 qualification matrices cannot be mixed")
+    if rf08:
+        from bench.harness.uniqueness_qualification import matrix
+        expected = {item.name: item.to_dict() for item in matrix(Scenario)}
+        actual = {item.name: item.to_dict() for item in scenarios}
+        _require(actual == expected,
+                 "RF08 qualification requires the exact 128/1/128-quota scenario matrix")
+        return
     budgets = {item.query_memory_budget_bytes for item in scenarios}
     _require(len(budgets) == 1 and type(next(iter(budgets))) is int
              and next(iter(budgets)) > 0,

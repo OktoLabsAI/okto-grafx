@@ -1,5 +1,6 @@
 """RF08 campaign fixture proves physical work, ACKs and memory coverage."""
 from dataclasses import replace
+from argparse import Namespace
 
 import pytest
 
@@ -109,6 +110,17 @@ def test_qualification_requires_the_complete_rf08_matrix():
     data["scenarios"].append(quota.to_dict())
     with pytest.raises(campaign_schema.CampaignError, match="six independent process runs"):
         campaign_schema.validate_campaign(data)
+
+
+def test_incomplete_rf08_selection_refused_before_campaign_workers(tmp_path):
+    from bench.harness.campaign import run_campaign
+
+    args = Namespace(output=tmp_path / "out", scenario=["rf08-create-128",
+                     "rf08-create-1-control"], target=[], max_cpu_percent=20,
+                     memory_budget=None, mode="optimization", intent="qualification")
+    with pytest.raises(campaign_schema.CampaignError, match="exact 128/1/128-quota"):
+        run_campaign(args)
+    assert not (args.output / "manifest.json").exists()
 
 
 def test_failed_duplicate_has_no_ack_or_persisted_prefix(tmp_path):
