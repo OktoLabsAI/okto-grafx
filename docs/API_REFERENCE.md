@@ -18,6 +18,19 @@ See [16-key and keyset examples](PERFORMANCE.md#rf10-reading-recipes-choose-the-
 and [lifetime diagnosis](OPERATIONS.md#read-snapshot-lifetime-and-diagnosis).
 These recipes preserve existing API signatures and snapshot/cleanup contracts.
 
+## Ingestion transaction boundaries
+
+For ingestion, distinguish `Transaction.executemany`'s per-call atomic staging
+from the enclosing transaction's durable commit. A failed batch discards its own
+prefix, not prior staged statements; escaping the transaction block rolls those
+back too. `ExecuteManyReport` is not a durable acknowledgement. A commit refusal
+at context exit may leave the transaction active: explicitly retire it before a
+new attempt. A durable `Transaction.report` forbids replay even when an exception
+escaped. `Database.retry` returns a new snapshot for an eligible active predecessor;
+it never reruns business logic. See [atomicity matrix](PERFORMANCE.md#ingestion-atomicity-and-cost)
+and the [bounded application retry recipe](OPERATIONS.md#commit-outcomes-and-retries)
+for cleanup, `details.retryable` precedence and unknown-outcome handling.
+
 `okto_grafx.collection_json.collection_json_value()` and
 `collection_from_json_value()` convert exact StoredType collections to/from owned,
 bounded JSON primitives. CSV/JSONL/SQLite reader/importer `types` now accepts

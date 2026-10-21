@@ -101,34 +101,61 @@ Read `code`, `retryable`, `details` and the transaction's `report`; do not match
 exception text. The post-barrier regression explicitly marks its exception
 nonretryable. Custom trusted adapters may propagate their own exceptions.
 
-Conservative conflict-only recipe (the operation must not send external messages
-or perform non-idempotent host side effects inside the retried transaction):
+Conservative conflict-only application recipe. `operation(txn)` must recompute
+business decisions from that attempt's snapshot, not replay previously calculated
+values. It must not send external messages or perform host side effects. This is
+application code, not a new Grafx API. The budget bounds attempts, not elapsed time.
+`pause` permits an application-owned backoff/deadline policy outside the transaction.
+
+<!-- rf09-conflict-recipe -->
 
 ```python
 import random
 import time
 from okto_grafx.errors import GrafxWriteConflict
 
-def write_with_conflict_retry(db, statement, parameters, attempts=3):
+def write_with_conflict_retry(db, operation, attempts=3, pause=time.sleep):
     if attempts < 1:
         raise ValueError("attempts must be positive")
     for attempt in range(attempts):
         txn = None
+        cleanup_complete = False
         try:
-            with db.begin("write") as txn:
-                txn.execute(statement, parameters)
+            try:
+                with db.begin("write") as txn:
+                    operation(txn)
+            finally:
+                # A refusal from __exit__'s commit can leave the transaction active.
+                if txn is not None and txn.active:
+                    txn.rollback()
+                cleanup_complete = True
             return txn.report
         except GrafxWriteConflict as error:
-            if (error.details.get("committed") or error.details.get("durable")
+            if (not cleanup_complete
+                    or error.details.get("committed") or error.details.get("durable")
                     or (txn is not None and txn.report is not None and txn.report.durable)
+                    or not error.details.get("retryable", error.retryable)
                     or attempt + 1 == attempts):
                 raise
-            time.sleep(random.uniform(0, min(0.05 * 2**attempt, 0.5)))
+            pause(random.uniform(0, min(0.05 * 2**attempt, 0.5)))
 ```
 
 The explicit `db.retry(txn)` door is for an active owned transaction refused by
 optimistic validation; it returns a fresh successor, not a replay of statements.
 It is not a universal substitute for the outcome policy above.
+
+Decision order matters: first reject replay of a durable/committed report or
+exception; then classify an unknown outcome for reconciliation; only then consult
+`details["retryable"]` (when present, it overrides the exception class default).
+The example retries only eligible `GrafxWriteConflict`; it deliberately propagates
+other errors, including uncertain barrier outcomes. A retryable flag alone does
+not prove that an operation was uncommitted or that external effects can be repeated.
+The explicit `finally` retires an active commit refusal before backoff. The next `begin`
+creates a fresh snapshot; `db.retry` is not called on that already closed predecessor.
+Release owned cursors as well. If cleanup fails, stop and reconcile instead of
+continuing a business retry loop. After success, publish external effects through
+an application idempotency/confirmation protocol; Grafx cannot atomically commit a
+remote service's side effect. See the [batch boundary matrix](PERFORMANCE.md#ingestion-atomicity-and-cost).
 
 ## Recovery runbook
 

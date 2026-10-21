@@ -74,6 +74,65 @@ Executable coverage: [RF10 recipes](../tests/api/test_read_snapshot_recipes.py),
 [reader registration](../tests/txn/test_reader_lifecycle.py). These establish
 consistency and cleanup, not temporal qualification.
 
+## Ingestion atomicity and cost
+
+Choose the application atomic unit before choosing a faster ingestion shape.
+These recipes use existing public APIs; they introduce no automatic chunking or
+retry helper. All writes below require an explicit write transaction.
+
+| Shape | Atomic boundary and failure | Consumption/cost boundary |
+| --- | --- | --- |
+| Repeated `txn.execute(text, params)` | Each successful statement remains staged; an escaping exception rolls the transaction back. Catching an error is not permission to assume all previous statements were undone. | Repeated statement execution; one durable acknowledgement only when the enclosing write transaction commits. |
+| `txn.executemany(text, iterable)` | One call rolls back its own successful prefix on failure, preserving work staged before that call. It does not commit. An error escaping the transaction block rolls back the whole transaction. | Lazy parameter consumption, no result rows, one parsed statement reused. Iterator side effects cannot be rolled back. |
+| `UNWIND $ids AS id CREATE (:Item {id: id})` | One statement inside a transaction; success is still staged until commit. A transaction failure does not make any prefix durable. | A collection parameter, not a lazy `executemany` iterator; consider parameter size and logical/transaction budgets. |
+| Several transactions containing chunks | Each acknowledged chunk is independently durable. A later failure leaves the earlier committed prefix. | More commits/ACKs; bounded per-transaction work. Use only when partial progress is acceptable and recorded by the application. |
+
+Given an existing `Item(id INT64, PRIMARY KEY(id))` table, an atomic lazy batch is:
+
+```python
+txn = db.begin("write")
+try:
+    with txn:
+        txn.executemany("CREATE (:Item {id: $id})", ({"id": i} for i in range(100)))
+finally:
+    if txn.active:
+        txn.rollback()  # also retire a refused commit at context exit
+report = txn.report  # commit occurred at successful context exit
+```
+
+Do not split this transaction to fit a limit if all 100 rows must commit together.
+Handle a refused commit with the [outcome and cleanup policy](OPERATIONS.md#commit-outcomes-and-retries).
+To accept partial progress explicitly instead:
+
+```python
+acknowledged = []
+for chunk_id, ids in enumerate(((0, 1), (2, 3))):
+    txn = db.begin("write")
+    try:
+        with txn:
+            txn.executemany("CREATE (:Item {id: $id})", ({"id": i} for i in ids))
+    finally:
+        if txn.active:
+            txn.rollback()
+    acknowledged.append((chunk_id, txn.report.csn))
+```
+
+The in-memory `acknowledged` list is illustrative, not a crash-safe resume ledger.
+An exception after a durable barrier can precede that append: reconcile using the
+commit report/durable state and application idempotency before replay. Close owned
+cursors and retire any active refused transaction before retry/backoff; do not
+swallow data/type/budget errors or blindly retry an iterator that has been consumed.
+For `UNWIND`, use `txn.execute("UNWIND $ids AS id CREATE (:Item {id: id})",
+{"ids": [0, 1]})` inside the same explicit transaction. Business recomputation on a
+fresh snapshot is distinct from reusing a literal parameter batch.
+
+Compare equal atomic contracts: report rows attempted/committed, transactions,
+durable write ACKs, conflicts/retries and latency per atomic unit alongside
+rows/second. State chunk size, limits, storage durability and writer count (1/2/4).
+One ACK per row and one ACK per thousand rows have different failure contracts;
+their throughput alone cannot establish an engine improvement. These recipes and
+deterministic tests make no temporal qualification claim.
+
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
 Updated October 21, 2026. “Current” means the **latest recorded observation for
