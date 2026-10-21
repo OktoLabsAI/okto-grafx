@@ -449,6 +449,7 @@ def _validate(data):
         samples = run["samples"]
         _require(isinstance(samples, list) and len(samples) == 25 * len(scenarios), "missing/extra samples")
         seen = set()
+        fts_setup_observations = {}
         for sample in samples:
             _fields(sample, ("scenario_id", "index", "kind", "seed", "config_hash", "query_hash", "parameters_hash",
                              "contract_hash", "cache_state", "result_hash", "expected_result_hash", "rows", "statistics",
@@ -498,10 +499,19 @@ def _validate(data):
                 _require((sample["statistics"].get("statistics_wal_records", 0) > 0)
                          == (scenario.fts_updates == 1), "FTS WAL-delta proof invalid")
                 setup = sample.get("fts_setup")
-                _fields(setup, ("elapsed_ns", "disk_allocated_bytes", "wal_allocated_bytes", "scope"), "FTS fixture setup")
+                _fields(setup, ("elapsed_ns", "disk_allocated_bytes", "wal_allocated_bytes", "scope",
+                                "observation_scope", "observation_id"), "FTS fixture setup")
                 _integer(setup["elapsed_ns"], "FTS setup elapsed", 1)
                 _integer(setup["disk_allocated_bytes"], "FTS setup disk", 1)
                 _integer(setup["wal_allocated_bytes"], "FTS setup WAL")
+                independent_setup = bool(scenario.fts_updates or scenario.fts_write_case != "none")
+                expected_scope = "one_fixture_per_sample" if independent_setup else "one_fixture_per_process"
+                expected_id = f"{run['invocation_id']}:{name}:{index if independent_setup else 'shared'}"
+                _require(setup["observation_scope"] == expected_scope
+                         and setup["observation_id"] == expected_id,
+                         "FTS fixture setup observation identity differs from actual fixture lifetime")
+                prior_setup = fts_setup_observations.setdefault(expected_id, setup)
+                _require(prior_setup == setup, "FTS shared setup observation changed between samples")
                 if scenario.fts_updates or scenario.fts_write_case != "none":
                     maintenance = sample.get("fts_maintenance")
                     _fields(maintenance, ("elapsed_ns", "durable_acks", "commit_ns", "disk_allocated_delta_bytes",
@@ -732,6 +742,22 @@ def _distribution(values, unit="ns"):
             f"stdev_{unit}": statistics.stdev(values) if len(values) > 1 else 0,
             "coefficient_of_variation": statistics.stdev(values) / statistics.mean(values)
             if len(values) > 1 and statistics.mean(values) != 0 else 0}
+
+
+def _fts_setup_distribution(rows, field, unit="ns"):
+    """Count built fixtures, not the read samples that reference each fixture."""
+    observations = {sample["fts_setup"]["observation_id"]: sample["fts_setup"]
+                    for sample in rows}
+    values = [setup[field] for setup in observations.values()]
+    result = _distribution(values, unit)
+    result["observation_count"] = len(values)
+    result["observation_scope"] = next(iter(observations.values()))["observation_scope"]
+    if len(values) < 20:
+        result[f"p95_{unit}"] = None
+    if len(values) < 2:
+        result[f"stdev_{unit}"] = None
+        result["coefficient_of_variation"] = None
+    return result
 
 
 def validate_write_sample(sample, scenario, *, qualification):
@@ -1040,9 +1066,9 @@ def compare_campaign(data):
                                           for source in ("snapshot_cache", "wal_delta", "durable_summary", "full_census")},
                         "postings_visited": _distribution([s["statistics"]["postings_visited"] for s in rows], "count"),
                         "statistics_wal_records": _distribution([s["statistics"]["statistics_wal_records"] for s in rows], "count"),
-                        "setup_elapsed_ns": _distribution([s["fts_setup"]["elapsed_ns"] for s in rows]),
-                        "setup_disk_allocated_bytes": _distribution([s["fts_setup"]["disk_allocated_bytes"] for s in rows], "bytes"),
-                        "setup_wal_allocated_bytes": _distribution([s["fts_setup"]["wal_allocated_bytes"] for s in rows], "bytes"),
+                        "setup_elapsed_ns": _fts_setup_distribution(rows, "elapsed_ns"),
+                        "setup_disk_allocated_bytes": _fts_setup_distribution(rows, "disk_allocated_bytes", "bytes"),
+                        "setup_wal_allocated_bytes": _fts_setup_distribution(rows, "wal_allocated_bytes", "bytes"),
                         "update_elapsed_ns": _distribution([s["fts_maintenance"]["elapsed_ns"] for s in rows])
                         if scenario.fts_updates else None,
                         "update_commit_ack_ns": _distribution([duration for s in rows
@@ -1070,6 +1096,18 @@ def compare_campaign(data):
                 }
             noisy |= any(d["coefficient_of_variation"] > .10 for d in distributions.values())
         totals.append({"scenario_id": scenario.name, "all_retained": {arm: _distribution(values) for arm, values in all_values.items()}})
+        if scenario.family == "fts_matrix":
+            setup_by_arm = {}
+            for arm in ("A", "B"):
+                rows = [sample for run in data["runs"] if run["arm"] == arm
+                        for sample in run["samples"] if sample["scenario_id"] == scenario.name
+                        and sample["kind"] == "retained"]
+                setup_by_arm[arm] = {
+                    "elapsed_ns": _fts_setup_distribution(rows, "elapsed_ns"),
+                    "disk_allocated_bytes": _fts_setup_distribution(rows, "disk_allocated_bytes", "bytes"),
+                    "wal_allocated_bytes": _fts_setup_distribution(rows, "wal_allocated_bytes", "bytes"),
+                }
+            totals[-1]["fts_setup_by_arm"] = setup_by_arm
     decision = "passed" if all(c["thresholds_met"] for c in comparisons) else "failed"
     if noisy:
         decision = "inconclusive"

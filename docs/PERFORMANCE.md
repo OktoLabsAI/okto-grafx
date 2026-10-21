@@ -974,6 +974,14 @@ recipe comparison to a workload tradeoff, not a comparative logical-memory
 claim.
 
 The raw samples keep setup duration and allocated database/WAL file sizes.
+For slices without updates, a worker builds one fixture and reuses it across
+the 25 search samples; setup therefore has one independent observation per
+process/arm/pair, three per arm across the campaign. Update and write-cost
+slices build one fixture per sample and have 20 retained setup observations
+per process/arm/pair. The report counts fixture observation IDs, not repeated
+references in read samples, and omits a setup p95 when fewer than 20 independent
+fixtures were observed. Setup remains a combined seed/index/checkpoint/close
+cost, never an isolated commit or index-maintenance measurement.
 For update slices they keep each durable commit ACK duration, total update
 duration and signed allocated-byte deltas outside search timing. Allocated WAL
 file growth is not logical bytes appended or a count of fsync operations;

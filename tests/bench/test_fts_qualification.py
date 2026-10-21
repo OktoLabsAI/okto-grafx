@@ -76,7 +76,9 @@ def test_write_cost_report_rejects_missing_ack_or_reopen_proof():
                                     "hits": sample["rows"]}
             sample["fts_setup"] = {"elapsed_ns": 100, "disk_allocated_bytes": 100,
                                    "wal_allocated_bytes": 0,
-                                   "scope": "seed_insert_index_creation_checkpoint_and_close"}
+                                   "scope": "seed_insert_index_creation_checkpoint_and_close",
+                                   "observation_scope": "one_fixture_per_sample",
+                                   "observation_id": f"{run['invocation_id']}:{scenario.name}:{index}"}
             sample["fts_maintenance"] = {"elapsed_ns": 10, "durable_acks": 1,
                                          "commit_ns": [5], "disk_allocated_delta_bytes": 1,
                                          "wal_allocated_delta_bytes": 1,
@@ -88,6 +90,7 @@ def test_write_cost_report_rejects_missing_ack_or_reopen_proof():
     tradeoff = compare_campaign(data)["comparisons"][0]["fts_tradeoff"]
     assert tradeoff["write_case"] == "insert"
     assert tradeoff["by_arm"]["A"]["write_commit_ack_ns"]["median_ns"] == 5
+    assert tradeoff["by_arm"]["A"]["setup_elapsed_ns"]["observation_count"] == 20
     for key, bad in (("durable_acks", 0), ("read_only_reopen_verified", False),
                      ("writer_origin", "second_handle")):
         data["runs"][0]["samples"][0]["fts_maintenance"][key] = bad

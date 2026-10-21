@@ -674,7 +674,9 @@ def run_worker(request, output):
                         shared_fts_setup = {"elapsed_ns": time.perf_counter_ns() - setup_start,
                                             "disk_allocated_bytes": setup_bytes,
                                             "wal_allocated_bytes": setup_wal,
-                                            "scope": "seed_insert_index_creation_checkpoint_and_close"}
+                                            "scope": "seed_insert_index_creation_checkpoint_and_close",
+                                            "observation_scope": "one_fixture_per_process",
+                                            "observation_id": f"{report['invocation_id']}:{scenario.name}:shared"}
                 for index in range(25):
                     sample_root = root if not independent else Path(directory) / f"independent-{index}"
                     sample_fts_setup = None
@@ -686,7 +688,9 @@ def run_worker(request, output):
                         sample_fts_setup = {"elapsed_ns": time.perf_counter_ns() - setup_start,
                                             "disk_allocated_bytes": setup_bytes,
                                             "wal_allocated_bytes": setup_wal,
-                                            "scope": "seed_insert_index_creation_checkpoint_and_close"}
+                                            "scope": "seed_insert_index_creation_checkpoint_and_close",
+                                            "observation_scope": "one_fixture_per_sample",
+                                            "observation_id": f"{report['invocation_id']}:{scenario.name}:{index}"}
                     fts_setup = sample_fts_setup or shared_fts_setup
                     fts_update = None
                     if scenario.family == fts_qualification.FAMILY and scenario.fts_write_case != "none":
