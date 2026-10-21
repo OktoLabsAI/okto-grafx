@@ -133,6 +133,16 @@ One ACK per row and one ACK per thousand rows have different failure contracts;
 their throughput alone cannot establish an engine improvement. These recipes and
 deterministic tests make no temporal qualification claim.
 
+The RF09 campaign report groups recipes only when row count, payload size and
+writer count match. Its `matched_write_loads` table shows each shape's atomic
+unit and per-pair throughput, durable ACK count and observed commit-call latency;
+it does not calculate a cross-shape speedup. Each `write_tradeoff` retains the
+individual ACK durations with writer, offset and row count. Allocated WAL/file
+byte deltas and runtime physical counters belong to the whole sample. Values
+divided by the ACK count are labelled amortized costs, not bytes or latency
+attributable to an individual commit. Missing physical counters are reported as
+unavailable; logical `rows_created` is listed separately from physical work.
+
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
 Updated October 21, 2026. “Current” means the **latest recorded observation for

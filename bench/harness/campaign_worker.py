@@ -328,7 +328,7 @@ class WriteCampaignFailure(CampaignError):
         super().__init__("write failed; durable prefix retained in write_failure; no replay")
 
 
-def execute_write_recipe(db, scenario, records, *, failure_evidence=None):
+def execute_write_recipe(db, scenario, records, *, failure_evidence=None, writer_id=0):
     """Use existing APIs; collect only returned ACKs, never replay a failed commit."""
     query = query_for(scenario)[0]
     width = (1 if scenario.write_shape == "transactions" else
@@ -356,8 +356,11 @@ def execute_write_recipe(db, scenario, records, *, failure_evidence=None):
             ack_start = time.perf_counter_ns()
             phase = "commit"
             report = tx.commit()
-            commit_ns += time.perf_counter_ns() - ack_start
-            reports.append({"csn": int(report.csn), "durable": report.durable, "wrote": report.wrote})
+            ack_duration_ns = time.perf_counter_ns() - ack_start
+            commit_ns += ack_duration_ns
+            reports.append({"csn": int(report.csn), "durable": report.durable, "wrote": report.wrote,
+                            "writer": writer_id, "offset": offset, "rows": len(group),
+                            "ack_duration_ns": ack_duration_ns})
             if report.durable is not True or report.wrote is not True:
                 raise CampaignError("write returned no durable ACK; campaign invalid, no replay")
             audit["confirmed_prefix"].append(reports[-1])
@@ -380,7 +383,7 @@ def execute_write_recipe(db, scenario, records, *, failure_evidence=None):
     return stats, reports, commit_ns
 
 
-def _measure_writer(db, scenario, records):
+def _measure_writer(db, scenario, records, *, writer_id=0):
     sequence = getattr(db._queries, "_observe_logical_memory_sequence", None)
     observe = sequence or (getattr(db._queries, "_observe_logical_memory", None)
                            if scenario.write_shape == "unwind" else None)
@@ -388,7 +391,8 @@ def _measure_writer(db, scenario, records):
     try:
         with (observe() if observe else nullcontext(None)) as observation:
             cpu_start, start = time.process_time_ns(), time.perf_counter_ns()
-            stats, reports, commit_ns = execute_write_recipe(db, scenario, records, failure_evidence=audit)
+            stats, reports, commit_ns = execute_write_recipe(
+                db, scenario, records, failure_evidence=audit, writer_id=writer_id)
             elapsed, cpu = time.perf_counter_ns() - start, time.process_time_ns() - cpu_start
     except BaseException as exc:
         audit.setdefault("primary_error", error_record(exc))
@@ -490,7 +494,7 @@ def _writer_child(root, spec, number, barrier, queue):
             records = [{"id": number * scenario.write_rows + i, "payload": "x" * scenario.payload_bytes}
                        for i in range(scenario.write_rows)]
             barrier.wait(timeout=60)
-            measured = _measure_writer(db, scenario, records)
+            measured = _measure_writer(db, scenario, records, writer_id=number)
             queue.put(dict(measured, writer=number, process_id=os.getpid()))
     except BaseException as exc:
         failure = error_record(exc)

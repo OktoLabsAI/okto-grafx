@@ -19,6 +19,22 @@ def test_operational_selection_requires_all_shapes_dimensions_and_fixed_budget()
                    {"scenarios": manifest["scenarios"] + [manifest["scenarios"][0]]}):
         with pytest.raises(ValueError):
             validate_manifest(dict(manifest, **change))
+    # This selection covers every dimension and shape, but each shape has a
+    # different workload: no meaningful recipe comparison can be made.
+    shapes = ("unwind", "statements", "executemany", "chunks", "transactions", "unwind")
+    loads = ((1, 64, 1), (32, 64, 1), (128, 4096, 1),
+             (512, 4096, 1), (32, 64, 2), (32, 64, 4))
+    unpaired = [next(s.name for s in ingestion_matrix() if
+                     (s.write_rows, s.payload_bytes, s.writers, s.write_shape) == (*load, shape))
+                for load, shape in zip(loads, shapes)]
+    with pytest.raises(ValueError, match="paired write shapes"):
+        validate_manifest(dict(manifest, scenarios=unpaired))
+    # A bounded subset can still cover every dimension while comparing at
+    # least two shapes under identical records/payload/writer count.
+    paired = [s.name for s in ingestion_matrix() if
+              (s.write_rows, s.payload_bytes, s.writers) == (32, 64, 1) or
+              s.write_shape in ("unwind", "executemany")]
+    validate_manifest(dict(manifest, scenarios=paired))
 
 
 def test_missing_manifest_fails_before_launch(tmp_path, monkeypatch):

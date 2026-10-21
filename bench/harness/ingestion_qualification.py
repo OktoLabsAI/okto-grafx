@@ -49,6 +49,17 @@ def validate_manifest(manifest):
                           ("write_rows", {1, 32, 128, 512}), ("payload_bytes", {64, 4096}), ("writers", {1, 2, 4})):
         if {getattr(s, field) for s in selected} != values:
             raise ValueError("representative matrix does not cover " + field)
+    # A comparison of recipes needs matched records, payload and contention.
+    # Cover every shape at the central workload and compare at least two shapes
+    # at every other selected workload. Do not accept a list whose five shapes
+    # each occur under a different load.
+    by_load = {}
+    for scenario in selected:
+        load = (scenario.write_rows, scenario.payload_bytes, scenario.writers)
+        by_load.setdefault(load, set()).add(scenario.write_shape)
+    shapes = {"unwind", "statements", "executemany", "chunks", "transactions"}
+    if by_load.get((32, 64, 1)) != shapes or any(len(group) < 2 for group in by_load.values()):
+        raise ValueError("RF09 requires paired write shapes at every load and all shapes at 32/64/1")
 
 
 def _manifest():

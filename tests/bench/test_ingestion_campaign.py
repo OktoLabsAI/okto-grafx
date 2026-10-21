@@ -131,7 +131,11 @@ def test_partial_ack_audit_preserves_primary_and_cleanup_failure():
         campaign_worker.execute_write_recipe(SimpleNamespace(begin=lambda _: Tx()), scenario,
                                               [{"id": 1}, {"id": 2}], failure_evidence=audit)
     assert caught.value is primary
-    assert audit["confirmed_prefix"] == [{"csn": 7, "durable": True, "wrote": True}]
+    assert len(audit["confirmed_prefix"]) == 1
+    assert {key: audit["confirmed_prefix"][0][key] for key in ("csn", "durable", "wrote",
+                                                                 "writer", "offset", "rows")} == {
+        "csn": 7, "durable": True, "wrote": True, "writer": 0, "offset": 0, "rows": 1}
+    assert audit["confirmed_prefix"][0]["ack_duration_ns"] > 0
     assert audit["failed_transaction"]["offset"] == 1
     assert audit["cleanup_error"]["type"] == "OSError"
     calls.clear()
@@ -140,7 +144,11 @@ def test_partial_ack_audit_preserves_primary_and_cleanup_failure():
         campaign_worker._measure_writer(db, scenario, [{"id": 1}, {"id": 2}])
     import json
     artifact = json.loads(json.dumps(campaign_worker.error_record(measured.value)))
-    assert artifact["write_failure"]["confirmed_prefix"] == audit["confirmed_prefix"]
+    assert [{key: report[key] for key in ("csn", "durable", "wrote", "writer", "offset", "rows")}
+            for report in artifact["write_failure"]["confirmed_prefix"]] == [
+                {key: report[key] for key in ("csn", "durable", "wrote", "writer", "offset", "rows")}
+                for report in audit["confirmed_prefix"]]
+    assert artifact["write_failure"]["confirmed_prefix"][0]["ack_duration_ns"] > 0
     assert artifact["write_failure"]["primary_error"]["type"] == "ValueError"
     assert artifact["write_failure"]["cleanup_error"]["type"] == "OSError"
 
@@ -179,6 +187,13 @@ def test_recipe_confirms_real_atomic_units_and_reopens(tmp_path, shape, commits)
     assert len(write["commit_reports"]) == commits
     assert all(r["durable"] is True and r["wrote"] is True for r in write["commit_reports"])
     assert len({r["csn"] for r in write["commit_reports"]}) == commits
+    assert [r["writer"] for r in write["commit_reports"]] == [0] * commits
+    expected_offsets = ([0, 2] if shape == "chunks" else [0, 1, 2]
+                        if shape == "transactions" else [0])
+    assert [r["offset"] for r in write["commit_reports"]] == expected_offsets
+    assert sum(r["rows"] for r in write["commit_reports"]) == 3
+    assert all(r["ack_duration_ns"] > 0 for r in write["commit_reports"])
+    assert sum(r["ack_duration_ns"] for r in write["commit_reports"]) == sample["commit_ns"]
     assert write["business_rows"] == 3
     assert write["rows_per_second"] == 3e9 / sample["elapsed_ns"]
     assert write["durable_acks_per_second"] == commits * 1e9 / sample["elapsed_ns"]
@@ -188,6 +203,38 @@ def test_recipe_confirms_real_atomic_units_and_reopens(tmp_path, shape, commits)
     broken["write"]["durable_acks"] += 1
     with pytest.raises(campaign_schema.CampaignError):
         campaign_schema.validate_write_sample(broken, scenario, qualification=True)
+    broken = copy.deepcopy(sample)
+    broken["statistics"].pop("index_probe_keys")
+    with pytest.raises(campaign_schema.CampaignError, match="physical work counters"):
+        campaign_schema.validate_write_sample(broken, scenario, qualification=True)
+    broken = copy.deepcopy(sample)
+    broken["wal_delta_bytes"] = "unmeasured"
+    with pytest.raises(campaign_schema.CampaignError, match="allocated-file cost"):
+        campaign_schema.validate_write_sample(broken, scenario, qualification=True)
+    for field, value in (("offset", 1), ("rows", 99), ("ack_duration_ns", 0)):
+        broken = copy.deepcopy(sample)
+        broken["write"]["commit_reports"][0][field] = value
+        with pytest.raises(campaign_schema.CampaignError):
+            campaign_schema.validate_write_sample(broken, scenario, qualification=True)
+    sample["wal_delta_bytes"] = 17
+    sample["disk_delta_bytes"] = 19
+    observed = campaign_schema.write_tradeoff({"A": [sample], "B": [sample]}, scenario)
+    assert observed["by_arm"]["A"]["runtime_statement_counters_per_sample"]["rows_created"]["median_count"] == 3
+    assert observed["by_arm"]["A"]["physical_work_per_sample"]["index_probe_keys"]["median_count"] == 3
+    assert "physical_node_versions_examined" in observed["by_arm"]["A"]["physical_work_unavailable"]
+    sample["statistics"]["index_probe_keys"] = 5
+    tradeoff = campaign_schema.write_tradeoff({"A": [sample], "B": [sample]}, scenario)
+    arm = tradeoff["by_arm"]["A"]
+    assert len(arm["ack_duration_by_atomic_unit"]) == commits
+    assert arm["allocated_file_bytes_per_sample"]["wal_delta_bytes"]["median_bytes"] == 17
+    assert arm["physical_work_per_sample"]["index_probe_keys"]["median_count"] == 5
+    assert arm["amortized_cost_per_atomic_unit"]["disk_allocated_delta_bytes"]["median_bytes"] == 19 / commits
+    assert "not individual ACK latencies" in tradeoff["amortized_cost_scope"]
+    loads = campaign_schema.matched_write_loads(
+        [scenario], [{"scenario_id": scenario.name, "pair": 0, "write_tradeoff": tradeoff}])
+    assert loads[0]["write_rows_per_writer"] == 3
+    assert loads[0]["shapes"][0]["atomic_unit"] == write["atomic_unit"]
+    assert loads[0]["shapes"][0]["pairs"][0]["by_arm"]["A"]["durable_acks_per_sample"] == commits
 
 
 def test_matrix_covers_dimensions_and_refuses_implicit_partial_progress():
@@ -212,6 +259,9 @@ def test_concurrent_proof_has_individual_memory_and_actual_acks(tmp_path, writer
     assert sample["write"]["commits"] == sample["write"]["durable_acks"] == writers
     assert len({w["process_id"] for w in sample["writers"]}) == writers
     assert all(sample["barrier_release_ns"] <= w["started_ns"] for w in sample["writers"])
+    assert all(all(report["writer"] == writer["writer"] and report["offset"] == 0
+                   and report["rows"] == 1 for report in writer["commit_reports"])
+               for writer in sample["writers"])
     campaign_schema.validate_write_sample(sample, scenario, qualification=True)
     for change in ({"rss_peak_bytes": 0}, {"rss_peak_bytes": -1}, {"rss_scope": "coordinator"}):
         invalid = copy.deepcopy(sample)

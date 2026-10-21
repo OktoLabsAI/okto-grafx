@@ -22,6 +22,9 @@ HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
 HISTORICAL_TREE = "c2795181cda21041998cd13959afc8de303802bb"
 HISTORICAL_QUERY_SHA256 = "8056d0625cf4764c3a160bb676b6cefdc71d680f7f52bba44b626a28e0fa7ad8"
 LOGICAL_COVERAGE = "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1"
+WRITE_PHYSICAL_COUNTERS = ("physical_node_versions_examined", "physical_edge_versions_examined",
+                           "index_probe_keys", "certificate_attempts", "certificate_retries")
+WRITE_REQUIRED_COUNTERS = ("index_probe_keys", "certificate_attempts")
 # Match the authenticated Pulse interpreter: ignore PYTHON* overrides and
 # unsafe cwd/script prepend, preserve declared user-site dependencies, no pyc.
 RUNNER_PYTHON_FLAGS = ("-E", "-P", "-B")
@@ -504,6 +507,11 @@ def validate_write_sample(sample, scenario, *, qualification):
     write = sample.get("write", {})
     from bench.harness.campaign_fixtures import contract
     _require(sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes, "write memory budget differs from scenario")
+    for key in ("wal_delta_bytes", "disk_delta_bytes"):
+        _require(type(sample.get(key)) is int, "write allocated-file cost must be a signed integer")
+    if qualification:
+        _require(all(key in sample["statistics"] for key in WRITE_REQUIRED_COUNTERS),
+                 "write physical work counters unavailable: cannot qualify")
     _require(write.get("atomic_unit") == contract(scenario)["transaction"] and
              write.get("throughput_boundary") == "sample elapsed interval through all returned durable ACKs",
              "write timing/atomicity boundary invalid")
@@ -516,6 +524,8 @@ def validate_write_sample(sample, scenario, *, qualification):
     for report in reports:
         _integer(report.get("csn"), "commit csn", 1)
         _require(report.get("durable") is True and report.get("wrote") is True, "write ACK not durable")
+        for key in ("writer", "offset", "rows", "ack_duration_ns"):
+            _integer(report.get(key), "write ACK " + key, 1 if key in ("rows", "ack_duration_ns") else 0)
     _require(len({r["csn"] for r in reports}) == expected, "duplicate commit report")
     _require(write.get("business_rows") == scenario.write_rows * scenario.writers, "write business rows inconsistent")
     _require(write.get("shape") == scenario.write_shape and write.get("partial_progress") is scenario.partial_progress,
@@ -540,6 +550,8 @@ def validate_write_sample(sample, scenario, *, qualification):
             _require(writer.get("memory_budget_bytes") == scenario.query_memory_budget_bytes, "writer memory budget differs from scenario")
             _integer(writer.get("process_id"), "writer process ID", 1)
             _require(len(writer.get("commit_reports", [])) == count, "writer ACK count differs from atomic units")
+            _require(sum(r["ack_duration_ns"] for r in writer["commit_reports"]) == writer["commit_ns"],
+                     "writer ACK durations differ from measured commit interval")
             for key in ("elapsed_ns", "cpu_ns", "commit_ns"):
                 _integer(writer.get(key), "writer " + key)
             _require(writer["elapsed_ns"] > 0 and writer["commit_ns"] <= writer["elapsed_ns"], "writer ACK boundary invalid")
@@ -547,6 +559,21 @@ def validate_write_sample(sample, scenario, *, qualification):
         _require(sample["memory"]["logical_memory_peak_bytes"] is None and sample["memory"]["unavailable_reason"] ==
                  "concurrent_process_peaks_reported_per_writer_not_aggregated", "concurrent memory cannot aggregate independent peaks")
         memories = [w["memory"] for w in writers]
+    else:
+        _require(sum(r["ack_duration_ns"] for r in reports) == sample["commit_ns"],
+                 "write ACK durations differ from measured commit interval")
+    for writer_id in range(scenario.writers):
+        writer_reports = [r for r in reports if r["writer"] == writer_id]
+        _require(len(writer_reports) == count, "writer atomic units missing or duplicated")
+        expected_offset = 0
+        for report in writer_reports:
+            _require(report["offset"] == expected_offset, "write atomic unit offset differs from input")
+            expected_rows = (1 if scenario.write_shape == "transactions" else
+                             min(scenario.chunk_rows, scenario.write_rows - expected_offset)
+                             if scenario.write_shape == "chunks" else scenario.write_rows)
+            _require(report["rows"] == expected_rows, "write atomic unit row count differs from input")
+            expected_offset += expected_rows
+        _require(expected_offset == scenario.write_rows, "write atomic units do not cover input")
     for memory in memories:
         peak = memory.get("logical_memory_peak_bytes")
         if peak is None:
@@ -558,6 +585,81 @@ def validate_write_sample(sample, scenario, *, qualification):
         if qualification:
             _require(scenario.query_memory_budget_bytes is not None and memory.get("coverage") in (
                 LOGICAL_COVERAGE, "simultaneous_sequence_query_budget_and_handle_owner_endpoint_tariffs_v1"), "writer memory coverage invalid")
+
+
+def write_tradeoff(samples, scenario):
+    """Aggregate recipe costs without attributing sample totals to an ACK."""
+    by_arm = {}
+    for arm, rows in samples.items():
+        atomic_units = {}
+        for sample in rows:
+            for report in sample["write"]["commit_reports"]:
+                key = (report["writer"], report["offset"], report["rows"])
+                atomic_units.setdefault(key, []).append(report["ack_duration_ns"])
+        physical = {key: _distribution([sample["statistics"][key] for sample in rows], "count")
+                    for key in WRITE_PHYSICAL_COUNTERS if all(key in sample["statistics"] for sample in rows)}
+        runtime_keys = sorted(set.intersection(*(set(sample["statistics"]) for sample in rows)))
+        by_arm[arm] = {
+            **{field: _distribution([sample["write"][field] for sample in rows],
+                                    "per_second" if field.endswith("per_second") else "count")
+               for field in ("commits", "durable_acks", "business_rows", "rows_per_second",
+                             "durable_acks_per_second")},
+            "ack_duration_ns": _distribution([report["ack_duration_ns"] for sample in rows
+                                               for report in sample["write"]["commit_reports"]]),
+            "ack_duration_by_atomic_unit": [
+                {"writer": writer, "offset": offset, "rows": count,
+                 "duration": _distribution(values)}
+                for (writer, offset, count), values in sorted(atomic_units.items())],
+            "physical_work_per_sample": physical,
+            "physical_work_unavailable": [key for key in WRITE_PHYSICAL_COUNTERS if key not in physical],
+            "runtime_statement_counters_per_sample": {
+                key: _distribution([sample["statistics"][key] for sample in rows], "count")
+                for key in runtime_keys},
+            "allocated_file_bytes_per_sample": {
+                "wal_delta_bytes": _distribution([sample["wal_delta_bytes"] for sample in rows], "bytes"),
+                "disk_delta_bytes": _distribution([sample["disk_delta_bytes"] for sample in rows], "bytes")},
+            "amortized_cost_per_atomic_unit": {
+                "elapsed_ns": _distribution([sample["elapsed_ns"] / sample["write"]["durable_acks"]
+                                             for sample in rows]),
+                "cpu_ns": _distribution([sample["cpu_ns"] / sample["write"]["durable_acks"]
+                                         for sample in rows]),
+                "wal_allocated_delta_bytes": _distribution([
+                    sample["wal_delta_bytes"] / sample["write"]["durable_acks"]
+                    for sample in rows], "bytes"),
+                "disk_allocated_delta_bytes": _distribution([
+                    sample["disk_delta_bytes"] / sample["write"]["durable_acks"]
+                    for sample in rows], "bytes")},
+        }
+    return {"atomic_unit": contract(scenario)["transaction"], "partial_progress": scenario.partial_progress,
+            "comparison_limit": "ACK counts and atomic units remain explicit; different shapes are not equivalent contracts",
+            "ack_duration_scope": "individual returned durable commit call; no replay of uncertain outcomes",
+            "allocated_file_bytes_scope": "net allocated file length change per complete sample; not logical WAL bytes or fsync count",
+            "amortized_cost_scope": "sample total divided by returned ACK count; concurrent wall time overlaps and these are not individual ACK latencies or attributable bytes",
+            "physical_work_scope": "runtime statement counters per complete sample; unavailable counters are listed, never imputed as zero",
+            "runtime_counter_scope": "returned statement statistics, including logical rows_created; these are not physical-write counters",
+            "by_arm": by_arm}
+
+
+def matched_write_loads(scenarios, comparisons):
+    """Index same-load recipes without implying equivalent atomic contracts."""
+    by_load = {}
+    for scenario in scenarios:
+        if scenario.family != "write":
+            continue
+        load = (scenario.write_rows, scenario.payload_bytes, scenario.writers)
+        pairs = [item for item in comparisons if item["scenario_id"] == scenario.name]
+        by_load.setdefault(load, []).append({
+            "scenario_id": scenario.name, "shape": scenario.write_shape,
+            "atomic_unit": contract(scenario)["transaction"],
+            "partial_progress": scenario.partial_progress,
+            "pairs": [{"pair": item["pair"], "by_arm": {
+                arm: {"rows_per_second_median": item["write_tradeoff"]["by_arm"][arm]["rows_per_second"]["median_per_second"],
+                      "durable_acks_per_sample": item["write_tradeoff"]["by_arm"][arm]["durable_acks"]["median_count"],
+                      "ack_duration_median_ns": item["write_tradeoff"]["by_arm"][arm]["ack_duration_ns"]["median_ns"]}
+                for arm in ("A", "B")}} for item in pairs]})
+    return [{"write_rows_per_writer": rows, "payload_bytes": size, "writers": writers,
+             "shapes": sorted(entries, key=lambda item: item["shape"])}
+            for (rows, size, writers), entries in sorted(by_load.items())]
 
 
 def compare_campaign(data):
@@ -599,15 +701,7 @@ def compare_campaign(data):
                                 "p95_limit": tail_limit, "physical_work_reduced": work_reduced,
                                 "thresholds_met": med <= limit and (tail_limit is None or tail <= tail_limit) and work_reduced is not False})
             if scenario.family == "write":
-                comparisons[-1]["write_tradeoff"] = {
-                    "atomic_unit": samples["A"][0]["write"]["atomic_unit"],
-                    "partial_progress": scenario.partial_progress,
-                    "comparison_limit": "ACK counts and atomic units remain explicit; different shapes are not equivalent contracts",
-                    "by_arm": {arm: {field: _distribution([s["write"][field] for s in rows],
-                                                         "per_second" if field.endswith("per_second") else "count")
-                                     for field in ("commits", "durable_acks", "business_rows", "rows_per_second", "durable_acks_per_second")}
-                               for arm, rows in samples.items()},
-                }
+                comparisons[-1]["write_tradeoff"] = write_tradeoff(samples, scenario)
             if scenario.family == "unique_create":
                 comparisons[-1]["unique_create_diagnostic"] = {
                     "atomic_unit": "one transaction; one durable ACK",
@@ -665,6 +759,8 @@ def compare_campaign(data):
              "comparative_logical_memory": data.get("qualification_scope") != HISTORICAL_SCOPE and data["intent"] == "qualification" and not all(Scenario.from_dict(s).family == "fts_matrix" for s in data["scenarios"]),
             "candidate_memory_verified": data.get("qualification_scope") == HISTORICAL_SCOPE,
             "decision": decision, "comparisons": comparisons, "overall": totals,
+            "matched_write_loads": matched_write_loads([Scenario.from_dict(s) for s in data["scenarios"]], comparisons)
+            if data["mode"] == "recipe" else [],
             "calibration_valid": calibrated,
             "noisy": noisy, "noise_policy": "CPU > registered limit or within-process CV >10%; at most one complete rerun",
             "percentile_scope": "descriptive retained samples, not production SLA or p99",
