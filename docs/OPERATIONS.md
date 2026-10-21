@@ -297,6 +297,48 @@ identities. Restart application processes after the maintenance window so their 
 adopts the new capability, floor and index authority. See
 [`docs/architecture/MVCC_VACUUM_V1.md`](architecture/MVCC_VACUUM_V1.md).
 
+### Capacity, retention and maintenance runbook
+
+Record the source revision, database configuration, workload shape, participant
+count and observation window before changing a setting. Keep three memory signals
+separate: process peak RSS is operating-system resident memory; the configured
+`buffer_budget_bytes` limits the page pool; query logical-memory peaks are charged
+estimates for instrumented operators. Neither logical peak nor page-pool budget is
+a process RSS ceiling. Compare like-for-like windows and collect the three signals
+independently. A growing RSS alone does not establish a retained Grafx snapshot or
+a leak; a stable logical charge alone does not rule out other Python allocations.
+
+For a suspected retention problem, inventory owned read transactions and cursors,
+their age and the last checkpoint. Close or roll back the readers that have
+finished; do not shorten their TTL to make a live snapshot disappear. Capture
+`db.maintenance.bloat()` and the checkpoint/WAL status before and after that
+ordinary lifecycle change. Its `recyclable_horizon_lsn` is capped by the last
+checkpoint **and** reader registrations. Closing a reader can leave the report
+unchanged until a separate checkpoint advances that cap. The census itself does
+not checkpoint, prune a registration, reclaim a page, or establish vacuum safety.
+Check `horizon_retained_versions`, `horizon_eligible_versions` and their **record
+slot** bytes; overflow payload bytes are excluded. These are physical-version
+estimates, not resident-memory or immediately recoverable disk-byte promises.
+
+Use the following matrix as a per-workload decision record. The named API and
+configuration fields are existing interfaces, not prescribed new defaults.
+
+| Signal and controlled sample | Potential local action | Cost and safety boundary | Decision |
+| --- | --- | --- | --- |
+| RSS, buffer occupancy and query logical peak across the same bounded read workload; note `buffer_budget_bytes`, `query_memory_budget_bytes` and concurrent handles | Keep the default if no resource pressure; otherwise test a local page-pool or query-budget change | More page-pool capacity consumes process memory; smaller budgets may refuse valid work. Neither budget bounds all Python/RSS use | Measure a paired candidate; never infer a leak from one signal |
+| IDs consumed versus reserved per committed implicit-ID batch; note `identity_lease_size` and the largest batch | Keep the default or test a local lease size against the observed batch distribution | The implicit-only reservation uses `max(identity_lease_size, batch length)`; shrinking the configured lease cannot cap a larger batch. IDs stay monotonic and are not recycled after a failed attempt | Preserve identity semantics; do not tune from gaps alone |
+| Bounded `index_distribution` sample, lookup work and the reported skew for one HASH index | Inspect key skew and consider an index-specific rehash/rebuild only under its normal gates | More buckets/pages and rebuild work may add storage and write cost; a hot key cannot be made uniformly distributed by a universal bucket count | Keep, adjust locally, or open a separate measured design/spec |
+| Checkpoint lag/WAL bytes, reader ages, writer latency and foreign-participant visibility | Test a local `checkpoint_interval_records`/explicit checkpoint cadence if lag is operationally costly | A checkpoint is an actual publication/barrier operation, not a substitute for a commit. Retained readers may cap recycling; external writer files must remain visible at the supported adoption boundary | Compare paired latency, WAL and read-visibility results before adjusting |
+
+Keep `maintenance.bloat()` read-only during diagnosis. If physical reclamation is
+needed, use the separate quiescent vacuum contract above; an eligible version
+does **not** mean `vacuum_safe`. Do not run destructive maintenance merely to
+improve a diagnostic number. For each proposed tuning change, preserve a control
+with the same dataset, workload and correctness checks, record raw samples and
+resource costs, then make a scoped decision. A failed or ambiguous campaign means
+retain the existing setting and investigate separately. See the
+[measurement protocol](PERFORMANCE.md#rf12-capacity-decision-protocol).
+
 WAL page-image compression is a separate explicit, one-way activation:
 
 ```python

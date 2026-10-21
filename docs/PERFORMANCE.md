@@ -818,6 +818,41 @@ unchanged.
 Grafx does not currently claim Ladybug parity, constant-time general traversal,
 linear CPU/GIL scaling or an RSS bound equal to `buffer_budget_bytes`. Historical
 cross-platform comparisons remain [historical](reports/PERFORMANCE_HISTORY.md).
+
+## RF12 capacity decision protocol
+
+The [operational runbook](OPERATIONS.md#capacity-retention-and-maintenance-runbook)
+defines the four candidate areas: memory, implicit-ID leases, HASH-key skew and
+checkpoint cadence. They are hypotheses for a particular workload, not global
+performance gains. Record a separate decision for each one:
+
+1. Pin source revision, database format, configuration, data/seed, concurrency,
+   transaction and cursor ownership, warmup, machine load and measurement window.
+   Keep the existing setting as control; vary one setting or index action at a
+   time on equivalent disposable copies.
+2. Collect raw per-run throughput/latency and tails alongside process RSS, logical
+   query peaks, page-pool budget, WAL/checkpoint lag, file growth and reader age
+   where applicable. Label absent observers as unavailable. Never convert a
+   logical tariff, record-slot estimate or configured budget into RSS.
+3. Prove exact result and ID semantics, fresh and retained snapshot visibility,
+   rollback/commit outcomes, recovery and external-participant adoption on both
+   arms. For checkpoint experiments, include a foreign writer's committed files
+   and a later reader's visibility across the checkpoint barrier. For a bloat
+   experiment, show the pinned report, reader close, separate checkpoint and
+   post-checkpoint report without treating the census as mutation.
+4. State the benefit and cost with variance and confounders, then choose
+   **maintain**, **local adjustment**, or **new investigation/spec**. If a
+   correctness check fails or the campaign cannot distinguish the arms, keep the
+   current setting. Do not silently change a project default or activate a
+   one-way storage capability from this diagnostic exercise.
+
+The proof for a proposed adjustment must belong to that adjustment. A faster
+lookup sample does not qualify an ID lease, a lower bloat estimate does not
+authorize vacuum, and a shorter checkpoint lag does not establish foreign-writer
+visibility. The runbook and existing `test_bloat_report.py` cover the read-only
+horizon distinction; fixture-level paired campaigns and explicit decision records
+are tracked separately from this documentation change.
+
 ## RF01 historical total-overhead qualification
 
 RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`
