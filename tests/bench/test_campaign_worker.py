@@ -86,12 +86,21 @@ def test_real_scan_reports_physical_work(tmp_path):
     assert sample["statistics"]["edge_scans"] == 1
     assert sample["statistics"]["physical_edge_versions_examined"] > 1
     assert sample["first_row_ns"] is None
-def test_real_unbudgeted_landing_reports_unavailable_memory_coverage(tmp_path):
+def test_real_unbudgeted_landing_reports_unavailable_memory_coverage(tmp_path, monkeypatch):
     from bench.harness.campaign_fixtures import matrix
     scenario = next(s for s in matrix() if s.name == "landing-control")
     assert scenario.query_memory_budget_bytes is None
     with connect(tmp_path / "landing") as db:
         build_fixture(db, scenario)
+        from bench.harness.campaign_schema import CampaignError
+        with db._queries._observe_logical_memory():
+            with pytest.raises(CampaignError, match="preexisting logical observation"):
+                measure_statement(db, scenario, 0)
+        # The unbudgeted sample must remain independent of the optional logical
+        # observer. Its unavailable proof is provided separately with a quota.
+        def unavailable_observer(_engine):
+            raise AssertionError("disabled logical observer was activated during landing")
+        monkeypatch.setattr(type(db._queries), "_observe_logical_memory", unavailable_observer)
         sample = measure_statement(db, scenario, 0)
     assert sample["memory"] == {
         "logical_memory_peak_bytes": None,

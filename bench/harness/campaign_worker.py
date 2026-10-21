@@ -98,7 +98,14 @@ def measure_statement(db, scenario, index, *, reader=None):
         plan = [type(node).__name__ for node in db.explain(query).walk()]
     prepare_ns = time.perf_counter_ns() - begin
     observe = getattr(db._queries, "_observe_logical_memory", None)
-    memory_scope = observe() if observe is not None else nullcontext(None)
+    # Unbudgeted landing cannot yield a logical-memory measurement. Activating
+    # the candidate-only observer would still charge identity checks and owner
+    # accounting inside the timed query even though its result must be null.
+    # The independent budgeted lifecycle proof retains the real observer.
+    unbudgeted_landing = scenario.family == "landing" and scenario.query_memory_budget_bytes is None
+    if unbudgeted_landing and getattr(db._queries, "_memory_observation", None) is not None:
+        raise CampaignError("unbudgeted landing requires no preexisting logical observation")
+    memory_scope = observe() if observe is not None and not unbudgeted_landing else nullcontext(None)
     first = commit = None
     stats = {}
     with memory_scope as observation:
@@ -134,7 +141,9 @@ def measure_statement(db, scenario, index, *, reader=None):
             rows = result.rows
         elapsed = time.perf_counter_ns() - start
         cpu = time.process_time_ns() - cpu_start
-    memory = observation.result() if observation is not None else unavailable_memory("revision_has_no_logical_memory_observer")
+    missing_reason = ("query_memory_budget_disabled" if observe is not None and unbudgeted_landing
+                      else "revision_has_no_logical_memory_observer")
+    memory = observation.result() if observation is not None else unavailable_memory(missing_reason)
     if memory["logical_memory_peak_bytes"] is None and memory["unavailable_reason"] == "query_memory_budget_disabled":
         # The observer identifies its implementation even when disabled. Raw
         # samples describe effective coverage, not that implementation label.
