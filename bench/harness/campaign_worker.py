@@ -109,7 +109,9 @@ def measure_statement(db, scenario, index, *, reader=None):
     else:
         plan = [type(node).__name__ for node in db.explain(query).walk()]
     prepare_ns = time.perf_counter_ns() - begin
-    observe = getattr(db._queries, "_observe_logical_memory", None)
+    observation_name = ("_observe_logical_memory_sequence" if scenario.family in
+                        {"read_autocommit", "read_shared"} else "_observe_logical_memory")
+    observe = getattr(db._queries, observation_name, None)
     # Unbudgeted landing cannot yield a logical-memory measurement. Activating
     # the candidate-only observer would still charge identity checks and owner
     # accounting inside the timed query even though its result must be null.

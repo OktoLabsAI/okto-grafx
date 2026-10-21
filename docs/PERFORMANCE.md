@@ -74,6 +74,16 @@ Executable coverage: [RF10 recipes](../tests/api/test_read_snapshot_recipes.py),
 [reader registration](../tests/txn/test_reader_lifecycle.py). These establish
 consistency and cleanup, not temporal qualification.
 
+The RF10 campaign has eight slices: four read recipes with warm and reopened
+handles. Use a positive, common query-memory budget in both source arms.
+The sixteen-statement recipes use the sequence logical-memory observer, which
+tracks the simultaneous retained tariff across the complete group; the single
+statement recipes use the ordinary observer. First-row timing belongs to the
+measured read. Transaction counts, partial-cursor closure, standing pins and
+handle closure come from a separate untimed diagnostic and are required in
+every qualified sample. Compare each recipe only with itself across revisions;
+the snapshot contracts above remain distinct.
+
 ## Ingestion atomicity and cost
 
 Choose the application atomic unit before choosing a faster ingestion shape.
@@ -910,6 +920,13 @@ authorize vacuum, and a shorter checkpoint lag does not establish foreign-writer
 visibility. The runbook and existing `test_bloat_report.py` cover the read-only
 horizon distinction; fixture-level paired campaigns and explicit decision records
 are tracked separately from this documentation change.
+
+The RF12 external-writer matrix includes a 64-lease/32-row reference, controls
+that vary only the lease or only the batch, and mixed lease/batch interaction
+slices. Attribute a local setting's effect only through its matching one-variable
+pair. An interaction slice describes joint behavior and cannot by itself
+qualify a lease or batch adjustment. The timed interval covers only the read;
+update, checkpoint and bloat census costs remain separate diagnostics.
 
 ## RF11 full-text statistics matrix
 

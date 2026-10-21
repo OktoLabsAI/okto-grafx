@@ -20,8 +20,12 @@ def matrix(scenario_type):
     slices = [(64, 512, 64, 32, case) for case in ("retained", "released", "external")]
     slices += [(buffer, 512, 64, 32, "released") for buffer in (16, 256)]
     slices += [(64, interval, 64, 32, "released") for interval in (128, 2048)]
-    slices += [(64, 512, lease, batch, "external")
-               for lease, batch in ((1, 1), (32, 128), (128, 32), (512, 512))]
+    # The 64/32 external slice above is the reference. Keep one-dimensional
+    # controls beside the mixed lease/batch interaction slices.
+    slices += [(64, 512, lease, batch, "external") for lease, batch in (
+        (1, 32), (32, 32), (128, 32), (512, 32),
+        (64, 1), (64, 128), (64, 512),
+        (1, 1), (32, 128), (512, 512))]
     return [scenario_type(f"rf12-{case}-buf{buffer}-cp{interval}-lease{lease}-batch{batch}",
                           "capacity", nodes=batch, edges_per_node=0, write_rows=batch,
                           capacity_case=case, buffer_budget_bytes=buffer << 20,
@@ -70,7 +74,23 @@ def contract(s):
             "errors": "success required; no replay",
             "case": s.capacity_case, "diagnostic": "read-only; horizon eligibility is not vacuum safety",
             "memory": "query logical peak, process lifetime RSS, and slot bytes are distinct",
-            "timing": "read query only; no attribution of write/checkpoint speed to this query"}
+            "timing": "read query only; no attribution of write/checkpoint speed to this query",
+            "comparison_scope": comparison_scope(s)}
+
+
+def comparison_scope(s):
+    """Label which external settings can support a one-variable comparison."""
+    if s.capacity_case != "external":
+        return "retained/released reader or single-setting capacity slice"
+    lease_changed = s.identity_lease_size != 64
+    batch_changed = s.write_rows != 32
+    if lease_changed and batch_changed:
+        return "lease_and_batch_interaction; descriptive only"
+    if lease_changed:
+        return "lease_only_against_external_64_32"
+    if batch_changed:
+        return "batch_only_against_external_64_32"
+    return "external_64_32_reference"
 
 
 def build_fixture(db, s):
@@ -200,6 +220,8 @@ def decision_template(report, *, objective):
             "report_sha256": canonical_hash(report) if report is not None else None,
             "decision": "review_local_tradeoffs" if reviewable else "new_research",
             "template_only": True, "change_defaults": False, "authorize_vacuum": False,
+            "comparison_scope": "one-variable external controls support local review; mixed lease/batch slices describe interactions only",
             "requires": ["recompose raw campaign and semantic gates", "3 pairs/5 warmups/20 retained",
                          "calibration/CPU/dispersion", "per-case RSS/logical/slot bytes and WAL/disk costs",
+                         "match same-load single-variable pairs before attributing a benefit",
                          "explicit local objective and acceptance; no universal recommendation"]}

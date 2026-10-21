@@ -127,6 +127,35 @@ def diagnose(db, scenario):
     return result
 
 
+def validate_diagnostic(sample, scenario):
+    """Require the separate ownership proof for every qualified RF10 sample."""
+    stats = sample.get("statistics")
+    if not isinstance(stats, dict):
+        raise ValueError("RF10 ownership statistics missing")
+    expected = 16 if scenario.family == "read_autocommit" else 1
+    required_nonnegative = ("diagnostic_transactions_begin", "diagnostic_transactions_commit",
+                            "diagnostic_transactions_rollback", "diagnostic_partial_first_row_ns",
+                            "diagnostic_partial_close_ns", "diagnostic_partial_resident_physical_pins",
+                            "diagnostic_physical_pins_after_close", "diagnostic_pool_retained_estimate_bytes")
+    if any(type(stats.get(key)) is not int or stats[key] < 0 for key in required_nonnegative):
+        raise ValueError("RF10 ownership diagnostic is missing or negative")
+    for key in ("diagnostic_partial_owned_transactions", "diagnostic_owned_transactions_after_close",
+                "diagnostic_handle_close_complete", "diagnostic_standing_reader_horizon_present"):
+        if type(stats.get(key)) is not int:
+            raise ValueError("RF10 ownership proof requires integer counters")
+    if (stats["diagnostic_transactions_begin"] != expected
+            or stats["diagnostic_transactions_commit"] + stats["diagnostic_transactions_rollback"] != expected
+            or stats["diagnostic_partial_first_row_ns"] == 0
+            or stats["diagnostic_partial_owned_transactions"] != 1
+            or stats["diagnostic_owned_transactions_after_close"] != 0
+            or stats["diagnostic_handle_close_complete"] != 1
+            or stats["diagnostic_standing_reader_horizon_present"] not in (0, 1)):
+        raise ValueError("RF10 ownership or close proof differs from the declared recipe")
+    if scenario.family in {"read_shared", "read_cursor"}:
+        if type(stats.get("lifecycle_explicit_close_ns")) is not int or stats["lifecycle_explicit_close_ns"] < 0:
+            raise ValueError("RF10 explicit close duration missing")
+
+
 def matrix():
     from bench.harness.campaign_fixtures import Scenario
     return [Scenario("rf10-" + family + "-" + cache, family, nodes=128,

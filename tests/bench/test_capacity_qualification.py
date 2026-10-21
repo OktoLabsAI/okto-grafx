@@ -20,6 +20,20 @@ def test_capacity_catalog_has_relevant_slices_without_cartesian_explosion():
     assert all(Scenario.from_dict(s.to_dict()) == s for s in cases)
 
 
+def test_external_lease_and_batch_interactions_have_one_variable_controls():
+    cases = [s for s in capacity.matrix(Scenario) if s.capacity_case == "external"]
+    settings = {(s.identity_lease_size, s.write_rows) for s in cases}
+    assert (64, 32) in settings
+    for lease, batch in settings:
+        if lease != 64 and batch != 32:
+            assert (lease, 32) in settings
+            assert (64, batch) in settings
+            scenario = next(s for s in cases if (s.identity_lease_size, s.write_rows) == (lease, batch))
+            assert "interaction" in capacity.contract(scenario)["comparison_scope"]
+    assert capacity.comparison_scope(next(s for s in cases if
+           (s.identity_lease_size, s.write_rows) == (128, 32))) == "lease_only_against_external_64_32"
+
+
 @pytest.mark.parametrize("case", ["retained", "released", "external"])
 def test_real_capacity_recipe_keeps_snapshot_and_diagnostic_contract(tmp_path, case):
     scenario = capacity.matrix(Scenario)[0]
@@ -60,6 +74,7 @@ def test_decision_template_keeps_missing_or_noisy_evidence_inconclusive():
     assert review["decision"] == "review_local_tradeoffs"
     assert review["template_only"] is True
     assert review["authorize_vacuum"] is False
+    assert "one-variable" in review["comparison_scope"]
 
 
 def test_invalid_capacity_config_and_unrelated_fields_are_rejected():

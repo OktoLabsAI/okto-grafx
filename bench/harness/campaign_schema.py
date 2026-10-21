@@ -15,13 +15,14 @@ import re
 import statistics
 
 from bench.harness.campaign_fixtures import Scenario, contract, oracle, query_for
-from bench.harness import fts_qualification, quota_qualification, rf04_qualification
+from bench.harness import fts_qualification, quota_qualification, read_lifecycle_qualification, rf04_qualification
 
 HISTORICAL_SCOPE = "rf01_historical_total_overhead"
 HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
 HISTORICAL_TREE = "c2795181cda21041998cd13959afc8de303802bb"
 HISTORICAL_QUERY_SHA256 = "8056d0625cf4764c3a160bb676b6cefdc71d680f7f52bba44b626a28e0fa7ad8"
 LOGICAL_COVERAGE = "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1"
+SEQUENCE_LOGICAL_COVERAGE = "simultaneous_sequence_query_budget_and_handle_owner_endpoint_tariffs_v1"
 WRITE_PHYSICAL_COUNTERS = ("physical_node_versions_examined", "physical_edge_versions_examined",
                            "index_probe_keys", "certificate_attempts", "certificate_retries")
 WRITE_REQUIRED_COUNTERS = ("index_probe_keys", "certificate_attempts")
@@ -437,7 +438,7 @@ def _validate(data):
                 _integer(sample[key], key)
             _require(sample["elapsed_ns"] > 0, "zero elapsed time")
             _require(sample["consume_all_ns"] <= sample["elapsed_ns"], "consume boundary exceeds total")
-            if scenario.cursor_batch_size and sample["rows"]:
+            if (scenario.cursor_batch_size or scenario.family in read_lifecycle_qualification.FAMILIES) and sample["rows"]:
                 _integer(sample["first_row_ns"], "first_row_ns")
                 _require(sample["first_row_ns"] <= sample["consume_all_ns"], "first-row boundary exceeds consume")
             else:
@@ -477,6 +478,11 @@ def _validate(data):
                     sample_contracts[key] = coverage
             else:
                 _require(sample["commit_ns"] is None, "read cannot claim durable commit timing")
+            if scenario.family in read_lifecycle_qualification.FAMILIES and data["intent"] == "qualification":
+                try:
+                    read_lifecycle_qualification.validate_diagnostic(sample, scenario)
+                except ValueError as exc:
+                    raise CampaignError(str(exc)) from exc
             memory = sample["memory"]
             if scenario.family == "capacity":
                 from bench.harness.capacity_qualification import validate_sample
@@ -486,6 +492,15 @@ def _validate(data):
                     raise CampaignError(str(exc)) from exc
             _fields(memory, ("logical_memory_peak_bytes", "baseline_retained_bytes", "coverage", "unavailable_reason"), "memory")
             _integer(memory["baseline_retained_bytes"], "baseline_retained_bytes")
+            if scenario.family in read_lifecycle_qualification.FAMILIES and data["intent"] == "qualification":
+                expected_coverage = (SEQUENCE_LOGICAL_COVERAGE if scenario.family in
+                                     {"read_autocommit", "read_shared"} else LOGICAL_COVERAGE)
+                _require(scenario.query_memory_budget_bytes is not None
+                         and sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes
+                         and memory["logical_memory_peak_bytes"] is not None
+                         and memory["coverage"] == expected_coverage
+                         and memory["unavailable_reason"] is None,
+                         "RF10 qualified recipe requires its covered logical-memory observer")
             if rf06_split:
                 _integer(sample["statistics"].get("certificate_attempts"), "RF06 certificate attempts", 1)
                 _integer(sample["statistics"].get("landing_candidates"), "RF06 landing candidates", 1)
