@@ -853,6 +853,32 @@ visibility. The runbook and existing `test_bloat_report.py` cover the read-only
 horizon distinction; fixture-level paired campaigns and explicit decision records
 are tracked separately from this documentation change.
 
+## RF11 full-text statistics matrix
+
+Use the [FTS source-selection recipe](FULL_TEXT_SEARCH.md#choosing-and-checking-a-statistics-source)
+to select an index declaration for a particular corpus. The existing `wal` mode
+is the control; `durable` is opt-in and activates its already defined capability.
+Do not modify a mode in place or infer a new default from a synthetic sample.
+
+| Workload cut | Required comparison | Main benefit/cost question |
+| --- | --- | --- |
+| First search on a newly opened handle, then repeated search in one snapshot | `wal` versus `durable`; record `snapshot_cache`, `wal_delta`, `durable_summary` or `full_census` actually observed | Does a proved summary remove census work when the local snapshot cache is cold? |
+| Read-only reopen after complete write and checkpoint | Same query, dataset and result oracle; separate process-local cache from OS file cache | Is cold/reopen read cost worth summary maintenance and format compatibility? |
+| Reader retained across updates, with history capacities 0, 8 and 32 where page size accepts each | Covered and uncovered snapshots, including marker eviction | Does bounded historical coverage justify larger page-0 records and affected-commit copies? |
+| Insert/update/delete and concurrent writer controls | One complete durable ACK per atomic unit, replay/reopen, exact scores and corpus | How much write latency, WAL, verification and storage cost moves to maintain the summary? |
+
+For each arm retain source revision, format/capabilities, index declaration, seed,
+document/term distribution, query and reader snapshot, cache state, all raw timing
+samples, `statistics_regime`, `statistics_wal_records`, `postings_visited`,
+`candidates`, `corpus_documents`, hit IDs/scores/order and the exact census oracle.
+Include process RSS and logical-memory measures where available, marking absent
+observers unavailable. Report write ACKs, WAL bytes, disk growth and verification
+separately from read latency. A `full_census` result can be correct; only a
+covered summary may claim census avoidance. Corrupt summary metadata must refuse
+rather than masquerade as a fallback. Keep timing in the calibrated campaign;
+the deterministic CI oracles in `test_fulltext_durable.py` and
+`test_fulltext_history.py` establish semantics and recovery, not a speedup.
+
 ## RF01 historical total-overhead qualification
 
 RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`
