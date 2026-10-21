@@ -12,6 +12,80 @@ import time
 import uuid
 
 BASELINE = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
+MINIMUM_CONTROLS = frozenset({"constant", "reader-short-churn0", "edges-n1024-uniform-x1"})
+PHYSICAL_COVERAGE = (
+    "physical_node_versions_examined", "physical_edge_versions_examined",
+    "index_probe_keys", "certificate_attempts", "landing_candidates", "landing_batches",
+)
+SEPARATE_LANDING_COVERAGE = ("landing_candidates", "landing_batches")
+
+
+def validate_controls(manifest):
+    """Require an explicit partition of the current catalog, never infer N/A.
+
+    controls contains {scenario, rationale}; not_applicable contains
+    {scenarios: [names], rationale}. Grouped omissions may share a rationale,
+    but every omitted name must occur exactly once. Reasons are auditable
+    author statements, not evidence that an instrumentation path is covered.
+    """
+    from bench.harness.campaign_fixtures import matrix
+    catalog = {scenario.name for scenario in matrix()}
+    controls = manifest.get("controls")
+    omissions = manifest.get("not_applicable")
+    if not isinstance(controls, list) or not controls or not isinstance(omissions, list):
+        raise ValueError("explicit controls and not_applicable lists required")
+    selected, excluded = [], []
+    for records, keys, destination, field in (
+        (controls, {"scenario", "rationale"}, selected, "scenario"),
+        (omissions, {"scenarios", "rationale"}, excluded, "scenarios"),
+    ):
+        for record in records:
+            if not isinstance(record, dict) or set(record) != keys:
+                raise ValueError("invalid control selection record")
+            if not isinstance(record["rationale"], str) or not record["rationale"].strip():
+                raise ValueError("explicit control/omission rationale required")
+            names = [record[field]] if field == "scenario" else record[field]
+            if not isinstance(names, list) or not names:
+                raise ValueError("nonempty omitted scenario list required")
+            for name in names:
+                if not isinstance(name, str) or name not in catalog or name in destination:
+                    raise ValueError("unknown or duplicate scenario")
+                destination.append(name)
+    if not MINIMUM_CONTROLS <= set(selected):
+        raise ValueError("minimum statement, cursor and edge controls required")
+    if set(selected) & set(excluded) or set(selected) | set(excluded) != catalog:
+        raise ValueError("selected and omitted scenarios must partition the catalog")
+    return selected
+
+
+def control_observations(raw):
+    """Coverage comes from retained candidate work, not a fixture/plan name.
+
+    These integer sums describe observed work only; they are not memory peaks
+    or timing aggregates. Uncovered paths remain blockers even with N/A prose.
+    """
+    counts = dict.fromkeys(PHYSICAL_COVERAGE, 0)
+    by_scenario = {}
+    for run in raw["runs"]:
+        if run["arm"] != "B":
+            continue
+        for sample in run["samples"]:
+            if sample["kind"] != "retained":
+                continue
+            observed = by_scenario.setdefault(sample.get("scenario_id", "unknown"), dict.fromkeys(counts, 0))
+            for name in counts:
+                value = sample["statistics"].get(name, 0)
+                if type(value) is not int or value < 0:
+                    raise ValueError("physical coverage requires nonnegative integer counters")
+                counts[name] += value
+                observed[name] += value
+    return {"counters": counts, "by_scenario": by_scenario,
+            "uncovered_instrumentation": [name for name, count in counts.items()
+                                          if count == 0 and name not in SEPARATE_LANDING_COVERAGE],
+            "separate_evidence_required": list(SEPARATE_LANDING_COVERAGE),
+            "separation_reason": "The historical campaign requires an explicit memory budget; "
+                                 "the existing executor guard disables batched landings with that budget. "
+                                 "Landing qualification requires a separately reviewed method; it is not N/A."}
 
 
 def canonical_path(value):
@@ -162,9 +236,14 @@ def _run(snapshot):
     started = time.monotonic()
     base = canonical_path(Path(os.environ["LOCALAPPDATA"]) / "Okto" / "Grafx")
     manifest_path = canonical_path(base / "rf01-qualification.json")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != "grafx-pulse-qualification/v1":
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = campaign_schema.load_json(manifest_bytes.decode("utf-8"))
+    if manifest.get("schema_version") != "grafx-pulse-qualification/v2":
         raise ValueError("unsupported operational manifest")
+    if set(manifest) != {"schema_version", "candidate_root", "baseline_root", "python",
+                         "candidate_revision", "output", "controls", "not_applicable"}:
+        raise ValueError("unknown or missing operational manifest field")
+    selected = validate_controls(manifest)
     candidate = canonical_path(manifest["candidate_root"])
     baseline = canonical_path(manifest["baseline_root"])
     python = canonical_path(manifest["python"])
@@ -179,9 +258,10 @@ def _run(snapshot):
     output = canonical_path(manifest["output"])
     output.relative_to(base / "runs")
     output.mkdir(parents=True, exist_ok=False)
-    receipt = {"manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    receipt = {"manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
                "candidate_revision": revision, "baseline_revision": BASELINE,
-               "decision": "incomplete", "commands": []}
+               "decision": "incomplete", "commands": [], "controls": manifest["controls"],
+               "not_applicable": manifest["not_applicable"]}
     try:
         # Isolated interpreter imports the actual runner snapshot's harness;
         # each worker independently attests the requested checkout import.
@@ -192,7 +272,8 @@ def _run(snapshot):
                     common + ["run", "--historical-noop", "--mode", "noop", "--intent", "qualification",
                               "--baseline", str(baseline), "--candidate", str(candidate),
                               "--memory-budget", "4096", "--max-cpu-percent", "20",
-                              "--scenario", "constant", "--calibrated-executor",
+                              *[part for name in selected for part in ("--scenario", name)],
+                              "--calibrated-executor",
                               "--calibration", str(calibration), "--output", str(output / "campaign")]]
         for index, command in enumerate(commands):
             remaining = 90 - (time.monotonic() - started)
@@ -210,9 +291,21 @@ def _run(snapshot):
         from bench.harness.campaign_schema import compare_campaign, load_json
         raw = load_json((output / "campaign" / "campaign.json").read_text(encoding="utf-8"))
         report = compare_campaign(raw)
+        receipt["temporal_decision"] = report.get("decision")
+        if [scenario["name"] for scenario in raw["scenarios"]] != selected:
+            raise ValueError("campaign controls differ from operational selection")
+        receipt["physical_coverage"] = control_observations(raw)
+        if receipt["physical_coverage"]["uncovered_instrumentation"]:
+            raise ValueError("uncovered physical instrumentation: " + ", ".join(
+                receipt["physical_coverage"]["uncovered_instrumentation"]))
         if report.get("decision") != "passed":
             raise RuntimeError("campaign did not qualify")
-        receipt["decision"] = "passed"
+        # A passing budgeted comparison cannot exercise batched landings, whose
+        # existing eligibility guard rejects a configured query memory budget.
+        # Preserve the measured temporal verdict without granting full RF01
+        # qualification until the separate verification method is resolved.
+        receipt["decision"] = "incomplete"
+        receipt["qualification_pending"] = receipt["physical_coverage"]["separate_evidence_required"]
     except BaseException as failure:
         receipt["decision"] = "failed"
         receipt["failure"] = f"{type(failure).__name__}: {failure}"
