@@ -315,7 +315,7 @@ def test_owner_dirty_table_keeps_read_your_writes_on_the_scan(
         "MATCH (n:A) WHERE n.v IN $ids RETURN n.id",
         "MATCH (n:A) WHERE n.v > 0 AND n.id IN $ids RETURN n.id",
         "MATCH (a:A), (n:A) WHERE n.id IN $ids RETURN n.id",
-        "MATCH (n:A)-[r:R]->(b:B) WHERE n.id IN $ids RETURN n.id",
+        "MATCH (n:A)-[r:R]->(b:B) WHERE n.id IN $ids AND n.v/0>1 RETURN n.id",
     ),
 )
 def test_near_misses_keep_the_scan(

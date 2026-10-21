@@ -2977,6 +2977,7 @@ class _Planner:
             terms,
             standalone=not pattern.relationships or zero_anchor or (inferred is None and not first.labels),
             inferred_table=inferred,
+            connected_key_seek=self._connected_key_seek_is_total(pattern, terms),
         )
         for position, relationship in enumerate(pattern.relationships):
             target_pattern = pattern.nodes[position + 1]
@@ -3007,6 +3008,45 @@ class _Planner:
             self.bound_paths.add(pattern.variable)
         return pipeline, terms
 
+    def _connected_key_seek_is_total(
+        self, pattern: PatternPath, terms: Sequence[Expression]
+    ) -> bool:
+        """Prove the bounded connected context in which an anchor may be skipped.
+
+        The existing multi-key helper still proves SingleRow, leading PK IN,
+        parameter shape and index authority. Here, no inline expression or
+        later pattern may refuse on an anchor eliminated before traversal.
+        Keep unknown/correlated/optional/updating contexts on their old path.
+        """
+        statement = self.analysis.statement
+        if (not isinstance(statement, Query) or statement.writes
+                or len(statement.match_clauses) != 1
+                or statement.match_clauses[0].optional
+                or len(statement.match_clauses[0].patterns) != 1
+                or len(pattern.nodes) != 2 or len(pattern.relationships) != 1
+                or pattern.variable is not None):
+            return False
+        original = statement.match_clauses[0].patterns[0]
+        # _match_clause lowers inline relationship maps into later predicates;
+        # inspect the authored pattern too, before that expression disappears.
+        if (pattern != original
+                or any(item.properties is not None for item in (*original.nodes, *original.relationships))):
+            return False
+        first, target = pattern.nodes
+        edge = pattern.relationships[0]
+        if (first.variable is None or len(first.labels) != 1
+                or len(target.labels) != 1 or len(edge.types) != 1
+                or edge.min_hops != 1 or edge.max_hops != 1
+                or edge.hop_range_written or edge.direction is Direction.UNDIRECTED
+                or any(item.properties is not None for item in (first, edge, target))):
+            return False
+        return all(
+            self._ordered_filter_is_total(term, first.variable)
+            and not any(isinstance(item, BinaryOperation) and item.operator == "OR"
+                        for item in walk(term))
+            for term in terms[1:]
+        )
+
     def _match_node(
         self,
         pipeline: PlanNode,
@@ -3015,6 +3055,7 @@ class _Planner:
         *,
         standalone: bool = True,
         inferred_table: TableDef | None = None,
+        connected_key_seek: bool = False,
     ) -> tuple[PlanNode, list[Expression], str]:
         """Bind one node of a pattern, as a reference, an index seek or a scan.
 
@@ -3076,7 +3117,7 @@ class _Planner:
         seek, remaining = self._index_seek(pipeline, variable, table, terms)
         if seek is not None:
             return membership(seek), remaining, variable
-        if standalone:
+        if standalone or connected_key_seek:
             keyed = self._node_multi_key_seek(pipeline, variable, table, terms)
             if keyed is not None:
                 return membership(keyed), terms, variable
@@ -3089,7 +3130,7 @@ class _Planner:
         table: TableDef,
         terms: Sequence[Expression],
     ) -> PlanNode | None:
-        """Return the multi-key seek for ``n.pk IN $keys`` leading a standalone labelled node.
+        """Return the multi-key seek for ``n.pk IN $keys`` in a proven labelled-node context.
 
         NODE-IN-SEEK.  The term must be the first local term of the conjunction: seeking on a
         later conjunct would evaluate it before the terms written ahead of it and could suppress
