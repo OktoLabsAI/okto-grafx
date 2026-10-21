@@ -281,7 +281,7 @@ def run_worker(request, output):
                     with okto_grafx.connect(sample_root, **options) as db:
                         if independent:
                             build_fixture(db, scenario, apply_updates=scenario.reader != "retained")
-                        report["metrics_sink"] = type(db._queries._metrics).__name__
+                        report["metrics_sink"] = type(db._queries._metrics.sink.inner).__name__
                         if db._queries._metrics.enabled:
                             raise CampaignError("default metrics sink unexpectedly enabled")
                         if scenario.family == "write" and scenario.writers > 1:

@@ -4,6 +4,14 @@ from okto_grafx import connect
 import pytest
 
 
+def test_default_sink_metadata_uses_underlying_noop_sink(tmp_path):
+    with connect(tmp_path / "db") as db:
+        assert type(db._queries._metrics).__name__ == "MetricEmitter"
+        assert type(db._queries._metrics.sink).__name__ == "ContainedMetricsSink"
+        assert type(db._queries._metrics.sink.inner).__name__ == "NoOpMetricsSink"
+        assert db._queries._metrics.enabled is False
+
+
 @pytest.mark.parametrize("family", ["write", "fts"])
 def test_write_ack_reopen_and_native_fts_membership(tmp_path, family):
     scenario = Scenario(name=family, family=family, nodes=4, write_rows=2, term="rare")
