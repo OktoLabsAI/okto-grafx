@@ -86,3 +86,20 @@ def test_real_scan_reports_physical_work(tmp_path):
     assert sample["statistics"]["edge_scans"] == 1
     assert sample["statistics"]["physical_edge_versions_examined"] > 1
     assert sample["first_row_ns"] is None
+def test_real_unbudgeted_landing_reports_unavailable_memory_coverage(tmp_path):
+    from bench.harness.campaign_fixtures import matrix
+    scenario = next(s for s in matrix() if s.name == "landing-control")
+    assert scenario.query_memory_budget_bytes is None
+    with connect(tmp_path / "landing") as db:
+        build_fixture(db, scenario)
+        sample = measure_statement(db, scenario, 0)
+    assert sample["memory"] == {
+        "logical_memory_peak_bytes": None,
+        "baseline_retained_bytes": 0,
+        "coverage": "unavailable",
+        "unavailable_reason": "query_memory_budget_disabled",
+    }
+    assert sample["memory_budget_bytes"] is None
+    assert sample["statistics"]["landing_batches"] > 0
+    assert sample["statistics"]["landing_candidates"] > 0
+    assert sample["result_hash"] == sample["expected_result_hash"]

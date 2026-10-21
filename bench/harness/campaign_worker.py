@@ -135,6 +135,11 @@ def measure_statement(db, scenario, index, *, reader=None):
         elapsed = time.perf_counter_ns() - start
         cpu = time.process_time_ns() - cpu_start
     memory = observation.result() if observation is not None else unavailable_memory("revision_has_no_logical_memory_observer")
+    if memory["logical_memory_peak_bytes"] is None and memory["unavailable_reason"] == "query_memory_budget_disabled":
+        # The observer identifies its implementation even when disabled. Raw
+        # samples describe effective coverage, not that implementation label.
+        # Preserve the null peak, reason and measured baseline verbatim.
+        memory = dict(memory, coverage="unavailable")
     if scenario.family == "fts":
         memory = unavailable_memory("native_fts_memory_not_covered_by_query_budget_observer")
         stats = {"postings_visited": result.postings_visited}
