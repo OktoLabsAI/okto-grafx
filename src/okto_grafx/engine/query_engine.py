@@ -169,7 +169,7 @@ from okto_grafx.domain.ports.query_spill import (
     QuerySpillSorter,
     QuerySpillWorkspace,
 )
-from okto_grafx.domain.query.memory import LogicalMemoryBudget
+from okto_grafx.domain.query.memory import LogicalMemoryBudget, _LogicalMemoryObservation
 from okto_grafx.domain.query.control import _ReadControl
 from okto_grafx.domain.txn.context import (
     SIZING_ENDPOINT,
@@ -929,6 +929,7 @@ class _QueryResultCursor:
         "_context",
         "_engine",
         "_reported",
+        "_memory_observation",
         "_rows",
         "_seen",
         "columns",
@@ -949,6 +950,10 @@ class _QueryResultCursor:
         self._rows = rows
         self._closed = False
         self._reported = False
+        self._memory_observation = engine._memory_observation_current()
+        if self._memory_observation is not None:
+            engine._observe_memory_statement(context.statistics)
+            self._memory_observation._cursors += 1
         self._seen = 0
         self._active_seconds = initial_seconds
         self.columns = root.columns
@@ -975,6 +980,11 @@ class _QueryResultCursor:
         """
         if self._closed:
             return (), True
+        observation = self._engine._memory_observation_current()
+        if observation is not None:
+            self._engine._observe_memory_statement(self._context.statistics)
+            if observation is not self._memory_observation:
+                observation.invalidate("cursor_started_before_observation")
         started = self._engine._reading()
         produced: list[tuple[Value, ...]] = []
         exhausted = False
@@ -1033,6 +1043,11 @@ class _QueryResultCursor:
         """Perform the idempotent internal half of cursor settlement."""
         if self._closed:
             return
+        observation = self._engine._memory_observation_current()
+        if observation is not None and observation is not self._memory_observation:
+            observation.invalidate("cursor_started_before_observation")
+        if self._memory_observation is not None:
+            self._memory_observation._cursors -= 1
         scope = self._engine._statement_work
         with scope.bind(self._context.statistics) if scope is not None else nullcontext():
             self._closed = True
@@ -1063,6 +1078,8 @@ class _QueryResultCursor:
                         "Query context release also failed with "
                         f"{type(caught).__name__}: {caught}"
                     )
+            if self._context.comprehension_memory is not None:
+                self._context.comprehension_memory._end_observation()
         if not self._reported and self._engine._metrics.enabled:
             self._reported = True
             try:
@@ -1969,6 +1986,7 @@ class _EndpointLocatorBudget:
         "_max_entries",
         "_used_bytes",
         "_used_entries",
+        "_observation_engine",
     )
 
     def __init__(
@@ -1982,6 +2000,7 @@ class _EndpointLocatorBudget:
         self._max_entries = max_entries
         self._used_bytes = 0
         self._used_entries = 0
+        self._observation_engine: QueryEngine | None = None
         # Mechanism belongs to the composition root.  The no-op default keeps direct core
         # construction deterministic; production hands this budget the same private RLock as
         # the endpoint memo registry.
@@ -1989,6 +2008,8 @@ class _EndpointLocatorBudget:
 
     def reserve(self, *, bytes_: int, entries: int) -> None:
         """Reserve derived state atomically, or ask the caller to use canonical lookup."""
+        observation = (None if self._observation_engine is None else
+                       self._observation_engine._memory_observation_current())
         with self._guard:
             next_bytes = self._used_bytes + bytes_
             next_entries = self._used_entries + entries
@@ -1996,12 +2017,18 @@ class _EndpointLocatorBudget:
                 raise _EndpointLocatorCapacity
             self._used_bytes = next_bytes
             self._used_entries = next_entries
+            if observation is not None:
+                observation.update(self, next_bytes)
 
     def release(self, *, bytes_: int, entries: int) -> None:
         """Return an exact reservation held by a closing locator."""
+        observation = (None if self._observation_engine is None else
+                       self._observation_engine._memory_observation_current())
         with self._guard:
             self._used_bytes -= bytes_
             self._used_entries -= entries
+            if observation is not None:
+                observation.update(self, self._used_bytes)
 
 
 @dataclass(slots=True)
@@ -2323,6 +2350,7 @@ class _OwnerLandingBudget:
         "_max_entries",
         "_used_bytes",
         "_used_entries",
+        "_observation_engine",
     )
 
     def __init__(
@@ -2336,10 +2364,13 @@ class _OwnerLandingBudget:
         self._max_entries = max_entries
         self._used_bytes = 0
         self._used_entries = 0
+        self._observation_engine: QueryEngine | None = None
         self._guard = nullcontext() if guard is None else guard
 
     def reserve(self, *, bytes_: int, entries: int) -> None:
         """Reserve before retaining an object, or leave the counters untouched."""
+        observation = (None if self._observation_engine is None else
+                       self._observation_engine._memory_observation_current())
         with self._guard:
             next_bytes = self._used_bytes + bytes_
             next_entries = self._used_entries + entries
@@ -2347,12 +2378,18 @@ class _OwnerLandingBudget:
                 raise _OwnerLandingCapacity
             self._used_bytes = next_bytes
             self._used_entries = next_entries
+            if observation is not None:
+                observation.update(self, next_bytes)
 
     def release(self, *, bytes_: int, entries: int) -> None:
         """Release one exact reservation while transaction settlement is fail-safe."""
+        observation = (None if self._observation_engine is None else
+                       self._observation_engine._memory_observation_current())
         with self._guard:
             self._used_bytes -= bytes_
             self._used_entries -= entries
+            if observation is not None:
+                observation.update(self, self._used_bytes)
 
 
 def _owner_landing_result_bytes(
@@ -3435,6 +3472,8 @@ class QueryEngine:
         "_pool",
         "_indexes",
         "_statement_work",
+        "_memory_observation",
+        "_memory_observation_owner",
         "_vectors",
         "_metrics",
         "_clock",
@@ -3517,6 +3556,8 @@ class QueryEngine:
         self._random_source = random_source
         self._temporal_resolver = temporal_resolver
         self._execution_identity = execution_identity
+        self._memory_observation: _LogicalMemoryObservation | None = None
+        self._memory_observation_owner: object | None = None
         for name, identity in (("database_uuid", database_uuid), ("entity_namespace", entity_namespace)):
             if identity is not None and (type(identity) is not bytes or len(identity) != 16):
                 raise GrafxConfigurationError("Entity identity composition needs 16 immutable bytes.", field=name)
@@ -3844,6 +3885,66 @@ class QueryEngine:
             raise
         self._observe(PHASE_PLAN, started)
         return plan
+
+    @contextmanager
+    def _observe_logical_memory(self) -> Iterator[_LogicalMemoryObservation]:
+        """Observe one exclusive execution interval, including existing handle tariffs.
+
+        This harness-only door does not measure Python allocations, result rows,
+        buffer frames or unbudgeted operators. A configured query budget and an
+        execution identity are required for a qualifying observation. Keep cursor
+        construction, every pull and close inside the interval. The harness must
+        own a private handle with no execution already running at entry; this
+        opt-in observer does not add an always-on registry to ordinary queries.
+        """
+        observation = _LogicalMemoryObservation()
+        identity = self._execution_identity
+        owner = None if identity is None else identity()
+        with self._endpoint_guard:
+            if self._memory_observation is not None:
+                self._memory_observation.invalidate("overlapping_observation")
+                raise RuntimeError("Logical memory observation already active on this handle.")
+            self._memory_observation = observation
+            self._memory_observation_owner = owner
+            for budget in (self._owner_budget, self._endpoint_budget):
+                observation.update(budget, budget._used_bytes)
+                budget._observation_engine = self
+            observation.freeze_baseline()
+        if identity is None:
+            observation.invalidate("execution_identity_unavailable")
+        if self._query_memory_budget_bytes is None:
+            observation.invalidate("query_memory_budget_disabled")
+        try:
+            yield observation
+        finally:
+            with self._endpoint_guard:
+                observation.close()
+                self._memory_observation = None
+                self._memory_observation_owner = None
+                self._owner_budget._observation_engine = None
+                self._endpoint_budget._observation_engine = None
+
+    def _memory_observation_current(self) -> _LogicalMemoryObservation | None:
+        """Resolve identity outside budget guards; foreign execution invalidates proof."""
+        observation = self._memory_observation
+        if observation is not None:
+            identity = self._execution_identity
+            if identity is None or identity() != self._memory_observation_owner:
+                observation.invalidate("concurrent_execution_on_handle")
+        return observation
+
+    def _observe_memory_statement(self, token: object) -> None:
+        observation = self._memory_observation_current()
+        if observation is not None:
+            with self._endpoint_guard:
+                observation.claim(token)
+
+    def _logical_memory_budget(self, limit: int, *, operator: str) -> LogicalMemoryBudget:
+        budget = LogicalMemoryBudget(limit, operator=operator)
+        observation = self._memory_observation_current()
+        if observation is not None:
+            budget._observe(observation)
+        return budget
 
     def execute(
         self,
@@ -4463,6 +4564,8 @@ class QueryEngine:
         """Evaluate and validate; staged intents remain invisible to other participants."""
         root = plan.root
         statistics: dict[str, int] = {} if procedure_parent is None else procedure_parent.statistics
+        if self._memory_observation is not None:
+            self._observe_memory_statement(statistics)
         scope = self._statement_work
         with scope.bind(statistics) if scope is not None else nullcontext():
             if isinstance(
@@ -4517,61 +4620,65 @@ class QueryEngine:
                 procedure_schema_scope=procedure_scope,
                 intermediate_rows={} if procedure_parent is None else procedure_parent.intermediate_rows,
             )
-            _bind_timestamp_values(plan, context)
-            _validate_bound_subscript_types(plan, parameters)
-            _validate_bound_label_arguments(plan, parameters)
-            # Prepare explicit write/read boundaries bottom-up before any parent scan
-            # captures its owner overlay. Native transaction intents remain private and
-            # the enclosing statement mark rolls all phases back on any later failure.
-            self._prepare_read_phases(self._read_phase_boundaries(root.child), context)
-            stream = self._rows(root.child, context)
-            stream_failure: BaseException | None = None
             try:
-                rows = self._collect_result_rows(stream, procedure_scope=procedure_scope) if root.columns else tuple(stream)
-            except BaseException as caught:
-                stream_failure = caught
-                raise
-            finally:
-                _close_iterator(stream, stream_failure)
-            produced: tuple[tuple[Value, ...], ...] = ()
-            if root.columns and context.atomic_staging:
-                # Give returned inserts their authenticated transaction-local reference
-                # before detachment. This is private intent staging, not COMMIT: the
-                # enclosing statement mark remains active through conversion/checks.
-                context.publish_phase()
-            if root.columns:
-                if procedure_scope is not None:
+                _bind_timestamp_values(plan, context)
+                _validate_bound_subscript_types(plan, parameters)
+                _validate_bound_label_arguments(plan, parameters)
+                # Prepare explicit write/read boundaries bottom-up before any parent scan
+                # captures its owner overlay. Native transaction intents remain private and
+                # the enclosing statement mark rolls all phases back on any later failure.
+                self._prepare_read_phases(self._read_phase_boundaries(root.child), context)
+                stream = self._rows(root.child, context)
+                stream_failure: BaseException | None = None
+                try:
+                    rows = self._collect_result_rows(stream, procedure_scope=procedure_scope) if root.columns else tuple(stream)
+                except BaseException as caught:
+                    stream_failure = caught
+                    raise
+                finally:
+                    _close_iterator(stream, stream_failure)
+                produced: tuple[tuple[Value, ...], ...] = ()
+                if root.columns and context.atomic_staging:
+                    # Give returned inserts their authenticated transaction-local reference
+                    # before detachment. This is private intent staging, not COMMIT: the
+                    # enclosing statement mark remains active through conversion/checks.
+                    context.publish_phase()
+                if root.columns:
+                    if procedure_scope is not None:
+                        for reference in context.ends_held:
+                            procedure_scope.context.note_ended(reference)
+                        produced = tuple(procedure_scope.project(row, root.columns, context) for row in rows)
+                    else:
+                        produced = tuple(_projected(row, root.columns, context) for row in rows)
+                for table, identity in context.plain_node_deletes:
+                    for edge_table, edge_ref, _endpoints in _incident_edges(self, context, table, identity):
+                        if not context.already_ended(edge_ref):
+                            raise GrafxQueryError(
+                                "DELETE cannot remove a node with live relationships; use DETACH DELETE or delete the edges.",
+                                reason="connected_node_delete", query_phase="execution", table=table.name, relationship_table=edge_table.name,
+                            )
+                # Snapshot diagnostics after the referential reads, while every allocation
+                # still precedes publication of this statement's staged work.
+                result = _owned_query_result(
+                    columns=root.columns,
+                    rows=produced,
+                    plan=root,
+                    statistics=dict(statistics),
+                )
+                # Publishing to the transaction is the final fallible phase: output detachment and
+                # referential checks must not fail after a caught statement error has staged effects.
+                context.release()
+                if procedure_parent is not None:
+                    # A callback's native DML has its own evaluation context, but owner
+                    # aliases must still observe deletions made by that successful child.
+                    # Child-local insert tokens are not transferable authority.
                     for reference in context.ends_held:
-                        procedure_scope.context.note_ended(reference)
-                    produced = tuple(procedure_scope.project(row, root.columns, context) for row in rows)
-                else:
-                    produced = tuple(_projected(row, root.columns, context) for row in rows)
-            for table, identity in context.plain_node_deletes:
-                for edge_table, edge_ref, _endpoints in _incident_edges(self, context, table, identity):
-                    if not context.already_ended(edge_ref):
-                        raise GrafxQueryError(
-                            "DELETE cannot remove a node with live relationships; use DETACH DELETE or delete the edges.",
-                            reason="connected_node_delete", query_phase="execution", table=table.name, relationship_table=edge_table.name,
-                        )
-            # Snapshot diagnostics after the referential reads, while every allocation
-            # still precedes publication of this statement's staged work.
-            result = _owned_query_result(
-                columns=root.columns,
-                rows=produced,
-                plan=root,
-                statistics=dict(statistics),
-            )
-            # Publishing to the transaction is the final fallible phase: output detachment and
-            # referential checks must not fail after a caught statement error has staged effects.
-            context.release()
-            if procedure_parent is not None:
-                # A callback's native DML has its own evaluation context, but owner
-                # aliases must still observe deletions made by that successful child.
-                # Child-local insert tokens are not transferable authority.
-                for reference in context.ends_held:
-                    procedure_parent.note_ended(reference)
-                procedure_parent._ends_staged = None
-            return result
+                        procedure_parent.note_ended(reference)
+                    procedure_parent._ends_staged = None
+                return result
+            finally:
+                if context.comprehension_memory is not None:
+                    context.comprehension_memory._end_observation()
 
     @staticmethod
     def _read_phase_boundaries(root: PlanNode) -> tuple[EagerRows, ...]:
@@ -4650,7 +4757,7 @@ class QueryEngine:
                 field="query_spill",
                 value="missing",
             )
-        budget = LogicalMemoryBudget(limit, operator=operator)
+        budget = self._logical_memory_budget(limit, operator=operator)
         try:
             workspace = factory.open(budget)
         except GrafxError:
@@ -13578,37 +13685,41 @@ def _merge_whole_pattern_rows(
     context.arguments[slot] = row
     matches: list[_Row] = []
     limit = engine._query_memory_budget_bytes
-    budget = None if limit is None else LogicalMemoryBudget(limit, operator="merge_matches")
-    stream = engine._rows(node.match_plan, context)
-    failure = None
+    budget = None if limit is None else engine._logical_memory_budget(limit, operator="merge_matches")
     try:
-        for matched in stream:
-            if budget is not None:
-                budget.reserve(128)
-                for value in (matched.bindings, matched.columns, matched.computed):
-                    _charge_comprehension_value(value, budget)
-            matches.append(matched)
-    except BaseException as caught:
-        failure = caught
-        raise
-    finally:
+        stream = engine._rows(node.match_plan, context)
+        failure = None
         try:
-            _close_iterator(stream, failure)
+            for matched in stream:
+                if budget is not None:
+                    budget.reserve(128)
+                    for value in (matched.bindings, matched.columns, matched.computed):
+                        _charge_comprehension_value(value, budget)
+                matches.append(matched)
+        except BaseException as caught:
+            failure = caught
+            raise
         finally:
-            context.arguments.pop(slot, None)
-    if matches:
-        for matched in matches:
-            matched = _Row(bindings={name: _current_entity_value(engine, context, value)
-                                    for name, value in matched.bindings.items()},
-                           computed=matched.computed, columns=matched.columns)
-            context.count("rows_matched", sum(written.table is not None for written in node.nodes))
-            context.count("relationships_matched", len(node.relationships))
-            yield _apply_merge_actions(engine, node, matched, context, created=False)
-        return
-    # CREATE, not per-element MERGE: partial matches do not authorize reuse.
-    inserted = _write_pattern(engine, CreateRelationships(child=node.child, nodes=node.nodes,
-        relationships=node.relationships, path_variable=node.path_variable), row, context)
-    yield _apply_merge_actions(engine, node, inserted, context, created=True)
+            try:
+                _close_iterator(stream, failure)
+            finally:
+                context.arguments.pop(slot, None)
+        if matches:
+            for matched in matches:
+                matched = _Row(bindings={name: _current_entity_value(engine, context, value)
+                                        for name, value in matched.bindings.items()},
+                               computed=matched.computed, columns=matched.columns)
+                context.count("rows_matched", sum(written.table is not None for written in node.nodes))
+                context.count("relationships_matched", len(node.relationships))
+                yield _apply_merge_actions(engine, node, matched, context, created=False)
+            return
+        # CREATE, not per-element MERGE: partial matches do not authorize reuse.
+        inserted = _write_pattern(engine, CreateRelationships(child=node.child, nodes=node.nodes,
+            relationships=node.relationships, path_variable=node.path_variable), row, context)
+        yield _apply_merge_actions(engine, node, inserted, context, created=True)
+    finally:
+        if budget is not None:
+            budget._end_observation()
 
 
 def _merge_node_rows(
@@ -13640,74 +13751,78 @@ def _merge_node_rows(
                          if table.kind == "node" and wanted <= set(table.node_label_candidates))
     matches_found: list[RowBinding] = []
     limit = engine._query_memory_budget_bytes
-    budget = None if limit is None else LogicalMemoryBudget(limit, operator="merge_matches")
+    budget = None if limit is None else engine._logical_memory_budget(limit, operator="merge_matches")
+    try:
 
-    def retain(binding: RowBinding) -> None:
-        """Retain a budgeted MERGE match with its pre-action label membership."""
-        labels = _current_node_labels(context, binding)
-        if not wanted <= set(labels):
-            return
-        # Freeze membership before conditional actions can alter other candidates.
-        token = context.pending_token(binding.version)
-        binding = replace(binding, version=replace(binding.version, node_labels=labels))
-        if token is not None:
-            context.register_pending_token(binding.version, token)
-        if budget is not None:
-            _charge_comprehension_value(binding, budget)
-        matches_found.append(binding)
+        def retain(binding: RowBinding) -> None:
+            """Retain a budgeted MERGE match with its pre-action label membership."""
+            labels = _current_node_labels(context, binding)
+            if not wanted <= set(labels):
+                return
+            # Freeze membership before conditional actions can alter other candidates.
+            token = context.pending_token(binding.version)
+            binding = replace(binding, version=replace(binding.version, node_labels=labels))
+            if token is not None:
+                context.register_pending_token(binding.version, token)
+            if budget is not None:
+                _charge_comprehension_value(binding, budget)
+            matches_found.append(binding)
 
-    views = tuple((table, *_transaction_row_view(context, table)) for table in match_tables)
-    for table, changed, inserted in views:
-        positions = tuple(table.column_positions.get(key) for key, _value in expected)
-        if not table.flexible_properties and any(position is None for position in positions):
-            continue
-        def matches(values: tuple[Value, ...]) -> bool:
-            """Match MERGE properties against either a flexible property bag or typed columns."""
-            if table.flexible_properties:
-                bag = _flexible_properties(table, values)
-                return all(_equal(bag.get(key), value) for key, value in expected)
-            return all(_equal(values[position], value) for position, (_key, value) in zip(positions, expected))
+        views = tuple((table, *_transaction_row_view(context, table)) for table in match_tables)
+        for table, changed, inserted in views:
+            positions = tuple(table.column_positions.get(key) for key, _value in expected)
+            if not table.flexible_properties and any(position is None for position in positions):
+                continue
+            def matches(values: tuple[Value, ...]) -> bool:
+                """Match MERGE properties against either a flexible property bag or typed columns."""
+                if table.flexible_properties:
+                    bag = _flexible_properties(table, values)
+                    return all(_equal(bag.get(key), value) for key, value in expected)
+                return all(_equal(values[position], value) for position, (_key, value) in zip(positions, expected))
 
-        candidates = engine.heap.scan(table, context.snapshot)
-        failure = None
-        try:
-            for ref, version in candidates:
-                context.count("rows_scanned")
-                if ref in changed:
-                    latest = changed[ref]
-                    if latest is None:
+            candidates = engine.heap.scan(table, context.snapshot)
+            failure = None
+            try:
+                for ref, version in candidates:
+                    context.count("rows_scanned")
+                    if ref in changed:
+                        latest = changed[ref]
+                        if latest is None:
+                            continue
+                        version = replace(version, values=latest)
+                    if not matches(version.values):
                         continue
-                    version = replace(version, values=latest)
-                if not matches(version.values):
-                    continue
-                binding = RowBinding(variable=variable, table=table, ref=ref, version=version,
-                                     polymorphic=len(match_tables) != 1 or written.table is None or written.table.unlabeled)
-                retain(binding)
-        except BaseException as caught:
-            failure = caught
-            raise
-        finally:
-            _close_iterator(candidates, failure)
-        for reference, values in inserted:
-            context.count("rows_scanned")
-            if matches(values):
-                binding = _matched_pending_binding(context, variable, table, values, reference)
-                if len(match_tables) != 1 or written.table is None or written.table.unlabeled:
-                    binding = replace(binding, polymorphic=True)
-                retain(binding)
-    if matches_found:
-        for binding in matches_found:
-            context.count("rows_matched")
-            matched = _Row(bindings={**row.bindings, variable: binding}, computed=row.computed, columns=row.columns)
-            yield _apply_merge_actions(engine, node, matched, context, created=False)
-        return
-    if written.table is None:
-        raise GrafxPlanError("MERGE found no node; creation requires an explicit table label.", field="labels")
-    # Reuse the evaluated expressions even for nondeterministic/correlated input.
-    properties = MapExpression(entries=tuple(MapEntry(key=key, value=Literal(value=value)) for key, value in expected))
-    created = replace(written, properties=properties)
-    inserted = _write_one(engine, CreateRelationships(child=node.child, nodes=(created,)), row, context)
-    yield _apply_merge_actions(engine, node, inserted, context, created=True)
+                    binding = RowBinding(variable=variable, table=table, ref=ref, version=version,
+                                         polymorphic=len(match_tables) != 1 or written.table is None or written.table.unlabeled)
+                    retain(binding)
+            except BaseException as caught:
+                failure = caught
+                raise
+            finally:
+                _close_iterator(candidates, failure)
+            for reference, values in inserted:
+                context.count("rows_scanned")
+                if matches(values):
+                    binding = _matched_pending_binding(context, variable, table, values, reference)
+                    if len(match_tables) != 1 or written.table is None or written.table.unlabeled:
+                        binding = replace(binding, polymorphic=True)
+                    retain(binding)
+        if matches_found:
+            for binding in matches_found:
+                context.count("rows_matched")
+                matched = _Row(bindings={**row.bindings, variable: binding}, computed=row.computed, columns=row.columns)
+                yield _apply_merge_actions(engine, node, matched, context, created=False)
+            return
+        if written.table is None:
+            raise GrafxPlanError("MERGE found no node; creation requires an explicit table label.", field="labels")
+        # Reuse the evaluated expressions even for nondeterministic/correlated input.
+        properties = MapExpression(entries=tuple(MapEntry(key=key, value=Literal(value=value)) for key, value in expected))
+        created = replace(written, properties=properties)
+        inserted = _write_one(engine, CreateRelationships(child=node.child, nodes=(created,)), row, context)
+        yield _apply_merge_actions(engine, node, inserted, context, created=True)
+    finally:
+        if budget is not None:
+            budget._end_observation()
 
 
 def _capture_written_path(node: CreateRelationships | MergePattern, row: _Row, context: _Context) -> _Row:
@@ -14199,7 +14314,7 @@ def _delete_rows(engine: QueryEngine, node: DeleteEntities, context: _Context) -
     source = engine._rows(node.child, context)
     pending = []
     limit = engine._query_memory_budget_bytes
-    budget = None if limit is None else LogicalMemoryBudget(limit, operator="delete_inputs")
+    budget = None if limit is None else engine._logical_memory_budget(limit, operator="delete_inputs")
     failure = None
     try:
         for row in source:
@@ -14216,6 +14331,8 @@ def _delete_rows(engine: QueryEngine, node: DeleteEntities, context: _Context) -
         raise
     finally:
         pending.clear()
+        if budget is not None:
+            budget._end_observation()
         _close_iterator(source, failure)
 
 
@@ -16988,7 +17105,7 @@ def _evaluate_pattern_comprehension(expression: PatternComprehension, row: _Row,
     limit = context.engine._query_memory_budget_bytes
     if limit is not None:
         if context.comprehension_memory is None:
-            context.comprehension_memory = LogicalMemoryBudget(limit, operator="pattern_comprehension")
+            context.comprehension_memory = context.engine._logical_memory_budget(limit, operator="pattern_comprehension")
         context.comprehension_memory.reserve(64)
     context.arguments[slot] = row
     stream = None

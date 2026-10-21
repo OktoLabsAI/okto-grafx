@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) · [Roadmap](../ROADMAP.md#remaining-performance-work)
 
-Updated September 14, 2026. “Current” means the **latest recorded observation for
+Updated October 21, 2026. “Current” means the **latest recorded observation for
 the stated workload/build**, not a new benchmark of every file in HEAD.
 Current development source is 0.0.7; published baseline is 0.0.6.
 The latest isolated installed Pulse/native observations below use the final
@@ -57,10 +57,59 @@ do not include a later transaction commit. Metrics publication occurs outside
 the cursor observation scope. These diagnostics do not extend the frozen
 `MetricsSink` catalogue; no data, query text or parameters become labels.
 
-RF01 remains in progress. Reproducible report validation, full qualification
-and the three-pair overhead campaign are pending. These deterministic counters
-establish measurement semantics;
+RF01 remains in progress. The versioned campaign and report validator are
+implemented; a complete real six-process run and the three-pair overhead
+qualification are pending. These deterministic counters establish measurement semantics;
 they do not establish a speedup or compliance with the overhead budget.
+
+### RF01 campaign evidence and memory boundary
+
+The development campaign under `bench/harness/campaign.py` records six separate
+process runs in AB/BA/AB order, with five warm-ups and twenty retained samples
+per selected scenario and process. Its versioned raw JSON keeps source revisions,
+import provenance, environment and configuration, seed, query and parameter
+hashes, typed result hashes, actual statistics, timing boundaries, cache state,
+WAL and disk deltas, and the measured plan. The independent fixture oracle must
+match every sample before ratios are computed. The report gives per-pair median
+and descriptive p95 ratios; it is not a production percentile or SLA estimate.
+The selected scenario list is part of the evidence; unselected dimensions are
+not implicitly covered.
+
+`python -m bench.harness.campaign calibrate --output <new-file.json>` produces
+an unsigned local executor receipt before a qualification run. It records five
+warm-ups, twenty retained fixed CPU controls, five host CPU observations,
+environment, timestamps, the producing command and hashes of the harness
+sources. `run --calibration <file>` embeds and validates that receipt. Its fixed
+hash workload checks repeatability and host load; it is not a disk or Grafx
+throughput calibration. A boolean calibration claim alone cannot produce a
+qualifying verdict. Invalid supplied receipts are rejected and a noisy or old
+receipt leaves the comparison inconclusive.
+
+The opt-in memory observer reports the peak *simultaneous admitted logical
+tariffs* of query budgets plus retained owner and endpoint handle budgets.
+It does not measure Python allocations, unbudgeted operators, result rows,
+buffer frames or process RSS. RSS is recorded separately as a process-lifetime
+peak. An observation requires a configured query-memory budget, one statement
+and a private handle whose cursor is fully consumed or closed within the
+interval. A missing observer, overlapping statement, foreign execution or
+incomplete cursor makes logical memory unavailable. Sequential operator peaks
+are never summed. This private measurement door changes neither quota admission
+nor the public `MetricsSink` catalogue.
+
+Native full-text search in this fixture verifies membership of sorted record
+IDs, not ranking or scores. Its native memory is outside the query-budget
+observer. Concurrent writer peaks are individual process measurements, never
+added into a fictional shared RSS peak. A qualification attempt must report
+unavailable coverage explicitly instead of substituting zero. Reopen after a
+durable write ACK checks the stored result but does not claim a cleared OS cache.
+
+The initial RF01 counter-overhead comparison kept identical results and raw
+samples but ran under high, varying host load. Its threshold result is
+inconclusive. A preregistered repeat stopped at its readiness gate after five
+minutes without starting either arm; the minimum observed host CPU was 28.2%.
+Neither run proves the RF01 overhead limit or a speedup. Full qualification
+requires a clean committed candidate, a compatible comparison source and a
+calibrated executor with the same evidence contract on both arms.
 
 ## 0.0.7 performance round closure
 

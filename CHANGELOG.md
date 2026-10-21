@@ -24,6 +24,11 @@ including the on-disk format.
   Isolate cursor pulls and preserve logical counters, cancellation checkpoints
   and quota charging. Full qualification and measured overhead remain pending.
   See [measurement boundaries](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
+- Add a development campaign with typed semantic oracles, raw six-process
+  AB/BA/AB samples and fail-closed comparison, plus an opt-in simultaneous
+  logical-budget observer. Preserve quota behavior and report unavailable
+  memory coverage explicitly. The first overhead comparison and its aborted
+  readiness-gated repeat are inconclusive; no speedup or overhead pass is claimed.
 
 ### CI portability and execution policy
 

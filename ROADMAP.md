@@ -17,32 +17,39 @@ reopen completed work, authorize production data changes or imply release approv
 
 ## Grafx performance RF01–RF12 (October 21, 2026)
 
-The Okto Pulse `okto-grafx` board holds twelve validated specifications and
-58 planned tasks. Native Spec dependencies are now explicit: RF01 precedes
+The Okto Pulse `okto-grafx` board holds twelve specifications and
+58 tasks. Native Spec dependencies are explicit: RF01 precedes
 RF02, RF03, RF05, RF06 and RF08–RF12; RF03 precedes RF04, which consequently
 also waits for RF01. RF07's streaming-contract protection is independent.
 Existing task dependencies further order implementation and qualification.
 
-RF01 is in progress. Instrumentation covers physical version headers in
-canonical scans and indexed reads, including MVCC-invisible history, actual
-probes/certificates/identity batches and the first executed fallback guard.
+RF01 is in progress. Its physical-counter implementation card is Done in Pulse;
+the harness, fixtures and report card is in progress with code and focused tests
+implemented, pending a real six-process run and validation. Instrumentation covers
+physical version headers in canonical scans and indexed reads, including
+MVCC-invisible history, actual probes/certificates/identity batches and the
+first executed fallback guard.
 Observation is isolated per statement or cursor pull, with unchanged
 cooperative checkpoints. See
 [coverage and units](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
 
-Remaining RF01 work: finish integration acceptance; extend the existing
-harness and validate raw reports; run semantic, consistency and
-three-pair overhead qualification. The current patch does not complete RF01
-or authorize dependent Specs to start. Full release/installed-wheel and
-consumer qualification remain separate from focused development tests.
+Remaining RF01 work: run and assess the complete harness on clean revisions;
+complete the linked semantic, consistency and three-pair overhead qualification.
+The first overhead campaign kept its raw samples and matching result hashes but
+did not meet the numerical limits under a busy host. A preregistered repeat
+could not start: CPU stayed above 28.2% throughout its five-minute readiness
+window. No overhead pass or performance gain is claimed. RF01 is not Done, so
+its dependent Specs remain blocked. Focused tests, wheel and isolated consumer
+checks passed; the full release matrix remains separate.
 
-RF07's independent streaming protection is implemented as a
+RF07's independent streaming protection is Done in Pulse as a
 [six-case demand/error/cleanup matrix](docs/PERFORMANCE.md#rf07-streaming-landing-demand),
 with pytest protections and three explicit unittest entry points for authenticated
 scenario execution. The conclusion remains negative for speculative destination
 prefetch: no production optimization, new cursor contract or speedup is claimed.
-Native Pulse acceptance, authenticated test evidence and both Test Cards remain
-pending until the committed delivery passes their gates.
+Its normal card and both Test Cards are Done: three authenticated automated
+scenarios, three inspections and both decision reviews passed, with 12/12
+implementation and 14/14 verification obligations satisfied.
 
 ## CI prerequisite correction (CI-WHEEL-RECEIPTS)
 

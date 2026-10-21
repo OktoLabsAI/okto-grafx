@@ -13,10 +13,74 @@ from okto_grafx.domain.errors import GrafxQueryBudgetExceeded
 __all__ = ["LogicalMemoryBudget"]
 
 
+class _LogicalMemoryObservation:
+    """Peak of simultaneous admitted tariffs; no allocator or RSS claim.
+
+    Internal opt-in observations are single-execution intervals. Closing revokes
+    updates from budgets that outlive the interval. Tokens identify budgets, not
+    operators: a spill workspace sharing a budget must not count it twice.
+    """
+
+    __slots__ = ("_values", "current", "_peak", "_baseline", "_active", "_reason", "_statement", "_cursors")
+
+    def __init__(self) -> None:
+        self._values: dict[object, int] = {}
+        self.current = 0
+        self._peak = 0
+        self._baseline = 0
+        self._active = True
+        self._reason: str | None = None
+        self._statement: object | None = None
+        self._cursors = 0
+
+    def update(self, token: object, retained: int) -> None:
+        if not self._active:
+            return
+        if retained < 0:
+            self.invalidate("negative_retained_bytes")
+            return
+        self.current += retained - self._values.get(token, 0)
+        if retained:
+            self._values[token] = retained
+        else:
+            self._values.pop(token, None)
+        self._peak = max(self._peak, self.current)
+
+    def freeze_baseline(self) -> None:
+        self._baseline = self.current
+
+    def invalidate(self, reason: str) -> None:
+        if self._active and self._reason is None:
+            self._reason = reason
+
+    def claim(self, statement: object) -> None:
+        if self._statement is None:
+            self._statement = statement
+        elif self._statement is not statement:
+            self.invalidate("multiple_statements_in_interval")
+
+    def close(self) -> None:
+        if self._statement is None:
+            self.invalidate("no_statement_observed")
+        if self._cursors:
+            self.invalidate("cursor_outlives_observation")
+        self._active = False
+        self._values.clear()
+        self._statement = None
+
+    def result(self) -> dict[str, object]:
+        return {
+            "logical_memory_peak_bytes": self._peak if self._reason is None else None,
+            "baseline_retained_bytes": self._baseline,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "unavailable_reason": self._reason,
+        }
+
+
 class LogicalMemoryBudget:
     """One execution-local byte counter shared by a blocking operator and its spill adapter."""
 
-    __slots__ = ("_limit", "_operator", "_retained", "_peak")
+    __slots__ = ("_limit", "_operator", "_retained", "_peak", "_observation", "_observation_token")
 
     def __init__(self, limit: int, *, operator: str) -> None:
         if type(limit) is not int or limit <= 0:
@@ -29,6 +93,21 @@ class LogicalMemoryBudget:
         self._operator = operator
         self._retained = 0
         self._peak = 0
+        self._observation: _LogicalMemoryObservation | None = None
+        self._observation_token: object | None = None
+
+    def _observe(self, observation: _LogicalMemoryObservation) -> None:
+        """Attach an internal observer without changing admission or public type."""
+        self._observation = observation
+        if self._observation_token is None:
+            self._observation_token = object()
+        observation.update(self._observation_token, self._retained)
+
+    def _end_observation(self) -> None:
+        """End this tariff's observed lifetime without changing quota accounting."""
+        if self._observation is not None:
+            self._observation.update(self._observation_token, 0)
+            self._observation = None
 
     @property
     def limit(self) -> int:
@@ -62,6 +141,8 @@ class LogicalMemoryBudget:
         self._retained = observed
         if observed > self._peak:
             self._peak = observed
+        if self._observation is not None:
+            self._observation.update(self._observation_token, observed)
         return True
 
     def reserve(self, amount: int, *, reason: str = "retained_record") -> None:
@@ -88,3 +169,5 @@ class LogicalMemoryBudget:
                 "Logical query-memory accounting was released out of balance."
             )
         self._retained -= amount
+        if self._observation is not None:
+            self._observation.update(self._observation_token, self._retained)

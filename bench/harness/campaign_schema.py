@@ -1,0 +1,332 @@
+"""Versioned RF01 raw evidence and fail-closed campaign comparison.
+
+Validation precedes all ratios. JSON duplicate keys, non-finite values, missing
+samples and semantic mismatches are errors, never fast measurements. A report is
+descriptive engineering evidence, not a production percentile/SLA estimate.
+"""
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+import json
+import math
+from pathlib import Path
+import re
+import statistics
+
+from bench.harness.campaign_fixtures import Scenario, contract, oracle, query_for
+
+
+class CampaignError(ValueError):
+    """Evidence cannot support a comparison."""
+
+
+def _typed(value):
+    if value is None:
+        return ["null"]
+    if type(value) is bool:
+        return ["bool", value]
+    if type(value) is int:
+        return ["int", str(value)]
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise CampaignError("non-finite number")
+        return ["float", value.hex()]
+    if type(value) is str:
+        return ["str", value]
+    if isinstance(value, (list, tuple)):
+        return ["sequence", [_typed(item) for item in value]]
+    if isinstance(value, dict) and all(type(key) is str for key in value):
+        return ["map", [[key, _typed(value[key])] for key in sorted(value)]]
+    raise CampaignError(f"unsupported canonical type: {type(value).__name__}")
+
+
+def canonical_hash(value):
+    return hashlib.sha256(json.dumps(_typed(value), separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def load_json(text):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise CampaignError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+    def invalid(value):
+        raise CampaignError(f"non-finite JSON constant: {value}")
+    try:
+        return json.loads(text, object_pairs_hook=unique, parse_constant=invalid)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise CampaignError(str(exc)) from exc
+
+
+def _require(condition, message):
+    if not condition:
+        raise CampaignError(message)
+
+
+def _fields(value, names, where):
+    _require(isinstance(value, dict), f"{where}: expected object")
+    missing = set(names) - value.keys()
+    _require(not missing, f"{where}: missing {sorted(missing)}")
+
+
+def _integer(value, name, minimum=0):
+    _require(type(value) is int and value >= minimum, f"{name}: invalid integer")
+
+
+def validate_campaign(data):
+    """Validate completeness, metadata, independent oracles and contracts."""
+    try:
+        _validate(data)
+    except CampaignError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise CampaignError(f"malformed campaign: {exc}") from exc
+
+
+def calibration_matches(data):
+    """Validate an embedded executor control receipt, not a boolean assertion.
+
+    Receipt schema is intentionally local to this harness. It is reproducible
+    evidence, not an authentication/signature claim. Missing evidence is noisy;
+    malformed supplied evidence is invalid. Age is checked against campaign time,
+    so re-reading a valid historical artifact does not change its verdict.
+    """
+    calibration = data.get("calibration")
+    if calibration is None:
+        return False
+    _fields(calibration, ("raw_json", "sha256", "path"), "calibration")
+    raw = calibration["raw_json"]
+    _require(isinstance(raw, str) and hashlib.sha256(raw.encode()).hexdigest() == calibration["sha256"], "calibration file hash mismatch")
+    receipt = load_json(raw)
+    _fields(receipt, ("schema_version", "observed_at", "environment_hash", "procedure", "elapsed_ns", "cpu_percent"), "calibration receipt")
+    _require(receipt["schema_version"] == "grafx-executor-calibration/v1", "unsupported calibration schema")
+    _fields(receipt["procedure"], ("command", "source_sha256"), "calibration procedure")
+    _require(isinstance(receipt["procedure"]["command"], list) and bool(receipt["procedure"]["command"]), "calibration command missing")
+    _require(bool(re.fullmatch("[0-9a-f]{64}", receipt["procedure"]["source_sha256"])), "calibration procedure digest invalid")
+    procedure = receipt["procedure"]
+    root = Path(__file__).resolve().parent
+    sources = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+               for name in ("campaign.py", "campaign_schema.py", "campaign_worker.py")}
+    _require(procedure.get("id") == "sha256-fixed-payload-v1"
+             and procedure["source_sha256"] == sources["campaign.py"]
+             and procedure.get("source_files") == sources
+             and procedure.get("control") == {"algorithm": "sha256", "payload_bytes": 65536, "iterations_per_sample": 128}
+             and procedure["command"][1:4] == ["-m", "bench.harness.campaign", "calibrate"],
+             "calibration procedure provenance does not match this executable harness")
+    _fields(receipt, ("environment", "warmup_ns", "producer_process_id", "clock"), "calibration receipt")
+    _require(canonical_hash(receipt["environment"]) == receipt["environment_hash"], "calibration environment hash mismatch")
+    _require(isinstance(receipt["warmup_ns"], list) and len(receipt["warmup_ns"]) == 5
+             and all(type(v) is int and v > 0 for v in receipt["warmup_ns"]), "invalid calibration warmup")
+    _integer(receipt["producer_process_id"], "calibration process_id", 1)
+    _require(receipt["clock"].get("name") == "perf_counter_ns"
+             and type(receipt["clock"].get("resolution_ns")) in (int, float)
+             and receipt["clock"]["resolution_ns"] > 0, "invalid calibration clock")
+    times, loads = receipt["elapsed_ns"], receipt["cpu_percent"]
+    _require(isinstance(times, list) and len(times) >= 20, "calibration requires twenty retained control samples")
+    _require(all(type(t) is int and t > 0 for t in times), "invalid calibration elapsed sample")
+    _require(isinstance(loads, list) and len(loads) >= 5 and all(type(v) in (int, float) and 0 <= v <= 100 for v in loads), "invalid calibration CPU observations")
+    observed = datetime.fromisoformat(receipt["observed_at"])
+    campaign_time = datetime.fromisoformat(data["started_at"])
+    _require(observed.tzinfo is not None and campaign_time.tzinfo is not None, "calibration timestamps require timezone")
+    age = (campaign_time.astimezone(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+    env = data["runs"][0]["environment"]
+    environment = {k: env[k] for k in ("python", "dependencies", "os", "cpu", "cpu_count", "ram_bytes", "gc_enabled")}
+    return (0 <= age <= 86400 and receipt["environment_hash"] == canonical_hash(environment)
+            and max(loads) <= data["protocol"]["max_cpu_percent"]
+            and statistics.stdev(times) / statistics.mean(times) <= .10)
+
+
+def _validate(data):
+    canonical_hash(data)  # Reject NaN/infinity anywhere, including optional fields.
+    _fields(data, ("schema_version", "mode", "intent", "calibrated_executor", "command", "protocol", "scenarios", "runs"), "campaign")
+    _require(data["schema_version"] == "grafx-campaign/v1", "unsupported schema version")
+    _require(data["mode"] in ("noop", "optimization", "recipe"), "unknown comparison mode")
+    _require(data["intent"] in ("exploratory", "qualification"), "unknown intent")
+    _require(type(data["calibrated_executor"]) is bool, "calibrated_executor must be boolean")
+    _require(isinstance(data["command"], list) and bool(data["command"]) and all(type(x) is str for x in data["command"]), "missing reproduction command")
+    protocol = data["protocol"]
+    _fields(protocol, ("pairs", "warmups", "retained", "orders", "attempt", "previous_campaign_sha256", "max_cpu_percent"), "protocol")
+    _require((protocol["pairs"], protocol["warmups"], protocol["retained"], protocol["orders"]) == (3, 5, 20, ["AB", "BA", "AB"]), "protocol requires three AB/BA/AB pairs and 5+20 samples")
+    _require(type(protocol["attempt"]) is int and protocol["attempt"] in (1, 2), "at most one complete rerun")
+    previous = protocol["previous_campaign_sha256"]
+    _require((previous is None and protocol["attempt"] == 1) or
+             (protocol["attempt"] == 2 and isinstance(previous, str) and bool(re.fullmatch("[0-9a-f]{64}", previous))), "rerun must link complete previous campaign")
+    _require(type(protocol["max_cpu_percent"]) in (int, float) and 0 < protocol["max_cpu_percent"] <= 100,
+             "CPU gate must be an explicit percentage")
+    scenarios = {}
+    expectations = {}
+    _require(isinstance(data["scenarios"], list) and bool(data["scenarios"]), "no scenarios")
+    for value in data["scenarios"]:
+        scenario = Scenario.from_dict(value)
+        _require(scenario.name not in scenarios, "duplicate scenario")
+        scenarios[scenario.name] = scenario
+        query, params = query_for(scenario)
+        expected_rows = oracle(scenario)
+        expectations[scenario.name] = {"seed": scenario.seed, "config_hash": canonical_hash(scenario.to_dict()),
+                                      "query_hash": canonical_hash(query), "parameters_hash": canonical_hash(params),
+                                      "contract_hash": canonical_hash(contract(scenario)),
+                                      "expected_result_hash": canonical_hash(expected_rows),
+                                      "result_hash": canonical_hash(expected_rows), "rows": len(expected_rows)}
+    if data["mode"] == "optimization":
+        _require(any(s.role == "target" and s.work_counter for s in scenarios.values()), "optimization needs target physical-work counter")
+        _require(any(s.role == "control" for s in scenarios.values()), "optimization needs controls")
+    runs = data["runs"]
+    _require(isinstance(runs, list) and len(runs) == 6, "six independent process runs required")
+    observed, invocations, revisions = set(), set(), {"A": set(), "B": set()}
+    environments = []
+    sample_contracts = {}
+    for position, run in enumerate(runs):
+        _fields(run, ("arm", "pair", "run_order", "process_id", "invocation_id", "revision", "source_clean",
+                      "package_file", "source_root", "environment", "cpu_before_percent", "cpu_after_percent", "metrics_sink", "samples"), "run")
+        arm, pair = run["arm"], run["pair"]
+        _require(arm in ("A", "B") and type(pair) is int and pair in (0, 1, 2), "invalid arm/pair")
+        _require((pair, arm) not in observed, "duplicate arm/pair")
+        observed.add((pair, arm))
+        _require(run["run_order"] == protocol["orders"][pair], "wrong AB/BA order")
+        _require(pair == position // 2 and arm == protocol["orders"][pair][position % 2], "actual process order differs from declaration")
+        _integer(run["process_id"], "process_id", 1)
+        _require(isinstance(run["invocation_id"], str) and bool(run["invocation_id"]) and run["invocation_id"] not in invocations, "duplicate invocation")
+        invocations.add(run["invocation_id"])
+        _require(isinstance(run["revision"], str) and bool(re.fullmatch("[0-9a-f]{40}", run["revision"])), "revision must be exact SHA")
+        revisions[arm].add(run["revision"])
+        _require(run["source_clean"] is True, "dirty source cannot establish revision")
+        _require(bool(run["source_root"]) and bool(run["package_file"]), "missing import provenance")
+        env = run["environment"]
+        _fields(env, ("python", "dependencies", "os", "cpu", "cpu_count", "ram_bytes", "disk", "gc_enabled"), "environment")
+        _require(env["gc_enabled"] is True, "GC must remain enabled")
+        _require(all(isinstance(env[k], str) and bool(env[k].strip()) for k in ("python", "os", "cpu")), "blank environment metadata")
+        _integer(env["cpu_count"], "cpu_count", 1)
+        _integer(env["ram_bytes"], "ram_bytes", 1)
+        _require(isinstance(env["dependencies"], dict) and isinstance(env["disk"], dict), "invalid dependencies/disk")
+        environments.append({k: env[k] for k in ("python", "dependencies", "os", "cpu", "cpu_count", "ram_bytes", "gc_enabled")})
+        for name in ("cpu_before_percent", "cpu_after_percent"):
+            _require(type(run[name]) in (int, float) and 0 <= run[name] <= 100, f"invalid {name}")
+        if data["mode"] == "noop":
+            _require(run["metrics_sink"] == "NoOpMetricsSink", "noop requires default NoOpMetricsSink")
+        samples = run["samples"]
+        _require(isinstance(samples, list) and len(samples) == 25 * len(scenarios), "missing/extra samples")
+        seen = set()
+        for sample in samples:
+            _fields(sample, ("scenario_id", "index", "kind", "seed", "config_hash", "query_hash", "parameters_hash",
+                             "contract_hash", "cache_state", "result_hash", "expected_result_hash", "rows", "statistics",
+                             "selected_plan", "effective_regime", "elapsed_ns", "cpu_ns", "prepare_ns", "prepare_boundary",
+                             "first_row_ns", "consume_all_ns", "commit_ns", "memory", "rss_peak_bytes", "rss_scope",
+                             "wal_delta_bytes", "disk_delta_bytes", "checkpoint"), "sample")
+            name, index = sample["scenario_id"], sample["index"]
+            _require(name in scenarios and type(index) is int and index in range(25), "invalid sample identity")
+            _require((name, index) not in seen, "duplicate sample")
+            seen.add((name, index))
+            scenario = scenarios[name]
+            _require(sample["kind"] == ("warmup" if index < 5 else "retained"), "wrong warmup classification")
+            for key, expected in expectations[name].items():
+                _require(sample[key] == expected, f"{name}: invalid {key} or semantic mismatch")
+            _require(isinstance(sample["cache_state"], dict) and set(sample["cache_state"]) >= {"plan", "handle", "fts", "process", "os"}, "cache dimensions missing")
+            sample_contract = {k: sample[k] for k in ("cache_state", "prepare_boundary", "rss_scope")}
+            if name in sample_contracts:
+                _require(sample_contract == sample_contracts[name], "measurement/cache contract changed between samples")
+            else:
+                sample_contracts[name] = sample_contract
+            _require(isinstance(sample["selected_plan"], list) and bool(sample["selected_plan"]), "plan missing")
+            _require(isinstance(sample["effective_regime"], dict), "effective runtime regime missing")
+            _require(isinstance(sample["statistics"], dict), "statistics missing")
+            for key, value in sample["statistics"].items():
+                _integer(value, f"counter {key}")
+            for key in ("elapsed_ns", "cpu_ns", "prepare_ns", "consume_all_ns", "rss_peak_bytes"):
+                _integer(sample[key], key)
+            _require(sample["elapsed_ns"] > 0, "zero elapsed time")
+            _require(sample["consume_all_ns"] <= sample["elapsed_ns"], "consume boundary exceeds total")
+            if scenario.cursor_batch_size and sample["rows"]:
+                _integer(sample["first_row_ns"], "first_row_ns")
+                _require(sample["first_row_ns"] <= sample["consume_all_ns"], "first-row boundary exceeds consume")
+            else:
+                _require(sample["first_row_ns"] is None, "first row only applies to cursors")
+            if scenario.family == "write":
+                _integer(sample["commit_ns"], "commit_ns")
+                _require(sample["commit_ns"] <= sample["elapsed_ns"], "ACK boundary exceeds total")
+            else:
+                _require(sample["commit_ns"] is None, "read cannot claim durable commit timing")
+            memory = sample["memory"]
+            _fields(memory, ("logical_memory_peak_bytes", "baseline_retained_bytes", "coverage", "unavailable_reason"), "memory")
+            _integer(memory["baseline_retained_bytes"], "baseline_retained_bytes")
+            if memory["logical_memory_peak_bytes"] is None:
+                _require(data["intent"] == "exploratory" and bool(memory["unavailable_reason"]), "memory unavailable: cannot qualify")
+            else:
+                _integer(memory["logical_memory_peak_bytes"], "logical_memory_peak_bytes")
+                _require(memory["logical_memory_peak_bytes"] >= memory["baseline_retained_bytes"], "memory peak below baseline")
+                _require(memory["unavailable_reason"] is None and bool(memory["coverage"]), "memory coverage invalid")
+                if data["intent"] == "qualification":
+                    coverage_key = name + ":memory"
+                    if coverage_key in sample_contracts:
+                        _require(memory["coverage"] == sample_contracts[coverage_key], "memory measurement method changed between arms")
+                    else:
+                        sample_contracts[coverage_key] = memory["coverage"]
+    _require(all(len(values) == 1 for values in revisions.values()), "revision changed inside an arm")
+    _require(all(value == environments[0] for value in environments), "environment changed between arms")
+    if data.get("calibration") is not None:
+        calibration_matches(data)
+
+
+def _distribution(values, unit="ns"):
+    return {f"median_{unit}": statistics.median(values), f"p95_{unit}": sorted(values)[math.ceil(.95 * len(values)) - 1],
+            f"minimum_{unit}": min(values), f"maximum_{unit}": max(values),
+            f"stdev_{unit}": statistics.stdev(values) if len(values) > 1 else 0,
+            "coefficient_of_variation": statistics.stdev(values) / statistics.mean(values)
+            if len(values) > 1 and statistics.mean(values) != 0 else 0}
+
+
+def compare_campaign(data):
+    validate_campaign(data)
+    comparisons, totals = [], []
+    calibrated = calibration_matches(data)
+    noisy = not calibrated or any(
+        run[key] > data["protocol"]["max_cpu_percent"] for run in data["runs"]
+        for key in ("cpu_before_percent", "cpu_after_percent"))
+    for spec in data["scenarios"]:
+        scenario = Scenario.from_dict(spec)
+        all_values = {"A": [], "B": []}
+        for pair in range(3):
+            samples = {run["arm"]: [s for s in run["samples"] if s["scenario_id"] == scenario.name and s["kind"] == "retained"]
+                       for run in data["runs"] if run["pair"] == pair}
+            values = {arm: [s["elapsed_ns"] for s in rows] for arm, rows in samples.items()}
+            distributions = {arm: _distribution(v) for arm, v in values.items()}
+            for arm in ("A", "B"):
+                all_values[arm].extend(values[arm])
+            med = distributions["B"]["median_ns"] / distributions["A"]["median_ns"]
+            tail = distributions["B"]["p95_ns"] / distributions["A"]["p95_ns"]
+            limit, tail_limit = (1.03, 1.05) if data["mode"] == "noop" else (1.05, 1.10)
+            work_reduced = None
+            if data["mode"] == "optimization" and scenario.role == "target":
+                limit = .90
+                tail_limit = None
+                key = scenario.work_counter
+                _require(all(key in s["statistics"] for rows in samples.values() for s in rows), "target physical counter missing")
+                work_reduced = all(b["statistics"][key] < a["statistics"][key]
+                                   for a, b in zip(samples["A"], samples["B"]))
+            measures = {}
+            for field in ("prepare_ns", "cpu_ns", "first_row_ns", "consume_all_ns", "commit_ns", "rss_peak_bytes"):
+                measures[field] = {arm: _distribution([s[field] for s in rows], "bytes" if field == "rss_peak_bytes" else "ns")
+                                   if all(s[field] is not None for s in rows) else None
+                                   for arm, rows in samples.items()}
+            comparisons.append({"scenario_id": scenario.name, "pair": pair, "distributions": distributions,
+                                "phase_distributions": measures,
+                                "median_ratio": med, "p95_ratio": tail, "median_limit": limit,
+                                "p95_limit": tail_limit, "physical_work_reduced": work_reduced,
+                                "thresholds_met": med <= limit and (tail_limit is None or tail <= tail_limit) and work_reduced is not False})
+            noisy |= any(d["coefficient_of_variation"] > .10 for d in distributions.values())
+        totals.append({"scenario_id": scenario.name, "all_retained": {arm: _distribution(values) for arm, values in all_values.items()}})
+    decision = "passed" if all(c["thresholds_met"] for c in comparisons) else "failed"
+    if noisy:
+        decision = "inconclusive"
+    if data["intent"] == "exploratory":
+        decision = "exploratory"
+    elif data["mode"] == "recipe" and not noisy:
+        decision = "tradeoff_reported"
+    return {"schema_version": "grafx-campaign-report/v1", "campaign_hash": canonical_hash(data),
+            "decision": decision, "comparisons": comparisons, "overall": totals,
+            "calibration_valid": calibrated,
+            "noisy": noisy, "noise_policy": "CPU > registered limit or within-process CV >10%; at most one complete rerun",
+            "percentile_scope": "descriptive retained samples, not production SLA or p99",
+            "raw_samples_retained": True}
