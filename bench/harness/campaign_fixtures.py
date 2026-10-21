@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import random
 
-from bench.harness import connected_qualification
+from bench.harness import connected_qualification, read_lifecycle_qualification
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ class Scenario:
             raise ValueError("partial progress must be explicitly accepted")
         if (self.write_shape == "chunks" and self.chunk_rows < 1) or (self.write_shape != "chunks" and self.chunk_rows != 0):
             raise ValueError("chunk size applies only to chunks")
-        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination"} | connected_qualification.FAMILIES:
+        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination"} | connected_qualification.FAMILIES | read_lifecycle_qualification.FAMILIES:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
             raise ValueError("invalid fixture dimensions")
@@ -71,6 +71,8 @@ class Scenario:
             raise ValueError("pagination case only applies to RF05 pagination")
         if self.family in connected_qualification.FAMILIES:
             connected_qualification.validate(self)
+        if self.family in read_lifecycle_qualification.FAMILIES:
+            read_lifecycle_qualification.validate(self)
 
     def to_dict(self):
         return asdict(self)
@@ -110,6 +112,8 @@ def live_data(scenario: Scenario):
 
 
 def oracle(scenario: Scenario):
+    if scenario.family in read_lifecycle_qualification.FAMILIES:
+        return read_lifecycle_qualification.oracle(scenario)
     if scenario.family == "pagination":
         from bench.harness.pagination_qualification import oracle as page_oracle
         return page_oracle(scenario)
@@ -136,6 +140,8 @@ def oracle(scenario: Scenario):
 
 
 def query_for(scenario: Scenario):
+    if scenario.family in read_lifecycle_qualification.FAMILIES:
+        return read_lifecycle_qualification.query_for(scenario)
     if scenario.family in connected_qualification.FAMILIES:
         return connected_qualification.query_for(scenario)
     family = scenario.family
@@ -187,6 +193,8 @@ def contract(scenario: Scenario):
                                   "one transaction per explicit chunk" if scenario.write_shape == "chunks" else
                                   "one atomic transaction per writer"),
                      comparison="different ACK counts/atomic units are tradeoffs, never equivalent contracts")
+    if scenario.family in read_lifecycle_qualification.FAMILIES:
+        value.update(read_lifecycle_qualification.contract(scenario))
     if scenario.family == "landing":
         value["regime_prerequisites"] = "identity indexes provisioned; blocking consumer; query memory budget disabled in both arms"
         value["qualification_limit"] = (
@@ -284,4 +292,4 @@ def matrix():
     from bench.harness.pagination_qualification import matrix as page_matrix
     result.extend(page_matrix(Scenario))
     from bench.harness.rf02_qualification import matrix as scalar_matrix
-    return result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix()
+    return result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix() + read_lifecycle_qualification.matrix()

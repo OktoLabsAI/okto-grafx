@@ -30,6 +30,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from bench.harness.campaign_fixtures import Scenario, apply_churn, build_fixture, contract, oracle, query_for
+from bench.harness import read_lifecycle_qualification
 from bench.harness.campaign_schema import CampaignError, canonical_hash, load_json
 from bench.harness.campaign_schema import HISTORICAL_SCOPE, validate_candidate_memory
 
@@ -113,7 +114,11 @@ def measure_statement(db, scenario, index, *, reader=None):
     with memory_scope as observation:
         cpu_start = time.process_time_ns()
         start = time.perf_counter_ns()
-        if scenario.family == "fts":
+        if scenario.family in read_lifecycle_qualification.FAMILIES:
+            if reader is not None:
+                raise CampaignError("read recipes own their snapshot")
+            rows, result, first = read_lifecycle_qualification.execute(db, scenario, start)
+        elif scenario.family == "fts":
             rows, result = _fts_rows(db, scenario)
         elif scenario.family == "write":
             tx = db.begin("write")
@@ -156,6 +161,10 @@ def measure_statement(db, scenario, index, *, reader=None):
         stats = {"postings_visited": result.postings_visited}
     else:
         stats = dict(result.statistics)
+    if scenario.family in read_lifecycle_qualification.FAMILIES:
+        # Separate diagnostic repeat after timing and logical-memory observation.
+        # Never claim these are manager counts from inside the measured interval.
+        stats.update(read_lifecycle_qualification.diagnose(db, scenario))
     if scenario.family == "write":
         rows = db.execute("MATCH (n:W) RETURN n.id,n.payload ORDER BY n.id").rows
     peak, scope = rss_peak()
@@ -526,7 +535,9 @@ def run_worker(request, output):
                             continue_sample = True
                         if scenario.cache == "warm" and scenario.family != "write":
                             query, params = query_for(scenario)
-                            if scenario.family == "fts":
+                            if scenario.family in read_lifecycle_qualification.FAMILIES:
+                                read_lifecycle_qualification.execute(db, scenario)
+                            elif scenario.family == "fts":
                                 _fts_rows(db, scenario)
                             else:
                                 db.execute(query, params)
@@ -539,6 +550,10 @@ def run_worker(request, output):
                                     sample = measure_statement(db, scenario, index, reader=reader)
                             else:
                                 sample = measure_statement(db, scenario, index)
+                    if scenario.family in read_lifecycle_qualification.FAMILIES:
+                        sample["statistics"]["diagnostic_handle_close_complete"] = int(db.close_complete)
+                        if not db.close_complete:
+                            raise CampaignError("read recipe handle did not finish closing")
                     if not continue_sample:
                         sample = measure_concurrent_write(sample_root, scenario, index)
                     after, wal_after = _sizes(sample_root)
