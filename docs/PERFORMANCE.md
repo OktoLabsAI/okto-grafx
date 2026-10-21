@@ -685,3 +685,40 @@ unchanged.
 Grafx does not currently claim Ladybug parity, constant-time general traversal,
 linear CPU/GIL scaling or an RSS bound equal to `buffer_budget_bytes`. Historical
 cross-platform comparisons remain [historical](reports/PERFORMANCE_HISTORY.md).
+## RF01 historical total-overhead qualification
+
+RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`
+only against the immutable original baseline
+`3a2239a0bda80223c298a68d6d14f3c951f133d2`, with a distinct committed candidate.
+Supply `--memory-budget` explicitly and `--max-cpu-percent 20` (or lower),
+alongside the existing baseline/candidate, scenario, output and calibration arguments.
+This profile currently supports single-statement read controls, including cursor
+consumption; FTS, concurrent writers and retained-reader profiles are rejected.
+
+The worker verifies imported engine paths and Git blob hashes. Arm A retains
+`logical_memory_peak_bytes: null` with the sole accepted reason
+`revision_has_no_logical_memory_observer`; it never fabricates zero or patches the
+historical engine. Both arms require real process lifetime peak RSS. RSS is not a
+per-query allocation measurement. Arm B requires real logical observation with
+the same explicitly configured operator budget as A. This exception qualifies
+only RF01 total noop timing, never comparative logical memory or RF02+ gains.
+An observer-patched control remains diagnostic rather than the historical baseline.
+
+Each candidate worker also produces separate, untimed lifecycle evidence: twenty
+successful sort executions, twenty execution errors after retention, and twenty
+partially consumed cursors cancelled on the same private handle per configured
+budget. The evidence checks simultaneous logical peaks, individual operator
+ceilings, no open transactions, return of live accounting to its prior state and
+no retained growth across those repetitions. Operator peaks are never summed.
+This is bounded evidence for these lifecycle paths and instrumented accounting,
+not a proof that all Python allocations or every query are leak-free. Receipts
+bind the procedure digest, engine hashes, revision, process and invocation;
+they are unsigned local evidence, not independent authenticated certification.
+
+Semantic hashes, identical contracts, calibration, host CPU at control points
+at most 20%, within-process CV at most 10%, three AB/BA/AB pairs, five warmups
+and twenty retained samples per arm remain mandatory. Noop limits remain 3%
+median and 5% p95; only one entire repeat after an inconclusive campaign is
+allowed. Missing candidate memory or missing memory outside this exact profile
+still fails closed. Implementation and functional tests do not establish an
+overhead pass: a valid campaign is still required, and no gain is claimed.

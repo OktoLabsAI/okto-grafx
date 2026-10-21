@@ -103,6 +103,12 @@ def test_noise_and_exploratory_never_pass():
     data = campaign()
     data["runs"][0]["cpu_before_percent"] = 21
     assert compare_campaign(data)["decision"] == "inconclusive"
+    data["runs"][0]["cpu_before_percent"] = 0
+    for sample in data["runs"][1]["samples"]:
+        sample.update(elapsed_ns=104, consume_all_ns=104)
+    assert compare_campaign(data)["decision"] == "failed"
+    del data["calibration"]
+    assert compare_campaign(data)["decision"] == "inconclusive"
     data["intent"] = "exploratory"
     assert compare_campaign(data)["decision"] == "exploratory"
 
@@ -167,4 +173,110 @@ def test_calibration_procedure_digest_must_identify_real_producer():
     raw = json.dumps(receipt)
     data["calibration"].update(raw_json=raw, sha256=hashlib.sha256(raw.encode()).hexdigest())
     with pytest.raises(CampaignError, match="procedure provenance"):
+        compare_campaign(data)
+
+
+def historical_campaign():
+    """Synthetic validator fixture only; these numbers are not benchmark proof."""
+    from bench.harness.campaign_fixtures import Scenario
+    from bench.harness.campaign_worker import sample_record
+    data = campaign()
+    data["qualification_scope"] = "rf01_historical_total_overhead"
+    spec = Scenario(name="constant", family="constant", nodes=4, query_memory_budget_bytes=4096).to_dict()
+    data["scenarios"] = [spec]
+    producer = Path(__file__).resolve().parents[2] / "bench/harness/campaign_worker.py"
+    for run in data["runs"]:
+        baseline = run["arm"] == "A"
+        if baseline:
+            run["revision"] = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
+        run["source_tree"] = "c2795181cda21041998cd13959afc8de303802bb" if baseline else "b" * 40
+        run["engine_source_hashes"] = {
+            "src/okto_grafx/engine/query_engine.py": "8056d0625cf4764c3a160bb676b6cefdc71d680f7f52bba44b626a28e0fa7ad8" if baseline else "b" * 64,
+            "src/okto_grafx/domain/query/memory.py": "c" * 64}
+        run["logical_observer_available"] = not baseline
+        memory = {"logical_memory_peak_bytes": None if baseline else 0,
+                  "baseline_retained_bytes": 0, "coverage": "unavailable" if baseline else "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+                  "unavailable_reason": "revision_has_no_logical_memory_observer" if baseline else None}
+        run["samples"] = [sample_record(spec, i, ((1,),), {"rows_returned": 1}, elapsed_ns=100,
+                            cpu_ns=10, prepare_ns=2, memory=memory.copy(), rss_peak_bytes=100,
+                            rss_scope="process_lifetime_peak_working_set_bytes") for i in range(25)]
+        if not baseline:
+            rows = []
+            for mode in ("success", "error", "cancel"):
+                for index in range(20):
+                    rows.append({"mode": mode, "index": index, "live_before_bytes": 0,
+                                 "live_after_bytes": 0, "handle_before_bytes": 0, "handle_after_bytes": 0,
+                                 "memory": dict(memory, logical_memory_peak_bytes=100),
+                                 "operator_budgets": [{"operator": "sort", "limit_bytes": 4096, "peak_bytes": 100}],
+                                 "error_code": {"success": None, "error": "plan_error", "cancel": "query_cancelled"}[mode],
+                                 "open_transactions_after": 0})
+            body = {"schema_version": "grafx-candidate-memory/v1", "revision": run["revision"],
+                    "process_id": run["process_id"], "invocation_id": run["invocation_id"],
+                    "engine_source_hashes": run["engine_source_hashes"],
+                    "procedure": {"id": "rf01-logical-lifecycle-v1", "source_sha256": hashlib.sha256(producer.read_bytes()).hexdigest()},
+                    "budgets": [{"budget_bytes": 4096, "records": rows}]}
+            run["candidate_memory_evidence"] = {"body": body, "sha256": canonical_hash(body)}
+    return data
+
+
+def test_historical_null_is_a_narrow_temporal_exception():
+    data = historical_campaign()
+    report = compare_campaign(data)
+    assert report["decision"] == "passed"
+    assert report["qualification_scope"] == "rf01_historical_total_overhead"
+    assert report["comparative_logical_memory"] is False
+    assert report["candidate_memory_verified"] is True
+
+
+@pytest.mark.parametrize("change", [
+    lambda d: d.pop("qualification_scope"),
+    lambda d: d.update(mode="recipe"),
+    lambda d: d["runs"][0].update(revision="a" * 40),
+    lambda d: d["runs"][0].update(source_tree="0" * 40),
+    lambda d: d["runs"][0].update(logical_observer_available=True),
+    lambda d: d["runs"][0]["samples"][0]["memory"].update(unavailable_reason="query_memory_budget_disabled"),
+    lambda d: d["runs"][0]["samples"][0]["memory"].update(logical_memory_peak_bytes=0),
+    lambda d: d["runs"][1]["samples"][0]["memory"].update(logical_memory_peak_bytes=None, unavailable_reason="revision_has_no_logical_memory_observer"),
+    lambda d: d["runs"][1].pop("candidate_memory_evidence"),
+    lambda d: d["runs"][1]["candidate_memory_evidence"].update(sha256="0" * 64),
+    lambda d: d["runs"][0]["samples"][0].update(rss_peak_bytes=0),
+    lambda d: d["protocol"].update(max_cpu_percent=30),
+])
+def test_historical_exemption_does_not_spread(change):
+    data = historical_campaign()
+    change(data)
+    with pytest.raises(CampaignError):
+        compare_campaign(data)
+
+
+@pytest.mark.parametrize("field,value", [("live_after_bytes", 1), ("handle_after_bytes", 1),
+                                        ("open_transactions_after", 1), ("error_code", None)])
+def test_historical_memory_proof_cannot_claim_cleanup(field, value):
+    data = historical_campaign()
+    evidence = data["runs"][1]["candidate_memory_evidence"]
+    evidence["body"]["budgets"][0]["records"][20][field] = value
+    evidence["sha256"] = canonical_hash(evidence["body"])
+    with pytest.raises(CampaignError):
+        compare_campaign(data)
+
+
+def test_historical_timing_still_requires_calibration_and_noise_and_thresholds():
+    data = historical_campaign()
+    data["runs"][0]["cpu_before_percent"] = 21
+    assert compare_campaign(data)["decision"] == "inconclusive"
+
+
+@pytest.mark.parametrize("change", [
+    lambda b: b.update(revision="c" * 40),
+    lambda b: b["procedure"].update(source_sha256="0" * 64),
+    lambda b: b["budgets"][0]["records"].pop(),
+    lambda b: b["budgets"][0]["records"][0]["operator_budgets"][0].update(peak_bytes=4097),
+    lambda b: b["budgets"][0]["records"][0]["memory"].update(coverage="unknown"),
+])
+def test_historical_memory_proof_validates_content_not_only_digest(change):
+    data = historical_campaign()
+    evidence = data["runs"][1]["candidate_memory_evidence"]
+    change(evidence["body"])
+    evidence["sha256"] = canonical_hash(evidence["body"])
+    with pytest.raises(CampaignError):
         compare_campaign(data)

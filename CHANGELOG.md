@@ -18,6 +18,12 @@ including the on-disk format.
 
 ### RF01 physical scan diagnostics (in progress)
 
+- Implement the formally revised RF01 historical noop profile: preserve missing
+  baseline logical memory explicitly, require RSS in both arms and separately
+  verify candidate accounting lifecycle and operator budgets. All timing and
+  noise gates remain; no measured overhead pass or performance gain is claimed.
+  See [historical qualification](docs/PERFORMANCE.md#rf01-historical-total-overhead-qualification).
+
 - Add statement-local counters for physical node/relationship versions,
   index probes, certificate attempts/retries and identity landing work.
   Record the first executed fallback guard with a bounded integer diagnostic.

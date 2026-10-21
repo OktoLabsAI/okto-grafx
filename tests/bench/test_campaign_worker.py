@@ -51,6 +51,21 @@ def test_two_writer_processes_persist_disjoint_exact_rows(tmp_path):
     assert sample["memory"]["logical_memory_peak_bytes"] is None
 
 
+def test_separate_candidate_memory_producer_observes_real_lifecycle(tmp_path):
+    from bench.harness.campaign_worker import collect_candidate_memory
+    from bench.harness.campaign_schema import validate_candidate_memory
+    run = {"revision": "b" * 40, "process_id": 123, "invocation_id": "test-only",
+           "engine_source_hashes": {"query": "b" * 64}}
+    evidence = collect_candidate_memory(run, {4096}, tmp_path)
+    validate_candidate_memory(dict(run, candidate_memory_evidence=evidence), {4096})
+    records = evidence["body"]["budgets"][0]["records"]
+    assert len(records) == 60
+    assert {r["mode"] for r in records} == {"success", "error", "cancel"}
+    assert all(r["memory"]["logical_memory_peak_bytes"] > 0 for r in records)
+    assert all(r["live_before_bytes"] == r["live_after_bytes"] == 0 for r in records)
+    assert all(r["handle_before_bytes"] == r["handle_after_bytes"] == 0 for r in records)
+
+
 def test_real_cursor_reports_first_row_consumption_and_exact_oracle(tmp_path):
     scenario = Scenario(name="cursor", family="node_scan", nodes=8, cursor_batch_size=1)
     with connect(tmp_path / "db") as db:

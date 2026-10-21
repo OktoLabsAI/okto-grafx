@@ -23,6 +23,12 @@ RF02, RF03, RF05, RF06 and RF08–RF12; RF03 precedes RF04, which consequently
 also waits for RF01. RF07's streaming-contract protection is independent.
 Existing task dependencies further order implementation and qualification.
 
+The edition 3 historical noop exception is implemented in the harness, with
+explicit unavailable baseline logical memory and separate bounded candidate
+lifecycle evidence. A valid temporal qualification is still pending; no overhead
+pass or gain is inferred from functional tests. See
+[historical qualification](docs/PERFORMANCE.md#rf01-historical-total-overhead-qualification).
+
 RF01 is in progress. Its physical-counter implementation card is Done in Pulse;
 the harness, fixtures and report card is in progress with code, focused tests and
 an exploratory real six-process run completed. Instrumentation covers

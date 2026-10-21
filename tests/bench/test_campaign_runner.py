@@ -13,6 +13,30 @@ def test_process_order_is_three_independent_pairs():
                                   (2, "A", "AB"), (2, "B", "AB")]
 
 
+@pytest.mark.parametrize("valid_baseline", [False, True])
+def test_historical_cli_enforces_identity_and_propagates_scope(tmp_path, monkeypatch, valid_baseline):
+    import bench.harness.campaign as runner
+    from bench.harness.campaign_schema import HISTORICAL_REVISION, HISTORICAL_SCOPE
+    baseline = tmp_path / "baseline"
+    revisions = iter([HISTORICAL_REVISION if valid_baseline else "a" * 40, "b" * 40])
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *a, **k: next(revisions))
+    requests = []
+    def fail(command, log, timeout):
+        requests.append(json.loads(Path(command[command.index("--request") + 1]).read_text()))
+        return 7
+    monkeypatch.setattr(runner, "execute_worker", fail)
+    args = Namespace(output=tmp_path / "out", baseline=baseline, candidate=tmp_path,
+                     scenario=["constant"], memory_budget=4096, target=[], previous=None,
+                     mode="noop", intent="qualification", calibrated_executor=False,
+                     max_cpu_percent=20, historical_noop=True)
+    with pytest.raises(CampaignError, match="worker failed" if valid_baseline else "exact original baseline"):
+        runner.run_campaign(args)
+    assert len(requests) == int(valid_baseline)
+    if valid_baseline:
+        assert requests[0]["qualification_scope"] == HISTORICAL_SCOPE
+        assert requests[0]["scenarios"][0]["query_memory_budget_bytes"] == 4096
+
+
 def test_existing_artifacts_are_never_overwritten(tmp_path):
     output = tmp_path / "campaign"
     reserve_output(output)

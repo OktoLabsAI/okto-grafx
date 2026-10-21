@@ -19,6 +19,7 @@ import time
 
 from bench.harness.campaign_fixtures import matrix
 from bench.harness.campaign_schema import CampaignError, canonical_hash, compare_campaign, load_json, validate_campaign
+from bench.harness.campaign_schema import HISTORICAL_SCOPE, HISTORICAL_REVISION
 
 
 def process_schedule():
@@ -140,6 +141,14 @@ def run_campaign(args):
     sources = {"A": args.baseline.resolve(), "B": args.candidate.resolve()}
     revisions = {arm: subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
                  for arm, root in sources.items()}
+    historical = getattr(args, "historical_noop", False)
+    if historical:
+        if args.mode != "noop" or revisions["A"] != HISTORICAL_REVISION or revisions["B"] == HISTORICAL_REVISION:
+            raise CampaignError("historical noop requires the exact original baseline and a distinct candidate")
+        if args.memory_budget is None or args.max_cpu_percent > 20:
+            raise CampaignError("historical noop requires explicit candidate budget and CPU ceiling <=20%")
+        if any(s["family"] in ("fts", "write") or s["writers"] != 1 or s["reader"] != "short" for s in selected):
+            raise CampaignError("historical profile currently supports single-statement read controls only")
     previous = None
     if args.previous is not None:
         previous_data = load_json(args.previous.read_text(encoding="utf-8"))
@@ -151,6 +160,10 @@ def run_campaign(args):
         previous_revisions = {run["arm"]: run["revision"] for run in previous_data["runs"]}
         if previous_revisions != revisions or previous_data["protocol"]["max_cpu_percent"] != args.max_cpu_percent:
             raise CampaignError("rerun must preserve revisions and registered noise policy")
+        if previous_data.get("qualification_scope") != (HISTORICAL_SCOPE if historical else None):
+            raise CampaignError("rerun cannot change historical/comparable-observer scope")
+        if historical and compare_campaign(previous_data)["decision"] != "inconclusive":
+            raise CampaignError("historical retry is allowed only after a complete inconclusive campaign")
     data = {"schema_version": "grafx-campaign/v1", "intent": args.intent, "mode": args.mode,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "calibrated_executor": args.calibrated_executor,
@@ -162,6 +175,8 @@ def run_campaign(args):
             "not_applicable": [name for name in catalog if name not in args.scenario],
             "harness_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                for path in Path(__file__).parent.glob("campaign*.py")}}
+    if historical:
+        data["qualification_scope"] = HISTORICAL_SCOPE
     calibration_path = getattr(args, "calibration", None)
     if calibration_path is not None:
         raw = calibration_path.read_text(encoding="utf-8")
@@ -173,6 +188,8 @@ def run_campaign(args):
     for pair, arm, order in process_schedule():
         request = {"source_root": str(sources[arm]), "revision": revisions[arm], "arm": arm,
                    "pair": pair, "run_order": order, "scenarios": selected}
+        if historical:
+            request["qualification_scope"] = HISTORICAL_SCOPE
         request_path = output / f"request-{pair}-{arm}.json"
         raw_path = output / f"raw-{pair}-{arm}.json"
         _write(request_path, request)
@@ -215,6 +232,8 @@ def main(argv=None):
     run.add_argument("--scenario", action="append", required=True)
     run.add_argument("--mode", choices=("noop", "optimization", "recipe"), default="noop")
     run.add_argument("--intent", choices=("exploratory", "qualification"), default="exploratory")
+    run.add_argument("--historical-noop", action="store_true",
+                     help="RF01 edition 3: exact original baseline, candidate memory proof, no comparative memory claim")
     run.add_argument("--calibrated-executor", action="store_true")
     run.add_argument("--calibration", type=Path, help="hashed executor control receipt; a boolean alone cannot qualify")
     run.add_argument("--worker-timeout", type=float, default=3600)

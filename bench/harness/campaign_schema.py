@@ -16,6 +16,83 @@ import statistics
 
 from bench.harness.campaign_fixtures import Scenario, contract, oracle, query_for
 
+HISTORICAL_SCOPE = "rf01_historical_total_overhead"
+HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
+HISTORICAL_TREE = "c2795181cda21041998cd13959afc8de303802bb"
+HISTORICAL_QUERY_SHA256 = "8056d0625cf4764c3a160bb676b6cefdc71d680f7f52bba44b626a28e0fa7ad8"
+LOGICAL_COVERAGE = "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1"
+
+
+def validate_candidate_memory(run, budgets):
+    """Separate deterministic lifecycle evidence, bound to this worker/source.
+
+    These are unsigned local receipts, not authenticated third-party claims.
+    No per-operator peak is added to another; live simultaneous totals and each
+    independent budget ceiling are checked separately.
+    """
+    evidence = run.get("candidate_memory_evidence")
+    _fields(evidence, ("body", "sha256"), "candidate memory evidence")
+    body = evidence["body"]
+    _require(canonical_hash(body) == evidence["sha256"], "candidate memory evidence hash mismatch")
+    _fields(body, ("schema_version", "revision", "process_id", "invocation_id", "engine_source_hashes", "procedure", "budgets"), "candidate memory proof")
+    _require(body["schema_version"] == "grafx-candidate-memory/v1", "unknown memory proof schema")
+    for key in ("revision", "process_id", "invocation_id", "engine_source_hashes"):
+        _require(body[key] == run[key], f"candidate memory proof not bound to run {key}")
+    producer = Path(__file__).with_name("campaign_worker.py")
+    _require(body["procedure"] == {"id": "rf01-logical-lifecycle-v1", "source_sha256": hashlib.sha256(producer.read_bytes()).hexdigest()},
+             "candidate memory procedure provenance mismatch")
+    _require(isinstance(body["budgets"], list) and len(body["budgets"]) == len(budgets), "missing/duplicate memory budget evidence")
+    seen = set()
+    for group in body["budgets"]:
+        limit = group["budget_bytes"]
+        _require(type(limit) is int and limit in budgets and limit not in seen, "wrong memory proof budget")
+        seen.add(limit)
+        records = group["records"]
+        _require(isinstance(records, list) and len(records) == 60, "memory proof requires twenty success/error/cancel executions each")
+        initial = None
+        for position, row in enumerate(records):
+            mode = ("success", "error", "cancel")[position // 20]
+            _require(row["mode"] == mode and row["index"] == position % 20, "memory proof missing/reordered lifecycle observation")
+            for key in ("live_before_bytes", "live_after_bytes", "handle_before_bytes", "handle_after_bytes", "open_transactions_after"):
+                _integer(row[key], key)
+            if initial is None:
+                initial = row["handle_before_bytes"]
+            _require(row["live_before_bytes"] == row["live_after_bytes"] == row["handle_before_bytes"] == row["handle_after_bytes"] == initial,
+                     "candidate memory retention grew or did not return to baseline")
+            _require(row["open_transactions_after"] == 0, "memory proof left transaction open")
+            expected_error = {"success": None, "error": "plan_error", "cancel": "query_cancelled"}[mode]
+            _require(row["error_code"] == expected_error, "memory proof did not exercise expected outcome")
+            memory = row["memory"]
+            _require(memory["coverage"] == LOGICAL_COVERAGE and memory["unavailable_reason"] is None,
+                     "candidate memory proof coverage unavailable")
+            _integer(memory["logical_memory_peak_bytes"], "memory proof peak", 1)
+            _require(memory["baseline_retained_bytes"] == initial, "memory proof baseline mismatch")
+            _require(memory["logical_memory_peak_bytes"] >= initial, "memory proof peak below baseline")
+            operators = row["operator_budgets"]
+            _require(isinstance(operators, list) and bool(operators), "memory proof observed no operator budgets")
+            for operator in operators:
+                _require(isinstance(operator["operator"], str) and bool(operator["operator"]), "operator identity missing")
+                _require(type(operator["limit_bytes"]) is int and operator["limit_bytes"] == limit,
+                         "operator budget differs from configured limit")
+                _integer(operator["peak_bytes"], "operator peak")
+                _require(operator["peak_bytes"] <= limit, "operator exceeded memory budget")
+
+
+def _historical_run(run, scenarios):
+    _fields(run, ("source_tree", "engine_source_hashes", "logical_observer_available"), "historical source evidence")
+    _require(bool(re.fullmatch("[0-9a-f]{40}", run["source_tree"])), "invalid source tree")
+    hashes = run["engine_source_hashes"]
+    _fields(hashes, ("src/okto_grafx/engine/query_engine.py", "src/okto_grafx/domain/query/memory.py"), "engine source hashes")
+    _require(all(isinstance(value, str) and bool(re.fullmatch("[0-9a-f]{64}", value)) for value in hashes.values()), "invalid engine source hash")
+    if run["arm"] == "A":
+        _require(run["revision"] == HISTORICAL_REVISION and run["source_tree"] == HISTORICAL_TREE
+                 and hashes["src/okto_grafx/engine/query_engine.py"] == HISTORICAL_QUERY_SHA256
+                 and run["logical_observer_available"] is False, "historical baseline identity or observer absence not established")
+    else:
+        _require(run["revision"] != HISTORICAL_REVISION and run["logical_observer_available"] is True,
+                 "candidate logical observer unavailable")
+        validate_candidate_memory(run, {s.query_memory_budget_bytes for s in scenarios.values()})
+
 
 class CampaignError(ValueError):
     """Evidence cannot support a comparison."""
@@ -145,6 +222,11 @@ def _validate(data):
     _require(data["schema_version"] == "grafx-campaign/v1", "unsupported schema version")
     _require(data["mode"] in ("noop", "optimization", "recipe"), "unknown comparison mode")
     _require(data["intent"] in ("exploratory", "qualification"), "unknown intent")
+    scope = data.get("qualification_scope")
+    _require(scope in (None, HISTORICAL_SCOPE), "unknown qualification scope")
+    historical = scope == HISTORICAL_SCOPE
+    if historical:
+        _require(data["mode"] == "noop", "historical exception is only RF01 total noop overhead")
     _require(type(data["calibrated_executor"]) is bool, "calibrated_executor must be boolean")
     _require(isinstance(data["command"], list) and bool(data["command"]) and all(type(x) is str for x in data["command"]), "missing reproduction command")
     protocol = data["protocol"]
@@ -156,6 +238,8 @@ def _validate(data):
              (protocol["attempt"] == 2 and isinstance(previous, str) and bool(re.fullmatch("[0-9a-f]{64}", previous))), "rerun must link complete previous campaign")
     _require(type(protocol["max_cpu_percent"]) in (int, float) and 0 < protocol["max_cpu_percent"] <= 100,
              "CPU gate must be an explicit percentage")
+    if historical:
+        _require(protocol["max_cpu_percent"] <= 20, "historical qualification CPU ceiling is 20 percent")
     scenarios = {}
     expectations = {}
     _require(isinstance(data["scenarios"], list) and bool(data["scenarios"]), "no scenarios")
@@ -163,6 +247,11 @@ def _validate(data):
         scenario = Scenario.from_dict(value)
         _require(scenario.name not in scenarios, "duplicate scenario")
         scenarios[scenario.name] = scenario
+        if historical:
+            _require(type(scenario.query_memory_budget_bytes) is int and scenario.query_memory_budget_bytes > 0,
+                     "historical candidate requires explicit logical budget in both arms")
+            _require(scenario.family not in ("fts", "write") and scenario.writers == 1 and scenario.reader == "short",
+                     "historical profile currently covers single-statement read controls only")
         query, params = query_for(scenario)
         expected_rows = oracle(scenario)
         expectations[scenario.name] = {"seed": scenario.seed, "config_hash": canonical_hash(scenario.to_dict()),
@@ -193,6 +282,8 @@ def _validate(data):
         _require(isinstance(run["revision"], str) and bool(re.fullmatch("[0-9a-f]{40}", run["revision"])), "revision must be exact SHA")
         revisions[arm].add(run["revision"])
         _require(run["source_clean"] is True, "dirty source cannot establish revision")
+        if historical:
+            _historical_run(run, scenarios)
         _require(bool(run["source_root"]) and bool(run["package_file"]), "missing import provenance")
         env = run["environment"]
         _fields(env, ("python", "dependencies", "os", "cpu", "cpu_count", "ram_bytes", "disk", "gc_enabled"), "environment")
@@ -251,8 +342,21 @@ def _validate(data):
             memory = sample["memory"]
             _fields(memory, ("logical_memory_peak_bytes", "baseline_retained_bytes", "coverage", "unavailable_reason"), "memory")
             _integer(memory["baseline_retained_bytes"], "baseline_retained_bytes")
+            if historical:
+                _require(sample["rss_peak_bytes"] > 0 and sample["rss_scope"] in (
+                    "process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"),
+                    "historical qualification requires real process RSS in both arms")
+                _require(sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes,
+                         "observed memory budget differs from common scenario config")
+                if arm == "A":
+                    _require(memory["logical_memory_peak_bytes"] is None
+                             and memory["unavailable_reason"] == "revision_has_no_logical_memory_observer"
+                             and memory["coverage"] == "unavailable", "historical memory must remain explicitly unavailable, never zero")
+                else:
+                    _require(memory["logical_memory_peak_bytes"] is not None and memory["coverage"] == LOGICAL_COVERAGE,
+                             "candidate memory must have real covered peak")
             if memory["logical_memory_peak_bytes"] is None:
-                _require(data["intent"] == "exploratory" and bool(memory["unavailable_reason"]), "memory unavailable: cannot qualify")
+                _require((historical and arm == "A") or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
             else:
                 _integer(memory["logical_memory_peak_bytes"], "logical_memory_peak_bytes")
                 _require(memory["logical_memory_peak_bytes"] >= memory["baseline_retained_bytes"], "memory peak below baseline")
@@ -325,6 +429,9 @@ def compare_campaign(data):
     elif data["mode"] == "recipe" and not noisy:
         decision = "tradeoff_reported"
     return {"schema_version": "grafx-campaign-report/v1", "campaign_hash": canonical_hash(data),
+            "qualification_scope": data.get("qualification_scope", "comparable_observer"),
+            "comparative_logical_memory": data.get("qualification_scope") != HISTORICAL_SCOPE and data["intent"] == "qualification",
+            "candidate_memory_verified": data.get("qualification_scope") == HISTORICAL_SCOPE,
             "decision": decision, "comparisons": comparisons, "overall": totals,
             "calibration_valid": calibrated,
             "noisy": noisy, "noise_policy": "CPU > registered limit or within-process CV >10%; at most one complete rerun",

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import gc
+import hashlib
 import importlib.metadata
 import json
 import multiprocessing
@@ -30,6 +31,7 @@ if __package__ in (None, ""):
 
 from bench.harness.campaign_fixtures import Scenario, apply_churn, build_fixture, contract, oracle, query_for
 from bench.harness.campaign_schema import CampaignError, canonical_hash, load_json
+from bench.harness.campaign_schema import HISTORICAL_SCOPE, validate_candidate_memory
 
 
 def unavailable_memory(reason):
@@ -72,6 +74,7 @@ def sample_record(spec, index, rows, statistics, *, elapsed_ns, cpu_ns, prepare_
             "prepare_ns": prepare_ns, "prepare_boundary": "explain_parse_plan_not_lazy_expression_compile",
             "first_row_ns": first_row_ns, "consume_all_ns": elapsed_ns if consume_all_ns is None else consume_all_ns,
             "commit_ns": commit_ns, "memory": memory, "rss_peak_bytes": rss_peak_bytes, "rss_scope": rss_scope,
+            "memory_budget_bytes": scenario.query_memory_budget_bytes,
             "wal_delta_bytes": 0, "disk_delta_bytes": 0, "checkpoint": "fixture checkpoint before measurements",
             "wal_scope": "allocated file bytes in WAL paths; not logical bytes appended or fsync count",
             "handle_scope": "private process/sample; no preexisting cursor or concurrent statement",
@@ -85,6 +88,8 @@ def _fts_rows(db, scenario):
 
 
 def measure_statement(db, scenario, index, *, reader=None):
+    if db._queries._query_memory_budget_bytes != scenario.query_memory_budget_bytes:
+        raise CampaignError("runtime logical memory budget differs from scenario")
     query, params = query_for(scenario)
     begin = time.perf_counter_ns()
     if scenario.family == "fts":
@@ -159,6 +164,98 @@ def executor_environment():
             for name in ("numpy", "google-crc32c", "psutil")}, "os": platform.platform(),
             "cpu": platform.processor() or "unknown", "cpu_count": os.cpu_count(),
             "ram_bytes": psutil.virtual_memory().total, "gc_enabled": gc.isenabled()}
+
+
+def source_identity(source, revision):
+    """Bind loaded Python files to exact immutable Git blobs; do not relabel."""
+    import okto_grafx.engine.query_engine as engine
+    import okto_grafx.domain.query.memory as memory
+    hashes = {}
+    for relative, module in (("src/okto_grafx/engine/query_engine.py", engine),
+                             ("src/okto_grafx/domain/query/memory.py", memory)):
+        expected = (source / relative).resolve()
+        if Path(module.__file__).resolve() != expected:
+            raise CampaignError("logical observer import provenance mismatch")
+        blob = subprocess.check_output(["git", "-C", str(source), "show", f"{revision}:{relative}"])
+        if expected.read_bytes().replace(b"\r\n", b"\n") != blob.replace(b"\r\n", b"\n"):
+            raise CampaignError("logical observer source differs from committed blob")
+        hashes[relative] = hashlib.sha256(blob).hexdigest()
+    return {"source_tree": _git(source, "rev-parse", f"{revision}^{{tree}}"),
+            "engine_source_hashes": hashes,
+            "logical_observer_available": callable(getattr(engine.QueryEngine, "_observe_logical_memory", None))}
+
+
+def collect_candidate_memory(run, budgets, directory):
+    """Separate untimed lifecycle proof on private handles, never a benchmark.
+
+    Observe real constructor-created operator budgets without changing their
+    admission/release methods. Preserve simultaneous observations and individual
+    peaks rather than summing sequential peaks. Each budget is tested on the same
+    handle across twenty success/error/cancel cycles, with no manual cleanup of
+    the counters being verified.
+    """
+    from unittest.mock import patch
+    from okto_grafx import CancellationToken, connect
+    from okto_grafx.errors import GrafxQueryError, GrafxQueryCancelled
+    from okto_grafx.domain.query.memory import LogicalMemoryBudget
+    groups = []
+    original_init = LogicalMemoryBudget.__init__
+    for budget in sorted(budgets):
+        records = []
+        operators = []
+        def tracking_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            operators.append(self)
+        with connect(Path(directory) / f"memory-proof-{budget}", query_memory_budget_bytes=budget) as db:
+            engine = db._queries
+            if not callable(getattr(engine, "_observe_logical_memory", None)):
+                raise CampaignError("candidate logical memory observer unavailable")
+            def retained():
+                return engine._owner_budget._used_bytes + engine._endpoint_budget._used_bytes
+            with patch.object(LogicalMemoryBudget, "__init__", tracking_init):
+                for mode in ("success", "error", "cancel"):
+                    for index in range(20):
+                        operators.clear()
+                        handle_before = retained()
+                        error_code = None
+                        with engine._observe_logical_memory() as observation:
+                            before = observation.current
+                            parameters = {"items": list(range(8, 0, -1)), "zero": 0}
+                            if mode == "success":
+                                result = db.execute("UNWIND $items AS i RETURN i ORDER BY i", parameters)
+                                if result.rows != tuple((i,) for i in range(1, 9)):
+                                    raise CampaignError("memory proof success oracle failed")
+                            elif mode == "error":
+                                try:
+                                    db.execute("UNWIND $items AS i WITH i ORDER BY i RETURN 1 / $zero", parameters)
+                                except GrafxQueryError as exc:
+                                    error_code = exc.code
+                            else:
+                                token = CancellationToken()
+                                with db.query("UNWIND $items AS i RETURN i ORDER BY i", parameters).cursor(batch_size=1, cancellation=token) as cursor:
+                                    if next(cursor) != (1,):
+                                        raise CampaignError("memory proof cursor oracle failed")
+                                    token.cancel()
+                                    try:
+                                        next(cursor)
+                                    except GrafxQueryCancelled as exc:
+                                        error_code = exc.code
+                            after = observation.current
+                        records.append({"mode": mode, "index": index, "live_before_bytes": before,
+                                        "live_after_bytes": after, "handle_before_bytes": handle_before,
+                                        "handle_after_bytes": retained(), "memory": observation.result(),
+                                        "operator_budgets": [{"operator": item._operator, "limit_bytes": item.limit,
+                                                               "peak_bytes": item.peak} for item in operators],
+                                        "error_code": error_code, "open_transactions_after": db.transactions.open_transactions})
+        groups.append({"budget_bytes": budget, "records": records})
+    body = {"schema_version": "grafx-candidate-memory/v1", "revision": run["revision"],
+            "process_id": run["process_id"], "invocation_id": run["invocation_id"],
+            "engine_source_hashes": run["engine_source_hashes"],
+            "procedure": {"id": "rf01-logical-lifecycle-v1", "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
+            "budgets": groups}
+    evidence = {"body": body, "sha256": canonical_hash(body)}
+    validate_candidate_memory(dict(run, candidate_memory_evidence=evidence), budgets)
+    return evidence
 
 
 def _writer_child(root, spec, number, barrier, queue):
@@ -265,6 +362,9 @@ def run_worker(request, output):
               "environment": {**executor_environment(),
                               "disk": {"root": str(output.parent.anchor), "free_bytes": shutil.disk_usage(output.parent).free}},
               "cpu_before_percent": psutil.cpu_percent(interval=.2), "samples": []}
+    historical = request.get("qualification_scope") == HISTORICAL_SCOPE
+    if historical:
+        report.update(source_identity(source, revision))
     output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
     try:
         for spec in request["scenarios"]:
@@ -316,6 +416,10 @@ def run_worker(request, output):
                                 raise CampaignError("write reopen oracle mismatch")
             output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
         report["cpu_after_percent"] = psutil.cpu_percent(interval=.2)
+        if historical and request["arm"] == "B":
+            with tempfile.TemporaryDirectory(prefix="memory-evidence-", dir=output.parent) as directory:
+                budgets = {Scenario.from_dict(spec).query_memory_budget_bytes for spec in request["scenarios"]}
+                report["candidate_memory_evidence"] = collect_candidate_memory(report, budgets, directory)
         if _git(source, "rev-parse", "HEAD") != revision or _git(source, "status", "--porcelain"):
             raise CampaignError("source changed during worker execution")
     except BaseException as exc:
