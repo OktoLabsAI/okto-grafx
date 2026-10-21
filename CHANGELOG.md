@@ -7,6 +7,14 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### RF01 physical scan diagnostics (in progress)
+
+- Add statement-local counters for stored node/relationship version headers
+  examined by canonical query scans, including versions rejected by MVCC.
+  Keep logical scan counters, cancellation checkpoints and quota charging.
+  Coverage is partial; index/landing counters, fallback reasons and overhead
+  qualification remain pending. See [measurement boundaries](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
+
 ### CI portability and execution policy
 
 - Move the full Windows/POSIX regression matrix and its coverage report to manual

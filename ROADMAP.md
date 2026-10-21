@@ -15,6 +15,26 @@ operational hardening and developer experience**. It replaces the execution
 authority of the former evolution/agent/performance/round plans. It does not
 reopen completed work, authorize production data changes or imply release approval.
 
+## Grafx performance RF01–RF12 (October 21, 2026)
+
+The Okto Pulse `okto-grafx` board holds twelve validated specifications and
+58 planned tasks. Native Spec dependencies are now explicit: RF01 precedes
+RF02, RF03, RF05, RF06 and RF08–RF12; RF03 precedes RF04, which consequently
+also waits for RF01. RF07's streaming-contract protection is independent.
+Existing task dependencies further order implementation and qualification.
+
+RF01 is in progress. The first slice instruments physical version headers in
+canonical node/relationship query scans, including MVCC-invisible history,
+with per-statement counts and unchanged cooperative checkpoints. See
+[coverage and units](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
+
+Remaining RF01 work: cover index/landing and other physical read paths;
+record probe/certificate/batch counts and actual fallback reasons; extend the
+existing harness and validate raw reports; run semantic, consistency and
+three-pair overhead qualification. The current patch does not complete RF01
+or authorize dependent Specs to start. Full release/installed-wheel and
+consumer qualification remain separate from focused development tests.
+
 ## CI prerequisite correction (CI-WHEEL-RECEIPTS)
 
 The maintainer requested a 20-minute limit per automatic CI job. The full

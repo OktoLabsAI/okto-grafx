@@ -415,6 +415,8 @@ _OWNER_LANDING_OBJECT_BYTES: int = 96
 _OWNER_LANDING_VECTOR_BASE_BYTES: int = 128
 _OWNER_LANDING_VECTOR_COMPONENT_BYTES: int = 32
 _VECTOR_FREE_CANONICAL_READ = HeapStore.read
+_OBSERVED_CANONICAL_SCAN = HeapStore.scan
+_OBSERVED_CANONICAL_PROJECTED_SCAN = HeapStore.scan_projected
 _VECTOR_FREE_CANONICAL_DECODE = HeapStore._decode_version
 _VECTOR_FREE_CANONICAL_VALIDATED = IndexManager.validated_versions
 _BATCH_LANDING_CANONICAL_SCALAR = IndexManager.validated_identity_landings
@@ -6781,13 +6783,29 @@ def _with_rows(
         yield _Row(bindings=bindings, columns=bindings)
 
 
-def _scanned_node_versions(
+def _scanned_versions(
     engine: QueryEngine,
     table: TableDef,
     snapshot: object,
-    materialized_positions: frozenset[int] | None,
+    materialized_positions: frozenset[int] | None = None,
+    *,
+    statistics: dict[str, int],
 ) -> Iterator[tuple[RecordRef, HeapVersion]]:
-    """Choose the closed projected scan only for the exact built-in heap."""
+    """Observe canonical heap scans; retain custom scan behavior and signatures.
+
+    Physical counts come from the walk before visibility, never from the rows
+    yielded here. This deliberately does not call _Context.count: physical
+    observations must not add cooperative steps or change quota boundaries.
+    """
+    if type(engine.heap) is HeapStore:
+        selected = (engine.heap.scan if materialized_positions is None
+                    else engine.heap.scan_projected)
+        canonical = (_OBSERVED_CANONICAL_SCAN if materialized_positions is None
+                     else _OBSERVED_CANONICAL_PROJECTED_SCAN)
+        if getattr(selected, "__func__", None) is canonical:
+            return engine.heap._scan_with_statistics(
+                table, snapshot, statistics, materialized_positions
+            )
     if materialized_positions is not None and type(engine.heap) is HeapStore:
         return engine.heap.scan_projected(
             table,
@@ -6817,11 +6835,12 @@ def _all_nodes_scan(
     projections = getattr(context, "node_scan_projections", {}).get(id(node), {})
     for row in engine._rows(node.child, context):
         for table, changed, inserted in views:
-            for ref, version in _scanned_node_versions(
+            for ref, version in _scanned_versions(
                 engine,
                 table,
                 snapshot,
                 projections.get(table.table_id),
+                statistics=context.statistics,
             ):
                 if ref in changed:
                     latest = changed[ref]
@@ -6899,8 +6918,8 @@ def _logical_node_rows_for_input(
 ) -> Iterator[_Row]:
     """Yield one table's scan-equivalent rows for an already-produced input row."""
 
-    for ref, version in _scanned_node_versions(
-        engine, table, snapshot, materialized_positions
+    for ref, version in _scanned_versions(
+        engine, table, snapshot, materialized_positions, statistics=context.statistics
     ):
         if ref in changed:
             latest = changed[ref]
@@ -7825,7 +7844,9 @@ def _edge_steps(
             context.count("edge_scans")
             by_source: dict[object, list[tuple[object, HeapVersion]]] = {}
             by_target: dict[object, list[tuple[object, HeapVersion]]] = {}
-            for ref, version in engine.heap.scan(relationship, snapshot):
+            for ref, version in _scanned_versions(
+                engine, relationship, snapshot, statistics=context.statistics
+            ):
                 if ref in ended:
                     continue
                 version = owner_version(ref, version)
@@ -8561,7 +8582,9 @@ def _relationship_scan(
     single_child = isinstance(node.child, SingleRow)
     for row in engine._rows(node.child, context):
         context.count("edge_scans")
-        for ref, version in engine.heap.scan(relationship, context.snapshot):
+        for ref, version in _scanned_versions(
+            engine, relationship, context.snapshot, statistics=context.statistics
+        ):
             if charge_expansions:
                 context.admit_traversal_expansion()
             if ref in ended:
@@ -9381,6 +9404,10 @@ def _relationship_incident_seek(
         if extent is not None:
             return False
         context.count("edge_scans")
+        # The missing extent proves zero physical headers, just as an executed
+        # scan of this empty table does. Preserve the differential statistics
+        # contract without opening a heap walk or adding a cooperative step.
+        context.statistics.setdefault("physical_edge_versions_examined", 0)
         return True
     # KGRUN-M3: the edge-first scan is chosen BEFORE up to 2 x 500 probes are encoded, when the
     # distinct frontier is known exactly without encoding.  A STRING key column encodes an exact
@@ -11784,7 +11811,9 @@ def _batched_relationship_count(
     context.count("edge_scans")
     total = 0
     frontier: list[tuple[int, int]] = []
-    for _ref, version in engine.heap.scan(scan.table, context.snapshot):
+    for _ref, version in _scanned_versions(
+        engine, scan.table, context.snapshot, statistics=context.statistics
+    ):
         frontier.append((version.values[0], version.values[1]))
         if len(frontier) == 64:
             total += count_frontier(frontier)

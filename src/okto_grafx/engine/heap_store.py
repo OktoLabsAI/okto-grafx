@@ -2175,6 +2175,28 @@ class HeapStore:
             _previous = header.previous
             yield ref, endpoints
 
+    def _scan_with_statistics(
+        self,
+        table: TableDef,
+        snapshot: SnapshotLike,
+        statistics: dict[str, int],
+        materialized_positions: frozenset[int] | None = None,
+    ) -> Iterator[tuple[RecordRef, HeapVersion]]:
+        """Observe a canonical query scan before MVCC filtering, without callbacks.
+
+        This internal door shares the public scan's walk and decoding. The
+        executor selects it only for unmodified built-in scan methods. Counts
+        describe examined headers, including invisible versions and the rest
+        of an already inspected page when consumption stops early.
+        """
+        def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            return snapshot.visible(xmin, xmax)
+
+        for ref, header, content in self._walk(table, accept=visible, statistics=statistics):
+            yield ref, self._decode_version_with_header(
+                table, header, content, materialized_positions=materialized_positions
+            )
+
     def scan_page(
         self,
         table: TableDef,
@@ -3429,6 +3451,7 @@ class HeapStore:
         *,
         accept: Callable[[RecordId, Csn, Csn], bool] | None = None,
         copy_content: bool = True,
+        statistics: dict[str, int] | None = None,
     ) -> Iterator[tuple[RecordRef, RecordHeader, bytes]]:
         """Yield every stored version of the table with its location and its raw content.
 
@@ -3439,6 +3462,10 @@ class HeapStore:
         overflow chain never needs a second frame while a data page is still held. Header-only
         callers may also suppress every content copy.
         """
+        counter = ("physical_edge_versions_examined" if table.kind == "rel"
+                   else "physical_node_versions_examined")
+        if statistics is not None:
+            statistics.setdefault(counter, 0)
         extent = self._find_extent(table.table_id)
         if extent is None:
             return
@@ -3457,31 +3484,40 @@ class HeapStore:
                     field="cycle",
                 )
             seen.add(index)
-            with self._pool.pinned(self._file, index) as page:
-                self._require_table_page(page, table)
-                items: list[tuple[SlotId, RecordHeader, bytes]] = []
-                for slot, view in page.iter_slot_views():
-                    if slot < FIRST_RECORD_SLOT:
-                        continue
-                    if accept is None:
-                        header = RecordHeader.decode(view)
-                    else:
-                        fields = RecordHeader.peek(view)
-                        (
-                            _flags,
-                            _reserved,
-                            _schema_version,
-                            _payload_len,
-                            record_id,
-                            xmin,
-                            xmax,
-                            _previous,
-                        ) = fields
-                        if not accept(record_id, xmin, xmax):
+            examined = 0
+            try:
+                with self._pool.pinned(self._file, index) as page:
+                    self._require_table_page(page, table)
+                    items: list[tuple[SlotId, RecordHeader, bytes]] = []
+                    for slot, view in page.iter_slot_views():
+                        if slot < FIRST_RECORD_SLOT:
                             continue
-                        header = RecordHeader._from_peek(fields)
-                    items.append((slot, header, bytes(view) if copy_content else b""))
-                following = page.next_page
+                        examined += 1
+                        if accept is None:
+                            header = RecordHeader.decode(view)
+                        else:
+                            fields = RecordHeader.peek(view)
+                            (
+                                _flags,
+                                _reserved,
+                                _schema_version,
+                                _payload_len,
+                                record_id,
+                                xmin,
+                                xmax,
+                                _previous,
+                            ) = fields
+                            if not accept(record_id, xmin, xmax):
+                                continue
+                            header = RecordHeader._from_peek(fields)
+                        items.append((slot, header, bytes(view) if copy_content else b""))
+                    following = page.next_page
+            finally:
+                # Only local integers change under the pin. Publish once per
+                # visited page, after release, without a MetricsSink or control
+                # callback and before yielding even the first decoded row.
+                if statistics is not None:
+                    statistics[counter] += examined
             for slot, header, content in items:
                 yield (
                     RecordRef(page=index, slot=slot),

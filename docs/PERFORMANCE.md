@@ -9,6 +9,36 @@ The latest isolated installed Pulse/native observations below use the final
 0.0.6 candidate. The latest production spec-consolidation measurement still uses
 `0.0.4@fa8f188`; no production spec was consolidated for these tests.
 
+## RF01 physical scan statistics (development)
+
+The first RF01 implementation adds two integer entries to `QueryResult.statistics`:
+`physical_node_versions_examined` and `physical_edge_versions_examined`. Their
+unit is a stored version header actually examined by an instrumented heap scan,
+before snapshot visibility and owner-overlay filtering. Ended or otherwise
+invisible versions count; pending inserts that have not reached the heap do not.
+Repeated scans count their repeated work. Existing `rows_scanned`, `edge_scans`
+and cooperative cancellation/quota checkpoints retain their meanings.
+
+Coverage currently includes canonical node scans (full and projected), all-node
+scans, grouped traversal scans, relationship scans and the batched relationship
+count scan. This is **partial physical-work coverage**: index validation,
+identity landings, cursor `scan_page`, endpoint-only scans and other heap reads
+are not included yet. An absent counter means no instrumented scan ran; it does
+not prove zero physical work. An executed empty scan, or the existing proven
+pageless relationship shortcut, reports zero. Custom or
+overridden scan methods keep their existing behavior without invented counts.
+
+The canonical walk inspects a page's headers before yielding its rows. Early
+close therefore includes the headers already inspected on that page, while
+later pages remain unvisited. Counts accumulate locally and publish after each
+page pin is released. They are per-statement diagnostics, not additions to the
+frozen `MetricsSink` catalogue; no data, query text or parameters become labels.
+
+RF01 remains in progress. Probe/certificate/landing counters, actual fallback
+reasons, reproducible report validation and the three-pair overhead campaign
+are pending. These deterministic counters establish measurement semantics;
+they do not establish a speedup or compliance with the overhead budget.
+
 ## 0.0.7 performance round closure
 
 The [closing comparison](reports/PERF_V007_CLOSURE.md) estimates **19.7%
