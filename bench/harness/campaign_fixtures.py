@@ -46,6 +46,7 @@ class Scenario:
     buffer_budget_bytes: int = 64 << 20
     checkpoint_interval_records: int = 512
     identity_lease_size: int = 64
+    capacity_batch_size: int = 0
     fts_statistics_mode: str = "durable"
     fts_updates: int = 0
     rf04_case: str | None = None
@@ -89,7 +90,8 @@ class Scenario:
             from bench.harness.capacity_qualification import validate
             validate(self)
         elif (self.capacity_case is not None or self.buffer_budget_bytes != 64 << 20
-              or self.checkpoint_interval_records != 512 or self.identity_lease_size != 64):
+              or self.checkpoint_interval_records != 512 or self.identity_lease_size != 64
+              or self.capacity_batch_size != 0):
             raise ValueError("capacity config applies only to RF12 recipes")
         if self.family == fts_qualification.FAMILY:
             fts_qualification.validate(self)

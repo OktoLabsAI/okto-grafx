@@ -921,11 +921,18 @@ visibility. The runbook and existing `test_bloat_report.py` cover the read-only
 horizon distinction; fixture-level paired campaigns and explicit decision records
 are tracked separately from this documentation change.
 
-The RF12 external-writer matrix includes a 64-lease/32-row reference, controls
-that vary only the lease or only the batch, and mixed lease/batch interaction
-slices. Attribute a local setting's effect only through its matching one-variable
-pair. An interaction slice describes joint behavior and cannot by itself
-qualify a lease or batch adjustment. The timed interval covers only the read;
+The RF12 external-writer matrix includes a 64-lease/32-row reference, equal-work
+controls that vary only the lease, batch-load slices at lease 64, and mixed
+lease/batch interaction slices. Changing batch also changes the number of rows
+in this fixture, so those cuts describe load scaling rather than a causal
+setting benefit. Attribute a local lease effect only through an equal-work
+pair. Four additional external-writer slices keep the same 512 records and
+lease 64, varying only durable transaction size (1, 32, 128 or 512 records).
+Their returned ACKs, offsets, row counts, commit-call times and full write
+interval are kept separately from read latency; the complete 512-row result
+is checked after a read-only reopen. Those equal-work slices can support a
+local transaction-size decision. Interaction slices cannot by themselves
+qualify an adjustment. The timed interval covers only the read;
 update, checkpoint and bloat census costs remain separate diagnostics.
 
 ## RF11 full-text statistics matrix

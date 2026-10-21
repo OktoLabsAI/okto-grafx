@@ -67,8 +67,15 @@ def test_external_writer_keeps_retained_scores_and_corpus(tmp_path, history, reg
                     "CREATE (:N {id:256,body:'common extra'})",
                     "MATCH (n:N {id:3}) DELETE n",
                 ):
-                    with writer.begin("write") as tx:
+                    tx = writer.begin("write")
+                    try:
                         tx.execute(query)
+                        ack = tx.commit()
+                    except BaseException:
+                        if tx.active:
+                            tx.rollback()
+                        raise
+                    assert ack.durable and ack.wrote
             for term in ("common", "rare"):
                 db._text_stats_cache.clear()
                 retained = db.search_text(reader, index="campaign_text", query=term, k=256)
@@ -81,8 +88,10 @@ def test_external_writer_keeps_retained_scores_and_corpus(tmp_path, history, reg
                 assert tuple(hit.score for hit in current.hits) != tuple(hit.score for hit in retained.hits)
         assert not db.verify("all").findings
     with connect(path) as reopened:
-        assert_corpus(reopened.search_text(index="campaign_text", query="common", k=256),
-                      after, "common")
+        for term in ("common", "rare"):
+            assert_corpus(reopened.search_text(index="campaign_text", query=term, k=256),
+                          after, term)
+        assert not reopened.verify("all").findings
 
 
 @pytest.mark.parametrize("history", [0, 8])

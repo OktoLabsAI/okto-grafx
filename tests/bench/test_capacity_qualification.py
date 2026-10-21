@@ -1,4 +1,5 @@
 """RF12 recipes retain semantic oracles and never authorize maintenance."""
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -32,6 +33,69 @@ def test_external_lease_and_batch_interactions_have_one_variable_controls():
             assert "interaction" in capacity.contract(scenario)["comparison_scope"]
     assert capacity.comparison_scope(next(s for s in cases if
            (s.identity_lease_size, s.write_rows) == (128, 32))) == "lease_only_against_external_64_32"
+
+
+def test_fixed_total_batch_group_rejects_unequal_load_or_missing_reference():
+    group = [s for s in capacity.matrix(Scenario) if s.capacity_batch_size]
+    assert len(group) == 4
+    assert {s.capacity_batch_size for s in group} == {1, 32, 128, 512}
+    assert {(s.nodes, s.write_rows, s.identity_lease_size) for s in group} == {(512, 512, 64)}
+    assert len({tuple(sorted((key, value) for key, value in s.to_dict().items()
+                             if key not in {"name", "capacity_batch_size"})) for s in group}) == 1
+    capacity.validate_batch_selection(group)
+    with pytest.raises(ValueError, match="equal 512-row load"):
+        capacity.validate_batch_selection([replace(group[0], nodes=511, write_rows=511), group[1]])
+    with pytest.raises(ValueError, match="32-row reference"):
+        capacity.validate_batch_selection([group[0], group[2]])
+    from bench.harness.campaign_schema import CampaignError, validate_campaign
+    from tests.bench.test_campaign_schema import campaign
+    data = campaign()
+    data.update(mode="recipe", scenarios=[group[1].to_dict(),
+                                          replace(group[0], nodes=511, write_rows=511).to_dict()])
+    with pytest.raises(CampaignError, match="equal 512-row load"):
+        validate_campaign(data)
+
+
+def test_equal_work_external_transaction_batches_have_durable_ack_and_reopen(tmp_path):
+    scenario = replace(next(s for s in capacity.matrix(Scenario) if s.capacity_batch_size == 32),
+                       nodes=8, write_rows=8, capacity_batch_size=2)
+    with connect(tmp_path / "batch", codec="pure", vector_math="pure",
+                 **capacity.connect_options(scenario)) as db:
+        capacity.build_fixture(db, scenario)
+        sample = capacity.measure(db, scenario, 5, measure_statement)
+    proof = sample["capacity"]["external_write"]
+    assert proof["total_rows"] == 8
+    assert [(ack["offset"], ack["rows"]) for ack in proof["acks"]] == [
+        (0, 2), (2, 2), (4, 2), (6, 2)]
+    assert all(ack["durable"] and ack["ack_duration_ns"] > 0 for ack in proof["acks"])
+    assert sample["capacity"]["reopen_verified"] is True
+    assert sample["capacity"]["minimum_reservation_estimate"] == 64
+    from bench.harness.campaign_schema import compare_campaign
+    from tests.bench.test_campaign_schema import campaign
+    data = campaign()
+    data.update(mode="recipe", intent="exploratory", scenarios=[scenario.to_dict()])
+    for run in data["runs"]:
+        run["samples"] = []
+        for index in range(25):
+            repeated = deepcopy(sample)
+            repeated.update(index=index, kind="warmup" if index < 5 else "retained")
+            run["samples"].append(repeated)
+    tradeoff = compare_campaign(data)["comparisons"][0]["capacity_tradeoff"]
+    assert tradeoff["total_update_rows"] == 8
+    assert tradeoff["transaction_batch_size"] == 2
+    assert tradeoff["by_arm"]["A"]["durable_acks_per_sample"]["median_count"] == 4
+    assert tradeoff["by_arm"]["A"]["external_write_elapsed_ns"] is not None
+    assert tradeoff["by_arm"]["A"]["read_elapsed_ns"] is not None
+    for alteration in (
+        lambda item: item["capacity"]["external_write"].update(total_rows=7),
+        lambda item: item["capacity"]["external_write"]["acks"][1].update(durable=False),
+        lambda item: item["capacity"]["external_write"]["acks"].pop(),
+        lambda item: item["capacity"].update(reopened_rows_hash="0" * 64),
+    ):
+        damaged = deepcopy(sample)
+        alteration(damaged)
+        with pytest.raises(ValueError):
+            capacity.validate_sample(damaged, scenario)
 
 
 @pytest.mark.parametrize("case", ["retained", "released", "external"])
@@ -74,7 +138,7 @@ def test_decision_template_keeps_missing_or_noisy_evidence_inconclusive():
     assert review["decision"] == "review_local_tradeoffs"
     assert review["template_only"] is True
     assert review["authorize_vacuum"] is False
-    assert "one-variable" in review["comparison_scope"]
+    assert "fixed-512 transaction-batch controls" in review["comparison_scope"]
 
 
 def test_invalid_capacity_config_and_unrelated_fields_are_rejected():

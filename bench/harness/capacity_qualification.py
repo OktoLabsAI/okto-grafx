@@ -21,17 +21,27 @@ def matrix(scenario_type):
     slices += [(buffer, 512, 64, 32, "released") for buffer in (16, 256)]
     slices += [(64, interval, 64, 32, "released") for interval in (128, 2048)]
     # The 64/32 external slice above is the reference. Keep one-dimensional
-    # controls beside the mixed lease/batch interaction slices.
+    # controls beside the mixed lease/batch interaction slices. Batch size
+    # changes total fixture rows here, so those slices show load scaling,
+    # not a same-work causal setting comparison.
     slices += [(64, 512, lease, batch, "external") for lease, batch in (
         (1, 32), (32, 32), (128, 32), (512, 32),
         (64, 1), (64, 128), (64, 512),
         (1, 1), (32, 128), (512, 512))]
-    return [scenario_type(f"rf12-{case}-buf{buffer}-cp{interval}-lease{lease}-batch{batch}",
+    result = [scenario_type(f"rf12-{case}-buf{buffer}-cp{interval}-lease{lease}-batch{batch}",
                           "capacity", nodes=batch, edges_per_node=0, write_rows=batch,
                           capacity_case=case, buffer_budget_bytes=buffer << 20,
                           checkpoint_interval_records=interval, identity_lease_size=lease,
                           query_memory_budget_bytes=1 << 20)
             for buffer, interval, lease, batch, case in slices]
+    # These four cuts keep all 512 records and every setting fixed except
+    # the number of records in each durable external-writer transaction.
+    result.extend(scenario_type(f"rf12-external-total512-lease64-txbatch{batch}",
+                                "capacity", nodes=512, edges_per_node=0, write_rows=512,
+                                capacity_case="external", capacity_batch_size=batch,
+                                query_memory_budget_bytes=1 << 20)
+                  for batch in (1, 32, 128, 512))
+    return result
 
 
 def validate(s):
@@ -45,6 +55,10 @@ def validate(s):
         raise ValueError("capacity recipe owns its retained reader and one update batch")
     if s.cursor_batch_size or s.cache != "warm":
         raise ValueError("capacity recipe uses a materialized warm read")
+    if (type(s.capacity_batch_size) is not int or s.capacity_batch_size < 0
+            or s.capacity_batch_size > s.write_rows
+            or (s.capacity_batch_size and s.capacity_case != "external")):
+        raise ValueError("capacity transaction batch requires an external writer and cannot exceed total rows")
 
 
 def connect_options(s):
@@ -75,22 +89,38 @@ def contract(s):
             "case": s.capacity_case, "diagnostic": "read-only; horizon eligibility is not vacuum safety",
             "memory": "query logical peak, process lifetime RSS, and slot bytes are distinct",
             "timing": "read query only; no attribution of write/checkpoint speed to this query",
+            "external_transaction_batch_size": s.capacity_batch_size or s.write_rows,
             "comparison_scope": comparison_scope(s)}
 
 
 def comparison_scope(s):
-    """Label which external settings can support a one-variable comparison."""
+    """Distinguish same-work lease controls from batch workload scaling."""
     if s.capacity_case != "external":
         return "retained/released reader or single-setting capacity slice"
+    if s.capacity_batch_size:
+        return "transaction_batch_size_only_same_512_rows_and_lease64" if (
+            s.write_rows == 512 and s.identity_lease_size == 64) else "custom_batch_slice_requires_matched_total"
     lease_changed = s.identity_lease_size != 64
     batch_changed = s.write_rows != 32
     if lease_changed and batch_changed:
-        return "lease_and_batch_interaction; descriptive only"
+        return "lease_and_batch_load_interaction; descriptive only"
     if lease_changed:
         return "lease_only_against_external_64_32"
     if batch_changed:
-        return "batch_only_against_external_64_32"
+        return "batch_load_slice_same_lease_64; unequal work"
     return "external_64_32_reference"
+
+
+def validate_batch_selection(scenarios):
+    """A qualified batch contrast needs the fixed 512-row reference and peer."""
+    selected = [s for s in scenarios if s.family == "capacity" and s.capacity_batch_size]
+    if not selected:
+        return
+    from bench.harness.campaign_fixtures import Scenario
+    fixed = {s.name: s.to_dict() for s in matrix(Scenario) if s.capacity_batch_size}
+    if (len(selected) < 2 or 32 not in {s.capacity_batch_size for s in selected}
+            or any(fixed.get(s.name) != s.to_dict() for s in selected)):
+        raise ValueError("RF12 batch qualification requires equal 512-row load and the 32-row reference")
 
 
 def build_fixture(db, s):
@@ -120,27 +150,51 @@ def _update(db, s):
     if s.capacity_case != "external":
         with db.begin("write") as tx:
             tx.execute("MATCH(n:P) SET n.note='after'")
-        return
+        return None
     import okto_grafx
     source = Path(okto_grafx.__file__).resolve().parents[1]
     code = """
-import sys,json
+import sys,json,time
 sys.path.insert(0,sys.argv[1])
 from okto_grafx import connect
+total=int(sys.argv[4]); batch=int(sys.argv[5]) or total
+acks=[]; started=time.perf_counter_ns()
 with connect(sys.argv[2],codec='pure',vector_math='pure',**json.loads(sys.argv[3])) as db:
-    with db.begin('write') as tx:
-        tx.execute("MATCH(n:P) SET n.note='after'")
+    for offset in range(0,total,batch):
+        rows=min(batch,total-offset)
+        tx=db.begin('write')
+        try:
+            if int(sys.argv[5]):
+                tx.execute("UNWIND $ids AS id MATCH (n:P {id:id}) SET n.note='after'",
+                           {'ids':list(range(offset,offset+rows))})
+            else:
+                tx.execute("MATCH(n:P) SET n.note='after'")
+            ack_start=time.perf_counter_ns()
+            report=tx.commit()
+            duration=time.perf_counter_ns()-ack_start
+            if not report.durable or not report.wrote:
+                raise RuntimeError('external writer did not return a durable write ACK')
+            acks.append({'offset':offset,'rows':rows,'ack_duration_ns':duration,'durable':True})
+        except BaseException:
+            if tx.active:
+                tx.rollback()
+            raise
     db.checkpoint()
-print('ACK',flush=True)
+print(json.dumps({'total_rows':total,'elapsed_ns':time.perf_counter_ns()-started,
+                  'acks':acks,'scope':'external child execute, durable commits and checkpoint; separate from read timing'}),flush=True)
 """
     import json
     process = subprocess.run(
         [sys.executable, "-E", "-P", "-B", "-c", code, str(source),
-         str(db.path), json.dumps(connect_options(s))],
-        capture_output=True, text=True, timeout=45,
+         str(db.path), json.dumps(connect_options(s)), str(s.write_rows), str(s.capacity_batch_size)],
+        capture_output=True, text=True, timeout=600,
     )
-    if process.returncode or process.stdout.strip() != "ACK":
+    if process.returncode:
         raise ValueError("external capacity writer failed: " + process.stderr[-2000:])
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("external capacity writer returned no structured ACK proof") from exc
 
 
 def measure(db, s, index, measure_statement):
@@ -156,7 +210,7 @@ def measure(db, s, index, measure_statement):
     failure = None
     try:
         reader.execute("MATCH(n:P) RETURN count(n)")
-        _update(db, s)
+        external_write = _update(db, s)
         db.checkpoint()
         before = _census(db)
         sample = measure_statement(db, s, index, reader=reader) if s.capacity_case == "retained" else None
@@ -173,17 +227,26 @@ def measure(db, s, index, measure_statement):
                 failure.add_note(f"capacity reader cleanup failed: {type(cleanup).__name__}")
     db.checkpoint()
     after = _census(db)
+    from okto_grafx import connect
+    expected_after = tuple((i, "after") for i in range(s.nodes))
+    with connect(db.path, read_only=True, **connect_options(s)) as reopened:
+        if (reopened.execute(query_for(s)[0]).rows != expected_after
+                or reopened.verify("all").findings):
+            raise ValueError("capacity post-reopen rows or storage verification diverged")
     preparation_ns = time.perf_counter_ns() - started
     if sample is None:
         sample = measure_statement(db, s, index)
     sample["capacity"] = {"before_close": before, "after_close": after,
                           "diagnostic_storage_unchanged": True,
                           "configuration": effective,
-                          "minimum_reservation_estimate": max(s.identity_lease_size, s.write_rows),
-                          "reservation_scope": "lower bound max(lease,batch), not measured allocation or RSS",
+                          "minimum_reservation_estimate": max(s.identity_lease_size, s.capacity_batch_size or s.write_rows),
+                          "reservation_scope": "lower bound max(lease,transaction rows), not measured allocation or RSS",
                           "lifecycle_ns": preparation_ns,
                           "lifecycle_scope": "update/checkpoint/census/reader lifecycle; includes read only for retained case",
-                          "external_writer_ack": s.capacity_case == "external"}
+                          "external_writer_ack": s.capacity_case == "external",
+                          "external_write": external_write,
+                          "reopen_verified": True,
+                          "reopened_rows_hash": canonical_hash(expected_after)}
     validate_sample(sample, s)
     return sample
 
@@ -205,10 +268,38 @@ def validate_sample(sample, s):
             or raw["after_close"].get("horizon_retained_versions") != 0
             or raw["after_close"].get("horizon_eligible_versions") != s.nodes):
         raise ValueError("capacity retained/released horizon mismatch")
-    if raw.get("minimum_reservation_estimate") != max(s.identity_lease_size, s.write_rows):
-        raise ValueError("capacity lease estimate ignores batch")
+    if raw.get("minimum_reservation_estimate") != max(s.identity_lease_size, s.capacity_batch_size or s.write_rows):
+        raise ValueError("capacity reservation estimate ignores transaction size")
     if raw.get("external_writer_ack") is not (s.capacity_case == "external"):
         raise ValueError("external writer ACK mismatch")
+    expected_after = tuple((i, "after") for i in range(s.nodes))
+    if raw.get("reopen_verified") is not True or raw.get("reopened_rows_hash") != canonical_hash(expected_after):
+        raise ValueError("capacity post-reopen oracle or verification proof missing")
+    proof = raw.get("external_write")
+    if s.capacity_case != "external":
+        if proof is not None:
+            raise ValueError("internal capacity writer cannot claim external ACKs")
+        return
+    if not isinstance(proof, dict) or proof.get("total_rows") != s.write_rows:
+        raise ValueError("external writer total load differs from scenario")
+    elapsed = proof.get("elapsed_ns")
+    if type(elapsed) is not int or elapsed <= 0:
+        raise ValueError("external writer duration missing")
+    batch = s.capacity_batch_size or s.write_rows
+    expected_units = [(offset, min(batch, s.write_rows - offset))
+                      for offset in range(0, s.write_rows, batch)]
+    acks = proof.get("acks")
+    if not isinstance(acks, list) or len(acks) != len(expected_units):
+        raise ValueError("external writer durable ACK count differs from transaction batches")
+    durations = []
+    for ack, (offset, rows) in zip(acks, expected_units):
+        if (not isinstance(ack, dict) or ack.get("offset") != offset or ack.get("rows") != rows
+                or ack.get("durable") is not True or type(ack.get("ack_duration_ns")) is not int
+                or ack["ack_duration_ns"] <= 0):
+            raise ValueError("external writer ACK lacks durable atomic-unit proof")
+        durations.append(ack["ack_duration_ns"])
+    if sum(durations) > elapsed:
+        raise ValueError("external writer ACK durations exceed separate write interval")
 
 
 def decision_template(report, *, objective):
@@ -220,8 +311,8 @@ def decision_template(report, *, objective):
             "report_sha256": canonical_hash(report) if report is not None else None,
             "decision": "review_local_tradeoffs" if reviewable else "new_research",
             "template_only": True, "change_defaults": False, "authorize_vacuum": False,
-            "comparison_scope": "one-variable external controls support local review; mixed lease/batch slices describe interactions only",
+            "comparison_scope": "same-work lease and fixed-512 transaction-batch controls support local review; legacy batch-load and mixed slices remain descriptive",
             "requires": ["recompose raw campaign and semantic gates", "3 pairs/5 warmups/20 retained",
                          "calibration/CPU/dispersion", "per-case RSS/logical/slot bytes and WAL/disk costs",
-                         "match same-load single-variable pairs before attributing a benefit",
+                         "match equal-work single-variable pairs before attributing a setting benefit; legacy batch-load slices are descriptive",
                          "explicit local objective and acceptance; no universal recommendation"]}

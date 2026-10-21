@@ -348,6 +348,12 @@ def _validate(data):
                                       "expected_result_hash": canonical_hash(expected_rows),
                                       "result_hash": canonical_hash(expected_rows), "rows": len(expected_rows)}
     validate_fixed_optimization_matrix(data["scenarios"], mode=data["mode"], intent=data["intent"])
+    if data["intent"] == "qualification" and any(s.family == "capacity" for s in scenarios.values()):
+        from bench.harness.capacity_qualification import validate_batch_selection
+        try:
+            validate_batch_selection(scenarios.values())
+        except ValueError as exc:
+            raise CampaignError(str(exc)) from exc
     if rf06_split:
         expected = [item.to_dict() for item in quota_qualification.qualification_matrix(Scenario)]
         _require(data["scenarios"] == expected,
@@ -890,6 +896,29 @@ def compare_campaign(data):
                 }
             if scenario.family == "write":
                 comparisons[-1]["write_tradeoff"] = write_tradeoff(samples, scenario)
+            if scenario.family == "capacity":
+                from bench.harness.capacity_qualification import comparison_scope as capacity_comparison_scope
+                comparisons[-1]["capacity_tradeoff"] = {
+                    "comparison_scope": capacity_comparison_scope(scenario),
+                    "total_update_rows": scenario.write_rows,
+                    "transaction_batch_size": scenario.capacity_batch_size or scenario.write_rows,
+                    "cost_scope": "external write/ACK durations are separate from the timed read; WAL/disk are complete-sample allocated deltas",
+                    "by_arm": {arm: {
+                        "read_elapsed_ns": distributions[arm],
+                        "external_write_elapsed_ns": _distribution([
+                            s["capacity"]["external_write"]["elapsed_ns"] for s in rows])
+                        if scenario.capacity_case == "external" else None,
+                        "durable_acks_per_sample": _distribution([
+                            len(s["capacity"]["external_write"]["acks"]) for s in rows], "count")
+                        if scenario.capacity_case == "external" else None,
+                        "ack_duration_ns": _distribution([
+                            ack["ack_duration_ns"] for s in rows
+                            for ack in s["capacity"]["external_write"]["acks"]])
+                        if scenario.capacity_case == "external" else None,
+                        "wal_allocated_delta_bytes": _distribution([s["wal_delta_bytes"] for s in rows], "bytes"),
+                        "disk_allocated_delta_bytes": _distribution([s["disk_delta_bytes"] for s in rows], "bytes"),
+                    } for arm, rows in samples.items()},
+                }
             if scenario.family == "unique_create":
                 comparisons[-1]["unique_create_diagnostic"] = {
                     "atomic_unit": "one transaction; one durable ACK",
