@@ -274,16 +274,35 @@ def collect_candidate_memory(run, budgets, directory):
     return evidence
 
 
-def execute_write_recipe(db, scenario, records):
+def error_record(exc):
+    result = {"type": type(exc).__name__, "message": str(exc)}
+    if hasattr(exc, "evidence"):
+        result["write_failure"] = exc.evidence
+    return result
+
+
+class WriteCampaignFailure(CampaignError):
+    def __init__(self, evidence):
+        self.evidence = evidence
+        super().__init__("write failed; durable prefix retained in write_failure; no replay")
+
+
+def execute_write_recipe(db, scenario, records, *, failure_evidence=None):
     """Use existing APIs; collect only returned ACKs, never replay a failed commit."""
     query = query_for(scenario)[0]
     width = (1 if scenario.write_shape == "transactions" else
              scenario.chunk_rows if scenario.write_shape == "chunks" else len(records))
     stats, reports, commit_ns = {}, [], 0
+    audit = failure_evidence if failure_evidence is not None else {}
+    audit.update(confirmed_prefix=[], failed_transaction=None, cleanup_error=None)
     for offset in range(0, len(records), max(1, width)):
         group = records[offset:offset + width]
-        tx = db.begin("write")
+        tx = None
+        primary = None
+        phase = "begin"
         try:
+            tx = db.begin("write")
+            phase = "execute"
             if scenario.write_shape == "executemany":
                 results = (tx.executemany(query, iter(group)),)
             elif scenario.write_shape in ("statements", "transactions"):
@@ -294,16 +313,29 @@ def execute_write_recipe(db, scenario, records):
                 for key, value in result.statistics.items():
                     stats[key] = stats.get(key, 0) + value
             ack_start = time.perf_counter_ns()
+            phase = "commit"
             report = tx.commit()
             commit_ns += time.perf_counter_ns() - ack_start
             reports.append({"csn": int(report.csn), "durable": report.durable, "wrote": report.wrote})
             if report.durable is not True or report.wrote is not True:
                 raise CampaignError("write returned no durable ACK; campaign invalid, no replay")
+            audit["confirmed_prefix"].append(reports[-1])
+        except BaseException as exc:
+            primary = exc
+            audit["primary_error"] = error_record(exc)
+            audit["failed_transaction"] = {"offset": offset, "rows": len(group), "phase": phase,
+                                           "outcome": "not_assumed_aborted_or_durable"}
+            raise
         finally:
             # A commit refusal may leave the transaction active. Confirmed and
             # uncertain outcomes never receive replay from this measurement.
-            if tx.active:
-                tx.rollback()
+            if tx is not None and tx.active:
+                try:
+                    tx.rollback()
+                except BaseException as cleanup:
+                    audit["cleanup_error"] = error_record(cleanup)
+                    if primary is None:
+                        raise
     return stats, reports, commit_ns
 
 
@@ -311,13 +343,19 @@ def _measure_writer(db, scenario, records):
     sequence = getattr(db._queries, "_observe_logical_memory_sequence", None)
     observe = sequence or (getattr(db._queries, "_observe_logical_memory", None)
                            if scenario.write_shape == "unwind" else None)
-    with (observe() if observe else nullcontext(None)) as observation:
-        cpu_start, start = time.process_time_ns(), time.perf_counter_ns()
-        stats, reports, commit_ns = execute_write_recipe(db, scenario, records)
-        elapsed, cpu = time.perf_counter_ns() - start, time.process_time_ns() - cpu_start
+    audit = {}
+    try:
+        with (observe() if observe else nullcontext(None)) as observation:
+            cpu_start, start = time.process_time_ns(), time.perf_counter_ns()
+            stats, reports, commit_ns = execute_write_recipe(db, scenario, records, failure_evidence=audit)
+            elapsed, cpu = time.perf_counter_ns() - start, time.process_time_ns() - cpu_start
+    except BaseException as exc:
+        audit.setdefault("primary_error", error_record(exc))
+        raise WriteCampaignFailure(audit) from exc
     memory = observation.result() if observation else unavailable_memory("revision_has_no_sequence_memory_observer")
     peak, rss_scope = rss_peak()
     return {"elapsed_ns": elapsed, "cpu_ns": cpu, "commit_ns": commit_ns,
+            "started_ns": start,
             "memory_budget_bytes": scenario.query_memory_budget_bytes,
             "statistics": stats, "commit_reports": reports, "memory": memory,
             "rss_peak_bytes": peak, "rss_scope": rss_scope}
@@ -354,6 +392,7 @@ def _writer_child(root, spec, number, barrier, queue):
     """Spawn target with disjoint keys; any conflict/error remains a failed run."""
     import okto_grafx
     scenario = Scenario.from_dict(spec)
+    measured = None
     try:
         with okto_grafx.connect(root, query_memory_budget_bytes=scenario.query_memory_budget_bytes) as db:
             records = [{"id": number * scenario.write_rows + i, "payload": "x" * scenario.payload_bytes}
@@ -362,18 +401,31 @@ def _writer_child(root, spec, number, barrier, queue):
             measured = _measure_writer(db, scenario, records)
             queue.put(dict(measured, writer=number, process_id=os.getpid()))
     except BaseException as exc:
-        queue.put({"writer": number, "error": type(exc).__name__, "message": str(exc)})
+        failure = error_record(exc)
+        if measured is not None:
+            failure["confirmed_before_close_failure"] = measured["commit_reports"]
+        queue.put({"writer": number, "error": failure})
         try:
             barrier.abort()
         except Exception:
             pass
 
 
+class _BarrierTimestamp:
+    """Spawn-picklable action runs before the barrier releases any writer."""
+    def __init__(self, shared):
+        self.shared = shared
+
+    def __call__(self):
+        self.shared.value = time.perf_counter_ns()
+
+
 def measure_concurrent_write(root, scenario, index):
     """Independent writer processes. Keep individual peaks; never sum them."""
     import okto_grafx
     ctx = multiprocessing.get_context("spawn")
-    barrier, queue = ctx.Barrier(scenario.writers + 1), ctx.Queue()
+    stamp = ctx.Value("q", 0)
+    barrier, queue = ctx.Barrier(scenario.writers + 1, action=_BarrierTimestamp(stamp)), ctx.Queue()
     children = [ctx.Process(target=_writer_child, args=(str(root), scenario.to_dict(), i, barrier, queue))
                 for i in range(scenario.writers)]
     try:
@@ -382,11 +434,11 @@ def measure_concurrent_write(root, scenario, index):
         # Startup/open is excluded; begin/execute/commit through all ACKs included.
         start = time.perf_counter_ns()
         barrier.wait(timeout=60)
-        release = time.perf_counter_ns()
+        release = stamp.value
         writers = [queue.get(timeout=120) for _ in children]
         elapsed = time.perf_counter_ns() - release
         if any("error" in writer for writer in writers):
-            raise CampaignError(f"writer failed: {writers}")
+            raise WriteCampaignFailure({"writers": writers, "sample_qualified": False})
         for child in children:
             child.join(timeout=10)
             if child.exitcode != 0:
@@ -410,6 +462,7 @@ def measure_concurrent_write(root, scenario, index):
                            rss_peak_bytes=peak, rss_scope=rss_scope,
                            commit_ns=max(w["commit_ns"] for w in writers), selected_plan=["concurrent_native_" + scenario.write_shape])
     sample.update(writers=sorted(writers, key=lambda w: w["writer"]),
+                  barrier_release_ns=release,
                   prepare_boundary="spawn_open_and_barrier_ready_not_query_compile",
                   commit_boundary="maximum individual durable commit duration; individual ACKs in writers",
                   cpu_scope="sum of writer CPU times; not coordinator CPU",
@@ -506,7 +559,7 @@ def run_worker(request, output):
         if _git(source, "rev-parse", "HEAD") != revision or _git(source, "status", "--porcelain"):
             raise CampaignError("source changed during worker execution")
     except BaseException as exc:
-        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        report["error"] = error_record(exc)
         output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
         raise
     output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")

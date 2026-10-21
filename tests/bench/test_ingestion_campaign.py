@@ -110,6 +110,58 @@ def test_refused_ack_is_not_counted_or_replayed():
     assert calls == ["commit"]
 
 
+def test_partial_ack_audit_preserves_primary_and_cleanup_failure():
+    from types import SimpleNamespace
+    calls, audit = [], {}
+    primary = ValueError("primary execution failure")
+    class Tx:
+        active = True
+        def execute(self, *_):
+            if calls:
+                raise primary
+            return SimpleNamespace(statistics={})
+        def commit(self):
+            calls.append("commit")
+            self.active = False
+            return SimpleNamespace(csn=7, durable=True, wrote=True)
+        def rollback(self):
+            raise OSError("cleanup failure")
+    scenario = Scenario("failure", "write", write_shape="chunks", chunk_rows=1, partial_progress=True)
+    with pytest.raises(ValueError) as caught:
+        campaign_worker.execute_write_recipe(SimpleNamespace(begin=lambda _: Tx()), scenario,
+                                              [{"id": 1}, {"id": 2}], failure_evidence=audit)
+    assert caught.value is primary
+    assert audit["confirmed_prefix"] == [{"csn": 7, "durable": True, "wrote": True}]
+    assert audit["failed_transaction"]["offset"] == 1
+    assert audit["cleanup_error"]["type"] == "OSError"
+    calls.clear()
+    db = SimpleNamespace(begin=lambda _: Tx(), _queries=SimpleNamespace())
+    with pytest.raises(campaign_worker.WriteCampaignFailure) as measured:
+        campaign_worker._measure_writer(db, scenario, [{"id": 1}, {"id": 2}])
+    import json
+    artifact = json.loads(json.dumps(campaign_worker.error_record(measured.value)))
+    assert artifact["write_failure"]["confirmed_prefix"] == audit["confirmed_prefix"]
+    assert artifact["write_failure"]["primary_error"]["type"] == "ValueError"
+    assert artifact["write_failure"]["cleanup_error"]["type"] == "OSError"
+
+
+def test_barrier_action_records_time_before_any_participant_returns():
+    import threading
+    import time
+    from types import SimpleNamespace
+    stamp = SimpleNamespace(value=0)
+    barrier = threading.Barrier(2, action=campaign_worker._BarrierTimestamp(stamp))
+    observed = []
+    def worker():
+        barrier.wait()
+        observed.append(time.perf_counter_ns())
+    thread = threading.Thread(target=worker)
+    thread.start()
+    barrier.wait()
+    thread.join()
+    assert 0 < stamp.value <= observed[0]
+
+
 @pytest.mark.parametrize("shape,commits", [("unwind", 1), ("statements", 1), ("executemany", 1), ("chunks", 2), ("transactions", 3)])
 def test_recipe_confirms_real_atomic_units_and_reopens(tmp_path, shape, commits):
     scenario = Scenario("recipe", "write", nodes=1, edges_per_node=0, write_rows=3,
@@ -159,7 +211,13 @@ def test_concurrent_proof_has_individual_memory_and_actual_acks(tmp_path, writer
     assert sample["memory"]["logical_memory_peak_bytes"] is None
     assert sample["write"]["commits"] == sample["write"]["durable_acks"] == writers
     assert len({w["process_id"] for w in sample["writers"]}) == writers
+    assert all(sample["barrier_release_ns"] <= w["started_ns"] for w in sample["writers"])
     campaign_schema.validate_write_sample(sample, scenario, qualification=True)
+    for change in ({"rss_peak_bytes": 0}, {"rss_peak_bytes": -1}, {"rss_scope": "coordinator"}):
+        invalid = copy.deepcopy(sample)
+        invalid["writers"][0].update(change)
+        with pytest.raises(campaign_schema.CampaignError, match="RSS"):
+            campaign_schema.validate_write_sample(invalid, scenario, qualification=True)
     broken = copy.deepcopy(sample)
     broken["writers"][0]["memory"]["logical_memory_peak_bytes"] = None
     with pytest.raises(campaign_schema.CampaignError, match="memory"):

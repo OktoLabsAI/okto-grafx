@@ -28,6 +28,52 @@ def test_missing_manifest_fails_before_launch(tmp_path, monkeypatch):
         ingestion_qualification.run(Path(__file__).resolve().parents[2])
 
 
+def test_exit_two_requires_complete_recomputed_inconclusive(monkeypatch, tmp_path):
+    from bench.harness import ingestion_qualification as q
+    monkeypatch.setattr(q, "inspect_result", lambda *_: {"decision": "inconclusive"})
+    q.phase_result(2, 1, tmp_path, {})
+    for code, index in ((1, 1), (2, 0), (3, 1)):
+        with pytest.raises(RuntimeError):
+            q.phase_result(code, index, tmp_path, {})
+    monkeypatch.setattr(q, "inspect_result", lambda *_: {"decision": "failed"})
+    with pytest.raises(RuntimeError):
+        q.phase_result(2, 1, tmp_path, {})
+    def incomplete(*_):
+        raise ValueError("incomplete raw")
+    monkeypatch.setattr(q, "inspect_result", incomplete)
+    with pytest.raises(ValueError, match="incomplete"):
+        q.phase_result(2, 1, tmp_path, {})
+
+
+def test_repeat_binds_all_raw_and_rejects_third_attempt(tmp_path, monkeypatch):
+    import hashlib
+    from bench.harness import ingestion_qualification as q
+    from bench.harness.campaign_fixtures import ingestion_matrix
+    previous = tmp_path / "runs/first"
+    (previous / "campaign").mkdir(parents=True)
+    raw = b'{"synthetic_unit_test_only":true}'
+    (previous / "campaign/campaign.json").write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    old = {"schema_version": "grafx-rf09-runner/v1", "candidate_revision": "b" * 40,
+           "baseline_revision": "a" * 40, "candidate_root": "candidate", "baseline_root": "baseline", "python": "python",
+           "memory_budget_bytes": 1048576, "timeout_seconds": 3500,
+           "scenarios": [s.name for s in ingestion_matrix()]}
+    (previous / "operational-manifest.json").write_text(json.dumps(old), encoding="utf-8")
+    (previous / "runner-receipt.json").write_text(json.dumps({"decision": "inconclusive",
+            "artifact_sha256": {"campaign/campaign.json": digest}}), encoding="utf-8")
+    manifest = dict(old, attempt=2, previous_output=str(previous), previous_campaign_sha256=digest)
+    monkeypatch.setattr(q, "inspect_result", lambda *_: {"decision": "inconclusive"})
+    q.validate_manifest(manifest)
+    assert q.verify_previous(tmp_path, manifest) == previous / "campaign/campaign.json"
+    with pytest.raises(ValueError, match="at most"):
+        q.validate_manifest(dict(manifest, attempt=3))
+    with pytest.raises(ValueError, match="changed scenarios"):
+        q.verify_previous(tmp_path, dict(manifest, scenarios=list(reversed(old["scenarios"]))))
+    (previous / "campaign/campaign.json").write_bytes(raw + b' ')
+    with pytest.raises(ValueError, match="artifact changed"):
+        q.verify_previous(tmp_path, manifest)
+
+
 def test_supervisor_failure_preserves_failed_audit_without_qualification(tmp_path, monkeypatch):
     from bench.harness import campaign, ingestion_qualification
     from bench.harness.campaign_fixtures import ingestion_matrix

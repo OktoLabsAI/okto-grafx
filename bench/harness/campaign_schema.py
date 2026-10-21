@@ -459,6 +459,14 @@ def validate_write_sample(sample, scenario, *, qualification):
                  "missing or duplicate writer proof")
         _require(len({w.get("process_id") for w in writers}) == scenario.writers, "writers must be independent processes")
         for writer in writers:
+            _integer(sample.get("barrier_release_ns"), "barrier release", 1)
+            _integer(writer.get("started_ns"), "writer start", 1)
+            _require(sample["barrier_release_ns"] <= writer["started_ns"] and
+                     writer["started_ns"] + writer["elapsed_ns"] <= sample["barrier_release_ns"] + sample["elapsed_ns"],
+                     "writer work falls outside common barrier interval")
+            _integer(writer.get("rss_peak_bytes"), "writer RSS", 1)
+            _require(writer.get("rss_scope") in ("process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"),
+                     "writer RSS scope invalid")
             _require(writer.get("memory_budget_bytes") == scenario.query_memory_budget_bytes, "writer memory budget differs from scenario")
             _integer(writer.get("process_id"), "writer process ID", 1)
             _require(len(writer.get("commit_reports", [])) == count, "writer ACK count differs from atomic units")

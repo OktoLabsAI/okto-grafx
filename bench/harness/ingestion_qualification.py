@@ -3,8 +3,8 @@
 LOCALAPPDATA/Okto/Grafx/rf09-runner.json selects immutable sources and a new
 output below runs/. Both revisions must supply real sequence memory observation.
 No missing proof, timeout or incomplete campaign can produce a passed receipt.
-This bridge supports the first whole campaign; repeat authorization remains a
-separate planning action and must not be achieved by selecting favorable raw.
+One explicit whole repeat may follow a complete inconclusive campaign, preserving
+the previous raw and matrix. Failed/incomplete evidence cannot authorize a repeat.
 """
 from __future__ import annotations
 
@@ -23,6 +23,15 @@ from bench.harness.pulse_qualification import canonical_path, inventory, verify_
 def validate_manifest(manifest):
     if manifest.get("schema_version") != "grafx-rf09-runner/v1":
         raise ValueError("RF09 manifest version required")
+    attempt = manifest.get("attempt", 1)
+    if type(attempt) is not int or attempt not in (1, 2):
+        raise ValueError("at most one whole repeat is allowed")
+    if attempt == 2:
+        digest = manifest.get("previous_campaign_sha256", "")
+        if not manifest.get("previous_output") or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("repeat requires previous output and exact raw hash")
+    elif manifest.get("previous_output") is not None or manifest.get("previous_campaign_sha256") is not None:
+        raise ValueError("first attempt cannot select previous evidence")
     for key in ("baseline_revision", "candidate_revision"):
         value = manifest.get(key)
         if not isinstance(value, str) or len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
@@ -62,8 +71,8 @@ def inspect_result(output, manifest):
         s["query_memory_budget_bytes"] != manifest["memory_budget_bytes"] for s in raw["scenarios"]
     ):
         raise ValueError("matrix or budget differs from operational manifest")
-    if raw["protocol"]["attempt"] != 1 or raw["protocol"]["previous_campaign_sha256"] is not None:
-        raise ValueError("first whole campaign required")
+    if raw["protocol"]["attempt"] != manifest.get("attempt", 1) or raw["protocol"]["previous_campaign_sha256"] != manifest.get("previous_campaign_sha256"):
+        raise ValueError("whole campaign retry lineage differs from manifest")
     calibration = (output.parent / "calibration.json").read_text(encoding="utf-8")
     if raw["calibration"]["raw_json"] != calibration or raw["calibration"]["sha256"] != hashlib.sha256(calibration.encode()).hexdigest():
         raise ValueError("calibration differs from operational run")
@@ -77,6 +86,40 @@ def inspect_result(output, manifest):
         if worker != run:
             raise ValueError("worker raw differs from assembled campaign")
     return report
+
+
+def verify_previous(base, manifest):
+    if manifest.get("attempt", 1) == 1:
+        return None
+    previous = canonical_path(manifest["previous_output"])
+    previous.relative_to(base / "runs")
+    old = json.loads((previous / "operational-manifest.json").read_text(encoding="utf-8"))
+    validate_manifest(old)
+    if old.get("attempt", 1) != 1:
+        raise ValueError("cannot repeat a second attempt")
+    for field in ("candidate_revision", "baseline_revision", "candidate_root", "baseline_root", "python", "memory_budget_bytes", "scenarios"):
+        if manifest[field] != old[field]:
+            raise ValueError("repeat changed " + field)
+    receipt = json.loads((previous / "runner-receipt.json").read_text(encoding="utf-8"))
+    if receipt.get("decision") != "inconclusive" or inspect_result(previous / "campaign", old)["decision"] != "inconclusive":
+        raise ValueError("repeat requires complete inconclusive evidence")
+    for name, digest in receipt["artifact_sha256"].items():
+        artifact = canonical_path(previous / name)
+        artifact.relative_to(previous)
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != digest:
+            raise ValueError("previous artifact changed")
+    raw = canonical_path(previous / "campaign/campaign.json")
+    if hashlib.sha256(raw.read_bytes()).hexdigest() != manifest["previous_campaign_sha256"]:
+        raise ValueError("previous campaign hash differs")
+    return raw
+
+
+def phase_result(code, index, output, manifest):
+    if code == 0:
+        return
+    if index == 1 and code == 2 and inspect_result(output / "campaign", manifest)["decision"] == "inconclusive":
+        return
+    raise RuntimeError(f"RF09 phase {index} exited {code}; artifacts preserved")
 
 
 def _run(snapshot, expected_manifest_hash):
@@ -97,6 +140,7 @@ def _run(snapshot, expected_manifest_hash):
     verify_snapshot(snapshot, before)
     output = canonical_path(manifest["output"])
     output.relative_to(base / "runs")
+    previous = verify_previous(base, manifest)
     output.mkdir(parents=True, exist_ok=False)
     (output / "operational-manifest.json").write_bytes(raw)
     receipt = {"decision": "incomplete", "manifest_sha256": expected_manifest_hash, "commands": []}
@@ -107,6 +151,8 @@ def _run(snapshot, expected_manifest_hash):
                           "--memory-budget", str(manifest["memory_budget_bytes"]), "--max-cpu-percent", "20",
                           "--calibration", str(output / "calibration.json"), "--output", str(output / "campaign"),
                           *[part for name in manifest["scenarios"] for part in ("--scenario", name)]]]
+    if previous is not None:
+        commands[1].extend(("--previous", str(previous)))
     try:
         for index, command in enumerate(commands):
             remaining = manifest["timeout_seconds"] - (time.monotonic() - started) - 5
@@ -115,11 +161,10 @@ def _run(snapshot, expected_manifest_hash):
             receipt["commands"].append(command)
             with (output / f"phase-{index}.log").open("x", encoding="utf-8") as log:
                 code = campaign.execute_worker(command, log, remaining)
-            if code:
-                raise RuntimeError(f"RF09 phase {index} exited {code}; artifacts preserved")
+            phase_result(code, index, output, manifest)
         receipt["report"] = inspect_result(output / "campaign", manifest)
         receipt["decision"] = receipt["report"]["decision"]
-        if receipt["decision"] != "tradeoff_reported":
+        if receipt["decision"] not in ("tradeoff_reported", "inconclusive"):
             raise RuntimeError("RF09 did not produce complete qualified tradeoff evidence")
     except BaseException as failure:
         receipt["decision"] = "failed"
@@ -163,9 +208,9 @@ def run(snapshot):
         if code:
             raise RuntimeError("RF09 child failed; artifacts preserved at " + str(audit))
         child = json.loads(result.read_text(encoding="utf-8"))
-        if child.get("decision") != "tradeoff_reported":
+        if child.get("decision") not in ("tradeoff_reported", "inconclusive"):
             raise RuntimeError("RF09 child did not qualify")
-        receipt["decision"] = "tradeoff_reported"
+        receipt["decision"] = child["decision"]
         return child
     finally:
         (audit / "supervisor-receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
