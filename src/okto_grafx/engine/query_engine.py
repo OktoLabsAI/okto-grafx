@@ -13707,6 +13707,10 @@ def _write_rows(
     source = engine._rows(node.child, context)
     failure = None
     try:
+        batch_index = _create_primary_key_batch_index(engine, node, context)
+        if batch_index is not None:
+            yield from _write_primary_key_batches(engine, node, context, source, batch_index)
+            return
         for row in source:
             if isinstance(node, MergePattern) and node.match_plan is not None:
                 yield from _merge_whole_pattern_rows(engine, node, row, context)
@@ -13722,6 +13726,118 @@ def _write_rows(
         raise
     finally:
         _close_iterator(source, failure)
+
+
+def _create_primary_key_batch_index(
+    engine: QueryEngine, node: PlanNode, context: _Context
+) -> object | None:
+    """Admit only an already materialised, total INT64-key CREATE stream.
+
+    No iterator or arbitrary expression is evaluated here. In particular, a later
+    invalid value must not move its schema error before an earlier duplicate.
+    Configured memory quotas retain the scalar path and its existing frontier.
+    """
+    statement = context.analysis.statement
+    if (type(statement) is not Query or context.procedure_parent is not None
+            or len(statement.ordered_clauses()) != 2
+            or type(statement.ordered_clauses()[1]) is not CreateClause):
+        return None
+    if (type(node) is not CreateRelationships or node.relationships
+            or node.path_variable is not None or len(node.nodes) != 1
+            or type(node.child) is not UnwindRows
+            or type(node.child.child) is not SingleRow
+            or type(node.child.expression) is not Parameter
+            or engine._query_memory_budget_bytes is not None):
+        return None
+    written = node.nodes[0]
+    table = written.table
+    if (table is None or table.kind != "node" or table.flexible_properties
+            or table.arity != 1 or table.primary_key != table.columns[0].name
+            or table.columns[0].type is not ValueType.INT64
+            or written.variable is None
+            or written.labels not in ((), (table.name,))
+            or written.properties is None or len(written.properties.entries) != 1):
+        return None
+    entry = written.properties.entries[0]
+    if (entry.key != table.primary_key or type(entry.value) is not Variable
+            or entry.value.name != node.child.alias):
+        return None
+    values = context.parameters.get(node.child.expression.name)
+    if (type(values) not in (list, tuple) or len(values) < 2
+            or any(type(value) is not int or not -(1 << 63) <= value < (1 << 63)
+                   for value in values)):
+        return None
+    manager = getattr(engine, "_indexes", None)
+    if (type(manager) is not IndexManager
+            or manager._heap is not engine.heap
+            or getattr(engine.heap.read, "__func__", None) is not _VECTOR_FREE_CANONICAL_READ
+            or getattr(engine.heap._decode_version, "__func__", None) is not _VECTOR_FREE_CANONICAL_DECODE
+            or getattr(engine.heap._read_slot, "__func__", None) is not _SCALAR_PK_CANONICAL_READ_SLOT):
+        return None
+    # Both the scalar validator and the group validator must still be canonical.
+    # An adapter/wrapper may implement a different authority contract.
+    for name, native in (("validated_versions_many", _NATIVE_VALIDATED_VERSIONS_MANY),
+                         ("validated_versions", _VECTOR_FREE_CANONICAL_VALIDATED),
+                         ("validated", IndexManager.validated)):
+        method = getattr(manager, name, None)
+        if getattr(method, "__func__", method) is not native:
+            return None
+    try:
+        index = _catalog_active_index(
+            manager, primary_key_index_name(table.name), context.schema(),
+            txn=context.txn, projection=context.index_authority,
+        )
+    except GrafxError:
+        return None
+    if (type(index) is not HashIndex or getattr(index, "stale", False)
+            or index.definition.table_id != table.table_id
+            or index.definition.table_name != table.name
+            or index.definition.positions != (0,)):
+        return None
+    return index
+
+
+def _write_primary_key_batches(
+    engine: QueryEngine, node: CreateRelationships, context: _Context,
+    source: Iterator[_Row], index: object,
+) -> Iterator[_Row]:
+    """Reuse one certified persisted answer per occurrence, never deduplicate writes.
+
+    Local overlays are checked by the ordinary uniqueness reducer *after* every
+    preceding occurrence is staged. Answers never escape this one statement.
+    A failed speculative group is replayed through scalar validation in order,
+    so neither a later corrupt key nor an unstable certificate masks a prior
+    duplicate. A failed query still uses the enclosing statement rollback mark.
+    """
+    while True:
+        rows = []
+        for _ in range(64):
+            try:
+                rows.append(next(source))
+            except StopIteration:
+                break
+        if not rows:
+            return
+        keys = tuple(index_key((row.bindings[node.child.alias],), (0,)) for row in rows)
+        context.count("pk_uniqueness_batches")
+        persisted_failure = None
+        try:
+            groups = engine._indexes.validated_versions_many(index, keys, context.snapshot)
+        except GrafxError as caught:
+            if caught.details.get("field") in ("index_view_changed", "index_view_unavailable"):
+                # The group already spent the native retry budget. Do not reset
+                # it through scalar calls; first retain the local conflict order.
+                persisted_failure = caught
+            else:
+                # This is not absence. Demand each scalar check to preserve the
+                # first error; stable corruption still propagates when demanded.
+                context.count("pk_uniqueness_scalar_replays")
+            groups = (None,) * len(rows)
+        for row, stored in zip(rows, groups, strict=True):
+            yield _write_pattern(engine, node, row, context, persisted_pk_rows=stored,
+                                 persisted_pk_failure=persisted_failure)
+        # Drop this certificate's answers before allocating the following group.
+        del row, stored, rows, keys, groups
 
 
 def _merge_whole_pattern_rows(
@@ -14525,6 +14641,9 @@ def _write_pattern(
     node: CreateRelationships | MergePattern,
     row: _Row,
     context: _Context,
+    *,
+    persisted_pk_rows: tuple[tuple[object, object], ...] | None = None,
+    persisted_pk_failure: GrafxError | None = None,
 ) -> _Row:
     """Materialise and stage the nodes and edges one written pattern names."""
     merging = isinstance(node, MergePattern)
@@ -14568,6 +14687,8 @@ def _write_pattern(
         _require_unique_primary_key(
             engine, written.table, values, context,
             also=[held[1] for held in staged if held[0].table_id == written.table.table_id],
+            persisted_rows=persisted_pk_rows,
+            persisted_failure=persisted_pk_failure,
         )
         pending = _pending_binding(written.variable, written.table, values, node_labels=node_labels)
         staged.append(
@@ -15845,6 +15966,8 @@ def _require_unique_primary_key(
     *,
     also: Sequence[tuple[Value, ...]] = (),
     replacing: object = None,
+    persisted_rows: tuple[tuple[object, object], ...] | None = None,
+    persisted_failure: GrafxError | None = None,
 ) -> None:
     """Refuse a row whose primary key another live row of the table already carries.
 
@@ -15882,7 +16005,10 @@ def _require_unique_primary_key(
         excluded=statement.changed_refs,
     ):
         raise _duplicate_key(table, key)
-    stored = _rows_carrying_key(engine, table, key, position, context)
+    if persisted_failure is not None:
+        raise persisted_failure
+    stored = (persisted_rows if persisted_rows is not None
+              else _rows_carrying_key(engine, table, key, position, context))
     if stored is None:
         stored = engine.heap.scan(table, context.snapshot)
     for ref, version in stored:
