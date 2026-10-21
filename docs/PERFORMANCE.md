@@ -983,6 +983,17 @@ even when the process-local statistics cache is freshly opened. Run only
 selected slices with the campaign's `recipe` mode and calibrated three-pair
 protocol; these synthetic results do not change the `wal` default.
 
+The write-cost matrix also includes paired `wal`/`durable` 256-document cuts
+for one insert, one update, one delete and a four-commit mixed workload from a
+second handle. Each unit must return a durable write ACK. Maintenance time,
+each ACK duration and signed allocated database/WAL byte changes are recorded
+outside search timing; a fresh handle then measures the read. A later read-only
+reopen checks the input-derived ID/score/corpus oracle and `verify("all")` after
+checkpoint. The mixed cut demonstrates visibility across handles, but four
+sequential commits do not establish simultaneous writer throughput. These
+costs are compared by operation and mode; they are not pooled into one update
+distribution or described as logical WAL append bytes.
+
 ## RF01 historical total-overhead qualification
 
 RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`

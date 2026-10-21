@@ -173,7 +173,7 @@ def measure_statement(db, scenario, index, *, reader=None):
     if native_fts:
         memory = unavailable_memory("native_fts_memory_not_covered_by_query_budget_observer")
         stats = fts_qualification.statistics(result)
-        if result.corpus_documents != scenario.nodes:
+        if result.corpus_documents != fts_qualification.corpus_documents(scenario):
             raise CampaignError("FTS corpus count differs from fixture")
         if result.statistics_regime != fts_qualification.expected_source(scenario):
             raise CampaignError("FTS statistics source does not cover the declared recipe")
@@ -661,7 +661,8 @@ def run_worker(request, output):
             with tempfile.TemporaryDirectory(prefix="fixture-", dir=output.parent) as directory:
                 root = Path(directory) / "db"
                 independent = scenario.family in ("write", "capacity", uniqueness_qualification.FAMILY) or scenario.reader == "retained" or (
-                    scenario.family == fts_qualification.FAMILY and scenario.fts_updates > 0)
+                    scenario.family == fts_qualification.FAMILY and (
+                        scenario.fts_updates > 0 or scenario.fts_write_case != "none"))
                 shared_fts_setup = None
                 if not independent:
                     setup_start = time.perf_counter_ns()
@@ -686,8 +687,25 @@ def run_worker(request, output):
                                             "disk_allocated_bytes": setup_bytes,
                                             "wal_allocated_bytes": setup_wal,
                                             "scope": "seed_insert_index_creation_checkpoint_and_close"}
+                    fts_setup = sample_fts_setup or shared_fts_setup
+                    fts_update = None
+                    if scenario.family == fts_qualification.FAMILY and scenario.fts_write_case != "none":
+                        before_write, wal_before_write = _sizes(sample_root)
+                        update_start = time.perf_counter_ns()
+                        with okto_grafx.connect(sample_root, **measured_options) as maintenance_db:
+                            commit_times = fts_qualification.apply_write_case(
+                                maintenance_db, scenario, sample_root)
+                        update_elapsed = time.perf_counter_ns() - update_start
+                        updated, updated_wal = _sizes(sample_root)
+                        fts_update = {"elapsed_ns": update_elapsed,
+                                      "durable_acks": len(commit_times),
+                                      "commit_ns": list(commit_times),
+                                      "disk_allocated_delta_bytes": updated - before_write,
+                                      "wal_allocated_delta_bytes": updated_wal - wal_before_write,
+                                      "scope": "separate_durable_units_before_cold_reopen",
+                                      "write_case": scenario.fts_write_case,
+                                      "writer_origin": "second_handle" if scenario.fts_write_case == "external_mixed" else "same_handle"}
                     with okto_grafx.connect(sample_root, **measured_options) as db:
-                        fts_setup = sample_fts_setup or shared_fts_setup
                         if independent and scenario.family != fts_qualification.FAMILY:
                             build_fixture(db, scenario, apply_updates=scenario.reader != "retained")
                         report["metrics_sink"] = type(db._queries._metrics.sink.inner).__name__
@@ -708,7 +726,6 @@ def run_worker(request, output):
                             else:
                                 db.execute(query, params)
                         before, wal_before = _sizes(sample_root)
-                        fts_update = None
                         if scenario.family == fts_qualification.FAMILY and scenario.fts_updates == 1:
                             update_start = time.perf_counter_ns()
                             commit_times = fts_qualification.apply_updates(db, scenario)
@@ -765,6 +782,16 @@ def run_worker(request, output):
                             if reopened.verify("all").findings:
                                 raise CampaignError("RF08 reopen verification found corruption")
                         sample["unique_create"]["reopened"] = True
+                    if scenario.family == fts_qualification.FAMILY and scenario.fts_write_case != "none":
+                        with okto_grafx.connect(sample_root, **options) as recovery:
+                            recovery.checkpoint()
+                        with okto_grafx.connect(sample_root, read_only=True, **options) as reopened:
+                            found, _ = fts_qualification.rows(reopened, scenario)
+                            if canonical_hash(found) != canonical_hash(oracle(scenario)):
+                                raise CampaignError("RF11 read-only reopen oracle mismatch")
+                            if reopened.verify("all").findings:
+                                raise CampaignError("RF11 reopen verification found corruption")
+                        sample["fts_maintenance"]["read_only_reopen_verified"] = True
                     report["samples"].append(sample)
                     output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
                     # Write results are rechecked through a new handle after ACK.

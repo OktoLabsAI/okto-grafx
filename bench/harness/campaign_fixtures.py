@@ -49,6 +49,7 @@ class Scenario:
     capacity_batch_size: int = 0
     fts_statistics_mode: str = "durable"
     fts_updates: int = 0
+    fts_write_case: str = "none"
     rf04_case: str | None = None
 
     def __post_init__(self):

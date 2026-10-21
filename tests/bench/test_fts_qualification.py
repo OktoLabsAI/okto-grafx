@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from bench.harness.campaign_fixtures import Scenario, matrix
-from bench.harness.fts_qualification import apply_updates, build_fixture, oracle, rows, statistics
+from bench.harness.fts_qualification import apply_updates, apply_write_case, build_fixture, corpus_documents, oracle, rows, statistics
 from bench.harness.campaign_worker import measure_statement
 from okto_grafx import connect
 
@@ -17,6 +17,36 @@ def test_matrix_covers_statistics_corpus_cache_and_snapshot_slices():
     assert {s.cache for s in scenarios} == {"warm", "reopen"}
     assert {s.term for s in scenarios} == {"common", "rare"}
     assert {s.reader for s in scenarios} == {"short", "retained"}
+    assert {(s.fts_statistics_mode, s.fts_write_case) for s in scenarios
+            if s.fts_write_case != "none"} == {
+                (mode, write_case) for mode in ("wal", "durable")
+                for write_case in ("insert", "update", "delete", "external_mixed")}
+
+
+@pytest.mark.parametrize("mode,history", [("wal", 0), ("durable", 8)])
+@pytest.mark.parametrize("write_case,ack_count", [
+    ("insert", 1), ("update", 1), ("delete", 1), ("external_mixed", 4)])
+def test_write_cost_slices_require_durable_acks_and_reopen_exactly(
+        tmp_path, mode, history, write_case, ack_count):
+    scenario = Scenario(f"fts-{mode}-{write_case}", "fts_matrix", nodes=256,
+                        edges_per_node=0, fts_statistics_mode=mode,
+                        fts_history=history, cache="reopen", fts_write_case=write_case)
+    path = tmp_path / "db"
+    with connect(path) as db:
+        build_fixture(db, scenario)
+        durations = apply_write_case(db, scenario, path)
+        assert len(durations) == ack_count
+        assert all(duration > 0 for duration in durations)
+    with connect(path) as reopened:
+        found, result = rows(reopened, scenario)
+        assert found == oracle(scenario)
+        assert result.corpus_documents == corpus_documents(scenario)
+        assert result.statistics_regime == ("full_census" if mode == "wal" else "durable_summary")
+        assert not reopened.verify("all").findings
+        reopened.checkpoint()
+    with connect(path, read_only=True) as read_only:
+        assert rows(read_only, scenario)[0] == oracle(scenario)
+        assert not read_only.verify("all").findings
 
 
 def test_ranked_fts_oracle_and_source_are_real_for_wal_and_durable(tmp_path):
@@ -75,7 +105,8 @@ def test_wal_delta_source_requires_cached_seed_and_exact_new_score(tmp_path):
 
 def test_invalid_wal_history_and_large_common_slice_rejected():
     for values in ({"fts_statistics_mode": "wal", "fts_history": 1},
-                   {"nodes": 65536, "term": "common"}):
+                   {"nodes": 65536, "term": "common"},
+                   {"fts_write_case": "external_mixed", "cache": "warm"}):
         try:
             Scenario("bad", "fts_matrix", **values)
         except ValueError:
