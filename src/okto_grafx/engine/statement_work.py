@@ -7,6 +7,8 @@ from collections.abc import Iterator
 
 from okto_grafx.domain.ports.scoped_value import ScopedValue
 
+__all__ = ["StatementWorkScope", "add_work"]
+
 
 class _Observation:
     __slots__ = ("statistics", "active")
