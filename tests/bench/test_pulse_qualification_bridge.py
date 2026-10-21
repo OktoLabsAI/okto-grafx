@@ -31,6 +31,40 @@ def test_relative_operational_paths_are_rejected():
         canonical_path(Path("relative"))
 
 
+def test_inventory_uses_git_blobs_with_crlf_checkout_and_export_ignored_files(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+
+    def command(*args):
+        return subprocess.check_output(["git", "-C", str(checkout), *args])
+
+    command("init", "--quiet")
+    attributes = b"*.txt text eol=crlf\nsecret.txt export-ignore\n"
+    (checkout / ".gitattributes").write_bytes(attributes)
+    (checkout / "example.txt").write_bytes(b"one\r\ntwo\r\n")
+    (checkout / "secret.txt").write_bytes(b"included\r\n")
+    command("add", ".")
+    command("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "--quiet", "-m", "CRLF fixture")
+    revision = command("rev-parse", "HEAD").decode().strip()
+    assert command("status", "--porcelain") == b""
+    assert (checkout / "example.txt").read_bytes() == b"one\r\ntwo\r\n"
+    tracked = inventory(checkout, revision)
+    assert set(tracked) == {".gitattributes", "example.txt", "secret.txt"}
+    for name in tracked:
+        (snapshot / name).write_bytes(command("show", revision + ":" + name))
+    assert (snapshot / "example.txt").read_bytes() == b"one\ntwo\n"
+    verify_snapshot(snapshot, tracked)
+    (snapshot / "secret.txt").write_bytes(b"tampered\n")
+    with pytest.raises(ValueError, match="snapshot differs"):
+        verify_snapshot(snapshot, tracked)
+    (checkout / "example.txt").write_bytes(b"tampered\r\n")
+    with pytest.raises(ValueError, match="dirty source"):
+        inventory(checkout, revision)
+
+
 def test_inventory_checks_real_git_revision_and_dirty_files(tmp_path):
     def command(*args):
         return subprocess.check_output(["git", "-C", str(tmp_path), *args])

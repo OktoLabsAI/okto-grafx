@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
@@ -30,25 +30,73 @@ def git(root, *args):
 
 
 def inventory(root, revision):
+    """Hash every committed blob, independent of checkout EOL conversion.
+
+    ls-tree plus one cat-file batch includes export-ignore files (unlike archive)
+    and avoids one subprocess or repeated ancestor resolution per tracked file.
+    Clean status separately attests the checkout against Git's filter semantics.
+    """
+    root = canonical_path(root)
     if git(root, "rev-parse", "HEAD").decode().strip() != revision:
         raise ValueError("revision mismatch")
     if git(root, "status", "--porcelain"):
         raise ValueError("dirty source")
-    paths = git(root, "ls-files", "-z").decode("utf-8").split("\0")
+    entries = []
+    checked = set()
+    for record in git(root, "ls-tree", "-rz", "--full-tree", revision).split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, kind, oid = metadata.split()
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
+            raise ValueError("unsupported tracked entry (symlink/submodule)")
+        name = raw_name.decode("utf-8")
+        _tracked_path(root, name, checked)
+        entries.append((name, oid))
+    payload = subprocess.check_output(
+        ["git", "-C", str(root), "cat-file", "--batch"],
+        input=b"".join(oid + b"\n" for _, oid in entries), timeout=10,
+    )
     result = {}
-    for name in filter(None, paths):
-        path = canonical_path(root / name)
-        path.relative_to(root)
-        result[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    offset = 0
+    for name, oid in entries:
+        end = payload.index(b"\n", offset)
+        actual_oid, kind, size = payload[offset:end].split()
+        if actual_oid != oid or kind != b"blob":
+            raise ValueError("unexpected Git batch object")
+        start = end + 1
+        offset = start + int(size)
+        if payload[offset:offset + 1] != b"\n":
+            raise ValueError("truncated Git batch object")
+        result[name] = hashlib.sha256(memoryview(payload)[start:offset]).hexdigest()
+        offset += 1
+    if offset != len(payload):
+        raise ValueError("unexpected Git batch trailer")
     if not result:
         raise ValueError("empty tracked source")
     return result
 
 
+def _tracked_path(root, name, checked):
+    relative = PurePosixPath(name)
+    if relative.is_absolute() or ".." in relative.parts or "\\" in name or ":" in name:
+        raise ValueError("invalid tracked path")
+    path = root
+    for part in relative.parts:
+        path = path / part
+        if path not in checked:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ValueError("reparse paths are not accepted")
+            checked.add(path)
+    return path
+
+
 def verify_snapshot(snapshot, tracked):
+    snapshot = canonical_path(snapshot)
+    checked = set()
     for name, expected in tracked.items():
-        path = canonical_path(snapshot / name)
-        path.relative_to(snapshot)
+        path = _tracked_path(snapshot, name, checked)
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError("runner snapshot differs from candidate: " + name)
 
