@@ -11,32 +11,55 @@ The latest isolated installed Pulse/native observations below use the final
 
 ## RF01 physical scan statistics (development)
 
-The first RF01 implementation adds two integer entries to `QueryResult.statistics`:
-`physical_node_versions_examined` and `physical_edge_versions_examined`. Their
-unit is a stored version header actually examined by an instrumented heap scan,
+RF01 adds integer diagnostics to `QueryResult.statistics` and cursor statistics.
+`physical_node_versions_examined` and `physical_edge_versions_examined` count
+a stored version header actually examined by an instrumented heap read,
 before snapshot visibility and owner-overlay filtering. Ended or otherwise
 invisible versions count; pending inserts that have not reached the heap do not.
 Repeated scans count their repeated work. Existing `rows_scanned`, `edge_scans`
 and cooperative cancellation/quota checkpoints retain their meanings.
 
-Coverage currently includes canonical node scans (full and projected), all-node
-scans, grouped traversal scans, relationship scans and the batched relationship
-count scan. This is **partial physical-work coverage**: index validation,
-identity landings, cursor `scan_page`, endpoint-only scans and other heap reads
-are not included yet. An absent counter means no instrumented scan ran; it does
-not prove zero physical work. An executed empty scan, or the existing proven
-pageless relationship shortcut, reports zero. Custom or
-overridden scan methods keep their existing behavior without invented counts.
+Coverage includes canonical node scans (full and projected), grouped traversal
+and relationship scans, index candidate reads, identity landings, visible-record
+cursors and `scan_page`. An absent counter means no instrumented operation
+reported that unit; it does not prove zero work through a custom collaborator.
+An executed empty scan, or the existing proven pageless relationship shortcut,
+reports zero. Custom ports retain their behavior; results returned by a custom
+port are never counted as a substitute for observing its physical work.
+
+| Counter | Unit |
+| --- | --- |
+| `index_probe_keys` | Distinct keys actually sent to a physical bucket lookup, counted again when retried |
+| `certificate_attempts` | Exact-read certificate attempts actually started |
+| `certificate_retries` | Additional attempts actually started after a refusal |
+| `landing_candidates` | Physical candidates submitted to identity validation, including invisible candidates and retries |
+| `landing_batches` | Identity groups submitted through a grouped validation door; a cache-only reuse does not add a batch |
+
+Result multiplicity does not multiply a reused physical read. A certificate
+retry counts its discarded work and is not itself a fallback. The first guard
+that actually selects a consumed alternative sets one integer diagnostic
+`fallback_reason_<reason>=1`. The closed reasons are `ineligible_shape`,
+`unproven_binding`, `unproven_totality`, `nonselective_probe_set`, `fan_limit`,
+`index_unavailable`, `index_stale`, `owner_overlay`, `noncanonical_port`,
+`quota_frontier`, `memory_guard` and `streaming_guard`. No such key means `none`
+for the instrumented execution. Planning an alternative alone does not set a
+reason; `unproven_binding` is reserved and is not inferred from a scan plan.
+The integer representation preserves the public statistics value contract.
 
 The canonical walk inspects a page's headers before yielding its rows. Early
 close therefore includes the headers already inspected on that page, while
 later pages remain unvisited. Counts accumulate locally and publish after each
-page pin is released. They are per-statement diagnostics, not additions to the
-frozen `MetricsSink` catalogue; no data, query text or parameters become labels.
+page pin is released. Observation is bound to one execution or cursor pull and
+revoked before returning control to the consumer. Interleaved cursors retain
+separate dictionaries, and nested native procedure statements contribute to
+their parent statement. Counts cover evaluation and referential checks; they
+do not include a later transaction commit. Metrics publication occurs outside
+the cursor observation scope. These diagnostics do not extend the frozen
+`MetricsSink` catalogue; no data, query text or parameters become labels.
 
-RF01 remains in progress. Probe/certificate/landing counters, actual fallback
-reasons, reproducible report validation and the three-pair overhead campaign
-are pending. These deterministic counters establish measurement semantics;
+RF01 remains in progress. Reproducible report validation, full qualification
+and the three-pair overhead campaign are pending. These deterministic counters
+establish measurement semantics;
 they do not establish a speedup or compliance with the overhead budget.
 
 ## 0.0.7 performance round closure
@@ -521,6 +544,55 @@ In-tree instruments live in `tools/` and `tools/perf_round/`; the historical
 and rigs. Do not run production-copy or long concurrency harnesses blindly from
 a documentation example. Detailed [reports](reports/README.md) preserve their
 commands/conditions; artifact paths outside the repository may be unavailable.
+
+## RF07 streaming landing demand
+
+Open streaming traversals retain scalar destination validation. A known `LIMIT`
+does not authorize certifying a larger destination window: a later destination
+may fail after the last row the caller needs. Catching and delaying that error
+does not undo the reads, checks or observed generation. A published prefix must
+never be replayed when a subsequent certificate cannot be stabilized.
+
+This is a negative feasibility result, with no streaming acceleration candidate
+or gain benchmark. Existing closed blocking consumers retain their bounded
+batches where the proof permits them. Adding `ORDER BY` changes the consumer
+and does not demonstrate an improvement to streaming. Reopening the research
+requires a proved speculative-read contract without observable effects, or an
+explicit consumer demand/failure contract. RF07 introduces neither.
+
+The [protection tests](../tests/query/test_streaming_landing_guard.py) and
+[standalone unittest entry points](../tests/query/test_streaming_landing_evidence.py)
+use one source, three destinations and two parallel edges per destination.
+Faults are injected at real heap and certificate doors, preserving the canonical
+port fences so the control can still reach the existing batch implementation.
+These protect an existing correct guard; they do not claim to fix a new defect.
+
+| Case | Demand and permitted destination work | Error and cleanup | Unittest method on `StreamingLandingEvidence` |
+| --- | --- | --- | --- |
+| LIMIT 0 | No destination validation | No destination fault; transaction/cache released | `test_demand_prefix` |
+| LIMIT 1 | First valid destination only | Later corruption or duplicate identity remains unobserved until demanded | `test_demand_prefix` |
+| Partial close | One row with iterator `batch_size=1` | Idempotent close; no further validation; cursor/buffer/transaction/cache released | `test_demand_prefix` |
+| Filter / DISTINCT | Consume until one accepted/distinct result, preserving parallel-edge processing | Later destination fault unobserved; transaction/cache released | `test_demand_prefix` |
+| Cancellation / deadline between pulls | No destination validation after control expires | Control error precedes later fault; cursor/buffer/transaction/cache released | `test_controls_cleanup_and_blocking` |
+| Generation rejection after published prefix | Bounded retries of the subsequent certificate only | `index_view_changed`, no prefix replay; cursor/buffer/transaction/cache released | `test_generation_failure_no_replay` |
+
+The demand test also forces unsafe batch admission in its isolated test process:
+`LIMIT 1` then observes the later corruption before returning its required row.
+The compatibility test checks the retained blocking batch: three distinct keys,
+six relationships and exact grouped results. No test relaxes CRC, MVCC or
+certificate validation to obtain a result.
+
+Demand follows the existing API: iteration may request its configured batch
+size, while `fetchone()` requests one row. Early close does not undo work for
+rows already requested in a batch. These tests do not promise that the default
+iterator batch validates only one row.
+
+The unittest file requires no pytest installation. It imports Grafx from the
+`src` directory adjacent to the tested repository snapshot and refuses an
+already imported Grafx package from elsewhere. Each named method is executable
+by the Pulse external unittest runner. Local runs prove the assertions only;
+authenticated scenario evidence additionally requires a registered runner,
+the committed revision and the Pulse execution/Delivery workflow.
 
 ## Performance policy
 

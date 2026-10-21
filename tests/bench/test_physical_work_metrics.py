@@ -10,6 +10,158 @@ from okto_grafx import connect
 from okto_grafx.domain.query.control import _ReadControl
 from okto_grafx.engine.heap_store import HeapStore
 from tests.query.stack import TransactionDouble, build_query_stack
+from tests.query import test_node_in_seek as node_in_fixture
+from tests.query import test_batched_landing_without_vectors as landing_fixture
+from okto_grafx.engine import query_engine as qe
+from okto_grafx.engine.index_manager import HashIndex, IndexManager
+
+database = node_in_fixture.database
+graph = landing_fixture.graph
+
+
+def _fallback(statistics):
+    return {key: value for key, value in statistics.items()
+            if key.startswith("fallback_reason_")}
+
+
+def test_fallback_is_actual_execution_not_an_alternative_in_plan(database, monkeypatch):
+    assert any(type(node).__name__ == "NodeScan"
+               for node in database.explain(node_in_fixture.QUERY).walk())
+    fast = database.execute(node_in_fixture.QUERY, {"ids": ["a1"]})
+    assert _fallback(fast.statistics) == {}
+    monkeypatch.setattr(IndexManager, "validated_versions_many", None)
+    scan = database.execute(node_in_fixture.QUERY, {"ids": ["a1"]})
+    assert scan.rows == fast.rows
+    assert _fallback(scan.statistics) == {"fallback_reason_index_unavailable": 1}
+
+
+@pytest.mark.parametrize("ids,reason", [
+    (["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10"], "nonselective_probe_set"),
+    (["\ud800"], "unproven_totality"),
+])
+def test_multi_key_scan_fallback_reports_its_executed_guard(database, ids, reason):
+    result = database.execute(node_in_fixture.QUERY, {"ids": ids})
+    assert _fallback(result.statistics) == {f"fallback_reason_{reason}": 1}
+
+
+def test_stale_authority_fallback_reports_staleness_without_probe(database, monkeypatch):
+    original = qe._IndexAuthorityProjection.named
+
+    class Stale:
+        stale = True
+
+        def __init__(self, store):
+            self.store = store
+
+        def __getattr__(self, name):
+            return getattr(self.store, name)
+
+    def named(self, name):
+        store = original(self, name)
+        return None if store is None else Stale(store)
+
+    monkeypatch.setattr(qe._IndexAuthorityProjection, "named", named)
+    result = database.execute(node_in_fixture.QUERY, {"ids": ["a1"]})
+    assert result.rows == (("a1", 1),)
+    assert _fallback(result.statistics) == {"fallback_reason_index_stale": 1}
+
+
+@pytest.mark.parametrize("suffix", ["RETURN b.id LIMIT 0", "RETURN b.id"])
+def test_unconsumed_landing_decisions_do_not_report_fallback(graph, suffix):
+    result = graph.execute(landing_fixture.PREFIX.replace("a.id='a'", "a.id='absent'") + suffix)
+    assert result.rows == ()
+    assert _fallback(result.statistics) == {}
+
+
+@pytest.mark.parametrize("option,reason", [
+    (None, "streaming_guard"),
+    ("_max_intermediate_rows", "quota_frontier"),
+    ("_query_memory_budget_bytes", "memory_guard"),
+])
+def test_landing_fallback_records_first_effective_guard(graph, monkeypatch, option, reason):
+    if option is not None:
+        monkeypatch.setattr(graph._queries, option, 65536)
+    with graph.query(landing_fixture.PREFIX + "RETURN b.id").cursor(batch_size=1) as cursor:
+        assert _fallback(cursor.statistics) == {}
+        assert cursor.fetchone() == ("b0",)
+        assert _fallback(cursor.statistics) == {f"fallback_reason_{reason}": 1}
+    assert graph.transactions.open_transactions == 0
+
+
+def test_fallback_diagnostic_does_not_add_cooperative_steps(graph, monkeypatch):
+    original_step = _ReadControl.step
+    steps = []
+
+    def step(self):
+        steps.append(1)
+        return original_step(self)
+
+    monkeypatch.setattr(_ReadControl, "step", step)
+    from okto_grafx import CancellationToken
+    result = graph.execute(landing_fixture.PREFIX + "RETURN b.id", cancellation=CancellationToken())
+    measured = len(steps)
+    assert _fallback(result.statistics) == {"fallback_reason_streaming_guard": 1}
+    monkeypatch.setattr(qe, "_record_fallback", lambda *_: None)
+    steps.clear()
+    reference = graph.execute(landing_fixture.PREFIX + "RETURN b.id", cancellation=CancellationToken())
+    assert result.rows == reference.rows
+    assert len(steps) == measured
+    assert {key: value for key, value in result.statistics.items()
+            if not key.startswith("fallback_reason_")} == reference.statistics
+
+
+def test_first_consumed_edge_fallback_wins_over_earlier_unused_landing_decision(graph, monkeypatch):
+    # The memory decision is evaluated first, but the edge scan is consumed first.
+    monkeypatch.setattr(graph._queries, "_query_memory_budget_bytes", 65536)
+    monkeypatch.setattr(qe, "_EDGE_LOOKUP_FAN_LIMIT", 0)
+    result = graph.execute(landing_fixture.PREFIX + "RETURN b.id")
+    assert result.rows == (("b0",), ("b0",), ("b1",), ("b1",), ("b2",), ("b2",))
+    assert result.statistics["edge_scans"] == 1
+    assert _fallback(result.statistics) == {"fallback_reason_fan_limit": 1}
+
+
+def test_owner_edge_overlay_reports_only_one_reason(graph):
+    with graph.begin("write") as tx:
+        tx.execute("MATCH (a:A),(b:B {id:'b0'}) CREATE (a)-[:E {rank:9}]->(b)")
+        result = tx.execute(landing_fixture.PREFIX + "RETURN b.id")
+        assert len(result.rows) == 7
+        assert _fallback(result.statistics) == {"fallback_reason_owner_overlay": 1}
+
+
+def test_empty_multi_key_table_does_not_claim_a_scan_fallback(database):
+    result = database.execute("MATCH (n:D) WHERE n.id IN $ids RETURN n.id", {"ids": ["absent"]})
+    assert result.rows == ()
+    assert _fallback(result.statistics) == {}
+
+
+def test_specialized_landing_port_is_not_misreported_as_totality(graph, monkeypatch):
+    original = HeapStore.read
+
+    def specialized(heap, ref):
+        return original(heap, ref)
+
+    monkeypatch.setattr(HeapStore, "read", specialized)
+    result = graph.execute(landing_fixture.PREFIX + "RETURN b.id")
+    assert len(result.rows) == 6
+    assert _fallback(result.statistics) == {"fallback_reason_noncanonical_port": 1}
+
+
+def test_certificate_retry_that_succeeds_is_not_a_fallback(database, monkeypatch):
+    original = HashIndex.finish_exact_read
+    rejected = []
+
+    def changed_once(store, before, lsn):
+        stable = original(store, before, lsn)
+        if not rejected:
+            rejected.append(1)
+            return False
+        return stable
+
+    monkeypatch.setattr(HashIndex, "finish_exact_read", changed_once)
+    result = database.execute(node_in_fixture.QUERY, {"ids": ["a1"]})
+    assert result.rows == (("a1", 1),)
+    assert result.statistics["certificate_retries"] == 1
+    assert _fallback(result.statistics) == {}
 
 
 class _ReadTransaction(TransactionDouble):

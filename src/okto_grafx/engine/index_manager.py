@@ -60,6 +60,7 @@ from types import MethodType
 from typing import NamedTuple, TypeVar
 
 from okto_grafx.domain.ports.scoped_value import ScopedValue
+from okto_grafx.engine.statement_work import StatementWorkScope, add_work
 from okto_grafx.domain.errors import (
     GrafxConfigurationError,
     GrafxCorruptionDetected,
@@ -544,6 +545,7 @@ class IndexStore:
         "_table_high_water",
         "_tombstone_backlog_count",
         "_key_page_memo",
+        "_statement_work",
     )
 
     def __init__(
@@ -557,6 +559,7 @@ class IndexStore:
                 value=type(definition).__name__,
             )
         self._definition: IndexDefinition = definition
+        self._statement_work: StatementWorkScope | None = None
         # IndexDefinition is frozen.  These values sit on every lookup/header-validation path
         # and deriving them again cannot observe catalog or cross-process state.
         self._definition_digest: bytes = definition.digest()
@@ -2696,7 +2699,12 @@ class IndexStore:
         operation: Callable[[_IndexReadCertificate], _ReadResult],
     ) -> _ReadResult:
         """Run one materialising read wholly inside a durable page-0 generation."""
+        scope = self._statement_work
+        statistics = None if scope is None else scope.current_statistics()
         for attempt in range(INDEX_READ_RETRY_BUDGET + 1):
+            add_work(statistics, "certificate_attempts")
+            if attempt:
+                add_work(statistics, "certificate_retries")
             try:
                 certificate = self.begin_exact_read(required_lsn)
             except GrafxIndexError as failure:
@@ -2753,6 +2761,8 @@ class IndexStore:
 
     def _candidates_unchecked(self, wanted: bytes) -> tuple[IndexEntry, ...]:
         """Walk one already-validated key; the manager surrounds this with its view fence."""
+        scope = self._statement_work
+        add_work(None if scope is None else scope.current_statistics(), "index_probe_keys")
         _pages, found = self._scan_bucket(
             self._definition.bucket_for(wanted), wanted
         )
@@ -2783,6 +2793,9 @@ class IndexStore:
             if len(wanted) == 1:
                 yield wanted[0], self._candidates_unchecked(wanted[0])
                 continue
+            scope = self._statement_work
+            add_work(None if scope is None else scope.current_statistics(),
+                     "index_probe_keys", len(wanted))
             _pages, entries = self._scan_bucket(bucket, keys=frozenset(wanted))
             groups: dict[bytes, list[IndexEntry]] = {key: [] for key in wanted}
             for entry in entries:
@@ -4380,6 +4393,7 @@ class IndexManager:
         "_projection_context",
         "_live_commit_context",
         "_key_cache_limits",
+        "_statement_work",
     )
 
     def __init__(
@@ -4403,6 +4417,7 @@ class IndexManager:
         """
         self._pool: BufferPool = pool
         self._heap: HeapStore = heap
+        self._statement_work = getattr(heap, "_statement_work", None)
         self._metrics: MetricsSink = metrics
         for field_name, transport in (
             ("projection_context", projection_context),
@@ -4450,6 +4465,7 @@ class IndexManager:
     def _publish_registered_index(self, index: IndexStore) -> None:
         """Publish one raw ownership entry and its table-local structural key."""
 
+        index._statement_work = self._statement_work
         if index._key_page_memo is None:
             from okto_grafx.engine.key_page_memo import KeyPageMemo
             index._key_page_memo = KeyPageMemo(*self._key_cache_limits)
@@ -7529,11 +7545,15 @@ class IndexManager:
 
         def confirm(certificate: _IndexReadCertificate) -> tuple[int, ...]:
             """Validate candidate groups against the selected index and heap view."""
+            scope = self._statement_work
+            statistics = None if scope is None else scope.current_statistics()
+            add_work(statistics, "landing_batches")
             self._prepare_heap_view(index.file, certificate)
             answers: dict[bytes, int] = {}
             for wanted, candidates in index._candidate_groups_unchecked(distinct):
                 count = 0
                 for entry in candidates:
+                    add_work(statistics, "landing_candidates")
                     version = self._heap.read_landing(entry.ref)
                     if version.table_id != definition.table_id:
                         raise GrafxCorruptionDetected(
@@ -7726,10 +7746,17 @@ class IndexManager:
         self._prepare_heap_view(index.file, certificate)
         definition = index.definition
         read = self._heap.read_landing if landing else self._heap.read
+        scope = self._statement_work
+        statistics = None if scope is None else scope.current_statistics()
+        identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
+        if identity and distinct:
+            add_work(statistics, "landing_batches")
         answers: dict[bytes, tuple[tuple[RecordRef, HeapVersion], ...]] = {}
         for wanted, candidates in index._candidate_groups_unchecked(distinct):
             accepted: list[tuple[RecordRef, HeapVersion]] = []
             for entry in candidates:
+                if identity:
+                    add_work(statistics, "landing_candidates")
                 version = read(entry.ref)
                 if version.table_id != definition.table_id:
                     raise GrafxCorruptionDetected(
@@ -7783,9 +7810,14 @@ class IndexManager:
             certificate: _IndexReadCertificate,
         ) -> tuple[_ReadResult, ...]:
             """Validate candidates against heap frames bound to this index generation."""
+            scope = self._statement_work
+            statistics = None if scope is None else scope.current_statistics()
+            identity = definition.key_derivation == RECORD_ID_KEY_DERIVATION
             self._prepare_heap_view(index.file, certificate)
             confirmed: list[_ReadResult] = []
             for entry in index._candidates_unchecked(wanted):
+                if identity:
+                    add_work(statistics, "landing_candidates")
                 version = read(entry.ref)
                 if version.table_id != definition.table_id:
                     raise GrafxCorruptionDetected(

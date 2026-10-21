@@ -11,6 +11,7 @@ from okto_grafx.engine.heap_store import HeapStore
 from okto_grafx.engine.index_manager import HashIndex, IndexManager, IndexStore, INDEX_READ_RETRY_BUDGET
 from okto_grafx.errors import GrafxCorruptionDetected, GrafxError, GrafxIndexError
 from . import test_vector_free_traversal as fixture
+from .work_statistics import comparable_statistics
 
 graph = fixture.graph
 PREFIX = fixture.PREFIX
@@ -44,7 +45,8 @@ def test_blocking_results_columns_order_and_statistics_match_scalar(graph, monke
     scalar = graph.execute(PREFIX + suffix)
     assert candidate.rows == scalar.rows
     assert candidate.columns == scalar.columns
-    assert candidate.statistics == scalar.statistics
+    assert comparable_statistics(candidate.statistics) == comparable_statistics(scalar.statistics)
+    assert candidate.statistics["certificate_attempts"] <= scalar.statistics["certificate_attempts"]
 
 
 def test_batch_never_exceeds_64_steps_and_preserves_parallel_edge_multiplicity(graph, monkeypatch):

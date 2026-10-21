@@ -979,24 +979,26 @@ class _QueryResultCursor:
         produced: list[tuple[Value, ...]] = []
         exhausted = False
         try:
-            while len(produced) < limit:
-                try:
-                    row = next(self._rows)
-                except StopIteration:
-                    exhausted = True
-                    break
-                observed = self._seen + 1
-                configured = self._engine._max_result_rows
-                if configured is not None and observed > configured:
-                    raise GrafxQueryBudgetExceeded(
-                        f"Query would exceed max_result_rows: limit {configured}, "
-                        f"observed {observed}.",
-                        field="max_result_rows",
-                        limit=configured,
-                        observed=observed,
-                    )
-                produced.append(_projected(row, self.columns, self._context))
-                self._seen = observed
+            scope = self._engine._statement_work
+            with scope.bind(self._context.statistics) if scope is not None else nullcontext():
+                while len(produced) < limit:
+                    try:
+                        row = next(self._rows)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    observed = self._seen + 1
+                    configured = self._engine._max_result_rows
+                    if configured is not None and observed > configured:
+                        raise GrafxQueryBudgetExceeded(
+                            f"Query would exceed max_result_rows: limit {configured}, "
+                            f"observed {observed}.",
+                            field="max_result_rows",
+                            limit=configured,
+                            observed=observed,
+                        )
+                    produced.append(_projected(row, self.columns, self._context))
+                    self._seen = observed
         except GrafxError as failure:
             self._engine._count_error(failure)
             self._accumulate_active(started)
@@ -1031,34 +1033,36 @@ class _QueryResultCursor:
         """Perform the idempotent internal half of cursor settlement."""
         if self._closed:
             return
-        self._closed = True
-        failure: BaseException | None = None
-        close = getattr(self._rows, "close", None)
-        if callable(close):
+        scope = self._engine._statement_work
+        with scope.bind(self._context.statistics) if scope is not None else nullcontext():
+            self._closed = True
+            failure: BaseException | None = None
+            close = getattr(self._rows, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException as caught:
+                    failure = caught
+            # Cursor plans are statically read-only, so release cannot transfer row writes.  Calling
+            # the common release door still clears any statement-local admission lists if a future
+            # read operator starts recording dependencies.
             try:
-                close()
+                moved = self._context.release()
+                if moved:
+                    raise GrafxTransactionStateError(
+                        "A read-only query cursor produced staged writes.",
+                        field="cursor",
+                        value="write_plan",
+                        rows=moved,
+                    )
             except BaseException as caught:
-                failure = caught
-        # Cursor plans are statically read-only, so release cannot transfer row writes.  Calling
-        # the common release door still clears any statement-local admission lists if a future
-        # read operator starts recording dependencies.
-        try:
-            moved = self._context.release()
-            if moved:
-                raise GrafxTransactionStateError(
-                    "A read-only query cursor produced staged writes.",
-                    field="cursor",
-                    value="write_plan",
-                    rows=moved,
-                )
-        except BaseException as caught:
-            if failure is None:
-                failure = caught
-            else:
-                failure.add_note(
-                    "Query context release also failed with "
-                    f"{type(caught).__name__}: {caught}"
-                )
+                if failure is None:
+                    failure = caught
+                else:
+                    failure.add_note(
+                        "Query context release also failed with "
+                        f"{type(caught).__name__}: {caught}"
+                    )
         if not self._reported and self._engine._metrics.enabled:
             self._reported = True
             try:
@@ -3430,6 +3434,7 @@ class QueryEngine:
         "_heap",
         "_pool",
         "_indexes",
+        "_statement_work",
         "_vectors",
         "_metrics",
         "_clock",
@@ -3573,6 +3578,7 @@ class QueryEngine:
         self._skip_claims: dict[str, set[object]] = {}
         self._durable_skips: set[str] = set()
         self._indexes = indexes
+        self._statement_work = getattr(heap, "_statement_work", None)
         self._vectors = vectors
         self._page_stager = page_stager
         self._schema_artifact_section = schema_artifact_section
@@ -4457,111 +4463,115 @@ class QueryEngine:
         """Evaluate and validate; staged intents remain invisible to other participants."""
         root = plan.root
         statistics: dict[str, int] = {} if procedure_parent is None else procedure_parent.statistics
-        if isinstance(
-            root, (CreateIndex, CreateNodeTable, CreateRelTable, CreateVectorSpace)
-        ):
-            self._schema(root, txn, statistics)
-            return _owned_query_result(plan=root, statistics=dict(statistics))
-        if not isinstance(root, ProduceResults):
-            raise GrafxPlanError(
-                f"A plan is rooted at the result it produces; got {root.label}.",
-                field="plan",
-                value=root.label,
+        scope = self._statement_work
+        with scope.bind(statistics) if scope is not None else nullcontext():
+            if isinstance(
+                root, (CreateIndex, CreateNodeTable, CreateRelTable, CreateVectorSpace)
+            ):
+                self._schema(root, txn, statistics)
+                return _owned_query_result(plan=root, statistics=dict(statistics))
+            if not isinstance(root, ProduceResults):
+                raise GrafxPlanError(
+                    f"A plan is rooted at the result it produces; got {root.label}.",
+                    field="plan",
+                    value=root.label,
+                )
+            if getattr(txn, "mode", None) is TransactionMode.READ and _plan_writes(root):
+                raise GrafxTransactionStateError(
+                    "A read transaction cannot execute a write plan, even when it would match no writes.",
+                    field="transaction", mode="read",
+                )
+            coalesce_types = _bound_coalesce_types(plan, parameters)
+            case_types = _bound_case_types(plan, parameters)
+            self._validate_procedure_parameters(plan, parameters)
+            context = _Context(
+                engine=self,
+                txn=txn,
+                parameters=parameters,
+                analysis=plan.analysis,
+                statistics=statistics,
+                coalesce_types=coalesce_types,
+                timestamp_values={},
+                temporal_context=(procedure_parent.temporal_context if procedure_parent is not None else txn._temporal_context.begin_statement()
+                                  if getattr(txn, "_temporal_context", None) is not None else None),
+                case_types=case_types,
+                pattern_predicates={id(item[0]): item for item in plan.pattern_predicates},
+                pattern_comprehensions={id(item[0]): item for item in plan.pattern_comprehensions},
+                existential_queries={id(item[0]): item for item in plan.existential_queries},
+                implicit_node_tables={t.name: t for t in plan.implicit_node_tables},
+                catalog=catalog,
+                read_control=read_control,
+                result_node=root.child if root.columns else None,
+                index_authority=index_authority,
+                short_circuit_traversals=_short_circuit_traversals(root.child),
+                node_scan_projections=_closed_node_scan_projections(root.child),
+                vector_free_landings=_closed_vector_free_landings(root.child),
+                atomic_staging=atomic_staging,
+                procedure_parent=procedure_parent,
+                procedure_stack=() if procedure_scope is None else procedure_scope.stack,
+                procedure_statements={} if procedure_parent is None else procedure_parent.procedure_statements,
+                procedure_outputs={} if procedure_parent is None else procedure_parent.procedure_outputs,
+                procedure_query_statements={} if procedure_parent is None else procedure_parent.procedure_query_statements,
+                procedure_query_outputs={} if procedure_parent is None else procedure_parent.procedure_query_outputs,
+                procedure_schema_statements={} if procedure_parent is None else procedure_parent.procedure_schema_statements,
+                procedure_schema_scope=procedure_scope,
+                intermediate_rows={} if procedure_parent is None else procedure_parent.intermediate_rows,
             )
-        if getattr(txn, "mode", None) is TransactionMode.READ and _plan_writes(root):
-            raise GrafxTransactionStateError(
-                "A read transaction cannot execute a write plan, even when it would match no writes.",
-                field="transaction", mode="read",
+            _bind_timestamp_values(plan, context)
+            _validate_bound_subscript_types(plan, parameters)
+            _validate_bound_label_arguments(plan, parameters)
+            # Prepare explicit write/read boundaries bottom-up before any parent scan
+            # captures its owner overlay. Native transaction intents remain private and
+            # the enclosing statement mark rolls all phases back on any later failure.
+            self._prepare_read_phases(self._read_phase_boundaries(root.child), context)
+            stream = self._rows(root.child, context)
+            stream_failure: BaseException | None = None
+            try:
+                rows = self._collect_result_rows(stream, procedure_scope=procedure_scope) if root.columns else tuple(stream)
+            except BaseException as caught:
+                stream_failure = caught
+                raise
+            finally:
+                _close_iterator(stream, stream_failure)
+            produced: tuple[tuple[Value, ...], ...] = ()
+            if root.columns and context.atomic_staging:
+                # Give returned inserts their authenticated transaction-local reference
+                # before detachment. This is private intent staging, not COMMIT: the
+                # enclosing statement mark remains active through conversion/checks.
+                context.publish_phase()
+            if root.columns:
+                if procedure_scope is not None:
+                    for reference in context.ends_held:
+                        procedure_scope.context.note_ended(reference)
+                    produced = tuple(procedure_scope.project(row, root.columns, context) for row in rows)
+                else:
+                    produced = tuple(_projected(row, root.columns, context) for row in rows)
+            for table, identity in context.plain_node_deletes:
+                for edge_table, edge_ref, _endpoints in _incident_edges(self, context, table, identity):
+                    if not context.already_ended(edge_ref):
+                        raise GrafxQueryError(
+                            "DELETE cannot remove a node with live relationships; use DETACH DELETE or delete the edges.",
+                            reason="connected_node_delete", query_phase="execution", table=table.name, relationship_table=edge_table.name,
+                        )
+            # Snapshot diagnostics after the referential reads, while every allocation
+            # still precedes publication of this statement's staged work.
+            result = _owned_query_result(
+                columns=root.columns,
+                rows=produced,
+                plan=root,
+                statistics=dict(statistics),
             )
-        coalesce_types = _bound_coalesce_types(plan, parameters)
-        case_types = _bound_case_types(plan, parameters)
-        self._validate_procedure_parameters(plan, parameters)
-        context = _Context(
-            engine=self,
-            txn=txn,
-            parameters=parameters,
-            analysis=plan.analysis,
-            statistics=statistics,
-            coalesce_types=coalesce_types,
-            timestamp_values={},
-            temporal_context=(procedure_parent.temporal_context if procedure_parent is not None else txn._temporal_context.begin_statement()
-                              if getattr(txn, "_temporal_context", None) is not None else None),
-            case_types=case_types,
-            pattern_predicates={id(item[0]): item for item in plan.pattern_predicates},
-            pattern_comprehensions={id(item[0]): item for item in plan.pattern_comprehensions},
-            existential_queries={id(item[0]): item for item in plan.existential_queries},
-            implicit_node_tables={t.name: t for t in plan.implicit_node_tables},
-            catalog=catalog,
-            read_control=read_control,
-            result_node=root.child if root.columns else None,
-            index_authority=index_authority,
-            short_circuit_traversals=_short_circuit_traversals(root.child),
-            node_scan_projections=_closed_node_scan_projections(root.child),
-            vector_free_landings=_closed_vector_free_landings(root.child),
-            atomic_staging=atomic_staging,
-            procedure_parent=procedure_parent,
-            procedure_stack=() if procedure_scope is None else procedure_scope.stack,
-            procedure_statements={} if procedure_parent is None else procedure_parent.procedure_statements,
-            procedure_outputs={} if procedure_parent is None else procedure_parent.procedure_outputs,
-            procedure_query_statements={} if procedure_parent is None else procedure_parent.procedure_query_statements,
-            procedure_query_outputs={} if procedure_parent is None else procedure_parent.procedure_query_outputs,
-            procedure_schema_statements={} if procedure_parent is None else procedure_parent.procedure_schema_statements,
-            procedure_schema_scope=procedure_scope,
-            intermediate_rows={} if procedure_parent is None else procedure_parent.intermediate_rows,
-        )
-        _bind_timestamp_values(plan, context)
-        _validate_bound_subscript_types(plan, parameters)
-        _validate_bound_label_arguments(plan, parameters)
-        # Prepare explicit write/read boundaries bottom-up before any parent scan
-        # captures its owner overlay. Native transaction intents remain private and
-        # the enclosing statement mark rolls all phases back on any later failure.
-        self._prepare_read_phases(self._read_phase_boundaries(root.child), context)
-        stream = self._rows(root.child, context)
-        stream_failure: BaseException | None = None
-        try:
-            rows = self._collect_result_rows(stream, procedure_scope=procedure_scope) if root.columns else tuple(stream)
-        except BaseException as caught:
-            stream_failure = caught
-            raise
-        finally:
-            _close_iterator(stream, stream_failure)
-        produced: tuple[tuple[Value, ...], ...] = ()
-        if root.columns and context.atomic_staging:
-            # Give returned inserts their authenticated transaction-local reference
-            # before detachment. This is private intent staging, not COMMIT: the
-            # enclosing statement mark remains active through conversion/checks.
-            context.publish_phase()
-        if root.columns:
-            if procedure_scope is not None:
+            # Publishing to the transaction is the final fallible phase: output detachment and
+            # referential checks must not fail after a caught statement error has staged effects.
+            context.release()
+            if procedure_parent is not None:
+                # A callback's native DML has its own evaluation context, but owner
+                # aliases must still observe deletions made by that successful child.
+                # Child-local insert tokens are not transferable authority.
                 for reference in context.ends_held:
-                    procedure_scope.context.note_ended(reference)
-                produced = tuple(procedure_scope.project(row, root.columns, context) for row in rows)
-            else:
-                produced = tuple(_projected(row, root.columns, context) for row in rows)
-        result = _owned_query_result(
-            columns=root.columns,
-            rows=produced,
-            plan=root,
-            statistics=dict(statistics),
-        )
-        for table, identity in context.plain_node_deletes:
-            for edge_table, edge_ref, _endpoints in _incident_edges(self, context, table, identity):
-                if not context.already_ended(edge_ref):
-                    raise GrafxQueryError(
-                        "DELETE cannot remove a node with live relationships; use DETACH DELETE or delete the edges.",
-                        reason="connected_node_delete", query_phase="execution", table=table.name, relationship_table=edge_table.name,
-                    )
-        # Publishing to the transaction is the final fallible phase: output detachment and
-        # referential checks must not fail after a caught statement error has staged effects.
-        context.release()
-        if procedure_parent is not None:
-            # A callback's native DML has its own evaluation context, but owner
-            # aliases must still observe deletions made by that successful child.
-            # Child-local insert tokens are not transferable authority.
-            for reference in context.ends_held:
-                procedure_parent.note_ended(reference)
-            procedure_parent._ends_staged = None
-        return result
+                    procedure_parent.note_ended(reference)
+                procedure_parent._ends_staged = None
+            return result
 
     @staticmethod
     def _read_phase_boundaries(root: PlanNode) -> tuple[EagerRows, ...]:
@@ -7112,6 +7122,27 @@ def _index_lookup_versions(
         yield ref, engine.heap.read(ref)
 
 
+_FALLBACK_REASONS = frozenset({
+    "ineligible_shape", "unproven_binding", "unproven_totality",
+    "nonselective_probe_set", "fan_limit", "index_unavailable", "index_stale",
+    "owner_overlay", "noncanonical_port", "quota_frontier", "memory_guard",
+    "streaming_guard",
+})
+_FALLBACK_STATISTICS = tuple("fallback_reason_" + reason for reason in _FALLBACK_REASONS)
+
+
+def _record_fallback(context: _Context, reason: str) -> None:
+    """Record only the first consumed fallback; absent keys mean ``none``.
+
+    This diagnostic is not logical work and must not debit cooperative control.
+    Callers defer it until the alternative is consumed, never while planning or
+    selecting a lazy iterator that might remain unused.
+    """
+    assert reason in _FALLBACK_REASONS
+    if not any(name in context.statistics for name in _FALLBACK_STATISTICS):
+        context.statistics["fallback_reason_" + reason] = 1
+
+
 def _index_seek(
     engine: QueryEngine, node: IndexSeek, context: _Context
 ) -> Iterator[_Row]:
@@ -7184,6 +7215,7 @@ def _index_seek(
             # (INT64/DOUBLE, signed zero and nested numeric values), so a single hash probe could
             # otherwise omit true rows.  Filter here because the planner correctly consumed the
             # equality terms when it chose IndexSeek.
+            _record_fallback(context, "unproven_totality")
             changed, inserted = scan_overlay()
             for candidate in _logical_node_rows_for_input(
                 engine,
@@ -7231,6 +7263,7 @@ def _index_seek(
                 # A legacy insert without a pending identity cannot be reconstructed from the
                 # incremental ownership fold.  Preserve its established duck-typed semantics by
                 # using the complete logical scan for this one probe.
+                _record_fallback(context, "owner_overlay")
                 changed, inserted = scan_overlay()
                 for candidate in _logical_node_rows_for_input(
                     engine,
@@ -7726,9 +7759,11 @@ def _edge_steps(
     manager = engine._indexes
     lookup = getattr(manager, "lookup", None) if manager is not None else None
     catalog = context.schema()
+    scan_reason: str | None = None
 
     def usable(name: str) -> object | None:
         """Return the store when that index is present, this table's own, and fresh."""
+        nonlocal scan_reason
         try:
             index = _catalog_active_index(  # type: ignore[arg-type]
                 manager,
@@ -7738,15 +7773,19 @@ def _edge_steps(
                 projection=getattr(context, "index_authority", None),
             )
         except GrafxError:
+            scan_reason = scan_reason or "index_unavailable"
             return None
         if index is None:
+            scan_reason = scan_reason or "index_unavailable"
             return None
         if (
             index.definition.table_id != relationship.table_id
             or index.definition.table_name != relationship.name
         ):
+            scan_reason = scan_reason or "index_unavailable"
             return None  # a name collision, not this table's index
         if getattr(index, "stale", False):
+            scan_reason = scan_reason or "index_stale"
             return None
         return index
 
@@ -7761,12 +7800,15 @@ def _edge_steps(
         else None
     )
     indexed = ((not outgoing) or from_index) and ((not incoming) or to_index)
+    if not indexed:
+        scan_reason = scan_reason or "index_unavailable"
     if pending:
         # An endpoint index describes COMMITTED edges. An edge this transaction created is not in
         # it and cannot be put in it before the commit, so a lookup would answer a question about
         # a graph its owner is no longer looking at. The grouped scan can be overlaid; an index
         # answer cannot be, because what is missing from it leaves no trace to overlay.
         indexed = False
+        scan_reason = scan_reason or "owner_overlay"
     snapshot = context.snapshot
 
     def owner_version(ref: object, version: HeapVersion) -> HeapVersion | None:
@@ -7841,6 +7883,7 @@ def _edge_steps(
     def grouped() -> tuple[dict, dict]:
         """Build the by-endpoint edge maps ONCE, on the first caller that needs them."""
         if not maps:
+            _record_fallback(context, scan_reason or "nonselective_probe_set")
             context.count("edge_scans")
             by_source: dict[object, list[tuple[object, HeapVersion]]] = {}
             by_target: dict[object, list[tuple[object, HeapVersion]]] = {}
@@ -7882,6 +7925,7 @@ def _edge_steps(
                 yield ref, version, from_table, version.values[0]
 
     if not indexed or not bounded_frontier:
+        scan_reason = scan_reason or "nonselective_probe_set"
         return by_scan
 
     # Indexed, WITH a fan limit -- and the limit is a cost model, not a hedge. Known scan-shaped
@@ -7896,12 +7940,14 @@ def _edge_steps(
         record_id: object,
     ) -> Iterator[tuple[object, HeapVersion, TableDef, object]]:
         """Serve by index up to the fan limit, then by the grouped scan for good."""
+        nonlocal scan_reason
         if isinstance(record_id, PendingRowRef):
             # A node this transaction created is not in any index, and its private identity is
             # not a stored value, so building a lookup key out of it asks the encoder to store a
             # promise. The scan answers the same question and answers it correctly: a node
             # created here can only be joined by edges created here, which the grouped maps
             # already carry.
+            scan_reason = scan_reason or "owner_overlay"
             yield from by_scan(record_id)
             return
         if not maps:
@@ -7909,6 +7955,7 @@ def _edge_steps(
             if len(seen_starts) <= _EDGE_LOOKUP_FAN_LIMIT:
                 yield from by_index(record_id)
                 return
+        scan_reason = scan_reason or "fan_limit"
         yield from by_scan(record_id)
 
     return hybrid
@@ -7956,6 +8003,7 @@ _BATCH_LANDING_CANONICAL_GET = _OwnerLandingView.get
 
 def _admits_batched_landings(
     engine: QueryEngine, node: TraverseRelationship, context: _Context,
+    reasons: list[str] | None = None,
 ) -> bool:
     """Admit bounded prefetch only when the closed consumer must read every hop.
 
@@ -7973,28 +8021,35 @@ def _admits_batched_landings(
     clock over. The property is the batched path's from the start; a vector-free landing
     table now reaches that same path.
     """
+    def decline(reason: str) -> bool:
+        if reasons is not None:
+            reasons.append(reason)
+        return False
+
     manager = engine._indexes
-    if (
-        type(context.txn) is not TransactionContext
-        or (
-            context.txn.mode is not TransactionMode.READ
-            and (context.txn.mode is not TransactionMode.WRITE or context.txn.wrote)
-        )
-        or engine._max_intermediate_rows is not None
-        or engine._max_traversal_expansions is not None
-        or engine._max_traversal_paths is not None
-        or engine._query_memory_budget_bytes is not None
-        or node.min_hops != 1 or node.max_hops != 1 or node.target_bound
+    if type(context.txn) is not TransactionContext:
+        return decline("noncanonical_port")
+    if (context.txn.mode is not TransactionMode.READ
+            and (context.txn.mode is not TransactionMode.WRITE or context.txn.wrote)):
+        return decline("owner_overlay")
+    if (engine._max_intermediate_rows is not None
+            or engine._max_traversal_expansions is not None
+            or engine._max_traversal_paths is not None):
+        return decline("quota_frontier")
+    if engine._query_memory_budget_bytes is not None:
+        return decline("memory_guard")
+    if (node.min_hops != 1 or node.max_hops != 1 or node.target_bound
         or node.path_variable is not None or node.target_table is None
-        or node.direction is Direction.UNDIRECTED
-        or getattr(getattr(manager, "validated_identity_landings", None), "__func__", None)
+        or node.direction is Direction.UNDIRECTED):
+        return decline("ineligible_shape")
+    if (getattr(getattr(manager, "validated_identity_landings", None), "__func__", None)
         is not _BATCH_LANDING_CANONICAL_SCALAR
         or getattr(getattr(manager, "validated_identity_landings_many", None), "__func__", None)
         is not _BATCH_LANDING_CANONICAL_MANY
         or getattr(manager._validated_items, "__func__", None)
         is not _SCALAR_PK_CANONICAL_VALIDATED_ITEMS
     ):
-        return False
+        return decline("noncanonical_port")
     consumer = context.result_node
     blocking = False
     while consumer is not node:
@@ -8003,11 +8058,11 @@ def _admits_batched_landings(
             blocking = True
         elif kind in (LimitRows, SkipRows):
             if blocking:
-                return False
+                return decline("streaming_guard")
         elif kind not in (ProjectRows, FilterRows, DistinctRows):
-            return False
+            return decline("ineligible_shape")
         consumer = consumer.child
-    return blocking
+    return True if blocking else decline("streaming_guard")
 
 
 def _declares_vector(table: TableDef) -> bool:
@@ -8015,7 +8070,9 @@ def _declares_vector(table: TableDef) -> bool:
     return any(column.type in VECTOR_VALUE_TYPES for column in table.columns)
 
 
-def _total_landings(engine: QueryEngine, node: TraverseRelationship) -> bool:
+def _total_landings(
+    engine: QueryEngine, node: TraverseRelationship, reasons: list[str] | None = None,
+) -> bool:
     """Admit the batched port for a landing table that declares no vector column.
 
     ``_OwnerLandingView.landings_many`` withholds exactly one thing its scalar sibling
@@ -8033,7 +8090,7 @@ def _total_landings(engine: QueryEngine, node: TraverseRelationship) -> bool:
     are checked exactly as the vector-free gate checks them, and ``_batched_landing_steps``
     re-proves the table of the landings it actually resolves before it batches anything.
     """
-    return (
+    canonical = (
         type(engine.heap) is HeapStore
         and type(engine._indexes) is IndexManager
         and getattr(engine.heap.read, "__func__", None) is _VECTOR_FREE_CANONICAL_READ
@@ -8041,9 +8098,16 @@ def _total_landings(engine: QueryEngine, node: TraverseRelationship) -> bool:
         is _VECTOR_FREE_CANONICAL_DECODE
         and getattr(engine._indexes.validated_versions, "__func__", None)
         is _VECTOR_FREE_CANONICAL_VALIDATED
-        and node.target_table is not None
-        and not _declares_vector(node.target_table)
     )
+    if not canonical:
+        if reasons is not None:
+            reasons.append("noncanonical_port")
+        return False
+    if node.target_table is None or _declares_vector(node.target_table):
+        if reasons is not None:
+            reasons.append("unproven_totality")
+        return False
+    return True
 
 
 def _batched_landing_steps(
@@ -8070,6 +8134,7 @@ def _batched_landing_steps(
     except StopIteration:
         return
     if not withhold_vectors and _declares_vector(first[2]):
+        _record_fallback(context, "unproven_totality")
         yield *first, False, None
         for candidate in steps:
             yield *candidate, False, None
@@ -8077,6 +8142,7 @@ def _batched_landing_steps(
     # A missing source/edge must not inspect the destination index eagerly.
     index = _endpoint_identity_index(engine, context, first[2])
     if index is None:
+        _record_fallback(context, "index_unavailable")
         yield *first, False, None
         for candidate in steps:
             yield *candidate, False, None
@@ -8086,6 +8152,7 @@ def _batched_landing_steps(
         type(view) is not _OwnerLandingView
         or getattr(view.get, "__func__", None) is not _BATCH_LANDING_CANONICAL_GET
     ):
+        _record_fallback(context, "noncanonical_port")
         yield *first, False, None
         for candidate in steps:
             yield *candidate, False, None
@@ -8171,11 +8238,13 @@ def _traverse(
     )
     # A landing table with no vector column reaches the same batched port without the closed
     # vector-free proof: there is nothing for the batch to withhold (READ-3).
+    landing_reasons: list[str] = []
     batch_landings = (
         type(node) is TraverseRelationship
-        and (vector_free or _total_landings(engine, node))
-        and _admits_batched_landings(engine, node, context)
+        and (vector_free or _total_landings(engine, node, landing_reasons))
+        and _admits_batched_landings(engine, node, context, landing_reasons)
     )
+    landing_fallback_recorded = False
 
     def view_at(table: TableDef) -> _OwnerLandingView:
         """Reuse one endpoint landing view per table within this operation."""
@@ -8236,6 +8305,7 @@ def _traverse(
 
             def successors(current: RowBinding, path: tuple[RowBinding, ...]) -> Iterator[tuple[RowBinding, RowBinding]]:
                 """Yield eligible adjacent edges and endpoints without reusing an edge in the path."""
+                nonlocal landing_fallback_recorded
                 record_id, current_table = _overlay_identity(current), current.table
                 taken = {_binding_identity(edge) for edge in path}
                 if prefix is not None:
@@ -8253,6 +8323,9 @@ def _traverse(
                     )
                     with _iterator_cleanup(lambda: (resolved, candidates)):
                         for ref, version, next_table, next_id, prevalidated, batch_landing in resolved:
+                            if not batch_landings and not landing_fallback_recorded:
+                                _record_fallback(context, landing_reasons[0] if landing_reasons else "ineligible_shape")
+                                landing_fallback_recorded = True
                             if charge_expansions:
                                 context.admit_traversal_expansion()
                             elif context.read_control is not None:
@@ -8932,6 +9005,7 @@ def _node_multi_key_seek(
     many = getattr(manager, "validated_versions_many", None)
     authority = context.index_authority
     if manager is None or not callable(many) or authority is None:
+        _record_fallback(context, "index_unavailable")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -8947,14 +9021,19 @@ def _node_multi_key_seek(
         or definition.positions != (position,)
         or definition.key_derivation != COLUMN_KEY_DERIVATION
         or definition.visibility is not IndexVisibility.EXACT
-        or getattr(store, "stale", True) is not False
     ):
+        _record_fallback(context, "index_unavailable")
+        yield from engine._rows(node.fallback, context)
+        return
+    if getattr(store, "stale", True) is not False:
+        _record_fallback(context, "index_stale")
         yield from engine._rows(node.fallback, context)
         return
 
     if node.table.table_id in _intent_table_ids(engine, context.txn):
         # An exact index describes only durable heap versions: the owner's pending rows and
         # pending keys are visible only to the scan's logical overlay.
+        _record_fallback(context, "owner_overlay")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -8964,6 +9043,7 @@ def _node_multi_key_seek(
         return
     if type(raw) not in (list, tuple):
         # Preserve the canonical IN refusal (and custom Sequence behaviour) in the fallback.
+        _record_fallback(context, "ineligible_shape")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -8984,6 +9064,7 @@ def _node_multi_key_seek(
     def small_table() -> Iterator[_Row]:
         """Yield the canonical fallback when a table extent is available."""
         if extent is not None:
+            _record_fallback(context, "nonselective_probe_set")
             yield from engine._rows(node.fallback, context)
 
     # KGRUN-M3: exact ASCII strings count their distinct keys without encoding; any other
@@ -8998,6 +9079,7 @@ def _node_multi_key_seek(
         if value is None:
             continue
         if not _exact_probe_is_encoding_complete(node.table, (position,), (value,)):
+            _record_fallback(context, "unproven_totality")
             yield from engine._rows(node.fallback, context)
             return
         template: list[Value] = [None] * node.table.arity
@@ -9008,6 +9090,7 @@ def _node_multi_key_seek(
             # The encoder refuses only the probe's own shape (a lone surrogate, a form the key
             # cannot carry); the scan compares that probe by value and raises nothing, so the
             # scan keeps the answer.  No certificate has been opened yet.
+            _record_fallback(context, "unproven_totality")
             yield from engine._rows(node.fallback, context)
             return
         unique.setdefault(key, cast(Value, value))
@@ -9091,10 +9174,16 @@ def _ordered_node_merge(
     """
 
     authority = context.index_authority
-    if authority is None or type(engine.heap) is not HeapStore:
+    if authority is None:
+        _record_fallback(context, "index_unavailable")
+        yield from engine._rows(node.fallback, context)
+        return
+    if type(engine.heap) is not HeapStore:
+        _record_fallback(context, "noncanonical_port")
         yield from engine._rows(node.fallback, context)
         return
     if len(node.tables) != len(node.indexes):
+        _record_fallback(context, "ineligible_shape")
         yield from engine._rows(node.fallback, context)
         return
     if {table.table_id for table in node.tables} & _intent_table_ids(
@@ -9102,6 +9191,7 @@ def _ordered_node_merge(
     ):
         # Ordered artifacts describe durable heap versions only. The owner-visible overlay is
         # implemented by the fallback scan and must remain the single authority for dirty rows.
+        _record_fallback(context, "owner_overlay")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -9124,9 +9214,16 @@ def _ordered_node_merge(
             or definition.layout is not IndexLayout.ORDERED
             or definition.key_derivation != ORDERED_KEY_DERIVATION
             or definition.visibility is not IndexVisibility.EXACT
-            or getattr(store, "stale", True) is not False
-            or not callable(getattr(store, "iter_visible_desc", None))
         ):
+            _record_fallback(context, "index_unavailable")
+            yield from engine._rows(node.fallback, context)
+            return
+        if getattr(store, "stale", True) is not False:
+            _record_fallback(context, "index_stale")
+            yield from engine._rows(node.fallback, context)
+            return
+        if not callable(getattr(store, "iter_visible_desc", None)):
+            _record_fallback(context, "index_unavailable")
             yield from engine._rows(node.fallback, context)
             return
         stores.append(store)
@@ -9135,6 +9232,7 @@ def _ordered_node_merge(
     wanted = _window(node.limit, context, "LIMIT")
     if wanted == 0:
         # The canonical path is the authority for eager expression validation at a zero window.
+        _record_fallback(context, "ineligible_shape")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -9144,6 +9242,7 @@ def _ordered_node_merge(
         upper_timestamp = _evaluate(node.upper_timestamp, empty, context)
         upper_string = _evaluate(node.upper_string, empty, context)
         if not isinstance(upper_timestamp, Timestamp) or type(upper_string) is not str:
+            _record_fallback(context, "ineligible_shape")
             yield from engine._rows(node.fallback, context)
             return
         for ordinal, (table, definition) in enumerate(
@@ -9155,6 +9254,7 @@ def _ordered_node_merge(
             try:
                 upper_keys[ordinal] = definition.key_for(values)
             except (GrafxIndexError, SchemaMismatchError):
+                _record_fallback(context, "unproven_totality")
                 yield from engine._rows(node.fallback, context)
                 return
 
@@ -9280,8 +9380,11 @@ def _relationship_incident_seek(
     many = getattr(manager, "validated_versions_many", None)
     authority = context.index_authority
     if manager is None or not callable(many) or authority is None:
+        _record_fallback(context, "index_unavailable")
         yield from engine._rows(node.fallback, context)
         return
+
+    store_reason: str | None = None
 
     def exact_store(
         name: str,
@@ -9289,6 +9392,7 @@ def _relationship_incident_seek(
         positions: tuple[int, ...],
     ) -> object | None:
         """Return the named exact index only when its table and columns match."""
+        nonlocal store_reason
         store = authority.named(name)
         definition = getattr(store, "definition", None)
         if (
@@ -9300,8 +9404,11 @@ def _relationship_incident_seek(
             or definition.positions != positions
             or definition.key_derivation != COLUMN_KEY_DERIVATION
             or definition.visibility is not IndexVisibility.EXACT
-            or getattr(store, "stale", True) is not False
         ):
+            store_reason = store_reason or "index_unavailable"
+            return None
+        if getattr(store, "stale", True) is not False:
+            store_reason = store_reason or "index_stale"
             return None
         return store
 
@@ -9320,6 +9427,7 @@ def _relationship_incident_seek(
             to_edge_index,
         )
     ):
+        _record_fallback(context, store_reason or "index_unavailable")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -9329,6 +9437,7 @@ def _relationship_incident_seek(
         node.from_table.table_id,
         node.to_table.table_id,
     }:
+        _record_fallback(context, "owner_overlay")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -9367,6 +9476,7 @@ def _relationship_incident_seek(
     from_values = probe_values(node.from_keys)
     to_values = probe_values(node.to_keys)
     if from_values is None or to_values is None:
+        _record_fallback(context, "ineligible_shape")
         yield from engine._rows(node.fallback, context)
         return
 
@@ -9426,17 +9536,20 @@ def _relationship_incident_seek(
         and allocated_upper * 2 <= exact_from + exact_to
     ):
         if not proved_empty():
+            _record_fallback(context, "nonselective_probe_set")
             yield from engine._rows(node.fallback, context)
         return
 
     from_keys = encoded_keys(from_values, node.from_table, node.from_key_position)
     to_keys = encoded_keys(to_values, node.to_table, node.to_key_position)
     if from_keys is None or to_keys is None:
+        _record_fallback(context, "unproven_totality")
         yield from engine._rows(node.fallback, context)
         return
     probe_frontier = len(from_keys) + len(to_keys)
     if allocated_upper * 2 <= probe_frontier:
         if not proved_empty():
+            _record_fallback(context, "nonselective_probe_set")
             yield from engine._rows(node.fallback, context)
         return
 

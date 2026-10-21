@@ -23,17 +23,26 @@ RF02, RF03, RF05, RF06 and RF08–RF12; RF03 precedes RF04, which consequently
 also waits for RF01. RF07's streaming-contract protection is independent.
 Existing task dependencies further order implementation and qualification.
 
-RF01 is in progress. The first slice instruments physical version headers in
-canonical node/relationship query scans, including MVCC-invisible history,
-with per-statement counts and unchanged cooperative checkpoints. See
+RF01 is in progress. Instrumentation covers physical version headers in
+canonical scans and indexed reads, including MVCC-invisible history, actual
+probes/certificates/identity batches and the first executed fallback guard.
+Observation is isolated per statement or cursor pull, with unchanged
+cooperative checkpoints. See
 [coverage and units](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
 
-Remaining RF01 work: cover index/landing and other physical read paths;
-record probe/certificate/batch counts and actual fallback reasons; extend the
-existing harness and validate raw reports; run semantic, consistency and
+Remaining RF01 work: finish integration acceptance; extend the existing
+harness and validate raw reports; run semantic, consistency and
 three-pair overhead qualification. The current patch does not complete RF01
 or authorize dependent Specs to start. Full release/installed-wheel and
 consumer qualification remain separate from focused development tests.
+
+RF07's independent streaming protection is implemented as a
+[six-case demand/error/cleanup matrix](docs/PERFORMANCE.md#rf07-streaming-landing-demand),
+with pytest protections and three explicit unittest entry points for authenticated
+scenario execution. The conclusion remains negative for speculative destination
+prefetch: no production optimization, new cursor contract or speedup is claimed.
+Native Pulse acceptance, authenticated test evidence and both Test Cards remain
+pending until the committed delivery passes their gates.
 
 ## CI prerequisite correction (CI-WHEEL-RECEIPTS)
 

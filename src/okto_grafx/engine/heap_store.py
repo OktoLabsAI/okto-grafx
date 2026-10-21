@@ -97,6 +97,7 @@ from okto_grafx.engine.buffer_pool import (
 
 if TYPE_CHECKING:
     from okto_grafx.engine.catalog_store import CatalogStore
+    from okto_grafx.engine.statement_work import StatementWorkScope
 
 __all__ = [
     "HEAP_FILE",
@@ -413,25 +414,35 @@ class _VisibleRecordCursor:
             self._admit_page()
             self._seen.add(index)
             selected: list[tuple[RecordRef, RecordId]] = []
-            with self._store._pool.pinned(self._store._file, index) as page:
-                self._store._require_table_page(page, self._table)
-                for slot in page.live_slots():
-                    if slot < FIRST_RECORD_SLOT:
-                        continue
-                    fields = RecordHeader.peek(page.slot_view(slot))
-                    (
-                        _flags,
-                        _reserved,
-                        _schema_version,
-                        _payload_len,
-                        record_id,
-                        xmin,
-                        xmax,
-                        _previous,
-                    ) = fields
-                    if self._snapshot.visible(xmin, xmax):
-                        selected.append((RecordRef(page=index, slot=slot), record_id))
-                following = page.next_page
+            scope = self._store._statement_work
+            statistics = None if scope is None else scope.current_statistics()
+            examined = 0
+            try:
+                with self._store._pool.pinned(self._store._file, index) as page:
+                    self._store._require_table_page(page, self._table)
+                    for slot in page.live_slots():
+                        if slot < FIRST_RECORD_SLOT:
+                            continue
+                        examined += 1
+                        fields = RecordHeader.peek(page.slot_view(slot))
+                        (
+                            _flags,
+                            _reserved,
+                            _schema_version,
+                            _payload_len,
+                            record_id,
+                            xmin,
+                            xmax,
+                            _previous,
+                        ) = fields
+                        if self._snapshot.visible(xmin, xmax):
+                            selected.append((RecordRef(page=index, slot=slot), record_id))
+                    following = page.next_page
+            finally:
+                if statistics is not None:
+                    counter = ("physical_edge_versions_examined" if self._table.kind == "rel"
+                               else "physical_node_versions_examined")
+                    statistics[counter] = statistics.get(counter, 0) + examined
             if following != NO_PAGE and following >= self._limit - 1:
                 current_page_ceiling = self._store._chain_limit() - 1
                 if following >= current_page_ceiling:
@@ -649,6 +660,7 @@ class HeapStore:
         "_overflow_reuse_cursor",
         "_free_index_cursor",
         "_node_label_write_catalog",
+        "_statement_work",
     )
 
     def __init__(
@@ -666,6 +678,7 @@ class HeapStore:
             )
         self._pool: BufferPool = pool
         self._node_label_write_catalog: Catalog | None = None
+        self._statement_work: StatementWorkScope | None = None
         self._catalog: CatalogStore = catalog
         self._tuple_encoding_proofs = tuple_encoding_proofs
         self._file: str = file
@@ -1991,10 +2004,21 @@ class HeapStore:
             )
         return high_water
 
+    def _observe_version(self, table: TableDef, amount: int = 1) -> None:
+        """Publish detached header work without sink or cooperative callbacks."""
+        scope = self._statement_work
+        if scope is not None:
+            statistics = scope.current_statistics()
+            if statistics is not None:
+                name = ("physical_edge_versions_examined" if table.kind == "rel"
+                        else "physical_node_versions_examined")
+                statistics[name] = statistics.get(name, 0) + amount
+
     def read(self, ref: RecordRef) -> HeapVersion:
         """Return the version stored at that location, whichever table it belongs to."""
         table_id, content = self._read_slot(ref)
         table = self._catalog.catalog.table_by_id(table_id)
+        self._observe_version(table)
         return self._decode_version(table, content)
 
     def read_if(
@@ -2015,6 +2039,7 @@ class HeapStore:
         table_id, content = self._read_slot(ref)
         table = self._catalog.catalog.table_by_id(table_id)
         fields = RecordHeader.peek(content)
+        self._observe_version(table)
         if not accept(fields[4], fields[5], fields[6]):
             return None
         return self._decode_version_with_header(
@@ -2037,6 +2062,7 @@ class HeapStore:
         table_id, content = self._read_slot(ref)
         table = self._catalog.catalog.table_by_id(table_id)
         fields = RecordHeader.peek(content)
+        self._observe_version(table)
         if not accept(fields[4], fields[5], fields[6]):
             return None
         return self._decode_version_with_header(
@@ -2073,6 +2099,7 @@ class HeapStore:
                 expected_table_id=table.table_id,
                 field="table_id",
             )
+        self._observe_version(table)
         version = self._decode_version(table, content)
         if version.record_id != record_id:
             raise GrafxCorruptionDetected(
@@ -2281,49 +2308,59 @@ class HeapStore:
             if check is not None:
                 check()
             self._refuse_endless_chain(table, pages_walked, chain_limit)
-            with self._pool.pinned(self._file, index) as page:
-                self._require_table_page(page, table)
-                following = page.next_page
-                for slot in page.live_slots():
-                    if check is not None:
-                        check()
-                    if slot < max(start_slot, FIRST_RECORD_SLOT):
-                        continue
-                    view = page.slot_view(slot)
-                    fields = RecordHeader.peek(view)
-                    (
-                        _flags,
-                        _reserved,
-                        _schema_version,
-                        _payload_len,
-                        _record_id,
-                        xmin,
-                        xmax,
-                        _previous,
-                    ) = fields
-                    if not snapshot.visible(xmin, xmax):
-                        continue
-                    header = RecordHeader._from_peek(fields)
-                    row_charge = 0 if max_batch_bytes is None else 512 + 64 * len(table.columns) + 64 * header.payload_len
-                    over_bytes = max_batch_bytes is not None and charged + row_charge > max_batch_bytes
-                    if over_bytes and not selected:
-                        raise GrafxQueryBudgetExceeded(
-                            "A scan row exceeds the logical batch bound.", resource="scan_batch",
-                            requested=row_charge, limit=max_batch_bytes,
+            scope = self._statement_work
+            statistics = None if scope is None else scope.current_statistics()
+            examined = 0
+            try:
+                with self._pool.pinned(self._file, index) as page:
+                    self._require_table_page(page, table)
+                    following = page.next_page
+                    for slot in page.live_slots():
+                        if check is not None:
+                            check()
+                        if slot < max(start_slot, FIRST_RECORD_SLOT):
+                            continue
+                        view = page.slot_view(slot)
+                        examined += 1
+                        fields = RecordHeader.peek(view)
+                        (
+                            _flags,
+                            _reserved,
+                            _schema_version,
+                            _payload_len,
+                            _record_id,
+                            xmin,
+                            xmax,
+                            _previous,
+                        ) = fields
+                        if not snapshot.visible(xmin, xmax):
+                            continue
+                        header = RecordHeader._from_peek(fields)
+                        row_charge = 0 if max_batch_bytes is None else 512 + 64 * len(table.columns) + 64 * header.payload_len
+                        over_bytes = max_batch_bytes is not None and charged + row_charge > max_batch_bytes
+                        if over_bytes and not selected:
+                            raise GrafxQueryBudgetExceeded(
+                                "A scan row exceeds the logical batch bound.", resource="scan_batch",
+                                requested=row_charge, limit=max_batch_bytes,
+                            )
+                        if len(selected) == limit or over_bytes:
+                            next_position = _HeapScanPosition(
+                                page=index,
+                                slot=slot,
+                                pages_walked=pages_walked,
+                                chain_limit=chain_limit,
+                            )
+                            break
+                        charged += row_charge
+                        selected.append(
+                            (RecordRef(page=index, slot=slot), header, bytes(view))
                         )
-                    if len(selected) == limit or over_bytes:
-                        next_position = _HeapScanPosition(
-                            page=index,
-                            slot=slot,
-                            pages_walked=pages_walked,
-                            chain_limit=chain_limit,
-                        )
-                        break
-                    charged += row_charge
-                    selected.append(
-                        (RecordRef(page=index, slot=slot), header, bytes(view))
-                    )
 
+            finally:
+                if statistics is not None:
+                    counter = ("physical_edge_versions_examined" if table.kind == "rel"
+                               else "physical_node_versions_examined")
+                    statistics[counter] = statistics.get(counter, 0) + examined
             if next_position is not None:
                 break
 
@@ -3380,6 +3417,7 @@ class HeapStore:
                 table=table.name,
                 table_id=table_id,
             )
+        self._observe_version(table)
         return RecordHeader.decode(content)
 
     def _end_version(
@@ -3464,6 +3502,8 @@ class HeapStore:
         """
         counter = ("physical_edge_versions_examined" if table.kind == "rel"
                    else "physical_node_versions_examined")
+        if statistics is None and self._statement_work is not None:
+            statistics = self._statement_work.current_statistics()
         if statistics is not None:
             statistics.setdefault(counter, 0)
         extent = self._find_extent(table.table_id)
@@ -3544,6 +3584,7 @@ class HeapStore:
         """
         table_id, content = self._read_slot(ref)
         table = self._catalog.catalog.table_by_id(table_id)
+        self._observe_version(table)
         return self._decode_version_with_header(
             table, RecordHeader.decode(content), content, landing=True
         )
