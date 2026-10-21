@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import random
 
-from bench.harness import connected_qualification, fts_qualification, read_lifecycle_qualification
+from bench.harness import connected_qualification, fts_qualification, read_lifecycle_qualification, uniqueness_qualification
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ class Scenario:
             raise ValueError("partial progress must be explicitly accepted")
         if (self.write_shape == "chunks" and self.chunk_rows < 1) or (self.write_shape != "chunks" and self.chunk_rows != 0):
             raise ValueError("chunk size applies only to chunks")
-        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination", "capacity", fts_qualification.FAMILY} | connected_qualification.FAMILIES | read_lifecycle_qualification.FAMILIES:
+        if self.family not in {"constant", "keys", "pk_seek", "landing", "node_scan", "edge_scan", "page", "fanout", "write", "fts", "pagination", "capacity", fts_qualification.FAMILY, uniqueness_qualification.FAMILY} | connected_qualification.FAMILIES | read_lifecycle_qualification.FAMILIES:
             raise ValueError("unsupported scenario family")
         if self.nodes < 1 or self.edges_per_node < 0 or self.writers not in (1, 2, 4):
             raise ValueError("invalid fixture dimensions")
@@ -91,6 +91,8 @@ class Scenario:
             raise ValueError("capacity config applies only to RF12 recipes")
         if self.family == fts_qualification.FAMILY:
             fts_qualification.validate(self)
+        if self.family == uniqueness_qualification.FAMILY:
+            uniqueness_qualification.validate(self)
 
     def to_dict(self):
         return asdict(self)
@@ -130,6 +132,8 @@ def live_data(scenario: Scenario):
 
 
 def oracle(scenario: Scenario):
+    if scenario.family == uniqueness_qualification.FAMILY:
+        return uniqueness_qualification.oracle(scenario)
     if scenario.family in read_lifecycle_qualification.FAMILIES:
         return read_lifecycle_qualification.oracle(scenario)
     if scenario.family == "capacity":
@@ -163,6 +167,8 @@ def oracle(scenario: Scenario):
 
 
 def query_for(scenario: Scenario):
+    if scenario.family == uniqueness_qualification.FAMILY:
+        return uniqueness_qualification.query_for(scenario)
     if scenario.family in read_lifecycle_qualification.FAMILIES:
         return read_lifecycle_qualification.query_for(scenario)
     if scenario.family == "capacity":
@@ -205,6 +211,8 @@ def query_for(scenario: Scenario):
 
 
 def contract(scenario: Scenario):
+    if scenario.family == uniqueness_qualification.FAMILY:
+        return uniqueness_qualification.contract(scenario)
     if scenario.family == "capacity":
         from bench.harness.capacity_qualification import contract as capacity_contract
         return capacity_contract(scenario)
@@ -241,6 +249,8 @@ def contract(scenario: Scenario):
 
 
 def build_fixture(db, scenario: Scenario, *, apply_updates=True):
+    if scenario.family == uniqueness_qualification.FAMILY:
+        return uniqueness_qualification.build_fixture(db, scenario)
     if scenario.family == "capacity":
         from bench.harness.capacity_qualification import build_fixture as capacity_fixture
         return capacity_fixture(db, scenario)
@@ -340,4 +350,4 @@ def matrix():
     from bench.harness.quota_qualification import matrix as quota_matrix
     return (result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix()
             + read_lifecycle_qualification.matrix() + quota_matrix(Scenario)
-            + fts_qualification.matrix(Scenario))
+            + fts_qualification.matrix(Scenario) + uniqueness_qualification.matrix(Scenario))

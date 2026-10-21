@@ -280,6 +280,11 @@ def _validate(data):
         if scenario.family == "fts_matrix":
             _require(data["mode"] == "recipe" and not historical,
                      "ranked FTS matrix requires a non-historical recipe comparison")
+        if scenario.family == "unique_create":
+            _require(data["mode"] == "optimization" and not historical,
+                     "RF08 CREATE requires its own optimization matrix")
+            _require(data["intent"] == "exploratory",
+                     "unbudgeted RF08 batch lacks logical peak; temporal run is diagnostic until formal criterion revision")
         if historical:
             if unbudgeted:
                 _require(scenario.family == "landing" and scenario.query_memory_budget_bytes is None,
@@ -413,11 +418,20 @@ def _validate(data):
                 _require(sample["first_row_ns"] <= sample["consume_all_ns"], "first-row boundary exceeds consume")
             else:
                 _require(sample["first_row_ns"] is None, "first row only applies to cursors")
-            if scenario.family == "write":
+            if scenario.family in ("write", "unique_create"):
                 _integer(sample["commit_ns"], "commit_ns")
                 _require(sample["commit_ns"] <= sample["elapsed_ns"], "ACK boundary exceeds total")
-                validate_write_sample(sample, scenario, qualification=data["intent"] == "qualification")
-                if data["intent"] == "qualification" and scenario.writers > 1:
+                if scenario.family == "unique_create":
+                    from bench.harness.uniqueness_qualification import validate_sample as validate_unique_sample
+                    try:
+                        validate_unique_sample(sample, scenario, arm=arm)
+                    except ValueError as exc:
+                        raise CampaignError(str(exc)) from exc
+                    _require(sample["unique_create"]["reopened"] is True,
+                             "RF08 read-only reopen and verify proof missing")
+                else:
+                    validate_write_sample(sample, scenario, qualification=data["intent"] == "qualification")
+                if data["intent"] == "qualification" and scenario.family == "write" and scenario.writers > 1:
                     key = name + ":writer_memory"
                     coverage = [w["memory"]["coverage"] for w in sample["writers"]]
                     _require(key not in sample_contracts or sample_contracts[key] == coverage,
@@ -593,6 +607,20 @@ def compare_campaign(data):
                                                          "per_second" if field.endswith("per_second") else "count")
                                      for field in ("commits", "durable_acks", "business_rows", "rows_per_second", "durable_acks_per_second")}
                                for arm, rows in samples.items()},
+                }
+            if scenario.family == "unique_create":
+                comparisons[-1]["unique_create_diagnostic"] = {
+                    "atomic_unit": "one transaction; one durable ACK",
+                    "memory_limit": "unbudgeted batch has no logical peak; budgeted scalar control is separate",
+                    "comparison_limit": "exploratory until RF08 temporal and memory criteria are formally aligned",
+                    "by_arm": {arm: {
+                        "batch_groups": _distribution([s["statistics"].get("pk_uniqueness_batches", 0)
+                                                       for s in rows], "count"),
+                        "certificate_attempts": _distribution([s["statistics"].get("certificate_attempts", 0)
+                                                               for s in rows], "count"),
+                        "durable_acks": sum(s["unique_create"]["ack_count"] for s in rows),
+                        "logical_memory_coverage": sorted({s["memory"]["coverage"] for s in rows}),
+                    } for arm, rows in samples.items()},
                 }
             if scenario.family == "fts_matrix":
                 comparisons[-1]["fts_tradeoff"] = {

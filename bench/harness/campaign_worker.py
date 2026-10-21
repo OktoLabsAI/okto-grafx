@@ -33,7 +33,7 @@ from bench.harness.campaign_fixtures import Scenario, apply_churn, build_fixture
 from bench.harness import read_lifecycle_qualification
 from bench.harness.campaign_schema import CampaignError, canonical_hash, load_json
 from bench.harness.campaign_schema import HISTORICAL_SCOPE, validate_candidate_memory
-from bench.harness import fts_qualification
+from bench.harness import fts_qualification, uniqueness_qualification
 
 
 def unavailable_memory(reason):
@@ -98,6 +98,8 @@ def measure_statement(db, scenario, index, *, reader=None):
         raise CampaignError("runtime logical memory budget differs from scenario")
     if scenario.family == "write":
         return measure_single_write(db, scenario, index)
+    if scenario.family == uniqueness_qualification.FAMILY:
+        return measure_unique_create(db, scenario, index)
     query, params = query_for(scenario)
     begin = time.perf_counter_ns()
     if scenario.family == "fts":
@@ -426,6 +428,57 @@ def measure_single_write(db, scenario, index):
     return sample
 
 
+def measure_unique_create(db, scenario, index):
+    """Time one materialized CREATE through its returned durable ACK."""
+    query, params = query_for(scenario)
+    prepare_start = time.perf_counter_ns()
+    plan = [type(node).__name__ for node in db.explain(query).walk()]
+    prepare_ns = time.perf_counter_ns() - prepare_start
+    observe = getattr(db._queries, "_observe_logical_memory", None)
+    if scenario.query_memory_budget_bytes is None:
+        # Enabling the observer here adds tariffs to the timed path yet cannot
+        # return a valid logical peak without a quota. Report the null honestly.
+        memory_scope = nullcontext(None)
+    else:
+        if observe is None:
+            raise CampaignError("RF08 quota control requires a logical-memory observer")
+        memory_scope = observe()
+    with memory_scope as observation:
+        tx = db.begin("write")
+        try:
+            cpu_start, start = time.process_time_ns(), time.perf_counter_ns()
+            result = tx.execute(query, params)
+            ack_start = time.perf_counter_ns()
+            ack = tx.commit()
+            commit_ns = time.perf_counter_ns() - ack_start
+            elapsed_ns, cpu_ns = time.perf_counter_ns() - start, time.process_time_ns() - cpu_start
+        except BaseException:
+            if tx.active:
+                tx.rollback()
+            raise
+    if ack.durable is not True or ack.wrote is not True:
+        raise CampaignError("RF08 write returned no durable ACK")
+    if result.rows != oracle(scenario):
+        raise CampaignError("RF08 CREATE statement rows differ from independent IDs")
+    rows = db.execute(uniqueness_qualification.READBACK).rows
+    memory = (observation.result() if observation is not None else
+              unavailable_memory("query_memory_budget_disabled"))
+    if observation is not None and memory["logical_memory_peak_bytes"] is None:
+        raise CampaignError("RF08 quota control yielded no logical-memory peak")
+    peak, scope = rss_peak()
+    sample = sample_record(scenario.to_dict(), index, rows, result.statistics,
+                           elapsed_ns=elapsed_ns, cpu_ns=cpu_ns, prepare_ns=prepare_ns,
+                           memory=memory, rss_peak_bytes=peak, rss_scope=scope,
+                           commit_ns=commit_ns, selected_plan=plan)
+    sample["unique_create"] = {
+        "ids": scenario.write_rows, "statement_rows": len(result.rows),
+        "readback_rows": len(rows), "ack_count": 1, "atomic_unit": "one transaction",
+        "ack": {"csn": int(ack.csn), "durable": ack.durable, "wrote": ack.wrote},
+        "reopened": False,
+    }
+    return sample
+
+
 def _writer_child(root, spec, number, barrier, queue):
     """Spawn target with disjoint keys; any conflict/error remains a failed run."""
     import okto_grafx
@@ -551,7 +604,7 @@ def run_worker(request, output):
             measured_options = {**options, **connection_options(scenario)}
             with tempfile.TemporaryDirectory(prefix="fixture-", dir=output.parent) as directory:
                 root = Path(directory) / "db"
-                independent = scenario.family in ("write", "capacity") or scenario.reader == "retained" or (
+                independent = scenario.family in ("write", "capacity", uniqueness_qualification.FAMILY) or scenario.reader == "retained" or (
                     scenario.family == fts_qualification.FAMILY and scenario.fts_updates > 0)
                 shared_fts_setup = None
                 if not independent:
@@ -587,7 +640,7 @@ def run_worker(request, output):
                             continue_sample = False
                         else:
                             continue_sample = True
-                        if scenario.cache == "warm" and scenario.family not in ("write", "capacity"):
+                        if scenario.cache == "warm" and scenario.family not in ("write", "capacity", uniqueness_qualification.FAMILY):
                             query, params = query_for(scenario)
                             if scenario.family in read_lifecycle_qualification.FAMILIES:
                                 read_lifecycle_qualification.execute(db, scenario)
@@ -644,6 +697,17 @@ def run_worker(request, output):
                         sample = measure_concurrent_write(sample_root, scenario, index)
                     after, wal_after = _sizes(sample_root)
                     sample.update(disk_delta_bytes=after-before, wal_delta_bytes=wal_after-wal_before)
+                    if scenario.family == uniqueness_qualification.FAMILY:
+                        # A read-only open requires a completed checkpoint. Do
+                        # recovery/checkpoint outside the timed ACK interval.
+                        with okto_grafx.connect(sample_root, **options) as recovery:
+                            recovery.checkpoint()
+                        with okto_grafx.connect(sample_root, read_only=True, **options) as reopened:
+                            if canonical_hash(reopened.execute(uniqueness_qualification.READBACK).rows) != canonical_hash(oracle(scenario)):
+                                raise CampaignError("RF08 reopen oracle mismatch")
+                            if reopened.verify("all").findings:
+                                raise CampaignError("RF08 reopen verification found corruption")
+                        sample["unique_create"]["reopened"] = True
                     report["samples"].append(sample)
                     output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
                     # Write results are rechecked through a new handle after ACK.
