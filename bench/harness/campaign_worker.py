@@ -89,6 +89,10 @@ def _fts_rows(db, scenario):
 
 
 def measure_statement(db, scenario, index, *, reader=None):
+    from bench.harness.quota_qualification import connection_options
+    for field, limit in connection_options(scenario).items():
+        if getattr(db._queries, "_" + field, None) != limit:
+            raise CampaignError("runtime traversal quota differs from scenario")
     if db._queries._query_memory_budget_bytes != scenario.query_memory_budget_bytes:
         raise CampaignError("runtime logical memory budget differs from scenario")
     if scenario.family == "write":
@@ -284,7 +288,11 @@ def collect_candidate_memory(run, budgets, directory):
 
 
 def error_record(exc):
+    from okto_grafx.errors import GrafxError
+
     result = {"type": type(exc).__name__, "message": str(exc)}
+    if isinstance(exc, GrafxError):
+        result.update(code=exc.code, details=dict(exc.details))
     if hasattr(exc, "evidence"):
         result["write_failure"] = exc.evidence
     return result
@@ -515,6 +523,8 @@ def run_worker(request, output):
         for spec in request["scenarios"]:
             scenario = Scenario.from_dict(spec)
             options = {"query_memory_budget_bytes": scenario.query_memory_budget_bytes}
+            from bench.harness.quota_qualification import connection_options
+            measured_options = {**options, **connection_options(scenario)}
             with tempfile.TemporaryDirectory(prefix="fixture-", dir=output.parent) as directory:
                 root = Path(directory) / "db"
                 independent = scenario.family == "write" or scenario.reader == "retained"
@@ -523,7 +533,7 @@ def run_worker(request, output):
                         build_fixture(db, scenario)
                 for index in range(25):
                     sample_root = root if not independent else Path(directory) / f"independent-{index}"
-                    with okto_grafx.connect(sample_root, **options) as db:
+                    with okto_grafx.connect(sample_root, **measured_options) as db:
                         if independent:
                             build_fixture(db, scenario, apply_updates=scenario.reader != "retained")
                         report["metrics_sink"] = type(db._queries._metrics.sink.inner).__name__

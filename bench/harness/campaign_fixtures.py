@@ -40,8 +40,12 @@ class Scenario:
     write_shape: str = "unwind"
     chunk_rows: int = 0
     partial_progress: bool = False
+    quota_field: str | None = None
+    quota_limit: int | None = None
 
     def __post_init__(self):
+        from bench.harness.quota_qualification import validate as validate_quota
+        validate_quota(self)
         if self.write_shape not in ("unwind", "statements", "executemany", "chunks", "transactions"):
             raise ValueError("unsupported write shape")
         if self.write_shape in ("chunks", "transactions") and not self.partial_progress:
@@ -201,6 +205,9 @@ def contract(scenario: Scenario):
             "historical temporal landing qualification requires no query quota in either arm; "
             "candidate logical-memory peak and retention require a separate positive-quota proof"
         )
+    if scenario.quota_field is not None:
+        from bench.harness.quota_qualification import contract as quota_contract
+        value.update(quota_contract(scenario))
     return value
 
 
@@ -292,4 +299,6 @@ def matrix():
     from bench.harness.pagination_qualification import matrix as page_matrix
     result.extend(page_matrix(Scenario))
     from bench.harness.rf02_qualification import matrix as scalar_matrix
-    return result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix() + read_lifecycle_qualification.matrix()
+    from bench.harness.quota_qualification import matrix as quota_matrix
+    return (result + scalar_matrix() + connected_qualification.matrix() + ingestion_matrix()
+            + read_lifecycle_qualification.matrix() + quota_matrix(Scenario))
