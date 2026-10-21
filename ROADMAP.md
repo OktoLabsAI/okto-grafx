@@ -24,8 +24,8 @@ also waits for RF01. RF07's streaming-contract protection is independent.
 Existing task dependencies further order implementation and qualification.
 
 RF01 is in progress. Its physical-counter implementation card is Done in Pulse;
-the harness, fixtures and report card is in progress with code and focused tests
-implemented, pending a real six-process run and validation. Instrumentation covers
+the harness, fixtures and report card is in progress with code, focused tests and
+an exploratory real six-process run completed. Instrumentation covers
 physical version headers in canonical scans and indexed reads, including
 MVCC-invisible history, actual probes/certificates/identity batches and the
 first executed fallback guard.
@@ -33,14 +33,19 @@ Observation is isolated per statement or cursor pull, with unchanged
 cooperative checkpoints. See
 [coverage and units](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
 
-Remaining RF01 work: run and assess the complete harness on clean revisions;
-complete the linked semantic, consistency and three-pair overhead qualification.
+Remaining RF01 work: complete the linked semantic, consistency and three-pair
+overhead qualification. The new harness validated all 150 samples in an
+exploratory same-revision run. A clean baseline control derived from `3a2239`
+with the same logical-memory observer and no RF01 physical counters also produced
+150 valid A/B samples against `b18e8f1`; its timing verdict was inconclusive
+with host CPU reaching 91.5%. The control tests only the incremental counter
+cost, so it cannot alone certify the total overhead against the historical base.
 The first overhead campaign kept its raw samples and matching result hashes but
 did not meet the numerical limits under a busy host. A preregistered repeat
 could not start: CPU stayed above 28.2% throughout its five-minute readiness
 window. No overhead pass or performance gain is claimed. RF01 is not Done, so
-its dependent Specs remain blocked. Focused tests, wheel and isolated consumer
-checks passed; the full release matrix remains separate.
+its dependent Specs remain blocked. N1 focused tests, wheel and isolated consumer
+checks passed; N2 focused tests passed. The full release matrix remains separate.
 
 RF07's independent streaming protection is Done in Pulse as a
 [six-case demand/error/cleanup matrix](docs/PERFORMANCE.md#rf07-streaming-landing-demand),

@@ -29,6 +29,9 @@ including the on-disk format.
   logical-budget observer. Preserve quota behavior and report unavailable
   memory coverage explicitly. The first overhead comparison and its aborted
   readiness-gated repeat are inconclusive; no speedup or overhead pass is claimed.
+  A real same-revision smoke and a compatible observer-control comparison both
+  validated 150 raw samples; the latter remains temporally inconclusive under
+  high host load.
 
 ### CI portability and execution policy
 

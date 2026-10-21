@@ -58,8 +58,8 @@ the cursor observation scope. These diagnostics do not extend the frozen
 `MetricsSink` catalogue; no data, query text or parameters become labels.
 
 RF01 remains in progress. The versioned campaign and report validator are
-implemented; a complete real six-process run and the three-pair overhead
-qualification are pending. These deterministic counters establish measurement semantics;
+implemented; real six-process runs validated the artifact contract, while the
+three-pair overhead qualification remains pending. These deterministic counters establish measurement semantics;
 they do not establish a speedup or compliance with the overhead budget.
 
 ### RF01 campaign evidence and memory boundary
@@ -103,13 +103,36 @@ added into a fictional shared RSS peak. A qualification attempt must report
 unavailable coverage explicitly instead of substituting zero. Reopen after a
 durable write ACK checks the stored result but does not claim a cleared OS cache.
 
-The initial RF01 counter-overhead comparison kept identical results and raw
-samples but ran under high, varying host load. Its threshold result is
-inconclusive. A preregistered repeat stopped at its readiness gate after five
-minutes without starting either arm; the minimum observed host CPU was 28.2%.
-Neither run proves the RF01 overhead limit or a speedup. Full qualification
-requires a clean committed candidate, a compatible comparison source and a
-calibrated executor with the same evidence contract on both arms.
+The first real run of the new harness used `b18e8f1` on both arms, selected only
+the constant control, and validated six clean process outputs in AB/BA/AB order
+with 150 raw samples. It is exploratory: host CPU reached 59%, calibration did
+not meet the registered noise policy, and query memory was unavailable because
+that run omitted the budget. Its purpose was to test orchestration, provenance
+and the raw schema, not counter overhead.
+
+A second complete run compared clean control `4d9c02e` (derived from `3a2239`
+with the same real logical-memory observer, without RF01 physical counters)
+against candidate `b18e8f1`, with the same 64 MiB query budget on both arms.
+All 150 samples validated with matching typed results and available logical
+memory coverage. Candidate/base median ratios across pairs were 1.060, 1.178
+and 1.192; descriptive p95 ratios were 1.011, 1.023 and 1.104. Host CPU reached
+91.5%, and within-process dispersion exceeded the registered limit. The verdict
+is **inconclusive**, irrespective of individual ratios. This control tests the
+incremental counter cost over a common observer, not the observer's own cost
+against the historical source.
+
+The earlier pre-harness counter-overhead comparison also kept identical results
+and raw samples under high, varying host load; its result remains inconclusive.
+Its preregistered repeat stopped at a five-minute readiness gate without starting
+either arm (minimum host CPU 28.2%). None of these runs proves the RF01 overhead
+limit or a speedup. A complete overhead claim must account for the observer's
+cost as well as the counters, under the fixed three-pair protocol and a calibrated
+executor. Artifacts for the new runs are retained locally under
+`.grafx-tmp/rf01-smoke-b18/` and `.grafx-tmp/rf01-control-comparison-1/`;
+their `campaign.json` SHA-256 digests are respectively
+`fa699b373dc5f3157b99c497bd8f304caeef281b4b5893135cee58eebe2ce8bd` and
+`4bf11896a5f5552c7f19446f0d93e5e43fb9576b727e501e88cf524cfaddc420`.
+They contain synthetic fixtures and all raw samples, but are not release evidence.
 
 ## 0.0.7 performance round closure
 
