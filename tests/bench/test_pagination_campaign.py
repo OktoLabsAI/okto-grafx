@@ -27,6 +27,10 @@ def test_rf05_case_has_independent_oracle_and_runtime_regime(tmp_path, case):
                 32 if case in ("membership", "dynamic_membership") else 16
             )
             assert result.statistics.get("ordered_merge_rows") == 16
+            if case == "first":
+                assert 0 < result.statistics["physical_node_versions_examined"] < scenario.nodes
+                assert sample["statistics"]["physical_node_versions_examined"] == result.statistics[
+                    "physical_node_versions_examined"]
         else:
             assert result.statistics.get("ordered_merge_rows", 0) == 0
 

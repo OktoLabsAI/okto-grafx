@@ -15,7 +15,7 @@ import re
 import statistics
 
 from bench.harness.campaign_fixtures import Scenario, contract, oracle, query_for
-from bench.harness import fts_qualification, rf04_qualification
+from bench.harness import fts_qualification, quota_qualification, rf04_qualification
 
 HISTORICAL_SCOPE = "rf01_historical_total_overhead"
 HISTORICAL_REVISION = "3a2239a0bda80223c298a68d6d14f3c951f133d2"
@@ -248,14 +248,19 @@ def _validate(data):
     _require(scope in (None, HISTORICAL_SCOPE), "unknown qualification scope")
     historical = scope == HISTORICAL_SCOPE
     regime = data.get("memory_regime", "budgeted")
-    _require(regime in ("budgeted", "unbudgeted_landing"), "unknown memory regime")
+    _require(regime in ("budgeted", "unbudgeted_landing", quota_qualification.SPLIT_MEMORY_REGIME),
+             "unknown memory regime")
     unbudgeted = regime == "unbudgeted_landing"
+    rf06_split = regime == quota_qualification.SPLIT_MEMORY_REGIME
     proof_budget = data.get("candidate_memory_budget_bytes")
     if unbudgeted:
         _require(historical, "unbudgeted landing is only a historical noop exception")
         _integer(proof_budget, "separate candidate memory budget", 1)
     else:
         _require(proof_budget is None, "separate memory budget only applies to unbudgeted landing")
+    if rf06_split:
+        _require(not historical and data["mode"] == "optimization" and data["intent"] == "qualification",
+                 "RF06 split-memory is only a comparable-revision optimization qualification")
     if historical:
         _require(data["mode"] == "noop", "historical exception is only RF01 total noop overhead")
     _require(type(data["calibrated_executor"]) is bool, "calibrated_executor must be boolean")
@@ -302,6 +307,10 @@ def _validate(data):
                                       "contract_hash": canonical_hash(contract(scenario)),
                                       "expected_result_hash": canonical_hash(expected_rows),
                                       "result_hash": canonical_hash(expected_rows), "rows": len(expected_rows)}
+    if rf06_split:
+        expected = [item.to_dict() for item in quota_qualification.qualification_matrix(Scenario)]
+        _require(data["scenarios"] == expected,
+                 "RF06 split-memory qualification requires exact quota targets and scalar controls")
     rf08_qualification = (data["intent"] == "qualification"
                           and any(s.family == "unique_create" for s in scenarios.values()))
     if rf08_qualification:
@@ -340,6 +349,8 @@ def _validate(data):
                 _require(run.get("memory_regime") == regime and run.get("candidate_memory_budget_bytes") == proof_budget,
                          "worker memory regime/proof budget differs from campaign")
             _historical_run(run, scenarios, unbudgeted, proof_budget)
+        if rf06_split:
+            _require(run.get("memory_regime") == regime, "RF06 worker memory regime differs from campaign")
         _require(bool(run["source_root"]) and bool(run["package_file"]), "missing import provenance")
         env = run["environment"]
         _fields(env, ("python", "dependencies", "os", "cpu", "cpu_count", "ram_bytes", "disk", "gc_enabled"), "environment")
@@ -475,6 +486,32 @@ def _validate(data):
                     raise CampaignError(str(exc)) from exc
             _fields(memory, ("logical_memory_peak_bytes", "baseline_retained_bytes", "coverage", "unavailable_reason"), "memory")
             _integer(memory["baseline_retained_bytes"], "baseline_retained_bytes")
+            if rf06_split:
+                _integer(sample["statistics"].get("certificate_attempts"), "RF06 certificate attempts", 1)
+                _integer(sample["statistics"].get("landing_candidates"), "RF06 landing candidates", 1)
+                _require(sample["rss_peak_bytes"] > 0 and sample["rss_scope"] in (
+                    "process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"),
+                    "RF06 requires real process RSS in both arms")
+                _require(sample.get("memory_budget_bytes") == scenario.query_memory_budget_bytes,
+                         "RF06 observed logical budget differs from fixed scenario")
+                if scenario.role == "target":
+                    _require(memory["logical_memory_peak_bytes"] is None
+                             and memory["coverage"] == "unavailable"
+                             and memory["unavailable_reason"] == "query_memory_budget_disabled",
+                             "RF06 unbudgeted target must report null logical peak")
+                    batches = sample["statistics"].get("landing_batches", 0)
+                    candidates = sample["statistics"].get("landing_candidates", 0)
+                    _require((batches == 0 if arm == "A" else batches == 2)
+                             and candidates == 128,
+                             "RF06 target did not distinguish scalar baseline and bounded candidate batches")
+                else:
+                    _require(memory["logical_memory_peak_bytes"] is not None
+                             and memory["logical_memory_peak_bytes"] <= scenario.query_memory_budget_bytes
+                             and memory["coverage"] == LOGICAL_COVERAGE
+                             and memory["unavailable_reason"] is None
+                             and sample["statistics"]["landing_candidates"] == 128
+                             and sample["statistics"].get("landing_batches", 0) == 0,
+                             "RF06 scalar quota control lacks covered memory or used batching")
             if historical:
                 _require(sample["rss_peak_bytes"] > 0 and sample["rss_scope"] in (
                     "process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"),
@@ -502,7 +539,7 @@ def _validate(data):
                                           sample["rss_peak_bytes"] > 0 and sample["rss_scope"] in (
                                               "process_lifetime_peak_working_set_bytes", "process_lifetime_ru_maxrss_bytes"))
                 rf08_unbudgeted = rf08_qualification and scenario.family == "unique_create" and scenario.query_memory_budget_bytes is None
-                _require((scenario.family == "write" and scenario.writers > 1) or (historical and (arm == "A" or unbudgeted)) or native_fts_unavailable or rf08_unbudgeted or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
+                _require((scenario.family == "write" and scenario.writers > 1) or (historical and (arm == "A" or unbudgeted)) or native_fts_unavailable or rf08_unbudgeted or (rf06_split and scenario.role == "target") or (data["intent"] == "exploratory" and bool(memory["unavailable_reason"])), "memory unavailable: cannot qualify")
             else:
                 _integer(memory["logical_memory_peak_bytes"], "logical_memory_peak_bytes")
                 _require(memory["logical_memory_peak_bytes"] >= memory["baseline_retained_bytes"], "memory peak below baseline")
@@ -513,6 +550,39 @@ def _validate(data):
                         _require(memory["coverage"] == sample_contracts[coverage_key], "memory measurement method changed between arms")
                     else:
                         sample_contracts[coverage_key] = memory["coverage"]
+        if rf06_split:
+            proofs = run.get("rf06_memory_proofs")
+            expected_controls = {name for name, scenario in scenarios.items() if scenario.role == "control"}
+            _require(isinstance(proofs, dict) and set(proofs) == expected_controls,
+                     "RF06 requires a separate retention proof for every scalar control")
+            for name, proof in proofs.items():
+                scenario = scenarios[name]
+                _require(proof.get("arm") == arm and proof.get("revision") == run["revision"]
+                         and proof.get("invocation_id") == run["invocation_id"]
+                         and proof.get("process_id") == run["process_id"]
+                         and proof.get("scenario_id") == name
+                         and proof.get("scenario_hash") == canonical_hash(scenario.to_dict())
+                         and proof.get("query_memory_budget_bytes") == scenario.query_memory_budget_bytes,
+                         "RF06 scalar memory proof is not bound to this run and workload")
+                records = proof.get("records")
+                _require(isinstance(records, list) and len(records) == 5,
+                         "RF06 scalar retention proof requires five same-handle repetitions")
+                baseline = records[0].get("retained_before_bytes")
+                _integer(baseline, "RF06 retained baseline")
+                for index, record in enumerate(records):
+                    _require(record.get("index") == index and record.get("retained_before_bytes") == baseline
+                             and record.get("retained_after_bytes") == baseline
+                             and record.get("open_transactions_after") == 0,
+                             "RF06 scalar control retained memory or transaction state")
+                    proof_memory = record.get("memory")
+                    _require(isinstance(proof_memory, dict) and proof_memory.get("coverage") == LOGICAL_COVERAGE
+                             and proof_memory.get("unavailable_reason") is None
+                             and proof_memory.get("baseline_retained_bytes") == baseline,
+                             "RF06 scalar proof lacks covered logical observation")
+                    peak = proof_memory.get("logical_memory_peak_bytes")
+                    _integer(peak, "RF06 scalar proof peak", baseline)
+                    _require(peak <= scenario.query_memory_budget_bytes,
+                             "RF06 scalar proof exceeded its logical query budget")
     _require(all(len(values) == 1 for values in revisions.values()), "revision changed inside an arm")
     _require(all(value == environments[0] for value in environments), "environment changed between arms")
     if data.get("calibration") is not None:
@@ -689,6 +759,7 @@ def matched_write_loads(scenarios, comparisons):
 
 def compare_campaign(data):
     validate_campaign(data)
+    rf06_split = data.get("memory_regime") == quota_qualification.SPLIT_MEMORY_REGIME
     comparisons, totals = [], []
     calibrated = calibration_matches(data)
     noisy = not calibrated or any(
@@ -743,6 +814,23 @@ def compare_campaign(data):
                         "logical_memory_peak_bytes": _distribution([
                             s["memory"]["logical_memory_peak_bytes"] for s in rows], "bytes")
                         if all(type(s["memory"]["logical_memory_peak_bytes"]) is int for s in rows) else None,
+                    } for arm, rows in samples.items()},
+                }
+            if rf06_split:
+                comparisons[-1]["rf06_tradeoff"] = {
+                    "traversal_quota": {scenario.quota_field: scenario.quota_limit},
+                    "query_memory_budget_bytes": scenario.query_memory_budget_bytes,
+                    "rss_scope": "process-lifetime peak, not query-attributable allocation",
+                    "by_arm": {arm: {
+                        "certificate_attempts": _distribution([
+                            s["statistics"]["certificate_attempts"] for s in rows], "count"),
+                        "landing_batches": _distribution([
+                            s["statistics"].get("landing_batches", 0) for s in rows], "count"),
+                        "landing_candidates": _distribution([
+                            s["statistics"]["landing_candidates"] for s in rows], "count"),
+                        "logical_memory_peak_bytes": _distribution([
+                            s["memory"]["logical_memory_peak_bytes"] for s in rows], "bytes")
+                        if scenario.role == "control" else None,
                     } for arm, rows in samples.items()},
                 }
             if scenario.family == "write":
@@ -803,8 +891,13 @@ def compare_campaign(data):
             "qualification_scope": data.get("qualification_scope", "comparable_observer"),
             "memory_regime": data.get("memory_regime", "budgeted"),
             "retry_scope": "single_campaign_only",
-             "comparative_logical_memory": data.get("qualification_scope") != HISTORICAL_SCOPE and data["intent"] == "qualification" and not all(Scenario.from_dict(s).family == "fts_matrix" for s in data["scenarios"]),
+            "comparative_logical_memory": not rf06_split and data.get("qualification_scope") != HISTORICAL_SCOPE and data["intent"] == "qualification" and not all(Scenario.from_dict(s).family == "fts_matrix" for s in data["scenarios"]),
             "candidate_memory_verified": data.get("qualification_scope") == HISTORICAL_SCOPE,
+            "rf06_scalar_control_memory_verified": rf06_split,
+            "rf06_memory_scope": ({"target": "logical peak unavailable in both unbudgeted arms; real process-lifetime RSS retained",
+                                   "scalar_controls": "same traversal quota class, positive query budget and covered logical peak in both arms; no batch",
+                                   "comparison_limit": "scalar control proves fallback and retention under a budget, not the unbudgeted target's query-level allocation"}
+                                  if rf06_split else None),
             "decision": decision, "comparisons": comparisons, "overall": totals,
             "matched_write_loads": matched_write_loads([Scenario.from_dict(s) for s in data["scenarios"]], comparisons)
             if data["mode"] == "recipe" else [],

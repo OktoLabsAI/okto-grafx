@@ -9,6 +9,7 @@ never successful temporal samples. Memory-budget controls retain scalar landing.
 from __future__ import annotations
 
 FIELDS = ("max_intermediate_rows", "max_traversal_paths", "max_traversal_expansions")
+SPLIT_MEMORY_REGIME = "rf06_split_memory_landing"
 
 
 def validate(scenario):
@@ -57,4 +58,24 @@ def matrix(scenario_type):
                                     nodes=65, edges_per_node=0, fanout=65,
                                     quota_field=field, quota_limit=65,
                                     query_memory_budget_bytes=1048576))
+        result.append(scenario_type(f"rf06-{short}-n128-memory-control", "landing",
+                                    nodes=128, edges_per_node=0, fanout=128,
+                                    quota_field=field, quota_limit=128,
+                                    query_memory_budget_bytes=1048576))
+    return result
+
+
+def qualification_matrix(scenario_type):
+    """The exact paired RF06 load: quota-bounded batch targets and scalar controls.
+
+    The target retains a traversal quota but no logical query-memory budget.
+    The matching control retains that traversal quota class and adds the
+    explicit logical budget, which must keep the scalar path in both arms.
+    """
+    catalog = {scenario.name: scenario for scenario in matrix(scenario_type)}
+    result = []
+    for field in FIELDS:
+        stem = field.removeprefix("max_")
+        result.extend((catalog[f"rf06-{stem}-n128"],
+                       catalog[f"rf06-{stem}-n128-memory-control"]))
     return result

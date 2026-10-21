@@ -324,6 +324,37 @@ def error_record(exc):
     return result
 
 
+def rf06_memory_retention_proof(db, scenario):
+    """Untimed same-handle scalar proof; it never measures target batch memory."""
+    from bench.harness.quota_qualification import expected_outcome
+
+    if (scenario.query_memory_budget_bytes is None or scenario.role != "control"
+            or expected_outcome(scenario) != "success"):
+        raise CampaignError("RF06 retention proof requires a successful budgeted scalar control")
+    observe = getattr(db._queries, "_observe_logical_memory", None)
+    if not callable(observe):
+        raise CampaignError("RF06 scalar memory observer unavailable")
+    query, params = query_for(scenario)
+    records = []
+    for index in range(5):
+        before = db._queries._owner_budget._used_bytes + db._queries._endpoint_budget._used_bytes
+        with observe() as observation:
+            result = db.execute(query, params)
+            if result.rows != oracle(scenario) or result.statistics.get("landing_batches", 0):
+                raise CampaignError("RF06 scalar memory proof diverged from oracle or used batching")
+        after = db._queries._owner_budget._used_bytes + db._queries._endpoint_budget._used_bytes
+        memory = observation.result()
+        if (after != before or db.transactions.open_transactions != 0
+                or memory["logical_memory_peak_bytes"] is None
+                or memory["logical_memory_peak_bytes"] > scenario.query_memory_budget_bytes):
+            raise CampaignError("RF06 scalar memory proof retained budget or leaked a transaction")
+        records.append({"index": index, "retained_before_bytes": before,
+                        "retained_after_bytes": after, "open_transactions_after": 0,
+                        "memory": memory})
+    return {"scope": "five untimed repetitions on one budgeted scalar handle; not target batch allocation",
+            "records": records}
+
+
 class WriteCampaignFailure(CampaignError):
     def __init__(self, evidence):
         self.evidence = evidence
@@ -600,6 +631,8 @@ def run_worker(request, output):
               "cpu_before_percent": psutil.cpu_percent(interval=.2), "samples": []}
     historical = request.get("qualification_scope") == HISTORICAL_SCOPE
     unbudgeted = request.get("memory_regime") == "unbudgeted_landing"
+    from bench.harness.quota_qualification import SPLIT_MEMORY_REGIME, qualification_matrix
+    rf06_split = request.get("memory_regime") == SPLIT_MEMORY_REGIME
     if unbudgeted:
         proof_budget = request.get("candidate_memory_budget_bytes")
         if not historical or type(proof_budget) is not int or proof_budget <= 0:
@@ -607,6 +640,10 @@ def run_worker(request, output):
         if any(Scenario.from_dict(spec).family != "landing" or Scenario.from_dict(spec).query_memory_budget_bytes is not None for spec in request["scenarios"]):
             raise CampaignError("unbudgeted worker requires landing without temporal quota")
         report.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=proof_budget)
+    if rf06_split:
+        if historical or request["scenarios"] != [item.to_dict() for item in qualification_matrix(Scenario)]:
+            raise CampaignError("RF06 worker requires the exact split-memory quota matrix")
+        report["memory_regime"] = SPLIT_MEMORY_REGIME
     if historical:
         report.update(source_identity(source, revision))
     output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
@@ -626,7 +663,8 @@ def run_worker(request, output):
                 shared_fts_setup = None
                 if not independent:
                     setup_start = time.perf_counter_ns()
-                    with okto_grafx.connect(root, **options) as db:
+                    setup_options = ({"query_memory_budget_bytes": None} if rf06_split else options)
+                    with okto_grafx.connect(root, **setup_options) as db:
                         build_fixture(db, scenario)
                     if scenario.family == fts_qualification.FAMILY:
                         setup_bytes, setup_wal = _sizes(root)
@@ -732,6 +770,15 @@ def run_worker(request, output):
                         with okto_grafx.connect(sample_root, **options) as reopened:
                             if canonical_hash(reopened.execute("MATCH (n:W) RETURN n.id,n.payload ORDER BY n.id").rows) != canonical_hash(oracle(scenario)):
                                 raise CampaignError("write reopen oracle mismatch")
+                if rf06_split and scenario.role == "control":
+                    with okto_grafx.connect(root, **measured_options) as proof_db:
+                        proof = rf06_memory_retention_proof(proof_db, scenario)
+                    proof.update(arm=report["arm"], revision=report["revision"],
+                                 invocation_id=report["invocation_id"], process_id=report["process_id"],
+                                 scenario_id=scenario.name,
+                                 scenario_hash=canonical_hash(scenario.to_dict()),
+                                 query_memory_budget_bytes=scenario.query_memory_budget_bytes)
+                    report.setdefault("rf06_memory_proofs", {})[scenario.name] = proof
             output.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
         report["cpu_after_percent"] = psutil.cpu_percent(interval=.2)
         if historical and request["arm"] == "B":

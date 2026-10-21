@@ -996,3 +996,42 @@ median and 5% p95; only one entire repeat after an inconclusive campaign is
 allowed. Missing candidate memory or missing memory outside this exact profile
 still fails closed. Implementation and functional tests do not establish an
 overhead pass: a valid campaign is still required, and no gain is claimed.
+
+## RF05 and RF06 qualification selectors
+
+RF05 uses the six `rf05-{first,membership,dynamic_membership,keyset,skip,no_index}-n1024-p16`
+cases in an A/B optimization campaign. Select `rf05-first-n1024-p16` as the
+target with `--target rf05-first-n1024-p16:physical_node_versions_examined`;
+the other five remain timing controls. Apply the same positive `--memory-budget`
+to both revisions. The ordered oracle retains the exact public sequence,
+including timestamp ties and keyset boundary. The first page must show bounded
+`ordered_candidates_examined` and lower physical node work; fallback controls
+must not be credited as index wins. The optimization threshold is a median
+candidate/base ratio at most 0.90 per pair, with controls at most 1.05 median
+and 1.10 p95, calibrated executor, real CPU/RSS and raw hashes as in RF01.
+
+RF06 uses `--rf06-split-memory` and the **exact** six-case matrix returned by
+`quota_qualification.qualification_matrix(Scenario)`, in its declared order.
+For each of `max_intermediate_rows`, `max_traversal_paths` and
+`max_traversal_expansions`, the 128-destination target keeps that traversal
+quota at 128 in both revisions and has no `query_memory_budget_bytes`; this
+permits the quota-aware batch. The paired control uses the same 128-destination
+fixture, query and traversal quota, adding only a 1 MiB query-memory budget in
+both revisions. This must retain the scalar path. Do not supply `--memory-budget`, `--target`,
+historical flags or a candidate-only memory configuration. Both source arms
+run the identical query and configuration for each case.
+
+The RF06 target's logical peak is honestly `null` with reason
+`query_memory_budget_disabled` in **both** arms. The target retains real
+process-lifetime RSS, CPU and physical `certificate_attempts`; its baseline
+must be scalar and its candidate must form two groups of 64 without changing
+the 128 candidate landings. Each budgeted scalar control must report a covered
+logical peak at or below its budget and no group. After timing, five extra
+reads on one control handle
+prove that owner/endpoint retained bytes return to the same baseline and no
+read transaction remains. This proves the scalar fallback under budget, not a
+per-query allocation bound for the unbudgeted target. The report explicitly
+marks comparative target logical memory unavailable. The usual A/B temporal,
+semantic, physical-work, calibration and noise gates still apply. A final
+qualified claim also needs the RF06 Spec's formally revised memory criterion;
+this harness profile alone does not revise that criterion.

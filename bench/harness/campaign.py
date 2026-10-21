@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from bench.harness.campaign_fixtures import matrix
+from bench.harness.campaign_fixtures import Scenario, matrix
 from bench.harness.campaign_schema import CampaignError, canonical_hash, compare_campaign, load_json, validate_campaign
 from bench.harness.campaign_schema import HISTORICAL_SCOPE, HISTORICAL_REVISION, RUNNER_PYTHON_FLAGS
 
@@ -143,8 +143,16 @@ def run_campaign(args):
     revisions = {arm: subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
                  for arm, root in sources.items()}
     unbudgeted = getattr(args, "historical_unbudgeted_landing", False)
+    rf06_split = getattr(args, "rf06_split_memory", False)
     proof_budget = getattr(args, "candidate_memory_budget", None)
     historical = getattr(args, "historical_noop", False) or unbudgeted
+    if rf06_split:
+        from bench.harness.quota_qualification import qualification_matrix
+        expected = [scenario.to_dict() for scenario in qualification_matrix(Scenario)]
+        if (historical or args.mode != "optimization" or args.intent != "qualification"
+                or args.memory_budget is not None or proof_budget is not None
+                or selected != expected or targets):
+            raise CampaignError("RF06 split-memory qualification requires the exact quota matrix without overrides")
     if unbudgeted:
         if args.memory_budget is not None or type(proof_budget) is not int or proof_budget <= 0:
             raise CampaignError("unbudgeted landing requires no temporal quota and a positive separate candidate memory budget")
@@ -172,7 +180,10 @@ def run_campaign(args):
             raise CampaignError("rerun must preserve revisions and registered noise policy")
         if previous_data.get("qualification_scope") != (HISTORICAL_SCOPE if historical else None):
             raise CampaignError("rerun cannot change historical/comparable-observer scope")
-        if previous_data.get("memory_regime", "budgeted") != ("unbudgeted_landing" if unbudgeted else "budgeted") or previous_data.get("candidate_memory_budget_bytes") != proof_budget:
+        expected_regime = ("rf06_split_memory_landing" if rf06_split else
+                           "unbudgeted_landing" if unbudgeted else "budgeted")
+        if (previous_data.get("memory_regime", "budgeted") != expected_regime
+                or previous_data.get("candidate_memory_budget_bytes") != proof_budget):
             raise CampaignError("rerun must preserve memory regime and separate proof budget")
         if historical and compare_campaign(previous_data)["decision"] != "inconclusive":
             raise CampaignError("historical retry is allowed only after a complete inconclusive campaign")
@@ -191,6 +202,9 @@ def run_campaign(args):
         data["qualification_scope"] = HISTORICAL_SCOPE
     if unbudgeted:
         data.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=proof_budget)
+    if rf06_split:
+        from bench.harness.quota_qualification import SPLIT_MEMORY_REGIME
+        data["memory_regime"] = SPLIT_MEMORY_REGIME
     calibration_path = getattr(args, "calibration", None)
     if calibration_path is not None:
         raw = calibration_path.read_text(encoding="utf-8")
@@ -206,6 +220,8 @@ def run_campaign(args):
             request["qualification_scope"] = HISTORICAL_SCOPE
         if unbudgeted:
             request.update(memory_regime="unbudgeted_landing", candidate_memory_budget_bytes=proof_budget)
+        if rf06_split:
+            request["memory_regime"] = data["memory_regime"]
         request_path = output / f"request-{pair}-{arm}.json"
         raw_path = output / f"raw-{pair}-{arm}.json"
         _write(request_path, request)
@@ -258,6 +274,8 @@ def main(argv=None):
                      help="historical landing without temporal quota; separate candidate memory proof required")
     run.add_argument("--candidate-memory-budget", type=int,
                      help="positive budget for separate untimed candidate proof in unbudgeted landing regime")
+    run.add_argument("--rf06-split-memory", action="store_true",
+                     help="fixed RF06 targets with traversal quotas and no query-memory budget, plus budgeted scalar controls")
     run.add_argument("--calibrated-executor", action="store_true")
     run.add_argument("--calibration", type=Path, help="hashed executor control receipt; a boolean alone cannot qualify")
     run.add_argument("--worker-timeout", type=float, default=3600)
