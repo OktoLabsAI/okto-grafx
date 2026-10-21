@@ -500,6 +500,8 @@ class _Planner:
     capture_paths: set[str] = field(default_factory=set)
     bound_paths: set[str] = field(default_factory=set)
     unwind_alias: str | None = None
+    # Lowered binding identities carried by the current driving pipeline.
+    scalar_unwind_bindings: set[str] = field(default_factory=set)
     unwind_source: Expression | None = None
     unwind_sources: dict[str, Expression] = field(default_factory=dict)
     alias_definitions: dict[str, Expression] = field(default_factory=dict)
@@ -1524,6 +1526,7 @@ class _Planner:
                 continue
             if isinstance(clause, UnwindClause):
                 self.unwind_alias = clause.alias
+                self.scalar_unwind_bindings.add(clause.alias)
                 self.unwind_source = clause.expression
                 self.unwind_sources[clause.alias] = clause.expression
                 proof = entity_sources(clause.expression, self._binding_entity_kind)
@@ -1753,6 +1756,14 @@ class _Planner:
                 ReturnItem(expression=Variable(item.name), alias=item.name) for item in clause.items
             ))
             pipeline = self._restore_imports(pipeline)
+        # WITH projects a new scope. Only a direct carry/rename preserves the
+        # UNWIND witness; a computed value with the same spelling does not.
+        # Aggregate boundaries remain conservative even for grouping keys.
+        self.scalar_unwind_bindings = set() if aggregations else {
+            item.name for item in clause.items
+            if isinstance(item.expression, Variable)
+            and item.expression.name in self.scalar_unwind_bindings
+        }
         return pipeline
 
 
@@ -3489,6 +3500,9 @@ class _Planner:
                 continue
             if not self._seekable_key(value):
                 continue
+            if isinstance(value, Variable) and subject.key != table.primary_key:
+                # RF02 admits scalar input only for the primary-key equality.
+                continue
             if self._column_of(table, subject.key) is None:
                 raise GrafxPlanError(
                     f"Table {table.name!r} has no column named {subject.key!r}.",
@@ -3513,6 +3527,12 @@ class _Planner:
 
         if isinstance(value, (Literal, Parameter)):
             return not free_variables(value)
+        if isinstance(value, Variable):
+            # A scan and a seek do not have interchangeable read phases when
+            # later writes revisit the same key. Keep the canonical pipeline
+            # for updating statements, including writes in nested subqueries.
+            return (value.name in self.scalar_unwind_bindings
+                    and not self.analysis.statement.writes)
         if self.unwind_alias is None:
             return False
         return (
