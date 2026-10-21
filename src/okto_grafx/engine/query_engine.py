@@ -8144,6 +8144,7 @@ def _admits_batched_landings(
     table now reaches that same path.
     """
     def decline(reason: str) -> bool:
+        """Record why this statement cannot use the batched landing path."""
         if reasons is not None:
             reasons.append(reason)
         return False

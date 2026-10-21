@@ -2217,6 +2217,7 @@ class HeapStore:
         of an already inspected page when consumption stops early.
         """
         def visible(_record_id: RecordId, xmin: Csn, xmax: Csn) -> bool:
+            """Apply the pinned snapshot to each walked version header."""
             return snapshot.visible(xmin, xmax)
 
         for ref, header, content in self._walk(table, accept=visible, statistics=statistics):

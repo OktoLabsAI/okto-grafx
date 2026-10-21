@@ -37,6 +37,7 @@ class _LogicalMemoryObservation:
         self._sequence = sequence
 
     def update(self, token: object, retained: int) -> None:
+        """Record the current retained tariff for one live budget token."""
         if not self._active:
             return
         if retained < 0:
@@ -50,19 +51,23 @@ class _LogicalMemoryObservation:
         self._peak = max(self._peak, self.current)
 
     def freeze_baseline(self) -> None:
+        """Remember retention before the measured sequence begins."""
         self._baseline = self.current
 
     def invalidate(self, reason: str) -> None:
+        """Keep the first reason an observation cannot certify a peak."""
         if self._active and self._reason is None:
             self._reason = reason
 
     def claim(self, statement: object) -> None:
+        """Bind work to one statement unless sequence mode was requested."""
         if self._statement is None:
             self._statement = statement
         elif self._statement is not statement and not self._sequence:
             self.invalidate("multiple_statements_in_interval")
 
     def close(self) -> None:
+        """Revoke the observer after checking statement and cursor ownership."""
         if self._statement is None:
             self.invalidate("no_statement_observed")
         if self._cursors:
@@ -72,6 +77,7 @@ class _LogicalMemoryObservation:
         self._statement = None
 
     def result(self) -> dict[str, object]:
+        """Return the observed peak or an explicit coverage failure reason."""
         return {
             "logical_memory_peak_bytes": self._peak if self._reason is None else None,
             "baseline_retained_bytes": self._baseline,
