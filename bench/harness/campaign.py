@@ -175,7 +175,11 @@ def run_campaign(args):
         if previous_data["protocol"]["attempt"] != 1:
             raise CampaignError("only one entire rerun is allowed")
         previous = hashlib.sha256(args.previous.read_bytes()).hexdigest()
-        if previous_data["scenarios"] != selected or previous_data["mode"] != args.mode:
+        # JSON restores tuple-valued probe keys as lists. Compare the validated
+        # scenario model so an unchanged campaign remains eligible for its one retry.
+        if ([Scenario.from_dict(item) for item in previous_data["scenarios"]]
+                != [Scenario.from_dict(item) for item in selected]
+                or previous_data["mode"] != args.mode):
             raise CampaignError("rerun must preserve scenarios and comparison mode")
         previous_revisions = {run["arm"]: run["revision"] for run in previous_data["runs"]}
         if previous_revisions != revisions or previous_data["protocol"]["max_cpu_percent"] != args.max_cpu_percent:
@@ -187,8 +191,8 @@ def run_campaign(args):
         if (previous_data.get("memory_regime", "budgeted") != expected_regime
                 or previous_data.get("candidate_memory_budget_bytes") != proof_budget):
             raise CampaignError("rerun must preserve memory regime and separate proof budget")
-        if historical and compare_campaign(previous_data)["decision"] != "inconclusive":
-            raise CampaignError("historical retry is allowed only after a complete inconclusive campaign")
+        if (historical or args.intent == "qualification") and compare_campaign(previous_data)["decision"] != "inconclusive":
+            raise CampaignError("qualification retry is allowed only after a complete inconclusive campaign")
     data = {"schema_version": "grafx-campaign/v1", "intent": args.intent, "mode": args.mode,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "calibrated_executor": args.calibrated_executor,

@@ -160,6 +160,56 @@ def test_invalid_selection_raises_campaign_error(tmp_path, targets, scenarios):
         run_campaign(args)
 
 
+@pytest.mark.parametrize("prior_decision", ["passed", "failed"])
+def test_qualification_retry_refuses_conclusive_previous_campaign(tmp_path, monkeypatch, prior_decision):
+    import bench.harness.campaign as runner
+
+    scenario = next(item for item in runner.matrix() if item.name == "constant")
+    previous = tmp_path / "previous.json"
+    previous.write_text(json.dumps({
+        "protocol": {"attempt": 1, "max_cpu_percent": 20},
+        "scenarios": [scenario.to_dict()], "mode": "optimization",
+        "runs": [{"arm": arm, "revision": "a" * 40} for arm in ("A", "B")],
+    }), encoding="utf-8")
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *a, **k: "a" * 40)
+    monkeypatch.setattr(runner, "compare_campaign", lambda *_: {"decision": prior_decision})
+    args = Namespace(output=tmp_path / "out", baseline=tmp_path, candidate=tmp_path,
+                     scenario=[scenario.name], memory_budget=None, target=[], previous=previous,
+                     mode="optimization", intent="qualification", max_cpu_percent=20)
+    with pytest.raises(CampaignError, match="only after a complete inconclusive"):
+        runner.run_campaign(args)
+    assert not (args.output / "manifest.json").exists()
+
+
+def test_inconclusive_retry_accepts_json_roundtrip_of_composite_keys(tmp_path, monkeypatch):
+    import bench.harness.campaign as runner
+    from bench.harness.campaign_fixtures import Scenario
+
+    scenario = Scenario("probe", "keys", nodes=4, edges_per_node=0, keys=(1, 2, 1))
+    previous = tmp_path / "previous.json"
+    previous.write_text(json.dumps({
+        "protocol": {"attempt": 1, "max_cpu_percent": 20},
+        "scenarios": [scenario.to_dict()], "mode": "optimization",
+        "runs": [{"arm": arm, "revision": "a" * 40} for arm in ("A", "B")],
+    }), encoding="utf-8")
+    assert json.loads(previous.read_text(encoding="utf-8"))["scenarios"][0]["keys"] == [1, 2, 1]
+    monkeypatch.setattr(runner, "matrix", lambda: [scenario])
+    monkeypatch.setattr(runner.subprocess, "check_output", lambda *a, **k: "a" * 40)
+    monkeypatch.setattr(runner, "compare_campaign", lambda *_: {"decision": "inconclusive"})
+
+    class WorkerReached(Exception):
+        pass
+
+    monkeypatch.setattr(runner, "execute_worker", lambda *a, **k: (_ for _ in ()).throw(WorkerReached))
+    args = Namespace(output=tmp_path / "out", baseline=tmp_path, candidate=tmp_path,
+                     scenario=[scenario.name], memory_budget=None, target=[], previous=previous,
+                     mode="optimization", intent="qualification", max_cpu_percent=20,
+                     calibrated_executor=False)
+    with pytest.raises(WorkerReached):
+        runner.run_campaign(args)
+    assert (args.output / "manifest.json").exists()
+
+
 def test_real_calibration_command_produces_bound_receipt(tmp_path, capsys, monkeypatch):
     import hashlib
     import bench.harness.campaign as runner
