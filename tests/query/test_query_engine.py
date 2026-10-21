@@ -128,6 +128,7 @@ def test_a_scan_rooted_at_single_row_does_not_copy_its_empty_bindings() -> None:
 
     class Context:
         snapshot = object()
+        statistics: dict[str, int] = {}
         txn = SimpleNamespace(row_intents=())
         staged_rows: tuple[()] = ()
         phase_rows: tuple[()] = ()
