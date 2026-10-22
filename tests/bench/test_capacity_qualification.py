@@ -21,6 +21,69 @@ def test_capacity_catalog_has_relevant_slices_without_cartesian_explosion():
     assert all(Scenario.from_dict(s.to_dict()) == s for s in cases)
 
 
+def test_closed_qualification_partitions_repeat_controls_without_reusing_campaigns():
+    partitions = capacity.qualification_partitions(Scenario)
+    assert {key: len(value) for key, value in partitions.items()} == {
+        "Q1": 3, "Q2": 3, "Q3": 3, "Q4": 5, "Q5": 4}
+    assert sum(map(len, partitions.values())) == 18
+    assert len({s.name for members in partitions.values() for s in members}) == 15
+    assert len(capacity.matrix(Scenario)) == 21
+    for name, members in partitions.items():
+        assert capacity.validate_qualification_partition(members) == name
+    with pytest.raises(ValueError, match="exactly one"):
+        capacity.validate_qualification_partition(partitions["Q1"][:2])
+    with pytest.raises(ValueError, match="exactly one"):
+        capacity.validate_qualification_partition(partitions["Q4"] + partitions["Q5"])
+    with pytest.raises(ValueError, match="exactly one"):
+        capacity.validate_qualification_partition([
+            replace(partitions["Q3"][0], checkpoint_interval_records=129),
+            *partitions["Q3"][1:]])
+
+
+def test_incomplete_or_unregistered_capacity_raw_cannot_be_qualification():
+    from bench.harness.campaign_schema import CampaignError, validate_campaign
+    from tests.bench.test_campaign_schema import campaign
+
+    data = campaign()
+    data.update(mode="recipe", scenarios=[s.to_dict() for s in
+                 capacity.qualification_partitions(Scenario)["Q2"][:2]])
+    with pytest.raises(CampaignError, match="exactly one"):
+        validate_campaign(data)
+    with pytest.raises(ValueError, match="all five"):
+        capacity.qualification_report({"Q1": data}, objective="local read latency")
+
+
+def test_aggregate_requires_fresh_invocations_and_keeps_functional_proof_separate(monkeypatch):
+    from bench.harness import campaign_schema
+
+    def fake_comparison(raw):
+        return {"decision": "tradeoff_reported", "calibration_valid": True,
+                "noisy": False, "campaign_hash": raw["partition"],
+                "comparisons": [{"capacity_tradeoff": {"comparison_scope": "local"}}]}
+
+    monkeypatch.setattr(campaign_schema, "compare_campaign", fake_comparison)
+    partitions = capacity.qualification_partitions(Scenario)
+    raw = {part: {"partition": part, "intent": "qualification",
+                  "calibrated_executor": True, "protocol": {"max_cpu_percent": 20},
+                  "scenarios": [s.to_dict() for s in members],
+                  "runs": [{"invocation_id": f"{part}-{i}", "arm": "A" if i % 2 == 0 else "B",
+                            "revision": "a" * 40 if i % 2 == 0 else "b" * 40}
+                           for i in range(6)]}
+           for part, members in partitions.items()}
+    report = capacity.qualification_report(raw, objective="reduce local read latency")
+    assert (report["participations"], report["distinct_scenarios"]) == (18, 15)
+    assert report["qualification_scope"] == "temporal_partitions_only"
+    assert report["checkpoint_foreign_writer_proof"] == "separate_functional_verification_required"
+    assert report["change_defaults"] is False and report["authorize_vacuum"] is False
+    raw["Q5"]["runs"][0]["invocation_id"] = raw["Q1"]["runs"][0]["invocation_id"]
+    with pytest.raises(ValueError, match="reused process"):
+        capacity.qualification_report(raw, objective="reduce local read latency")
+    raw["Q5"]["runs"][0]["invocation_id"] = "Q5-0"
+    raw["Q5"]["runs"][0]["revision"] = "c" * 40
+    with pytest.raises(ValueError, match="unstable source revision"):
+        capacity.qualification_report(raw, objective="reduce local read latency")
+
+
 def test_external_lease_and_batch_interactions_have_one_variable_controls():
     cases = [s for s in capacity.matrix(Scenario) if s.capacity_case == "external"]
     settings = {(s.identity_lease_size, s.write_rows) for s in cases}
@@ -52,7 +115,7 @@ def test_fixed_total_batch_group_rejects_unequal_load_or_missing_reference():
     data = campaign()
     data.update(mode="recipe", scenarios=[group[1].to_dict(),
                                           replace(group[0], nodes=511, write_rows=511).to_dict()])
-    with pytest.raises(CampaignError, match="equal 512-row load"):
+    with pytest.raises(CampaignError, match="exactly one"):
         validate_campaign(data)
 
 
@@ -98,7 +161,7 @@ def test_equal_work_external_transaction_batches_have_durable_ack_and_reopen(tmp
             capacity.validate_sample(damaged, scenario)
 
 
-def test_qualified_capacity_recipe_rejects_logical_peak_over_quota(tmp_path):
+def test_partial_recipe_cannot_claim_qualification_even_with_good_memory(tmp_path):
     scenario = replace(next(s for s in capacity.matrix(Scenario) if s.capacity_case == "external"
                             and s.capacity_batch_size == 0), nodes=4, write_rows=4)
     with connect(tmp_path / "quota", codec="pure", vector_math="pure",
@@ -115,9 +178,10 @@ def test_qualified_capacity_recipe_rejects_logical_peak_over_quota(tmp_path):
             repeated = deepcopy(sample)
             repeated.update(index=index, kind="warmup" if index < 5 else "retained")
             run["samples"].append(repeated)
-    assert compare_campaign(data)["decision"] == "tradeoff_reported"
+    with pytest.raises(CampaignError, match="exactly one"):
+        compare_campaign(data)
     data["runs"][0]["samples"][0]["memory"]["logical_memory_peak_bytes"] = (1 << 20) + 1
-    with pytest.raises(CampaignError, match="RF12 qualified recipe requires a covered logical peak"):
+    with pytest.raises(CampaignError, match="exactly one"):
         compare_campaign(data)
 
 

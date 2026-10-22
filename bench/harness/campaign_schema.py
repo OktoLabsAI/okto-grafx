@@ -377,11 +377,13 @@ def _validate(data):
     validate_fixed_optimization_matrix(data["scenarios"], mode=data["mode"], intent=data["intent"])
     validate_read_lifecycle_matrix(data["scenarios"], mode=data["mode"], intent=data["intent"])
     if data["intent"] == "qualification" and any(s.family == "capacity" for s in scenarios.values()):
-        from bench.harness.capacity_qualification import validate_batch_selection
+        from bench.harness.capacity_qualification import validate_qualification_partition
         try:
-            validate_batch_selection(scenarios.values())
+            validate_qualification_partition(scenarios.values())
         except ValueError as exc:
             raise CampaignError(str(exc)) from exc
+        _require(data["calibrated_executor"] is True and protocol["max_cpu_percent"] <= 20,
+                 "RF12 qualification requires calibration and CPU ceiling <=20%")
     fixed_read_qualification = (data["intent"] == "qualification" and data["mode"] == "optimization"
                                 and any(s.name.startswith(("rf02-", "rf03-")) or s.family == "pagination"
                                         for s in scenarios.values()))

@@ -44,6 +44,123 @@ def matrix(scenario_type):
     return result
 
 
+def qualification_partitions(scenario_type):
+    """The closed RF12 matrix: 18 participations, 15 distinct scenarios.
+
+    Repeated controls are intentional. A runner must execute each partition in
+    its own campaign, including a fresh observation of that partition's control.
+    The six remaining catalog cases are descriptive load/interaction cuts.
+    """
+    catalog = {scenario.name: scenario for scenario in matrix(scenario_type)}
+    names = {
+        "Q1": [f"rf12-{case}-buf64-cp512-lease64-batch32"
+               for case in ("retained", "released", "external")],
+        "Q2": [f"rf12-released-buf{budget}-cp512-lease64-batch32"
+               for budget in (16, 64, 256)],
+        "Q3": [f"rf12-released-buf64-cp{interval}-lease64-batch32"
+               for interval in (128, 512, 2048)],
+        "Q4": [f"rf12-external-buf64-cp512-lease{lease}-batch32"
+               for lease in (1, 32, 64, 128, 512)],
+        "Q5": [f"rf12-external-total512-lease64-txbatch{batch}"
+               for batch in (1, 32, 128, 512)],
+    }
+    return {partition: tuple(catalog[name] for name in members)
+            for partition, members in names.items()}
+
+
+def validate_qualification_partition(scenarios):
+    """Refuse a partial, mixed, or edited RF12 temporal qualification."""
+    from bench.harness.campaign_fixtures import Scenario
+
+    selected = list(scenarios)
+    if not selected or any(s.family != "capacity" for s in selected):
+        raise ValueError("RF12 qualification requires one capacity-only partition")
+    by_name = {s.name: s.to_dict() for s in selected}
+    if len(by_name) != len(selected):
+        raise ValueError("RF12 qualification contains duplicate scenarios")
+    for partition, members in qualification_partitions(Scenario).items():
+        expected = {s.name: s.to_dict() for s in members}
+        if by_name == expected:
+            return partition
+    raise ValueError("RF12 qualification requires exactly one unmodified Q1-Q5 partition")
+
+
+def qualification_report(campaigns, *, objective):
+    """Recompose all five campaigns; a report is never authority to tune defaults.
+
+    ``campaigns`` maps Q1..Q5 to raw campaigns, not to self-declared reports.
+    The common campaign validator recomputes semantic, provenance, memory and
+    temporal gates for every partition before this aggregate can be complete.
+    """
+    if not isinstance(objective, str) or not objective.strip():
+        raise ValueError("a local objective is required")
+    if not isinstance(campaigns, dict) or set(campaigns) != {"Q1", "Q2", "Q3", "Q4", "Q5"}:
+        raise ValueError("RF12 qualification requires all five independent partitions")
+    from bench.harness.campaign_fixtures import Scenario
+    from bench.harness.campaign_schema import compare_campaign
+
+    partitions = qualification_partitions(Scenario)
+    result = {}
+    invocations = set()
+    common_revisions = None
+    for partition in partitions:
+        campaign = campaigns[partition]
+        if not isinstance(campaign, dict) or campaign.get("intent") != "qualification":
+            raise ValueError(f"RF12 {partition} requires qualification raw")
+        if validate_qualification_partition(Scenario.from_dict(s) for s in campaign.get("scenarios", ())) != partition:
+            raise ValueError(f"RF12 {partition} contains the wrong scenarios")
+        protocol = campaign.get("protocol", {})
+        if (campaign.get("calibrated_executor") is not True
+                or type(protocol.get("max_cpu_percent")) not in (int, float)
+                or protocol["max_cpu_percent"] > 20):
+            raise ValueError(f"RF12 {partition} requires a calibrated executor and CPU ceiling <=20%")
+        report = compare_campaign(campaign)
+        if (report["decision"] != "tradeoff_reported" or report["calibration_valid"] is not True
+                or report["noisy"] is not False):
+            raise ValueError(f"RF12 {partition} did not pass temporal qualification")
+        run_ids = {run["invocation_id"] for run in campaign["runs"]}
+        if invocations & run_ids:
+            raise ValueError("RF12 partitions reused process invocations or reference raw")
+        invocations.update(run_ids)
+        revisions = {arm: {run["revision"] for run in campaign["runs"] if run["arm"] == arm}
+                     for arm in ("A", "B")}
+        if any(len(values) != 1 for values in revisions.values()):
+            raise ValueError("RF12 partition has unstable source revision")
+        if common_revisions is None:
+            common_revisions = revisions
+        elif revisions != common_revisions:
+            raise ValueError("RF12 partitions must reuse immutable baseline/candidate revisions")
+        result[partition] = {
+            "campaign_hash": report["campaign_hash"],
+            "scenario_names": [s.name for s in partitions[partition]],
+            "scenario_count": len(partitions[partition]),
+            "decision": report["decision"],
+            "comparison_scope": [c["capacity_tradeoff"]["comparison_scope"]
+                                 for c in report["comparisons"]],
+        }
+    return {
+        "schema": "grafx-rf12-qualification/v1",
+        "objective": objective.strip(),
+        "source_revisions": {arm: next(iter(values)) for arm, values in common_revisions.items()},
+        "partitions": result,
+        "participations": sum(item["scenario_count"] for item in result.values()),
+        "distinct_scenarios": len({name for item in result.values() for name in item["scenario_names"]}),
+        "decision": "review_local_tradeoffs",
+        "qualification_scope": "temporal_partitions_only",
+        "checkpoint_foreign_writer_proof": "separate_functional_verification_required",
+        "architecture_inspection": "separate_verification_required",
+        "change_defaults": False,
+        "authorize_vacuum": False,
+        "authorize_rehash": False,
+        "limits": ["Q1 does not isolate reader ownership latency",
+                   "Q2 buffer budget is not process RSS",
+                   "Q3 read timing is not isolated checkpoint cost or cadence",
+                   "Q4 keeps 32 rows while lease changes",
+                   "Q5 keeps 512 rows while transaction size changes",
+                   "HASH skew requires a separate investigation and spec"],
+    }
+
+
 def validate(s):
     if s.capacity_case not in ("retained", "released", "external"):
         raise ValueError("invalid capacity case")
