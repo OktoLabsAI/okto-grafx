@@ -185,6 +185,17 @@ def interaction_report(campaigns):
                 for sample in fan_samples
             ):
                 raise CampaignError(f"RF04 {phase} candidate did not switch once at the 64-start fan-limit")
+        fallback_name = f"rf04-{PHASES[phase]}-fallback"
+        fallback_samples = [sample for run in data["runs"] if run["arm"] == "B"
+                            for sample in run["samples"] if sample["scenario_id"] == fallback_name]
+        if len(fallback_samples) != 75 or any(
+            not sample["rf04_access"]["conditional_seek_in_plan"]
+            or sample["rf04_access"]["actual_fallbacks"].get(
+                "fallback_reason_nonselective_probe_set") != 1
+            or sample["rf04_access"]["physical_node_versions_examined"] < 16
+            for sample in fallback_samples
+        ):
+            raise CampaignError(f"RF04 {phase} candidate did not execute the broad node-scan fallback")
         # The disk-free observation changes while campaigns write raw output.
         # Compare the same stable executor identity used by campaign validation.
         environment = data["runs"][0]["environment"]

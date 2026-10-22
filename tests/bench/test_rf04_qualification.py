@@ -60,8 +60,9 @@ def test_real_rf04_target_preserves_rows_and_uses_endpoint_work(tmp_path):
             assert observed["physical_edge_versions_examined"] < 1151
 
 
-def test_real_broad_control_reports_executed_fallback(tmp_path):
-    scenario = next(s for s in rf04_matrix(Scenario) if s.name == "rf04-with-fallback")
+@pytest.mark.parametrize("profile", ("original", "with"))
+def test_real_broad_control_reports_executed_fallback(tmp_path, profile):
+    scenario = next(s for s in rf04_matrix(Scenario) if s.name == f"rf04-{profile}-fallback")
     with okto_grafx.connect(tmp_path / "db", codec="pure", vector_math="pure") as db:
         build_fixture(db, scenario)
         query, params = query_for(scenario)
@@ -93,6 +94,7 @@ def test_interaction_binds_four_distinct_revisions_and_checks_actual_fan_limit(m
         scenarios = phase_scenarios(phase, Scenario, budget=1 << 20)
         target = scenarios[0].name
         fan = scenarios[1].name
+        fallback = scenarios[3].name
         runs = []
         for pair, order in enumerate(("AB", "BA", "AB")):
             for arm in order:
@@ -104,6 +106,10 @@ def test_interaction_binds_four_distinct_revisions_and_checks_actual_fan_limit(m
                         "physical_edge_versions_examined": 16}})
                     observations.append({"scenario_id": fan, "rf04_access": {
                         "edge_lookups": 64, "edge_scans": 1}})
+                    observations.append({"scenario_id": fallback, "rf04_access": {
+                        "conditional_seek_in_plan": True,
+                        "actual_fallbacks": {"fallback_reason_nonselective_probe_set": 1},
+                        "physical_node_versions_examined": 16}})
                 runs.append({"arm": arm, "revision": revisions[left if arm == "A" else right],
                              "environment": {"python": "same", "dependencies": {}, "os": "same",
                                              "cpu": "same", "cpu_count": 1, "ram_bytes": 1024,
@@ -117,6 +123,11 @@ def test_interaction_binds_four_distinct_revisions_and_checks_actual_fan_limit(m
     with pytest.raises(CampaignError, match="fan-limit"):
         interaction_report(campaigns)
     campaigns["incremental"]["runs"][1]["samples"][1]["rf04_access"]["edge_scans"] = 1
+    campaigns["incremental"]["runs"][1]["samples"][2]["rf04_access"]["actual_fallbacks"] = {}
+    with pytest.raises(CampaignError, match="broad node-scan fallback"):
+        interaction_report(campaigns)
+    campaigns["incremental"]["runs"][1]["samples"][2]["rf04_access"]["actual_fallbacks"] = {
+        "fallback_reason_nonselective_probe_set": 1}
     campaigns["combined"]["runs"][0]["revision"] = revisions["rf04"]
     with pytest.raises(CampaignError, match="revision changed"):
         interaction_report(campaigns)
