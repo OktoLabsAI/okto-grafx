@@ -63,3 +63,17 @@ def test_rf05_catalog_is_explicit_and_rejects_wrong_dimensions():
     assert canonical_hash(Timestamp(1336)) != canonical_hash(Timestamp(1337))
     with pytest.raises(ValueError):
         Scenario("invalid", "pagination", nodes=32, page=32, pagination_case="first")
+
+
+def test_rf05_qualified_target_executes_at_declared_scale_and_memory_budget(tmp_path):
+    """The closed 1,024-node profile must work under its declared query quota."""
+    scenario = next(item for item in matrix() if item.pagination_case == "first")
+    scenario = Scenario.from_dict({**scenario.to_dict(), "query_memory_budget_bytes": 4096})
+    with connect(tmp_path / "db", codec="pure", query_memory_budget_bytes=4096) as db:
+        build_fixture(db, scenario)
+        sample = measure_statement(db, scenario, 5)
+    assert sample["result_hash"] == sample["expected_result_hash"]
+    validate_qualification_sample(sample, scenario, arm="B")
+    assert sample["statistics"]["ordered_candidates_examined"] == 16
+    assert sample["statistics"]["ordered_merge_rows"] == 16
+    assert sample["memory"]["logical_memory_peak_bytes"] <= 4096
