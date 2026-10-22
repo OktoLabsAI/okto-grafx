@@ -13752,7 +13752,8 @@ def _create_primary_key_batch_index(
 
     No iterator or arbitrary expression is evaluated here. In particular, a later
     invalid value must not move its schema error before an earlier duplicate.
-    Configured memory quotas retain the scalar path and its existing frontier.
+    Configured memory and intermediate-row quotas retain the scalar path and
+    its existing error frontier.
     """
     statement = context.analysis.statement
     if (type(statement) is not Query or context.procedure_parent is not None
@@ -13764,7 +13765,8 @@ def _create_primary_key_batch_index(
             or type(node.child) is not UnwindRows
             or type(node.child.child) is not SingleRow
             or type(node.child.expression) is not Parameter
-            or engine._query_memory_budget_bytes is not None):
+            or engine._query_memory_budget_bytes is not None
+            or engine._max_intermediate_rows is not None):
         return None
     written = node.nodes[0]
     table = written.table

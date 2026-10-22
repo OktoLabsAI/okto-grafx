@@ -128,6 +128,33 @@ def test_quota_uses_existing_scalar_memory_frontier(tmp_path):
             assert result.statistics.get("pk_uniqueness_batches", 0) == 0
 
 
+def test_intermediate_row_quota_keeps_first_error_in_scalar_order(tmp_path, monkeypatch):
+    with connect(tmp_path / "db", max_intermediate_rows=1) as db:
+        _schema(db)
+        with db.begin("write") as tx:
+            tx.execute("CREATE (:N {id: 1})")
+
+        def first_error():
+            with db.begin("write") as tx:
+                with pytest.raises(GrafxError) as caught:
+                    tx.execute(INSERT, {"ids": [1, 2]})
+                return type(caught.value), caught.value.details
+
+        actual = first_error()
+        with monkeypatch.context() as scalar:
+            scalar.setattr(qe, "_create_primary_key_batch_index", lambda *_: None)
+            assert first_error() == actual
+        assert actual[1]["constraint"] == "primary_key"
+        assert db.execute("MATCH (n:N) RETURN n.id").rows == ((1,),)
+
+    with connect(tmp_path / "clean", max_intermediate_rows=2) as db:
+        _schema(db)
+        with db.begin("write") as tx:
+            result = tx.execute(INSERT, {"ids": [1, 2]})
+            assert result.rows == ((1,), (2,))
+            assert result.statistics.get("pk_uniqueness_batches", 0) == 0
+
+
 def _competing_writer(path, barrier, results):
     try:
         with connect(path) as db:
