@@ -1002,6 +1002,16 @@ sequential commits do not establish simultaneous writer throughput. These
 costs are compared by operation and mode; they are not pooled into one update
 distribution or described as logical WAL append bytes.
 
+The operational runner produces separate authenticated outputs for P1–P5.
+After all five finish, `python -m bench.harness.rf11_partition_closure --p1
+<P1-output> --p2 <P2-output> --p3 <P3-output> --p4 <P4-output> --p5
+<P5-output> --output <closure.json>` verifies each runner receipt, raw/report
+recomputation, artifact hashes, the exact 25 scenario names, and a common
+baseline, candidate, runner and interpreter. An absent, altered, failed or
+inconclusive partition cannot produce a global `tradeoff_reported` decision.
+The closure links the five reports; their per-scenario costs and raw samples
+remain the authority for a limited recommendation.
+
 ## RF01 historical total-overhead qualification
 
 RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`
