@@ -456,6 +456,34 @@ def test_xdist_collection_reaches_controller_without_weakening_disappearance_gat
     assert "vanished from collection" in output
 
 
+def test_xdist_reconciles_all_worker_reports_and_catches_a_silent_item(tmp_path: Path) -> None:
+    xdist = ("-p", "xdist.plugin", "-n", "2")
+    passing = HEADER + "@pytest.mark.parametrize('n', range(8))\ndef test_planted(n):\n    assert n < 8\n"
+    code, output = _plant(tmp_path / "reported", module=passing, extra_arguments=xdist)
+    assert code == 0, output
+    assert "collected but never reported" not in output
+
+    # A worker can claim that it handled an item while sending no report. The controller's
+    # complete collection and merged reports must still expose this loss after distribution.
+    nested_conftest = (
+        "\n\ndef pytest_runtest_protocol(item, nextitem):\n"
+        "    if 'test_silent' in item.nodeid:\n"
+        "        return True\n"
+        "    return None\n"
+    )
+    nested_module = HEADER + "def test_silent() -> None:\n    assert False\n"
+    code, output = _plant(
+        tmp_path / "silent",
+        module=passing,
+        nested_conftest=nested_conftest,
+        nested_module=nested_module,
+        extra_arguments=xdist,
+    )
+    assert code == 1, output
+    assert "test_silent" in output
+    assert "collected but never reported" in output
+
+
 def test_xdist_skip_attribution_requires_a_source_visible_marker(tmp_path: Path) -> None:
     xdist = ("-p", "xdist.plugin", "-n", "2")
     marked = (

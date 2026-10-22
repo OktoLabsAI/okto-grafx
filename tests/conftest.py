@@ -474,6 +474,7 @@ _PENDING_XDIST_SKIPS: dict[object, set[str]] = {}
 _VANISHED: list[str] = []
 _ERRORED_FILES: set[str] = set()
 _COLLECTED_IDS: dict[str, pytest.Item] = {}
+_XDIST_COLLECTED_IDS: set[str] = set()
 _REPORTED_IDS: set[str] = set()
 _DESELECTED_IDS: set[str] = set()
 _DECLARED_DISTRIBUTIONS: frozenset[str] = frozenset()
@@ -1364,9 +1365,11 @@ def pytest_xdist_node_collection_finished(node: object, ids: list[str]) -> None:
 
     The controller receives test reports, but never runs collection_modifyitems.
     Its disappearance check still needs the workers' actual collection inventory.
-    Workers retain their own skip and silent-item attribution checks.
+    The controller also reconciles all collected ids against reports from every worker.
+    A worker sees the entire collection but reports only its scheduled share.
     """
     rootpath = pathlib.Path(str(node.config.rootpath))
+    _XDIST_COLLECTED_IDS.update(ids)
     for nodeid in ids:
         path = nodeid.split("::", 1)[0]
         if path.endswith(".py"):
@@ -1509,6 +1512,12 @@ def _reconcile(session: pytest.Session) -> list[str]:
         return []
     if getattr(session, "shouldstop", False) or getattr(session, "shouldfail", False):
         return []
+    if getattr(session.config, "workerinput", None) is not None:
+        # Every xdist worker collects the full suite, but runs only its assigned items.
+        # The controller sees every report and performs the global reconciliation below.
+        return []
+    if _XDIST_COLLECTED_IDS:
+        return sorted(_XDIST_COLLECTED_IDS - _REPORTED_IDS - _DESELECTED_IDS)
     silent: list[str] = []
     for nodeid, item in _COLLECTED_IDS.items():
         if nodeid in _REPORTED_IDS or nodeid in _DESELECTED_IDS:
