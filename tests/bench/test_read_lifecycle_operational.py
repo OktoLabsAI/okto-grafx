@@ -54,9 +54,14 @@ def test_repeat_binds_complete_first_attempt_and_raw_hash(tmp_path, monkeypatch)
     (previous / "campaign/campaign.json").write_bytes(raw)
     digest = hashlib.sha256(raw).hexdigest()
     old = dict(manifest(), candidate_root="candidate", baseline_root="baseline", python="python")
-    (previous / "operational-manifest.json").write_text(json.dumps(old), encoding="utf-8")
+    old_manifest = previous / "operational-manifest.json"
+    old_manifest.write_text(json.dumps(old), encoding="utf-8")
+    manifest_digest = hashlib.sha256(old_manifest.read_bytes()).hexdigest()
+    artifacts = {path.relative_to(previous).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in previous.rglob("*") if path.is_file()}
     (previous / "runner-receipt.json").write_text(json.dumps({
-        "decision": "inconclusive", "artifact_sha256": {"campaign/campaign.json": digest},
+        "decision": "inconclusive", "manifest_sha256": manifest_digest,
+        "artifact_sha256": artifacts,
     }), encoding="utf-8")
     repeat = dict(old, attempt=2, previous_output=str(previous), previous_campaign_sha256=digest)
     monkeypatch.setattr(operational, "inspect_result", lambda *_: {"decision": "inconclusive"})
@@ -65,6 +70,42 @@ def test_repeat_binds_complete_first_attempt_and_raw_hash(tmp_path, monkeypatch)
         operational.verify_previous(tmp_path, dict(repeat, scenarios=list(reversed(old["scenarios"]))))
     (previous / "campaign/campaign.json").write_bytes(raw + b" ")
     with pytest.raises(ValueError, match="artifact changed"):
+        operational.verify_previous(tmp_path, repeat)
+
+
+def test_repeat_rejects_unsealed_or_substituted_previous_artifacts(tmp_path, monkeypatch):
+    import hashlib
+
+    previous = tmp_path / "runs/first"
+    (previous / "campaign").mkdir(parents=True)
+    (previous / "campaign/campaign.json").write_text("{}", encoding="utf-8")
+    old = dict(manifest(), candidate_root="candidate", baseline_root="baseline", python="python")
+    old_manifest = previous / "operational-manifest.json"
+    old_manifest.write_text(json.dumps(old), encoding="utf-8")
+    artifacts = {path.relative_to(previous).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for path in previous.rglob("*") if path.is_file()}
+    receipt_path = previous / "runner-receipt.json"
+    receipt = {"decision": "inconclusive",
+               "manifest_sha256": hashlib.sha256(old_manifest.read_bytes()).hexdigest(),
+               "artifact_sha256": artifacts}
+    repeat = dict(old, attempt=2, previous_output=str(previous),
+                  previous_campaign_sha256=artifacts["campaign/campaign.json"])
+    monkeypatch.setattr(operational, "inspect_result", lambda *_: {"decision": "inconclusive"})
+
+    def check(candidate):
+        receipt_path.write_text(json.dumps(candidate), encoding="utf-8")
+        operational.verify_previous(tmp_path, repeat)
+
+    check(receipt)
+    with pytest.raises(ValueError, match="complete inconclusive"):
+        check(dict(receipt, manifest_sha256="0" * 64))
+    with pytest.raises(ValueError, match="inventory differs"):
+        check(dict(receipt, artifact_sha256={"campaign/campaign.json": artifacts["campaign/campaign.json"]}))
+    with pytest.raises(ValueError, match="artifact changed"):
+        check(dict(receipt, artifact_sha256=dict(artifacts, **{"campaign/campaign.json": "not-a-hash"})))
+    check(receipt)
+    (previous / "campaign/extra.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="inventory differs"):
         operational.verify_previous(tmp_path, repeat)
 
 
