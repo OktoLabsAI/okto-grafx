@@ -8,6 +8,7 @@ or stand in for the manual architecture inspections.
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 import subprocess
 import sys
@@ -56,6 +57,7 @@ _SELECTORS = {
         "tests/bench/test_fts_qualification.py::test_ranked_fts_oracle_and_source_are_real_for_wal_and_durable",
         "tests/bench/test_fts_qualification.py::test_retained_reader_uses_before_update_corpus_and_score",
         "tests/bench/test_fts_qualification.py::test_wal_delta_source_requires_cached_seed_and_exact_new_score",
+        "tests/bench/test_fts_contract_guards.py::test_default_wal_and_optin_durable_keep_exact_ranking_and_capability_boundary",
     ),
     "rf11_boundaries": (
         "tests/bench/test_fts_qualification_adversarial.py::test_external_writer_keeps_retained_scores_and_corpus",
@@ -68,6 +70,7 @@ _SELECTORS = {
     "rf11_integration": (
         "tests/bench/test_fts_qualification.py::test_ranked_fts_oracle_and_source_are_real_for_wal_and_durable",
         "tests/bench/test_fts_qualification.py::test_matrix_covers_statistics_corpus_cache_and_snapshot_slices",
+        "tests/bench/test_fts_contract_guards.py::test_default_wal_and_optin_durable_keep_exact_ranking_and_capability_boundary",
     ),
     "rf12_main": (
         "tests/bench/test_capacity_qualification.py::test_real_capacity_recipe_keeps_snapshot_and_diagnostic_contract",
@@ -78,13 +81,56 @@ _SELECTORS = {
     "rf12_compatibility": (
         "tests/bench/test_capacity_qualification.py::test_external_lease_and_batch_interactions_have_one_variable_controls",
         "tests/bench/test_capacity_qualification.py::test_equal_work_external_transaction_batches_have_durable_ack_and_reopen",
+        "tests/bench/test_capacity_operational_proofs.py::test_foreign_commit_survives_checkpoint_with_retained_reader",
     ),
     "rf12_integration": (
         "tests/bench/test_capacity_qualification.py::test_capacity_catalog_has_relevant_slices_without_cartesian_explosion",
         "tests/bench/test_capacity_qualification.py::test_decision_template_keeps_missing_or_noisy_evidence_inconclusive",
         "tests/bench/test_capacity_qualification.py::test_capacity_cannot_claim_universal_optimization",
+        "tests/bench/test_capacity_operational_proofs.py::test_hash_skew_diagnosis_is_bounded_read_only_and_cannot_authorize_rehash",
     ),
 }
+
+
+# Explicit collected-case manifest. A base selector alone is not a sufficient
+# receipt for a parametrized test: one passing variant cannot represent all of
+# its siblings. Re-review these cases whenever the committed source changes.
+_CASE_SUFFIXES = {
+    "tests/api/test_ingestion_performance_recipes.py::test_equal_atomic_contracts_survive_reopen":
+        ("statements", "executemany", "unwind"),
+    "tests/api/test_ingestion_performance_recipes.py::test_recipe_never_replays_explicit_refusal_or_acknowledged_commit":
+        ("False", "True"),
+    "tests/api/test_read_snapshot_recipes.py::test_cleanup_preserves_primary_failure_and_releases_stream":
+        ("consumer_error", "cancel"),
+    "tests/api/test_read_snapshot_recipes.py::test_materialized_rows_survive_handle_close_and_partial_cursor_releases_owner":
+        ("False", "True"),
+    "tests/api/test_read_snapshot_recipes.py::test_sixteen_primary_keys_explicitly_choose_one_or_sixteen_transactions":
+        ("False", "True"),
+    "tests/bench/test_capacity_qualification.py::test_real_capacity_recipe_keeps_snapshot_and_diagnostic_contract":
+        ("retained", "released", "external"),
+    "tests/bench/test_capacity_operational_proofs.py::test_foreign_commit_survives_checkpoint_with_retained_reader":
+        ("128", "512", "2048"),
+    "tests/bench/test_fts_qualification.py::test_retained_reader_uses_before_update_corpus_and_score":
+        ("0-full_census", "1-full_census", "8-durable_summary", "32-durable_summary"),
+    "tests/bench/test_fts_qualification_adversarial.py::test_external_writer_keeps_retained_scores_and_corpus":
+        ("0-full_census", "1-full_census", "8-durable_summary", "32-durable_summary"),
+    "tests/bench/test_fts_qualification_adversarial.py::test_invalid_persisted_summary_refuses_instead_of_census":
+        ("0", "8"),
+    "tests/bench/test_ingestion_campaign.py::test_concurrent_proof_has_individual_memory_and_actual_acks":
+        ("2", "4"),
+    "tests/bench/test_ingestion_campaign.py::test_recipe_confirms_real_atomic_units_and_reopens":
+        ("unwind-1", "statements-1", "executemany-1", "chunks-2", "transactions-3"),
+    "tests/bench/test_read_lifecycle_qualification.py::test_read_recipes_and_separate_diagnostics":
+        ("read_autocommit", "read_cursor", "read_materialized", "read_shared"),
+}
+
+
+def _exact_cases(selectors: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        f"{selector}[{suffix}]" if suffix is not None else selector
+        for selector in selectors
+        for suffix in _CASE_SUFFIXES.get(selector, (None,))
+    )
 
 
 def _verify_junit(path: Path, selectors: tuple[str, ...]) -> None:
@@ -104,22 +150,24 @@ def _verify_junit(path: Path, selectors: tuple[str, ...]) -> None:
                 raise ValueError(f"JUnit suite has negative {key}")
             totals[key] += value
     cases = root.findall(".//testcase")
-    if totals["tests"] == 0 or totals["tests"] != len(cases):
-        raise ValueError("JUnit case count is empty or inconsistent")
+    expected_cases = _exact_cases(selectors)
+    if totals["tests"] != len(cases) or totals["tests"] != len(expected_cases):
+        raise ValueError("JUnit selector coverage incomplete or count inconsistent")
     if any(totals[key] for key in ("errors", "failures", "skipped")):
         raise ValueError("JUnit suite contains errors, failures or skips")
-    expected = {(path.removesuffix(".py").replace("/", "."), name)
-                for path, name in (selector.split("::", 1) for selector in selectors)}
-    observed = set()
+    expected = Counter((source.removesuffix(".py").replace("/", "."), name)
+                       for source, name in (selector.split("::", 1)
+                                            for selector in expected_cases))
+    observed = Counter()
     for case in cases:
         if any(case.find(tag) is not None for tag in ("error", "failure", "skipped")):
             raise ValueError("JUnit case contains error, failure or skip")
         classname = case.attrib.get("classname", "")
-        name = case.attrib.get("name", "").split("[", 1)[0]
+        name = case.attrib.get("name", "")
         identity = (classname, name)
         if identity not in expected:
             raise ValueError(f"JUnit case outside closed selector set: {classname}.{name}")
-        observed.add(identity)
+        observed[identity] += 1
     if observed != expected:
         raise ValueError("JUnit selector coverage incomplete")
 
@@ -131,6 +179,7 @@ class RF0912FunctionalEvidence(unittest.TestCase):
 
     def _check(self, key: str) -> None:
         selectors = _SELECTORS[key]
+        exact_cases = _exact_cases(selectors)
         with tempfile.TemporaryDirectory(prefix="grafx-functional-") as temp:
             junit = Path(temp) / "junit.xml"
             command = [
@@ -145,7 +194,7 @@ class RF0912FunctionalEvidence(unittest.TestCase):
                 "-p",
                 "no:cacheprovider",
                 f"--junitxml={junit}",
-                *selectors,
+                *exact_cases,
             ]
             try:
                 completed = subprocess.run(

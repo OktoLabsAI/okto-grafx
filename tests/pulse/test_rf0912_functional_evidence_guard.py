@@ -37,3 +37,33 @@ def test_skipped_case_is_rejected_even_if_process_would_exit_zero(tmp_path):
 def test_missing_selector_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="coverage incomplete"):
         MODULE._verify_junit(_write(tmp_path), (*SELECTORS, "tests/api/test_other.py::test_b"))
+
+
+def _write_parameter_cases(tmp_path, names):
+    path = tmp_path / "parameterized.xml"
+    cases = "".join(
+        '<testcase classname="tests.bench.test_capacity_operational_proofs" '
+        f'name="{name}"/>' for name in names
+    )
+    path.write_text(
+        f'<testsuites><testsuite tests="{len(names)}" errors="0" failures="0" '
+        f'skipped="0">{cases}</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_parameterized_manifest_requires_each_case_once(tmp_path):
+    base = ("tests/bench/test_capacity_operational_proofs.py::"
+            "test_foreign_commit_survives_checkpoint_with_retained_reader")
+    names = tuple(
+        f"test_foreign_commit_survives_checkpoint_with_retained_reader[{interval}]"
+        for interval in (128, 512, 2048)
+    )
+    MODULE._verify_junit(_write_parameter_cases(tmp_path, names), (base,))
+
+    with pytest.raises(ValueError, match="coverage incomplete"):
+        MODULE._verify_junit(_write_parameter_cases(tmp_path, names[:-1]), (base,))
+    with pytest.raises(ValueError, match="coverage incomplete"):
+        MODULE._verify_junit(_write_parameter_cases(
+            tmp_path, (names[0], names[0], names[2])), (base,))
