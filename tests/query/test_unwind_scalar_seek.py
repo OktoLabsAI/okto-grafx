@@ -129,6 +129,17 @@ def test_old_snapshot_and_new_snapshot_see_their_own_versions(database):
         assert database.execute(query).rows == ((9,), (9,))
 
 
+def test_external_connection_keeps_old_unwind_snapshot_and_fresh_visibility(database, tmp_path):
+    query = "UNWIND ['a','a'] AS i MATCH (n:Item {id:i}) RETURN n.value"
+    with database.begin("read") as old:
+        assert old.execute(query).rows == ((1,), (1,))
+        with okto_grafx.connect(tmp_path / "db", page_size=512) as writer:
+            with writer.begin("write") as tx:
+                tx.execute("MATCH (n:Item {id:'a'}) SET n.value=9")
+        assert old.execute(query).rows == ((1,), (1,))
+        assert database.execute(query).rows == ((9,), (9,))
+
+
 @pytest.mark.parametrize("key", [-(2**63), 2**63 - 1, 1, 1.0, True, False, None, "1"])
 def test_numeric_equality_matches_canonical_scan(tmp_path, key):
     with okto_grafx.connect(tmp_path / "numeric") as db:

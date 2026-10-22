@@ -77,6 +77,44 @@ def test_old_reader_preserves_snapshot_and_parallel_edge_multiplicity(database):
         )
 
 
+@pytest.mark.parametrize("authority", ["stale", "missing_many"])
+def test_connected_anchor_authority_falls_back_to_canonical_scan(
+    database, monkeypatch, authority
+):
+    """Exercise both refusals on the connected query, including edge work."""
+    ids = {"ids": ["a1", "missing"]}
+    with database.begin("read") as reader:
+        with monkeypatch.context() as control:
+            control.setattr(IndexManager, "validated_versions_many", None)
+            expected = fixture._outcome(reader, QUERY, ids)
+        if authority == "missing_many":
+            monkeypatch.setattr(IndexManager, "validated_versions_many", None)
+        else:
+            from okto_grafx.engine import query_engine
+
+            original = query_engine._IndexAuthorityProjection.named
+
+            class Stale:
+                stale = True
+
+                def __init__(self, store):
+                    self.store = store
+
+                def __getattr__(self, name):
+                    return getattr(self.store, name)
+
+            def named(projection, name):
+                store = original(projection, name)
+                return None if store is None else Stale(store)
+
+            monkeypatch.setattr(query_engine._IndexAuthorityProjection, "named", named)
+        assert fixture._outcome(reader, QUERY, ids) == expected
+        result = reader.execute(QUERY, ids)
+        assert result.rows == (("a1", "b1"),)
+        assert result.statistics.get("rows_scanned", 0) >= 5
+        assert result.statistics.get("edge_scans", 0) + result.statistics.get("edge_lookups", 0) > 0
+
+
 def test_optional_retains_canonical_null_extension(database):
     query = "OPTIONAL " + QUERY
     assert not seeks(database, query)
