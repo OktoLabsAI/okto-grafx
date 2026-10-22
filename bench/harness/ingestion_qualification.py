@@ -104,7 +104,8 @@ def verify_previous(base, manifest):
         return None
     previous = canonical_path(manifest["previous_output"])
     previous.relative_to(base / "runs")
-    old = json.loads((previous / "operational-manifest.json").read_text(encoding="utf-8"))
+    old_manifest = previous / "operational-manifest.json"
+    old = json.loads(old_manifest.read_text(encoding="utf-8"))
     validate_manifest(old)
     if old.get("attempt", 1) != 1:
         raise ValueError("cannot repeat a second attempt")
@@ -112,12 +113,23 @@ def verify_previous(base, manifest):
         if manifest[field] != old[field]:
             raise ValueError("repeat changed " + field)
     receipt = json.loads((previous / "runner-receipt.json").read_text(encoding="utf-8"))
-    if receipt.get("decision") != "inconclusive" or inspect_result(previous / "campaign", old)["decision"] != "inconclusive":
+    if receipt.get("manifest_sha256") != hashlib.sha256(old_manifest.read_bytes()).hexdigest():
+        raise ValueError("previous manifest digest differs")
+    if (receipt.get("decision") != "inconclusive"
+            or inspect_result(previous / "campaign", old)["decision"] != "inconclusive"):
         raise ValueError("repeat requires complete inconclusive evidence")
-    for name, digest in receipt["artifact_sha256"].items():
+    expected_artifacts = receipt.get("artifact_sha256")
+    actual_artifacts = {path.relative_to(previous).as_posix() for path in previous.rglob("*")
+                        if path.is_file() and path != previous / "runner-receipt.json"}
+    if (not isinstance(expected_artifacts, dict) or not expected_artifacts
+            or set(expected_artifacts) != actual_artifacts):
+        raise ValueError("previous artifact inventory differs")
+    for name, digest in expected_artifacts.items():
         artifact = canonical_path(previous / name)
         artifact.relative_to(previous)
-        if hashlib.sha256(artifact.read_bytes()).hexdigest() != digest:
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                or hashlib.sha256(artifact.read_bytes()).hexdigest() != digest):
             raise ValueError("previous artifact changed")
     raw = canonical_path(previous / "campaign/campaign.json")
     if hashlib.sha256(raw.read_bytes()).hexdigest() != manifest["previous_campaign_sha256"]:

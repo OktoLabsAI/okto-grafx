@@ -74,13 +74,30 @@ def test_repeat_binds_all_raw_and_rejects_third_attempt(tmp_path, monkeypatch):
            "baseline_revision": "a" * 40, "candidate_root": "candidate", "baseline_root": "baseline", "python": "python",
            "memory_budget_bytes": 1048576, "timeout_seconds": 3500,
            "scenarios": [s.name for s in ingestion_matrix()]}
-    (previous / "operational-manifest.json").write_text(json.dumps(old), encoding="utf-8")
-    (previous / "runner-receipt.json").write_text(json.dumps({"decision": "inconclusive",
-            "artifact_sha256": {"campaign/campaign.json": digest}}), encoding="utf-8")
+    old_manifest = previous / "operational-manifest.json"
+    old_manifest.write_text(json.dumps(old), encoding="utf-8")
+    manifest_digest = hashlib.sha256(old_manifest.read_bytes()).hexdigest()
+    artifacts = {"campaign/campaign.json": digest,
+                 "operational-manifest.json": manifest_digest}
+    receipt_path = previous / "runner-receipt.json"
+    receipt = {"decision": "inconclusive", "manifest_sha256": manifest_digest,
+               "artifact_sha256": artifacts}
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     manifest = dict(old, attempt=2, previous_output=str(previous), previous_campaign_sha256=digest)
     monkeypatch.setattr(q, "inspect_result", lambda *_: {"decision": "inconclusive"})
     q.validate_manifest(manifest)
     assert q.verify_previous(tmp_path, manifest) == previous / "campaign/campaign.json"
+    receipt["artifact_sha256"] = {"campaign/campaign.json": digest}
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact inventory"):
+        q.verify_previous(tmp_path, manifest)
+    receipt["artifact_sha256"] = artifacts
+    receipt["manifest_sha256"] = "0" * 64
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest"):
+        q.verify_previous(tmp_path, manifest)
+    receipt["manifest_sha256"] = manifest_digest
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     with pytest.raises(ValueError, match="at most"):
         q.validate_manifest(dict(manifest, attempt=3))
     with pytest.raises(ValueError, match="changed scenarios"):

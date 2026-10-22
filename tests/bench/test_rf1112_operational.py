@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 
 import pytest
 
 from bench.harness.campaign_fixtures import matrix
+from bench.harness import rf1112_operational as operational
 from bench.harness.rf1112_operational import PARTITIONS, SCHEMA, validate_manifest
 
 
@@ -63,3 +66,38 @@ def test_retry_requires_frozen_lineage():
     candidate["previous_campaign_sha256"] = "not a hash"
     with pytest.raises(ValueError):
         validate_manifest(candidate, "Q5")
+
+
+def test_retry_requires_complete_receipt_inventory_and_manifest_binding(tmp_path, monkeypatch):
+    previous = tmp_path / "runs" / "first"
+    campaign = previous / "campaign" / "campaign.json"
+    campaign.parent.mkdir(parents=True)
+    campaign.write_text('{"synthetic_unit_test_only":true}', encoding="utf-8")
+    old = manifest("Q5")
+    old["output"] = str(previous)
+    old_manifest = previous / "operational-manifest.json"
+    old_manifest.write_text(json.dumps(old), encoding="utf-8")
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    artifacts = {"campaign/campaign.json": digest(campaign),
+                 "operational-manifest.json": digest(old_manifest)}
+    receipt_path = previous / "runner-receipt.json"
+    receipt = {"partition": "Q5", "decision": "inconclusive",
+               "manifest_sha256": digest(old_manifest), "artifact_sha256": artifacts}
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    retry = manifest("Q5")
+    retry.update(attempt=2, output=str(tmp_path / "runs" / "second"),
+                 previous_output=str(previous),
+                 previous_campaign_sha256=digest(campaign))
+    monkeypatch.setattr(operational, "inspect_result", lambda *_: {"decision": "inconclusive"})
+    assert operational._previous(tmp_path, retry) == campaign
+
+    receipt["artifact_sha256"] = {"campaign/campaign.json": digest(campaign)}
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact inventory"):
+        operational._previous(tmp_path, retry)
+    receipt["artifact_sha256"] = artifacts
+    receipt["manifest_sha256"] = "0" * 64
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest"):
+        operational._previous(tmp_path, retry)
