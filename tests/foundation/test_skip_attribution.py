@@ -459,9 +459,23 @@ def test_xdist_collection_reaches_controller_without_weakening_disappearance_gat
 def test_xdist_reconciles_all_worker_reports_and_catches_a_silent_item(tmp_path: Path) -> None:
     xdist = ("-p", "xdist.plugin", "-n", "2")
     passing = HEADER + "@pytest.mark.parametrize('n', range(8))\ndef test_planted(n):\n    assert n < 8\n"
-    code, output = _plant(tmp_path / "reported", module=passing, extra_arguments=xdist)
+    worker_audit = (
+        "\n\ndef pytest_unconfigure(config):\n"
+        "    worker = getattr(config, 'workerinput', None)\n"
+        "    if worker is not None:\n"
+        "        (pathlib.Path(config.rootpath) / f\"g4-{worker['workerid']}.txt\").write_text(\n"
+        "            repr(_UNATTRIBUTED), encoding='utf-8'\n"
+        "        )\n"
+    )
+    reported = tmp_path / "reported"
+    code, output = _plant(
+        reported, module=passing, conftest_extra=worker_audit, extra_arguments=xdist
+    )
     assert code == 0, output
     assert "collected but never reported" not in output
+    worker_verdicts = sorted(reported.glob("g4-*.txt"))
+    assert len(worker_verdicts) == 2, output
+    assert all(path.read_text(encoding="utf-8") == "[]" for path in worker_verdicts), output
 
     # A worker can claim that it handled an item while sending no report. The controller's
     # complete collection and merged reports must still expose this loss after distribution.
