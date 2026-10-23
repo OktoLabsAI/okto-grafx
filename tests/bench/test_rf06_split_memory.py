@@ -6,7 +6,7 @@ import pytest
 from bench.harness.campaign_fixtures import Scenario, oracle, query_for
 from bench.harness.campaign_schema import CampaignError, canonical_hash, compare_campaign
 from bench.harness.campaign_worker import sample_record
-from bench.harness.quota_qualification import SPLIT_MEMORY_REGIME, qualification_matrix
+from bench.harness.quota_qualification import FIELDS, SPLIT_MEMORY_REGIME, qualification_matrix
 from tests.bench.test_campaign_schema import campaign
 
 
@@ -70,13 +70,15 @@ def test_fixed_split_matrix_has_same_traversal_quota_in_each_pair():
         assert target.work_counter == "certificate_attempts"
 
 
-def test_real_scalar_control_releases_budget_after_repeated_reads(tmp_path):
+@pytest.mark.parametrize("field", FIELDS)
+def test_real_scalar_control_releases_budget_after_repeated_reads(tmp_path, field):
     from bench.harness.campaign_fixtures import build_fixture
     from bench.harness.campaign_worker import rf06_memory_retention_proof
     from bench.harness.quota_qualification import connection_options
     from okto_grafx import connect
 
-    scenario = qualification_matrix(Scenario)[1]
+    scenario = next(item for item in qualification_matrix(Scenario)
+                    if item.role == "control" and item.quota_field == field)
     root = tmp_path / "rf06-control"
     with connect(root) as setup:
         build_fixture(setup, scenario)
@@ -85,7 +87,10 @@ def test_real_scalar_control_releases_budget_after_repeated_reads(tmp_path):
         records = rf06_memory_retention_proof(db, scenario)["records"]
     assert len(records) == 5
     assert {record["retained_before_bytes"] for record in records} == {0}
-    assert all(record["memory"]["logical_memory_peak_bytes"] >= 0 for record in records)
+    assert {record["retained_after_bytes"] for record in records} == {0}
+    assert {record["open_transactions_after"] for record in records} == {0}
+    assert all(0 <= record["memory"]["logical_memory_peak_bytes"]
+               <= scenario.query_memory_budget_bytes for record in records)
 
 
 def test_split_campaign_qualifies_time_without_claiming_target_memory():

@@ -19,7 +19,7 @@ from tests.pulse.rf0205_authority_evidence import _verify_junit
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-_TIMEOUT_SECONDS = 100
+_TIMEOUT_SECONDS = 240
 _FTS_WRITE = "tests/bench/test_fts_qualification.py::test_write_cost_slices_require_durable_acks_and_reopen_exactly"
 _CASES = {
     "rf09_quota_ack_occ": (
@@ -44,15 +44,27 @@ _CASES = {
         *("tests/bench/test_pagination_campaign.py::"
           f"test_rf05_case_has_independent_oracle_and_runtime_regime[{case}]"
           for case in ("first", "membership", "dynamic_membership", "keyset", "skip", "no_index")),
+        *("tests/bench/test_pagination_campaign.py::"
+          f"test_rf05_other_closed_pages_keep_order_cursor_and_fallback_under_quota[{case}]"
+          for case in ("membership", "dynamic_membership", "keyset", "skip", "no_index")),
+        "tests/query/test_label_keyset_pagination.py::test_null_timestamp_and_null_keyset_keep_canonical_order",
     ),
     "rf06": (
         "tests/bench/test_rf06_split_memory.py::test_fixed_split_matrix_has_same_traversal_quota_in_each_pair",
-        "tests/bench/test_rf06_split_memory.py::test_real_scalar_control_releases_budget_after_repeated_reads",
+        *("tests/bench/test_quota_qualification.py::"
+          f"test_128_landings_reduce_real_certificate_work_with_same_quota_and_fixture[{field}]"
+          for field in ("max_intermediate_rows", "max_traversal_paths", "max_traversal_expansions")),
+        *("tests/bench/test_rf06_split_memory.py::"
+          f"test_real_scalar_control_releases_budget_after_repeated_reads[{field}]"
+          for field in ("max_intermediate_rows", "max_traversal_paths", "max_traversal_expansions")),
     ),
     "rf08": (
         "tests/bench/test_uniqueness_qualification.py::test_target_and_scalar_oracle_share_rows_but_not_certificate_work",
         "tests/bench/test_uniqueness_qualification.py::test_control_and_catalog_are_explicit",
         "tests/bench/test_uniqueness_qualification.py::test_failed_duplicate_has_no_ack_or_persisted_prefix",
+        "tests/query/test_batched_pk_uniqueness.py::test_quota_uses_existing_scalar_memory_frontier",
+        "tests/query/test_batched_pk_uniqueness.py::test_intermediate_row_quota_keeps_first_error_in_scalar_order",
+        "tests/query/test_batched_pk_uniqueness.py::test_executemany_does_not_advance_generator_after_failure",
     ),
     "rf09_memory": (
         "tests/bench/test_ingestion_campaign.py::test_sequence_observes_retained_growth_and_partial_call_cleanup",
