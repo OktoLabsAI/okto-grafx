@@ -22,6 +22,20 @@ sys.path.insert(0, str(ROOT / "src"))
 _TIMEOUT_SECONDS = 100
 _FTS_WRITE = "tests/bench/test_fts_qualification.py::test_write_cost_slices_require_durable_acks_and_reopen_exactly"
 _CASES = {
+    "rf09_quota_ack_occ": (
+        *("tests/bench/test_ingestion_campaign.py::"
+          f"test_matrix_central_recipes_preserve_rows_payload_acks_and_one_mib[{shape}]"
+          for shape in ("unwind", "statements", "executemany", "chunks", "transactions")),
+        "tests/bench/test_ingestion_campaign.py::test_matrix_chunk_recipe_keeps_each_durable_prefix_atomic",
+        "tests/bench/test_ingestion_campaign.py::"
+        "test_recipe_occ_conflict_rolls_back_without_implicit_replay_then_explicit_retry",
+    ),
+    "rf10_eight_recipes": tuple(
+        "tests/bench/test_read_lifecycle_qualification.py::"
+        f"test_all_eight_real_read_recipes_cover_budget_and_release_ownership[rf10-{family}-{cache}]"
+        for family in ("read_autocommit", "read_cursor", "read_materialized", "read_shared")
+        for cache in ("warm", "reopen")
+    ),
     "rf03": (
         "tests/query/test_connected_anchor_seek.py::test_exact_connected_fixture_reduces_anchor_scan_only",
     ),
@@ -158,8 +172,14 @@ class DownstreamStructuralEvidence(unittest.TestCase):
     def test_rf09_sequence_memory(self) -> None:
         self._check("rf09_memory")
 
+    def test_rf09_quota_ack_occ(self) -> None:
+        self._check("rf09_quota_ack_occ")
+
     def test_rf10_sequence_memory(self) -> None:
         self._check("rf10_memory")
+
+    def test_rf10_eight_real_recipes(self) -> None:
+        self._check("rf10_eight_recipes")
 
     def test_rf11_write_ack_and_reopen(self) -> None:
         self._check("rf11_write")
