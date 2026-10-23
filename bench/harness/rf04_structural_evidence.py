@@ -68,14 +68,16 @@ def build_source_manifest(repository: Path) -> dict:
 
 
 def _source_inventory(root: Path, expected: str, count: int) -> dict[str, bytes]:
-    """Hash the whole relevant source slice; ignore only this new runner."""
+    """Hash the 1b8 source slice; exclude only later evidence helpers."""
     root = root.resolve(strict=True)
-    paths = [path for folder in ("src", "bench/harness")
+    paths = [path for folder in ("src/okto_grafx", "bench/harness")
              for path in (root / folder).rglob("*") if path.is_file()
              and "__pycache__" not in path.parts and path.suffix != ".pyc"]
     paths.append(root / "tests/query/test_conditional_endpoint_evidence.py")
+    later_helpers = {"bench/harness/rf04_structural_evidence.py",
+                     "bench/harness/structural_qualification.py"}
     result = {path.relative_to(root).as_posix(): path.read_bytes() for path in paths
-              if path.relative_to(root).as_posix() != "bench/harness/rf04_structural_evidence.py"}
+              if path.relative_to(root).as_posix() not in later_helpers}
     if len(result) != count or any(not name.startswith(("src/", "bench/harness/", "tests/query/"))
                                    for name in result):
         raise ValueError("RF04 source bundle path inventory changed")
