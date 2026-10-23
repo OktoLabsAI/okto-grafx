@@ -94,6 +94,43 @@ def test_external_writer_keeps_retained_scores_and_corpus(tmp_path, history, reg
         assert not reopened.verify("all").findings
 
 
+def test_wal_reader_keeps_old_scores_across_foreign_commits_and_checkpoint(tmp_path):
+    path = tmp_path / "wal-retained"
+    scenario = Scenario("wal-retained", "fts_matrix", nodes=256, edges_per_node=0,
+                        fts_statistics_mode="wal", fts_history=0, cache="reopen",
+                        reader="retained", fts_updates=4)
+    before = input_corpus()
+    after = {identity: list(tokens) for identity, tokens in before.items()}
+    for identity in range(1, 5):
+        after[identity] = [*after[identity], "extra"]
+    with connect(path) as db:
+        build_fixture(db, scenario)
+        with db.begin("read") as reader:
+            assert reader.execute("MATCH (n:N) RETURN count(n)").rows == ((256,),)
+            with connect(path) as foreign:
+                for identity in range(4):
+                    with foreign.begin("write") as tx:
+                        tx.execute("MATCH (n:N {id:$id}) SET n.body=$body",
+                                   {"id": identity,
+                                    "body": " ".join(after[identity + 1])})
+            db.checkpoint()
+            for term in ("common", "rare"):
+                db._text_stats_cache.clear()
+                retained = db.search_text(reader, index="campaign_text", query=term, k=256)
+                assert retained.statistics_regime == "full_census"
+                assert_corpus(retained, before, term)
+                db._text_stats_cache.clear()
+                current = db.search_text(index="campaign_text", query=term, k=256)
+                assert_corpus(current, after, term)
+        assert db.verify("all").findings == ()
+        db.checkpoint()
+    with connect(path, read_only=True) as reopened:
+        for term in ("common", "rare"):
+            assert_corpus(reopened.search_text(index="campaign_text", query=term, k=256),
+                          after, term)
+        assert reopened.verify("all").findings == ()
+
+
 @pytest.mark.parametrize("history", [0, 8])
 def test_invalid_persisted_summary_refuses_instead_of_census(tmp_path, history):
     import okto_grafx.engine.fulltext_durable as durable

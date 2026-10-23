@@ -97,7 +97,7 @@ def test_foreign_commit_survives_checkpoint_with_retained_reader(tmp_path, inter
 
 def test_hash_skew_diagnosis_is_bounded_read_only_and_cannot_authorize_rehash(tmp_path):
     root = tmp_path / "db"
-    with connect(root, codec="pure", vector_math="pure") as db:
+    with connect(root, page_size=512, codec="pure", vector_math="pure") as db:
         with db.begin("write") as tx:
             tx.execute("CREATE NODE TABLE D(id INT64, v STRING, PRIMARY KEY(id))")
             tx.execute("UNWIND $ids AS id CREATE (:D {id:id,v:'same'})",
@@ -108,14 +108,36 @@ def test_hash_skew_diagnosis_is_bounded_read_only_and_cannot_authorize_rehash(tm
             "v", max_pages=1000, max_entries=1000, max_memory_bytes=1 << 20,
         )
         assert report.entries == 40
+        assert report.overflow_pages > 0
         assert report.dominant_key_fraction == 1.0
         assert report.recommendation == "inspect_key_skew"
         assert "same" not in repr(report)
         assert capacity._image(db) == before
-        with pytest.raises(GrafxQueryBudgetExceeded):
-            db.index_distribution("v", max_entries=1)
-        assert capacity._image(db) == before
+        for limit in ({"max_pages": 1}, {"max_entries": 1},
+                      {"max_memory_bytes": 1}):
+            with pytest.raises(GrafxQueryBudgetExceeded):
+                db.index_distribution("v", **limit)
+            assert capacity._image(db) == before
         assert db.verify("all").findings == ()
+        db.checkpoint()
+
+    with connect(root, read_only=True, page_size=512,
+                 codec="pure", vector_math="pure") as reopened:
+        # Read-only operations may register a transient reader lease. Compare
+        # persisted data/index/WAL bytes, not that coordination record.
+        def durable_image():
+            return tuple(entry for entry in capacity._image(reopened)
+                         if not entry[0].startswith("control/readers/"))
+
+        before = durable_image()
+        assert reopened.index_distribution("v", max_pages=1000, max_entries=1000,
+                                           max_memory_bytes=1 << 20) == report
+        for limit in ({"max_pages": 1}, {"max_entries": 1},
+                      {"max_memory_bytes": 1}):
+            with pytest.raises(GrafxQueryBudgetExceeded):
+                reopened.index_distribution("v", **limit)
+            assert durable_image() == before
+        assert reopened.verify("all").findings == ()
 
     decision = capacity.decision_template(None, objective="review one HASH index")
     assert decision["decision"] == "new_research"
