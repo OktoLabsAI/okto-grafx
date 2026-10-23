@@ -2,6 +2,7 @@
 
 import pytest
 from copy import deepcopy
+from dataclasses import replace
 
 from bench.harness.campaign_fixtures import Scenario, build_fixture, contract, matrix, oracle, query_for
 from bench.harness.pagination_qualification import validate_qualification_sample
@@ -77,3 +78,29 @@ def test_rf05_qualified_target_executes_at_declared_scale_and_memory_budget(tmp_
     assert sample["statistics"]["ordered_candidates_examined"] == 16
     assert sample["statistics"]["ordered_merge_rows"] == 16
     assert sample["memory"]["logical_memory_peak_bytes"] <= 4096
+
+
+@pytest.mark.parametrize("case", ["membership", "dynamic_membership", "keyset", "skip", "no_index"])
+def test_rf05_other_closed_pages_keep_order_cursor_and_fallback_under_quota(tmp_path, case):
+    scenario = replace(next(item for item in matrix() if item.family == "pagination"
+                            and item.pagination_case == case), query_memory_budget_bytes=1 << 20)
+    query, params = query_for(scenario)
+    with connect(tmp_path / "db", codec="pure", query_memory_budget_bytes=1 << 20) as db:
+        build_fixture(db, scenario)
+        result = db.execute(query, params)
+        assert result.rows == oracle(scenario)
+        assert len(result.rows) == scenario.page == 16
+        sample = measure_statement(db, scenario, 5)
+        validate_qualification_sample(sample, scenario, arm="B")
+        assert sample["result_hash"] == sample["expected_result_hash"]
+        assert sample["memory"]["unavailable_reason"] is None
+        assert sample["memory"]["baseline_retained_bytes"] == 0
+        assert 0 <= sample["memory"]["logical_memory_peak_bytes"] <= 1 << 20
+        assert db._queries._owner_budget._used_bytes == 0
+        if case == "keyset":
+            assert params["cursor_pk"] == f"n-{scenario.nodes - 12:04d}"
+            assert result.rows[0] == (f"n-{scenario.nodes - 13:04d}",)
+        if case in ("skip", "no_index"):
+            assert result.statistics.get("ordered_merge_rows", 0) == 0
+        else:
+            assert result.statistics["ordered_merge_rows"] == 16

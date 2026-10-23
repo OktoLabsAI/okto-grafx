@@ -61,6 +61,39 @@ def test_multi_statement_recipe_uses_sequence_memory_observer(tmp_path, family):
     assert sample["memory"]["unavailable_reason"] is None
 
 
+@pytest.mark.parametrize("scenario", lifecycle.matrix(), ids=lambda scenario: scenario.name)
+def test_all_eight_real_read_recipes_cover_budget_and_release_ownership(tmp_path, scenario):
+    scenario = replace(scenario, query_memory_budget_bytes=1 << 20)
+    root = tmp_path / scenario.name
+    with okto_grafx.connect(root, query_memory_budget_bytes=1 << 20) as setup:
+        build_fixture(setup, scenario)
+    with okto_grafx.connect(root, query_memory_budget_bytes=1 << 20) as db:
+        if scenario.cache == "warm":
+            assert lifecycle.execute(db, scenario)[0] == oracle(scenario)
+        sample = measure_statement(db, scenario, 5)
+        assert sample["result_hash"] == sample["expected_result_hash"]
+        assert sample["rows"] == len(oracle(scenario))
+        assert sample["first_row_ns"] is not None
+        assert sample["memory"]["coverage"] == (
+            SEQUENCE_LOGICAL_COVERAGE if scenario.family in
+            {"read_autocommit", "read_shared"} else LOGICAL_COVERAGE)
+        assert sample["memory"]["unavailable_reason"] is None
+        assert sample["memory"]["baseline_retained_bytes"] == 0
+        assert 0 <= sample["memory"]["logical_memory_peak_bytes"] <= 1 << 20
+        assert sample["statistics"]["diagnostic_partial_owned_transactions"] == 1
+        assert sample["statistics"]["diagnostic_owned_transactions_after_close"] == 0
+        assert db.transactions.open_transactions == 0
+        with okto_grafx.connect(root, query_memory_budget_bytes=1 << 20) as observer:
+            db.close()
+            assert observer._transactions._coordinator.reader_horizon() is None
+    sample["statistics"]["diagnostic_handle_close_complete"] = int(db.close_complete)
+    assert db.close_complete
+    assert sample["cache_state"]["handle"] == (
+        "private reopened; primed" if scenario.cache == "warm"
+        else "private reopened; unprimed")
+    lifecycle.validate_diagnostic(sample, scenario)
+
+
 def _qualified_shared_read():
     data = campaign()
     scenarios = [replace(s, query_memory_budget_bytes=1 << 20) for s in lifecycle.matrix()]
