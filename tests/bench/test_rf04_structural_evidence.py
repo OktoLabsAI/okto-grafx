@@ -3,10 +3,13 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
-from bench.harness.rf04_structural_evidence import CASES, PROFILES, REVISIONS, evaluate
+from bench.harness.rf04_structural_evidence import (
+    CASES, PROFILES, REVISIONS, evaluate, materialize_bundle, source_isolation,
+)
 
 
 def _four_arm_observations():
@@ -25,7 +28,10 @@ def _four_arm_observations():
                     stats["fallback_reason_nonselective_probe_set"] = 1
                 cases[f"rf04-{profile}-{case}"] = {
                     "rows": 32, "rows_sha256": "rows", "query_sha256": profile,
-                    "fixture_sha256": case, "statistics": stats,
+                    "fixture_sha256": case,
+                    "fixture_topology": {"starts": 1024, "destinations": 128, "edges": 1151,
+                                         "hot_starts": 10, "edges_from_hot_starts": 930},
+                    "statistics": stats,
                     "plan": ["NodeMultiKeySeek"] if case == "fallback" else [],
                     "memory": {"logical_memory_peak_bytes": 40960,
                                "baseline_retained_bytes": 0, "coverage": "query_budget_v1",
@@ -81,8 +87,23 @@ def test_recorded_four_arm_evidence_replays_and_keeps_candidate_guard_source():
         encoding="utf-8"))
     assert evaluate(record["observations"], record["report"]["source_isolation"]) == record["report"]
     guard = record["candidate_functional_guards"]
-    module = root / guard["module"]
-    assert hashlib.sha256(module.read_bytes()).hexdigest() == guard["module_sha256"]
+    blob = subprocess.run(["git", "show", f"{guard['revision']}:{Path(guard['module']).as_posix()}"],
+                          cwd=root, check=True, capture_output=True).stdout
+    assert hashlib.sha256(blob).hexdigest() == guard["module_blob_sha256"]
     assert guard["revision"] == REVISIONS["both"]
     assert len(guard["passed_methods"]) == 3
     assert record["report"]["latency_certified"] is False
+
+
+def test_git_free_bundle_rejects_any_changed_source_blob(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    manifest = json.loads((root / "bench/evidence/rf04-source-bundle-1b8e529.json").read_text(
+        encoding="utf-8"))
+    arms = materialize_bundle(root, tmp_path, manifest)
+    assert all(not (arm / ".git").exists() for arm in arms.values())
+    assert source_isolation(arms, manifest)["changed_files"]["rf03_only_to_both"] == [
+        "src/okto_grafx/engine/query_engine.py"]
+    tampered = arms["both"] / "src/okto_grafx/engine/query_engine.py"
+    tampered.write_bytes(tampered.read_bytes() + bytes([10]))
+    with pytest.raises(ValueError, match="source bundle blob mismatch"):
+        source_isolation(arms, manifest)

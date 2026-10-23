@@ -1,7 +1,7 @@
 {
   "candidate_functional_guards": {
     "module": "tests\\query\\test_conditional_endpoint_evidence.py",
-    "module_sha256": "34d515eea763b04144e138f67f575daf130537ac30aa4e620bb6dfbb2ce09757",
+    "module_blob_sha256": "676469e318b9750e0283b0e4c3ed16bd2dee052a7b640d5a055ffcc47e79f5fc",
     "passed_methods": [
       "test_sixteen_starts_without_global_edge_census",
       "test_fan_limit_and_actual_conditional_node_fallback",
@@ -14,7 +14,14 @@
       "arm": "base",
       "cases": {
         "rf04-original-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -47,7 +54,14 @@
           }
         },
         "rf04-original-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -80,7 +94,14 @@
           }
         },
         "rf04-original-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -113,7 +134,14 @@
           }
         },
         "rf04-original-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -146,7 +174,14 @@
           }
         },
         "rf04-with-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -182,7 +217,14 @@
           }
         },
         "rf04-with-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -218,7 +260,14 @@
           }
         },
         "rf04-with-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -254,7 +303,14 @@
           }
         },
         "rf04-with-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -299,7 +355,14 @@
       "arm": "both",
       "cases": {
         "rf04-original-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -333,7 +396,14 @@
           }
         },
         "rf04-original-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -367,7 +437,14 @@
           }
         },
         "rf04-original-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -401,7 +478,14 @@
           }
         },
         "rf04-original-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -435,7 +519,14 @@
           }
         },
         "rf04-with-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -471,7 +562,14 @@
           }
         },
         "rf04-with-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -507,7 +605,14 @@
           }
         },
         "rf04-with-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -543,7 +648,14 @@
           }
         },
         "rf04-with-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -588,7 +700,14 @@
       "arm": "rf03_only",
       "cases": {
         "rf04-original-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -622,7 +741,14 @@
           }
         },
         "rf04-original-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -656,7 +782,14 @@
           }
         },
         "rf04-original-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -690,7 +823,14 @@
           }
         },
         "rf04-original-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -724,7 +864,14 @@
           }
         },
         "rf04-with-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -760,7 +907,14 @@
           }
         },
         "rf04-with-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -796,7 +950,14 @@
           }
         },
         "rf04-with-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -832,7 +993,14 @@
           }
         },
         "rf04-with-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -877,7 +1045,14 @@
       "arm": "rf04_only",
       "cases": {
         "rf04-original-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -910,7 +1085,14 @@
           }
         },
         "rf04-original-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -943,7 +1125,14 @@
           }
         },
         "rf04-original-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -976,7 +1165,14 @@
           }
         },
         "rf04-original-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -1009,7 +1205,14 @@
           }
         },
         "rf04-with-fallback": {
-          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "fixture_sha256": "37554cca4bea35bb3adc3b6a3f696da9a36021f4be27d6c13da300cf701e2264",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 143,
+            "edges_from_hot_starts": 9,
+            "hot_starts": 1,
+            "starts": 16
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -1045,7 +1248,14 @@
           }
         },
         "rf04-with-fan_limit": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -1081,7 +1291,14 @@
           }
         },
         "rf04-with-hub": {
-          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "fixture_sha256": "1f5d32001b8c2a2419a84e0dc3e3e9cfaca87484b407dd5a829f735a5d9821b2",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 931,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -1117,7 +1334,14 @@
           }
         },
         "rf04-with-target": {
-          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "fixture_sha256": "a68f7836fcd083128a68078fe85dd764663de23b15392f64d16ece1e6034d7af",
+          "fixture_topology": {
+            "destinations": 128,
+            "edges": 1151,
+            "edges_from_hot_starts": 20,
+            "hot_starts": 10,
+            "starts": 1024
+          },
           "memory": {
             "baseline_retained_bytes": 0,
             "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
@@ -1161,10 +1385,10 @@
   },
   "report": {
     "arm_hashes": {
-      "base": "205dacf404a4fb9901737abccfae5ee2c6100675d78308b8223585f771e8bd57",
-      "both": "6e70eed5411fa0e04602dbde13aa9aa6c527915dbad9b52752e3b5ad988fbfcc",
-      "rf03_only": "f799f932c1f71b4dc07e48b18a9d1c5070fc820b484eefc93d354704047581d3",
-      "rf04_only": "3908ae7ddafea2a5809c9491a1ddd1390da5375d1547afcd8d03dd550b3112ea"
+      "base": "751e29e42de5bbe0fbe8b6c588468d0e79a9beffbbc3625419b8011d773273e8",
+      "both": "b4c8998dc48c58c4cf54c71c70b9cd4fc56cc2caffb6e9a539ac4248bde7a40c",
+      "rf03_only": "422a808e78d8038616604e8d2333de8cfe5c617589a78f518cffea948a9e9cbf",
+      "rf04_only": "d937acdfe4eec65d2d5636b0e97bc6b63412405ccc270c8d38ac8fc2de853b09"
     },
     "contrasts": {
       "rf04-original-fallback": {
@@ -1569,9 +1793,21 @@
       }
     },
     "decision": "structural_pass",
+    "hub_tradeoffs": {
+      "original": {
+        "rf04_increases_physical_edge_work": true,
+        "with_rf04_edge_versions": 1874,
+        "without_rf04_edge_versions": 1151
+      },
+      "with": {
+        "rf04_increases_physical_edge_work": true,
+        "with_rf04_edge_versions": 1874,
+        "without_rf04_edge_versions": 1151
+      }
+    },
     "latency_certified": false,
     "schema_version": "grafx-rf04-structural-report/v1",
-    "scope": "input-derived ordered rows, equal fixtures/queries, physical counters, fan limit, hub and actual broad fallback; no temporal gain asserted",
+    "scope": "input-derived ordered rows, equal fixtures/queries, physical counters, fan limit, hub and actual broad fallback; hub may increase physical edge work; no temporal gain asserted",
     "source_isolation": {
       "changed_files": {
         "base_to_rf03_only": [
