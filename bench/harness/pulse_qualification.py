@@ -394,7 +394,10 @@ def _run(snapshot, expected_manifest_sha256=None):
     candidate = canonical_path(manifest["candidate_root"])
     baseline = canonical_path(manifest["baseline_root"])
     python = canonical_path(manifest["python"])
-    if python != canonical_path(sys.executable):
+    # Hosted Python installations may expose the active interpreter through a
+    # symlink (for example, bin/python -> bin/python3). Authenticate the real
+    # executable while keeping manifest paths subject to canonical_path.
+    if python != canonical_path(Path(sys.executable).resolve()):
         raise ValueError("operational interpreter differs from authenticated runner")
     revision = manifest["candidate_revision"]
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):

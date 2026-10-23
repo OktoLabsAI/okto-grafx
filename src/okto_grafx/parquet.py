@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import closing
 from dataclasses import dataclass
+from inspect import signature
 import os
 from pathlib import Path
 import stat
@@ -127,8 +128,14 @@ def read_parquet_batches(path: str | os.PathLike[str], *, allowed_root: str | os
             if before.st_size > max_file_bytes:
                 raise GrafxQueryBudgetExceeded("Parquet file bound exceeded.", resource="parquet_file")
             _unchanged_root(root, identity)
+            reader_options = {}
+            if "schema_depth_limit" in signature(pq.ParquetFile).parameters:
+                # Native StoredType permits 64 nested containers. A Parquet LIST
+                # uses multiple schema levels, so Arrow's default 100 is too low.
+                reader_options["schema_depth_limit"] = 256
             with pq.ParquetFile(stream, memory_map=False, pre_buffer=False,
-                                thrift_string_size_limit=1048576, thrift_container_size_limit=100000) as source:
+                                thrift_string_size_limit=1048576, thrift_container_size_limit=100000,
+                                **reader_options) as source:
                 schema = _schema(tuple(source.schema_arrow.names), types, pa)
                 _read_schema(source.schema_arrow, schema, types, pa)
                 if source.metadata.num_rows > max_rows or source.num_row_groups > max_batches:

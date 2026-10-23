@@ -184,7 +184,7 @@ def _run(snapshot, partition, expected_manifest_hash):
     baseline = canonical_path(manifest["baseline_root"])
     candidate = canonical_path(manifest["candidate_root"])
     python = canonical_path(manifest["python"])
-    if python != canonical_path(sys.executable):
+    if python != canonical_path(Path(sys.executable).resolve()):
         raise ValueError("interpreter differs from registered runner")
     runner_before = inventory(runner, manifest["runner_revision"])
     baseline_before = inventory(baseline, manifest["baseline_revision"])
