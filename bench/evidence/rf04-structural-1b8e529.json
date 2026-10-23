@@ -1,0 +1,1599 @@
+{
+  "candidate_functional_guards": {
+    "module": "tests\\query\\test_conditional_endpoint_evidence.py",
+    "module_sha256": "34d515eea763b04144e138f67f575daf130537ac30aa4e620bb6dfbb2ce09757",
+    "passed_methods": [
+      "test_sixteen_starts_without_global_edge_census",
+      "test_fan_limit_and_actual_conditional_node_fallback",
+      "test_directions_parallel_self_loop_and_owned_overlay"
+    ],
+    "revision": "1b8e5291a5dd77e8725297f86af9333237ec34e2"
+  },
+  "observations": {
+    "base": {
+      "arm": "base",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 122910,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 393255,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 90080,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 66,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 130,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "da8d821b233a792553a833d69050aa19be2778aa",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    },
+    "both": {
+      "arm": "both",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 32,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 286,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 130,
+            "edge_lookups": 64,
+            "edge_scans": 1,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 194,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1407,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1874,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 64,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 32,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 286,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 130,
+            "edge_lookups": 64,
+            "edge_scans": 1,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 194,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1407,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1874,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 64,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "1b8e5291a5dd77e8725297f86af9333237ec34e2",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    },
+    "rf03_only": {
+      "arm": "rf03_only",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 66,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 130,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 66,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 130,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 17,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "237775048ab4ee162a563328215e4ce2c6029f2f",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    },
+    "rf04_only": {
+      "arm": "rf04_only",
+      "cases": {
+        "rf04-original-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4a871f5c9e944e6baf2640790d929476ca1a34d8d7d72ca2c30712927d52d01e",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 16,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 16,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 143,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 122910,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "77c20237ce46a8fef4fa00bd4501a2a031173002dc86c1b76439d3f3727fb0d6",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 393255,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-original-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 90080,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "FilterRows",
+            "TraverseRelationship",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "ead390b523253863ebd0b6d9834905d4f8c38bf2809361d0e3190585a3adfc76",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 128,
+            "edge_lookups": 0,
+            "edge_scans": 1,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 128,
+            "landing_candidates": 128,
+            "physical_edge_versions_examined": 1151,
+            "physical_node_versions_examined": 1152,
+            "rows_scanned": 2175,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fallback": {
+          "fixture_sha256": "ff0dec46a0366f1ba0b45e23939a45beed9351635339d6f4843c24d8145e9354",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 60065,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "2fb4e23f862519f099021220875f7c1772a5f615a014f64ad2b6b15d47ff975f",
+          "rows": 143,
+          "rows_sha256": "99034d5d245caf38d778a3d6b97f6b3667a1e1d76bfa380a4739e50abb0759e6",
+          "statistics": {
+            "certificate_attempts": 32,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_nonselective_probe_set": 1,
+            "index_probe_keys": 32,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 286,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 159,
+            "rows_seeked": 0
+          }
+        },
+        "rf04-with-fan_limit": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 158560,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "1551055e89a8ecf4e7374cf1bd64f3779f3fe97dac2965ae1a2c64bc1c90978f",
+          "rows": 130,
+          "rows_sha256": "131d68fd9cd29d10881dec240e0a223998dbba33fd2c10285b583bb50f0058fb",
+          "statistics": {
+            "certificate_attempts": 130,
+            "edge_lookups": 64,
+            "edge_scans": 1,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 194,
+            "landing_candidates": 65,
+            "physical_edge_versions_examined": 1407,
+            "physical_node_versions_examined": 130,
+            "rows_scanned": 130,
+            "rows_seeked": 65
+          }
+        },
+        "rf04-with-hub": {
+          "fixture_sha256": "805856a00920f6f5aae761fd7fce3c225647f764cea7ae987a11e230b6428e0e",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 344135,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 937,
+          "rows_sha256": "5556abf68d780d86d72460f9cd8c3b2b456a4aab480f51b654250316a6be05de",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 1874,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 937,
+            "rows_seeked": 16
+          }
+        },
+        "rf04-with-target": {
+          "fixture_sha256": "ac6138175efd1627196e14371a5525821e9550b81c21900013067f195880b503",
+          "memory": {
+            "baseline_retained_bytes": 0,
+            "coverage": "simultaneous_query_budget_and_handle_owner_endpoint_tariffs_v1",
+            "logical_memory_peak_bytes": 40960,
+            "unavailable_reason": null
+          },
+          "plan": [
+            "ProduceResults",
+            "SortRows",
+            "ProjectRows",
+            "TraverseRelationship",
+            "FilterRows",
+            "WithRows",
+            "FilterRows",
+            "NodeMultiKeySeek",
+            "NodeScan",
+            "SingleRow"
+          ],
+          "query_sha256": "4782bee2c679a99af559b61c1e99a7334fb358a6f4ffc5b0be0febc8a07f01df",
+          "rows": 32,
+          "rows_sha256": "5512d2dccb1fa0caaf22ac825e8c64ccdcf51aa359ebaee1ae0851c6f0ec1b02",
+          "statistics": {
+            "certificate_attempts": 33,
+            "edge_lookups": 16,
+            "edge_scans": 0,
+            "fallback_reason_memory_guard": 1,
+            "index_probe_keys": 48,
+            "landing_candidates": 16,
+            "physical_edge_versions_examined": 64,
+            "physical_node_versions_examined": 32,
+            "rows_scanned": 32,
+            "rows_seeked": 16
+          }
+        }
+      },
+      "query_memory_budget_bytes": 1048576,
+      "revision": "3736ae08a5ca30310b4f383e001258bf98f4fb52",
+      "schema_version": "grafx-rf04-structural-arm/v1",
+      "source_module": "src\\okto_grafx\\__init__.py"
+    }
+  },
+  "report": {
+    "arm_hashes": {
+      "base": "205dacf404a4fb9901737abccfae5ee2c6100675d78308b8223585f771e8bd57",
+      "both": "6e70eed5411fa0e04602dbde13aa9aa6c527915dbad9b52752e3b5ad988fbfcc",
+      "rf03_only": "f799f932c1f71b4dc07e48b18a9d1c5070fc820b484eefc93d354704047581d3",
+      "rf04_only": "3908ae7ddafea2a5809c9491a1ddd1390da5375d1547afcd8d03dd550b3112ea"
+    },
+    "contrasts": {
+      "rf04-original-fallback": {
+        "base": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 32,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 286,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf03_only": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf04_only": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-original-fan_limit": {
+        "base": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 130,
+          "edge_lookups": 64,
+          "edge_scans": 1,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 194,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1407,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf03_only": {
+          "certificate_attempts": 66,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 130,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf04_only": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-original-hub": {
+        "base": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1874,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-original-target": {
+        "base": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 64,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 128,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 128,
+          "landing_candidates": 128,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 1152,
+          "rows_scanned": 2175,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-with-fallback": {
+        "base": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "both": {
+          "certificate_attempts": 32,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 286,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf03_only": {
+          "certificate_attempts": 16,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 16,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 143,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        },
+        "rf04_only": {
+          "certificate_attempts": 32,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 286,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 159,
+          "rows_seeked": 0
+        }
+      },
+      "rf04-with-fan_limit": {
+        "base": {
+          "certificate_attempts": 66,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 130,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "both": {
+          "certificate_attempts": 130,
+          "edge_lookups": 64,
+          "edge_scans": 1,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 194,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1407,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf03_only": {
+          "certificate_attempts": 66,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 130,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        },
+        "rf04_only": {
+          "certificate_attempts": 130,
+          "edge_lookups": 64,
+          "edge_scans": 1,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 194,
+          "landing_candidates": 65,
+          "physical_edge_versions_examined": 1407,
+          "physical_node_versions_examined": 130,
+          "rows_scanned": 130,
+          "rows_seeked": 65
+        }
+      },
+      "rf04-with-hub": {
+        "base": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1874,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1874,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 937,
+          "rows_seeked": 16
+        }
+      },
+      "rf04-with-target": {
+        "base": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "both": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 64,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf03_only": {
+          "certificate_attempts": 17,
+          "edge_lookups": 0,
+          "edge_scans": 1,
+          "fallback_reason_nonselective_probe_set": 1,
+          "index_probe_keys": 32,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 1151,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        },
+        "rf04_only": {
+          "certificate_attempts": 33,
+          "edge_lookups": 16,
+          "edge_scans": 0,
+          "fallback_reason_memory_guard": 1,
+          "index_probe_keys": 48,
+          "landing_candidates": 16,
+          "physical_edge_versions_examined": 64,
+          "physical_node_versions_examined": 32,
+          "rows_scanned": 32,
+          "rows_seeked": 16
+        }
+      }
+    },
+    "decision": "structural_pass",
+    "latency_certified": false,
+    "schema_version": "grafx-rf04-structural-report/v1",
+    "scope": "input-derived ordered rows, equal fixtures/queries, physical counters, fan limit, hub and actual broad fallback; no temporal gain asserted",
+    "source_isolation": {
+      "changed_files": {
+        "base_to_rf03_only": [
+          "src/okto_grafx/domain/query/planner.py"
+        ],
+        "base_to_rf04_only": [
+          "src/okto_grafx/engine/query_engine.py"
+        ],
+        "rf03_only_to_both": [
+          "src/okto_grafx/engine/query_engine.py"
+        ],
+        "rf04_only_to_both": [
+          "src/okto_grafx/domain/query/planner.py"
+        ]
+      },
+      "revisions": {
+        "base": "da8d821b233a792553a833d69050aa19be2778aa",
+        "both": "1b8e5291a5dd77e8725297f86af9333237ec34e2",
+        "rf03_only": "237775048ab4ee162a563328215e4ce2c6029f2f",
+        "rf04_only": "3736ae08a5ca30310b4f383e001258bf98f4fb52"
+      },
+      "scope": "all four commits have identical trees except the two isolated feature switches"
+    }
+  }
+}
