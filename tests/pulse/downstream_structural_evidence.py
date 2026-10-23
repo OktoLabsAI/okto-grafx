@@ -61,6 +61,7 @@ _CASES = {
     "rf08": (
         "tests/bench/test_uniqueness_qualification.py::test_target_and_scalar_oracle_share_rows_but_not_certificate_work",
         "tests/bench/test_uniqueness_qualification.py::test_control_and_catalog_are_explicit",
+        "tests/bench/test_uniqueness_qualification.py::test_same_one_mib_quota_keeps_both_128_create_arms_scalar_and_durable",
         "tests/bench/test_uniqueness_qualification.py::test_failed_duplicate_has_no_ack_or_persisted_prefix",
         "tests/query/test_batched_pk_uniqueness.py::test_quota_uses_existing_scalar_memory_frontier",
         "tests/query/test_batched_pk_uniqueness.py::test_intermediate_row_quota_keeps_first_error_in_scalar_order",

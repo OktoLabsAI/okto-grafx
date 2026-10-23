@@ -70,6 +70,29 @@ def test_control_and_catalog_are_explicit(tmp_path):
         replace(quota, query_memory_budget_bytes=4096)
 
 
+def test_same_one_mib_quota_keeps_both_128_create_arms_scalar_and_durable(tmp_path):
+    quota = rf08.matrix(campaign_fixtures.Scenario)[2]
+    assert quota.write_rows == 128
+    assert quota.query_memory_budget_bytes == rf08.QUOTA_BYTES == 1 << 20
+    candidate = _sample(tmp_path, quota)
+    scalar = _sample(tmp_path, quota, scalar=True)
+    assert candidate["result_hash"] == scalar["result_hash"]
+    assert candidate["rows"] == scalar["rows"] == 128
+    for sample, arm in ((candidate, "B"), (scalar, "A")):
+        rf08.validate_sample(sample, quota, arm=arm)
+        assert sample["statistics"].get("pk_uniqueness_batches", 0) == 0
+        assert sample["unique_create"]["ack_count"] == 1
+        assert sample["unique_create"]["ack"]["durable"] is True
+        assert sample["unique_create"]["reopened"] is True
+        assert sample["memory"]["unavailable_reason"] is None
+        assert 0 <= sample["memory"]["logical_memory_peak_bytes"] <= 1 << 20
+        assert sample["unique_create"]["quota_retention"] == {
+            "retained_before_bytes": 0,
+            "retained_after_bytes": 0,
+            "open_transactions_after": 0,
+        }
+
+
 def test_metadata_tampering_cannot_claim_missing_ack_or_logical_peak(tmp_path):
     target = rf08.matrix(campaign_fixtures.Scenario)[0]
     sample = _sample(tmp_path, target)
