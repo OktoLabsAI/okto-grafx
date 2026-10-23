@@ -1,12 +1,125 @@
 """RF09 deterministic recipe oracles; these tests do not qualify timing."""
 import copy
+from dataclasses import replace
 
 import pytest
 
 from bench.harness.campaign_fixtures import Scenario, build_fixture, oracle
 from bench.harness import campaign_fixtures, campaign_schema, campaign_worker
 from okto_grafx import connect
-from okto_grafx.errors import GrafxQueryError
+from okto_grafx.engine.database import Transaction
+from okto_grafx.errors import GrafxQueryError, GrafxWriteConflict
+
+
+MIB = 1 << 20
+READBACK = "MATCH (n:W) RETURN n.id,n.payload ORDER BY n.id"
+
+
+@pytest.mark.parametrize("shape", ("unwind", "statements", "executemany", "chunks", "transactions"))
+def test_matrix_central_recipes_preserve_rows_payload_acks_and_one_mib(tmp_path, shape):
+    scenario = replace(next(s for s in campaign_fixtures.ingestion_matrix()
+                            if (s.write_shape, s.write_rows, s.payload_bytes, s.writers)
+                            == (shape, 32, 64, 1)), query_memory_budget_bytes=MIB)
+    root = tmp_path / shape
+    with connect(root, query_memory_budget_bytes=MIB) as db:
+        build_fixture(db, scenario)
+        sample = campaign_worker.measure_statement(db, scenario, 0)
+        assert db.execute(READBACK).rows == oracle(scenario)
+        assert db.transactions.open_transactions == 0
+        assert db._queries._owner_budget._used_bytes == 0
+        db.checkpoint()
+    with connect(root, read_only=True) as reopened:
+        rows = reopened.execute(READBACK).rows
+        assert rows == oracle(scenario)
+        assert all(len(payload) == 64 for _, payload in rows)
+        assert reopened.verify("all").findings == ()
+
+    assert sample["rows"] == 32
+    assert sample["result_hash"] == sample["expected_result_hash"]
+    assert sample["write"]["business_rows"] == 32
+    expected_acks = 32 if shape == "transactions" else 1
+    reports = sample["write"]["commit_reports"]
+    assert sample["write"]["commits"] == sample["write"]["durable_acks"] == expected_acks
+    assert len(reports) == expected_acks
+    assert all(report["durable"] is True and report["wrote"] is True for report in reports)
+    assert len({report["csn"] for report in reports}) == expected_acks
+    assert sum(report["rows"] for report in reports) == 32
+    assert [report["offset"] for report in reports] == (
+        list(range(32)) if shape == "transactions" else [0])
+    assert 0 <= sample["memory"]["logical_memory_peak_bytes"] <= MIB
+    assert sample["memory"]["baseline_retained_bytes"] == 0
+    assert sample["memory"]["coverage"] != "unavailable"
+    assert sample["memory"]["unavailable_reason"] is None
+    campaign_schema.validate_write_sample(sample, scenario, qualification=True)
+
+
+def test_matrix_chunk_recipe_keeps_each_durable_prefix_atomic(tmp_path):
+    scenario = replace(next(s for s in campaign_fixtures.ingestion_matrix()
+                            if (s.write_shape, s.write_rows, s.payload_bytes, s.writers)
+                            == ("chunks", 128, 4096, 1)), query_memory_budget_bytes=MIB)
+    root = tmp_path / "chunks"
+    with connect(root, query_memory_budget_bytes=MIB) as db:
+        build_fixture(db, scenario)
+        sample = campaign_worker.measure_statement(db, scenario, 0)
+        assert db.transactions.open_transactions == 0
+        db.checkpoint()
+    with connect(root, read_only=True) as reopened:
+        assert reopened.execute(READBACK).rows == oracle(scenario)
+        assert reopened.verify("all").findings == ()
+    reports = sample["write"]["commit_reports"]
+    assert [(r["offset"], r["rows"]) for r in reports] == [(0, 32), (32, 32), (64, 32), (96, 32)]
+    assert sample["write"]["durable_acks"] == 4
+    assert 0 <= sample["memory"]["logical_memory_peak_bytes"] <= MIB
+    assert sample["memory"]["coverage"] != "unavailable"
+    campaign_schema.validate_write_sample(sample, scenario, qualification=True)
+
+
+def test_recipe_occ_conflict_rolls_back_without_implicit_replay_then_explicit_retry(
+    tmp_path, monkeypatch,
+):
+    scenario = Scenario("occ-recipe", "write", nodes=1, edges_per_node=0,
+                        write_rows=2, write_shape="statements", query_memory_budget_bytes=MIB)
+    records = [{"id": 0, "payload": "a"}, {"id": 1, "payload": "b"}]
+    root = tmp_path / "occ"
+    with connect(root, query_memory_budget_bytes=MIB) as db:
+        build_fixture(db, scenario)
+        original_commit = Transaction.commit
+        attempted = []
+
+        def conflicting_commit(tx):
+            attempted.append(tx)
+            with db.begin("write") as contender:
+                contender.execute("CREATE (:W {id:0,payload:'contender'})")
+                ack = original_commit(contender)
+                assert ack.durable is True and ack.wrote is True
+            return original_commit(tx)
+
+        audit = {}
+        with monkeypatch.context() as patch:
+            patch.setattr(Transaction, "commit", conflicting_commit)
+            with pytest.raises(GrafxWriteConflict) as failure:
+                campaign_worker.execute_write_recipe(db, scenario, records,
+                                                     failure_evidence=audit)
+        assert failure.value.retryable is True
+        assert len(attempted) == 1
+        assert audit["confirmed_prefix"] == []
+        assert audit["failed_transaction"]["phase"] == "commit"
+        assert db.transactions.open_transactions == 0
+        assert db.execute(READBACK).rows == ((0, "contender"),)
+        db.checkpoint()
+    with connect(root, query_memory_budget_bytes=MIB) as db:
+        assert db.execute(READBACK).rows == ((0, "contender"),)
+        with db.begin("write") as tx:
+            tx.execute("MATCH (n:W {id:0}) DELETE n")
+        stats, reports, _ = campaign_worker.execute_write_recipe(db, scenario, records)
+        assert stats["rows_created"] == 2
+        assert len(reports) == 1 and reports[0]["durable"] is True
+        assert db.execute(READBACK).rows == ((0, "a"), (1, "b"))
+        assert db.transactions.open_transactions == 0
+        db.checkpoint()
+    with connect(root, read_only=True) as reopened:
+        assert reopened.execute(READBACK).rows == ((0, "a"), (1, "b"))
+        assert reopened.verify("all").findings == ()
 
 
 def test_sequence_observes_retained_growth_and_partial_call_cleanup(tmp_path):
