@@ -36,6 +36,8 @@ def validate_manifest(manifest):
         value = manifest.get(key)
         if not isinstance(value, str) or len(value) != 40 or any(c not in "0123456789abcdef" for c in value):
             raise ValueError("exact immutable SHA required")
+    if manifest["baseline_revision"] == manifest["candidate_revision"]:
+        raise ValueError("RF10 recipe comparison requires distinct source revisions")
     for key, limit in (("memory_budget_bytes", 2**31), ("timeout_seconds", 3600)):
         value = manifest.get(key)
         if type(value) is not int or not 0 < value <= limit:

@@ -23,7 +23,8 @@ def test_manifest_requires_exact_eight_slices_one_budget_and_immutable_revisions
                    {"scenarios": list(reversed(valid["scenarios"]))},
                    {"scenarios": valid["scenarios"] + valid["scenarios"][:1]},
                    {"memory_budget_bytes": 0}, {"timeout_seconds": 3601},
-                   {"candidate_revision": "HEAD"}, {"attempt": 3}):
+                   {"candidate_revision": "HEAD"},
+                   {"candidate_revision": valid["baseline_revision"]}, {"attempt": 3}):
         with pytest.raises(ValueError):
             operational.validate_manifest(dict(valid, **change))
 
