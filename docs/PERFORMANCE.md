@@ -1,5 +1,19 @@
 # Current performance and measurement boundaries
 
+## RF01–RF12 implementation evidence
+
+The current development branch includes the RF01–RF12 mechanisms and recipes
+summarized in the [roadmap](../ROADMAP.md#grafx-performance-rf01rf12-october-23-2026).
+Their qualification establishes exact results, bounded logical-memory and
+quota behavior, streaming demand, durable ACK/reopen, rollback and structural
+physical-work observations on the selected workloads. RF11 full-text proofs
+also check ranking and statistics-source behavior. These checks do not certify
+an elapsed-time improvement, a universal throughput ratio or RF01 total
+instrumentation overhead. Earlier calibrated timing runs were inconclusive
+under host load. The timed campaign protocols below remain available when a
+temporal claim is needed; no default or storage maintenance policy follows
+from the structural evidence alone.
+
 ## RF10 reading recipes: choose the snapshot contract
 
 | Application need | Recipe | Visibility and lifetime |
@@ -30,7 +44,7 @@ visible only after a new transaction starts. Equality on an unchanged fixture
 does not make the concurrent semantics interchangeable. Grouping can amortize
 transaction work when shared consistency is required; no universal speedup is
 promised. Deterministic tests count successful opens and settlements (1 versus
-16). RF10's separate measurement card owns latency/campaign evidence.
+16). These counts do not establish a latency comparison.
 
 ### Keyset pages and ownership
 
@@ -210,10 +224,11 @@ do not include a later transaction commit. Metrics publication occurs outside
 the cursor observation scope. These diagnostics do not extend the frozen
 `MetricsSink` catalogue; no data, query text or parameters become labels.
 
-RF01 remains in progress. The versioned campaign and report validator are
-implemented; real six-process runs validated the artifact contract, while the
-three-pair overhead qualification remains pending. These deterministic counters establish measurement semantics;
-they do not establish a speedup or compliance with the overhead budget.
+RF01's counters and lifecycle have deterministic structural and functional
+qualification. The versioned campaign and report validator are implemented;
+real six-process runs validated the artifact contract, while a conclusive
+three-pair overhead comparison has not been obtained. The counters establish
+measurement semantics, not a speedup or compliance with the overhead budget.
 
 ### RF01 campaign evidence and memory boundary
 
@@ -772,6 +787,11 @@ commands/conditions; artifact paths outside the repository may be unavailable.
 
 ## RF04 endpoint qualification with RF03 interaction
 
+The structural four-arm interaction proof is available independently of the
+calibrated timing protocol described here. The protocol is needed for any
+future latency claim; its thresholds do not turn structural results into a
+measured speedup.
+
 The RF04 recipe uses the existing connected N/B/E fixture: 1,024 starts, 128
 destinations and 1,151 weighted edges. The selective target has 16 distinct
 keys. A second fixture puts at least 80% of edges on 1% of starts; controls
@@ -862,10 +882,9 @@ iterator batch validates only one row.
 
 The unittest file requires no pytest installation. It imports Grafx from the
 `src` directory adjacent to the tested repository snapshot and refuses an
-already imported Grafx package from elsewhere. Each named method is executable
-by the Pulse external unittest runner. Local runs prove the assertions only;
-authenticated scenario evidence additionally requires a registered runner,
-the committed revision and the Pulse execution/Delivery workflow.
+already imported Grafx package from elsewhere. Each named method can run
+against a committed source revision. Local runs prove the stated assertions;
+the resulting tests do not establish a streaming speedup.
 
 ## Performance policy
 
@@ -1013,6 +1032,10 @@ The closure links the five reports; their per-scenario costs and raw samples
 remain the authority for a limited recommendation.
 
 ## RF01 historical total-overhead qualification
+
+This optional temporal profile is retained for a future measured-overhead
+claim. The completed structural and lifecycle checks do not imply that its
+timing thresholds have passed.
 
 RF01 edition 3 permits `run --historical-noop --mode noop --intent qualification`
 only against the immutable original baseline

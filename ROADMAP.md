@@ -15,58 +15,38 @@ operational hardening and developer experience**. It replaces the execution
 authority of the former evolution/agent/performance/round plans. It does not
 reopen completed work, authorize production data changes or imply release approval.
 
-## Grafx performance RF01–RF12 (October 21, 2026)
+## Grafx performance RF01–RF12 (October 23, 2026)
 
-RF10 N1 adds [explicit reading recipes](docs/PERFORMANCE.md#rf10-reading-recipes-choose-the-snapshot-contract)
-and deterministic snapshot/ownership/cleanup tests. It preserves the existing
-participant lifetime and distinguishes fixed snapshots from fresh independent
-transactions. Fixture measurement, authenticated verification and full RF10
-qualification remain pending; no performance gain or Spec completion is claimed.
+The implementation and deterministic qualification for all twelve work areas
+are present in this development branch. Their technical scope is:
 
-The Okto Pulse `okto-grafx` board holds twelve specifications and
-58 tasks. Native Spec dependencies are explicit: RF01 precedes
-RF02, RF03, RF05, RF06 and RF08–RF12; RF03 precedes RF04, which consequently
-also waits for RF01. RF07's streaming-contract protection is independent.
-Existing task dependencies further order implementation and qualification.
+| Area | Delivered behavior or evidence |
+| --- | --- |
+| RF01 | Statement-local physical scan, probe, certificate and landing counters; bounded logical-memory observation and semantic campaign oracles. |
+| RF02 | Proven scalar `UNWIND` primary-key seeks, with multiplicity, quota and fallback checks. |
+| RF03 | Proven connected `IN` anchors, with exact edge results, quota and authority checks. |
+| RF04 | Conditional endpoint frontier, with four-arm structural interaction and fallback controls. |
+| RF05 | Bounded ordered pages for an unambiguous label owner, preserving order, membership and keyset boundaries. |
+| RF06 | Quota-bounded closed-consumer landing batches, retaining refusal order and scalar controls. |
+| RF07 | Streaming demand and cleanup protections; speculative destination prefetch remains unsupported. |
+| RF08 | Grouped uniqueness probes for eligible integer creates, with crash, rollback, ACK and reopen checks. |
+| RF09 | Atomic ingestion and bounded retry recipes with durable ACK and recovery oracles. |
+| RF10 | Explicit read snapshot, page and ownership recipes with lifecycle tests. |
+| RF11 | Full-text statistics source and cost recipes with exact ranking, write ACK and reopen proofs. |
+| RF12 | Capacity and retention diagnostics with foreign-checkpoint, snapshot and bounded HASH-skew proofs. |
 
-The edition 3 historical noop exception is implemented in the harness, with
-explicit unavailable baseline logical memory and separate bounded candidate
-lifecycle evidence. A valid temporal qualification is still pending; no overhead
-pass or gain is inferred from functional tests. See
-[historical qualification](docs/PERFORMANCE.md#rf01-historical-total-overhead-qualification).
+The qualification supports correctness, physical-work reduction where measured,
+logical quota boundaries, durability and repeatable structural oracles. It does
+not certify a latency percentage, RF01 total counter overhead, or a global
+configuration change. Earlier calibrated timing attempts were inconclusive
+under host load. The three-pair campaigns and their thresholds in
+[performance](docs/PERFORMANCE.md) remain available for a future temporal claim;
+they are not the acceptance basis of this implementation round. The full
+Windows/POSIX release matrix remains a separate execution gate.
 
-RF01 is in progress. Its physical-counter implementation card is Done in Pulse;
-the harness, fixtures and report card is in progress with code, focused tests and
-an exploratory real six-process run completed. Instrumentation covers
-physical version headers in canonical scans and indexed reads, including
-MVCC-invisible history, actual probes/certificates/identity batches and the
-first executed fallback guard.
-Observation is isolated per statement or cursor pull, with unchanged
-cooperative checkpoints. See
-[coverage and units](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
-
-Remaining RF01 work: complete the linked semantic, consistency and three-pair
-overhead qualification. The new harness validated all 150 samples in an
-exploratory same-revision run. A clean baseline control derived from `3a2239`
-with the same logical-memory observer and no RF01 physical counters also produced
-150 valid A/B samples against `b18e8f1`; its timing verdict was inconclusive
-with host CPU reaching 91.5%. The control tests only the incremental counter
-cost, so it cannot alone certify the total overhead against the historical base.
-The first overhead campaign kept its raw samples and matching result hashes but
-did not meet the numerical limits under a busy host. A preregistered repeat
-could not start: CPU stayed above 28.2% throughout its five-minute readiness
-window. No overhead pass or performance gain is claimed. RF01 is not Done, so
-its dependent Specs remain blocked. N1 focused tests, wheel and isolated consumer
-checks passed; N2 focused tests passed. The full release matrix remains separate.
-
-RF07's independent streaming protection is Done in Pulse as a
-[six-case demand/error/cleanup matrix](docs/PERFORMANCE.md#rf07-streaming-landing-demand),
-with pytest protections and three explicit unittest entry points for authenticated
-scenario execution. The conclusion remains negative for speculative destination
-prefetch: no production optimization, new cursor contract or speedup is claimed.
-Its normal card and both Test Cards are Done: three authenticated automated
-scenarios, three inspections and both decision reviews passed, with 12/12
-implementation and 14/14 verification obligations satisfied.
+RF07's [six-case demand/error/cleanup matrix](docs/PERFORMANCE.md#rf07-streaming-landing-demand)
+is a negative result for speculative destination prefetch: it preserves the
+existing scalar streaming contract and the bounded closed-consumer batches.
 
 ## CI prerequisite correction (CI-WHEEL-RECEIPTS)
 

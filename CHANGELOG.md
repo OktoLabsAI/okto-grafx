@@ -7,6 +7,21 @@ including the on-disk format.
 
 ## [Unreleased]
 
+### RF01–RF12 structural performance and consistency round
+
+- Deliver physical-work diagnostics, proven scalar and connected seeks,
+  conditional endpoint access, bounded ordered pages, quota-aware landing
+  batches and eligible grouped uniqueness probes. Preserve exact results,
+  fallbacks, memory limits, streaming demand, rollback, durable ACK and reopen.
+- Add ingestion, read-lifecycle, full-text statistics and capacity decision
+  recipes with executable correctness, ownership and recovery proofs. The
+  full-text harness separates ranking, statistics-source and maintenance-cost
+  observations by operation. Capacity diagnostics do not change defaults or
+  authorize storage maintenance.
+- Qualify the implemented behavior with deterministic structural and functional
+  evidence. Calibrated latency gains and RF01 total counter overhead have not
+  been certified; earlier timing attempts under host load were inconclusive.
+
 ### RF05 ordered pages with label membership
 
 - Admit a single label-selected node owner to the existing ordered page path,
@@ -19,8 +34,7 @@ including the on-disk format.
 - Document shared versus independent read snapshots, 16-key groups, keyset
   pages, detached results and partial cursor cleanup. Add deterministic tests
   for external publication, transaction counts, participant release and primary
-  error preservation. No engine/default change or temporal gain is claimed;
-  RF10 fixture and campaign qualification remain separate work.
+  error preservation. No engine/default change or temporal gain is claimed.
 
 ### RF07 streaming protection
 
@@ -28,10 +42,10 @@ including the on-disk format.
   cancellation/deadline and generation-failure protections for streaming landings.
   Preserve scalar demand and the existing closed-consumer batches; record the
   [negative prefetch feasibility result](docs/PERFORMANCE.md#rf07-streaming-landing-demand)
-  without a streaming performance claim. Standalone unittest entry points support
-  the separately governed Pulse evidence workflow.
+  without a streaming performance claim. Standalone unittest entry points
+  exercise the same demand and cleanup contract.
 
-### RF01 physical scan diagnostics (in progress)
+### RF01 physical scan diagnostics
 
 - Implement the formally revised RF01 historical noop profile: preserve missing
   baseline logical memory explicitly, require RSS in both arms and separately
@@ -43,7 +57,8 @@ including the on-disk format.
   index probes, certificate attempts/retries and identity landing work.
   Record the first executed fallback guard with a bounded integer diagnostic.
   Isolate cursor pulls and preserve logical counters, cancellation checkpoints
-  and quota charging. Full qualification and measured overhead remain pending.
+  and quota charging. Structural qualification covers semantics and accounting;
+  measured overhead remains unqualified.
   See [measurement boundaries](docs/PERFORMANCE.md#rf01-physical-scan-statistics-development).
 - Add a development campaign with typed semantic oracles, raw six-process
   AB/BA/AB samples and fail-closed comparison, plus an opt-in simultaneous
